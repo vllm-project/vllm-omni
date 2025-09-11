@@ -1,5 +1,5 @@
 # Core dependencies
-vllm>=0.2.0
+vllm>=0.9.0
 torch>=2.0.0
 transformers>=4.30.0
 numpy>=1.21.0
