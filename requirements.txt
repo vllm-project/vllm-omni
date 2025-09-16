@@ -1,4 +1,6 @@
-# Core dependencies
+from vllm_omni.entrypoints.api_server import run_server
+
+# Start the API server
 vllm>=0.9.0
 torch>=2.0.0
 transformers>=4.30.0
