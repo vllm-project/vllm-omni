@@ -1,8 +1,6 @@
-from vllm_omni.entrypoints.api_server import run_server
-
-# Start the API server
-vllm>=0.9.0
-torch>=2.0.0
+# Core dependencies
+vllm>=0.10.2
+torch>=2.7
 transformers>=4.30.0
 numpy>=1.21.0
 pillow>=8.0.0
@@ -18,6 +16,11 @@ gradio>=3.0.0
 asyncio-mqtt>=0.11.0
 ray>=2.0.0
 
-# Optional: DiT acceleration modules
-# xDiT  # Uncomment when available
-# Cache-DiT  # Uncomment when available
+# Development dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.0.0

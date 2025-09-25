@@ -71,39 +71,6 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 
-class SchedulerType(Enum):
-    """Types of schedulers available."""
-    FIFO = "fifo"
-    PRIORITY = "priority"
-    MULTIMODAL = "multimodal"
-    DIFFUSION = "diffusion"
-
-@dataclass
-class SchedulerConfig:
-    """Configuration for scheduler."""
-    scheduler_type: SchedulerType = SchedulerType.FIFO
-    max_queue_size: int = 1000
-    priority_weights: Dict[str, float] = None
-    timeout_seconds: int = 300
-
-class BaseScheduler(ABC):
-    """Abstract base class for all schedulers."""
-    
-    @abstractmethod
-    async def schedule_request(self, request: OmniRequest) -> bool:
-        """Schedule a request for processing."""
-        pass
-    
-    @abstractmethod
-    async def get_next_request(self) -> Optional[OmniRequest]:
-        """Get the next request to process."""
-        pass
-    
-    @abstractmethod
-    async def remove_request(self, request_id: str) -> bool:
-        """Remove a request from the queue."""
-        pass
-
 class DiTCacheManager:
     """Manages DiT cache for diffusion models."""
     
@@ -129,7 +96,7 @@ class DiTCacheManager:
 
 #### Initialization
 ```python
-class CoreScheduler:
+class OmniScheduler():
     def __init__(self, config: SchedulerConfig):
         """Initialize the core scheduler."""
         self.config = config
@@ -148,7 +115,7 @@ class CoreScheduler:
 
 #### Core Operations
 ```python
-    async def schedule_request(self, request: OmniRequest) -> bool:
+    async def schedule(self, request: OmniRequest) -> bool:
         """
         Schedule a request for processing.
         
@@ -161,33 +128,6 @@ class CoreScheduler:
         Raises:
             SchedulerError: If scheduling fails
             QueueFullError: If queue is at capacity
-        """
-        pass
-    
-    async def get_next_request(self) -> Optional[OmniRequest]:
-        """
-        Get the next request to process.
-        
-        Returns:
-            OmniRequest or None: Next request to process
-            
-        Raises:
-            SchedulerError: If retrieval fails
-        """
-        pass
-    
-    async def process_request(self, request: OmniRequest) -> Any:
-        """
-        Process a request through the appropriate pipeline.
-        
-        Args:
-            request: The request to process
-            
-        Returns:
-            Any: Processing result
-            
-        Raises:
-            ProcessingError: If processing fails
         """
         pass
 ```
@@ -240,7 +180,7 @@ class CoreScheduler:
 
 ```python
 @dataclass
-class CoreModuleConfig:
+class OmniConfig:
     """Configuration for the core module."""
     
     # Scheduler configuration

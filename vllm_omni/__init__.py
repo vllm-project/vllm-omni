@@ -14,9 +14,14 @@ __author__ = "vLLM-omni Team"
 __email__ = "hsliuustc@gmail.com"
 
 # Main entry points
-from .async_llm import AsyncLLM
-from .omni_engine import OmniEngine
-from .diffusion_engine import DiffusionEngine
+from .core.omni_llm import OmniLLM, AsyncOmniLLM
+from .config import (
+    OmniStageConfig,
+    DiTConfig,
+    DiTCacheConfig,
+    create_ar_stage_config,
+    create_dit_stage_config,
+)
 
 __all__ = [
     # Version info
@@ -25,9 +30,15 @@ __all__ = [
     "__email__",
     
     # Main components
-    "AsyncLLM",
-    "OmniEngine",
-    "DiffusionEngine",
+    "OmniLLM",
+    "AsyncOmniLLM",
+    
+    # Configuration
+    "OmniStageConfig",
+    "DiTConfig",
+    "DiTCacheConfig",
+    "create_ar_stage_config",
+    "create_dit_stage_config",
     
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.

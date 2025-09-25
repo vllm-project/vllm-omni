@@ -37,5 +37,4 @@ class OmniScheduler(SchedulerInterface):
             
     def schedule(self, requests: List[OmniRequest]) -> List[OmniRequest]:
         # TODO: Implement scheduling logic
-        return requests
-
+        pass

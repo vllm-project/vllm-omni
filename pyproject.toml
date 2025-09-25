@@ -71,7 +71,11 @@ Documentation = "https://vllm-omni.readthedocs.io"
 "Bug Tracker" = "https://github.com/hsliuustc0106/vllm-omni/issues"
 
 [project.scripts]
-vllm-omni = "vllm_omni.cli:main"
+vllm = "vllm_omni.entrypoints.cli.main:main"
+vllm-omni = "vllm_omni.entrypoints.cli.main:main"
+
+[project.entry-points."vllm.plugins"]
+omni = "vllm_omni.plugin:OmniPlugin"
 
 [tool.setuptools.packages.find]
 where = ["."]
