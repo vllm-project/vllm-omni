@@ -152,6 +152,12 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# cursor
+.cursor/
+
+# docker
+docker/
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be added to the global gitignore or merged into this project gitignore.  For a PyCharm

@@ -218,7 +218,7 @@ from vllm_omni import OmniLLM, create_ar_stage_config, create_dit_stage_config
 # Create stage configurations
 ar_config = create_ar_stage_config(
     stage_id=0,
-    model_path="microsoft/DialoGPT-small",
+    model_path="Qwen/Qwen3-0.6B",
     input_modalities=["text"],
     output_modalities=["text"]
 )

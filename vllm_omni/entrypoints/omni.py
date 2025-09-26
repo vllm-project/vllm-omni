@@ -21,10 +21,12 @@ class OmniServeCommand:
             description="vLLM-omni: Multi-modality models inference and serving"
         )
         
-        # Model arguments
+        # Model arguments - make it optional with default
         parser.add_argument(
             "model",
-            help="Path to the model or model name"
+            nargs="?",
+            default="Qwen/Qwen3-0.6B",
+            help="Path to the model or model name (default: Qwen/Qwen3-0.6B)"
         )
         
         # Server arguments
@@ -105,19 +107,27 @@ class OmniServeCommand:
         stage_configs = []
         stage_id = 0
         
-        # Add AR stage if specified
-        if args.ar_stage:
-            ar_config = create_ar_stage_config(
-                stage_id=stage_id,
-                model_path=args.ar_stage,
-                input_modalities=["text"],
-                output_modalities=["text"]
-            )
-            stage_configs.append(ar_config)
-            stage_id += 1
+        # Add AR stage - use main model if ar_stage not specified
+        ar_model = args.ar_stage if args.ar_stage else args.model
+        ar_config = create_ar_stage_config(
+            stage_id=stage_id,
+            model_path=ar_model,
+            input_modalities=["text"],
+            output_modalities=["text"]
+        )
+        stage_configs.append(ar_config)
+        stage_id += 1
         
         # Add DiT stage if specified
         if args.dit_stage:
+            dit_model = args.dit_stage
+        elif args.use_diffusers:
+            # Use a default DiT model if diffusers is enabled
+            dit_model = "stabilityai/stable-diffusion-2-1"
+        else:
+            dit_model = None
+            
+        if dit_model:
             dit_config = DiTConfig(
                 model_type="dit",
                 scheduler_type="ddpm",
@@ -128,7 +138,7 @@ class OmniServeCommand:
             
             dit_stage_config = create_dit_stage_config(
                 stage_id=stage_id,
-                model_path=args.dit_stage,
+                model_path=dit_model,
                 input_modalities=["text"],
                 output_modalities=["image"],
                 dit_config=dit_config
@@ -184,7 +194,7 @@ class OmniServeCommand:
             from vllm_omni.entrypoints.api_server import run_server
             
             await run_server(
-                omni_llm=omni_llm,
+                omni_llm_instance=omni_llm,
                 host=args.host,
                 port=args.port
             )

@@ -373,7 +373,7 @@ class TestVLLMIntegration:
             OmniStageConfig(
                 stage_id=0,
                 engine_type="AR",
-                model_path="microsoft/DialoGPT-small",  # Small test model
+                model_path="Qwen/Qwen3-0.6B",  # Small test model
                 input_modalities=["text"],
                 output_modalities=["text"]
             )
@@ -443,7 +443,7 @@ class TestFullPipeline:
             OmniStageConfig(
                 stage_id=0,
                 engine_type="AR",
-                model_path="microsoft/DialoGPT-small",
+                model_path="Qwen/Qwen3-0.6B",
                 input_modalities=["text"],
                 output_modalities=["text"]
             ),

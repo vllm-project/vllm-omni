@@ -93,7 +93,8 @@ def create_ar_stage_config(
     model_path: str,
     input_modalities: List[str] = None,
     output_modalities: List[str] = None,
-    vllm_config: Optional[VllmConfig] = None
+    vllm_config: Optional[VllmConfig] = None,
+    executor_class: Optional[Type[Executor]] = None
 ) -> OmniStageConfig:
     """Create a configuration for an AR (Autoregressive) stage."""
     if input_modalities is None:
@@ -101,13 +102,16 @@ def create_ar_stage_config(
     if output_modalities is None:
         output_modalities = ["text"]
     
+    # For now, we'll create minimal configs
+    # vllm_config and executor_class will be handled by the LLM class
     return OmniStageConfig(
         stage_id=stage_id,
         engine_type="AR",
         model_path=model_path,
         input_modalities=input_modalities,
         output_modalities=output_modalities,
-        vllm_config=vllm_config
+        vllm_config=vllm_config,
+        executor_class=executor_class
     )
 
 
@@ -118,7 +122,8 @@ def create_dit_stage_config(
     output_modalities: List[str] = None,
     dit_config: Optional[DiTConfig] = None,
     cache_config: Optional[DiTCacheConfig] = None,
-    vllm_config: Optional[VllmConfig] = None
+    vllm_config: Optional[VllmConfig] = None,
+    executor_class: Optional[Type[Executor]] = None
 ) -> OmniStageConfig:
     """Create a configuration for a DiT (Diffusion Transformer) stage."""
     if input_modalities is None:
@@ -133,6 +138,8 @@ def create_dit_stage_config(
             num_inference_steps=50
         )
     
+    # For now, we'll create minimal configs
+    # vllm_config and executor_class will be handled by the LLM class
     return OmniStageConfig(
         stage_id=stage_id,
         engine_type="DiT",
@@ -141,5 +148,6 @@ def create_dit_stage_config(
         output_modalities=output_modalities,
         vllm_config=vllm_config,
         dit_config=dit_config,
-        cache_config=cache_config
+        cache_config=cache_config,
+        executor_class=executor_class
     )

@@ -2,13 +2,12 @@
 Core OmniLLM and AsyncOmniLLM classes for multi-stage processing.
 """
 
-import asyncio
 from typing import List, Dict, Any, Optional, Union, Callable
 from vllm.entrypoints.llm import LLM
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
-from vllm.outputs import RequestOutput
-from vllm.outputs import LoRARequest
+from vllm.outputs import RequestOutput, LoRARequest
+
 
 from ..config import OmniStageConfig
 from .stage_manager import StageManager
@@ -26,6 +25,20 @@ class OmniLLM(LLM):
     ):
         # Use the first stage's model as the default model for LLM
         default_model = stage_configs[0].model_path if stage_configs else "test-model"
+        
+        # Fix configuration validation issues
+        # Ensure max_num_batched_tokens is at least as large as max_model_len
+        if 'max_model_len' in kwargs and 'max_num_batched_tokens' in kwargs:
+            if kwargs['max_num_batched_tokens'] < kwargs['max_model_len']:
+                kwargs['max_num_batched_tokens'] = kwargs['max_model_len']
+        elif 'max_model_len' in kwargs:
+            # If max_model_len is set but max_num_batched_tokens is not, set it to max_model_len
+            kwargs['max_num_batched_tokens'] = kwargs['max_model_len']
+        else:
+            # Set reasonable defaults to avoid validation errors
+            kwargs['max_model_len'] = 2048
+            kwargs['max_num_batched_tokens'] = 2048
+        
         super().__init__(model=default_model, **kwargs)
         self.stage_configs = stage_configs
         self.log_stats = log_stats
@@ -153,34 +166,54 @@ class OmniLLM(LLM):
         priority: Optional[List[int]] = None
     ) -> Any:
         """Execute a single stage."""
-        # This is a simplified implementation
-        # In practice, this would involve proper request management
-        # and integration with vLLM's engine system
+        # Use the parent LLM's generate method for actual text generation
+        prompt = processed_input.get("prompt", "")
+        max_tokens = processed_input.get("max_tokens", 100)
+        temperature = processed_input.get("temperature", 0.7)
         
-        # For now, we'll return a mock output
-        # In the full implementation, this would call stage_engine.generate()
-        from vllm.outputs import RequestOutput, CompletionOutput
+        # Generate using the base LLM class
+        from vllm.sampling_params import SamplingParams
         
-        mock_output = CompletionOutput(
-            index=0,
-            text=processed_input.get("prompt", ""),
-            token_ids=[],
-            cumulative_logprob=0.0,
-            logprobs=None,
-            finish_reason="length"
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=processed_input.get("top_p", 1.0),
+            frequency_penalty=processed_input.get("frequency_penalty", 0.0),
+            presence_penalty=processed_input.get("presence_penalty", 0.0),
+            stop=processed_input.get("stop", None)
         )
         
-        return RequestOutput(
-            request_id="mock_request",
-            prompt=processed_input.get("prompt", ""),
-            prompt_token_ids=[],
-            outputs=[mock_output],
-            finished=True
-        )
+        # Use the parent class's generate method
+        outputs = super().generate([prompt], sampling_params)
+        
+        # Return the first output (we're processing one prompt at a time)
+        if outputs:
+            return outputs[0]
+        else:
+            # Fallback to mock output if generation fails
+            from vllm.outputs import RequestOutput, CompletionOutput
+            
+            mock_output = CompletionOutput(
+                index=0,
+                text="Generation failed",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="error"
+            )
+            
+            return RequestOutput(
+                request_id="fallback_request",
+                prompt=prompt,
+                prompt_token_ids=[],
+                prompt_logprobs=None,
+                outputs=[mock_output],
+                finished=True
+            )
 
 
-class AsyncOmniLLM(AsyncLLM):
-    """Extended AsyncLLM supporting multiple engines and stage-based processing."""
+class AsyncOmniLLM(LLM):
+    """Extended LLM class supporting multiple engines and stage-based processing."""
     
     def __init__(
         self,
@@ -188,14 +221,30 @@ class AsyncOmniLLM(AsyncLLM):
         log_stats: bool = False,
         **kwargs
     ):
-        # Use the first stage's model as the default model for AsyncLLM
-        default_model = stage_configs[0].model_path if stage_configs else "test-model"
-        super().__init__(model=default_model, **kwargs)
+        # Use the first stage's model for the base LLM
+        if stage_configs and stage_configs[0].model_path:
+            model = stage_configs[0].model_path
+        else:
+            model = "Qwen/Qwen3-0.6B"
+        
+        # Fix configuration validation issues
+        # Ensure max_num_batched_tokens is at least as large as max_model_len
+        if 'max_model_len' in kwargs and 'max_num_batched_tokens' in kwargs:
+            if kwargs['max_num_batched_tokens'] < kwargs['max_model_len']:
+                kwargs['max_num_batched_tokens'] = kwargs['max_model_len']
+        elif 'max_model_len' in kwargs:
+            # If max_model_len is set but max_num_batched_tokens is not, set it to max_model_len
+            kwargs['max_num_batched_tokens'] = kwargs['max_model_len']
+        else:
+            # Set reasonable defaults to avoid validation errors
+            kwargs['max_model_len'] = 2048
+            kwargs['max_num_batched_tokens'] = 2048
+            
+        super().__init__(model=model, **kwargs)
         self.stage_configs = stage_configs
         self.log_stats = log_stats
         self.stage_manager = StageManager(stage_configs, log_stats)
         self.output_processor = MultimodalOutputProcessor()
-        self._initialize_async_stage_engines()
     
     def _initialize_async_stage_engines(self) -> None:
         """Initialize AsyncLLM instances for each stage."""
@@ -308,25 +357,47 @@ class AsyncOmniLLM(AsyncLLM):
         priority: Optional[List[int]] = None
     ) -> Any:
         """Execute a single stage asynchronously."""
-        # This is a simplified implementation
-        # In practice, this would involve proper async request management
+        # Use the parent LLM's generate method for actual text generation
+        prompt = processed_input.get("prompt", "")
+        max_tokens = processed_input.get("max_tokens", 100)
+        temperature = processed_input.get("temperature", 0.7)
         
-        # For now, we'll return a mock output
-        from vllm.outputs import RequestOutput, CompletionOutput
+        # Generate using the base LLM class
+        from vllm.sampling_params import SamplingParams
         
-        mock_output = CompletionOutput(
-            index=0,
-            text=processed_input.get("prompt", ""),
-            token_ids=[],
-            cumulative_logprob=0.0,
-            logprobs=None,
-            finish_reason="length"
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=processed_input.get("top_p", 1.0),
+            frequency_penalty=processed_input.get("frequency_penalty", 0.0),
+            presence_penalty=processed_input.get("presence_penalty", 0.0),
+            stop=processed_input.get("stop", None)
         )
         
-        return RequestOutput(
-            request_id="mock_request",
-            prompt=processed_input.get("prompt", ""),
-            prompt_token_ids=[],
-            outputs=[mock_output],
-            finished=True
-        )
+        # Use the parent class's generate method
+        outputs = super().generate([prompt], sampling_params)
+        
+        # Return the first output (we're processing one prompt at a time)
+        if outputs:
+            return outputs[0]
+        else:
+            # Fallback to mock output if generation fails
+            from vllm.outputs import RequestOutput, CompletionOutput
+            
+            mock_output = CompletionOutput(
+                index=0,
+                text="Generation failed",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="error"
+            )
+            
+            return RequestOutput(
+                request_id="fallback_request",
+                prompt=prompt,
+                prompt_token_ids=[],
+                prompt_logprobs=None,
+                outputs=[mock_output],
+                finished=True
+            )

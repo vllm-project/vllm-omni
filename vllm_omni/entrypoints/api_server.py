@@ -53,19 +53,22 @@ async def generate(request: GenerateRequest):
         
         # Prepare stage arguments
         if request.stage_args is None:
-            # Create default stage arguments
-            stage_args = []
-            for i, prompt in enumerate(request.prompts):
-                stage_args.append({
-                    "prompt": prompt,
-                    "max_tokens": request.max_tokens,
-                    "temperature": request.temperature
-                })
+            # Create default stage arguments - one per stage config
+            # For now, we'll process all prompts in the first stage
+            stage_args = [{
+                "prompt": " ".join(request.prompts) if request.prompts else "",
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature
+            }]
         else:
             stage_args = request.stage_args
         
         # Generate using omni_llm
-        outputs = await omni_llm.generate_async(stage_args)
+        try:
+            outputs = await omni_llm.generate_async(stage_args)
+        except Exception as e:
+            # Fallback to synchronous generation
+            outputs = omni_llm.generate(stage_args)
         
         # Convert outputs to response format
         response_outputs = []

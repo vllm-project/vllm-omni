@@ -12,8 +12,8 @@ def main():
     """Main CLI entry point that intercepts vLLM commands."""
     # Check if --omni flag is present
     if "--omni" in sys.argv:
-        # Remove --omni flag and process with vLLM-omni
-        omni_args = [arg for arg in sys.argv[1:] if arg != "--omni"]
+        # Remove --omni flag and "serve" command, process with vLLM-omni
+        omni_args = [arg for arg in sys.argv[1:] if arg not in ["--omni", "serve"]]
         omni_serve = OmniServeCommand()
         omni_serve.run(omni_args)
     else:

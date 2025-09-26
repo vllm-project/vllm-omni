@@ -1,62 +1,49 @@
 # vLLM-omni Examples
 
-This directory contains examples demonstrating how to use vLLM-omni for various tasks.
+This directory contains examples demonstrating how to use vLLM-omni for multi-modality model inference and serving.
 
-## Basic Examples
+## Directory Structure
 
-- [Text Generation](basic/text_generation.py) - Basic text generation using AR models
-- [Image Generation](basic/image_generation.py) - Image generation using diffusion models
-- [Multimodal Processing](basic/multimodal_processing.py) - Processing text and images together
+- `basic/` - Simple usage examples and API client
+- `advanced/` - Advanced features and configurations  
+- `multimodal/` - Multi-modality specific examples
 
-## Advanced Examples
+## Quick Start
 
-- [Custom Model Integration](advanced/custom_model.py) - Integrating custom models
-- [Batch Processing](advanced/batch_processing.py) - Efficient batch processing
-- [Streaming Output](advanced/streaming.py) - Real-time streaming output
-
-## Multimodal Examples
-
-- [Image-to-Text](multimodal/image_to_text.py) - Image captioning and description
-- [Text-to-Image](multimodal/text_to_image.py) - Text-to-image generation
-- [Audio Processing](multimodal/audio_processing.py) - Audio generation and processing
-- [Video Generation](multimodal/video_generation.py) - Video generation workflows
-
-## API Examples
-
-- [REST API](api/rest_api.py) - Using the REST API interface
-- [Gradio Interface](api/gradio_interface.py) - Creating Gradio web interfaces
-- [ComfyUI Integration](api/comfyui_integration.py) - ComfyUI workflow integration
-
-## Configuration Examples
-
-- [Custom Configuration](config/custom_config.py) - Custom configuration setup
-- [Multi-GPU Setup](config/multi_gpu.py) - Multi-GPU configuration
-- [Distributed Processing](config/distributed.py) - Distributed processing setup
-
-## Getting Started
-
-1. Install vLLM-omni:
+1. **Basic Usage:**
    ```bash
-   pip install vllm-omni
+   cd examples/basic
+   python simple_usage.py
    ```
 
-2. Run a basic example:
+2. **API Server:**
    ```bash
-   python examples/basic/text_generation.py
+   # Start server
+   vllm serve Qwen/Qwen3-0.6B --omni --port 8000
+   
+   # Test with client
+   python api_client.py
    ```
 
-3. Explore the examples in each subdirectory for more advanced usage.
+## Examples Overview
+
+### Basic Examples (`basic/`)
+- `simple_usage.py` - Direct library usage (sync/async)
+- `api_client.py` - HTTP API client examples
+- `README.md` - Basic examples documentation
+
+### Advanced Examples (`advanced/`)
+- Multi-stage processing
+- Custom configurations
+- Performance optimization
+
+### Multi-modality Examples (`multimodal/`)
+- Text-to-image generation
+- Image-to-text processing
+- Multi-modal pipelines
 
 ## Requirements
 
-Most examples require additional dependencies. Install them with:
-
-```bash
-pip install -r requirements.txt
-```
-
-For development examples, install the development dependencies:
-
-```bash
-pip install -r requirements-dev.txt
-```
+- Python 3.8+
+- vLLM-omni installed
+- For API examples: HTTP server running
