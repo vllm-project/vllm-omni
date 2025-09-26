@@ -161,9 +161,6 @@ docker/
 # scripts
 scripts/
 
-# examples
-examples/
-
 # tests
 tests/
 
