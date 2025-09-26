@@ -157,7 +157,7 @@ class OmniLLM(LLM):
             return self._process_ar_inputs(**stage_args)
         elif stage_config.engine_type == "DiT":
             return self._process_dit_inputs(**stage_args)
-        else
+        else:
             raise NotImplementedError
     
     def _process_dit_inputs(**stage_args)-> Any:
