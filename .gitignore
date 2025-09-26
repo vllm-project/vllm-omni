@@ -158,6 +158,15 @@ cython_debug/
 # docker
 docker/
 
+# scripts
+scripts/
+
+# examples
+examples/
+
+# tests
+tests/
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be added to the global gitignore or merged into this project gitignore.  For a PyCharm
