@@ -206,7 +206,7 @@ dit_stage_config.executor_class = DiffusersPipelineExecutor
 
 Similar to OmniLLM in offline inference, add some asynchronous processing, referring to AsyncLLM 
 ```python
-from vllm.v1.engine.async_llm improt AsyncLLM
+from vllm.v1.engine.async_llm import AsyncLLM
 
 
 class AsyncOmniLLM(AsyncLLM):
