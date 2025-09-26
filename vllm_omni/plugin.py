@@ -3,7 +3,7 @@ vLLM plugin system for vLLM-omni integration.
 """
 
 from typing import Dict, Any, Optional
-from vllm_omni.core.omni_llm import OmniLLM, AsyncOmniLLM
+from vllm_omni.entrypoints.omni_llm import OmniLLM, AsyncOmniLLM
 from vllm_omni.config import create_ar_stage_config, create_dit_stage_config
 
 

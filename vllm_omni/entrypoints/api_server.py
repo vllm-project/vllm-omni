@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-from ..core.omni_llm import AsyncOmniLLM
+from .omni_llm import AsyncOmniLLM
 
 
 class GenerateRequest(BaseModel):

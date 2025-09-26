@@ -7,7 +7,7 @@ with a single AR (Autoregressive) stage.
 """
 
 import asyncio
-from vllm_omni.core.omni_llm import OmniLLM, AsyncOmniLLM
+from vllm_omni.entrypoints.omni_llm import OmniLLM, AsyncOmniLLM
 from vllm_omni.config import create_ar_stage_config
 
 

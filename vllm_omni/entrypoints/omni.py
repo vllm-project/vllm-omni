@@ -5,7 +5,7 @@ Omni serve command for vLLM-omni.
 import argparse
 import asyncio
 from typing import List, Optional
-from vllm_omni.core.omni_llm import AsyncOmniLLM
+from .omni_llm import AsyncOmniLLM
 from vllm_omni.config import create_ar_stage_config, create_dit_stage_config, DiTConfig
 
 

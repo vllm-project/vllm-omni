@@ -10,7 +10,7 @@ from vllm.outputs import RequestOutput, LoRARequest
 
 
 from ..config import OmniStageConfig
-from .stage_manager import StageManager
+from ..core.stage_manager import StageManager
 from ..engine.output_processor import MultimodalOutputProcessor
 
 
