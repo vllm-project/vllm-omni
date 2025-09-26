@@ -16,7 +16,7 @@ vLLM-omni is a multi-modality extension for vLLM that supports non-autoregressiv
 
 API Server --> OmniLLM/AsyncOmniLLM (New, including multi engines) --> LLMEngine/AsyncLLM --> Engine Core
  --> Scheduler (New one for DiT) --> Executor (New one for diffusers) --> Worker (New one for DiT)
- --> ModelRunner (New one for AR hiddenstate, New one for DiT) --> RequestState --> OutputProcessoer (New one for final multimodal output)
+ --> ModelRunner (New one for AR hiddenstate, New one for DiT) --> RequestState --> OutputProcessor (New one for final multimodal output)
 
 ## Core Components (Ordered by Data Flow)
 
