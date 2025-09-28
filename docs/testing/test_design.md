@@ -100,9 +100,9 @@ class TestOmniStageConfig:
     def test_dit_stage_config_creation(self):
         """Test DiT stage configuration creation"""
         dit_config = DiTConfig(
-            model_type="dit",
-            scheduler_type="ddpm",
-            num_inference_steps=50
+            num_inference_steps=50,
+            guidance_scale=7.5,
+            use_diffusers=False,
         )
         config = OmniStageConfig(
             stage_id=1,
@@ -130,27 +130,24 @@ class TestOmniStageConfig:
 #### test_dit_config.py
 ```python
 import pytest
-from vllm_omni.config.dit_config import DiTConfig
+from vllm.config import ModelConfig
+from vllm_omni.config import DiTConfig
 
 class TestDiTConfig:
     def test_dit_config_defaults(self):
         """Test DiT configuration with defaults"""
-        config = DiTConfig(
-            model_type="dit",
-            scheduler_type="ddpm",
-            num_inference_steps=50
-        )
+        config = DiTConfig(num_inference_steps=50)
+        assert config.model_config is None
         assert config.use_diffusers is False
         assert config.diffusers_pipeline is None
     
     def test_diffusers_config(self):
         """Test DiT configuration with diffusers"""
         config = DiTConfig(
-            model_type="dit",
-            scheduler_type="ddpm",
+            model_config=ModelConfig(model="stabilityai/stable-diffusion-2-1"),
             num_inference_steps=50,
             use_diffusers=True,
-            diffusers_pipeline="stable-diffusion"
+            diffusers_pipeline="stable-diffusion",
         )
         assert config.use_diffusers is True
         assert config.diffusers_pipeline == "stable-diffusion"
@@ -431,6 +428,7 @@ class TestCLIIntegration:
 #### test_full_pipeline.py
 ```python
 import pytest
+from vllm.config import ModelConfig
 from vllm_omni.core.omni_llm import OmniLLM
 from vllm_omni.config.stage_config import OmniStageConfig, DiTConfig
 
@@ -454,9 +452,10 @@ class TestFullPipeline:
                 input_modalities=["text"],
                 output_modalities=["image"],
                 dit_config=DiTConfig(
-                    model_type="dit",
-                    scheduler_type="ddpm",
-                    num_inference_steps=10  # Reduced for testing
+                    model_config=ModelConfig(model="stabilityai/stable-diffusion-2-1"),
+                    num_inference_steps=10,
+                    guidance_scale=7.5,
+                    use_diffusers=False,
                 )
             )
         ]
@@ -631,9 +630,9 @@ def sample_stage_configs():
             input_modalities=["text"],
             output_modalities=["image"],
             dit_config=DiTConfig(
-                model_type="dit",
-                scheduler_type="ddpm",
-                num_inference_steps=10
+                model_config=ModelConfig(model="test-dit-model"),
+                num_inference_steps=10,
+                guidance_scale=7.5,
             )
         )
     ]

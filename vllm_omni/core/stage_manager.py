@@ -2,9 +2,10 @@
 Stage manager for orchestrating multiple engines in vLLM-omni.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Union
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM
+from ..engine.diffusion_engine import DiffusionEngine
 
 from ..config import OmniStageConfig
 
@@ -15,7 +16,7 @@ class StageManager:
     def __init__(self, stage_configs: List[OmniStageConfig], log_stats: bool = False):
         self.stage_configs = stage_configs
         self.log_stats = log_stats
-        self.engine_list: List[LLMEngine] = []
+        self.engine_list: List[Union[LLMEngine, DiffusionEngine]] = []
         self.async_engine_list: List[AsyncLLM] = []
         self._initialized = False
         self._async_initialized = False

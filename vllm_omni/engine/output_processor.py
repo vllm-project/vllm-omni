@@ -37,7 +37,23 @@ class MultimodalOutputProcessor:
         handler = self.output_handlers.get(output_type, self._process_pooling_output)
         
         return handler(engine_core_output)
-    
+
+    def _build_request_output(
+        self,
+        source: Any,
+        completion_outputs: List[CompletionOutput],
+    ) -> RequestOutput:
+        """Helper to construct RequestOutput with safe defaults."""
+
+        return RequestOutput(
+            request_id=getattr(source, "request_id", "unknown"),
+            prompt=getattr(source, "prompt", ""),
+            prompt_token_ids=getattr(source, "prompt_token_ids", []),
+            prompt_logprobs=getattr(source, "prompt_logprobs", None),
+            outputs=completion_outputs,
+            finished=getattr(source, "finished", True),
+        )
+
     def _detect_output_type(self, output: Any) -> str:
         """Detect the type of output based on its content."""
         if hasattr(output, 'output_type'):
@@ -76,16 +92,8 @@ class MultimodalOutputProcessor:
             finish_reason=getattr(output, 'finish_reason', 'length')
         )
         
-        request_output = RequestOutput(
-            request_id=getattr(output, 'request_id', 'unknown'),
-            prompt=getattr(output, 'prompt', ''),
-            prompt_token_ids=getattr(output, 'prompt_token_ids', []),
-            outputs=[completion_output],
-            finished=getattr(output, 'finished', True)
-        )
-        
-        return [request_output]
-    
+        return [self._build_request_output(output, [completion_output])]
+
     def _process_image_output(self, output: Any) -> List[RequestOutput]:
         """Process image output."""
         # For image outputs, we need to create a special RequestOutput
@@ -109,15 +117,9 @@ class MultimodalOutputProcessor:
         # Add image data to the completion output
         completion_output.image = image_data
         
-        request_output = RequestOutput(
-            request_id=getattr(output, 'request_id', 'unknown'),
-            prompt=getattr(output, 'prompt', ''),
-            prompt_token_ids=getattr(output, 'prompt_token_ids', []),
-            outputs=[completion_output],
-            finished=getattr(output, 'finished', True)
-        )
-        
-        return [request_output]
+        return [
+            self._build_request_output(output, [completion_output])
+        ]
     
     def _process_text_image_output(self, output: Any) -> List[RequestOutput]:
         """Process combined text and image output."""
@@ -141,15 +143,9 @@ class MultimodalOutputProcessor:
         # Add image data to the completion output
         completion_output.image = image_data
         
-        request_output = RequestOutput(
-            request_id=getattr(output, 'request_id', 'unknown'),
-            prompt=getattr(output, 'prompt', ''),
-            prompt_token_ids=getattr(output, 'prompt_token_ids', []),
-            outputs=[completion_output],
-            finished=getattr(output, 'finished', True)
-        )
-        
-        return [request_output]
+        return [
+            self._build_request_output(output, [completion_output])
+        ]
     
     def _process_latents_output(self, output: Any) -> List[RequestOutput]:
         """Process latent representation output."""
@@ -171,15 +167,9 @@ class MultimodalOutputProcessor:
         # Add latent data to the completion output
         completion_output.latents = latent_data
         
-        request_output = RequestOutput(
-            request_id=getattr(output, 'request_id', 'unknown'),
-            prompt=getattr(output, 'prompt', ''),
-            prompt_token_ids=getattr(output, 'prompt_token_ids', []),
-            outputs=[completion_output],
-            finished=getattr(output, 'finished', True)
-        )
-        
-        return [request_output]
+        return [
+            self._build_request_output(output, [completion_output])
+        ]
     
     def _process_pooling_output(self, output: Any) -> List[RequestOutput]:
         """Process pooling output (hidden states, embeddings, etc.)."""
@@ -201,15 +191,9 @@ class MultimodalOutputProcessor:
         # Add pooling data to the completion output
         completion_output.pooler_output = pooling_data
         
-        request_output = RequestOutput(
-            request_id=getattr(output, 'request_id', 'unknown'),
-            prompt=getattr(output, 'prompt', ''),
-            prompt_token_ids=getattr(output, 'prompt_token_ids', []),
-            outputs=[completion_output],
-            finished=getattr(output, 'finished', True)
-        )
-        
-        return [request_output]
+        return [
+            self._build_request_output(output, [completion_output])
+        ]
     
     def process_outputs(self, engine_core_outputs: List[EngineCoreOutput], **kwargs) -> List[RequestOutput]:
         """Process multiple engine core outputs."""

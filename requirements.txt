@@ -5,6 +5,7 @@ transformers>=4.30.0
 numpy>=1.21.0
 pillow>=8.0.0
 opencv-python>=4.5.0
+PyYAML>=6.0
 
 # API and serving
 fastapi>=0.100.0

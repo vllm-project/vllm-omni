@@ -238,7 +238,6 @@ Dockerfile.dev
 
 # Kubernetes
 k8s/
-*.yaml
 *.yml
 !configs/*.yaml
 !configs/*.yml

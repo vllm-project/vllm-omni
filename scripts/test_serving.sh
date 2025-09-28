@@ -122,16 +122,22 @@ start_server() {
 # Test health endpoint
 test_health() {
     log_info "Testing health endpoint..."
-    local response=$(curl -s -w "%{http_code}" http://$HOST:$PORT/health 2>/dev/null || echo "000")
-    local http_code="${response: -3}"
-    local body="${response%???}"
-    
-    if [ "$http_code" = "200" ]; then
-        log_success "Health check passed: $body"
-    else
-        log_error "Health check failed (HTTP $http_code): $body"
-        return 1
-    fi
+    for attempt in {1..10}; do
+        local response=$(curl -s -w "%{http_code}" http://$HOST:$PORT/health 2>/dev/null || echo "000")
+        local http_code="${response: -3}"
+        local body="${response%???}"
+
+        if [ "$http_code" = "200" ]; then
+            log_success "Health check passed: $body"
+            return 0
+        fi
+
+        log_warning "Health check attempt $attempt failed (HTTP $http_code). Retrying in 3s..."
+        sleep 3
+    done
+
+    log_error "Health check failed after multiple attempts"
+    return 1
 }
 
 # Test info endpoint
@@ -184,6 +190,60 @@ test_api_client() {
     else
         log_warning "API client example not found, skipping"
     fi
+}
+
+# Test AR → DiT pipeline example
+test_ar_dit_pipeline() {
+    log_info "Testing AR → DiT diffusers pipeline example..."
+
+    if ! python - 2>/dev/null <<'PY'
+import importlib
+for pkg in ("torch", "diffusers"):
+    if importlib.util.find_spec(pkg) is None:
+        raise ImportError(pkg)
+PY
+    then
+        log_warning "Required packages for diffusers pipeline not found, skipping AR → DiT test"
+        return 0
+    fi
+
+    if [ ! -f "examples/omni/ar_dit_diffusers.py" ]; then
+        log_warning "AR → DiT example not found, skipping"
+        return 0
+    fi
+
+    local output_path="logs/ar_dit_pipeline.png"
+    local log_path="logs/ar_dit_pipeline.log"
+    rm -f "$output_path"
+
+    local cmd=(python examples/omni/ar_dit_diffusers.py
+        --prompt "Smoke test prompt of a lighthouse"
+        --seed 0
+        --output "$output_path")
+
+    local env_prefix=()
+    if [ -n "$AR_MODEL" ]; then
+        env_prefix+=("AR_MODEL=$AR_MODEL")
+    fi
+    if [ -n "$DIT_MODEL" ]; then
+        env_prefix+=("DIT_MODEL=$DIT_MODEL")
+    fi
+
+    if ! env "${env_prefix[@]}" "${cmd[@]}" >"$log_path" 2>&1; then
+        log_error "AR → DiT pipeline test failed"
+        log_info "AR → DiT logs:"
+        cat "$log_path"
+        return 1
+    fi
+
+    if [ ! -f "$output_path" ]; then
+        log_error "AR → DiT pipeline did not produce an image"
+        log_info "AR → DiT logs:"
+        cat "$log_path"
+        return 1
+    fi
+
+    log_success "AR → DiT pipeline test passed (output: $output_path)"
 }
 
 # Test simple usage example
@@ -250,10 +310,11 @@ run_tests() {
     test_generation
     test_performance
     test_api_client
-    
+    test_ar_dit_pipeline
+
     # Note: Simple usage test is commented out as it starts its own server
     # test_simple_usage
-    
+
     log_success "All tests completed successfully!"
     echo "=========================================="
     log_info "Test Summary:"
@@ -262,6 +323,7 @@ run_tests() {
     log_info "✅ Text generation functionality"
     log_info "✅ Performance metrics"
     log_info "✅ API client integration"
+    log_info "✅ AR → DiT diffusers pipeline"
     log_info "✅ All imports working correctly"
 }
 

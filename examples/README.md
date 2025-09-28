@@ -1,49 +1,16 @@
 # vLLM-omni Examples
 
-This directory contains examples demonstrating how to use vLLM-omni for multi-modality model inference and serving.
+A curated set of runnable samples demonstrating vLLM-omni usage.
 
-## Directory Structure
+## Directory Overview
 
-- `basic/` - Simple usage examples and API client
-- `advanced/` - Advanced features and configurations  
-- `multimodal/` - Multi-modality specific examples
+- **basic/** – Quick-start scripts for text-only flows.
+  - `text_generation.py` – Minimal CPU-friendly text generation with vLLM.
+  - `api_client.py` – Calls the FastAPI server using the JSON API.
+  - `docker_run.py` – Template for launching the server in Docker.
+- **omni/** – Multi-stage AR → DiT pipelines powered by diffusers.
+  - `ar_dit_diffusers.py` – Runs Qwen3 (AR) feeding Stable Diffusion 2.1 (DiT).
+  - `configs/ar_dit_local.yaml` – Sample plugin config referencing local weights.
+- **advanced/** – Placeholder for upcoming complex flows (Ray, benchmarking).
 
-## Quick Start
-
-1. **Basic Usage:**
-   ```bash
-   cd examples/basic
-   python simple_usage.py
-   ```
-
-2. **API Server:**
-   ```bash
-   # Start server
-   vllm serve Qwen/Qwen3-0.6B --omni --port 8000
-   
-   # Test with client
-   python api_client.py
-   ```
-
-## Examples Overview
-
-### Basic Examples (`basic/`)
-- `simple_usage.py` - Direct library usage (sync/async)
-- `api_client.py` - HTTP API client examples
-- `README.md` - Basic examples documentation
-
-### Advanced Examples (`advanced/`)
-- Multi-stage processing
-- Custom configurations
-- Performance optimization
-
-### Multi-modality Examples (`multimodal/`)
-- Text-to-image generation
-- Image-to-text processing
-- Multi-modal pipelines
-
-## Requirements
-
-- Python 3.8+
-- vLLM-omni installed
-- For API examples: HTTP server running
+See the subdirectory READMEs for usage instructions.

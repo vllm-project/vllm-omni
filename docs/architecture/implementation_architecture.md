@@ -12,13 +12,12 @@ vllm_omni/
 │   └── cache_config.py        # Caching configurations
 ├── core/                       # Core processing components
 │   ├── __init__.py
-│   ├── omni_llm.py            # OmniLLM and AsyncOmniLLM
 │   ├── stage_manager.py       # Multi-stage orchestration
 │   ├── dit_cache_manager.py   # DiT caching system
 │   └── sched/                 # Schedulers
 │       ├── __init__.py
 │       ├── scheduler.py       # Base scheduler interface
-│       └── diffusion_scheduler.py  # DiT scheduler
+
 ├── engine/                     # Engine components
 │   ├── __init__.py
 │   ├── processor.py           # Output processing
@@ -29,14 +28,14 @@ vllm_omni/
 │   └── diffusers_executor.py  # Diffusers pipeline executor
 ├── model_executor/            # Model execution components
 │   ├── __init__.py
-│   ├── ar_model_runner.py     # OmniARModelRunner
-│   └── dit_model_runner.py    # OmniDiffusionModelRunner
 ├── worker/                     # Worker implementations
 │   ├── __init__.py
-│   └── omni_worker.py         # Extended worker for DiT
+│   ├── gpu_diffusion_model_runner.py  # Loads and runs diffusers pipelines
+│   └── gpu_diffusion_worker.py        # Worker facade around the diffusion runner
 ├── entrypoints/               # Entry points and CLI
 │   ├── __init__.py
 │   ├── omni.py               # OmniServeCommand
+│   ├── omni_llm.py            # OmniLLM and AsyncOmniLLM
 │   └── cli/                  # CLI integration
 │       ├── __init__.py
 │       └── main.py           # CLI main entry point
@@ -87,24 +86,29 @@ class OmniStageConfig:
     input_modalities: List[str]
     output_modalities: List[str]
     vllm_config: Optional[VllmConfig] = None
-    executor_class: type[Executor] = MultiprocExecutor
     dit_config: Optional[DiTConfig] = None
-    cache_config: Optional[DiTCacheConfig] = None
+    executor_class: Optional[type[Executor]] = None
     stage_output: Optional[Any] = None
 ```
 
 ### 3.2 DiT Configuration
 
 ```python
-# vllm_omni/config/dit_config.py
+# vllm_omni/config/stage_config.py
 @dataclass
 class DiTConfig:
-    model_type: str
-    scheduler_type: str
+    model_config: Optional[ModelConfig] = None
+    scheduler_config: Optional[Any] = None
+    device_config: Optional[DeviceConfig] = None
+    load_config: Optional[LoadConfig] = None
+    compilation_config: Optional[CompilationConfig] = None
+    dit_cache_config: Optional[DiTCacheConfig] = None
     num_inference_steps: int
-    guidance_scale: float
+    guidance_scale: float = 7.5
     use_diffusers: bool = False
     diffusers_pipeline: Optional[str] = None
+    height: int = 512
+    width: int = 512
 ```
 
 ### 3.3 Cache Configuration
@@ -179,34 +183,9 @@ class AsyncOmniLLM(AsyncLLM):
         """Async generation interface"""
         # Similar to OmniLLM but with async/await patterns
         pass
-```
+``
 
-### 4.3 DiT Scheduler Implementation
-
-```python
-# vllm_omni/core/sched/diffusion_scheduler.py
-class OmniDiffusionScheduler(SchedulerInterface):
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        kv_cache_config: KVCacheConfig,
-        dit_cache_config: DiTCacheConfig,
-        structured_output_manager: StructuredOutputManager,
-        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
-        include_finished_set: bool = False,
-        log_stats: bool = False,
-    ) -> None:
-        super().__init__(vllm_config, kv_cache_config, structured_output_manager, 
-                        mm_registry, include_finished_set, log_stats)
-        self.dit_cache_manager = DiTCacheManager(dit_cache_config)
-    
-    def schedule(self) -> SchedulerOutput:
-        """Schedule DiT requests with caching optimization"""
-        # Implement DiT-specific scheduling logic
-        pass
-```
-
-### 4.4 Model Runners
+### 4.3 Model Runners
 
 ```python
 # vllm_omni/model_executor/dit_model_runner.py

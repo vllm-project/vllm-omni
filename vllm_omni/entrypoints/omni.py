@@ -5,8 +5,13 @@ Omni serve command for vLLM-omni.
 import argparse
 import asyncio
 from typing import List, Optional
+
 from .omni_llm import AsyncOmniLLM
-from vllm_omni.config import create_ar_stage_config, create_dit_stage_config, DiTConfig
+from vllm_omni.config import (
+    DiTConfig,
+    create_ar_stage_config,
+    create_dit_stage_config,
+)
 
 
 class OmniServeCommand:
@@ -129,11 +134,10 @@ class OmniServeCommand:
             
         if dit_model:
             dit_config = DiTConfig(
-                model_type="dit",
-                scheduler_type="ddpm",
                 num_inference_steps=args.dit_steps,
                 guidance_scale=args.dit_guidance_scale,
-                use_diffusers=args.use_diffusers
+                use_diffusers=args.use_diffusers,
+                diffusers_pipeline="auto" if args.use_diffusers else None,
             )
             
             dit_stage_config = create_dit_stage_config(
@@ -160,11 +164,10 @@ class OmniServeCommand:
                 stage_configs.append(ar_config)
                 
                 dit_config = DiTConfig(
-                    model_type="dit",
-                    scheduler_type="ddpm",
                     num_inference_steps=args.dit_steps,
                     guidance_scale=args.dit_guidance_scale,
-                    use_diffusers=args.use_diffusers
+                    use_diffusers=args.use_diffusers,
+                    diffusers_pipeline="auto" if args.use_diffusers else None,
                 )
                 
                 dit_stage_config = create_dit_stage_config(

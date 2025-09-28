@@ -3,24 +3,15 @@ Stage configuration for vLLM-omni multi-stage processing.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Type, Literal, Any
-from vllm.config import VllmConfig
+from typing import List, Optional, Type, Literal, Any, Dict
+from vllm.config import (
+    VllmConfig,
+    DeviceConfig,
+    LoadConfig,
+    ModelConfig,
+    CompilationConfig,
+)
 from vllm.executor.executor_base import ExecutorBase as Executor
-
-
-@dataclass
-class DiTConfig:
-    """Configuration for DiT (Diffusion Transformer) stages."""
-    model_type: str
-    scheduler_type: str
-    num_inference_steps: int
-    guidance_scale: float = 7.5
-    use_diffusers: bool = False
-    diffusers_pipeline: Optional[str] = None
-    height: int = 512
-    width: int = 512
-    batch_size: int = 1
-
 
 @dataclass
 class DiTCacheTensor:
@@ -42,17 +33,45 @@ class DiTCacheConfig:
 
 
 @dataclass
+class DiTConfig:
+    """Configuration for DiT (Diffusion Transformer) stages."""
+
+    num_inference_steps: int
+    """Number of diffusion inference steps."""
+
+    model_config: Optional[ModelConfig] = None
+    """Model configuration."""
+    scheduler_config: Optional[Any] = None
+    """Scheduler configuration."""
+    device_config: Optional[DeviceConfig] = None
+    """Device configuration."""
+    load_config: Optional[LoadConfig] = None
+    """Model loading configuration."""
+    compilation_config: Optional[CompilationConfig] = None
+    """Compilation configuration."""
+    dit_cache_config: Optional[DiTCacheConfig] = None
+    """DiT cache configuration."""
+    guidance_scale: float = 7.5
+    use_diffusers: bool = False
+    diffusers_pipeline: Optional[str] = None
+    height: int = 512
+    width: int = 512
+    batch_size: int = 1
+
+
+@dataclass
 class OmniStageConfig:
     """Configuration for a processing stage in vLLM-omni."""
+
     stage_id: int
     engine_type: Literal["AR", "DiT"]
     model_path: str
     input_modalities: List[str]
     output_modalities: List[str]
     vllm_config: Optional[VllmConfig] = None
-    executor_class: Type[Executor] = None  # Will be set based on engine_type
     dit_config: Optional[DiTConfig] = None
-    cache_config: Optional[DiTCacheConfig] = None
+    executor_class: Type[Executor] = None  # Will be set based on engine_type
+    default_stage_args: Optional[Dict[str, Any]] = None
     stage_output: Optional[Any] = None
     
     def __post_init__(self):
@@ -94,7 +113,8 @@ def create_ar_stage_config(
     input_modalities: List[str] = None,
     output_modalities: List[str] = None,
     vllm_config: Optional[VllmConfig] = None,
-    executor_class: Optional[Type[Executor]] = None
+    executor_class: Optional[Type[Executor]] = None,
+    default_stage_args: Optional[Dict[str, Any]] = None,
 ) -> OmniStageConfig:
     """Create a configuration for an AR (Autoregressive) stage."""
     if input_modalities is None:
@@ -111,19 +131,19 @@ def create_ar_stage_config(
         input_modalities=input_modalities,
         output_modalities=output_modalities,
         vllm_config=vllm_config,
-        executor_class=executor_class
+        executor_class=executor_class,
+        default_stage_args=default_stage_args,
     )
 
 
 def create_dit_stage_config(
     stage_id: int,
     model_path: str,
-    input_modalities: List[str] = None,
-    output_modalities: List[str] = None,
+    input_modalities: Optional[List[str]] = None,
+    output_modalities: Optional[List[str]] = None,
     dit_config: Optional[DiTConfig] = None,
-    cache_config: Optional[DiTCacheConfig] = None,
-    vllm_config: Optional[VllmConfig] = None,
-    executor_class: Optional[Type[Executor]] = None
+    executor_class: Optional[Type[Executor]] = None,
+    default_stage_args: Optional[Dict[str, Any]] = None,
 ) -> OmniStageConfig:
     """Create a configuration for a DiT (Diffusion Transformer) stage."""
     if input_modalities is None:
@@ -132,22 +152,15 @@ def create_dit_stage_config(
         output_modalities = ["image"]
     
     if dit_config is None:
-        dit_config = DiTConfig(
-            model_type="dit",
-            scheduler_type="ddpm",
-            num_inference_steps=50
-        )
-    
-    # For now, we'll create minimal configs
-    # vllm_config and executor_class will be handled by the LLM class
+        dit_config = DiTConfig(num_inference_steps=50)
+
     return OmniStageConfig(
         stage_id=stage_id,
         engine_type="DiT",
         model_path=model_path,
         input_modalities=input_modalities,
         output_modalities=output_modalities,
-        vllm_config=vllm_config,
         dit_config=dit_config,
-        cache_config=cache_config,
-        executor_class=executor_class
+        executor_class=executor_class,
+        default_stage_args=default_stage_args,
     )
