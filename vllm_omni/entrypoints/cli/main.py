@@ -5,7 +5,7 @@ CLI entry point for vLLM-omni that intercepts vLLM commands.
 import sys
 import argparse
 from typing import List, Optional
-from vllm_omni.entrypoints.omni import OmniServeCommand
+from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 
 
 def main():

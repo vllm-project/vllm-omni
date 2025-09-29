@@ -6,7 +6,7 @@ import argparse
 import asyncio
 from typing import List, Optional
 
-from .omni_llm import AsyncOmniLLM
+from ..omni_llm import AsyncOmniLLM
 from vllm_omni.config import (
     DiTConfig,
     create_ar_stage_config,
