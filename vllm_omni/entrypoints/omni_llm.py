@@ -9,9 +9,10 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.outputs import RequestOutput, LoRARequest
 
 from ..config import OmniStageConfig
-from ..core.stage_manager import StageManager
+from .stage_manager import StageManager
 from ..engine.output_processor import MultimodalOutputProcessor
 from ..engine.diffusion_engine import DiffusersPipelineEngine
+
 
 
 class OmniLLM(LLM):
@@ -482,12 +483,12 @@ class AsyncOmniLLM(LLM):
         if stage_config and stage_config.engine_type == "DiT":
             dit = stage_config.dit_config
             if dit and getattr(dit, "use_diffusers", False):
-                if not hasattr(self, "_dit_executors"):
-                    self._dit_executors = {}
-                exec_inst = self._dit_executors.get(stage_config.stage_id)
+                if not hasattr(self, "_dit_engines"):
+                    self._dit_engines = {}
+                exec_inst = self._dit_engines.get(stage_config.stage_id)
                 if exec_inst is None:
-                    from vllm_omni.executor.diffusers_executor import (
-                        DiffusersPipelineExecutor,
+                    from vllm_omni.engine.diffusion_engine import (
+                        DiffusersPipelineEngine,
                     )
 
                     pipeline_name = getattr(dit, "diffusers_pipeline", None)
@@ -506,13 +507,13 @@ class AsyncOmniLLM(LLM):
                         else:
                             dtype = getattr(model_cfg, "dtype", None)
 
-                    exec_inst = DiffusersPipelineExecutor(
+                    exec_inst = DiffusersPipelineEngine(
                         model_path=stage_config.model_path,
                         pipeline_name=pipeline_name,
                         device=device,
                         dtype=dtype,
                     )
-                    self._dit_executors[stage_config.stage_id] = exec_inst
+                    self._dit_engines[stage_config.stage_id] = exec_inst
 
                 return exec_inst.generate(
                     prompt=processed_input.get("prompt", ""),

@@ -300,7 +300,7 @@ omni = "vllm_omni.plugin:OmniPlugin"
 
 ### 7.1 Package Installation
 ```bash
-pip install vllm>=0.2.0
+pip install vllm>=0.10.2
 pip install vllm-omni
 ```
 
