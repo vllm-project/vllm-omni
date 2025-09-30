@@ -1,18 +1,9 @@
 """
-Diffusion Engine: Diffusion Transformer (DiT) processing modules.
-
-This module provides specialized processing for diffusion models including
-step management, cache management, and model wrapping.
+Engine components for vLLM-omni.
 """
 
-from .step_manager import DiffusionStepManager
-from .cache_manager import DiffusionCacheManager
-from .models import DiffusionModel
-from .base import BaseDiffusionEngine
+from .output_processor import MultimodalOutputProcessor
 
 __all__ = [
-    "DiffusionStepManager",
-    "DiffusionCacheManager",
-    "DiffusionModel",
-    "BaseDiffusionEngine",
+    "MultimodalOutputProcessor",
 ]

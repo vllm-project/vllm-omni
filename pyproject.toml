@@ -34,6 +34,7 @@ dependencies = [
     "numpy>=1.21.0",
     "pillow>=8.0.0",
     "opencv-python>=4.5.0",
+    "PyYAML>=6.0",
     "gradio>=3.0.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
@@ -71,7 +72,8 @@ Documentation = "https://vllm-omni.readthedocs.io"
 "Bug Tracker" = "https://github.com/hsliuustc0106/vllm-omni/issues"
 
 [project.scripts]
-vllm-omni = "vllm_omni.cli:main"
+vllm = "vllm_omni.entrypoints.cli.main:main"
+vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

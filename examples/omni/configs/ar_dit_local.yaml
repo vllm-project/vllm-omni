@@ -1,0 +1,28 @@
+# Example config for running OmniLLM with local AR + DiT models.
+stages:
+  - stage_id: 0
+    engine_type: AR
+    model_path: Qwen/Qwen3-0.6B
+    input_modalities: [text]
+    output_modalities: [text]
+    default_stage_args:
+      max_tokens: 16
+      temperature: 0.7
+  - stage_id: 1
+    engine_type: DiT
+    model_path: stabilityai/stable-diffusion-2-1
+    input_modalities: [text]
+    output_modalities: [image]
+    default_stage_args:
+      height: 512
+      width: 512
+    dit_config:
+      num_inference_steps: 20
+      guidance_scale: 5.0
+      use_diffusers: true
+      diffusers_pipeline: auto
+      height: 512
+      width: 512
+      device_config:
+        device: mps
+        dtype: float16
