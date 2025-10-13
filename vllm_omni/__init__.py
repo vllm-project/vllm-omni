@@ -14,8 +14,9 @@ __author__ = "vLLM-omni Team"
 __email__ = "hsliuustc@gmail.com"
 
 # Main entry points
-from .entrypoints.omni_llm import OmniLLM, AsyncOmniLLM
+from .entrypoints.omni_llm import OmniLLM
 from .config import (
+    OmniConfig,
     OmniStageConfig,
     DiTConfig,
     DiTCacheConfig,
@@ -31,9 +32,9 @@ __all__ = [
     
     # Main components
     "OmniLLM",
-    "AsyncOmniLLM",
     
     # Configuration
+    "OmniConfig",
     "OmniStageConfig",
     "DiTConfig",
     "DiTCacheConfig",

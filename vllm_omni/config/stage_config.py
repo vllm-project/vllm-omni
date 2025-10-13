@@ -97,12 +97,10 @@ class OmniStageConfig:
             from vllm.executor.uniproc_executor import UniProcExecutor
             return UniProcExecutor
         elif self.engine_type == "DiT":
-            if self.dit_config and self.dit_config.use_diffusers:
-                from vllm_omni.executor.diffusers_executor import DiffusersPipelineExecutor
-                return DiffusersPipelineExecutor
-            else:
-                from vllm.executor.uniproc_executor import UniProcExecutor
-                return UniProcExecutor
+            # For DiT stages, we use the standard executor
+            # The actual diffusion processing happens in DiffusersPipelineEngine
+            from vllm.executor.uniproc_executor import UniProcExecutor
+            return UniProcExecutor
         
         raise ValueError(f"No executor class available for engine_type: {self.engine_type}")
 

@@ -8,8 +8,18 @@ to optimize inference performance and memory usage.
 import time
 import torch
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
-from ..config import DiTCacheConfig, DiTCacheTensor
+from dataclasses import dataclass, field
+from ..config import DiTCacheConfig
+
+
+@dataclass
+class CachedTensor:
+    """Runtime cache entry for a tensor."""
+    name: str
+    tensor: torch.Tensor
+    timestamp: float
+    access_count: int = 0
+    size_bytes: int = 0
 
 
 class DiTCacheManager:
@@ -17,8 +27,8 @@ class DiTCacheManager:
     
     def __init__(self, config: DiTCacheConfig):
         self.config = config
-        self.cache_tensors: Dict[str, DiTCacheTensor] = {}
-        self.cache_groups: List[DiTCacheTensor] = config.cache_tensors
+        self.cache_tensors: Dict[str, CachedTensor] = {}
+        self.cache_groups = config.cache_tensors  # Configuration for cache tensors
         self.max_cache_size = config.max_cache_size
         self.current_cache_size = 0
         self.cache_hits = 0
@@ -35,7 +45,7 @@ class DiTCacheManager:
         tensor = torch.zeros(size, dtype=torch.float32)
         
         # Store in cache
-        cache_tensor = DiTCacheTensor(
+        cache_tensor = CachedTensor(
             name=request_id,
             tensor=tensor,
             timestamp=time.time(),
@@ -69,7 +79,7 @@ class DiTCacheManager:
             new_size_bytes = tensor.numel() * 4  # Assuming float32
             self.current_cache_size += new_size_bytes
             
-            self.cache_tensors[request_id] = DiTCacheTensor(
+            self.cache_tensors[request_id] = CachedTensor(
                 name=request_id,
                 tensor=tensor,
                 timestamp=time.time(),
@@ -82,7 +92,7 @@ class DiTCacheManager:
             if self.current_cache_size + new_size_bytes > self.max_cache_size:
                 self._evict_cache()
             
-            self.cache_tensors[request_id] = DiTCacheTensor(
+            self.cache_tensors[request_id] = CachedTensor(
                 name=request_id,
                 tensor=tensor,
                 timestamp=time.time(),

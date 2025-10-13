@@ -1,0 +1,32 @@
+# stage config for running qwen2.5-omni with architecture of OmniLLM.
+stage_engine_args:
+  - stage_id: 0
+    model_stage: thinker
+    model_arch: Qwen2_5OmniForConditionalGeneration
+    worker_cls: vllm_omni.worker.AR_gpu_worker.ARGPUWorker
+    scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
+    gpu_memory_utilization: 0.32
+    enforce_eager: true  # need to discuss
+    trust_remote_code: true
+    engine_output_type: latent
+    
+  - stage_id: 1
+    model_stage: talker
+    model_arch: Qwen2_5OmniForConditionalGeneration
+    worker_cls: vllm_omni.worker.AR_gpu_worker.ARGPUWorker
+    scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
+    gpu_memory_utilization: 0.32
+    enforce_eager: true
+    trust_remote_code: true
+    engine_output_type: latent
+
+  - stage_id: 2
+    model_stage: code2wav
+    model_arch: Qwen2_5OmniForConditionalGeneration
+    worker_cls: vllm_omni.worker.diffusion_gpu_worker.DiffusionGPUWorker
+    scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    engine_output_type: audio
