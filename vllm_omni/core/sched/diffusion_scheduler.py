@@ -1,5 +1,4 @@
 from vllm.v1.core.sched.scheduler import SchedulerOutput, EngineCoreOutputs, Request, RequestStatus, SpecDecodingStats, defaultdict, Optional
-from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.engine import EngineCoreEventType
 from vllm.distributed.kv_events import KVEventBatch
@@ -7,6 +6,7 @@ import time
 from vllm_omni.core.sched.scheduler import OmniScheduler
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.core.sched.output import OmniNewRequestData
 
 
 class DiffusionScheduler(OmniScheduler):
@@ -100,7 +100,7 @@ class DiffusionScheduler(OmniScheduler):
 
         # 组装 SchedulerOutput
         new_reqs_data = [
-            NewRequestData.from_request(req, req_to_new_block_ids[req.request_id])
+            OmniNewRequestData.from_request(req, req_to_new_block_ids[req.request_id])
             for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(

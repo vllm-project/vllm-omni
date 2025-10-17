@@ -12,9 +12,7 @@ import numpy as np
 import torch
 
 from vllm import envs
-from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu_model_runner import (
-    GPUModelRunner,
     EMPTY_MODEL_RUNNER_OUTPUT,
     IntermediateTensors,
     get_pp_group,
@@ -24,13 +22,15 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.multimodal.inputs import MultiModalKwargs
-from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.forward_context import BatchDescriptor
 from vllm.v1.spec_decode.eagle import EagleProposer
 
+from vllm_omni.engine import PromptEmbedsPayload, AdditionalInformationPayload
+from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
-class ARModelRunner(GPUModelRunner):
+
+class ARModelRunner(OmniGPUModelRunner):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     This runner follows the same preparation and forward path as GPUModelRunner
@@ -51,34 +51,52 @@ class ARModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+    ) -> Union[OmniModelRunnerOutput, IntermediateTensors]:
         # Update internal state with the new schedule
         self._update_states(scheduler_output)
 
-        # Decode per-request prompt_embeds payloads (if present) into CPU tensors
+        # Decode per-request prompt_embeds / additional_hidden_states payloads (if present) into CPU tensors
         try:
             new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
             if new_reqs:
                 import numpy as np
                 import torch
                 for nr in new_reqs:
-                    req_id = getattr(nr, "request_id", None)
-                    payload = getattr(nr, "prompt_embeds", None)
-                    if req_id is None or payload is None:
+                    req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
+                    if req_id is None:
                         continue
-                    # Accept both already-decoded tensor or payload struct
-                    if isinstance(payload, torch.Tensor):
-                        pe_cpu = payload.detach().to("cpu").contiguous()
-                    else:
-                        try:
-                            dt = np.dtype(getattr(payload, "dtype", "float32"))
-                            arr = np.frombuffer(payload.data, dtype=dt)
-                            arr = arr.reshape(payload.shape)
+                    # prompt_embeds
+                    payload_pe = getattr(nr, "prompt_embeds", None)
+                    if payload_pe is not None:
+                        if isinstance(payload_pe, torch.Tensor):
+                            pe_cpu = payload_pe.detach().to("cpu").contiguous()
+                        elif isinstance(payload_pe, PromptEmbedsPayload):
+                            dt = np.dtype(getattr(payload_pe, "dtype", "float32"))
+                            arr = np.frombuffer(payload_pe.data, dtype=dt)
+                            arr = arr.reshape(payload_pe.shape)
                             pe_cpu = torch.from_numpy(arr)
-                        except Exception:
-                            continue
-                    if req_id in self.requests:
-                        setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
+                        else:
+                            pe_cpu = None
+                        if pe_cpu is not None and req_id in self.requests:
+                            setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
+                    # additional_information
+                    payload_info = getattr(nr, "additional_information", None)
+                    if payload_info is not None:
+                        info_dict = {}
+                        if isinstance(payload_info, dict):
+                            # Already decoded
+                            info_dict = payload_info
+                        elif isinstance(payload_info, AdditionalInformationPayload):
+                            for k, entry in payload_info.entries.items():
+                                if entry.tensor_data is not None:
+                                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
+                                    arr = np.frombuffer(entry.tensor_data, dtype=dt)
+                                    arr = arr.reshape(entry.tensor_shape)
+                                    info_dict[k] = torch.from_numpy(arr)
+                                else:
+                                    info_dict[k] = entry.list_data
+                        if info_dict and req_id in self.requests:
+                            setattr(self.requests[req_id], "additional_information_cpu", info_dict)
         except Exception:
             pass
 
@@ -105,7 +123,7 @@ class ARModelRunner(GPUModelRunner):
             tp_size = self.vllm_config.parallel_config.tensor_parallel_size
             if (self.compilation_config.pass_config.enable_sequence_parallelism
                     and tp_size > 1):
-                from vllm.compilation.utils import round_up  # lazy local import
+                from vllm.utils import round_up  # lazy local import
                 num_input_tokens = round_up(num_scheduled_tokens, tp_size)
             else:
                 num_input_tokens = num_scheduled_tokens
@@ -121,7 +139,7 @@ class ARModelRunner(GPUModelRunner):
         else:
             mm_embeds = []
 
-        # Always assemble inputs_embeds on first PP rank; overlay per-request prompt_embeds
+        # Always assemble inputs_embeds on first PP rank; overlay per-request prompt_embeds and collect additional_hidden_states for prefill only
         if get_pp_group().is_first_rank:
             inputs_embeds_scheduled = self.model.get_input_embeddings(
                 input_ids=self.input_ids[:num_scheduled_tokens],
@@ -133,12 +151,15 @@ class ARModelRunner(GPUModelRunner):
             self.inputs_embeds[:num_scheduled_tokens].copy_(
                 inputs_embeds_scheduled)
 
-            # Overlay custom prompt_embeds per request for the prompt portion
+            # Reset per-step additional information collector
+            if hasattr(self, "_forward_additional_information"):
+                self._forward_additional_information = None
+
+            # Overlay custom prompt_embeds per request for the prompt portion; collect additional_information (tensor/list) for prefill portion only
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests[req_id]
                 pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
-                if pe_cpu is None:
-                    continue
+                addi_cpu = getattr(req_state, "additional_information_cpu", None)
                 num_computed_tokens = int(
                     self.input_batch.num_computed_tokens_cpu[req_index])
                 prompt_len = len(req_state.prompt_token_ids)
@@ -147,14 +168,49 @@ class ARModelRunner(GPUModelRunner):
                 overlay_len = min(sched_tokens, prompt_remaining)
                 if overlay_len <= 0:
                     continue
-                src = pe_cpu[num_computed_tokens:
-                             num_computed_tokens + overlay_len].to(
-                                 dtype=self.dtype,
-                                 device=self.device,
-                                 non_blocking=True)
-                start_offset = int(self.query_start_loc_cpu[req_index])
-                self.inputs_embeds[start_offset:start_offset + overlay_len] \
-                    .copy_(src)
+                if pe_cpu is not None:
+                    src = pe_cpu[num_computed_tokens:
+                                 num_computed_tokens + overlay_len].to(
+                                      dtype=self.dtype,
+                                      device=self.device,
+                                      non_blocking=True)
+                    start_offset = int(self.query_start_loc_cpu[req_index])
+                    self.inputs_embeds[start_offset:start_offset + overlay_len] \
+                        .copy_(src)
+                # For additional_information: handle arbitrary keys
+                if addi_cpu is not None and isinstance(addi_cpu, dict):
+                    # Lazy init collector dict
+                    if not hasattr(self, "_forward_additional_information") or \
+                       self._forward_additional_information is None:
+                        self._forward_additional_information = {}
+                    # Process tensors (slice by scheduled prompt range) and lists (append per-request)
+                    for k, v in addi_cpu.items():
+                        if isinstance(v, torch.Tensor):
+                            # Slice along token dimension for prefill part
+                            try:
+                                seg = v[num_computed_tokens:
+                                        num_computed_tokens + overlay_len].to(
+                                            dtype=self.dtype,
+                                            device=self.device,
+                                            non_blocking=True)
+                            except Exception:
+                                # Fallback: move whole tensor if slicing fails
+                                seg = v.to(dtype=self.dtype,
+                                           device=self.device,
+                                           non_blocking=True)
+                            prev_val = self._forward_additional_information.get(k)
+                            self._forward_additional_information[k] = (
+                                torch.cat([prev_val, seg], dim=0)
+                                if isinstance(prev_val, torch.Tensor) else seg.clone())
+                        elif isinstance(v, list):
+                            prev_val = self._forward_additional_information.get(k)
+                            if prev_val is None:
+                                self._forward_additional_information[k] = [v]
+                            elif isinstance(prev_val, list):
+                                self._forward_additional_information[k].append(v)
+                            else:
+                                # Mixed types: wrap existing into list
+                                self._forward_additional_information[k] = [prev_val, v]
 
             input_ids = self.input_ids[:num_input_tokens]  # preserved for APIs
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
@@ -191,6 +247,12 @@ class ARModelRunner(GPUModelRunner):
         ), self.maybe_get_kv_connector_output(
                 scheduler_output) as kv_connector_output:
 
+            model_kwargs_extra = {}
+            # Only pass additional_information for the prefill part
+            if hasattr(self, "_forward_additional_information") and \
+               self._forward_additional_information is not None and \
+               isinstance(self._forward_additional_information, dict):
+                model_kwargs_extra["additional_information"] = self._forward_additional_information
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -203,6 +265,7 @@ class ARModelRunner(GPUModelRunner):
                 sampling_metadata=self.input_batch.sampling_metadata,
                 logits_index=logits_indices,
                 sampler=self.sampler,
+                **model_kwargs_extra,
             )
 
         if self.use_aux_hidden_state_outputs:
@@ -347,12 +410,15 @@ class ARModelRunner(GPUModelRunner):
 
         # Convert to per-request tensors on CPU
         pooler_output: list[Optional[torch.Tensor]] = []
-        pooler_output.append(text_hidden_states.detach().cpu())
+        prev_logits_index = 0
+        for logits_index in logits_indices:
+            pooler_output.append(text_hidden_states[prev_logits_index:logits_index])
+            prev_logits_index = logits_index + 1
 
 
         self.eplb_step()
 
-        return ModelRunnerOutput(
+        return OmniModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
             sampled_token_ids=valid_sampled_token_ids,
@@ -362,7 +428,6 @@ class ARModelRunner(GPUModelRunner):
             pooler_output=pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
-            multimodal_outputs=multimodal_outputs,
         )
     
     @torch.inference_mode()
@@ -385,128 +450,52 @@ class ARModelRunner(GPUModelRunner):
     def _dummy_run(
         self,
         num_tokens: int,
-        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        force_attention: bool = False,
-        uniform_decode: bool = False,
+        capture_attn_cudagraph: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
-        create_mixed_batch: bool = False,
-        remove_lora: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run a dummy forward pass to warm up/profile run or capture the
-        CUDA graph for the model.
-
-        Args:
-            num_tokens: Number of tokens to run the dummy forward pass.
-            cudagraph_runtime_mode: used to control the behavior.
-                - CUDAGraphMode.NONE: No cudagraph, for warm up and profile run
-                - CUDAGraphMode.PIECEWISE: Piecewise cudagraph.
-                - CUDAGraphMode.FULL: Full cudagraph, attention metadata is
-                    needed.
-            force_attention: If True, always create attention metadata. Used to
-                warm up attention backend when mode is NONE.
-            uniform_decode: If True, the batch is a uniform decode batch.
-            skip_eplb: If True, skip EPLB state update.
-            is_profile: If True, this is a profile run.
-            create_mixed_batch: If True, create a mixed batch with both decode
-                (1 token) and prefill (multiple tokens) requests.
-            remove_lora: If False, dummy LoRAs are not destroyed after the run
-        """
-        assert cudagraph_runtime_mode in {
-            CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
-        }
 
         # Padding for DP
         num_pad, num_tokens_across_dp = self.get_dp_padding(num_tokens)
         num_tokens += num_pad
-
-        # If cudagraph_mode.decode_mode() == FULL and
-        # cudagraph_mode.separate_routine(). This means that we are using
-        # different graphs and/or modes for mixed prefill-decode batches vs.
-        # uniform decode batches. A uniform decode batch means that all
-        # requests have identical query length, except a potential virtual
-        # request (shorter) in the batch account for padding.
-        # Uniform decode batch could either be common pure decode, where
-        # max_query_len == 1, or speculative decode, where
-        # max_query_len == 1 + num_spec_decode_tokens.
-
-        # When setting max_query_len = 1, we switch to and capture the optimized
-        # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
-        # for GQA/MQA.
-        max_query_len = self.uniform_decode_query_len if uniform_decode else \
-                                                                num_tokens
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
-            assert not uniform_decode
-            # Create mixed batch:
-            # first half decode tokens, second half one prefill
-            num_decode_tokens = num_tokens // 2
-            num_prefill_tokens = num_tokens - num_decode_tokens
-            num_reqs = num_decode_tokens + 1
-
-            # Create decode requests (1 token each) followed by prefill request
-            num_scheduled_tokens_list = [1] * num_decode_tokens + [
-                num_prefill_tokens
-            ]
-            # Note: Overriding max_query_len to be the prefill tokens
-            max_query_len = num_prefill_tokens
-        elif uniform_decode:
-            num_reqs = num_tokens // max_query_len
-            assert num_reqs <= max_num_reqs, \
-                "Do not capture num_reqs > max_num_reqs for uniform batch"
-            num_scheduled_tokens_list = [max_query_len] * num_reqs
-            if num_tokens % max_query_len != 0:
-                num_scheduled_tokens_list[-1] += num_tokens % max_query_len
-        else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
-            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
-
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list,
                                         dtype=np.int32)
 
         attn_metadata: Optional[dict[str, Any]] = None
-
-        # If force_attention is True, we always capture attention. Otherwise,
-        # it only happens for cudagraph_runtime_mode=FULL.
-        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+        if capture_attn_cudagraph:
             attn_metadata = {}
 
-            if create_mixed_batch:
-                # In the mixed batch mode (used for FI warmup), we use
-                # shorter sequence lengths to run faster.
-                # TODO(luka) better system for describing dummy batches
-                seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
-            else:
-                # Make sure max_model_len is used at the graph capture time.
-                seq_lens = self.max_model_len
-            self.seq_lens.np[:num_reqs] = seq_lens
-            self.seq_lens.np[num_reqs:] = 0
-            self.seq_lens.copy_to_gpu()
+            # Make sure max_model_len is used at the graph capture time.
+            self.seq_lens_np[:num_reqs] = self.max_model_len
+            self.seq_lens_np[num_reqs:] = 0
+            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
+                                           non_blocking=True)
 
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
                     self.kv_cache_config.kv_cache_groups):
                 common_attn_metadata = CommonAttentionMetadata(
-                    query_start_loc=self.query_start_loc.gpu[:num_reqs + 1],
-                    query_start_loc_cpu=self.query_start_loc.cpu[:num_reqs +
+                    query_start_loc=self.query_start_loc[:num_reqs + 1],
+                    query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs +
                                                                  1],
-                    seq_lens=self.seq_lens.gpu[:num_reqs],
-                    seq_lens_cpu=self.seq_lens.cpu[:num_reqs],
+                    seq_lens=self.seq_lens[:num_reqs],
+                    seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
                     num_computed_tokens_cpu=self.input_batch.
                     num_computed_tokens_cpu_tensor[:num_reqs],
                     num_reqs=num_reqs,
                     num_actual_tokens=num_tokens,
-                    max_query_len=max_query_len,
-                    max_seq_len=self.max_model_len,
+                    max_query_len=num_tokens,
                     block_table_tensor=self.input_batch.block_table[
                         kv_cache_group_id].get_device_tensor()[:num_reqs],
                     slot_mapping=self.input_batch.
@@ -520,24 +509,20 @@ class ARModelRunner(GPUModelRunner):
                         attn_metadata[layer_name] = attn_metadata_i
 
         with self.maybe_dummy_run_with_lora(self.lora_config,
-                                            num_scheduled_tokens, remove_lora):
-            model_kwargs = self._init_model_kwargs(num_tokens)
-            if (self.supports_mm_inputs
-                    and not self.model_config.is_encoder_decoder):
+                                            num_scheduled_tokens):
+            if self.is_multimodal_model:
                 input_ids = None
-                inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
-                model_kwargs = {
-                    **model_kwargs,
-                    **self._dummy_mm_kwargs(num_reqs),
-                }
+                inputs_embeds = self.inputs_embeds[:num_tokens]
+                model_mm_kwargs = self._dummy_mm_kwargs(num_reqs)
             else:
-                input_ids = self.input_ids.gpu[:num_tokens]
+                input_ids = self.input_ids[:num_tokens]
                 inputs_embeds = None
+                model_mm_kwargs = {}
 
             if self.uses_mrope:
-                positions = self.mrope_positions.gpu[:, :num_tokens]
+                positions = self.mrope_positions[:, :num_tokens]
             else:
-                positions = self.positions.gpu[:num_tokens]
+                positions = self.positions[:num_tokens]
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -551,32 +536,21 @@ class ARModelRunner(GPUModelRunner):
 
                 intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                     num_tokens, None, False)
-            if cudagraph_runtime_mode == CUDAGraphMode.NONE:
-                batch_descriptor = None
-            else:
-                # filter out the valid batch descriptor
-                _cg_mode, batch_descriptor = \
-                    self.cudagraph_dispatcher.dispatch(
-                        BatchDescriptor(num_tokens=num_tokens,
-                                        uniform_decode=uniform_decode))
-                # sanity check
-                assert cudagraph_runtime_mode == _cg_mode, (
-                    f"Cudagraph runtime mode mismatch at dummy_run. "
-                    f"Expected {_cg_mode}, but got {cudagraph_runtime_mode}.")
 
             with self.maybe_randomize_inputs(input_ids), set_forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_descriptor):
+                    num_tokens_across_dp=num_tokens_across_dp):
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
-                    **model_kwargs,
+                    **MultiModalKwargs.as_kwargs(
+                        model_mm_kwargs,
+                        device=self.device,
+                    ),
                 )
 
             if self.use_aux_hidden_state_outputs:
@@ -599,7 +573,6 @@ class ARModelRunner(GPUModelRunner):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-
         hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
         return hidden_states, hidden_states[logit_indices]
 

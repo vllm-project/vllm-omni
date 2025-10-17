@@ -14,6 +14,7 @@ __author__ = "vLLM-omni Team"
 __email__ = "hsliuustc@gmail.com"
 
 # Main entry points
+from . import patch
 from .entrypoints.omni_llm import OmniLLM
 from .config import (
     OmniConfig,

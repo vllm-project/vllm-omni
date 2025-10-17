@@ -5,13 +5,13 @@ from typing import Optional
 
 from vllm.v1.core.sched.output import (
                                        SchedulerOutput, )
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput 
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 
@@ -29,12 +29,12 @@ class OmniScheduler(VLLMScheduler):
         model_runner_output: OmniModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         sampled_token_ids = model_runner_output.sampled_token_ids
+        spec_token_ids = model_runner_output.spec_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
-        multimodal_outputs = model_runner_output.multimodal_outputs
 
         outputs: dict[int, list[OmniEngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
@@ -60,19 +60,19 @@ class OmniScheduler(VLLMScheduler):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
             if scheduled_spec_token_ids:
-                num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
-                # tokens.
-                request.num_computed_tokens -= num_rejected
+                # tokens, where is given by:
+                # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
+                num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
+                                       len(generated_token_ids))
+                request.num_computed_tokens -= num_tokens_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted)
+                    num_draft_tokens=len(scheduled_spec_token_ids),
+                    num_accepted_tokens=len(generated_token_ids) - 1)
 
             stopped = False
             new_logprobs = None
@@ -110,12 +110,23 @@ class OmniScheduler(VLLMScheduler):
                     request):
                 # NOTE: structured_output_request
                 # should not be None if use_structured_output, we have
-                # checked above, so safe to ignore type warning
+                # check above, so safe to ignore type warning
                 request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
                     req_id, new_token_ids)
 
+            # spec_token_ids comes from the model runner output
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
+
+            # Add newly generated spec token ids to the request.
+            if spec_token_ids is not None:
+                if self.structured_output_manager.should_advance(request):
+                    metadata = request.structured_output_request
+                    # Needs to happen after new_token_ids are accepted.
+                    request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
+                        spec_token_ids[req_index])
+                else:
+                    request.spec_token_ids = spec_token_ids[req_index]
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
@@ -134,18 +145,19 @@ class OmniScheduler(VLLMScheduler):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
-                        trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
-                        multimodal_outputs=multimodal_outputs,
                         output_type=getattr(self.vllm_config.model_config, "engine_output_type", None),
                     ))
+
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
-            self.running = remove_all(self.running, stopped_running_reqs)
+            self.running = [
+                req for req in self.running if req not in stopped_running_reqs
+            ]
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -175,12 +187,9 @@ class OmniScheduler(VLLMScheduler):
                         finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats)) is not None:
+        if engine_core_outputs:
             # Return stats to only one of the front-ends.
-            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
-                # We must return the stats even if there are no request
-                # outputs this step.
-                engine_core_outputs[0] = eco = EngineCoreOutputs()
-            eco.scheduler_stats = stats
+            next(iter(engine_core_outputs.values())).scheduler_stats = (
+                self.make_stats(spec_decoding_stats))
 
         return engine_core_outputs

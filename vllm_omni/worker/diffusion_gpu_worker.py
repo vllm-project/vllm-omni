@@ -7,8 +7,9 @@ from vllm.platforms import current_platform
 from vllm.worker.worker import _check_if_gpu_supports_dtype
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.model_executor import set_random_seed
-from vllm_omni.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm.v1.utils import report_usage_stats
+
+from vllm_omni.worker.diffusion_model_runner import DiffusionModelRunner
 
 
 class DiffusionGPUWorker(GPUWorker):

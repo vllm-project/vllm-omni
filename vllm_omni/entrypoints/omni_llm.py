@@ -14,7 +14,6 @@ from vllm.engine.arg_utils import HfOverrides
 from vllm.usage.usage_lib import UsageContext
 from vllm.config import CompilationConfig, is_init_field
 from vllm.entrypoints.utils import log_non_default_args
-from vllm.plugins.io_processors import get_io_processor
 from vllm.utils import Counter
 from vllm.logger import init_logger
 import vllm.envs as envs
@@ -22,6 +21,7 @@ import vllm.envs as envs
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
+from vllm_omni.engine.processor import OmniProcessor
 
 
 logger = init_logger(__name__)
@@ -59,7 +59,7 @@ class OmniLM:
         pass
 
 
-class OmniLLM(LLM):
+class OmniLLM(LLM): 
     def __init__(self, 
                 model: str, 
                 compilation_config: Optional[Union[int, dict[str, Any],
@@ -67,7 +67,6 @@ class OmniLLM(LLM):
                 hf_overrides: Optional[HfOverrides] = None,
                 **kwargs):
         """LLM constructor."""
-
         if "disable_log_stats" not in kwargs:
             kwargs["disable_log_stats"] = True
 
@@ -80,7 +79,7 @@ class OmniLLM(LLM):
 
         if "kv_transfer_config" in kwargs and isinstance(
                 kwargs["kv_transfer_config"], dict):
-            from vllm.config.kv_transfer import KVTransferConfig
+            from vllm.config import KVTransferConfig
             raw_config_dict = kwargs["kv_transfer_config"]
             try:
                 kwargs["kv_transfer_config"] = KVTransferConfig(
@@ -123,6 +122,8 @@ class OmniLLM(LLM):
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.llm_engine.output_processor = MultimodalOutputProcessor(tokenizer=self.llm_engine.tokenizer, 
                                                                     log_stats=self.llm_engine.log_stats)
+        self.llm_engine.processor = OmniProcessor(vllm_config=self.llm_engine.vllm_config,
+                                                  tokenizer=self.llm_engine.tokenizer)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
@@ -137,8 +138,3 @@ class OmniLLM(LLM):
         logger.info("Supported_tasks: %s", supported_tasks)
 
         self.supported_tasks = supported_tasks
-
-        # Load the Input/Output processor plugin if any
-        io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
-        self.io_processor = get_io_processor(self.llm_engine.vllm_config,
-                                             io_processor_plugin)

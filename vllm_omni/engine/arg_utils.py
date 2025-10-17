@@ -2,6 +2,7 @@ from vllm.engine.arg_utils import EngineArgs
 from typing import Literal, Optional
 from dataclasses import dataclass
 from vllm_omni.config import OmniModelConfig
+from vllm.utils import FlexibleArgumentParser
 
 
 @dataclass
@@ -10,6 +11,23 @@ class OmniEngineArgs(EngineArgs):
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: Optional[str] = None
+
+    @staticmethod
+    def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+        """Shared CLI arguments for vLLM engine."""
+        parser.add_argument(
+            "--engine-output-type",
+            type=str,
+            default=EngineArgs.engine_output_type,
+            help=(
+                "Declare EngineCoreOutput.output_type (e.g., 'text', 'image', "
+                "'text+image', 'latent'). This will be written into "
+                "model_config.engine_output_type for schedulers to use."
+            ),
+        )
+        parser.add_argument("--model-stage", type=str, default=EngineArgs.model_stage, 
+        help="Declare model stage (e.g., 'thinker', 'talker', 'token2wav'). This will be written into model_config.model_stage for schedulers to use.")
+        return parser
 
     def create_model_config(self) -> OmniModelConfig:
         # First, get the base ModelConfig from the parent class
