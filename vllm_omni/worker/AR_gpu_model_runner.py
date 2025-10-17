@@ -412,7 +412,7 @@ class ARModelRunner(OmniGPUModelRunner):
         pooler_output: list[Optional[torch.Tensor]] = []
         prev_logits_index = 0
         for logits_index in logits_indices:
-            pooler_output.append(text_hidden_states[prev_logits_index:logits_index])
+            pooler_output.append(text_hidden_states[prev_logits_index:logits_index+1])
             prev_logits_index = logits_index + 1
 
 
