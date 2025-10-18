@@ -235,9 +235,3 @@ configs/development.yaml
 # Docker
 .dockerignore
 Dockerfile.dev
-
-# Kubernetes
-k8s/
-*.yml
-!configs/*.yaml
-!configs/*.yml
