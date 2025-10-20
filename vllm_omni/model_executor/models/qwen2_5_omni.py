@@ -725,9 +725,7 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
         # Load token2wav weights (if any)
         if token2wav_weights and self.token2wav is not None:
             self._init_token2wav_model()
-            hf_model_folder = download_weights_from_hf(self.vllm_config.model_config.model, 
-            self.vllm_config.load_config.download_dir, allow_patterns=["*.safetensors", "*.bin", "*.pt"])
-            t2w_loaded = self.token2wav.load_weights(token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt"))
+            t2w_loaded = self.token2wav.load_weights(token2wav_weights, os.path.join(self.vllm_config.model_config.model, "spk_dict.pt"))
             t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, 'token2wav')
             loaded_weights.update(t2w_loaded)
         loaded_weights.update(self._init_special_tokens_embeddings())
