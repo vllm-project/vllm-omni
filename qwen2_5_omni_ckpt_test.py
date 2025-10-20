@@ -167,8 +167,10 @@ parser.add_argument('--prompt_type',
                     default='text')
 parser.add_argument('--use-torchvision', action='store_true')
 parser.add_argument('--tokenize', action='store_true')
-parser.add_argument('--output-wav', default="output.wav", help='Output wav file path.')
+parser.add_argument('--output-wav', default="output.wav", help='Output wav dir or file path.')
 parser.add_argument('--thinker-hidden-states-dir', default="thinker_hidden_states", help='Path to thinker hidden states directory.')
+parser.add_argument('--stats-csv', default="stats_log.csv", help='Path to save per-prompt stats CSV.')
+parser.add_argument('--write-csv', action='store_true', help='Enable writing per-prompt stats to CSV.')
 args = parser.parse_args()
 
 os.environ["thinker_hidden_states_dir"] = args.thinker_hidden_states_dir
@@ -225,8 +227,8 @@ def ensure_config(model_dir: str, code2wav_dir: str | None, dit_ckpt: str | None
         cfg = {}
 
     archs = cfg.get('architectures') or []
-    if 'Qwen2_5OmniForConditionalGeneration' not in archs:
-        cfg['architectures'] = ['Qwen2_5OmniForConditionalGeneration']
+    if 'Qwen2_5OmniMergedModel' not in archs:
+        cfg['architectures'] = ['Qwen2_5OmniMergedModel']
 
     code2wav_cfg = cfg.get('code2wav_config') or {}
     if code2wav_dir:
@@ -596,11 +598,11 @@ def talker2code(llm:OmniLLM, talker_outputs, multi_modal_data = None):
         )
     return code_outputs
 
-def thinker_generate(llm: OmniLLM):
+def thinker_generate(llm: OmniLLM, prompt: str | None = None):
     print("--------------------------")
     print("thinker_generate")
     print("--------------------------")
-    prompt = [make_omni_prompt(prompt) for prompt in args.prompts]
+    prompt_list = [make_omni_prompt(prompt)]
     
     sampling = SamplingParams(
         temperature=0.0,    # Deterministic - no randomness
@@ -611,15 +613,19 @@ def thinker_generate(llm: OmniLLM):
         detokenize=True,
         repetition_penalty=1.1,
         )
-    final = run_generation(llm, sampling, prompt)
-    
+    start_time = time.time()
+    final = run_generation(llm, sampling, prompt_list)
+    elapsed = time.time() - start_time
 
-    multi_modal_data = {output.request_id: prompt.get('multi_modal_data', None) for output, prompt in zip(final, prompt)}
+    multi_modal_data = {output.request_id: getattr(prompt_obj, 'multi_modal_data', None) for output, prompt_obj in zip(final, prompt_list)}
     
     thinker_outputs = thinker2talker(llm, final, multi_modal_data)
     text_outputs = extract_text(llm, final)
     print_nvidia_sim_info(gpu_index=torch.cuda.current_device(), stage="After_thinker2talker", model_stage="thinker")
-    return thinker_outputs, text_outputs, multi_modal_data
+    tokens = len(final[0].outputs[0].token_ids)
+    tps = tokens / max(elapsed, 1e-9)
+    print(f"Thinker: time={elapsed:.3f}s, tokens={tokens}, tps={tps:.2f}")
+    return thinker_outputs, text_outputs, multi_modal_data, tokens, elapsed, tps
 
 def talker_generate(llm: OmniLLM, thinker_outputs, multi_modal_data):
     print("--------------------------")
@@ -635,15 +641,22 @@ def talker_generate(llm: OmniLLM, thinker_outputs, multi_modal_data):
         repetition_penalty=1.1,
         stop_token_ids=[8294]
     )
+    start_time = time.time()
     final = run_generation(llm, sampling, thinker_outputs)
+    elapsed = time.time() - start_time
     print_nvidia_sim_info(gpu_index=torch.cuda.current_device(), stage="After_talker_generate", model_stage="talker")
+    tokens = len(final[0].outputs[0].token_ids)
+    tps = tokens / max(elapsed, 1e-9)
+    print(f"Talker: time={elapsed:.3f}s, tokens={tokens}, tps={tps:.2f}")
     talker_outputs = talker2code(llm, final, multi_modal_data)
-    return talker_outputs
+    return talker_outputs, tokens, elapsed, tps
 
 def token2wav_generate(llm: OmniLLM, talker_outputs):
     print("--------------------------")
     print("token2wav_generate")
     print("--------------------------")
+    input_tokens = len(talker_outputs[0]["prompt_token_ids"]) if isinstance(talker_outputs, list) and len(talker_outputs) > 0 else 0
+    print(f"Code2Wav input num tokens: {input_tokens}")
     sampling = SamplingParams(
         temperature=0.0,    # Deterministic - no randomness
         top_p=1.0,          # Disable nucleus sampling
@@ -653,9 +666,13 @@ def token2wav_generate(llm: OmniLLM, talker_outputs):
         detokenize=True,
         repetition_penalty=1.1,
     )
+    start_time = time.time()
     final = run_generation(llm, sampling, talker_outputs)
+    elapsed = time.time() - start_time
     print_nvidia_sim_info(gpu_index=torch.cuda.current_device(), stage="After_token2wav_generate", model_stage="code2wav")
-    return final
+    tps = input_tokens / max(elapsed, 1e-9)
+    print(f"Code2Wav: time={elapsed:.3f}s, tokens={input_tokens}, tps={tps:.2f}")
+    return final, input_tokens, elapsed, tps
 
 def init_thinker_llm() -> OmniLLM:
     engine_args = asdict(OmniEngineArgs(
@@ -719,17 +736,107 @@ def main():
     thinker_llm = init_thinker_llm()
     talker_llm = init_talker_llm()
     diffusion_llm = init_diffusion_llm()
+    final_outputs = []
+    final_text_outputs = []
+    thinker_stats = []
+    talker_stats = []
+    code2wav_stats = []
 
-    thinker_outputs, text_outputs, multi_modal_data = thinker_generate(thinker_llm)
-    talker_outputs = talker_generate(talker_llm, thinker_outputs, multi_modal_data)
-    token2wav_outputs = token2wav_generate(diffusion_llm, talker_outputs)
-    for output in token2wav_outputs:
+    total_start_time = time.time()
+    total_thinker_time = 0.0
+    total_talker_time = 0.0
+    total_code2wav_time = 0.0
+    total_thinker_tokens = 0
+    total_talker_tokens = 0
+    total_code2wav_tokens = 0
+
+    csv_file = None
+    csv_writer = None
+    if args.write_csv:
+        os.makedirs(os.path.dirname(args.stats_csv) or ".", exist_ok=True)
+        import csv
+        csv_file = open(args.stats_csv, "w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "prompt_id",
+            "thinker_time_s","thinker_tokens","thinker_tps",
+            "talker_time_s","talker_tokens","talker_tps",
+            "code2wav_time_s","code2wav_tokens","code2wav_tps",
+            "prompt_text_preview"
+        ])
+
+    for prompt_id, prompt in enumerate(args.prompts):
+        thinker_outputs, text_outputs, multi_modal_data, th_tokens, th_time, th_tps = thinker_generate(thinker_llm, prompt)
+        talker_outputs, tk_tokens, tk_time, tk_tps = talker_generate(talker_llm, thinker_outputs, multi_modal_data)
+        token2wav_outputs, cw_tokens, cw_time, cw_tps = token2wav_generate(diffusion_llm, talker_outputs)
+
+        final_outputs += token2wav_outputs
+        for ro in token2wav_outputs:
+            rid = ro.request_id
+            final_text_outputs.append(text_outputs.get(rid, ""))
+
+        thinker_stats.append((th_time, th_tokens, th_tps))
+        talker_stats.append((tk_time, tk_tokens, tk_tps))
+        code2wav_stats.append((cw_time, cw_tokens, cw_tps))
+
+        total_thinker_time += th_time
+        total_talker_time += tk_time
+        total_code2wav_time += cw_time
+        total_thinker_tokens += th_tokens
+        total_talker_tokens += tk_tokens
+        total_code2wav_tokens += cw_tokens
+
+        if csv_writer:
+            preview = str(prompt).replace("\n", " ")[:120]
+            csv_writer.writerow([
+                prompt_id,
+                f"{th_time:.6f}", th_tokens, f"{th_tps:.6f}",
+                f"{tk_time:.6f}", tk_tokens, f"{tk_tps:.6f}",
+                f"{cw_time:.6f}", cw_tokens, f"{cw_tps:.6f}",
+                preview
+            ])
+
+    # Save audio files
+    if len(final_outputs) == 1 and not os.path.isdir(args.output_wav) and not args.output_wav.endswith(os.sep):
+        os.makedirs(os.path.dirname(args.output_wav) or ".", exist_ok=True)
+        audio_tensor = final_outputs[0].multimodal_output["audio"]
+        sf.write(args.output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+        print(f"Saved audio to {args.output_wav}")
+        print(f"Generated text: {final_text_outputs[0] if final_text_outputs else ''}")
+    else:
         os.makedirs(args.output_wav, exist_ok=True)
-        output_wav = os.path.join(args.output_wav, f"output_{output.request_id}.wav")
-        audio_tensor = output.multimodal_output["audio"]
-        sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
-        print(f"Saved audio to {output_wav}")
-        print(f"Generated text: {text_outputs[output.request_id]}")
+        for i, output in enumerate(final_outputs):
+            output_wav = os.path.join(args.output_wav, f"output_{i}.wav")
+            audio_tensor = output.multimodal_output["audio"]
+            sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+            print(f"Saved audio to {output_wav}")
+            print(f"Generated text: {final_text_outputs[i] if i < len(final_text_outputs) else ''}")
+
+    total_end_time = time.time()
+    total_wall_time = total_end_time - total_start_time
+    grand_total_tokens = total_thinker_tokens + total_talker_tokens + total_code2wav_tokens
+    overall_tps = grand_total_tokens / max(total_wall_time, 1e-9)
+
+    print("\n===== Overall Stats =====")
+    print(f"Total wall time: {total_wall_time:.3f}s")
+    print(f"Total tokens: {grand_total_tokens}")
+    print(f"Overall throughput: {overall_tps:.2f} tokens/sec")
+
+    def print_stage(name, total_time, total_tokens, n):
+        tps_total = total_tokens / max(total_time, 1e-9)
+        avg_time = total_time / max(n, 1)
+        avg_tokens = total_tokens / max(n, 1)
+        print(f"{name}: total_time={total_time:.3f}s, total_tokens={total_tokens}, "
+              f"tps={tps_total:.2f}, avg_time_per_prompt={avg_time:.3f}s, avg_tokens_per_prompt={avg_tokens:.2f}")
+
+    num_prompts = len(args.prompts)
+    print_stage("Thinker", total_thinker_time, total_thinker_tokens, num_prompts)
+    print_stage("Talker",  total_talker_time,  total_talker_tokens,  num_prompts)
+    print_stage("Code2Wav", total_code2wav_time, total_code2wav_tokens, num_prompts)
+
+    if csv_file:
+        csv_file.close()
+        print(f"Stats CSV saved to: {args.stats_csv}")
 
 if __name__ == '__main__':
     main()
