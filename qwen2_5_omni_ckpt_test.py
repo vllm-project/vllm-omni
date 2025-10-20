@@ -687,6 +687,7 @@ def init_thinker_llm() -> OmniLLM:
         scheduler_cls="vllm_omni.core.sched.scheduler.OmniScheduler",
         engine_output_type="latent",
         model_stage="thinker",
+        enable_prefix_caching=False,
     ))
     return OmniLLM(**engine_args)
 
@@ -703,6 +704,7 @@ def init_talker_llm() -> OmniLLM:
         scheduler_cls="vllm_omni.core.sched.scheduler.OmniScheduler",
         engine_output_type="latent",
         model_stage="talker",
+        enable_prefix_caching=False,
     ))
     return OmniLLM(**engine_args)
 
@@ -719,6 +721,7 @@ def init_diffusion_llm() -> OmniLLM:
         scheduler_cls="vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler",
         engine_output_type="audio",
         model_stage="code2wav",
+        enable_prefix_caching=False,
     ))
     return OmniLLM(**engine_args)
 
