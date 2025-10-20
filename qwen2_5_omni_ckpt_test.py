@@ -227,8 +227,8 @@ def ensure_config(model_dir: str, code2wav_dir: str | None, dit_ckpt: str | None
         cfg = {}
 
     archs = cfg.get('architectures') or []
-    if 'Qwen2_5OmniMergedModel' not in archs:
-        cfg['architectures'] = ['Qwen2_5OmniMergedModel']
+    if 'Qwen2_5OmniForConditionalGeneration' not in archs:
+        cfg['architectures'] = ['Qwen2_5OmniForConditionalGeneration']
 
     code2wav_cfg = cfg.get('code2wav_config') or {}
     if code2wav_dir:

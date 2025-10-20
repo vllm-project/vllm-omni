@@ -379,6 +379,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
     def _init_special_tokens_embeddings(
         self,
     ):
+        # thinker and talker embeddings
+        self.thinker_embedding = self._load_model_embedding('thinker')
+        self.talker_embedding = self._load_model_embedding('talker')
 
         # embed_text_bos_token
         self.tts_text_spk_token_ids = {
@@ -397,59 +400,53 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
         talker_hf_config = self.talker_config
         if hasattr(talker_hf_config, 'talker_config'):
             talker_hf_config = talker_hf_config.talker_config
-        
-        if self.model_stage=="thinker":
-            self.thinker_embedding = self._load_model_embedding('thinker')
 
-            self.embed_text_bos_token = self.thinker_embedding(
+        self.embed_text_bos_token = self.thinker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_text_start_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_text_spk_tokens = {
+            key:
+            self.thinker_embedding(
                 torch.tensor(
-                    [talker_hf_config.tts_text_start_token_id],
+                    [value],
                     dtype=torch.long,
                     device="cuda:0",
                 ))
-            self.embed_text_spk_tokens = {
-                key:
-                self.thinker_embedding(
-                    torch.tensor(
-                        [value],
-                        dtype=torch.long,
-                        device="cuda:0",
-                    ))
-                for key, value in self.tts_text_spk_token_ids.items()
-            }
-            self.embed_text_eos_token = self.thinker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_text_end_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-            self.embed_text_pad_token = self.thinker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_text_pad_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-        
-        if self.model_stage=="talker":
-            self.talker_embedding = self._load_model_embedding('talker')
-            self.embed_codec_bos_token = self.talker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_codec_start_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-            self.embed_codec_eos_token = self.talker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_codec_end_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-            self.embed_codec_pad_token = self.talker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_codec_pad_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
+            for key, value in self.tts_text_spk_token_ids.items()
+        }
+        self.embed_text_eos_token = self.thinker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_text_end_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_text_pad_token = self.thinker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_text_pad_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_codec_bos_token = self.talker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_codec_start_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_codec_eos_token = self.talker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_codec_end_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_codec_pad_token = self.talker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_codec_pad_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
     def _get_embed_text_spk_token(self, voice_type: str):
