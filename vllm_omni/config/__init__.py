@@ -2,22 +2,12 @@
 Configuration module for vLLM-omni.
 """
 
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig
 from typing import Optional
 from pydantic.dataclasses import dataclass
 from pydantic import ConfigDict
-# from vllm.config.utils import config
 from vllm.config import config
 import vllm_omni.model_executor.models as me_models
-
-from .stage_config import (
-    OmniStageConfig,
-    DiTConfig,
-    DiTCacheConfig,
-    DiTCacheTensor,
-    create_ar_stage_config,
-    create_dit_stage_config,
-)
 
 
 @config
@@ -39,30 +29,6 @@ class OmniModelConfig(ModelConfig):
         return [self.model_arch]
 
 
-@dataclass
-class OmniConfig:
-    """Configuration for vLLM-omni multi-stage processing."""
-    
-    vllm_config: Optional[VllmConfig] = None
-    """Base vLLM configuration."""
-    
-    stage_configs: list[OmniStageConfig] = None
-    """List of stage configurations."""
-    
-    dit_cache_config: Optional[DiTCacheConfig] = None
-    """DiT cache configuration."""
-    
-    log_stats: bool = False
-    """Whether to log statistics."""
-
-
 __all__ = [
     "OmniModelConfig",
-    "OmniConfig",
-    "OmniStageConfig",
-    "DiTConfig",
-    "DiTCacheConfig",
-    "DiTCacheTensor",
-    "create_ar_stage_config",
-    "create_dit_stage_config",
 ]

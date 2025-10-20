@@ -13,8 +13,11 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
-
+from vllm.logger import init_logger
 from vllm_omni.engine import OmniEngineCoreOutput
+
+
+logger = init_logger(__name__)
 
 
 class OmniRequestState(RequestState):
@@ -155,7 +158,8 @@ class OmniRequestState(RequestState):
                 if not hasattr(base_output, "multimodal_output"):
                     setattr(base_output, "multimodal_output", {})
                 setattr(base_output, "multimodal_output", {self.mm_type: tensor})
-        except Exception:
+        except Exception as e:
+            logger.warning("Error in _new_completion_output", e)
             pass
         return base_output
 
@@ -280,7 +284,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                         if not hasattr(ro, "multimodal_output"):
                             setattr(ro, "multimodal_output", {})
                         ro.multimodal_output[mm_key] = req_state.mm_accumulated
-                except Exception:
+                except Exception as e:
+                    logger.warning("Error in process_outputs", e)
                     pass
                 if req_state.queue is not None:
                     req_state.queue.put(ro)

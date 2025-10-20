@@ -1,10 +1,7 @@
-from typing import Union, Sequence, Optional, Callable, Any
-from tqdm import tqdm
+from typing import Union, Sequence, Optional, Any
 import cloudpickle
 from pydantic import ValidationError
 
-from vllm.lora.request import LoRARequest
-from vllm.outputs import RequestOutput
 from vllm.inputs import PromptType
 from vllm.sampling_params import SamplingParams
 from vllm.entrypoints.llm import LLM
@@ -13,15 +10,16 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.engine.arg_utils import HfOverrides
 from vllm.usage.usage_lib import UsageContext
 from vllm.config import CompilationConfig, is_init_field
-from vllm.entrypoints.utils import log_non_default_args
 from vllm.utils import Counter
 from vllm.logger import init_logger
 import vllm.envs as envs
 
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model
+from vllm_omni.entrypoints.stage_manager import Stage
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
+from vllm_omni.outputs import OmniRequestOutput
 
 
 logger = init_logger(__name__)
@@ -42,21 +40,38 @@ class OmniLM:
     
     def initialize_stages(self, model: str):
         for stage_config in self.stage_configs:
-            stage = OmniLLM(model=model, **stage_config)
+            stage = Stage(stage_config)
+            omni_llm = OmniLLM(model=model, **stage_config.engine_args)
+            stage.set_engine(omni_llm)
             self.stage_list.append(stage)
     
     def generate(
         self,
         prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params: Optional[Union[SamplingParams,
+        sampling_params_list: Optional[Union[SamplingParams,
                                         Sequence[SamplingParams]]] = None,
-        *,
-        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
-        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
-        priority: Optional[list[int]] = None,
-    ) -> list[RequestOutput]:
+    ) -> list[OmniRequestOutput]:
         """Generate text outputs for the given prompts."""
-        pass
+        final_outputs: list[OmniRequestOutput] = []
+        for stage_id, stage in enumerate(self.stage_list):
+            if stage_id > 0:
+                engine_inputs = stage.process_engine_inputs(self.stage_list, prompts)
+            else:
+                engine_inputs = prompts
+            engine_outputs = self._run_generation(stage, sampling_params_list[stage_id], engine_inputs)
+            stage.set_engine_outputs(engine_outputs)
+            if hasattr(stage, 'final_output') and stage.final_output:
+                final_outputs.append(OmniRequestOutput(
+                    stage_id=stage_id, 
+                    final_output_type=stage.final_output_type, 
+                    request_output=engine_outputs))
+        return final_outputs
+    
+    def _run_generation(self, stage: Stage, sampling_params: SamplingParams, prompts: Union[PromptType, Sequence[PromptType]]):
+        engine_outputs = []
+        for ro in stage.engine.generate(prompts, sampling_params):
+            engine_outputs.append(ro)
+        return engine_outputs
 
 
 class OmniLLM(LLM): 

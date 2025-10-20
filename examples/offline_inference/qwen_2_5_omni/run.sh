@@ -1,4 +1,6 @@
-python qwen2_5_omni_ckpt_test.py --model Qwen/Qwen2.5-Omni-7B \
+export PYTHONPATH=/home/dyvm6xra/dyvm6xrauser08/gh/vllm_project/vllm:$PYTHONPATH
+export HF_ENDPOINT=https://hf-mirror.com
+python end2end.py --model Qwen/Qwen2.5-Omni-7B \
                                  --prompts "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words." \
                                  --voice-type "m02" \
                                  --dit-ckpt none \

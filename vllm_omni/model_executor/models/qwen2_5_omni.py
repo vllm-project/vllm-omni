@@ -37,6 +37,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.models.qwen2_5_omni_thinker import (
+    Qwen2_5OmniConditionalGenerationMixin,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+    Qwen2_5OmniThinkerProcessingInfo,
+    Qwen2_5OmniThinkerDummyInputsBuilder)
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -47,13 +52,6 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
                     maybe_prefix)
 from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm_omni.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerMultiModalProcessor,
-    Qwen2_5OmniThinkerProcessingInfo,
-    Qwen2_5OmniThinkerDummyInputsBuilder)
-
-
 
 class OmniOutput(NamedTuple):
     """Output from the merged Omni model containing both text and audio."""
@@ -89,11 +87,10 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
         # Initialize talker components
         talker_config: Qwen2_5OmniTalkerConfig = config.talker_config
         self.talker_config = talker_config
+        
+
 
         self.model_stage = vllm_config.model_config.model_stage
-        self.thinker = None
-        self.talker = None
-        self.token2wav = None
         if self.model_stage=="thinker":
             # Initialize thinker model (multimodal processing)
             self.thinker = init_vllm_registered_model(
@@ -104,8 +101,11 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
                 architectures=["Qwen2_5OmniThinkerModel"],
                 )
             self.model = self.thinker
-        
-        if self.model_stage=="talker":
+            self.talker = None
+            self.token2wav = None
+            
+        elif self.model_stage=="talker":
+            self.thinker = None
             # Initialize talker model wrapper (handles projection + LM)
             self.talker = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -116,13 +116,15 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
             )
             self.talker.init_multi_modal(thinker_config)
             self.model=self.talker
+            self.token2wav = None
             self._init_special_tokens_embeddings()
-
-        
-        
-        if self.model_stage=="code2wav":
+            
+        elif self.model_stage=="code2wav":
+            self.thinker = None
+            self.talker = None
             # Initialize token2wav (code->mel->wav) like thinker/talker
             self.token2wav_config = getattr(config, 'token2wav_config', None)
+            self.token2wav = None
             if self.token2wav_config is not None:
                 self.token2wav = init_vllm_registered_model(
                     vllm_config=vllm_config,
@@ -130,10 +132,12 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
                     hf_config=self.token2wav_config,
                     architectures=["Qwen2_5OmniToken2WavModel"],
                 )
-                self.model = self.token2wav
             # voice resources (loaded on demand)
             self._token2wav_conds: Dict[str, torch.Tensor] = {}
             self._token2wav_ref_mels: Dict[str, torch.Tensor] = {}
+            self.model = self.token2wav
+        else:
+            raise ValueError("Invalid model stage")
         
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
@@ -193,6 +197,7 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
         return self.model.get_input_embeddings(
             input_ids, multimodal_embeddings)
+       
 
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to thinker model for multimodal processing
@@ -379,6 +384,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
     def _init_special_tokens_embeddings(
         self,
     ):
+        # thinker and talker embeddings
+        self.thinker_embedding = self._load_model_embedding('thinker')
+        self.talker_embedding = self._load_model_embedding('talker')
 
         # embed_text_bos_token
         self.tts_text_spk_token_ids = {
@@ -397,59 +405,53 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
         talker_hf_config = self.talker_config
         if hasattr(talker_hf_config, 'talker_config'):
             talker_hf_config = talker_hf_config.talker_config
-        
-        if self.model_stage=="thinker":
-            self.thinker_embedding = self._load_model_embedding('thinker')
 
-            self.embed_text_bos_token = self.thinker_embedding(
+        self.embed_text_bos_token = self.thinker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_text_start_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_text_spk_tokens = {
+            key:
+            self.thinker_embedding(
                 torch.tensor(
-                    [talker_hf_config.tts_text_start_token_id],
+                    [value],
                     dtype=torch.long,
                     device="cuda:0",
                 ))
-            self.embed_text_spk_tokens = {
-                key:
-                self.thinker_embedding(
-                    torch.tensor(
-                        [value],
-                        dtype=torch.long,
-                        device="cuda:0",
-                    ))
-                for key, value in self.tts_text_spk_token_ids.items()
-            }
-            self.embed_text_eos_token = self.thinker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_text_end_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-            self.embed_text_pad_token = self.thinker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_text_pad_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-        
-        if self.model_stage=="talker":
-            self.talker_embedding = self._load_model_embedding('talker')
-            self.embed_codec_bos_token = self.talker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_codec_start_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-            self.embed_codec_eos_token = self.talker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_codec_end_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
-            self.embed_codec_pad_token = self.talker_embedding(
-                torch.tensor(
-                    [talker_hf_config.tts_codec_pad_token_id],
-                    dtype=torch.long,
-                    device="cuda:0",
-                ))
+            for key, value in self.tts_text_spk_token_ids.items()
+        }
+        self.embed_text_eos_token = self.thinker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_text_end_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_text_pad_token = self.thinker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_text_pad_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_codec_bos_token = self.talker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_codec_start_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_codec_eos_token = self.talker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_codec_end_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
+        self.embed_codec_pad_token = self.talker_embedding(
+            torch.tensor(
+                [talker_hf_config.tts_codec_pad_token_id],
+                dtype=torch.long,
+                device="cuda:0",
+            ))
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
     def _get_embed_text_spk_token(self, voice_type: str):
@@ -716,6 +718,7 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
                 thinker_loaded = set([k for k,v in thinker_weights])
             thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, 'thinker')
             loaded_weights.update(thinker_loaded)
+            torch.save(self.thinker.language_model.model.embed_tokens, "thinker_embedding.pt")
 
         
         # Load talker weights
@@ -724,6 +727,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
             talker_loaded = self.talker.load_weights(talker_weights)
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, 'talker')
             loaded_weights.update(talker_loaded)
+            torch.save(self.talker.language_model.model.embed_tokens, "talker_embedding.pt")
+            loaded_weights.update(self._init_special_tokens_embeddings())
+            
         
         # Load token2wav weights (if any)
         if token2wav_weights and self.token2wav is not None:
@@ -733,6 +739,5 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
             t2w_loaded = self.token2wav.load_weights(token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt"))
             t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, 'token2wav')
             loaded_weights.update(t2w_loaded)
-        loaded_weights.update(self._init_special_tokens_embeddings())
         
         return loaded_weights

@@ -15,14 +15,9 @@ __email__ = "hsliuustc@gmail.com"
 
 # Main entry points
 from . import patch
-from .entrypoints.omni_llm import OmniLLM
+from .entrypoints.omni_lm import OmniLM
 from .config import (
-    OmniConfig,
-    OmniStageConfig,
-    DiTConfig,
-    DiTCacheConfig,
-    create_ar_stage_config,
-    create_dit_stage_config,
+    OmniModelConfig,
 )
 
 __all__ = [
@@ -32,15 +27,10 @@ __all__ = [
     "__email__",
     
     # Main components
-    "OmniLLM",
+    "OmniLM",
     
     # Configuration
-    "OmniConfig",
-    "OmniStageConfig",
-    "DiTConfig",
-    "DiTCacheConfig",
-    "create_ar_stage_config",
-    "create_dit_stage_config",
+    "OmniModelConfig",
     
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.
