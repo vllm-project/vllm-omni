@@ -1,0 +1,21 @@
+import sys
+
+from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding as _OriginalMRotaryEmbedding
+from vllm.v1.request import Request as _OriginalRequest
+from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
+
+from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
+from vllm_omni.request import OmniRequest
+from vllm_omni.engine import OmniEngineCoreRequest
+
+for module_name, module in sys.modules.items():
+    if hasattr(module, 'TokensPrompt') and module.TokensPrompt == _OriginalTokensPrompt:
+        module.TokensPrompt = OmniTokensPrompt
+    if hasattr(module, 'MRotaryEmbedding') and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
+        module.MRotaryEmbedding = MRotaryEmbedding
+    if hasattr(module, 'Request') and module.Request == _OriginalRequest:
+        module.Request = OmniRequest
+    if hasattr(module, 'EngineCoreRequest') and module.EngineCoreRequest == _OriginalEngineCoreRequest:
+        module.EngineCoreRequest = OmniEngineCoreRequest
