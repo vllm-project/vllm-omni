@@ -39,8 +39,8 @@ class OmniLLM:
     def initialize_stages(self, model: str):
         for stage_config in self.stage_configs:
             stage = Stage(stage_config)
-            omni_llm = OmniLLM(model=model, **stage_config.engine_args)
-            stage.set_engine(omni_llm)
+            stage_llm = StageLLM(model=model, **stage_config.engine_args)
+            stage.set_engine(stage_llm)
             self.stage_list.append(stage)
     
     def generate(
@@ -51,6 +51,7 @@ class OmniLLM:
     ) -> list[OmniRequestOutput]:
         """Generate text outputs for the given prompts."""
         final_outputs: list[OmniRequestOutput] = []
+        assert len(sampling_params_list) == len(self.stage_list), "sampling_params_list must be a list of length equal to the number of stages"
         for stage_id, stage in enumerate(self.stage_list):
             if stage_id > 0:
                 engine_inputs = stage.process_engine_inputs(self.stage_list, prompts)
