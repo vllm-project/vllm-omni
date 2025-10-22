@@ -59,8 +59,6 @@ class ARModelRunner(OmniGPUModelRunner):
         try:
             new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
             if new_reqs:
-                import numpy as np
-                import torch
                 for nr in new_reqs:
                     req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
                     if req_id is None:
@@ -272,6 +270,7 @@ class ARModelRunner(OmniGPUModelRunner):
             hidden_states, _aux_hidden_states = model_output
         else:
             hidden_states = model_output
+            _aux_hidden_states = None
 
         text_hidden_states, multimodal_outputs = (
             self.extract_multimodal_outputs(hidden_states))
@@ -403,16 +402,17 @@ class ARModelRunner(OmniGPUModelRunner):
                 sampling_metadata,
                 text_hidden_states,
                 sample_hidden_states,
-                _aux_hidden_states if '_aux_hidden_states' in locals() else None,
+                _aux_hidden_states,
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
             )
 
         # Convert to per-request tensors on CPU
+        text_hidden_states_cpu = text_hidden_states.detach().to("cpu").contiguous()
         pooler_output: list[Optional[torch.Tensor]] = []
         prev_logits_index = 0
         for logits_index in logits_indices:
-            pooler_output.append(text_hidden_states[prev_logits_index:logits_index+1].detach().to("cpu").contiguous())
+            pooler_output.append(text_hidden_states_cpu[prev_logits_index:logits_index+1])
             prev_logits_index = logits_index + 1
 
 
