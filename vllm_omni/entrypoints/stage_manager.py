@@ -2,86 +2,79 @@
 Stage manager for orchestrating multiple engines in vLLM-omni.
 """
 
-from typing import List, Optional, Union
+import importlib
+from typing import List, Union
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.engine.async_llm import AsyncLLM
-from ..engine.diffusion_engine import DiffusionEngine
+from vllm.inputs import TextPrompt
+from vllm.v1.engine import EngineCoreOutput
 
-from ..config import OmniStageConfig
+from vllm_omni.inputs.data import OmniTokensPrompt
 
 
-class StageManager:
-    """Manages multiple stage engines for multi-stage processing."""
+class Stage:
+    def __init__(self, stage_config):
+        self.stage_config = stage_config
+        self.engine = None
+        self.async_engine = None
+        self.stage_id = stage_config.stage_id
+        self.engine_args = stage_config.engine_args
+        self.model_stage = stage_config.engine_args.model_stage
+        if hasattr(stage_config, 'engine_input_source'):
+            self.engine_input_source = stage_config.engine_input_source
+        else:
+            self.engine_input_source = []
+        self.engine_output_type = stage_config.engine_args.engine_output_type
+        self.engine_outputs = None
+        if hasattr(stage_config, 'custom_process_input_func'):
+            # Import the module specified in the config (already a full module path)
+            module_path, func_name = stage_config.custom_process_input_func.rsplit('.', 1)
+            module = importlib.import_module(module_path)
+            self.custom_process_input_func = getattr(module, func_name)
+        else:
+            self.custom_process_input_func = None
+
+        if hasattr(stage_config, 'final_output'):
+            self.final_output = stage_config.final_output
+        else:
+            self.final_output = False
+
+        if hasattr(stage_config, 'final_output_type'):
+            self.final_output_type = stage_config.final_output_type
+        else:
+            self.final_output_type = None
+
+    def set_engine(self, engine: LLMEngine) -> None:
+        """Initialize the engine for the stage."""
+        self.engine = engine
+
+    def set_async_engine(self, async_engine: AsyncLLM) -> None:
+        """Initialize the async engine for the stage."""
+        self.async_engine = async_engine
     
-    def __init__(self, stage_configs: List[OmniStageConfig], log_stats: bool = False):
-        self.stage_configs = stage_configs
-        self.log_stats = log_stats
-        self.engine_list: List[Union[LLMEngine, DiffusionEngine]] = []
-        self.async_engine_list: List[AsyncLLM] = []
-        self._initialized = False
-        self._async_initialized = False
+    def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
+        """Set the engine output for the stage."""
+        self.engine_outputs = engine_outputs
     
-    def initialize_engines(self) -> None:
-        """Initialize LLMEngine instances for each stage."""
-        if self._initialized:
-            return
-        
-        # For now, create placeholder engines
-        # In a full implementation, this would create actual engines
-        for stage_config in self.stage_configs:
-            # Placeholder - would create actual engine here
-            self.engine_list.append(None)
-        
-        self._initialized = True
-    
-    def initialize_async_engines(self) -> None:
-        """Initialize AsyncLLM instances for each stage."""
-        if self._async_initialized:
-            return
-        
-        # For now, create placeholder engines
-        # In a full implementation, this would create actual engines
-        for stage_config in self.stage_configs:
-            # Placeholder - would create actual engine here
-            self.async_engine_list.append(None)
-        
-        self._async_initialized = True
-    
-    def get_engine(self, stage_id: int) -> LLMEngine:
-        """Get the engine for a specific stage."""
-        if not self._initialized:
-            self.initialize_engines()
-        
-        if stage_id >= len(self.engine_list):
-            raise IndexError(f"Stage {stage_id} not found. Available stages: 0-{len(self.engine_list)-1}")
-        
-        return self.engine_list[stage_id]
-    
-    def get_async_engine(self, stage_id: int) -> AsyncLLM:
-        """Get the async engine for a specific stage."""
-        if not self._async_initialized:
-            self.initialize_async_engines()
-        
-        if stage_id >= len(self.async_engine_list):
-            raise IndexError(f"Async stage {stage_id} not found. Available stages: 0-{len(self.async_engine_list)-1}")
-        
-        return self.async_engine_list[stage_id]
-    
-    def get_stage_config(self, stage_id: int) -> OmniStageConfig:
-        """Get the configuration for a specific stage."""
-        if stage_id >= len(self.stage_configs):
-            raise IndexError(f"Stage config {stage_id} not found. Available stages: 0-{len(self.stage_configs)-1}")
-        
-        return self.stage_configs[stage_id]
-    
-    def get_num_stages(self) -> int:
-        """Get the number of stages."""
-        return len(self.stage_configs)
-    
-    def cleanup(self) -> None:
-        """Clean up resources."""
-        # Clean up engines if needed
-        self.engine_list.clear()
-        self.async_engine_list.clear()
-        self._initialized = False
-        self._async_initialized = False
+    def process_engine_inputs(self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None) -> List[Union[OmniTokensPrompt, TextPrompt]]:
+        """Process the engine input for the stage."""
+        if self.custom_process_input_func is None:
+            engine_inputs = []
+            if len(self.engine_input_source) == 0:
+                raise ValueError("engine_input_source is empty")
+            source_stage_id = self.engine_input_source[0]
+            source_outputs = stage_list[source_stage_id].engine_outputs
+            multi_modal_data = {source_output.request_id: 
+            prompt.get('multi_modal_data', None) for source_output, prompt in zip(source_outputs, prompt)}
+
+            for source_output in source_outputs:
+                engine_input = OmniTokensPrompt(
+                    prompt_token_ids = source_output.outputs[0].token_ids,
+                    multi_modal_data=multi_modal_data[source_output.request_id] if multi_modal_data else None,
+                )
+                engine_inputs.append(engine_input)
+            return engine_inputs
+
+        else:
+            engine_input_source = self.engine_input_source
+            return self.custom_process_input_func(stage_list, engine_input_source, prompt)
