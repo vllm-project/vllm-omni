@@ -542,7 +542,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Get the valid generated tokens.
         import os
-        sampled_token_ids = sampler_output.sampled_token_ids if os.environ.get("model_stage") != "code2wav" else torch.tensor([[8294]]).to(torch.int32).cuda()
+        sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
             # No spec decode tokens.
