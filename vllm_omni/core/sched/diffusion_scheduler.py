@@ -1,4 +1,6 @@
-from vllm.v1.core.sched.scheduler import SchedulerOutput, EngineCoreOutputs, Request, RequestStatus, SpecDecodingStats, defaultdict, Optional
+from vllm.v1.core.sched.scheduler import SchedulerOutput, EngineCoreOutputs, Request, RequestStatus, SpecDecodingStats
+from collections import defaultdict
+from typing import Optional
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.engine import EngineCoreEventType
 from vllm.distributed.kv_events import KVEventBatch
