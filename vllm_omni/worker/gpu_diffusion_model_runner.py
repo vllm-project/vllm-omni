@@ -132,11 +132,11 @@ class DiffusionModelRunner(OmniGPUModelRunner):
         pooler_output: List[Optional[torch.Tensor]] = []
         if isinstance(multimodal_outputs, torch.Tensor):
             # If model returned a single stacked tensor, split by requests
-            assert outputs.shape[0] == self.input_batch.num_reqs
+            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append(outputs[i].detach().to("cpu").contiguous())
+                pooler_output.append(multimodal_outputs[i].detach().to("cpu").contiguous())
         elif isinstance(multimodal_outputs, list):
-            for out in outputs:
+            for out in multimodal_outputs:
                 pooler_output.append(out.detach().to("cpu").contiguous() if out is not None else None)
         elif isinstance(multimodal_outputs, dict):
             for out in multimodal_outputs.values():
