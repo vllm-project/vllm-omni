@@ -17,6 +17,8 @@ import vllm.envs as envs
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model
 from vllm_omni.entrypoints.stage_manager import Stage
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.output_processor import MultimodalOutputProcessor
+from vllm_omni.engine.processor import OmniProcessor
 from vllm_omni.outputs import OmniRequestOutput
 
 
@@ -134,6 +136,10 @@ class StageLLM(LLM):
         # Create the Engine (autoselects V0 vs V1)
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
+        self.llm_engine.output_processor = MultimodalOutputProcessor(tokenizer=self.llm_engine.tokenizer, 
+                                                                    log_stats=self.llm_engine.log_stats)
+        self.llm_engine.processor = OmniProcessor(vllm_config=self.llm_engine.vllm_config,
+                                                  tokenizer=self.llm_engine.tokenizer)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
