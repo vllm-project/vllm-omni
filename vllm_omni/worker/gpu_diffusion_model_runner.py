@@ -10,7 +10,6 @@ import logging
 import torch
 
 from vllm.v1.worker.gpu_model_runner import (
-    GPUModelRunner,
     EMPTY_MODEL_RUNNER_OUTPUT,
     IntermediateTensors,
     get_pp_group,
@@ -30,7 +29,7 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 logger = logging.getLogger(__name__)
 
 
-class DiffusionModelRunner(OmniGPUModelRunner):
+class GPUDiffusionModelRunner(OmniGPUModelRunner):
     """Diffusion model runner for vLLM-omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
@@ -47,11 +46,9 @@ class DiffusionModelRunner(OmniGPUModelRunner):
         self._update_states(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
-            if not has_kv_transfer_group():
-                return EMPTY_MODEL_RUNNER_OUTPUT
-            return self.kv_connector_no_forward(scheduler_output,
-                                                self.vllm_config)
 
+            return EMPTY_MODEL_RUNNER_OUTPUT
+           
         # Prepare decoder inputs and attention metadata (for batch/order mapping)
         (attn_metadata, attention_cuda_graphs, logits_indices,
          spec_decode_metadata, num_scheduled_tokens_np,
