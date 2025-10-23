@@ -9,10 +9,10 @@ from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.model_executor import set_random_seed
 from vllm.v1.utils import report_usage_stats
 
-from vllm_omni.worker.AR_gpu_model_runner import ARModelRunner
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
-class ARGPUWorker(GPUWorker):
+class GPUARWorker(GPUWorker):
     def init_device(self):
         if self.device_config.device.type == "cuda":
             # torch.distributed.all_reduce does not free the input tensor until
@@ -59,7 +59,7 @@ class ARGPUWorker(GPUWorker):
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
-        self.model_runner: ARModelRunner = ARModelRunner(
+        self.model_runner: GPUARModelRunner = GPUARModelRunner(
             self.vllm_config, self.device)
 
         if self.rank == 0:

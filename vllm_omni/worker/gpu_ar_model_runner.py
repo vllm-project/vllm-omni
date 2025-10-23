@@ -30,7 +30,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 
-class ARModelRunner(OmniGPUModelRunner):
+class GPUARModelRunner(OmniGPUModelRunner):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     This runner follows the same preparation and forward path as GPUModelRunner
