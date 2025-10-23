@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 import vllm.envs as envs
 
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model
-from vllm_omni.entrypoints.stage_manager import Stage
+from vllm_omni.entrypoints.stage import Stage
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor

@@ -1,6 +1,8 @@
-from vllm.inputs import TextPrompt
 from typing import Union
 import torch
+
+from vllm.inputs import TextPrompt
+
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 def thinker2talker(stage_list, engine_input_source, prompt: Union[OmniTokensPrompt, TextPrompt] = None):

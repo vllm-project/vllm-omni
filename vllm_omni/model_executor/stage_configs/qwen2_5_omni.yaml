@@ -4,7 +4,7 @@ stage_args:
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.AR_gpu_worker.ARGPUWorker
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
       gpu_memory_utilization: 0.32
       enforce_eager: true  # need to discuss
@@ -16,7 +16,7 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.AR_gpu_worker.ARGPUWorker
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
       gpu_memory_utilization: 0.32
       enforce_eager: true
@@ -24,12 +24,11 @@ stage_args:
       engine_output_type: latent
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
-
   - stage_id: 2
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.diffusion_gpu_worker.DiffusionGPUWorker
+      worker_cls: vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker
       scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
       gpu_memory_utilization: 0.3
       enforce_eager: true

@@ -1,10 +1,11 @@
 """
 Configuration module for vLLM-omni.
 """
-from vllm.config import ModelConfig
 from typing import Optional
 from pydantic.dataclasses import dataclass
 from pydantic import ConfigDict
+
+from vllm.config import ModelConfig
 from vllm.config import config
 
 import vllm_omni.model_executor.models as me_models
