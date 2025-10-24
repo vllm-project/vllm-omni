@@ -19,10 +19,10 @@ Due to authentication limitations preventing direct access to PR #19, I have cre
 
 | Document | Size | Purpose |
 |----------|------|---------|
-| **PR_19_REVIEW_PACKAGE_README.md** | 9.0 KB | Master guide with complete workflow |
+| **PR_19_REVIEW_PACKAGE_README.md** | 9 KB | Master guide with complete workflow |
 | **AI_EXPERT_REVIEW_GUIDE.md** | 13 KB | Deep AI/ML technical expertise |
-| **REVIEW_PR_19_GUIDE.md** | 5.9 KB | Quick start guide for PR #19 |
-| **PR_19_REVIEW.md** | 9.6 KB | Comprehensive review checklist |
+| **REVIEW_PR_19_GUIDE.md** | 6 KB | Quick start guide for PR #19 |
+| **PR_19_REVIEW.md** | 10 KB | Comprehensive review checklist |
 
 ### Tools
 
@@ -70,19 +70,19 @@ Due to authentication limitations preventing direct access to PR #19, I have cre
 ### Option 1: Quick Review (30 minutes)
 ```bash
 # 1. Start with the master guide
-cat PR_19_REVIEW_PACKAGE_README.md
+less PR_19_REVIEW_PACKAGE_README.md
 
 # 2. Run automated analysis
 python tools/review_pr.py --pr-number 19 --export pr19_analysis.md
 
 # 3. Review the automated report
-cat pr19_analysis.md
+less pr19_analysis.md
 ```
 
 ### Option 2: Comprehensive Review (2-3 hours)
 ```bash
 # 1. Read the quick start guide
-cat REVIEW_PR_19_GUIDE.md
+less REVIEW_PR_19_GUIDE.md
 
 # 2. Check out PR locally
 gh pr checkout 19
@@ -115,6 +115,13 @@ brew install gh
 
 # Linux
 sudo apt install gh
+# or
+snap install gh
+# or download from https://github.com/cli/cli/releases
+
+# Windows
+winget install --id GitHub.cli
+# or download from https://github.com/cli/cli/releases
 
 # Authenticate
 gh auth login
