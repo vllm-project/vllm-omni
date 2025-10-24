@@ -30,6 +30,9 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
 from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 
+TALKER_CODEC_EOS_TOKEN_ID = 8294
+TALKER_CODEC_BOS_TOKEN_ID = 8293
+
 class OmniOutput(NamedTuple):
     """Output from the merged Omni model containing both text and audio."""
     text_hidden_states: torch.Tensor
@@ -308,7 +311,7 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         if self.model_stage=="code2wav":
             code = input_ids if input_ids is not None else torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
-            audio_tensor = self.generate_audio(code[:-1] if code[-1]==8294 else code, voice_type)
+            audio_tensor = self.generate_audio(code[:-1] if code[-1]==TALKER_CODEC_EOS_TOKEN_ID else code, voice_type)
             return OmniOutput(
                 text_hidden_states = None,
                 multimodal_outputs = {
@@ -319,8 +322,8 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
         return OmniOutput(
             text_hidden_states=torch.cat(
                 [
-                    torch.zeros([inputs_embeds.shape[0],896], dtype=torch.bfloat16).to(self._module_device(self.model)),
-                    self.talker.thinker_to_talker_proj(self.talker.get_input_embeddings(torch.tensor([8294,8293]).to(torch.bfloat16).to(self._module_device(self.model))))[0]
+                    torch.zeros([inputs_embeds.shape[0],self.talker.config.hidden_size], dtype=torch.bfloat16).to(self._module_device(self.model)),
+                    self.talker.thinker_to_talker_proj(self.talker.get_input_embeddings(torch.tensor([TALKER_CODEC_BOS_TOKEN_ID,TALKER_CODEC_EOS_TOKEN_ID]).to(torch.bfloat16).to(self._module_device(self.model))))[0]
                 ],
                 dim=0),
             multimodal_outputs=None
@@ -352,11 +355,11 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         # embed_text_bos_token
         self.tts_text_spk_token_ids = {
-            # M02：我是个会说标准普通话、带部分北方口音的男声
+            # M02: Male voice with standard Mandarin and a slight northern accent
             'm02': 151870,
             'Ethan': 151870,
 
-            # F030：我是你的二次元虚拟女友
+            # F030: Your anime-styled virtual girlfriend
             'f030': 151872,
             'Chelsie': 151872,
         }
@@ -532,21 +535,22 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def _convert_to_codec_tokens(self, talker_output: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor:
         """
-        参考 HF：使用 talker 的 codec 头得到 logits，抑制 BOS，再贪心选取当前步的下一个 codec token。
+        Reference (HF): use the talker's codec head to obtain logits, suppress BOS,
+        then greedily select the next codec token for the current step.
         """
         with torch.inference_mode():
             logits = self.talker.compute_logits(talker_output, None)
             if logits is None:
                 return torch.zeros((talker_output.size(0), 0), dtype=torch.long, device=talker_output.device)
 
-            # 仅抑制 codec_bos，与 HF generate 的 suppress_tokens 行为一致
+            # Suppress only codec_bos, consistent with HF generate's suppress_tokens behavior
             bos_id = None
             if hasattr(self, 'talker_config') and hasattr(self.talker_config, 'tts_codec_start_token_id'):
                 bos_id = int(getattr(self.talker_config, 'tts_codec_start_token_id'))
             if bos_id is not None:
                 logits[..., bos_id] = -1e9
 
-            # 取最后一步位置的分布并贪心选取
+            # Take the distribution at the last step and select greedily
             next_id = self.talker.sample(logits, sampling_metadata).sampled_token_ids
             return next_id.to(dtype=torch.long)
 
