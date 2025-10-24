@@ -1,0 +1,40 @@
+# stage config for running qwen2.5-omni with architecture of OmniLLM.
+stage_args:
+  - stage_id: 0
+    engine_args:
+      model_stage: thinker
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
+      gpu_memory_utilization: 0.32
+      enforce_eager: true  # need to discuss
+      trust_remote_code: true
+      engine_output_type: latent  # change the param name,such as pooling_output
+    final_output: true
+    final_output_type: text
+  - stage_id: 1
+    engine_args:
+      model_stage: talker
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
+      gpu_memory_utilization: 0.32
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
+  - stage_id: 2
+    engine_args:
+      model_stage: code2wav
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker
+      scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio

@@ -8,7 +8,7 @@ Traditional vLLM systems are limited to text-based, autoregressive generation. v
 
 - **Multi-modal Models**: Text, image, video, audio, and sensor data processing
 - **Non-autoregressive Architectures**: Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous Outputs**: Beyond traditional text generation to structured, binary, and streaming outputs
+- **Heterogeneous Outputs**: Beyond traditional text generation to multimodal outputs
 
 ## 🏗️ Architecture
 
@@ -28,119 +28,48 @@ vLLM-omni is built on a modular architecture that extends vLLM's core functional
 - **Text**: Advanced tokenization and embedding generation
 - **Image**: Vision encoder integration (CLIP, etc.)
 - **Audio**: Speech processing and audio embedding
-- **Video**: Frame-by-frame and temporal processing
-- **Sensor**: IoT and sensor data interpretation
-
-### Output Formats
-
-- **Structured Data**: JSON, XML, and custom formats
-- **Binary Outputs**: Images, audio, and video generation
-- **Streaming**: Real-time progressive generation
-- **Multipart**: Combined multi-modal responses
 
 ## 📋 Supported Models
 
 ### AR + Diffusion Transformer (DiT) Models
-- Qwen-Image (Image generation and editing)
 - Qwen-omni (Thinker-Talker-Codec structure)
-- Custom DiT and hiybrid architectures
+- HunyunaImage 3.0 (Ongoing)
+- Qwen-Image (Ongoing)
 
 ## 🛠️ Installation
 
-### Quick Start
-
-#### Option 1: Docker (Recommended for macOS)
+Set up basic environments
+```bash
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+```
+Install certain version of vllm with commitid: 808a7b69df479b6b3a16181711cac7ca28a9b941
 
 ```bash
-# Clone the repository
-git clone https://github.com/hsliuustc0106/vllm-omni.git
-cd vllm-omni
-
-# Run the automated Docker setup
-./scripts/docker-setup-macos.sh
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
+VLLM_USE_PRECOMPILED=1 uv pip install --editable .
 ```
 
-#### Option 2: Local Installation
+## Run examples (Qwen2.5-omni)
 
+Get into the example folder
 ```bash
-# Clone the repository
-git clone https://github.com/hsliuustc0106/vllm-omni.git
-cd vllm-omni
-
-# Run the installation script
-./install.sh
+cd vllm_omni
+cd examples/offline_inference/qwen2_5_omni
 ```
-
-### Prerequisites
-
-- Python 3.11+ (recommended)
-- Conda or Miniconda
-- Git
-- CUDA 11.8+ (for GPU acceleration) or CPU-only installation
-
-### Installation Methods
-
-#### Method 1: Automated Installation (Recommended)
+Modify PYTHONPATH in run.sh as your path of vllm_omni. Then run.
 ```bash
-# Using shell script
-./install.sh
-
-# Or using Python script
-python install.py
+bash run.sh
 ```
+The output audio is saved in ./output_audio
 
-#### Method 2: Manual Installation
-```bash
-# Create conda environment
-conda create -n vllm_omni python=3.11 -y
-conda activate vllm_omni
+## To-do list
+- [x] Offline inference example for Qwen2.5-omni with single request
+- [ ] Adaptation from current vllm branch to stable vllm v0.11.0
+- [ ] Offline inference example for Qwen2.5-omni with streaming multiple requests
+- [ ] Online inference support
+- [ ] Support for other models
 
-# Install PyTorch (CPU or GPU)
-pip install torch>=2.7 --index-url https://download.pytorch.org/whl/cpu  # CPU
-# pip install torch>=2.7 --index-url https://download.pytorch.org/whl/cu121  # GPU
-
-# Install dependencies
-pip install -r requirements.txt
-pip install "vllm>=0.10.2"
-
-# Install vLLM-omni
-pip install -e .
-```
-
-### Verify Installation
-
-```bash
-# Test the installation
-python test_installation.py
-
-# Test basic functionality
-python -c "import vllm_omni; print('Ready!')"
-
-# Test CLI
-vllm --help
-```
-
-For detailed installation instructions, see [INSTALL.md](INSTALL.md).
-
-## 📥 Model Download
-
-Models are automatically downloaded when first used, or you can pre-download them:
-
-```bash
-# Check downloaded models
-python scripts/download_models.py --check-cache
-
-# Download all default models
-python scripts/download_models.py --all
-
-# Download specific models
-python scripts/download_models.py --ar-models Qwen/Qwen3-0.6B
-python scripts/download_models.py --dit-models stabilityai/stable-diffusion-2-1
-```
-
-**Model Storage Location:**
-- Default: `~/.cache/huggingface/hub/`
-- AR models: 100MB - 1GB each
-- DiT models: 2GB - 7GB each
-
-For detailed model management, see [MODEL_DOWNLOAD_GUIDE.md](docs/MODEL_DOWNLOAD_GUIDE.md).
+For detailed model management, see [vllm_omni_design.md](docs/architecture/vllm_omni_design.md) and [high_level_arch_design.md](docs/architecture/high_level_arch_design.md).
