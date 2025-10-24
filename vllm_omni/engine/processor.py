@@ -21,6 +21,27 @@ from vllm_omni.engine import PromptEmbedsPayload, AdditionalInformationPayload, 
 import torch
 
 class OmniProcessor(Processor):
+    @staticmethod
+    def _dtype_to_name(dtype: torch.dtype) -> str:
+        mapping = {
+            torch.float32: "float32",
+            torch.float: "float32",
+            torch.float16: "float16",
+            torch.half: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float64: "float64",
+            torch.double: "float64",
+            torch.int64: "int64",
+            torch.long: "int64",
+            torch.int32: "int32",
+            torch.int: "int32",
+            torch.int16: "int16",
+            torch.short: "int16",
+            torch.int8: "int8",
+            torch.uint8: "uint8",
+            torch.bool: "bool",
+        }
+        return mapping.get(dtype, str(dtype).replace("torch.", ""))
     def __init__(self, 
                  vllm_config: VllmConfig,
                  tokenizer: TokenizerGroup,
@@ -165,7 +186,7 @@ class OmniProcessor(Processor):
             # Move to CPU and ensure contiguous memory for stable serialization
             pe_cpu = pe.detach().to("cpu").contiguous()
             seq_len, hidden_size = pe_cpu.shape
-            dtype_str = str(pe_cpu.dtype).replace("torch.", "")
+            dtype_str = self._dtype_to_name(pe_cpu.dtype)
             data_bytes = pe_cpu.numpy().tobytes()
             prompt_embeds_payload = PromptEmbedsPayload(
                 data=data_bytes,
@@ -178,7 +199,7 @@ class OmniProcessor(Processor):
             for key, value in raw_info.items():
                 if isinstance(value, torch.Tensor):
                     v_cpu = value.detach().to("cpu").contiguous()
-                    dtype_str = str(v_cpu.dtype).replace("torch.", "")
+                    dtype_str = self._dtype_to_name(v_cpu.dtype)
                     data_bytes = v_cpu.numpy().tobytes()
                     entry = AdditionalInformationEntry(
                         tensor_data=data_bytes,
