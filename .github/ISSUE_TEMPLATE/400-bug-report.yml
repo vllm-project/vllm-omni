@@ -16,7 +16,7 @@ body:
       - Passwords or authentication credentials
       - Private URLs or endpoints
       - Personal or confidential data
-      
+
       Consider redacting or replacing sensitive values with placeholders like `<YOUR_TOKEN_HERE>` when sharing configuration or code examples.
 - type: textarea
   attributes:
@@ -58,7 +58,7 @@ body:
           input_modalities=["text"],
           output_modalities=["text"]
       )
-      
+
       dit_config = create_dit_stage_config(
           stage_id=1,
           model_path="stabilityai/stable-diffusion-2-1",

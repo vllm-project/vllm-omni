@@ -1,37 +1,35 @@
-
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
 import torch
-
 import vllm.envs as envs
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.inputs import MultiModalKwargs
+from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
-from vllm.utils import LazyLoader
+from vllm.utils import LazyLoader, round_up
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.sampling_params import SamplingType
-from vllm.distributed.kv_transfer import has_kv_transfer_group
-from vllm.utils import round_up
 from vllm.v1.spec_decode.eagle import EagleProposer
-
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
+from vllm_omni.outputs import OmniModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
-        "xgr_torch_compile", globals(),
-        "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
+        "xgr_torch_compile",
+        globals(),
+        "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile",
+    )
 
 logger = init_logger(__name__)
 
@@ -90,16 +88,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
-            if sampling_params and \
-                sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+            if (
+                sampling_params
+                and sampling_params.sampling_type == SamplingType.RANDOM_SEED
+            ):
                 generator = torch.Generator(device=self.device)
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
 
             if pooling_params:
-                assert (task := pooling_params.task) is not None, (
-                    "You did not set `task` in the API")
+                assert (
+                    task := pooling_params.task
+                ) is not None, "You did not set `task` in the API"
 
                 model = cast(VllmModelForPooling, self.model)
                 to_update = model.pooler.get_pooling_updates(task)
@@ -129,7 +130,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                     pe_cpu = torch.from_numpy(arr)
                     # Store temporarily on CPU; later moved to device in builder
                     setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
-                    # Also replace payload with Tensor for user visibility in scheduler_output
+                    # Also replace payload with Tensor for user visibility in
+                    # scheduler_output
                     try:
                         new_req_data.prompt_embeds = pe_cpu  # type: ignore[assignment]
                     except Exception:
@@ -145,17 +147,24 @@ class OmniGPUModelRunner(GPUModelRunner):
                         info_dict = payload_info
                     else:
                         from vllm.v1.engine import AdditionalInformationPayload
+
                         if isinstance(payload_info, AdditionalInformationPayload):
                             for k, entry in payload_info.entries.items():
                                 if entry.tensor_data is not None:
-                                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
+                                    dt = np.dtype(
+                                        getattr(entry, "tensor_dtype", "float32")
+                                    )
                                     arr = np.frombuffer(entry.tensor_data, dtype=dt)
                                     arr = arr.reshape(entry.tensor_shape)
                                     info_dict[k] = torch.from_numpy(arr)
                                 else:
                                     info_dict[k] = entry.list_data
                     if info_dict:
-                        setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+                        setattr(
+                            self.requests[req_id],
+                            "additional_information_cpu",
+                            info_dict,
+                        )
             except Exception:
                 pass
 
@@ -168,33 +177,30 @@ class OmniGPUModelRunner(GPUModelRunner):
                 use_audio_in_video = False
                 for mm_input in self.requests[req_id].mm_inputs:
                     if mm_input.get("image_grid_thw") is not None:
-                        image_grid_thw.extend(
-                            mm_input["image_grid_thw"].tolist())
+                        image_grid_thw.extend(mm_input["image_grid_thw"].tolist())
                     if mm_input.get("video_grid_thw") is not None:
-                        video_grid_thw.extend(
-                            mm_input["video_grid_thw"].tolist())
+                        video_grid_thw.extend(mm_input["video_grid_thw"].tolist())
                     if mm_input.get("second_per_grid_ts") is not None:
-                        second_per_grid_ts.extend(
-                            mm_input["second_per_grid_ts"])
+                        second_per_grid_ts.extend(mm_input["second_per_grid_ts"])
                     if mm_input.get("audio_feature_lengths") is not None:
-                        audio_feature_lengths.extend(
-                            mm_input["audio_feature_lengths"])
+                        audio_feature_lengths.extend(mm_input["audio_feature_lengths"])
                     if mm_input.get("use_audio_in_video") is True:
                         use_audio_in_video = True
 
                 hf_config = self.model_config.hf_config
 
-                self.requests[req_id].mrope_positions, \
-                    self.requests[req_id].mrope_position_delta = \
-                    MRotaryEmbedding.get_input_positions_tensor(
-                        self.requests[req_id].prompt_token_ids,
-                        hf_config=hf_config,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        second_per_grid_ts=second_per_grid_ts,
-                        audio_feature_lengths=audio_feature_lengths,
-                        use_audio_in_video=use_audio_in_video,
-                    )
+                (
+                    self.requests[req_id].mrope_positions,
+                    self.requests[req_id].mrope_position_delta,
+                ) = MRotaryEmbedding.get_input_positions_tensor(
+                    self.requests[req_id].prompt_token_ids,
+                    hf_config=hf_config,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    audio_feature_lengths=audio_feature_lengths,
+                    use_audio_in_video=use_audio_in_video,
+                )
 
             req_ids_to_add.append(req_id)
 
@@ -217,20 +223,19 @@ class OmniGPUModelRunner(GPUModelRunner):
                 new_token_ids = req_data.new_token_ids[i]
                 # Add the sampled token(s) from the previous step (if any).
                 # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (num_computed_tokens + len(new_token_ids) -
-                                  req_state.num_tokens)
+                num_new_tokens = (
+                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                )
                 if num_new_tokens == 1:
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
                 elif num_new_tokens > 0:
-                    req_state.output_token_ids.extend(
-                        new_token_ids[-num_new_tokens:])
+                    req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
 
             # Update the block IDs.
             if not resumed_from_preemption:
                 # Append the new blocks to the existing block IDs.
-                for block_ids, new_ids in zip(req_state.block_ids,
-                                              new_block_ids):
+                for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                     block_ids.extend(new_ids)
             else:
                 # The request is resumed from preemption.
@@ -246,8 +251,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 continue
 
             # Update the persistent batch.
-            self.input_batch.num_computed_tokens_cpu[req_index] = (
-                num_computed_tokens)
+            self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
@@ -257,21 +261,22 @@ class OmniGPUModelRunner(GPUModelRunner):
                 start_token_index = num_computed_tokens
                 end_token_index = num_computed_tokens + len(new_token_ids)
                 self.input_batch.token_ids_cpu[
-                    req_index,
-                    start_token_index:end_token_index] = new_token_ids
-                self.input_batch.num_tokens_no_spec[
-                    req_index] = end_token_index
+                    req_index, start_token_index:end_token_index
+                ] = new_token_ids
+                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
                 self.input_batch.num_tokens[req_index] = end_token_index
 
             # Add spec_token_ids to token_ids_cpu.
-            spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
+            spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
+                req_id, ()
+            )
             if spec_token_ids:
                 num_spec_tokens = len(spec_token_ids)
                 start_index = self.input_batch.num_tokens_no_spec[req_index]
                 end_token_index = start_index + num_spec_tokens
                 self.input_batch.token_ids_cpu[
-                    req_index, start_index:end_token_index] = spec_token_ids
+                    req_index, start_index:end_token_index
+                ] = spec_token_ids
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
 
@@ -287,7 +292,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
-    
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -300,29 +305,35 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
-            return self.kv_connector_no_forward(scheduler_output,
-                                                self.vllm_config)
+            return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
         # Prepare the decoder inputs.
-        (attn_metadata, attention_cuda_graphs, logits_indices,
-         spec_decode_metadata, num_scheduled_tokens_np,
-         spec_decode_common_attn_metadata) = (
-             self._prepare_inputs(scheduler_output))
+        (
+            attn_metadata,
+            attention_cuda_graphs,
+            logits_indices,
+            spec_decode_metadata,
+            num_scheduled_tokens_np,
+            spec_decode_common_attn_metadata,
+        ) = self._prepare_inputs(scheduler_output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        if (self.use_cuda_graph
-                and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
+        if (
+            self.use_cuda_graph
+            and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]
+        ):
             # Use piecewise CUDA graphs.
             # Add padding to the batch size.
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                num_scheduled_tokens)
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_scheduled_tokens)
         else:
             # Eager mode.
             # Pad tokens to multiple of tensor_parallel_size when
             # enabled collective fusion for SP
             tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            if self.compilation_config.pass_config. \
-                enable_sequence_parallelism and tp_size > 1:
+            if (
+                self.compilation_config.pass_config.enable_sequence_parallelism
+                and tp_size > 1
+            ):
                 num_input_tokens = round_up(num_scheduled_tokens, tp_size)
             else:
                 num_input_tokens = num_scheduled_tokens
@@ -345,13 +356,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             # multimodal and text-only models can consume embeddings.
             inputs_embeds_scheduled = self.model.get_input_embeddings(
                 input_ids=self.input_ids[:num_scheduled_tokens],
-                multimodal_embeddings=(mm_embeds or None)
-                if self.is_multimodal_model else None,
+                multimodal_embeddings=(
+                    (mm_embeds or None) if self.is_multimodal_model else None
+                ),
             )
 
             # TODO(woosuk): Avoid the copy. Optimize.
-            self.inputs_embeds[:num_scheduled_tokens].copy_(
-                inputs_embeds_scheduled)
+            self.inputs_embeds[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
 
             # Overlay per-request custom prompt_embeds for the prompt portion
             for req_index, req_id in enumerate(self.input_batch.req_ids):
@@ -360,26 +371,27 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if pe_cpu is None:
                     continue
                 num_computed_tokens = int(
-                    self.input_batch.num_computed_tokens_cpu[req_index])
+                    self.input_batch.num_computed_tokens_cpu[req_index]
+                )
                 prompt_len = len(req_state.prompt_token_ids)
                 prompt_remaining = max(0, prompt_len - num_computed_tokens)
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
                 overlay_len = min(sched_tokens, prompt_remaining)
                 if overlay_len <= 0:
                     continue
-                src = pe_cpu[num_computed_tokens:
-                             num_computed_tokens + overlay_len].to(
-                                 dtype=self.dtype,
-                                 device=self.device,
-                                 non_blocking=True)
+                src = pe_cpu[
+                    num_computed_tokens : num_computed_tokens + overlay_len
+                ].to(dtype=self.dtype, device=self.device, non_blocking=True)
                 start_offset = int(self.query_start_loc_cpu[req_index])
-                self.inputs_embeds[start_offset:start_offset + overlay_len]\
-                    .copy_(src)
+                self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
 
             input_ids = self.input_ids[:num_input_tokens]  # preserved for APIs
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
-            model_mm_kwargs = (self._extract_mm_kwargs(scheduler_output)
-                               if self.is_multimodal_model else {})
+            model_mm_kwargs = (
+                self._extract_mm_kwargs(scheduler_output)
+                if self.is_multimodal_model
+                else {}
+            )
         else:
             # For non-first PP ranks, use token ids as usual; embeddings are
             # only consumed on the first rank.
@@ -395,7 +407,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             intermediate_tensors = None
         else:
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                num_input_tokens, intermediate_tensors, True)
+                num_input_tokens, intermediate_tensors, True
+            )
 
         # Some attention backends only support CUDA Graphs in pure decode.
         # If attention doesn't support CUDA Graphs for this batch, but we
@@ -405,13 +418,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                skip_cuda_graphs=skip_cuda_graphs,
-        ), self.maybe_get_kv_connector_output(
-                scheduler_output) as kv_connector_output:
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            skip_cuda_graphs=skip_cuda_graphs,
+        ), self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
 
             model_output = self.model(
                 input_ids=input_ids,
@@ -433,37 +445,50 @@ class OmniGPUModelRunner(GPUModelRunner):
             hidden_states = model_output
             aux_hidden_states = None
 
-        text_hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+        text_hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
+            hidden_states
+        )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
         # https://github.com/vllm-project/vllm/issues/18019
-        broadcast_pp_output = \
-            self.parallel_config.distributed_executor_backend \
-            == "external_launcher" and len(get_pp_group().ranks) > 0
+        broadcast_pp_output = (
+            self.parallel_config.distributed_executor_backend == "external_launcher"
+            and len(get_pp_group().ranks) > 0
+        )
         if not get_pp_group().is_last_rank:
             # For mid-pipeline stages, return the hidden states.
             assert isinstance(text_hidden_states, IntermediateTensors)
             if not broadcast_pp_output:
                 text_hidden_states.kv_connector_output = kv_connector_output
                 return text_hidden_states
-            get_pp_group().send_tensor_dict(text_hidden_states.tensors,
-                                            all_gather_group=get_tp_group())
+            get_pp_group().send_tensor_dict(
+                text_hidden_states.tensors, all_gather_group=get_tp_group()
+            )
             logits = None
         else:
             if self.input_batch.pooling_params:
-                return self._pool(text_hidden_states, num_scheduled_tokens,
-                                  num_scheduled_tokens_np, kv_connector_output)
+                return self._pool(
+                    text_hidden_states,
+                    num_scheduled_tokens,
+                    num_scheduled_tokens_np,
+                    kv_connector_output,
+                )
 
             sample_hidden_states = text_hidden_states[logits_indices]
             logits = self.model.compute_logits(sample_hidden_states, None)
         if broadcast_pp_output:
-            model_output_broadcast_data = {
-                "logits": logits.contiguous(),
-            } if logits is not None else {}
+            model_output_broadcast_data = (
+                {
+                    "logits": logits.contiguous(),
+                }
+                if logits is not None
+                else {}
+            )
             model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
-                model_output_broadcast_data, src=len(get_pp_group().ranks) - 1)
+                model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+            )
             assert model_output_broadcast_data is not None
             logits = model_output_broadcast_data["logits"]
 
@@ -513,8 +538,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         discard_sampled_tokens_req_indices = []
         for i, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
-            seq_len = (req_state.num_computed_tokens +
-                       scheduler_output.num_scheduled_tokens[req_id])
+            seq_len = (
+                req_state.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens[req_id]
+            )
             if seq_len < req_state.num_tokens:
                 # Ignore the sampled token for partial prefills.
                 # Rewind the generator state as if the token was not sampled.
@@ -529,8 +556,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
         logprobs_tensors = sampler_output.logprobs_tensors
-        logprobs_lists = logprobs_tensors.tolists() \
-            if logprobs_tensors is not None else None
+        logprobs_lists = (
+            logprobs_tensors.tolists() if logprobs_tensors is not None else None
+        )
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -539,7 +567,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
         # Get the valid generated tokens.
-        import os
+        # import os  # unused import
+
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
@@ -569,10 +598,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             assert end_idx <= self.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
                 f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.max_model_len}")
+                f"{self.max_model_len}"
+            )
 
-            self.input_batch.token_ids_cpu[req_idx,
-                                           start_idx:end_idx] = sampled_ids
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
             self.input_batch.num_tokens[req_idx] = end_idx
             req_id = self.input_batch.req_ids[req_idx]
@@ -609,10 +638,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             num_nans_in_logits=num_nans_in_logits,
             multimodal_outputs=multimodal_outputs,
         )
-    
+
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
+    def extract_multimodal_outputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, dict]:
+        if (
+            hasattr(self.model, "have_multimodal_outputs")
+            and self.model.have_multimodal_outputs
+        ):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 
@@ -620,7 +654,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             text_hidden_states = hidden_states
             multimodal_outputs = {}
         return text_hidden_states, multimodal_outputs
-    
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -645,8 +679,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_list[-1] += num_tokens % num_reqs
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list,
-                                        dtype=np.int32)
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
 
         attn_metadata: Optional[dict[str, Any]] = None
         if capture_attn_cudagraph:
@@ -655,36 +688,43 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Make sure max_model_len is used at the graph capture time.
             self.seq_lens_np[:num_reqs] = self.max_model_len
             self.seq_lens_np[num_reqs:] = 0
-            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
-                                           non_blocking=True)
+            self.seq_lens[:num_reqs].copy_(
+                self.seq_lens_cpu[:num_reqs], non_blocking=True
+            )
 
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                    self.kv_cache_config.kv_cache_groups):
+                self.kv_cache_config.kv_cache_groups
+            ):
                 common_attn_metadata = CommonAttentionMetadata(
-                    query_start_loc=self.query_start_loc[:num_reqs + 1],
-                    query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs +
-                                                                 1],
+                    query_start_loc=self.query_start_loc[: num_reqs + 1],
+                    query_start_loc_cpu=self.query_start_loc_cpu[: num_reqs + 1],
                     seq_lens=self.seq_lens[:num_reqs],
                     seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
-                    num_computed_tokens_cpu=self.input_batch.
-                    num_computed_tokens_cpu_tensor[:num_reqs],
+                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[  # noqa: E501
+                        :num_reqs
+                    ],
                     num_reqs=num_reqs,
                     num_actual_tokens=num_tokens,
                     max_query_len=num_tokens,
                     block_table_tensor=self.input_batch.block_table[
-                        kv_cache_group_id].get_device_tensor()[:num_reqs],
-                    slot_mapping=self.input_batch.
-                    block_table[kv_cache_group_id].slot_mapping[:num_tokens],
-                    causal=True)
+                        kv_cache_group_id
+                    ].get_device_tensor()[:num_reqs],
+                    slot_mapping=self.input_batch.block_table[
+                        kv_cache_group_id
+                    ].slot_mapping[:num_tokens],
+                    causal=True,
+                )
 
                 for attn_group in self.attn_groups[kv_cache_group_id]:
-                    attn_metadata_i = attn_group.metadata_builder\
-                        .build_for_cudagraph_capture(common_attn_metadata)
+                    attn_metadata_i = (
+                        attn_group.metadata_builder.build_for_cudagraph_capture(
+                            common_attn_metadata
+                        )
+                    )
                     for layer_name in kv_cache_group_spec.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
-        with self.maybe_dummy_run_with_lora(self.lora_config,
-                                            num_scheduled_tokens):
+        with self.maybe_dummy_run_with_lora(self.lora_config, num_scheduled_tokens):
             if self.is_multimodal_model:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds[:num_tokens]
@@ -707,16 +747,20 @@ class OmniGPUModelRunner(GPUModelRunner):
                         self.model.make_empty_intermediate_tensors(
                             batch_size=self.max_num_tokens,
                             dtype=self.model_config.dtype,
-                            device=self.device))
+                            device=self.device,
+                        )
+                    )
 
                 intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                    num_tokens, None, False)
+                    num_tokens, None, False
+                )
 
             with self.maybe_randomize_inputs(input_ids), set_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp):
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+            ):
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -726,7 +770,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         model_mm_kwargs,
                         device=self.device,
                     ),
-                    sampler = None
+                    sampler=None,
                 )
 
             if self.use_aux_hidden_state_outputs:
@@ -734,8 +778,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             else:
                 hidden_states = outputs
 
-            text_hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
-
+            text_hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
+                hidden_states
+            )
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)

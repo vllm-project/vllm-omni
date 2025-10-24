@@ -1,11 +1,12 @@
 """
 Engine components for vLLM-omni.
 """
-import msgspec
-from typing import Any
 
+from typing import Any, Optional
+
+import msgspec
 from vllm.v1.engine import EngineCoreRequest
-from typing import Optional
+
 
 class PromptEmbedsPayload(msgspec.Struct):
     """Serialized prompt embeddings payload for direct transfer.
@@ -52,4 +53,3 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     prompt_embeds: Optional[PromptEmbedsPayload] = None
     # Optional additional information dictionary (serialized)
     additional_information: Optional[AdditionalInformationPayload] = None
-    

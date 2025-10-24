@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Optional, Union, List
-import numpy as np
 import gc
 import logging
+from typing import List, Optional, Union
 
+import numpy as np
 import torch
-
+from vllm.multimodal.inputs import MultiModalKwargs
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     IntermediateTensors,
@@ -14,14 +16,9 @@ from vllm.v1.worker.gpu_model_runner import (
     set_forward_context,
 )
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
-from vllm.multimodal.inputs import MultiModalKwargs
-
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +42,16 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         if not scheduler_output.total_num_scheduled_tokens:
 
             return EMPTY_MODEL_RUNNER_OUTPUT
-           
+
         # Prepare decoder inputs and attention metadata (for batch/order mapping)
-        (attn_metadata, attention_cuda_graphs, logits_indices,
-         spec_decode_metadata, num_scheduled_tokens_np,
-         spec_decode_common_attn_metadata) = self._prepare_inputs(
-             scheduler_output)
+        (
+            attn_metadata,
+            attention_cuda_graphs,
+            logits_indices,
+            spec_decode_metadata,
+            num_scheduled_tokens_np,
+            spec_decode_common_attn_metadata,
+        ) = self._prepare_inputs(scheduler_output)
 
         # Input token count for this iteration (not used by diffusion, but
         # retained to keep DP padding/ordering consistent)
@@ -68,11 +69,12 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # Build inputs to mirror AR runner: input_ids/positions/embeds
         if self.is_multimodal_model and get_pp_group().is_first_rank:
             inputs_embeds_scheduled = self.model.get_input_embeddings(
-                input_ids=self.input_ids[:scheduler_output.total_num_scheduled_tokens],
+                input_ids=self.input_ids[: scheduler_output.total_num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds or None,
             )
-            self.inputs_embeds[:scheduler_output.total_num_scheduled_tokens].copy_(
-                inputs_embeds_scheduled)
+            self.inputs_embeds[: scheduler_output.total_num_scheduled_tokens].copy_(
+                inputs_embeds_scheduled
+            )
             input_ids = self.input_ids[:num_input_tokens]
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
             model_mm_kwargs = self._extract_mm_kwargs(scheduler_output)
@@ -92,18 +94,18 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             intermediate_tensors = None
         else:
             intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                num_input_tokens, intermediate_tensors, True)
+                num_input_tokens, intermediate_tensors, True
+            )
 
         # Set forward context mainly for resource management and kv connector
         skip_cuda_graphs = True  # diffusion path does not rely on cuda graphs here
         with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                skip_cuda_graphs=skip_cuda_graphs,
-        ), self.maybe_get_kv_connector_output(
-                scheduler_output) as kv_connector_output:
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            skip_cuda_graphs=skip_cuda_graphs,
+        ), self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output:
 
             if not get_pp_group().is_last_rank:
                 # For non-last PP stages, pass through intermediate tensors.
@@ -119,8 +121,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                 multimodal_kwargs=model_mm_kwargs,
                 logits_indices=logits_indices,
             )
-        _, multimodal_outputs = (
-            self.extract_multimodal_outputs(outputs))
+        _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
 
         # Ensure one tensor per request, map to CPU for output struct
         pooler_output: List[Optional[torch.Tensor]] = []
@@ -128,13 +129,19 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             # If model returned a single stacked tensor, split by requests
             assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append(multimodal_outputs[i].detach().to("cpu").contiguous())
+                pooler_output.append(
+                    multimodal_outputs[i].detach().to("cpu").contiguous()
+                )
         elif isinstance(multimodal_outputs, list):
             for out in multimodal_outputs:
-                pooler_output.append(out.detach().to("cpu").contiguous() if out is not None else None)
+                pooler_output.append(
+                    out.detach().to("cpu").contiguous() if out is not None else None
+                )
         elif isinstance(multimodal_outputs, dict):
             for out in multimodal_outputs.values():
-                pooler_output.append(out.detach().to("cpu").contiguous() if out is not None else None)
+                pooler_output.append(
+                    out.detach().to("cpu").contiguous() if out is not None else None
+                )
         else:
             raise RuntimeError("Unsupported diffusion output type")
 
@@ -184,12 +191,12 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # For Qwen 2.5 Omni's current implementation, we only support the forward method
         if hasattr(self.model, "forward"):
             return self.model.forward(**kwargs)
-        #TODO: add the diffuse method for other models
+        # TODO: add the diffuse method for other models
 
         raise RuntimeError(
             "The loaded model does not expose diffusion interfaces 'sample', "
-            "'forward', or 'diffuse'. Please implement one of them or adapt the runner.")
-
+            "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
+        )
 
     @torch.inference_mode()
     def _dummy_run(
@@ -214,8 +221,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         num_scheduled_tokens_list[-1] += num_tokens % num_reqs
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
-        num_scheduled_tokens = np.array(num_scheduled_tokens_list,
-                                        dtype=np.int32)
+        num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
 
         attn_metadata: Optional[dict[str, dict]] = None
         if capture_attn_cudagraph:
@@ -224,35 +230,43 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             # Make sure max_model_len is used at the graph capture time.
             self.seq_lens_np[:num_reqs] = self.max_model_len
             self.seq_lens_np[num_reqs:] = 0
-            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
-                                           non_blocking=True)
+            self.seq_lens[:num_reqs].copy_(
+                self.seq_lens_cpu[:num_reqs], non_blocking=True
+            )
 
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                    self.kv_cache_config.kv_cache_groups):
+                self.kv_cache_config.kv_cache_groups
+            ):
                 common_attn_metadata = CommonAttentionMetadata(
-                    query_start_loc=self.query_start_loc[:num_reqs + 1],
-                    query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs + 1],
+                    query_start_loc=self.query_start_loc[: num_reqs + 1],
+                    query_start_loc_cpu=self.query_start_loc_cpu[: num_reqs + 1],
                     seq_lens=self.seq_lens[:num_reqs],
                     seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
-                    num_computed_tokens_cpu=self.input_batch.
-                    num_computed_tokens_cpu_tensor[:num_reqs],
+                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[  # noqa: E501
+                        :num_reqs
+                    ],
                     num_reqs=num_reqs,
                     num_actual_tokens=num_tokens,
                     max_query_len=num_tokens,
                     block_table_tensor=self.input_batch.block_table[
-                        kv_cache_group_id].get_device_tensor()[:num_reqs],
+                        kv_cache_group_id
+                    ].get_device_tensor()[:num_reqs],
                     slot_mapping=self.input_batch.block_table[
-                        kv_cache_group_id].slot_mapping[:num_tokens],
-                    causal=True)
+                        kv_cache_group_id
+                    ].slot_mapping[:num_tokens],
+                    causal=True,
+                )
 
                 for attn_group in self.attn_groups[kv_cache_group_id]:
-                    attn_metadata_i = attn_group.metadata_builder \
-                        .build_for_cudagraph_capture(common_attn_metadata)
+                    attn_metadata_i = (
+                        attn_group.metadata_builder.build_for_cudagraph_capture(
+                            common_attn_metadata
+                        )
+                    )
                     for layer_name in kv_cache_group_spec.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
-        with self.maybe_dummy_run_with_lora(self.lora_config,
-                                            num_scheduled_tokens):
+        with self.maybe_dummy_run_with_lora(self.lora_config, num_scheduled_tokens):
             if self.is_multimodal_model:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds[:num_tokens]
@@ -275,17 +289,21 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                         self.model.make_empty_intermediate_tensors(
                             batch_size=self.max_num_tokens,
                             dtype=self.model_config.dtype,
-                            device=self.device))
+                            device=self.device,
+                        )
+                    )
 
                 intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                    num_tokens, None, False)
+                    num_tokens, None, False
+                )
 
             # Diffusion path: avoid CUDA graphs; we only use context for resource wiring
             with self.maybe_randomize_inputs(input_ids), set_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp):
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+            ):
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -311,9 +329,9 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             if not skip_eplb:
                 self.eplb_step(is_dummy=True, is_profile=is_profile)
 
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        # logit_indices = np.cumsum(num_scheduled_tokens) - 1  # unused variable
         return text_hidden_states, None
-    
+
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         logger.warning("Dummy sampler run is not implemented for diffusion model")
@@ -327,7 +345,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             assert mm_budget is not None
 
             # TODO: handle encoder-decoder models once supported.
-            if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
+            if (mm_budget.get_encoder_budget()) > 0:  # encoder_budget unused
                 (
                     dummy_modality,
                     max_tokens,
@@ -343,15 +361,15 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                 )
 
                 dummy_encoder_outputs = self.model.get_multimodal_embeddings(
-                    **batched_dummy_mm_inputs)
+                    **batched_dummy_mm_inputs
+                )
 
                 sanity_check_mm_encoder_outputs(
                     dummy_encoder_outputs,
                     expected_num_items=max_mm_items_per_batch,
                 )
 
-                self.encoder_cache["tmp"] = dict(
-                    enumerate(dummy_encoder_outputs))
+                self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
 
         hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True)
         if get_pp_group().is_last_rank:

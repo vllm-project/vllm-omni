@@ -1,10 +1,11 @@
-from typing import Optional, Any, Union
-from typing_extensions import assert_never
+from typing import Any, Optional, Union
 
-from vllm.lora.request import LoRARequest
+from typing_extensions import assert_never
+from vllm.inputs.data import SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt
 from vllm.inputs.preprocess import InputPreprocessor
-from vllm.inputs.data import TokensPrompt, SingletonPrompt, SingletonInputs, TextPrompt
+from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalInputs
+
 from vllm_omni.inputs.data import OmniTokenInputs, token_inputs_omni
 from vllm_omni.inputs.parse import parse_singleton_prompt_omni
 
@@ -44,7 +45,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             inputs["cache_salt"] = cache_salt
 
         return inputs
-    
+
     def _prompt_to_llm_inputs(
         self,
         prompt: SingletonPrompt,
@@ -91,7 +92,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             )
 
         assert_never(parsed)
-    
+
     async def _process_tokens_async(
         self,
         parsed_content: TokensPrompt,
@@ -126,7 +127,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             inputs["cache_salt"] = cache_salt
 
         return inputs
-    
+
     async def _prompt_to_llm_inputs_async(
         self,
         prompt: SingletonPrompt,
