@@ -18,7 +18,8 @@ class DiffusionScheduler(OmniScheduler):
         - If the token budget cannot be satisfied at once, fall back to the default vLLM scheduling.
         """
 
-        # 选出零 prompt 且使用 pooling（扩散结果经 pooler_output 回传）的请求
+        # Select requests with zero prompt and using pooling
+        # (diffusion results returned via pooler_output)
         token_budget = self.max_num_scheduled_tokens
         capacity = self.max_num_running_reqs - len(self.running)
         scheduled_timestamp = time.monotonic()
@@ -33,24 +34,20 @@ class DiffusionScheduler(OmniScheduler):
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         structured_output_request_ids: dict[str, int] = {}
 
-        # 临时队列：保持等待队列顺序，不破坏非扩散请求
+        # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
 
-        # 快速通道挑选并调度（所有请求都视为扩散请求，不依赖 pooling_params）
+        # Fast path selection and scheduling (treat all as diffusion requests,
+        # independent of pooling_params)
         while self.waiting and token_budget > 0 and capacity > 0:
             request = self.waiting.peek_request()
-            # 统一按扩散处理。若未来需要条件开关，可接入配置或请求标记。
-            is_diffusion = True
-            if not is_diffusion:
-                # 暂存到跳过队列，稍后归还到等待队列头部
-                self.waiting.pop_request()
-                skipped_waiting_requests.prepend_request(request)
-                continue
+            # Uniformly treat as diffusion. A feature flag can be added later via config or request tag.
 
-            # 一次性为该请求分配全部输入 token（若为 0，则分配 1 个占位 token）
+            # Allocate all input tokens for the request in one shot
+            # (allocate 1 placeholder if zero)
             required_tokens = max(getattr(request, "num_prompt_tokens", 0), 1)
             if required_tokens > token_budget:
-                # 无足够预算一次性完成该请求的输入处理，停止快速通道尝试
+                # Insufficient budget to process all inputs at once; stop fast path attempt
                 break
             num_new_tokens = required_tokens
             new_blocks = self.kv_cache_manager.allocate_slots(
@@ -59,12 +56,13 @@ class DiffusionScheduler(OmniScheduler):
                 num_lookahead_tokens=self.num_lookahead_tokens,
             )
             if new_blocks is None:
-                # 无法分配（显存紧张等），停止快速通道尝试，回退到默认调度
-                # 将当前 request 放回等待队列头
-                # 注意：此处不改变原队列顺序
+                # Allocation failed (e.g., VRAM pressure); stop fast path and
+                # fall back to default scheduling
+                # Put the current request back to the head of the waiting queue
+                # Note: the original queue order is preserved
                 break
 
-            # 正式调度该请求
+            # Officially schedule this request
             request = self.waiting.pop_request()
             self.running.append(request)
             request.status = RequestStatus.RUNNING
@@ -78,15 +76,15 @@ class DiffusionScheduler(OmniScheduler):
             capacity -= 1
             scheduled_new_reqs.append(request)
 
-        # 归还被跳过的等待请求
+        # Return skipped waiting requests
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
-        # 若快速通道未调度任何请求，则回退到原始调度逻辑
+        # If fast path scheduled none, fall back to the original scheduling
         if not num_scheduled_tokens:
             return super().schedule()
 
-        # 计算公共前缀块（与 v1 对齐）
+        # Compute common prefix blocks (aligned with v1)
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
@@ -100,7 +98,7 @@ class DiffusionScheduler(OmniScheduler):
             scheduled_spec_decode_tokens,
         )
 
-        # 组装 SchedulerOutput
+        # Assemble SchedulerOutput
         new_reqs_data = [
             OmniNewRequestData.from_request(req, req_to_new_block_ids[req.request_id])
             for req in scheduled_new_reqs
@@ -128,18 +126,18 @@ class DiffusionScheduler(OmniScheduler):
             grammar_bitmask=grammar_bitmask,
         )
 
-        # KVTransfer：封装元信息
+        # KVTransfer: package metadata
         if self.connector is not None:
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
-        # 发布 KV 事件（与 v1 对齐）
+        # Publish KV events (aligned with v1)
         events = self.kv_cache_manager.take_events()
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
-        # 更新内部状态（推进 num_computed_tokens，释放 encoder 输入等）
+        # Update internal state (advance num_computed_tokens, free encoder inputs, etc.)
         self._update_after_schedule(scheduler_output)
         return scheduler_output
     """
@@ -212,9 +210,9 @@ class DiffusionScheduler(OmniScheduler):
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
 
-            # 扩散请求：单步完成，直接标记完成并释放资源
+            # Diffusion request: completes in one step; mark finished and free resources
             request.status = RequestStatus.FINISHED_STOPPED
-            # 可选：标注停止原因，便于前端区分（不影响协议）
+            # Optional: set a stop_reason for front-end clarity (does not affect protocol)
             request.stop_reason = request.stop_reason or "diffusion_done"
             kv_transfer_params = self._free_request(request)
             if status_before_stop == RequestStatus.RUNNING:
