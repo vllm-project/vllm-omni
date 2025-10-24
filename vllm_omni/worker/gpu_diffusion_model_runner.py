@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-
 from __future__ import annotations
 
 from typing import Optional, Union, List
@@ -13,7 +11,6 @@ from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     IntermediateTensors,
     get_pp_group,
-    has_kv_transfer_group,
     set_forward_context,
 )
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
@@ -187,19 +184,11 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # For Qwen 2.5 Omni's current implementation, we only support the forward method
         if hasattr(self.model, "forward"):
             return self.model.forward(**kwargs)
-        
-        # if hasattr(self.model, "sample"):
-        #     return self.model.sample(**kwargs)
-        # if hasattr(self.model, "forward"):
-        #     return self.model.forward(**kwargs)
-        # if hasattr(self.model, "diffuse"):
-        #     return self.model.diffuse(**kwargs)
+        #TODO: add the diffuse method for other models
 
         raise RuntimeError(
             "The loaded model does not expose diffusion interfaces 'sample', "
             "'forward', or 'diffuse'. Please implement one of them or adapt the runner.")
-
-
 
 
     @torch.inference_mode()
