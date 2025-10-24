@@ -1,4 +1,6 @@
-from vllm.v1.core.sched.scheduler import SchedulerOutput, EngineCoreOutputs, Request, RequestStatus, SpecDecodingStats, defaultdict, Optional
+from vllm.v1.core.sched.scheduler import SchedulerOutput, EngineCoreOutputs, Request, RequestStatus, SpecDecodingStats
+from collections import defaultdict
+from typing import Optional
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.engine import EngineCoreEventType
 from vllm.distributed.kv_events import KVEventBatch
@@ -11,9 +13,9 @@ from vllm_omni.core.sched.output import OmniNewRequestData
 
 class DiffusionScheduler(OmniScheduler):
     def schedule(self) -> SchedulerOutput:
-        """扩散快速通道：
-        - 一次性喂入该请求的全部输入 token（若为 0，则分配 1 个占位 token）。
-        - 若无法一次性满足 token 预算，则退回上游 vLLM 的默认调度。
+        """Diffusion fast path:
+        - Feed all input tokens of the request at once (if 0, allocate 1 placeholder token).
+        - If the token budget cannot be satisfied at once, fall back to the default vLLM scheduling.
         """
 
         # 选出零 prompt 且使用 pooling（扩散结果经 pooler_output 回传）的请求
