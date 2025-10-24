@@ -1,14 +1,5 @@
 from __future__ import annotations
-
-from collections import defaultdict
-from typing import Optional
-
-from vllm.v1.core.sched.output import (
-                                       SchedulerOutput, )
-from vllm.v1.core.sched.utils import check_stop
-from vllm.v1.engine import EngineCoreOutputs
-from vllm.v1.request import Request, RequestStatus
-from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 
