@@ -18,7 +18,7 @@ class OmniEngineArgs(EngineArgs):
         parser.add_argument(
             "--engine-output-type",
             type=str,
-            default=EngineArgs.engine_output_type,
+            default=OmniEngineArgs.engine_output_type,
             help=(
                 "Declare EngineCoreOutput.output_type (e.g., 'text', 'image', "
                 "'text+image', 'latent'). This will be written into "
