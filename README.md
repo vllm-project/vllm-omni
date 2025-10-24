@@ -42,32 +42,148 @@ vLLM-omni is built on a modular architecture that extends vLLM's core functional
 
 ## 🛠️ Installation
 
-Set up basic environments
+### Prerequisites
+
+- **Python**: 3.8 or higher (3.12 recommended)
+- **CUDA**: Compatible GPU with CUDA support
+- **Operating System**: Linux (tested on Ubuntu 20.04+)
+
+### Quick Install (Coming Soon)
+
+Once released on PyPI:
+```bash
+pip install vllm-omni
+```
+
+### Development Installation
+
+#### Step 1: Set up Python environment
+
+Using `uv` (recommended):
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
-Install certain version of vllm with commitid: 808a7b69df479b6b3a16181711cac7ca28a9b941
+
+Or using standard `venv`:
+```bash
+python3.12 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+#### Step 2: Install vLLM dependency
+
+Install specific version of vLLM (commit: 808a7b69df479b6b3a16181711cac7ca28a9b941):
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
 VLLM_USE_PRECOMPILED=1 uv pip install --editable .
+cd ..
 ```
 
-## Run examples (Qwen2.5-omni)
+#### Step 3: Install vLLM-omni
 
-Get into the example folder
+For development:
 ```bash
-cd vllm_omni
-cd examples/offline_inference/qwen2_5_omni
+git clone https://github.com/hsliuustc0106/vllm-omni.git
+cd vllm-omni
+pip install -e ".[dev]"  # Includes development dependencies
 ```
-Modify PYTHONPATH in run.sh as your path of vllm_omni. Then run.
+
+Or for production:
+```bash
+git clone https://github.com/hsliuustc0106/vllm-omni.git
+cd vllm-omni
+pip install -e .
+```
+
+#### Step 4: Verify Installation
+
+```bash
+python -c "import vllm_omni; print(f'vLLM-omni {vllm_omni.__version__} installed successfully!')"
+```
+
+## 🚀 Quick Start
+
+### Running Qwen2.5-omni Example
+
+Navigate to the example directory:
+```bash
+cd examples/offline_inference/qwen_2_5_omni
+```
+
+Modify `PYTHONPATH` in `run.sh` to point to your vllm_omni installation path, then run:
 ```bash
 bash run.sh
 ```
-The output audio is saved in ./output_audio
+
+The output audio will be saved in `./output_audio`
+
+For more examples, see the [examples](examples/) directory.
+
+## 💡 Usage Examples
+
+### Basic Text Generation
+
+```python
+from vllm_omni import OmniLLM
+
+# Initialize the model
+llm = OmniLLM(model="path/to/model")
+
+# Generate text
+outputs = llm.generate("Hello, how are you?")
+print(outputs[0].text)
+```
+
+### Multi-modal Processing
+
+```python
+from vllm_omni import OmniLLM
+from PIL import Image
+
+# Initialize with multi-modal model
+llm = OmniLLM(model="Qwen2.5-omni")
+
+# Process text and image
+image = Image.open("image.jpg")
+outputs = llm.generate(
+    prompt="Describe this image",
+    image=image
+)
+```
+
+For comprehensive examples, see:
+- [Basic Examples](examples/basic/) - Simple text generation and API usage
+- [Omni Examples](examples/omni/) - Multi-modal model examples
+- [Offline Inference](examples/offline_inference/) - Batch processing examples
+
+## ⚙️ Configuration
+
+vLLM-omni can be configured through:
+
+- **Python API**: Direct configuration when initializing models
+- **YAML configs**: Stage-specific configurations in `vllm_omni/model_executor/stage_configs/`
+- **Environment variables**: For system-level settings
+
+Example configuration:
+```python
+from vllm_omni import OmniLLM
+from vllm_omni.config import DiTConfig, DiTCacheConfig
+
+# Configure DiT engine
+dit_config = DiTConfig(
+    max_iterations=50,
+    guidance_scale=7.5
+)
+
+llm = OmniLLM(
+    model="path/to/model",
+    dit_config=dit_config
+)
+```
 
 ## 📍 Roadmap
 
@@ -76,6 +192,60 @@ The output audio is saved in ./output_audio
 - [ ] Offline inference example for Qwen2.5-omni with streaming multiple requests
 - [ ] Online inference support
 - [ ] Support for other models
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+#### ImportError: No module named 'cloudpickle'
+
+Install missing dependencies:
+```bash
+pip install cloudpickle
+```
+
+#### CUDA Out of Memory
+
+Reduce batch size or model size:
+```python
+llm = OmniLLM(
+    model="path/to/model",
+    max_model_len=2048,  # Reduce context length
+    gpu_memory_utilization=0.8  # Reduce GPU memory usage
+)
+```
+
+#### vLLM Version Mismatch
+
+Ensure you're using the correct vLLM commit:
+```bash
+cd vllm
+git fetch
+git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
+pip install --editable . --force-reinstall
+```
+
+#### Model Loading Errors
+
+Verify model path and format:
+```bash
+ls -la /path/to/model  # Should contain config.json, model files, etc.
+```
+
+For more issues, check:
+- [GitHub Issues](https://github.com/hsliuustc0106/vllm-omni/issues)
+- [vLLM Documentation](https://docs.vllm.ai/)
+
+### Getting Help
+
+If you encounter issues:
+1. Check existing [issues](https://github.com/hsliuustc0106/vllm-omni/issues)
+2. Review [documentation](docs/)
+3. Open a new issue with:
+   - Error messages and stack traces
+   - Python and CUDA versions
+   - Minimal reproduction code
+   - System information (OS, GPU model)
 
 ## 📚 Documentation
 
