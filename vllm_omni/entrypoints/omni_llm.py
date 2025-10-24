@@ -138,7 +138,8 @@ class OmniStageLLM(LLM):
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.llm_engine.output_processor = MultimodalOutputProcessor(tokenizer=self.llm_engine.tokenizer, 
-                                                                    log_stats=self.llm_engine.log_stats)
+                                                                    log_stats=self.llm_engine.log_stats,
+                                                                    engine_core_output_type=engine_args.engine_output_type)
         self.llm_engine.processor = OmniProcessor(vllm_config=self.llm_engine.vllm_config,
                                                   tokenizer=self.llm_engine.tokenizer)
         self.engine_class = type(self.llm_engine)

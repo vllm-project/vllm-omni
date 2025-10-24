@@ -177,7 +177,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
       produce the correct RequestOutput/PoolingRequestOutput.
     - Allow custom per-modality handlers via register_handler().
     """
-    def __init__(self, tokenizer: TokenizerGroup, log_stats: bool, engine_core_output_type: Optional[str] = None):
+    def __init__(self, tokenizer: TokenizerGroup, log_stats: bool, engine_core_output_type: Optional[str] = "text"):
         super().__init__(tokenizer=tokenizer, log_stats=log_stats)
         self.output_handlers: Dict[str, Callable[[EngineCoreOutput], None]] = {}
         self._reqid_to_mm_type: Dict[str, str] = {}
@@ -223,7 +223,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     ) -> OutputProcessorOutput:
         self._reqid_to_mm_type.clear()
         for eco in engine_core_outputs:
-            mm_type = (getattr(eco, "output_type", None) or "").lower()
+            mm_type = (self.engine_core_output_type or "").lower()
             if mm_type:
                 self._reqid_to_mm_type[eco.request_id] = mm_type
             self._route_and_normalize(eco)
@@ -262,7 +262,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # 2.5) Accumulate multimodal tensors in RequestState
             try:
-                mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
+                mm_type = (self.engine_core_output_type or "").lower()
                 if pooling_output is not None and isinstance(req_state, OmniRequestState):
                     req_state.add_multimodal_tensor(pooling_output, mm_type)
             except Exception:
@@ -315,7 +315,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     
     # ---- routing helpers ----
     def _route_and_normalize(self, eco: EngineCoreOutput) -> None:
-        output_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
+        output_type = (self.engine_core_output_type or "").lower()
 
         # Custom handler first (if registered)
         if output_type in self.output_handlers:
