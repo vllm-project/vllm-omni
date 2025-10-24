@@ -18,14 +18,14 @@ class OmniEngineArgs(EngineArgs):
         parser.add_argument(
             "--engine-output-type",
             type=str,
-            default=EngineArgs.engine_output_type,
+            default=OmniEngineArgs.engine_output_type,
             help=(
                 "Declare EngineCoreOutput.output_type (e.g., 'text', 'image', "
                 "'text+image', 'latent'). This will be written into "
                 "model_config.engine_output_type for schedulers to use."
             ),
         )
-        parser.add_argument("--model-stage", type=str, default=EngineArgs.model_stage, 
+        parser.add_argument("--model-stage", type=str, default=OmniEngineArgs.model_stage, 
         help="Declare model stage (e.g., 'thinker', 'talker', 'token2wav'). This will be written into model_config.model_stage for schedulers to use.")
         return parser
 
