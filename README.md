@@ -1,5 +1,9 @@
 # vLLM-omni: Multi-modal Extension for vLLM
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
 vLLM-omni is designed to extend vLLM capabilities to support multi-modality model inference and serving, particularly focusing on non-autoregressive structures and non-textual outputs.
 
 ## 🎯 Overview
@@ -65,11 +69,61 @@ bash run.sh
 ```
 The output audio is saved in ./output_audio
 
-## To-do list
+## 📍 Roadmap
+
 - [x] Offline inference example for Qwen2.5-omni with single request
 - [ ] Adaptation from current vllm branch to stable vllm v0.11.0
 - [ ] Offline inference example for Qwen2.5-omni with streaming multiple requests
 - [ ] Online inference support
 - [ ] Support for other models
 
-For detailed model management, see [vllm_omni_design.md](docs/architecture/vllm_omni_design.md) and [high_level_arch_design.md](docs/architecture/high_level_arch_design.md).
+## 📚 Documentation
+
+For more detailed information, see:
+- [Architecture Design](docs/architecture/high_level_arch_design.md) - High-level system architecture
+- [Implementation Details](docs/architecture/implementation_architecture.md) - Detailed implementation
+- [API Documentation](docs/api/README.md) - API usage and design
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details on:
+- Setting up your development environment
+- Code style and standards
+- Submitting pull requests
+- Reporting issues
+
+Please also read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
+
+## 🔒 Security
+
+For security issues, please see our [Security Policy](SECURITY.md) for responsible disclosure guidelines.
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## 📝 Citation
+
+If you use vLLM-omni in your research, please cite:
+
+```bibtex
+@software{vllm_omni_2024,
+  title = {vLLM-omni: Multi-modal Extension for vLLM},
+  author = {vLLM-omni Team},
+  year = {2024},
+  url = {https://github.com/hsliuustc0106/vllm-omni}
+}
+```
+
+## 🙏 Acknowledgments
+
+vLLM-omni is built on top of [vLLM](https://github.com/vllm-project/vllm), an excellent fast and easy-to-use library for LLM inference and serving.
+
+## 📧 Contact
+
+- **Issues**: [GitHub Issues](https://github.com/hsliuustc0106/vllm-omni/issues)
+- **Email**: hsliuustc@gmail.com
+
+---
+
+**Star ⭐ this repository if you find it helpful!**

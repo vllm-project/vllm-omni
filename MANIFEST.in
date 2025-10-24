@@ -1,0 +1,38 @@
+# Include documentation
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include SECURITY.md
+
+# Include requirements
+include requirements.txt
+include pyproject.toml
+
+# Include package data
+recursive-include vllm_omni *.py
+recursive-include vllm_omni *.yaml
+recursive-include vllm_omni *.yml
+recursive-include vllm_omni *.json
+
+# Include documentation
+recursive-include docs *.md
+recursive-include docs *.rst
+
+# Include examples
+recursive-include examples *.py
+recursive-include examples *.sh
+recursive-include examples *.md
+recursive-include examples *.yaml
+
+# Include tests
+recursive-include tests *.py
+
+# Exclude unwanted files
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude *.swp
+global-exclude *.swo
