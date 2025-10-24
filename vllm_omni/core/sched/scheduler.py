@@ -1,8 +1,7 @@
 from __future__ import annotations
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-
-
+from vllm.logger import init_logger
 
 class OmniScheduler(VLLMScheduler):
     """
@@ -44,6 +43,6 @@ class OmniScheduler(VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
         except Exception:
             # If anything goes wrong, leave the original output unchanged
-            pass
+            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
 
         return scheduler_output
