@@ -91,13 +91,15 @@ class OmniRequestState(RequestState):
             try:
                 t = t.to("cpu")
             except Exception:
-                pass
+                # Best-effort CPU move; keep original device if conversion fails
+                logger.debug("Failed to move multimodal tensor to CPU", exc_info=True)
             if self.mm_accumulated is None:
                 self.mm_accumulated = t
             else:
                 self.mm_accumulated = torch.cat([self.mm_accumulated, t], dim=0)
         except Exception:
-            pass
+            # Log and continue without crashing the output pipeline
+            logger.exception("Error accumulating multimodal tensor")
 
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
@@ -153,14 +155,13 @@ class OmniRequestState(RequestState):
                 try:
                     tensor = tensor.detach().to("cpu")
                 except Exception:
-                    pass
+                    logger.debug("Failed to move accumulated multimodal tensor to CPU", exc_info=True)
                 # Attach on the completion output for downstream consumers.
                 if not hasattr(base_output, "multimodal_output"):
                     setattr(base_output, "multimodal_output", {})
                 setattr(base_output, "multimodal_output", {self.mm_type: tensor})
-        except Exception as e:
-            logger.warning("Error in _new_completion_output", e)
-            pass
+        except Exception:
+            logger.exception("Error in _new_completion_output")
         return base_output
 
 
@@ -265,7 +266,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 if pooling_output is not None and isinstance(req_state, OmniRequestState):
                     req_state.add_multimodal_tensor(pooling_output, mm_type)
             except Exception:
-                pass
+                logger.debug("Failed to accumulate multimodal tensor for request %s", req_id, exc_info=True)
 
             # 3) Create RequestOutput objects, forcing combined mode to keep ids
             pooling_for_make = pooling_output
@@ -285,9 +286,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                         if not hasattr(ro, "multimodal_output"):
                             setattr(ro, "multimodal_output", {})
                         ro.multimodal_output[mm_key] = req_state.mm_accumulated
-                except Exception as e:
-                    logger.warning("Error in process_outputs", e)
-                    pass
+                except Exception:
+                    logger.exception("Error attaching multimodal payload in process_outputs")
                 if req_state.queue is not None:
                     req_state.queue.put(ro)
                 else:
@@ -323,7 +323,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 self.output_handlers[output_type](eco)
                 # Fall through to default fixups in case the handler left gaps
             except Exception:
-                pass
+                logger.exception("Error in custom output handler for %s", output_type)
 
         if output_type == "image":
             self._process_image_output(eco)
