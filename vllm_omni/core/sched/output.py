@@ -19,7 +19,7 @@ class OmniNewRequestData(NewRequestData):
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
-    ) -> NewRequestData:
+    ) -> "OmniNewRequestData":
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
