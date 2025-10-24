@@ -3,19 +3,22 @@ Stage configuration for vLLM-omni multi-stage processing.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Type, Literal, Any, Dict
+from typing import Any, Dict, List, Literal, Optional, Type
+
 from vllm.config import (
-    VllmConfig,
+    CompilationConfig,
     DeviceConfig,
     LoadConfig,
     ModelConfig,
-    CompilationConfig,
+    VllmConfig,
 )
 from vllm.executor.executor_base import ExecutorBase as Executor
+
 
 @dataclass
 class DiTCacheTensor:
     """Configuration for DiT cache tensors."""
+
     name: str
     shape: List[int]
     dtype: str = "float32"
@@ -25,6 +28,7 @@ class DiTCacheTensor:
 @dataclass
 class DiTCacheConfig:
     """Configuration for DiT caching system."""
+
     cache_tensors: List[DiTCacheTensor]
     max_cache_size: int = 1024 * 1024 * 1024  # 1GB
     cache_strategy: str = "fifo"  # fifo, lru, lfu
@@ -73,38 +77,47 @@ class OmniStageConfig:
     executor_class: Type[Executor] = None  # Will be set based on engine_type
     default_stage_args: Optional[Dict[str, Any]] = None
     stage_output: Optional[Any] = None
-    
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.engine_type not in ["AR", "DiT"]:
-            raise ValueError(f"Invalid engine_type: {self.engine_type}. Must be 'AR' or 'DiT'")
-        
+            raise ValueError(
+                f"Invalid engine_type: {self.engine_type}. Must be 'AR' or 'DiT'"
+            )
+
         if self.engine_type == "DiT" and self.dit_config is None:
             raise ValueError("DiT engine requires dit_config")
-        
+
         if not self.input_modalities:
             raise ValueError("input_modalities cannot be empty")
-        
+
         if not self.output_modalities:
             raise ValueError("output_modalities cannot be empty")
-    
+
     def get_executor_class(self) -> Type[Executor]:
         """Get the appropriate executor class for this stage."""
         if self.executor_class is not None:
             return self.executor_class
-        
+
         if self.engine_type == "AR":
             from vllm.executor.uniproc_executor import UniProcExecutor
+
             return UniProcExecutor
         elif self.engine_type == "DiT":
             if self.dit_config and self.dit_config.use_diffusers:
-                from vllm_omni.executor.diffusers_executor import DiffusersPipelineExecutor
+                from vllm_omni.executor.diffusers_executor import (
+                    DiffusersPipelineExecutor,
+                )
+
                 return DiffusersPipelineExecutor
             else:
                 from vllm.executor.uniproc_executor import UniProcExecutor
+
                 return UniProcExecutor
-        
-        raise ValueError(f"No executor class available for engine_type: {self.engine_type}")
+
+        raise ValueError(
+            f"No executor class available for engine_type: {self.engine_type}"
+        )
 
 
 def create_ar_stage_config(
@@ -121,7 +134,7 @@ def create_ar_stage_config(
         input_modalities = ["text"]
     if output_modalities is None:
         output_modalities = ["text"]
-    
+
     # For now, we'll create minimal configs
     # vllm_config and executor_class will be handled by the LLM class
     return OmniStageConfig(
@@ -150,7 +163,7 @@ def create_dit_stage_config(
         input_modalities = ["text"]
     if output_modalities is None:
         output_modalities = ["image"]
-    
+
     if dit_config is None:
         dit_config = DiTConfig(num_inference_steps=50)
 

@@ -7,8 +7,9 @@ class OmniScheduler(VLLMScheduler):
     """
     OmniScheduler: Scheduler for vLLM-omni multimodal processing.
 
-    This scheduler extends vLLM's scheduler to support multimodal and non-autoregressive
-    processing with additional fields and methods specific to vLLM-omni.
+    This scheduler extends vLLM's scheduler to support multimodal and
+    non-autoregressive processing with additional fields and methods
+    specific to vLLM-omni.
     """
 
     # Ensure scheduled_new_reqs carry omni-specific payloads (e.g., additional_information)

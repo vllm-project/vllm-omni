@@ -3,8 +3,7 @@ CLI entry point for vLLM-omni that intercepts vLLM commands.
 """
 
 import sys
-import argparse
-from typing import List, Optional
+
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 
 
@@ -19,6 +18,7 @@ def main():
     else:
         # Forward to original vLLM CLI
         from vllm.entrypoints.cli.main import main as vllm_main
+
         vllm_main()
 
 

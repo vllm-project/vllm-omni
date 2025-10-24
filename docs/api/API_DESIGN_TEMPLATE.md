@@ -73,20 +73,20 @@ from enum import Enum
 
 class DiTCacheManager:
     """Manages DiT cache for diffusion models."""
-    
+
     def __init__(self, config: DiTCacheConfig):
         self.config = config
         self.cache = {}
         self.cache_stats = {}
-    
+
     async def get_cache(self, cache_key: str) -> Optional[Any]:
         """Retrieve cached data."""
         pass
-    
+
     async def set_cache(self, cache_key: str, data: Any) -> None:
         """Store data in cache."""
         pass
-    
+
     async def invalidate_cache(self, cache_key: str) -> None:
         """Invalidate cached data."""
         pass
@@ -103,7 +103,7 @@ class OmniScheduler():
         self.scheduler = self._create_scheduler()
         self.cache_manager = DiTCacheManager(config.dit_cache_config)
         self._running = False
-    
+
     def _create_scheduler(self) -> BaseScheduler:
         """Factory method to create appropriate scheduler."""
         if self.config.scheduler_type == SchedulerType.FIFO:
@@ -118,13 +118,13 @@ class OmniScheduler():
     async def schedule(self, request: OmniRequest) -> bool:
         """
         Schedule a request for processing.
-        
+
         Args:
             request: The request to schedule
-            
+
         Returns:
             bool: True if successfully scheduled, False otherwise
-            
+
         Raises:
             SchedulerError: If scheduling fails
             QueueFullError: If queue is at capacity
@@ -137,7 +137,7 @@ class OmniScheduler():
     def update_config(self, new_config: SchedulerConfig) -> None:
         """Update scheduler configuration."""
         pass
-    
+
     def get_config(self) -> SchedulerConfig:
         """Get current configuration."""
         pass
@@ -149,12 +149,12 @@ class OmniScheduler():
         """Start the scheduler."""
         self._running = True
         # Start background tasks
-    
+
     async def stop(self) -> None:
         """Stop the scheduler gracefully."""
         self._running = False
         # Cleanup resources
-    
+
     async def shutdown(self) -> None:
         """Force shutdown the scheduler."""
         # Immediate cleanup
@@ -170,7 +170,7 @@ class OmniScheduler():
             "processed_requests": self.scheduler.processed_count(),
             "cache_hit_rate": self.cache_manager.get_hit_rate()
         }
-    
+
     def get_metrics(self) -> Dict[str, float]:
         """Get performance metrics."""
         pass
@@ -182,21 +182,21 @@ class OmniScheduler():
 @dataclass
 class OmniConfig:
     """Configuration for the core module."""
-    
+
     # Scheduler configuration
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    
+
     # Cache configuration
     dit_cache: DiTCacheConfig = field(default_factory=DiTCacheConfig)
-    
+
     # Resource limits
     max_memory_gb: float = 16.0
     max_gpu_utilization: float = 0.8
-    
+
     # Timeouts
     request_timeout: int = 300
     worker_timeout: int = 60
-    
+
     def validate(self) -> None:
         """Validate configuration parameters."""
         if self.max_memory_gb <= 0:
