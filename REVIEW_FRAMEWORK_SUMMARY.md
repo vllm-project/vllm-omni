@@ -11,7 +11,7 @@ Since direct access to PR #20 was not available through the GitHub API (due to a
 ## 📚 Documentation Created
 
 ### 1. Core Review Guide
-**[AI Expert PR Review Guide](./AI_EXPERT_PR_REVIEW_GUIDE.md)** (15KB, ~400 lines)
+**[AI Expert PR Review Guide](./docs/AI_EXPERT_PR_REVIEW_GUIDE.md)** (15KB, ~400 lines)
 
 A comprehensive guide covering:
 - ✅ Technical correctness criteria for AI/ML systems
@@ -33,7 +33,7 @@ A comprehensive guide covering:
 - Addresses GPU memory management and optimization
 
 ### 2. Quick Reference Guide
-**[AI Review Quick Reference](./AI_REVIEW_QUICK_REFERENCE.md)** (10KB, ~300 lines)
+**[AI Review Quick Reference](./docs/AI_REVIEW_QUICK_REFERENCE.md)** (10KB, ~300 lines)
 
 A practical quick-reference guide with:
 - ⚡ 5-minute quick checks
@@ -50,7 +50,7 @@ A practical quick-reference guide with:
 - Tensor operation best practices
 
 ### 3. Step-by-Step Review Guide
-**[How to Review PR #20](./HOW_TO_REVIEW_PR20.md)** (11KB, ~350 lines)
+**[How to Review PR #20](./docs/HOW_TO_REVIEW_PR20.md)** (11KB, ~350 lines)
 
 Practical instructions for conducting the review:
 - 📋 Prerequisites and setup
@@ -68,7 +68,7 @@ Practical instructions for conducting the review:
 - FAQ section
 
 ### 4. PR #20 Review Template
-**[PR #20 Review Template](./PR_20_REVIEW.md)** (10KB, ~300 lines)
+**[PR #20 Review Template](./docs/PR_20_REVIEW.md)** (10KB, ~300 lines)
 
 A structured template for documenting the review:
 - 📝 Executive summary section
@@ -86,7 +86,7 @@ A structured template for documenting the review:
 - Ready to use once PR #20 is accessed
 
 ### 5. Documentation Index
-**[docs/README.md](./README.md)** (6KB, ~200 lines)
+**[docs/README.md](./docs/README.md)** (6KB, ~200 lines)
 
 Navigation guide for all documentation:
 - 📚 Complete documentation structure
@@ -98,22 +98,22 @@ Navigation guide for all documentation:
 
 ### For Reviewing PR #20
 
-1. **Start Here**: Read [AI Expert PR Review Guide](./AI_EXPERT_PR_REVIEW_GUIDE.md)
+1. **Start Here**: Read [AI Expert PR Review Guide](./docs/AI_EXPERT_PR_REVIEW_GUIDE.md)
    - Understand the review principles
    - Learn about multi-modal AI considerations
    - Review the comprehensive checklist
 
-2. **Access PR #20**: Follow [How to Review PR #20](./HOW_TO_REVIEW_PR20.md)
+2. **Access PR #20**: Follow [How to Review PR #20](./docs/HOW_TO_REVIEW_PR20.md)
    - Navigate to: https://github.com/hsliuustc0106/vllm-omni/pull/20
    - Set up local testing environment
    - Follow step-by-step review process
 
-3. **During Review**: Use [AI Review Quick Reference](./AI_REVIEW_QUICK_REFERENCE.md)
+3. **During Review**: Use [AI Review Quick Reference](./docs/AI_REVIEW_QUICK_REFERENCE.md)
    - Quick checks for common issues
    - Code pattern validation
    - Performance profiling
 
-4. **Document Findings**: Fill in [PR #20 Review Template](./PR_20_REVIEW.md)
+4. **Document Findings**: Fill in [PR #20 Review Template](./docs/PR_20_REVIEW.md)
    - Record all findings
    - Categorize by severity
    - Make final recommendation
@@ -217,9 +217,9 @@ This framework is not limited to PR #20. It can be used for:
 ### To Review PR #20
 
 1. **Access the PR**: Visit https://github.com/hsliuustc0106/vllm-omni/pull/20
-2. **Read the framework**: Start with [AI Expert PR Review Guide](./AI_EXPERT_PR_REVIEW_GUIDE.md)
-3. **Follow the process**: Use [How to Review PR #20](./HOW_TO_REVIEW_PR20.md)
-4. **Document review**: Fill in [PR #20 Review Template](./PR_20_REVIEW.md)
+2. **Read the framework**: Start with [AI Expert PR Review Guide](./docs/AI_EXPERT_PR_REVIEW_GUIDE.md)
+3. **Follow the process**: Use [How to Review PR #20](./docs/HOW_TO_REVIEW_PR20.md)
+4. **Document review**: Fill in [PR #20 Review Template](./docs/PR_20_REVIEW.md)
 5. **Submit feedback**: Post review on GitHub PR interface
 
 ### To Improve This Framework
