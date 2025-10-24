@@ -12,7 +12,7 @@ from vllm.v1.engine import EngineCoreOutput
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
-class Stage:
+class OmniStage:
     def __init__(self, stage_config):
         self.stage_config = stage_config
         self.engine = None

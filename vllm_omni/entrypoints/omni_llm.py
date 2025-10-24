@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 import vllm.envs as envs
 
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model
-from vllm_omni.entrypoints.stage import Stage
+from vllm_omni.entrypoints.stage import OmniStage
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
@@ -40,8 +40,8 @@ class OmniLLM:
     
     def initialize_stages(self, model: str):
         for stage_config in self.stage_configs:
-            stage = Stage(stage_config)
-            stage_llm = StageLLM(model=model, **stage_config.engine_args)
+            stage = OmniStage(stage_config)
+            stage_llm = OmniStageLLM(model=model, **stage_config.engine_args)
             stage.set_engine(stage_llm)
             self.stage_list.append(stage)
     
@@ -53,7 +53,8 @@ class OmniLLM:
     ) -> list[OmniRequestOutput]:
         """Generate text outputs for the given prompts."""
         final_outputs: list[OmniRequestOutput] = []
-        assert len(sampling_params_list) == len(self.stage_list), "sampling_params_list must be a list of length equal to the number of stages"
+        if len(sampling_params_list) != len(self.stage_list):
+            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
         for stage_id, stage in enumerate(self.stage_list):
             if stage_id > 0:
                 engine_inputs = stage.process_engine_inputs(self.stage_list, prompts)
@@ -68,14 +69,14 @@ class OmniLLM:
                     request_output=engine_outputs))
         return final_outputs
     
-    def _run_generation(self, stage: Stage, sampling_params: SamplingParams, prompts: Union[PromptType, Sequence[PromptType]]):
+    def _run_generation(self, stage: OmniStage, sampling_params: SamplingParams, prompts: Union[PromptType, Sequence[PromptType]]):
         engine_outputs = []
         for ro in stage.engine.generate(prompts, sampling_params):
             engine_outputs.append(ro)
         return engine_outputs
 
 
-class StageLLM(LLM): 
+class OmniStageLLM(LLM): 
     def __init__(self, 
                 model: str, 
                 compilation_config: Optional[Union[int, dict[str, Any],

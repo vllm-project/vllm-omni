@@ -6,7 +6,13 @@ from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 def thinker2talker(stage_list, engine_input_source, prompt: Union[OmniTokensPrompt, TextPrompt] = None):
+    if not engine_input_source:
+      raise ValueError("engine_input_source cannot be empty")
     source_stage_id = engine_input_source[0]
+    if source_stage_id >= len(stage_list):
+      raise IndexError(f"Invalid stage_id: {source_stage_id}")
+    if stage_list[source_stage_id].engine_outputs is None:
+        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
     thinker_outputs = stage_list[source_stage_id].engine_outputs
     talker_inputs = []
     multi_modal_data = {thinker_output.request_id: 
