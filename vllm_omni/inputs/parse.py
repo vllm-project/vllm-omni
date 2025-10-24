@@ -8,7 +8,7 @@ def parse_singleton_prompt_omni(prompt: SingletonPrompt) -> ParsedSingletonPromp
     elif isinstance(prompt, dict):
         # Type ignores are because mypy does not correctly infer the TypedDicts
         # Pyright does succeed.
-        # 优先 tokens：当 tokens 与 embeds 同在时，保留两者并走 tokens 路径
+        # Priority tokens: When both tokens and embeds exist, keep both and follow the tokens path
         if "prompt_token_ids" in prompt:
             return ParsedTokensPrompt(
                 type="tokens", content=prompt)  # type: ignore[typeddict-item]

@@ -14,10 +14,11 @@ from vllm.config import VllmConfig
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm.platforms import current_platform
 
 from vllm.v1.engine.processor import Processor
 from vllm_omni.engine import PromptEmbedsPayload, AdditionalInformationPayload, AdditionalInformationEntry, OmniEngineCoreRequest
-
+import torch
 
 class OmniProcessor(Processor):
     def __init__(self, 
@@ -71,7 +72,6 @@ class OmniProcessor(Processor):
             lora_request=lora_request,
             return_mm_hashes=return_mm_hashes,
         )
-        from vllm.platforms import current_platform
         current_platform.validate_request(
             prompt=prompt,
             params=params,
@@ -157,8 +157,7 @@ class OmniProcessor(Processor):
         prompt_embeds_payload: Optional[PromptEmbedsPayload] = None
         additional_information_payload: Optional[AdditionalInformationPayload] = None
         if "prompt_embeds" in decoder_inputs:  # type: ignore[operator]
-            import numpy as np
-            import torch
+
             pe: torch.Tensor = decoder_inputs["prompt_embeds"]  # type: ignore[index]
             if pe.ndim != 2:
                 raise ValueError(
@@ -174,8 +173,6 @@ class OmniProcessor(Processor):
                 dtype=dtype_str,
             )
         if "additional_information" in decoder_inputs:  # type: ignore[operator]
-            import numpy as np
-            import torch
             raw_info: dict[str, Any] = decoder_inputs["additional_information"]  # type: ignore[index]
             entries: dict[str, AdditionalInformationEntry] = {}
             for key, value in raw_info.items():
