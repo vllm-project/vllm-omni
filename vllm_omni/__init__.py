@@ -15,9 +15,7 @@ Architecture:
 __version__ = "0.1.0"
 __author__ = "vLLM-omni Team"
 __email__ = "hsliuustc@gmail.com"
-
-# Main entry points
-from .entrypoints.omni_llm import OmniLLM
+from . import patch
 from .config import (
     DiTCacheConfig,
     DiTConfig,
@@ -27,7 +25,7 @@ from .config import (
 )
 
 # Main entry points
-from .entrypoints.omni_llm import OmniLLM #AsyncOmniLLM, 
+from .entrypoints.omni_llm import AsyncOmniLLM, OmniLLM
 
 __all__ = [
     # Version info
@@ -36,8 +34,7 @@ __all__ = [
     "__email__",
     # Main components
     "OmniLLM",
-    #AsyncOmniLLM is not supported yet
-    
+    "AsyncOmniLLM",
     # Configuration
     "OmniStageConfig",
     "DiTConfig",
