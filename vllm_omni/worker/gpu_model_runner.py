@@ -123,7 +123,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             try:
                 if getattr(new_req_data, "prompt_embeds", None) is not None:
                     payload = new_req_data.prompt_embeds
-                    import numpy as np
                     dtype = getattr(np, payload.dtype)
                     arr = np.frombuffer(payload.data, dtype=dtype)
                     arr = arr.reshape(payload.shape)
@@ -147,7 +146,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                     else:
                         from vllm.v1.engine import AdditionalInformationPayload
                         if isinstance(payload_info, AdditionalInformationPayload):
-                            import numpy as np
                             for k, entry in payload_info.entries.items():
                                 if entry.tensor_data is not None:
                                     dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
@@ -613,7 +611,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
     
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor) -> dict:
+    def extract_multimodal_outputs(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, dict]:
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
@@ -736,7 +734,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             else:
                 hidden_states = outputs
 
-            logger.warning(f"Multimodal outputs are not returned in the dummy run, need to double check the implementation!")
             text_hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
 
