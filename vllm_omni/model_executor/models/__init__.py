@@ -1,1 +1,1 @@
-from .registry import OmniModelsRegistry
+from .registry import OmniModelRegistry
