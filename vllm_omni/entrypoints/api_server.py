@@ -116,9 +116,9 @@ async def get_info():
     return {
         "service": "vllm-omni",
         "version": "0.1.0",
-        "num_stages": omni_llm.get_num_stages()
-        if hasattr(omni_llm, "get_num_stages")
-        else 0,
+        "num_stages": (
+            omni_llm.get_num_stages() if hasattr(omni_llm, "get_num_stages") else 0
+        ),
         "stage_configs": [
             {
                 "stage_id": config.stage_id,
