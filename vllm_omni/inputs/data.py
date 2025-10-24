@@ -1,6 +1,7 @@
-from vllm.inputs.data import TokensPrompt, EmbedsPrompt, TokenInputs
 from typing import Any, NotRequired, Optional
+
 import torch
+from vllm.inputs.data import EmbedsPrompt, TokenInputs, TokensPrompt
 
 
 class OmniTokensPrompt(TokensPrompt):

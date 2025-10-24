@@ -5,10 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from ..config import DiTConfig
-from ..worker.gpu_diffusion_worker import (
-    DiffusionGPUWorker,
-    DiffusionRunnerOutput,
-)
+from ..worker.gpu_diffusion_worker import DiffusionGPUWorker, DiffusionRunnerOutput
 
 
 class DiffusionEngine:
@@ -27,14 +24,12 @@ class DiffusionEngine:
         config_model_path = None
         if model_cfg is not None:
             if isinstance(model_cfg, dict):
-                config_model_path = (
-                    model_cfg.get("model")
-                    or model_cfg.get("model_path")
+                config_model_path = model_cfg.get("model") or model_cfg.get(
+                    "model_path"
                 )
             else:
-                config_model_path = (
-                    getattr(model_cfg, "model", None)
-                    or getattr(model_cfg, "model_path", None)
+                config_model_path = getattr(model_cfg, "model", None) or getattr(
+                    model_cfg, "model_path", None
                 )
 
         self.model_path = model_path or config_model_path
@@ -116,9 +111,7 @@ class DiffusersPipelineEngine(DiffusionEngine):
             else self.num_inference_steps
         )
         guidance = (
-            float(guidance_scale)
-            if guidance_scale is not None
-            else self.guidance_scale
+            float(guidance_scale) if guidance_scale is not None else self.guidance_scale
         )
 
         return self.worker.generate(

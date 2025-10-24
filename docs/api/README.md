@@ -157,10 +157,10 @@ Each API template follows this standardized structure:
    # Clone the repository
    git clone https://github.com/hsliuustc0106/vllm-omni.git
    cd vllm-omni
-   
+
    # Install dependencies
    pip install -r requirements-dev.txt
-   
+
    # Set up pre-commit hooks
    pre-commit install
    ```

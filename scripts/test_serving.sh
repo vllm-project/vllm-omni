@@ -99,15 +99,15 @@ print('✅ All imports successful')
 start_server() {
     log_info "Starting vLLM-omni server on port $PORT..."
     log_info "Command: vllm serve $MODEL_PATH --omni --port $PORT"
-    
+
     # Start server in background
     vllm serve "$MODEL_PATH" --omni --port "$PORT" > server.log 2>&1 &
     SERVER_PID=$!
-    
+
     log_info "Server started with PID: $SERVER_PID"
     log_info "Waiting $SERVER_STARTUP_WAIT seconds for server to initialize..."
     sleep $SERVER_STARTUP_WAIT
-    
+
     # Check if server is still running
     if ! kill -0 $SERVER_PID 2>/dev/null; then
         log_error "Server failed to start"
@@ -115,7 +115,7 @@ start_server() {
         cat server.log
         exit 1
     fi
-    
+
     log_success "Server appears to be running"
 }
 
@@ -146,7 +146,7 @@ test_info() {
     local response=$(curl -s -w "%{http_code}" http://$HOST:$PORT/info 2>/dev/null || echo "000")
     local http_code="${response: -3}"
     local body="${response%???}"
-    
+
     if [ "$http_code" = "200" ]; then
         log_success "Info endpoint working"
         echo "$body" | python -m json.tool 2>/dev/null || log_warning "Info response not valid JSON"
@@ -159,13 +159,13 @@ test_info() {
 # Test text generation
 test_generation() {
     log_info "Testing text generation..."
-    
+
     # Test 1: Simple generation
     local response=$(curl -s -X POST http://$HOST:$PORT/generate \
         -H "Content-Type: application/json" \
         -d '{"prompts": ["Test the server functionality"], "max_tokens": 20, "temperature": 0.7}' \
         2>/dev/null || echo "{}")
-    
+
     if echo "$response" | python -c "import sys, json; data=json.load(sys.stdin); exit(0 if 'outputs' in data and len(data['outputs']) > 0 else 1)" 2>/dev/null; then
         log_success "Text generation test passed"
         echo "$response" | python -c "import sys, json; data=json.load(sys.stdin); print('Generated text:', data['outputs'][0]['text'][:100] + '...' if len(data['outputs'][0]['text']) > 100 else data['outputs'][0]['text'])" 2>/dev/null
@@ -271,7 +271,7 @@ test_simple_usage() {
 # Performance test
 test_performance() {
     log_info "Running performance test..."
-    
+
     local start_time=$(date +%s)
     local response=$(curl -s -X POST http://$HOST:$PORT/generate \
         -H "Content-Type: application/json" \
@@ -279,7 +279,7 @@ test_performance() {
         2>/dev/null)
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
-    
+
     if echo "$response" | python -c "import sys, json; data=json.load(sys.stdin); exit(0 if 'outputs' in data else 1)" 2>/dev/null; then
         log_success "Performance test passed (${duration}s response time)"
     else
@@ -295,16 +295,16 @@ run_tests() {
     log_info "Port: $PORT"
     log_info "Host: $HOST"
     echo "=========================================="
-    
+
     # Run all tests
     check_model
     check_environment
     test_imports
     start_server
-    
+
     # Wait a bit more for server to be fully ready
     sleep 5
-    
+
     test_health
     test_info
     test_generation
@@ -348,13 +348,13 @@ main() {
         show_usage
         exit 0
     fi
-    
+
     # Change to script directory
     cd "$(dirname "$0")/.."
-    
+
     # Create logs directory if it doesn't exist
     mkdir -p logs
-    
+
     # Run tests
     run_tests
 }

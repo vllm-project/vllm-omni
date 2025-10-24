@@ -136,7 +136,7 @@ class OmniLLM(LLM):
         self.engine_list: List[LLMEngine] = []
         self.output_processor = MultimodalOutputProcessor()
         self._initialize_stage_engines()
-    
+
     def _initialize_stage_engines(self) -> None:
         """Initialize LLMEngine instances for each stage"""
         for stage_config in self.stage_configs:
@@ -145,24 +145,24 @@ class OmniLLM(LLM):
             elif stage_config.engine_type == "DiT":
                 engine = self._create_dit_engine(stage_config)
             self.engine_list.append(engine)
-    
+
     def generate(self, stage_args_list: List[Dict], **kwargs) -> List[RequestOutput]:
         """Main generation interface - orchestrates multi-stage processing"""
         current_output = None
-        
+
         for i, (stage_config, stage_args) in enumerate(zip(self.stage_configs, stage_args_list)):
             stage_engine = self.engine_list[i]
-            
+
             # Prepare input for this stage
             processed_input = self._process_stage_inputs(stage_config, stage_args, current_output)
-            
+
             # Execute stage
             stage_output = self._execute_stage(stage_engine, processed_input)
-            
+
             # Update for next stage
             current_output = stage_output
             stage_config.stage_output = stage_output
-        
+
         # Process final output
         return self.output_processor.process_output(current_output)
 ```
@@ -178,7 +178,7 @@ class AsyncOmniLLM(AsyncLLM):
         self.async_engine_list: List[AsyncLLM] = []
         self.output_processor = MultimodalOutputProcessor()
         self._initialize_async_stage_engines()
-    
+
     async def generate_async(self, stage_args_list: List[Dict], **kwargs) -> List[RequestOutput]:
         """Async generation interface"""
         # Similar to OmniLLM but with async/await patterns
@@ -241,7 +241,7 @@ class MultimodalOutputProcessor(OutputProcessor):
             "latents": self._process_latents_output,
             "text": self._process_text_output,
         }
-    
+
     def process_outputs(self, engine_core_outputs: List[EngineCoreOutput], ...):
         """Process multimodal outputs based on type"""
         for engine_core_output in engine_core_outputs:

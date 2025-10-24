@@ -1,13 +1,14 @@
-from vllm.v1.worker.gpu_worker import Worker as GPUWorker
-import torch
-import os
 import gc
-from vllm.utils import GiB_bytes, MemorySnapshot
-from vllm.platforms import current_platform
-from vllm.worker.worker import _check_if_gpu_supports_dtype
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+import os
+
+import torch
 from vllm.model_executor import set_random_seed
+from vllm.platforms import current_platform
+from vllm.utils import GiB_bytes, MemorySnapshot
 from vllm.v1.utils import report_usage_stats
+from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.worker.worker import _check_if_gpu_supports_dtype
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
@@ -34,10 +35,15 @@ class GPUARWorker(GPUWorker):
 
             # take current memory snapshot
             self.init_snapshot = MemorySnapshot()
-            self.requested_memory = (self.init_snapshot.total_memory *
-                                     self.cache_config.gpu_memory_utilization)
+            self.requested_memory = (
+                self.init_snapshot.total_memory
+                * self.cache_config.gpu_memory_utilization
+            )
             if self.init_snapshot.free_memory < self.requested_memory:
-                GiB = lambda b: round(b / GiB_bytes, 2)
+
+                def GiB(b):
+                    return round(b / GiB_bytes, 2)
+
                 raise ValueError(
                     f"Free memory on device "
                     f"({GiB(self.init_snapshot.free_memory)}/"
@@ -48,19 +54,22 @@ class GPUARWorker(GPUWorker):
                     f"utilization or reduce GPU memory used by other processes."
                 )
         else:
-            raise RuntimeError(
-                f"Not support device type: {self.device_config.device}")
+            raise RuntimeError(f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
-        init_worker_distributed_environment(self.vllm_config, self.rank,
-                                            self.distributed_init_method,
-                                            self.local_rank,
-                                            current_platform.dist_backend)
+        init_worker_distributed_environment(
+            self.vllm_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+            current_platform.dist_backend,
+        )
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
         self.model_runner: GPUARModelRunner = GPUARModelRunner(
-            self.vllm_config, self.device)
+            self.vllm_config, self.device
+        )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

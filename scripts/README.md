@@ -106,4 +106,3 @@ python scripts/download_models.py
 - `server.log`: Server startup and runtime logs
 - `api_client_test.log`: API client test results
 - `simple_usage_test.log`: Simple usage test results
-

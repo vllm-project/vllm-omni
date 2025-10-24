@@ -176,7 +176,6 @@ tests/
 
 # vLLM-omni specific
 # Model files and checkpoints
-models/
 checkpoints/
 *.bin
 *.safetensors

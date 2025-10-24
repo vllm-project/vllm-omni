@@ -2,23 +2,28 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union
 
+import torch
+from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.lora.request import LoRARequest
-from vllm.multimodal import MultiModalKwargs
+from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs, MultiModalRegistry
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.multimodal.utils import merge_and_sort_multimodal_metadata
+from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.config import VllmConfig
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
-from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm_omni.inputs.preprocess import OmniInputPreprocessor
-from vllm.platforms import current_platform
-
 from vllm.v1.engine.processor import Processor
-from vllm_omni.engine import PromptEmbedsPayload, AdditionalInformationPayload, AdditionalInformationEntry, OmniEngineCoreRequest
-import torch
+
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PromptEmbedsPayload,
+)
+from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+
 
 class OmniProcessor(Processor):
     @staticmethod
@@ -42,15 +47,17 @@ class OmniProcessor(Processor):
             torch.bool: "bool",
         }
         return mapping.get(dtype, str(dtype).replace("torch.", ""))
-    def __init__(self, 
-                 vllm_config: VllmConfig,
-                 tokenizer: TokenizerGroup,
-                 mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
-                 ):
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        tokenizer: TokenizerGroup,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+    ):
         super().__init__(vllm_config, tokenizer, mm_registry)
-        self.input_preprocessor = OmniInputPreprocessor(self.model_config,
-                                                    self.tokenizer,
-                                                    mm_registry)
+        self.input_preprocessor = OmniInputPreprocessor(
+            self.model_config, self.tokenizer, mm_registry
+        )
 
     def process_inputs(
         self,
@@ -73,10 +80,13 @@ class OmniProcessor(Processor):
             raise ValueError("V1 does not support tracing yet.")
 
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
-        if data_parallel_rank is not None and not (0 <= data_parallel_rank <
-                                                   data_parallel_size):
-            raise ValueError(f"data_parallel_rank {data_parallel_rank} "
-                             f"is out of range [0, {data_parallel_size}).")
+        if data_parallel_rank is not None and not (
+            0 <= data_parallel_rank < data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank {data_parallel_rank} "
+                f"is out of range [0, {data_parallel_size})."
+            )
 
         if arrival_time is None:
             arrival_time = time.time()
@@ -85,8 +95,9 @@ class OmniProcessor(Processor):
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
         #   multimodal data and expand prompt token ids accordingly.
-        return_mm_hashes = (self.model_config.processor_return_mm_hashes
-                            or bool(self.cache_config.enable_prefix_caching))
+        return_mm_hashes = self.model_config.processor_return_mm_hashes or bool(
+            self.cache_config.enable_prefix_caching
+        )
         processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
             prompt,
             tokenization_kwargs=tokenization_kwargs,
@@ -115,14 +126,16 @@ class OmniProcessor(Processor):
             sampling_params = params.clone()
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
-                sampling_params.max_tokens = (
-                    self.model_config.max_model_len -
-                    len(decoder_inputs["prompt_token_ids"]))
+                sampling_params.max_tokens = self.model_config.max_model_len - len(
+                    decoder_inputs["prompt_token_ids"]
+                )
             sampling_params.update_from_generation_config(
-                self.generation_config_fields, eos_token_id)
+                self.generation_config_fields, eos_token_id
+            )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(
-                    self.tokenizer.get_lora_tokenizer(lora_request))
+                    self.tokenizer.get_lora_tokenizer(lora_request)
+                )
         else:
             pooling_params = params.clone()
 
@@ -159,22 +172,23 @@ class OmniProcessor(Processor):
                     items = decoder_mm_inputs.get_items(modality)
                     item = items[used_indices[modality]]
 
-                    orig_sorted_mm_inputs.append(
-                        MultiModalKwargs.from_items([item]))
+                    orig_sorted_mm_inputs.append(MultiModalKwargs.from_items([item]))
                     used_indices[modality] += 1
             else:
                 orig_sorted_mm_inputs = [
-                    MultiModalKwargs.from_items([item]) for item in
-                    decoder_mm_inputs.get_items(sorted_item_modalities[0])
+                    MultiModalKwargs.from_items([item])
+                    for item in decoder_mm_inputs.get_items(sorted_item_modalities[0])
                 ]
 
             if sorted_mm_hashes is not None:
                 sorted_mm_inputs = self.mm_input_cache_client.get_and_update(
-                    orig_sorted_mm_inputs, sorted_mm_hashes)
+                    orig_sorted_mm_inputs, sorted_mm_hashes
+                )
             else:
                 sorted_mm_inputs = orig_sorted_mm_inputs
-        
-        # Serialize prompt_embeds and additional_information if provided (direct-transfer path)
+
+        # Serialize prompt_embeds and additional_information if provided
+        # (direct-transfer path)
         prompt_embeds_payload: Optional[PromptEmbedsPayload] = None
         additional_information_payload: Optional[AdditionalInformationPayload] = None
         if "prompt_embeds" in decoder_inputs:  # type: ignore[operator]
@@ -182,7 +196,8 @@ class OmniProcessor(Processor):
             pe: torch.Tensor = decoder_inputs["prompt_embeds"]  # type: ignore[index]
             if pe.ndim != 2:
                 raise ValueError(
-                    "prompt_embeds must be of shape (seq_len, hidden_size)")
+                    "prompt_embeds must be of shape (seq_len, hidden_size)"
+                )
             # Move to CPU and ensure contiguous memory for stable serialization
             pe_cpu = pe.detach().to("cpu").contiguous()
             seq_len, hidden_size = pe_cpu.shape
@@ -194,7 +209,7 @@ class OmniProcessor(Processor):
                 dtype=dtype_str,
             )
         if "additional_information" in decoder_inputs:  # type: ignore[operator]
-            raw_info: dict[str, Any] = decoder_inputs["additional_information"]  # type: ignore[index]
+            raw_info: dict[str, Any] = decoder_inputs["additional_information"]  # type: ignore[index]  # noqa: E501
             entries: dict[str, AdditionalInformationEntry] = {}
             for key, value in raw_info.items():
                 if isinstance(value, torch.Tensor):
@@ -210,10 +225,12 @@ class OmniProcessor(Processor):
                     entry = AdditionalInformationEntry(list_data=value)
                 else:
                     raise ValueError(
-                        "additional_information values must be Tensor or list")
+                        "additional_information values must be Tensor or list"
+                    )
                 entries[key] = entry
             additional_information_payload = AdditionalInformationPayload(
-                entries=entries)
+                entries=entries
+            )
 
         return decoder_inputs.get("prompt"), OmniEngineCoreRequest(
             request_id=request_id,

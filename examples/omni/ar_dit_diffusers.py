@@ -10,8 +10,8 @@ from typing import Dict, List
 import yaml
 
 from vllm_omni import (
-    OmniLLM,
     DiTConfig,
+    OmniLLM,
     create_ar_stage_config,
     create_dit_stage_config,
 )
