@@ -2,49 +2,52 @@
 #      Start Token2Wav     #
 ############################
 
-from typing import Iterable, Optional, Set, Tuple, List, Union
+import math
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import math
 from torch.nn import Parameter
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+    Qwen2_5OmniBigVGANConfig,
+    Qwen2_5OmniDiTConfig,
+    Qwen2_5OmniToken2WavConfig,
+)
+from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+    Qwen2_5OmniPreTrainedModel,
+)
 
+# Bring in HF base classes, configs and utilities used below
+from transformers.utils.logging import get_logger as _hf_get_logger
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.sequence import IntermediateTensors
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader as _Vllm_AutoWeightsLoader,
-    WeightsMapper as _Vllm_WeightsMapper,
+)
+from vllm.model_executor.models.utils import WeightsMapper as _Vllm_WeightsMapper
+from vllm.model_executor.models.utils import (
     init_vllm_registered_model as _Vllm_init_vllm_registered_model,
-    maybe_prefix as _Vllm_maybe_prefix,
 )
+from vllm.model_executor.models.utils import maybe_prefix as _Vllm_maybe_prefix
+from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.sequence import IntermediateTensors
 
-# Bring in HF base classes, configs and utilities used below
-from transformers.utils import ModelOutput
-from transformers.utils.logging import get_logger as _hf_get_logger
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
-    Qwen2_5OmniPreTrainedModel,
-    Qwen2_5OmniPreTrainedModelForConditionalGeneration,
-)
-from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-    Qwen2_5OmniDiTConfig,
-    Qwen2_5OmniBigVGANConfig,
-    Qwen2_5OmniToken2WavConfig,
-)
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
 def auto_docstring(func=None, **_kwargs):
     if func is None:
+
         def wrapper(f):
             return f
+
         return wrapper
     return func
+
 
 # HF logger alias
 logger = _hf_get_logger(__name__)
@@ -183,7 +186,7 @@ class AttentiveStatisticsPooling(nn.Module):
     def _length_to_mask(self, length, max_len=None, dtype=None, device=None):
         """Creates a binary mask for each sequence.
 
-        Reference: https://discuss.pytorch.org/t/how-to-generate-variable-length-mask/23397/3
+        Reference: https://discuss.pytorch.org/t/how-to-generate-variable-length-mask/23397/3  # noqa: E501
 
         Arguments
         ---------
@@ -213,7 +216,9 @@ class AttentiveStatisticsPooling(nn.Module):
 
     def _compute_statistics(self, x, m, dim=2):
         mean = (m * x).sum(dim)
-        std = torch.sqrt((m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(self.eps))
+        std = torch.sqrt(
+            (m * (x - mean.unsqueeze(dim)).pow(2)).sum(dim).clamp(self.eps)
+        )
         return mean, std
 
     def forward(self, hidden_states):
@@ -222,7 +227,10 @@ class AttentiveStatisticsPooling(nn.Module):
 
         # Make binary mask of shape [N, 1, L]
         mask = self._length_to_mask(
-            lengths * seq_length, max_len=seq_length, dtype=hidden_states.dtype, device=hidden_states.device
+            lengths * seq_length,
+            max_len=seq_length,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
         mask = mask.unsqueeze(1)
 
@@ -272,7 +280,9 @@ class SqueezeExcitationRes2NetBlock(nn.Module):
             kernel_size=1,
             dilation=1,
         )
-        self.res2net_block = Res2NetBlock(out_channels, out_channels, res2net_scale, kernel_size, dilation)
+        self.res2net_block = Res2NetBlock(
+            out_channels, out_channels, res2net_scale, kernel_size, dilation
+        )
         self.tdnn2 = TimeDelayNetBlock(
             out_channels,
             out_channels,
@@ -300,10 +310,13 @@ class ECAPA_TimeDelayNet(torch.nn.Module):
 
     def __init__(self, config: Qwen2_5OmniDiTConfig):
         super().__init__()
-        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(
-            config.enc_dilations
-        ):
-            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
+        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(
+            config.enc_channels
+        ) != len(config.enc_dilations):
+            raise ValueError(
+                "enc_channels, enc_kernel_sizes and enc_dilations should have "
+                "same length"
+            )
         self.channels = config.enc_channels
         self.blocks = nn.ModuleList()
 
@@ -397,14 +410,26 @@ class DiTInputEmbedding(nn.Module):
     ):
         if apply_cfg:
             hidden_states = torch.cat([hidden_states, hidden_states], dim=0)
-            speaker_embedding = torch.cat([speaker_embedding, torch.zeros_like(speaker_embedding)], dim=0)
-            condition_vector = torch.cat([condition_vector, torch.zeros_like(condition_vector)], dim=0)
+            speaker_embedding = torch.cat(
+                [speaker_embedding, torch.zeros_like(speaker_embedding)], dim=0
+            )
+            condition_vector = torch.cat(
+                [condition_vector, torch.zeros_like(condition_vector)], dim=0
+            )
             code_embed = torch.cat([code_embed, code_embed_uncond], dim=0)
         elif drop_audio_cond:  # cfg for cond audio
             condition_vector = torch.zeros_like(condition_vector)
             speaker_embedding = torch.zeros_like(speaker_embedding)
-        condition_vector = self.spk_encoder(condition_vector).unsqueeze(1).repeat(1, hidden_states.size(1), 1)
-        hidden_states = self.proj(torch.cat((hidden_states, condition_vector, code_embed, speaker_embedding), dim=-1))
+        condition_vector = (
+            self.spk_encoder(condition_vector)
+            .unsqueeze(1)
+            .repeat(1, hidden_states.size(1), 1)
+        )
+        hidden_states = self.proj(
+            torch.cat(
+                (hidden_states, condition_vector, code_embed, speaker_embedding), dim=-1
+            )
+        )
 
         return hidden_states
 
@@ -438,9 +463,13 @@ class Qwen2_5_OmniAdaLayerNormZero(nn.Module):
 
     def forward(self, hidden_states, emb=None):
         emb = self.linear(self.silu(emb))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(emb, 6, dim=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(
+            emb, 6, dim=1
+        )
 
-        hidden_states = self.norm(hidden_states) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        hidden_states = (
+            self.norm(hidden_states) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        )
         return hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -459,7 +488,9 @@ class Qwen2_5_OmniAdaLayerNormZero_Final(nn.Module):
         emb = self.linear(self.silu(emb))
         scale, shift = torch.chunk(emb, 2, dim=1)
 
-        hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        hidden_states = (
+            self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        )
         return hidden_states
 
 
@@ -496,14 +527,18 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         position_ids (`torch.Tensor`, *optional*):
             Deprecated and unused.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+            The 'unsqueeze_dim' argument specifies the dimension along which to
+            unsqueeze cos[position_ids] and sin[position_ids] so that they can be
+            properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape
+            [batch_size, seq_len, head_dim]. Then, if q and k have the shape
+            [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1
+            makes cos[position_ids] and sin[position_ids] broadcastable to the
+            shapes of q and k. Similarly, if q and k have the shape
+            [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
     Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated
+        using the Rotary Position Embedding.
     """
 
     def rotate_half_codec(x):
@@ -535,7 +570,9 @@ class DiTAttention(nn.Module):
         self.to_k = nn.Linear(config.hidden_size, self.inner_dim)
         self.to_v = nn.Linear(config.hidden_size, self.inner_dim)
 
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, config.hidden_size), nn.Dropout(config.dropout)])
+        self.to_out = nn.ModuleList(
+            [nn.Linear(self.inner_dim, config.hidden_size), nn.Dropout(config.dropout)]
+        )
 
     def forward(
         self,
@@ -558,9 +595,12 @@ class DiTAttention(nn.Module):
         value = value.view(batch_size, -1, self.heads, head_dim).transpose(1, 2)
 
         # apply rotary position embedding
-        # Due to training process, only first head is applied with RoPE, will be fixed at next release
+        # Due to training process, only first head is applied with RoPE,
+        # will be fixed at next release
         cos, sin = position_embeddings
-        query[:, :1], key[:, :1] = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
+        query[:, :1], key[:, :1] = apply_rotary_pos_emb(
+            query[:, :1], key[:, :1], cos, sin
+        )
 
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         attention_weights, _ = attention_interface(
@@ -572,8 +612,11 @@ class DiTAttention(nn.Module):
             is_causal=False,
         )
 
-        # mask. e.g. inference got a batch with different target durations, mask out the padding
-        attention_weights = attention_weights.reshape(batch_size, -1, self.heads * head_dim)
+        # mask. e.g. inference got a batch with different target durations,
+        # mask out the padding
+        attention_weights = attention_weights.reshape(
+            batch_size, -1, self.heads * head_dim
+        )
         attention_weights = attention_weights.to(query.dtype)
 
         # linear proj
@@ -603,7 +646,9 @@ class DiTTimestepEmbedding(nn.Module):
     def __init__(self, dim, freq_embed_dim=256):
         super().__init__()
         self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.ModuleList([nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)])
+        self.time_mlp = nn.ModuleList(
+            [nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)]
+        )
 
     def forward(self, timestep):  # noqa: F821
         time_hidden = self.time_embed(timestep)
@@ -614,21 +659,29 @@ class DiTTimestepEmbedding(nn.Module):
 
 
 class DiTDecoderLayer(nn.Module):
-    def __init__(self, config: Qwen2_5OmniDiTConfig, look_ahead_block=0, look_backward_block=0):
+    def __init__(
+        self, config: Qwen2_5OmniDiTConfig, look_ahead_block=0, look_backward_block=0
+    ):
         super().__init__()
         self.attn_norm = Qwen2_5_OmniAdaLayerNormZero(config.hidden_size)
 
         self.attn = DiTAttention(config)
         self.look_ahead_block = look_ahead_block
         self.look_backward_block = look_backward_block
-        self.ff_norm = nn.LayerNorm(config.hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ff = DiTMLP(dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout)
+        self.ff_norm = nn.LayerNorm(
+            config.hidden_size, elementwise_affine=False, eps=1e-6
+        )
+        self.ff = DiTMLP(
+            dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout
+        )
 
     def forward(
         self, hidden_states, timestep, position_embeddings=None, block_diff=None
     ):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(hidden_states, emb=timestep)
+        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(
+            hidden_states, emb=timestep
+        )
 
         # attention
         attn_output = self.attn(
@@ -641,7 +694,9 @@ class DiTDecoderLayer(nn.Module):
         # process attention output for input x
         hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
 
-        norm = self.ff_norm(hidden_states) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm = (
+            self.ff_norm(hidden_states) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        )
         ff_output = self.ff(norm)
         hidden_states = hidden_states + gate_mlp.unsqueeze(1) * ff_output
 
@@ -650,7 +705,8 @@ class DiTDecoderLayer(nn.Module):
 
 class SnakeBeta(nn.Module):
     """
-    A modified Snake function which uses separate parameters for the magnitude of the periodic components
+    A modified Snake function which uses separate parameters for the magnitude
+    of the periodic components
     Shape:
         - Input: (B, C, T)
         - Output: (B, C, T), same shape as the input
@@ -658,7 +714,8 @@ class SnakeBeta(nn.Module):
         - alpha - trainable parameter that controls frequency
         - beta - trainable parameter that controls magnitude
     References:
-        - This activation function is a modified version based on this paper by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
+        - This activation function is a modified version based on this paper
+          by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
         https://huggingface.co/papers/2006.08195
     """
 
@@ -682,9 +739,9 @@ class SnakeBeta(nn.Module):
         beta = self.beta.unsqueeze(0).unsqueeze(-1)
         alpha = torch.exp(alpha)
         beta = torch.exp(beta)
-        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
-            torch.sin(hidden_states * alpha), 2
-        )
+        hidden_states = hidden_states + (
+            1.0 / (beta + self.no_div_by_zero)
+        ) * torch.pow(torch.sin(hidden_states * alpha), 2)
 
         return hidden_states
 
@@ -714,7 +771,9 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
     else:
         beta = 0.0
 
-    kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
+    kaiser_window = torch.kaiser_window(
+        kernel_size, beta=beta, periodic=False, dtype=torch.float32
+    )
 
     # Compute time indices
     if is_even:
@@ -724,7 +783,9 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
 
     # Compute sinc filter
     if cutoff == 0:
-        return torch.zeros((1, 1, kernel_size), dtype=torch.float32)  # Ensures correct shape
+        return torch.zeros(
+            (1, 1, kernel_size), dtype=torch.float32
+        )  # Ensures correct shape
 
     sinc_filter = torch.sinc(2 * cutoff * time_indices)
     normalized_filter = 2 * cutoff * kaiser_window * sinc_filter
@@ -739,21 +800,32 @@ class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None):
         super().__init__()
         self.ratio = ratio
-        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
+        self.kernel_size = (
+            int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
+        )
         self.stride = ratio
         self.pad = self.kernel_size // ratio - 1
         self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
-        self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
+        self.pad_right = (
+            self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
+        )
 
-        filter = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
+        filter = kaiser_sinc_filter1d(
+            cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size
+        )
         self.register_buffer("filter", filter, persistent=False)
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
         hidden_states_dtype = hidden_states.dtype
-        hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate").to(self.filter.dtype)
+        hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate").to(
+            self.filter.dtype
+        )
         hidden_states = self.ratio * F.conv_transpose1d(
-            hidden_states, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels
+            hidden_states,
+            self.filter.expand(channels, -1, -1),
+            stride=self.stride,
+            groups=channels,
         ).to(hidden_states_dtype)
         hidden_states = hidden_states[..., self.pad_left : -self.pad_right]
 
@@ -781,8 +853,15 @@ class DownSample1d(nn.Module):
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
         hidden_states_dtype = hidden_states.dtype
-        hidden_states = F.pad(hidden_states, (self.pad_left, self.pad_right), mode="replicate").to(self.filter.dtype)
-        out = F.conv1d(hidden_states, self.filter.expand(channels, -1, -1), stride=self.stride, groups=channels).to(hidden_states_dtype)
+        hidden_states = F.pad(
+            hidden_states, (self.pad_left, self.pad_right), mode="replicate"
+        ).to(self.filter.dtype)
+        out = F.conv1d(
+            hidden_states,
+            self.filter.expand(channels, -1, -1),
+            stride=self.stride,
+            groups=channels,
+        ).to(hidden_states_dtype)
         return out
 
 
@@ -877,10 +956,15 @@ class AMPBlock(torch.nn.Module):
             ]
         )
 
-        self.num_layers = len(self.convs1) + len(self.convs2)  # total number of conv layers
+        self.num_layers = len(self.convs1) + len(
+            self.convs2
+        )  # total number of conv layers
 
         self.activations = nn.ModuleList(
-            [TorchActivation1d(activation=SnakeBeta(channels)) for _ in range(self.num_layers)]
+            [
+                TorchActivation1d(activation=SnakeBeta(channels))
+                for _ in range(self.num_layers)
+            ]
         )
 
     def _get_padding(self, kernel_size, dilation=1):
@@ -901,7 +985,8 @@ class AMPBlock(torch.nn.Module):
 
 @auto_docstring(
     custom_intro="""
-    The full Qwen2.5Omni Token2WavBigVGAN model. Which take mel spectrogram as input and predict waveform.
+    The full Qwen2.5Omni Token2WavBigVGAN model. Which take mel spectrogram
+    as input and predict waveform.
     """
 )
 class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
@@ -912,7 +997,9 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         self.num_residual_blocks = len(config.resblock_kernel_sizes)
         self.num_upsample_layers = len(config.upsample_rates)
 
-        self.conv_pre = nn.Conv1d(config.mel_dim, config.upsample_initial_channel, 7, 1, padding=3)
+        self.conv_pre = nn.Conv1d(
+            config.mel_dim, config.upsample_initial_channel, 7, 1, padding=3
+        )
 
         # Removing extra ModuleList breaks official state dict
         ups = [
@@ -927,31 +1014,54 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
                     )
                 ]
             )
-            for layer_idx, (stride, kernel_size) in enumerate(zip(config.upsample_rates, config.upsample_kernel_sizes))
+            for layer_idx, (stride, kernel_size) in enumerate(
+                zip(config.upsample_rates, config.upsample_kernel_sizes)
+            )
         ]
         self.ups = nn.ModuleList(ups)
 
         self.resblocks = nn.ModuleList(
             [
-                AMPBlock(config.upsample_initial_channel // (2 ** (layer_idx + 1)), kernel_size, dilation)
+                AMPBlock(
+                    config.upsample_initial_channel // (2 ** (layer_idx + 1)),
+                    kernel_size,
+                    dilation,
+                )
                 for layer_idx in range(self.num_upsample_layers)
-                for kernel_size, dilation in zip(config.resblock_kernel_sizes, config.resblock_dilation_sizes)
+                for kernel_size, dilation in zip(
+                    config.resblock_kernel_sizes, config.resblock_dilation_sizes
+                )
             ]
         )
 
         self.activation_post = TorchActivation1d(
-            activation=SnakeBeta(config.upsample_initial_channel // (2**self.num_upsample_layers))
+            activation=SnakeBeta(
+                config.upsample_initial_channel // (2**self.num_upsample_layers)
+            )
         )
         self.conv_post = nn.Conv1d(
-            config.upsample_initial_channel // (2**self.num_upsample_layers), 1, 7, 1, padding=3, bias=False
+            config.upsample_initial_channel // (2**self.num_upsample_layers),
+            1,
+            7,
+            1,
+            padding=3,
+            bias=False,
         )
 
     def normalize_spectrogram(self, spectrogram, max_value, min_db):
-        return torch.clamp((2 * max_value) * ((spectrogram - min_db) / (-min_db)) - max_value, -max_value, max_value)
+        return torch.clamp(
+            (2 * max_value) * ((spectrogram - min_db) / (-min_db)) - max_value,
+            -max_value,
+            max_value,
+        )
 
     def amplitude_to_db(self, amplitude, min_db_level):
         min_level = torch.exp(
-            torch.tensor(min_db_level / 20.0 * np.log(10), device=amplitude.device, dtype=amplitude.dtype)
+            torch.tensor(
+                min_db_level / 20.0 * np.log(10),
+                device=amplitude.device,
+                dtype=amplitude.dtype,
+            )
         )
         return 20 * torch.log10(torch.clamp(amplitude, min=min_level))
 
@@ -967,7 +1077,9 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         for layer_index in range(self.num_upsample_layers):
             hidden_representation = self.ups[layer_index][0](hidden_representation)
             residual_output = sum(
-                self.resblocks[layer_index * self.num_residual_blocks + block_index](hidden_representation)
+                self.resblocks[layer_index * self.num_residual_blocks + block_index](
+                    hidden_representation
+                )
                 for block_index in range(self.num_residual_blocks)
             )
             residual_output = residual_output / self.num_residual_blocks
@@ -986,20 +1098,48 @@ class RungeKutta4ODESolver:
         self._one_third = 1 / 3
         self._two_thirds = 2 / 3
 
-    def _rk4_step(self, function, time_start, time_step, time_end, value_start, function_value_start=None):
-        k1 = function_value_start if function_value_start is not None else function(time_start, value_start)
-        k2 = function(time_start + time_step * self._one_third, value_start + time_step * k1 * self._one_third)
-        k3 = function(time_start + time_step * self._two_thirds, value_start + time_step * (k2 - k1 * self._one_third))
+    def _rk4_step(
+        self,
+        function,
+        time_start,
+        time_step,
+        time_end,
+        value_start,
+        function_value_start=None,
+    ):
+        k1 = (
+            function_value_start
+            if function_value_start is not None
+            else function(time_start, value_start)
+        )
+        k2 = function(
+            time_start + time_step * self._one_third,
+            value_start + time_step * k1 * self._one_third,
+        )
+        k3 = function(
+            time_start + time_step * self._two_thirds,
+            value_start + time_step * (k2 - k1 * self._one_third),
+        )
         k4 = function(time_end, value_start + time_step * (k1 - k2 + k3))
         return (k1 + 3 * (k2 + k3) + k4) * time_step / 8
 
     def _compute_step(self, function, time_start, time_step, time_end, value_start):
         function_value_start = function(time_start, value_start)
-        return self._rk4_step(
-            function, time_start, time_step, time_end, value_start, function_value_start=function_value_start
-        ), function_value_start
+        return (
+            self._rk4_step(
+                function,
+                time_start,
+                time_step,
+                time_end,
+                value_start,
+                function_value_start=function_value_start,
+            ),
+            function_value_start,
+        )
 
-    def _linear_interpolation(self, time_start, time_end, value_start, value_end, time_point):
+    def _linear_interpolation(
+        self, time_start, time_end, value_start, value_end, time_point
+    ):
         if time_point == time_start:
             return value_start
         if time_point == time_end:
@@ -1020,12 +1160,21 @@ class RungeKutta4ODESolver:
         current_value = self.initial_value
         for time_start, time_end in zip(time_points[:-1], time_points[1:]):
             time_step = time_end - time_start
-            delta_value, _ = self._compute_step(self.function, time_start, time_step, time_end, current_value)
+            delta_value, _ = self._compute_step(
+                self.function, time_start, time_step, time_end, current_value
+            )
             next_value = current_value + delta_value
 
-            while current_index < len(time_points) and time_end >= time_points[current_index]:
+            while (
+                current_index < len(time_points)
+                and time_end >= time_points[current_index]
+            ):
                 solution[current_index] = self._linear_interpolation(
-                    time_start, time_end, current_value, next_value, time_points[current_index]
+                    time_start,
+                    time_end,
+                    current_value,
+                    next_value,
+                    time_points[current_index],
                 )
                 current_index += 1
 
@@ -1036,7 +1185,8 @@ class RungeKutta4ODESolver:
 
 @auto_docstring(
     custom_intro="""
-    The full Qwen2.5Omni Token2WavDiT model. Which take speech tokens as input and predict mel spectrogram.
+    The full Qwen2.5Omni Token2WavDiT model. Which take speech tokens as
+    input and predict mel spectrogram.
     """
 )
 class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
@@ -1049,7 +1199,9 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         self.repeats = config.repeats
         self.time_embed = DiTTimestepEmbedding(config.hidden_size)
 
-        self.text_embed = DiTCodecEmbedding(config.num_embeds, config.emb_dim, config.repeats)
+        self.text_embed = DiTCodecEmbedding(
+            config.num_embeds, config.emb_dim, config.repeats
+        )
         self.input_embed = DiTInputEmbedding(config)
 
         self.rotary_embed = Qwen2_5OmniDiTRotaryEmbedding(config.head_dim)
@@ -1069,12 +1221,16 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                 )
             )
 
-        self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
+        self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(
+            config.hidden_size
+        )  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
 
     def _create_block_diff(self, hidden_states):
         batch, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-        block_indices = torch.arange(seq_len, device=hidden_states.device) // self.block_size  # [seq_length]
+        block_indices = (
+            torch.arange(seq_len, device=hidden_states.device) // self.block_size
+        )  # [seq_length]
 
         block_i = block_indices.unsqueeze(1)  # [seq_length, 1]
         block_j = block_indices.unsqueeze(0)  # [1, seq_length]
@@ -1099,8 +1255,12 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
         # Compute embeddings
         time_embedding = self.time_embed(time_step)
-        text_embedding = self.text_embed(quantized_code, drop_code=False if apply_cfg else drop_code)
-        text_embedding_unconditioned = self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        text_embedding = self.text_embed(
+            quantized_code, drop_code=False if apply_cfg else drop_code
+        )
+        text_embedding_unconditioned = (
+            self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        )
 
         hidden_states = self.input_embed(
             hidden_states,
@@ -1140,11 +1300,17 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         guidance_scale=0.5,
         sway_coefficient=-1.0,
     ):
-        noise_initialization = torch.randn([1, 30000, self.mel_dim], dtype=reference_mel_spectrogram.dtype)
+        noise_initialization = torch.randn(
+            [1, 30000, self.mel_dim], dtype=reference_mel_spectrogram.dtype
+        )
         maximum_duration = quantized_code.shape[1] * self.repeats
-        initial_state = noise_initialization[:, :maximum_duration].to(quantized_code.device)
+        initial_state = noise_initialization[:, :maximum_duration].to(
+            quantized_code.device
+        )
         batch_size = reference_mel_spectrogram.shape[0]
-        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(1, maximum_duration, 1)
+        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(
+            1, maximum_duration, 1
+        )
 
         if batch_size != 1:
             raise ValueError("Only batch size = 1 is currently supported")
@@ -1171,17 +1337,28 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                 apply_cfg=True,
             )
             guided_prediction, null_prediction = torch.chunk(model_output, 2, dim=0)
-            return guided_prediction + (guided_prediction - null_prediction) * guidance_scale
+            return (
+                guided_prediction
+                + (guided_prediction - null_prediction) * guidance_scale
+            )
 
         initial_time = 0
         time_embedding = torch.linspace(
-            initial_time, 1, num_steps, device=quantized_code.device, dtype=conditioning_vector.dtype
+            initial_time,
+            1,
+            num_steps,
+            device=quantized_code.device,
+            dtype=conditioning_vector.dtype,
         )
 
         if sway_coefficient is not None:
-            time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
+            time_embedding += sway_coefficient * (
+                torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding
+            )
 
-        ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
+        ode_solver = RungeKutta4ODESolver(
+            function=ode_function, initial_value=initial_state
+        )
         solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
@@ -1212,7 +1389,9 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         """
         initial_state = y0.to(quantized_code.device)
         batch_size = reference_mel_spectrogram.shape[0]
-        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(1, initial_state.shape[1], 1)
+        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(
+            1, initial_state.shape[1], 1
+        )
 
         if batch_size != 1:
             raise ValueError("Only batch size = 1 is currently supported")
@@ -1239,17 +1418,28 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                 apply_cfg=True,
             )
             guided_prediction, null_prediction = torch.chunk(model_output, 2, dim=0)
-            return guided_prediction + (guided_prediction - null_prediction) * guidance_scale
+            return (
+                guided_prediction
+                + (guided_prediction - null_prediction) * guidance_scale
+            )
 
         initial_time = 0
         time_embedding = torch.linspace(
-            initial_time, 1, num_steps, device=quantized_code.device, dtype=conditioning_vector.dtype
+            initial_time,
+            1,
+            num_steps,
+            device=quantized_code.device,
+            dtype=conditioning_vector.dtype,
         )
 
         if sway_coefficient is not None:
-            time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
+            time_embedding += sway_coefficient * (
+                torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding
+            )
 
-        ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
+        ode_solver = RungeKutta4ODESolver(
+            function=ode_function, initial_value=initial_state
+        )
         solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
@@ -1259,26 +1449,34 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
 @auto_docstring(
     custom_intro="""
-    The full Qwen2.5Omni Token2Wav model. Consists a DiT model take speech tokens as input and predict mel spectrogram and a BigVGAN vocoder take mel spectrogram as input and predict waveform.
+    The full Qwen2.5Omni Token2Wav model. Consists a DiT model take speech
+    tokens as input and predict mel spectrogram and a BigVGAN vocoder take
+    mel spectrogram as input and predict waveform.
     """
 )
 class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
     config: Qwen2_5OmniToken2WavConfig
     base_model_prefix = "model"
-    _no_split_modules = ["Qwen2_5OmniToken2WavDiTModel", "Qwen2_5OmniToken2WavBigVGANModel"]
+    _no_split_modules = [
+        "Qwen2_5OmniToken2WavDiTModel",
+        "Qwen2_5OmniToken2WavBigVGANModel",
+    ]
 
     def __init__(self, config: Qwen2_5OmniToken2WavConfig):
         super().__init__(config)
         attn_impl = config._attn_implementation
         if config._attn_implementation == "flash_attention_2":
             logger.warning_once(
-                "Qwen2_5OmniToken2WavModel must inference with fp32, but flash_attention_2 only supports fp16 and bf16, "
-                "attention implementation of Qwen2_5OmniToken2WavModel will fallback to sdpa."
+                "Qwen2_5OmniToken2WavModel must inference with fp32, but "
+                "flash_attention_2 only supports fp16 and bf16, "
+                "attention implementation of Qwen2_5OmniToken2WavModel will "
+                "fallback to sdpa."
             )
             attn_impl = "sdpa"
         elif config._attn_implementation == "eager":
             logger.warning_once(
-                "Qwen2_5OmniToken2WavModel does not support eager attention implementation, fall back to sdpa"
+                "Qwen2_5OmniToken2WavModel does not support eager attention "
+                "implementation, fall back to sdpa"
             )
             attn_impl = "sdpa"
         self.code2wav_dit_model = Qwen2_5OmniToken2WavDiTModel._from_config(
@@ -1301,7 +1499,9 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
 
         # codec embedding size for masking EOS out-of-range
         try:
-            self.codec_embed_size = self.code2wav_dit_model.text_embed.codec_embed.weight.size(0)
+            self.codec_embed_size = (
+                self.code2wav_dit_model.text_embed.codec_embed.weight.size(0)
+            )
         except Exception:
             self.codec_embed_size = -1
 
@@ -1341,7 +1541,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
 
         return waveform
 
-    # ============== Chunked processing helpers (compat with qwen2_code2wav_dit) ==============
+    # ============== Chunked processing helpers (compat with qwen2_code2wav_dit) ==============  # noqa: E501
     @torch.inference_mode()
     def process_chunk_dit_batch(
         self,
@@ -1351,7 +1551,9 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         y0: torch.Tensor,
         steps: int,
     ) -> torch.Tensor:
-        """Block-wise DiT: generate mel from initial state y0 for the given code slice."""
+        """
+        Block-wise DiT: generate mel from initial state y0 for the given code slice.
+        """
         # prevent codec out-of-range (eos)
         if self.codec_embed_size > 0:
             code = code.clone()
@@ -1384,11 +1586,21 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Streaming per small chunk: returns (mel_or_None, audio_slice)."""
         start_index = max(i * self.chunk_size - self.past_cache_size, 0)
-        end_index = min((i + 1) * self.chunk_size + self.future_cache_size,
-                        codec_all.shape[1] * self.factor)
+        end_index = min(
+            (i + 1) * self.chunk_size + self.future_cache_size,
+            codec_all.shape[1] * self.factor,
+        )
 
-        y0 = y_all[:, start_index:end_index].reshape(1, -1, self.code2wav_dit_model.mel_dim).contiguous()
-        codec = codec_all[:, start_index // self.factor:end_index // self.factor].reshape(1, -1).contiguous()
+        y0 = (
+            y_all[:, start_index:end_index]
+            .reshape(1, -1, self.code2wav_dit_model.mel_dim)
+            .contiguous()
+        )
+        codec = (
+            codec_all[:, start_index // self.factor : end_index // self.factor]
+            .reshape(1, -1)
+            .contiguous()
+        )
 
         # generate mel for current window (B, mel_dim, T)
         generated = self.process_chunk_dit_batch(
@@ -1459,28 +1671,41 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         # Normalize dtype
         generated = generated.to(torch.float32)
         if i == 0:
-            mel = generated[:, :, :self.chunk_size]
+            mel = generated[:, :, : self.chunk_size]
         elif finished:
-            mel_trim = generated[:, :, self.past_cache_size:]
-            mel = torch.cat([prev_generated[:, :, -self.future_size * 2:], mel_trim], dim=2)
+            mel_trim = generated[:, :, self.past_cache_size :]
+            mel = torch.cat(
+                [prev_generated[:, :, -self.future_size * 2 :], mel_trim], dim=2
+            )
         else:
             if start_index == 0:
-                mel_trim = generated[:, :, i * self.chunk_size:-self.future_cache_size]
+                mel_trim = generated[
+                    :, :, i * self.chunk_size : -self.future_cache_size
+                ]
             else:
-                mel_trim = generated[:, :, self.past_cache_size:-self.future_cache_size]
-            mel = torch.cat([prev_generated[:, :, -self.future_size * 2:], mel_trim], dim=2)
+                mel_trim = generated[
+                    :, :, self.past_cache_size : -self.future_cache_size
+                ]
+            mel = torch.cat(
+                [prev_generated[:, :, -self.future_size * 2 :], mel_trim], dim=2
+            )
 
         audio = self.code2wav_bigvgan_model(mel)
         if i == 0:
-            audio_output = audio[:-self.future_size * self.vocoder_hop]
+            audio_output = audio[: -self.future_size * self.vocoder_hop]
         elif finished:
-            audio_output = audio[self.future_size * self.vocoder_hop:]
+            audio_output = audio[self.future_size * self.vocoder_hop :]
         else:
-            audio_output = audio[self.future_size * self.vocoder_hop:-self.future_size * self.vocoder_hop]
+            audio_output = audio[
+                self.future_size
+                * self.vocoder_hop : -self.future_size
+                * self.vocoder_hop
+            ]
         return mel, audio_output
 
 
 # ================= vLLM-style wrapper for Token2Wav =================
+
 
 class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     logger = init_logger(__name__)
@@ -1490,7 +1715,8 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         orig_to_new_prefix={
             # HF root is 'model.'
             "model.": "token2wav_model.",
-        })
+        }
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1508,6 +1734,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         # Provide placeholder to align with vLLM runner expectations
         def _empty_intermediate_tensors():
             return None
+
         self.make_empty_intermediate_tensors = _empty_intermediate_tensors
 
     def get_language_model(self) -> torch.nn.Module:
@@ -1555,7 +1782,9 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     ) -> Optional[SamplerOutput]:
         return None
 
-    def load_weights_without_buffers(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights_without_buffers(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Set[str]:
         loader = _Vllm_AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         # Log load summary
@@ -1567,7 +1796,11 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             device = next(self.parameters()).device
             self.logger.info(
                 "[Model Loaded] name=%s, success=%s, size=%.2f MB, device=%s",
-                self.__class__.__name__, True, total_bytes / (1024**2), str(device))
+                self.__class__.__name__,
+                True,
+                total_bytes / (1024**2),
+                str(device),
+            )
         except Exception:
             pass
         return loaded
@@ -1575,29 +1808,27 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     def find_all_registers(self):
         """
         Find all registered buffers in a PyTorch model.
-        
+
         Args:
         Returns:
             dict: Dictionary with buffer names as keys and their properties as values
         """
         registers = {}
-        
+
         # Get all named buffers
         for name, buf in self.named_buffers():
             if name in self.state_dict():
-                registers[name] = {
-                    'name': name,
-                    'buffer': buf
-                }
+                registers[name] = {"name": name, "buffer": buf}
         return registers
 
-        
-    #remove buffers from the weights and reload them after loading weights
-    def remove_buffers_from_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], buffers: dict):
+    # remove buffers from the weights and reload them after loading weights
+    def remove_buffers_from_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], buffers: dict
+    ):
         weights_to_load = []
         for key, value in weights:
             if key in buffers:
-                buffers[key]['buffer'] = value
+                buffers[key]["buffer"] = value
                 continue
             weights_to_load.append((key, value))
         return weights_to_load
@@ -1609,16 +1840,18 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         loaded_buffers = set()
         for name, buf_val in self.named_buffers():
             if name in buffers:
-                buf_val.copy_(buffers[name]['buffer'])
+                buf_val.copy_(buffers[name]["buffer"])
                 loaded_buffers.add(name)
         return loaded_buffers
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], spk_dict_path: str) -> Set[str]:
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], spk_dict_path: str
+    ) -> Set[str]:
         buffers = self.find_all_registers()
         weights_to_load = self.remove_buffers_from_weights(weights, buffers)
         loaded = self.load_weights_without_buffers(weights_to_load)
         loaded_buffers = self.reload_buffers_to_model(buffers)
-        #merge loaded and loaded_buffers
+        # merge loaded and loaded_buffers
         loaded.update(loaded_buffers)
         self.spk_dict = torch.load(spk_dict_path)
         return loaded
@@ -1641,7 +1874,9 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         )
 
     @torch.inference_mode()
-    def process_chunk_bigvgan_batch(self, mel_batch: torch.Tensor) -> Optional[torch.Tensor]:
+    def process_chunk_bigvgan_batch(
+        self, mel_batch: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         # BigVGAN is not part of this wrapper; return None for parity.
         return None
 
@@ -1684,7 +1919,9 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             y_all=y_all,
             i=i,
             steps=steps,
-            prev_generated=prev_generated if isinstance(prev_generated, torch.Tensor) else None,
+            prev_generated=(
+                prev_generated if isinstance(prev_generated, torch.Tensor) else None
+            ),
             finished=finished,
-        )        
+        )
         return _mel if _mel is not None else prev_generated, out

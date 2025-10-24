@@ -1,10 +1,10 @@
 from dataclasses import dataclass
-from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.request import Request
 from typing import Optional
 
-from vllm_omni.engine import PromptEmbedsPayload, AdditionalInformationPayload
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.request import Request
 
+from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 
 
 @dataclass

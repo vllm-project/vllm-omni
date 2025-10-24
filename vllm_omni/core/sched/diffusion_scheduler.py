@@ -1,21 +1,30 @@
-from vllm.v1.core.sched.scheduler import SchedulerOutput, EngineCoreOutputs, Request, RequestStatus, SpecDecodingStats
+import time
 from collections import defaultdict
 from typing import Optional
-from vllm.v1.core.sched.request_queue import create_request_queue
-from vllm.v1.engine import EngineCoreEventType
+
 from vllm.distributed.kv_events import KVEventBatch
-import time
+from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.scheduler import (
+    EngineCoreOutputs,
+    Request,
+    RequestStatus,
+    SchedulerOutput,
+    SpecDecodingStats,
+)
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput
+
+from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.core.sched.scheduler import OmniScheduler
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm.v1.engine import EngineCoreOutput
-from vllm_omni.core.sched.output import OmniNewRequestData
 
 
 class DiffusionScheduler(OmniScheduler):
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
-        - Feed all input tokens of the request at once (if 0, allocate 1 placeholder token).
-        - If the token budget cannot be satisfied at once, fall back to the default vLLM scheduling.
+        - Feed all input tokens of the request at once
+          (if 0, allocate 1 placeholder token).
+        - If the token budget cannot be satisfied at once, fall back to the
+          default vLLM scheduling.
         """
 
         # Select requests with zero prompt and using pooling
@@ -41,13 +50,15 @@ class DiffusionScheduler(OmniScheduler):
         # independent of pooling_params)
         while self.waiting and token_budget > 0 and capacity > 0:
             request = self.waiting.peek_request()
-            # Uniformly treat as diffusion. A feature flag can be added later via config or request tag.
+            # Uniformly treat as diffusion. A feature flag can be added later
+            # via config or request tag.
 
             # Allocate all input tokens for the request in one shot
             # (allocate 1 placeholder if zero)
             required_tokens = max(getattr(request, "num_prompt_tokens", 0), 1)
             if required_tokens > token_budget:
-                # Insufficient budget to process all inputs at once; stop fast path attempt
+                # Insufficient budget to process all inputs at once;
+                # stop fast path attempt
                 break
             num_new_tokens = required_tokens
             new_blocks = self.kv_cache_manager.allocate_slots(
@@ -67,8 +78,7 @@ class DiffusionScheduler(OmniScheduler):
             self.running.append(request)
             request.status = RequestStatus.RUNNING
             if self.log_stats:
-                request.record_event(EngineCoreEventType.SCHEDULED,
-                                     scheduled_timestamp)
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
 
             req_to_new_block_ids[request.request_id] = new_blocks.get_block_ids()
             num_scheduled_tokens[request.request_id] = num_new_tokens
@@ -90,7 +100,9 @@ class DiffusionScheduler(OmniScheduler):
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
-                    any_request, len(self.running)))
+                    any_request, len(self.running)
+                )
+            )
 
         grammar_bitmask = self.structured_output_manager.grammar_bitmask(
             self.requests,
@@ -137,16 +149,20 @@ class DiffusionScheduler(OmniScheduler):
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
-        # Update internal state (advance num_computed_tokens, free encoder inputs, etc.)
+        # Update internal state (advance num_computed_tokens, free encoder inputs,
+        # etc.)
         self._update_after_schedule(scheduler_output)
         return scheduler_output
+
     """
     Scheduler for the diffusion model.
     This scheduler is modified to stop the request immediately for the diffusion model.
     This is because the diffusion model can generate the final image/audio in one step.
-    Note: This is just a minimal modification to the original scheduler, and there should be some further efforts to optimize the scheduler. 
+    Note: This is just a minimal modification to the original scheduler,
+    and there should be some further efforts to optimize the scheduler.
     The original scheduler is still used for the AR model.
     """
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -182,11 +198,13 @@ class DiffusionScheduler(OmniScheduler):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
-            generated_token_ids = sampled_token_ids[
-                req_index] if sampled_token_ids else []
+            generated_token_ids = (
+                sampled_token_ids[req_index] if sampled_token_ids else []
+            )
 
             scheduled_spec_token_ids = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+            )
             if scheduled_spec_token_ids:
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -194,13 +212,15 @@ class DiffusionScheduler(OmniScheduler):
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens, where is given by:
                 # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
-                num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
-                                       len(generated_token_ids))
+                num_tokens_rejected = (
+                    len(scheduled_spec_token_ids) + 1 - len(generated_token_ids)
+                )
                 request.num_computed_tokens -= num_tokens_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=len(scheduled_spec_token_ids),
-                    num_accepted_tokens=len(generated_token_ids) - 1)
+                    num_accepted_tokens=len(generated_token_ids) - 1,
+                )
 
             new_logprobs = None
             new_token_ids = generated_token_ids
@@ -212,7 +232,8 @@ class DiffusionScheduler(OmniScheduler):
 
             # Diffusion request: completes in one step; mark finished and free resources
             request.status = RequestStatus.FINISHED_STOPPED
-            # Optional: set a stop_reason for front-end clarity (does not affect protocol)
+            # Optional: set a stop_reason for front-end clarity
+            # (does not affect protocol)
             request.stop_reason = request.stop_reason or "diffusion_done"
             kv_transfer_params = self._free_request(request)
             if status_before_stop == RequestStatus.RUNNING:
@@ -221,19 +242,22 @@ class DiffusionScheduler(OmniScheduler):
                 stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None \
-                and request.sampling_params.logprobs is not None and logprobs:
+            if (
+                request.sampling_params is not None
+                and request.sampling_params.logprobs is not None
+                and logprobs
+            ):
                 # NOTE: once we support N tokens per step (spec decode),
                 # the outer lists can be of length > 1.
                 new_logprobs = logprobs.slice(req_index, req_index + 1)
 
-            if new_token_ids and self.structured_output_manager.should_advance(
-                    request):
-                # NOTE: structured_output_request
-                # should not be None if use_structured_output, we have
-                # check above, so safe to ignore type warning
-                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids)
+            if new_token_ids and self.structured_output_manager.should_advance(request):
+                # NOTE: structured_output_request should not be None if
+                # use_structured_output, we have check above, so safe to ignore
+                # type warning
+                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]  # noqa: E501
+                    req_id, new_token_ids
+                )
 
             # spec_token_ids comes from the model runner output
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
@@ -244,15 +268,15 @@ class DiffusionScheduler(OmniScheduler):
                 if self.structured_output_manager.should_advance(request):
                     metadata = request.structured_output_request
                     # Needs to happen after new_token_ids are accepted.
-                    request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
-                        spec_token_ids[req_index])
+                    request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]  # noqa: E501
+                        spec_token_ids[req_index]
+                    )
                 else:
                     request.spec_token_ids = spec_token_ids[req_index]
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None \
-                or kv_transfer_params:
+            if new_token_ids or pooler_output is not None or kv_transfer_params:
 
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -267,7 +291,8 @@ class DiffusionScheduler(OmniScheduler):
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         num_cached_tokens=request.num_cached_tokens,
-                    ))
+                    )
+                )
 
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
@@ -284,8 +309,7 @@ class DiffusionScheduler(OmniScheduler):
 
         # KV Connector: update state for finished KV Transfers.
         if model_runner_output.kv_connector_output:
-            self._update_from_kv_xfer_finished(
-                model_runner_output.kv_connector_output)
+            self._update_from_kv_xfer_finished(model_runner_output.kv_connector_output)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -304,12 +328,14 @@ class DiffusionScheduler(OmniScheduler):
                     eco.finished_requests = finished_set
                 else:
                     engine_core_outputs[client_index] = EngineCoreOutputs(
-                        finished_requests=finished_set)
+                        finished_requests=finished_set
+                    )
             finished_req_ids.clear()
 
         if engine_core_outputs:
             # Return stats to only one of the front-ends.
-            next(iter(engine_core_outputs.values())).scheduler_stats = (
-                self.make_stats(spec_decoding_stats))
+            next(iter(engine_core_outputs.values())).scheduler_stats = self.make_stats(
+                spec_decoding_stats
+            )
 
         return engine_core_outputs
