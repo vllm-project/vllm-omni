@@ -58,7 +58,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         if self.mrope_section:
-            print("Warning: mrope_section check is not disabled in Qwen2.5-Omni, this may cause errors, and should be removed in the future.")
+            print("Warning: mrope_section check is disabled in Qwen2.5-Omni, this may cause errors, and should be restored in the future.")
             # assert sum(self.mrope_section) == rotary_dim // 2
 
     def forward(
