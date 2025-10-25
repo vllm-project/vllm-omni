@@ -242,7 +242,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     ) -> OutputProcessorOutput:
         self._reqid_to_mm_type.clear()
         for eco in engine_core_outputs:
-            mm_type = (getattr(eco, "output_type", None) or "").lower()
+            mm_type = (self.engine_core_output_type or "").lower()
             if mm_type:
                 self._reqid_to_mm_type[eco.request_id] = mm_type
             self._route_and_normalize(eco)
