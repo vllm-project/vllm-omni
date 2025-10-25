@@ -12,35 +12,19 @@ Architecture:
   processing
 """
 
-__version__ = "0.1.0"
-__author__ = "vLLM-omni Team"
-__email__ = "hsliuustc@gmail.com"
-from . import patch
-from .config import (
-    DiTCacheConfig,
-    DiTConfig,
-    OmniStageConfig,
-    create_ar_stage_config,
-    create_dit_stage_config,
-)
+from . import patch  # noqa: F401
+from .config import OmniModelConfig
 
 # Main entry points
 from .entrypoints.omni_llm import OmniLLM
+from .entrypoints.omni_llm import OmniLLM
 
 __all__ = [
-    # Version info
-    "__version__",
-    "__author__",
-    "__email__",
     # Main components
     "OmniLLM",
-    # AsyncOmniLLM is not supported yet
+    # "AsyncOmniLLM", # TODO: add AsyncOmniLLM back when it is implemented
     # Configuration
-    "OmniStageConfig",
-    "DiTConfig",
-    "DiTCacheConfig",
-    "create_ar_stage_config",
-    "create_dit_stage_config",
+    "OmniModelConfig",
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.
 ]

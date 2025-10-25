@@ -51,6 +51,10 @@ cd vllm
 git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
 VLLM_USE_PRECOMPILED=1 uv pip install --editable .
 ```
+Install additional requirements for vllm-omni
+```bash
+uv pip install -r requirements.txt
+```
 
 ## Run examples (Qwen2.5-omni)
 

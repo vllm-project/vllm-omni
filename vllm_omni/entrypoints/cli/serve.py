@@ -3,12 +3,7 @@ Omni serve command for vLLM-omni.
 """
 
 import argparse
-import asyncio
 from typing import List
-
-from vllm_omni.config import DiTConfig, create_ar_stage_config, create_dit_stage_config
-
-from ..omni_llm import AsyncOmniLLM
 
 
 class OmniServeCommand:
@@ -80,103 +75,13 @@ class OmniServeCommand:
 
     def run(self, args: List[str]) -> None:
         """Run the omni serve command."""
-        parsed_args = self.parser.parse_args(args)
-
-        # Create stage configurations
-        stage_configs = self._create_stage_configs(parsed_args)
-
-        # Create AsyncOmniLLM instance
-        omni_llm = AsyncOmniLLM(
-            stage_configs=stage_configs, log_stats=parsed_args.log_stats
-        )
-
-        # Start the server
-        asyncio.run(self._start_server(omni_llm, parsed_args))
+        pass
 
     def _create_stage_configs(self, args) -> List:
         """Create stage configurations based on arguments."""
-        stage_configs = []
-        stage_id = 0
+        pass
 
-        # Add AR stage - use main model if ar_stage not specified
-        ar_model = args.ar_stage if args.ar_stage else args.model
-        ar_config = create_ar_stage_config(
-            stage_id=stage_id,
-            model_path=ar_model,
-            input_modalities=["text"],
-            output_modalities=["text"],
-        )
-        stage_configs.append(ar_config)
-        stage_id += 1
-
-        # Add DiT stage if specified
-        if args.dit_stage:
-            dit_model = args.dit_stage
-        elif args.use_diffusers:
-            # Use a default DiT model if diffusers is enabled
-            dit_model = "stabilityai/stable-diffusion-2-1"
-        else:
-            dit_model = None
-
-        if dit_model:
-            dit_config = DiTConfig(
-                num_inference_steps=args.dit_steps,
-                guidance_scale=args.dit_guidance_scale,
-                use_diffusers=args.use_diffusers,
-                diffusers_pipeline="auto" if args.use_diffusers else None,
-            )
-
-            dit_stage_config = create_dit_stage_config(
-                stage_id=stage_id,
-                model_path=dit_model,
-                input_modalities=["text"],
-                output_modalities=["image"],
-                dit_config=dit_config,
-            )
-            stage_configs.append(dit_stage_config)
-            stage_id += 1
-
-        # If no specific stages are specified, use the main model
-        if not stage_configs:
-            # Try to detect if it's a multimodal model
-            if "omni" in args.model.lower() or "multimodal" in args.model.lower():
-                # Assume it's a multimodal model that can handle both AR and DiT
-                ar_config = create_ar_stage_config(
-                    stage_id=0,
-                    model_path=args.model,
-                    input_modalities=["text"],
-                    output_modalities=["text"],
-                )
-                stage_configs.append(ar_config)
-
-                dit_config = DiTConfig(
-                    num_inference_steps=args.dit_steps,
-                    guidance_scale=args.dit_guidance_scale,
-                    use_diffusers=args.use_diffusers,
-                    diffusers_pipeline="auto" if args.use_diffusers else None,
-                )
-
-                dit_stage_config = create_dit_stage_config(
-                    stage_id=1,
-                    model_path=args.model,
-                    input_modalities=["text"],
-                    output_modalities=["image"],
-                    dit_config=dit_config,
-                )
-                stage_configs.append(dit_stage_config)
-            else:
-                # Default to AR stage
-                ar_config = create_ar_stage_config(
-                    stage_id=0,
-                    model_path=args.model,
-                    input_modalities=["text"],
-                    output_modalities=["text"],
-                )
-                stage_configs.append(ar_config)
-
-        return stage_configs
-
-    async def _start_server(self, omni_llm: AsyncOmniLLM, args) -> None:
+    async def _start_server(self, omni_llm, args) -> None:
         """Start the API server."""
         try:
             # Import here to avoid circular imports

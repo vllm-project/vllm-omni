@@ -14,6 +14,7 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
@@ -625,7 +626,7 @@ class Qwen2_5OmniForConditionalGeneration(
             next_id = self.talker.sample(logits, sampling_metadata).sampled_token_ids
             return next_id.to(dtype=torch.long)
 
-    def _init_token2wav_model(self):
+    def _init_token2wav_model(self, hf_model_folder):
         """Initialize speaker resources if provided; model is constructed in
         __init__."""
         if self.token2wav is None or self.token2wav_config is None:
@@ -642,7 +643,7 @@ class Qwen2_5OmniForConditionalGeneration(
                 k: torch.as_tensor(v, device=device) for k, v in ref_mels.items()
             }
         # legacy: load from directory if provided
-        model_path = self.vllm_config.model_config.model
+        model_path = hf_model_folder
         if isinstance(model_path, str) and os.path.isdir(model_path):
             spk_pt = os.path.join(model_path, "spk_dict.pt")
             if os.path.exists(spk_pt):
@@ -816,10 +817,14 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # Load token2wav weights (if any)
         if token2wav_weights and self.token2wav is not None:
-            self._init_token2wav_model()
+            hf_model_folder = download_weights_from_hf(
+                self.vllm_config.model_config.model,
+                self.vllm_config.load_config.download_dir,
+                allow_patterns=["*.safetensors", "*.bin", "*.pt"],
+            )
+            self._init_token2wav_model(hf_model_folder)
             t2w_loaded = self.token2wav.load_weights(
-                token2wav_weights,
-                os.path.join(self.vllm_config.model_config.model, "spk_dict.pt"),
+                token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt")
             )
             t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, "token2wav")
             loaded_weights.update(t2w_loaded)
