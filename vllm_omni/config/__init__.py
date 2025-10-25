@@ -10,15 +10,6 @@ from vllm.config import ModelConfig, config
 
 import vllm_omni.model_executor.models as me_models
 
-from .stage_config import (
-    DiTCacheConfig,
-    DiTCacheTensor,
-    DiTConfig,
-    OmniStageConfig,
-    create_ar_stage_config,
-    create_dit_stage_config,
-)
-
 
 @config
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -41,10 +32,4 @@ class OmniModelConfig(ModelConfig):
 
 __all__ = [
     "OmniModelConfig",
-    "OmniStageConfig",
-    "DiTConfig",
-    "DiTCacheConfig",
-    "DiTCacheTensor",
-    "create_ar_stage_config",
-    "create_dit_stage_config",
 ]

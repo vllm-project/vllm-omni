@@ -1,1 +1,1 @@
-from .registry import OmniModelRegistry
+from .registry import OmniModelRegistry  # noqa: F401
