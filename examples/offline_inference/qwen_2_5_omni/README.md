@@ -10,10 +10,10 @@ source .venv/bin/activate
 Install certain version of vllm with commitid: 808a7b69df479b6b3a16181711cac7ca28a9b941
 
 ```bash
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
-VLLM_USE_PRECOMPILED=1 uv pip install --editable .
+export VLLM_COMMIT=808a7b69df479b6b3a16181711cac7ca28a9b941
+uv pip install vllm \
+    --torch-backend=auto \
+    --extra-index-url https://wheels.vllm.ai/${VLLM_COMMIT}
 ```
 
 ## Run examples
