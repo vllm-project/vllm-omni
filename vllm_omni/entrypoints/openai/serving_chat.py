@@ -730,7 +730,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     def _create_audio_choice(self, omni_outputs: OmniRequestOutput, role: str):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
-        audio_tensor = final_res.multimodal_output["audio"].detach().cpu().numpy()
+        audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
 
         # Convert numpy array to WAV bytes and encode as base64
         if soundfile is None:

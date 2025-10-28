@@ -2,7 +2,7 @@ import glob
 import os
 from collections.abc import Iterable
 from functools import cached_property
-from typing import NamedTuple, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -26,6 +26,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerDummyInputsBuilder,
@@ -37,14 +38,6 @@ from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
-
-
-class OmniOutput(NamedTuple):
-    """Output from the merged Omni model containing both text and audio."""
-
-    text_hidden_states: torch.Tensor
-    multimodal_outputs: dict = {}
-    intermediate_tensors: Optional[IntermediateTensors] = None
 
 
 logger = init_logger(__name__)
@@ -439,7 +432,7 @@ class Qwen2_5OmniForConditionalGeneration(
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
 
             audio_tensor = self.generate_audio(code, voice_type)
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audio_tensor})
+            return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
         return OmniOutput(
             text_hidden_states=torch.cat(

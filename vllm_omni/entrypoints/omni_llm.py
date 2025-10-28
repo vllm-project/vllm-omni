@@ -1,6 +1,5 @@
 import multiprocessing as mp
 import os
-import sys
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +10,6 @@ from pydantic import ValidationError
 
 # External library imports (vLLM)
 from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
-from vllm.engine.arg_utils import HfOverrides
 from vllm.entrypoints.llm import LLM
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -96,12 +94,12 @@ class OmniLLM:
 
         # Optional file handler for orchestrator
         self._log_file = log_file
-        if self._log_file:
-            remove_old_logs(self._log_file, len(self.stage_configs))
-            configure_orchestrator_logger(logger, self._log_file)
 
         self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
         self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
+        if self._log_file:
+            remove_old_logs(self._log_file, len(self.stage_list))
+            configure_orchestrator_logger(logger, self._log_file)
 
     def _initialize_stages(
         self,
@@ -378,7 +376,16 @@ class OmniLLM:
                 next_stage_id = stage_id + 1
                 if next_stage_id < num_stages:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                    try:
+                        next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                    except Exception as e:
+                        logger.exception(
+                            "[Orchestrator] Process engine inputs error for req %s at stage %s: %s",
+                            req_id,
+                            next_stage_id,
+                            e,
+                        )
+                        continue
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]  # type: ignore[index]
                     try:
                         # Measure transfer size and time (encode + enqueue)
@@ -467,7 +474,7 @@ class OmniLLM:
                 progressed = True
                 if result.get("type") == "stage_ready":
                     self._stages_ready.add(stage_id)
-                    logger.debug("[Orchestrator] Stage-%s reported ready", stage_id)
+                    logger.info("[Orchestrator] Stage-%s reported ready", stage_id)
                 else:
                     # No user data should arrive before seeding; ignore other messages
                     pass
@@ -500,20 +507,8 @@ class OmniLLM:
                 logger.error(
                     "[Orchestrator] Stage initialization failed and an error occurred while logging suggestions",
                 )
-
-            # Attempt graceful shutdown of all stages before exiting
-            try:
-                self.close()
-            except Exception:
-                pass
-
-            # Terminate the current process with non-zero exit code
-            try:
-                sys.exit(1)
-            except SystemExit:
-                raise
-            except Exception:
-                os._exit(1)
+        elif len(self._stages_ready) == num_stages:
+            logger.info("[Orchestrator] All stages initialized successfully")
 
 
 class OmniStageLLM(LLM):
@@ -539,9 +534,8 @@ class OmniStageLLM(LLM):
         self,
         model: str,
         compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
-        hf_overrides: Optional[HfOverrides] = None,
         structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
-        **kwargs: Any,
+        **kwargs,
     ):
         """LLM constructor."""
         if "disable_log_stats" not in kwargs:
@@ -570,9 +564,6 @@ class OmniStageLLM(LLM):
                 # to provide better context to the user.
                 raise ValueError(f"Invalid 'kv_transfer_config' provided: {e}") from e
 
-        if hf_overrides is None:
-            hf_overrides = {}
-
         if compilation_config is not None:
             if isinstance(compilation_config, int):
                 compilation_config_instance = CompilationConfig(level=compilation_config)
@@ -597,7 +588,6 @@ class OmniStageLLM(LLM):
 
         engine_args = OmniEngineArgs(
             model=model,
-            hf_overrides=hf_overrides,
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
             **kwargs,

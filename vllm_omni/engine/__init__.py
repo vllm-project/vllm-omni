@@ -2,10 +2,21 @@
 Engine components for vLLM-Omni.
 """
 
-from typing import Any, Optional
+import time
+from collections.abc import Mapping
+from typing import Any, Optional, Union
 
 import msgspec
-from vllm.v1.engine import EngineCoreRequest
+import torch
+from vllm.v1.engine import (
+    EngineCoreEvent,
+    EngineCoreRequest,
+    FinishReason,
+    LogprobsLists,
+    LogprobsTensors,
+    SchedulerStats,
+    UtilityOutput,
+)
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -66,3 +77,62 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     prompt_embeds: Optional[PromptEmbedsPayload] = None
     # Optional additional information dictionary (serialized)
     additional_information: Optional[AdditionalInformationPayload] = None
+
+
+class OmniEngineCoreOutput(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    request_id: str
+    new_token_ids: list[int]
+
+    new_logprobs: Optional[LogprobsLists] = None
+    new_prompt_logprobs_tensors: Optional[LogprobsTensors] = None
+
+    pooling_output: Optional[dict[str, torch.Tensor]] = None
+
+    finish_reason: Optional[FinishReason] = None
+    stop_reason: Union[int, str, None] = None
+    events: Optional[list[EngineCoreEvent]] = None
+    kv_transfer_params: Optional[dict[str, Any]] = None
+
+    trace_headers: Optional[Mapping[str, str]] = None
+    # The number of tokens with prefix cache hits.
+    num_cached_tokens: int = 0
+
+    @property
+    def finished(self) -> bool:
+        return self.finish_reason is not None
+
+
+class OmniEngineCoreOutputs(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    # NOTE(Nick): We could consider ways to make this more compact,
+    # e.g. columnwise layout
+
+    engine_index: int = 0
+
+    # [num_reqs]
+    outputs: list[OmniEngineCoreOutput] = []
+    scheduler_stats: Optional[SchedulerStats] = None
+    timestamp: float = 0.0
+
+    utility_output: Optional[UtilityOutput] = None
+    finished_requests: Optional[set[str]] = None
+
+    # In DP case, used to signal that the current wave of requests
+    # has finished and the engines are paused.
+    wave_complete: Optional[int] = None
+    # In DP case, used to signal that a request was received for an
+    # "old" wave, so the next wave needs to be started in other engines.
+    start_wave: Optional[int] = None
+
+    def __post_init__(self):
+        if self.timestamp == 0.0:
+            self.timestamp = time.monotonic()

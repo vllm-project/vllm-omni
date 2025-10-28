@@ -2,7 +2,6 @@ import asyncio
 import multiprocessing as mp
 import os
 import socket
-import sys
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -94,8 +93,8 @@ class AsyncOmniLLM(EngineClient):
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
-        init_timeout: int = 300,
-        **kwargs: Any,
+        init_timeout: int = 60000,
+        **kwargs,
     ):
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
@@ -194,6 +193,8 @@ class AsyncOmniLLM(EngineClient):
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
+        print("[AsyncOmniLLM] __del__ close()", flush=True)
+        raise Exception("test")
         try:
             self.close()
         except Exception as e:
@@ -460,9 +461,8 @@ class AsyncOmniLLM(EngineClient):
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        deadline = time.time() + max(0, int(timeout))
         num_stages = len(self.stage_list)
-        while len(self._stages_ready) < num_stages and time.time() < deadline:
+        while len(self._stages_ready) < num_stages:
             progressed = False
             for stage_id, stage in enumerate(self.stage_list):
                 if stage_id in self._stages_ready:
@@ -527,20 +527,6 @@ class AsyncOmniLLM(EngineClient):
                     "[Orchestrator] Stage initialization failed and an error \
                         occurred while logging suggestions",
                 )
-
-            # Attempt graceful shutdown of all stages before exiting
-            try:
-                self.close()
-            except Exception:
-                pass
-
-            # Terminate the current process with non-zero exit code
-            try:
-                sys.exit(1)
-            except SystemExit:
-                raise
-            except Exception:
-                os._exit(1)
 
     @property
     def is_running(self) -> bool:

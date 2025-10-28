@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import logging
 import multiprocessing as mp
+import os
 from typing import Any, Optional, Union
 
 from vllm.inputs import TextPrompt
@@ -237,6 +238,14 @@ class OmniStage:
                     self._proc.terminate()
                 except Exception as e:
                     self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
+        # Cleanup temporary stage log if we created one (only when no log_file provided)
+        try:
+            if not self._log_file:
+                tmp_path = f"/tmp/omni_stage{self.stage_id}.log"
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+        except Exception:
+            pass
 
     def submit(self, payload: dict[str, Any]) -> None:
         """Submit a task to the stage worker.
@@ -286,8 +295,6 @@ class OmniStage:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
             source_outputs = stage_list[source_stage_id].engine_outputs
-            if not isinstance(prompt, list):
-                prompt = [prompt]
             multi_modal_data = {
                 source_output.request_id: p.get("multi_modal_data", None)
                 for source_output, p in zip(source_outputs, prompt)
@@ -322,6 +329,7 @@ def _stage_worker(
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
+    import os as _os
     import time as _time
 
     from vllm_omni.entrypoints.log_utils import (
@@ -331,7 +339,6 @@ def _stage_worker(
         log_stage_running_avg,
     )
     from vllm_omni.entrypoints.omni_llm import OmniStageLLM
-
     # no inline JSONL/serialization imports; logging handled by utilities
 
     stage_id = stage_payload["stage_id"]
@@ -339,12 +346,31 @@ def _stage_worker(
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
 
-    # Per-stage file logger (optional)
+    # Per-stage logger: clear inherited handlers to avoid broken parent streams
     try:
-        if log_file:
-            stage_log = _logging.getLogger(__name__)
-            stage_log.setLevel(_logging.DEBUG)
-            fh = _logging.FileHandler(f"{log_file}.stage{stage_id}.log")
+        stage_log = _logging.getLogger(__name__)
+        stage_log.setLevel(_logging.DEBUG)
+        for _h in list(stage_log.handlers):
+            try:
+                stage_log.removeHandler(_h)
+            except Exception:
+                pass
+        stage_log.propagate = False
+
+        class _StageFilter(_logging.Filter):
+            def filter(self, record: _logging.LogRecord) -> bool:
+                setattr(record, "stage", stage_id)
+                return True
+
+        # Prefer file logging even when log_file is not provided, to avoid invalid stdio in child procs
+        try:
+            if log_file:
+                _path = f"{log_file}.stage{stage_id}.log"
+            else:
+                _path = f"/tmp/omni_stage{stage_id}.log"
+            # Ensure dir exists
+            _os.makedirs(_os.path.dirname(_path), exist_ok=True)
+            fh = _logging.FileHandler(_path)
             fh.setLevel(_logging.DEBUG)
             fh.setFormatter(
                 _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
@@ -357,6 +383,34 @@ def _stage_worker(
 
             fh.addFilter(_StageFilter())
             stage_log.addHandler(fh)
+            try:
+                # Also route vLLM internal logs to the same handler for this stage
+                _vllm_logger = _logging.getLogger("vllm")
+                _vllm_logger.setLevel(_logging.DEBUG)
+                for _vh in list(_vllm_logger.handlers):
+                    try:
+                        _vllm_logger.removeHandler(_vh)
+                    except Exception:
+                        pass
+                _vllm_logger.propagate = False
+                _vllm_logger.addHandler(fh)
+            except Exception:
+                pass
+        except Exception:
+            # Final fallback: attach NullHandler to avoid logging errors
+            stage_log.addHandler(_logging.NullHandler())
+    except Exception:
+        pass
+
+    try:
+        _logging.raiseExceptions = False
+        _root_logger = _logging.getLogger()
+        for _h in list(_root_logger.handlers):
+            try:
+                _root_logger.removeHandler(_h)
+            except Exception:
+                pass
+        _root_logger.addHandler(_logging.NullHandler())
     except Exception:
         pass
 
@@ -377,9 +431,7 @@ def _stage_worker(
 
     # Init LLM
     _logging.getLogger(__name__).debug(
-        "[Stage-%s] Initializing engine with args keys=%s",
-        stage_id,
-        list(engine_args.keys()),
+        "[Stage-%s] Initializing engine with args keys=%s", stage_id, list(engine_args.keys())
     )
     stage_engine = OmniStageLLM(model=model, **engine_args)
     _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
@@ -394,21 +446,35 @@ def _stage_worker(
         task = in_q.get()
         _recv_dequeue_ts = _time.time()
         if task is None:
-            _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
+            _logging.getLogger(__name__).error("[Stage-%s] Received shutdown signal", stage_id)
             break
 
         max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
+        print(f"[Stage-{stage_id}] Max batch size: {max_batch_size}")
         batch_tasks: list[dict[str, Any]] = [task]
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
+                start_time = _time.time()
                 if not in_q.empty():
-                    extra = in_q.get(timeout=batch_timeout)
+                    extra = in_q.get_nowait()
                     if extra is None:
                         in_q.put(None)
                         break
                     batch_tasks.append(extra)
+                    end_time = _time.time()
+                    duration = end_time - start_time
+                    if duration > batch_timeout:
+                        break
+                    else:
+                        continue
                 else:
-                    break
+                    end_time = _time.time()
+                    duration = end_time - start_time
+                    _time.sleep(0.05)
+                    if duration > batch_timeout:
+                        break
+                    else:
+                        continue
 
         batch_request_ids: list[Any] = []
         batch_engine_inputs: list[Any] = []
@@ -434,7 +500,7 @@ def _stage_worker(
             elif isinstance(ein, dict):
                 batch_engine_inputs.append(ein)
             else:
-                _logging.getLogger(__name__).exception("[Stage-%s] Invalid engine input type: %s", stage_id, type(ein))
+                _logging.getLogger(__name__).error("[Stage-%s] Invalid engine input type: %s", stage_id, type(ein))
         sampling_params = batch_tasks[0]["sampling_params"]
         _logging.getLogger(__name__).debug(
             "[Stage-%s] Received batch size=%d, request_ids=%s",
@@ -456,6 +522,14 @@ def _stage_worker(
                 gen_outputs.append(ro)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+            try:
+                print(
+                    f"[Stage-{stage_id}] Generate done: batch={len(batch_tasks)}, "
+                    f"req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -783,6 +857,14 @@ async def _stage_worker_async(
                             "metrics": _metrics,
                         }
                     )
+                    try:
+                        print(
+                            f"[Stage-{stage_id}] Enqueued req={rid}, use_shm={use_shm}, "
+                            f"tokens_out={_metrics['num_tokens_out']}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 _logging.getLogger(__name__).exception(
                     "[Stage-%s] Failed to enqueue result for request %s: %s",
@@ -815,3 +897,6 @@ async def _stage_worker_async(
                     "error": str(e),
                 }
             )
+    print("--------------------------------", flush=True)
+    print(f"[Stage-{stage_id}] Stage worker exiting", flush=True)
+    print("--------------------------------", flush=True)

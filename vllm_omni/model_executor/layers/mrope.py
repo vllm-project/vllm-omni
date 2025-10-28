@@ -4,7 +4,10 @@ from typing import Optional, Union
 import numpy as np
 import torch
 from transformers import PretrainedConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+logger = init_logger(__name__)
 
 
 def _apply_rotary_emb(
@@ -442,9 +445,16 @@ class MRotaryEmbedding(RotaryEmbedding):
         #  _vl_get_input_positions_tensor.
 
         thinker_config = hf_config.thinker_config
-        audio_token_id = thinker_config.audio_token_index
-        image_token_id = thinker_config.image_token_index
-        video_token_id = thinker_config.video_token_index
+        try:
+            audio_token_id = thinker_config.audio_token_index
+            image_token_id = thinker_config.image_token_index
+            video_token_id = thinker_config.video_token_index
+        except Exception:
+            logger.info("Multimodal token idx changed!")
+            audio_token_id = thinker_config.audio_token_id
+            image_token_id = thinker_config.image_token_id
+            video_token_id = thinker_config.video_token_id
+
         audio_start_token_id = thinker_config.audio_start_token_id
         audio_end_token_id = thinker_config.audio_end_token_id
         vision_start_token_id = thinker_config.vision_start_token_id

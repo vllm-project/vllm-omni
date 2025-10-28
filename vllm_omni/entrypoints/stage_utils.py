@@ -53,11 +53,7 @@ def set_stage_gpu_devices(stage_id: int, devices: str | int | None) -> None:
                     if 0 <= logical_idx < len(mapping):
                         selected_physical = mapping[logical_idx]
                 except Exception as e:
-                    logger.debug(
-                        "[Stage-%s] Failed to map logical index via CUDA_VISIBLE_DEVICES: %s",
-                        stage_id,
-                        e,
-                    )
+                    logger.debug("[Stage-%s] Failed to map logical index via CUDA_VISIBLE_DEVICES: %s", stage_id, e)
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
@@ -69,18 +65,12 @@ def set_stage_gpu_devices(stage_id: int, devices: str | int | None) -> None:
                 selected_physical,
             )
         elif devices in (None, "cpu"):
-            logger.debug(
-                "[Stage-%s] Using default device visibility (devices=%s)",
-                stage_id,
-                devices,
-            )
+            logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
         else:
             selected_physical = int(str(devices))
             os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_physical)
             logger.debug(
-                "[Stage-%s] Set CUDA_VISIBLE_DEVICES to single device %s (fallback)",
-                stage_id,
-                selected_physical,
+                "[Stage-%s] Set CUDA_VISIBLE_DEVICES to single device %s (fallback)", stage_id, selected_physical
             )
 
         try:
