@@ -1,10 +1,8 @@
 cloudpickle==3.1.1
-flash_attn==2.8.3
 msgspec==0.19.0
 numpy==2.3.4
 omegaconf==2.3.0
 pydantic==2.12.3
-torch==2.8.0
 transformers==4.57.0
 typing_extensions==4.15.0
 decord==0.6.0
@@ -14,4 +12,3 @@ Pillow==12.0.0
 Requests==2.32.5
 resampy==0.4.3
 soundfile==0.13.1
-torchvision==0.23.0
