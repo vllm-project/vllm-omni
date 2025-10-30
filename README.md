@@ -47,6 +47,7 @@ docker run --gpus all --ipc=host --network=host -v $source_dir:$container_dir --
 
 Set up basic uv environment
 ```bash
+pip install uv
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
