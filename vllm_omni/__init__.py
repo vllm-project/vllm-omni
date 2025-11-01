@@ -17,7 +17,6 @@ from .config import OmniModelConfig
 
 # Main entry points
 from .entrypoints.omni_llm import OmniLLM
-from .entrypoints.omni_llm import OmniLLM
 
 __all__ = [
     # Main components

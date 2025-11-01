@@ -14,7 +14,6 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm.model_executor.model_loader.weight_utils import download_weights_from_hf
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
@@ -29,6 +28,9 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
@@ -817,7 +819,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # Load token2wav weights (if any)
         if token2wav_weights and self.token2wav is not None:
-            hf_model_folder = download_weights_from_hf(
+            hf_model_folder = download_weights_from_hf_specific(
                 self.vllm_config.model_config.model,
                 self.vllm_config.load_config.download_dir,
                 allow_patterns=["*.safetensors", "*.bin", "*.pt"],
