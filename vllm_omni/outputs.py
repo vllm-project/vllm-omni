@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
 from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 

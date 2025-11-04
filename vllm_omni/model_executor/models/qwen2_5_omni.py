@@ -11,9 +11,9 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniTalkerConfig,
     Qwen2_5OmniThinkerConfig,
 )
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
@@ -22,12 +22,13 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -167,7 +168,7 @@ class Qwen2_5OmniForConditionalGeneration(
     def sampler(self):
         if hasattr(self.model, "sampler"):
             return self.model.sampler
-        return get_sampler()
+        return Sampler()
 
     def get_input_embeddings(
         self,
@@ -556,16 +557,14 @@ class Qwen2_5OmniForConditionalGeneration(
         return output_token_ids, processed_output_token_embeds
 
     def compute_logits(
-        self,
-        hidden_states: Union[torch.Tensor, OmniOutput],
-        sampling_metadata: SamplingMetadata,
+        self, hidden_states: Union[torch.Tensor, OmniOutput]
     ) -> Optional[torch.Tensor]:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
 
         # Use thinker model for logits computation
-        return self.model.compute_logits(hidden_states, sampling_metadata)
+        return self.model.compute_logits(hidden_states)
 
     def sample(
         self,

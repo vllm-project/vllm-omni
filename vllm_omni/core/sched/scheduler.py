@@ -32,9 +32,7 @@ class OmniScheduler(VLLMScheduler):
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
                     prompt_token_ids=nr.prompt_token_ids,
-                    mm_inputs=nr.mm_inputs,
-                    mm_hashes=nr.mm_hashes,
-                    mm_positions=nr.mm_positions,
+                    mm_features=nr.mm_features,
                     sampling_params=nr.sampling_params,
                     pooling_params=nr.pooling_params,
                     block_ids=nr.block_ids,

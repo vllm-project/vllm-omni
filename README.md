@@ -38,7 +38,7 @@ vLLM-omni is built on a modular architecture that extends vLLM's core functional
 
 ## 🛠️ Installation
 
-### Installation of vLLM
+### Environment setup
 
 Use Docker to keep consistent basic environment (Optional, Recommended)
 ```bash
@@ -51,21 +51,37 @@ pip install uv
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
-Install certain version of vllm with commitid: 808a7b69df479b6b3a16181711cac7ca28a9b941
+
+### Installation of vLLM (for users)
+
+Now we build it based on vLLM v0.11.0. Please install it with command below.
+```bash
+uv pip install vllm==0.11.0 --torch-backend=auto
+```
+
+### Installation of vLLM (for developers)
+
+Install stable release version of vllm with 0.11.0
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
+git checkout v0.11.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set VLLM_PRECOMPILED_WHEEL_LOCATION as your local absolute path of whl file.
 ```bash
-export VLLM_COMMIT=808a7b69df479b6b3a16181711cac7ca28a9b941
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl
 ```
-Install vllm with command below.
+Install vllm with command below (If you have no existing PyTorch).
 ```bash
 uv pip install --editable .
+```
+
+Install vllm with command below (If you already have PyTorch).
+```bash
+python use_existing_torch.py
+uv pip install -r requirements/build.txt
+uv pip install --no-build-isolation --editable .
 ```
 
 ### Installation of vLLM-omni
@@ -90,7 +106,7 @@ The output audio is saved in ./output_audio
 
 ## To-do list
 - [x] Offline inference example for Qwen2.5-omni with single request
-- [ ] Adaptation from current vllm branch to stable vllm v0.11.0
+- [x] Adaptation from current vllm branch to stable vllm v0.11.0
 - [ ] Offline inference example for Qwen2.5-omni with streaming multiple requests
 - [ ] Online inference support
 - [ ] Support for other models

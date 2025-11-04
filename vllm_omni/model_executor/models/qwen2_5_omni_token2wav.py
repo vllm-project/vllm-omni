@@ -22,9 +22,9 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
 
 # Bring in HF base classes, configs and utilities used below
 from transformers.utils.logging import get_logger as _hf_get_logger
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader as _Vllm_AutoWeightsLoader,
@@ -34,8 +34,10 @@ from vllm.model_executor.models.utils import (
     init_vllm_registered_model as _Vllm_init_vllm_registered_model,
 )
 from vllm.model_executor.models.utils import maybe_prefix as _Vllm_maybe_prefix
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -1743,7 +1745,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     @property
     def sampler(self):
         # Token2Wav does not use sampler; return vLLM default for API parity
-        return get_sampler()
+        return Sampler()
 
     def forward(
         self,
@@ -1767,11 +1769,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             **kwargs,
         )
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         # Token2Wav outputs waveform; logits are not applicable
         return hidden_states
 

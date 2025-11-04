@@ -3,6 +3,7 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import Qwen2Config
+
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -19,7 +20,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,9 +38,11 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import IntermediateTensors, PoolerOutput
+from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import PoolerOutput, SamplerOutput
 from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 logger = init_logger(__name__)
 
@@ -449,7 +451,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = get_sampler()
+        self.sampler = Sampler()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -473,9 +475,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def sample(

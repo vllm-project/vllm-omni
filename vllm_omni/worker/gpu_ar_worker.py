@@ -2,34 +2,42 @@ import gc
 import os
 
 import torch
+
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.utils import GiB_bytes, MemorySnapshot
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-from vllm.worker.worker import _check_if_gpu_supports_dtype
-
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
 class GPUARWorker(GPUWorker):
     def init_device(self):
         if self.device_config.device.type == "cuda":
-            # torch.distributed.all_reduce does not free the input tensor until
-            # the synchronization point. This causes the memory usage to grow
-            # as the number of all_reduce calls increases. This env var disables
-            # this behavior.
-            # Related issue:
-            # https://discuss.pytorch.org/t/cuda-allocation-lifetime-for-inputs-to-distributed-all-reduce/191573
-            os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
-
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             self.device = torch.device(f"cuda:{self.local_rank}")
             current_platform.set_device(self.device)
 
-            _check_if_gpu_supports_dtype(self.model_config.dtype)
+            current_platform.check_if_supports_dtype(self.model_config.dtype)
+
+            # Initialize the distributed environment BEFORE taking
+            # memory snapshot
+            # This ensures NCCL buffers are allocated before we measure
+            # available memory
+            init_worker_distributed_environment(
+                self.vllm_config,
+                self.rank,
+                self.distributed_init_method,
+                self.local_rank,
+                current_platform.dist_backend,
+            )
+
+            # Set random seed.
+            set_random_seed(self.model_config.seed)
+
+            # Now take memory snapshot after NCCL is initialized
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -55,16 +63,6 @@ class GPUARWorker(GPUWorker):
                 )
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
-        # Initialize the distributed environment.
-        init_worker_distributed_environment(
-            self.vllm_config,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-            current_platform.dist_backend,
-        )
-        # Set random seed.
-        set_random_seed(self.model_config.seed)
 
         # Construct the model runner
         self.model_runner: GPUARModelRunner = GPUARModelRunner(

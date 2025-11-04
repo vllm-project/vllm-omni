@@ -1,8 +1,10 @@
 import time
+from pathlib import Path
 from typing import Optional, Union
 
 import huggingface_hub
 from huggingface_hub import snapshot_download
+
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import DisabledTqdm, get_lock
 
@@ -16,7 +18,8 @@ def download_weights_from_hf_specific(
     revision: Optional[str] = None,
     ignore_patterns: Optional[Union[str, list[str]]] = None,
 ) -> str:
-    """Download model weights from Hugging Face Hub.
+    """Download model weights from Hugging Face Hub. Users can specify the
+    allow_patterns to download only the necessary weights.
 
     Args:
         model_name_or_path (str): The model name or path.
@@ -33,6 +36,7 @@ def download_weights_from_hf_specific(
     Returns:
         str: The path to the downloaded model weights.
     """
+    assert len(allow_patterns) > 0
     local_only = huggingface_hub.constants.HF_HUB_OFFLINE
 
     logger.info("Using model weights format %s", allow_patterns)
@@ -40,15 +44,20 @@ def download_weights_from_hf_specific(
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         start_time = time.perf_counter()
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=local_only,
-        )
+        for allow_pattern in allow_patterns:
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_pattern,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=local_only,
+            )
+            # If we have downloaded weights for this allow_pattern,
+            # we don't need to check the rest.
+            if any(Path(hf_folder).glob(allow_pattern)):
+                break
         time_taken = time.perf_counter() - start_time
         if time_taken > 0.5:
             logger.info(

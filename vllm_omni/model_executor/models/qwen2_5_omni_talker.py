@@ -14,7 +14,6 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
@@ -34,9 +33,11 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     merge_multimodal_embeddings,
 )
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -112,7 +113,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         if hasattr(self.language_model, "sampler"):
             return self.language_model.sampler
 
-        return get_sampler()
+        return Sampler()
 
     def get_input_embeddings(
         self,
@@ -165,12 +166,8 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         )
         return hidden_states
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states, sampling_metadata)
+    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        return self.language_model.compute_logits(hidden_states)
 
     def sample(
         self,
