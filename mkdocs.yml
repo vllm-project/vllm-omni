@@ -39,7 +39,6 @@ theme:
     - navigation.tabs.sticky
     - navigation.sections
     - navigation.indexes
-    - navigation.expand
     - navigation.top
     - search.suggest
     - search.highlight
@@ -71,6 +70,7 @@ plugins:
       modules: ["vllm_omni"]
       api_root_uri: "api"
       nav_item_prefix: ""  # No prefix in navigation tree (clean names)
+      show_full_namespace: false  # Show only module name, not full path
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
   - mkdocstrings:
@@ -146,7 +146,9 @@ nav:
   - Architecture:
     - architecture/vllm_omni_design.md
     - architecture/high level arch design.md
-  - API Reference: api
+  - API Reference:
+      - Summary: api/README.md
+      - API: api
   - Examples:
     - examples/index.md
   - Developer Guide:
