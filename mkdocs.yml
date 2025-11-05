@@ -3,7 +3,7 @@ site_description: Multi-modality models inference and serving with non-autoregre
 site_author: vLLM-omni Team
 site_url: https://samithuang.github.io/vllm-omni/
 
-repo_name: vllm-project/vllm-omni
+repo_name: samithuang/vllm-omni
 repo_url: https://github.com/samithuang/vllm-omni
 edit_uri: edit/main/docs/
 
