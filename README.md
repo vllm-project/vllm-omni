@@ -42,7 +42,7 @@ vLLM-omni is built on a modular architecture that extends vLLM's core functional
 
 Use Docker to keep consistent basic environment (Optional, Recommended)
 ```bash
-docker run --gpus all --ipc=host --network=host -v $source_dir:$container_dir --rm --name $container_name -it nvcr.io/nvidia/pytorch:25.01-py3 bash
+docker run --gpus all --ipc=host --network=host -v $source_dir:$container_dir --name $container_name -it nvcr.io/nvidia/pytorch:25.01-py3 bash
 ```
 
 Set up basic uv environment
@@ -61,7 +61,7 @@ uv pip install vllm==0.11.0 --torch-backend=auto
 
 ### Installation of vLLM (for developers)
 
-Install stable release version of vllm with 0.11.0
+If you want to check or debug with source code of vLLM, install stable release version of vllm with 0.11.0 from source with pre-built wheel file.
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git
@@ -82,6 +82,12 @@ Install vllm with command below (If you already have PyTorch).
 python use_existing_torch.py
 uv pip install -r requirements/build.txt
 uv pip install --no-build-isolation --editable .
+```
+
+### Verification for successful installation of vLLM
+Just run the command below. If no error, it demonstrates that the installation is successfull.
+```bash
+python -c "import vllm._C"
 ```
 
 ### Installation of vLLM-omni
