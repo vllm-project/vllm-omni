@@ -110,11 +110,6 @@ bash run.sh
 ```
 The output audio is saved in ./output_audio
 
-## To-do list
-- [x] Offline inference example for Qwen2.5-omni with single request
-- [x] Adaptation from current vllm branch to stable vllm v0.11.0
-- [ ] Offline inference example for Qwen2.5-omni with streaming multiple requests
-- [ ] Online inference support
-- [ ] Support for other models
+## Further details
 
-For detailed model management, see [vllm_omni_design.md](docs/architecture/vllm_omni_design.md) and [high_level_arch_design.md](docs/architecture/high_level_arch_design.md).
+For detailed architecture design, see [vllm_omni_design.md](docs/architecture/vllm_omni_design.md) and [high_level_arch_design.md](docs/architecture/high_level_arch_design.md).

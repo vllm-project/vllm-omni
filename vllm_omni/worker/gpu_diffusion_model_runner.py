@@ -26,7 +26,6 @@ from vllm.v1.worker.gpu_model_runner import (
     get_pp_group,
     set_forward_context,
 )
-from vllm.v1.worker.ubatch_splitting import ubatch_split
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -400,27 +399,8 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
 
-        total_num_scheduled_tokens = int(num_scheduled_tokens.sum())
-
         ubatch_slices = None
         num_tokens_after_padding = None
-
-        # We currently only microbatch if the number of tokens is
-        # over a certain threshold.
-        if self.parallel_config.enable_dbo and allow_microbatching:
-            ubatch_slices, ubatch_num_tokens_after_padding = ubatch_split(
-                num_scheduled_tokens,
-                total_num_scheduled_tokens,
-                total_num_scheduled_tokens,
-                uniform_decode=uniform_decode,
-                vllm_config=self.vllm_config,
-            )
-            # Currently when DBO is enabled `ubatch_split` returns
-            # the num_tokens_after_padding for a single ubatch, but we have 2
-            # TODO(sage,lucas): this is cruft that should be addressed in the
-            # padding refactor.
-            if ubatch_num_tokens_after_padding is not None:
-                num_tokens_after_padding = ubatch_num_tokens_after_padding * 2
 
         # If we failed to microbatch, currently need to resynchronize
         # TODO(lucas,sage): we should be able to avoid this second sync by

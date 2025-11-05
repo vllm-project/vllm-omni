@@ -2,7 +2,6 @@ import time
 from collections import defaultdict
 from typing import Optional
 
-from vllm.distributed.kv_events import KVEventBatch
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import (
@@ -144,23 +143,6 @@ class DiffusionScheduler(OmniScheduler):
         if self.connector is not None:
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
-
-        # Publish KV events (aligned with v1)
-        events = self.kv_cache_manager.take_events()
-
-        # collect KV cache events from connector
-        if self.connector is not None:
-            connector_events = self.connector.take_events()
-            if connector_events:
-                if events is None:
-                    events = list(connector_events)
-                else:
-                    events.extend(connector_events)
-
-        # publish collected KV cache events
-        if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
 
         # Update internal state (advance num_computed_tokens, free encoder inputs,
         # etc.)
