@@ -1,4 +1,10 @@
-from typing import Any, NotRequired, Optional
+from typing import Any, Optional
+
+try:
+    from typing import NotRequired
+except ImportError:
+    # Python < 3.11: use typing_extensions
+    from typing_extensions import NotRequired
 
 import torch
 

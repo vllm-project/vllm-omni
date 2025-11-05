@@ -7,7 +7,7 @@ name = "vllm-omni"
 version = "0.1.0"
 description = "vLLM-omni: Multi-modality models inference and serving with non-autoregressive structures"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"  # numpy 2.x and other modern packages require Python 3.9+
 license = {text = "Apache-2.0"}
 authors = [
     {name = "vLLM-omni Team", email = "hsliuustc@gmail.com"}
@@ -19,31 +19,66 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 dependencies = [
-    "vllm>=0.2.0",
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
-    "numpy>=1.21.0",
-    "pillow>=8.0.0",
-    "opencv-python>=4.5.0",
-    "PyYAML>=6.0",
-    "gradio>=3.0.0",
-    "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
+    # Core runtime dependencies (required for actual usage)
+    "numpy>=1.21.0",  # numpy 2.x requires Python 3.9+ (which we require)
+    "cloudpickle>=3.0.0",
+    "msgspec>=0.18.0",
+    "omegaconf>=2.0.0",
     "pydantic>=2.0.0",
-    "asyncio-mqtt>=0.11.0",
-    "ray>=2.0.0",
+    "typing-extensions>=4.0.0",
+    # Utilities
+    "PyYAML>=6.0",
+    "packaging>=21.0",
+    "requests>=2.28.0",
 ]
 
 [project.optional-dependencies]
+# GPU/ML dependencies - required for actual inference, not needed for docs
+gpu = [
+    "vllm>=0.2.0",
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    # Image/Video processing
+    "pillow>=8.0.0",
+    "opencv-python>=4.5.0",
+    # Audio processing (used in examples and models)
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "resampy>=0.4.0",
+    "decord>=0.6.0",
+    # Distributed computing
+    "ray>=2.0.0",
+]
+# Web serving dependencies
+serve = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+]
+# All dependencies (for convenience - includes gpu + serve)
+all = [
+    "vllm>=0.2.0",
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "pillow>=8.0.0",
+    "opencv-python>=4.5.0",
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "resampy>=0.4.0",
+    "decord>=0.6.0",
+    "ray>=2.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+]
+
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -55,9 +90,17 @@ dev = [
     "pre-commit>=3.0.0",
 ]
 docs = [
-    "sphinx>=6.0.0",
-    "sphinx-rtd-theme>=1.2.0",
-    "myst-parser>=1.0.0",
+    "mkdocs>=1.5.0",
+    "mkdocs-api-autonav",
+    "mkdocs-material",
+    "mkdocstrings-python",
+    "mkdocs-gen-files",
+    # "mkdocs-awesome-nav",  # Not available on PyPI
+    "mkdocs-glightbox",
+    "mkdocs-git-revision-date-localized-plugin",
+    "mkdocs-minify-plugin",
+    "regex",
+    "pydantic",
 ]
 examples = [
     "jupyter>=1.0.0",
@@ -66,10 +109,10 @@ examples = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/hsliuustc0106/vllm-omni"
-Repository = "https://github.com/hsliuustc0106/vllm-omni"
+Homepage = "https://github.com/vllm-project/vllm-omni"
+Repository = "https://github.com/vllm-project/vllm-omni"
 Documentation = "https://vllm-omni.readthedocs.io"
-"Bug Tracker" = "https://github.com/hsliuustc0106/vllm-omni/issues"
+"Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
 
 [project.scripts]
 vllm = "vllm_omni.entrypoints.cli.main:main"
@@ -81,7 +124,7 @@ include = ["vllm_omni*"]
 
 [tool.black]
 line-length = 88
-target-version = ['py38', 'py39', 'py310', 'py311']
+target-version = ['py39', 'py310', 'py311', 'py312']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -108,7 +151,7 @@ max-line-length = 88
 extend-ignore = ["E203", "W503"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
