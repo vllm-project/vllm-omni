@@ -97,7 +97,6 @@ The GitHub Actions workflow (`.github/workflows/docs.yml`) will automatically:
 - Deploy it to GitHub Pages
 - Update the documentation whenever you make changes
 
-For more details, see [Deployment Guide](DEPLOYMENT.md).
 
 ### Read the Docs (Alternative)
 

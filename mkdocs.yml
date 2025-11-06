@@ -142,18 +142,20 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started:
-    - getting_started/index.md
-  - Architecture:
-    - architecture/vllm_omni_design.md
-    - architecture/high level arch design.md
+    - getting_started/quickstart.md
   - API Reference:
       - Summary: api/README.md
       - API: api
   - Examples:
     - examples/index.md
   - Developer Guide:
-    - contributing.md
-    - development.md
+    - contributing/README.md
+    - Design Documents:
+      - contributing/design_documents/index.md
+      - contributing/design_documents/vllm_omni_design.md
+      - contributing/design_documents/architecture_overview.md
+      - contributing/design_documents/api_design_doc.md
+      - contributing/design_documents/api_design_template.md
 
 # Extra
 extra:

@@ -51,9 +51,9 @@ outputs = llm.generate(
 
 ## <span class="twemoji">📚</span> Documentation
 
-- [:material-play-circle: Getting Started](getting_started/index.md) - Installation and quick start guide
-- [:material-sitemap: Architecture](architecture/vllm_omni_design.md) - System architecture and design
+- [:material-play-circle: Getting Started](getting_started/quickstart.md) - Installation and quick start guide
+- [:material-sitemap: Architecture](contributing/design_documents/vllm_omni_design.md) - System architecture and design
 - [:material-code-tags: API Reference](api/index.md) - Complete API documentation
 - [:material-code-braces: Examples](examples/index.md) - Code examples and tutorials
-- [:material-tools: Developer Guide](contributing.md) - Contributing and development guide
+- [:material-tools: Developer Guide](contributing/README.md) - Contributing and development guide
 
