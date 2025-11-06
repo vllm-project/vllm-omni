@@ -10,11 +10,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.multimodal.inputs import MultiModalKwargs
-from vllm.utils import cdiv
-from vllm.v1.attention.backends.utils import (
-    CommonAttentionMetadata,
-    split_attn_metadata,
-)
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.utils import record_function_or_nullcontext
@@ -317,7 +313,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
-        allow_microbatching: bool = True,
         skip_eplb: bool = False,
         is_profile: bool = False,
         create_mixed_batch: bool = False,
@@ -371,35 +366,16 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # has num_tokens in total.
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        if create_mixed_batch:
-            assert not uniform_decode
-            # Create mixed batch:
-            # first half decode tokens, second half one prefill
-            num_decode_tokens = num_tokens // 2
-            num_prefill_tokens = num_tokens - num_decode_tokens
-            num_reqs = num_decode_tokens + 1
 
-            # Create decode requests (1 token each) followed by prefill request
-            num_scheduled_tokens_list = [1] * num_decode_tokens + [num_prefill_tokens]
-            # Note: Overriding max_query_len to be the prefill tokens
-            max_query_len = num_prefill_tokens
-        elif uniform_decode:
-            assert not create_mixed_batch
-            num_reqs = cdiv(num_tokens, max_query_len)
-            num_scheduled_tokens_list = [max_query_len] * num_reqs
-            if num_tokens % max_query_len != 0:
-                num_scheduled_tokens_list[-1] = num_tokens % max_query_len
-        else:
-            num_reqs = min(num_tokens, max_num_reqs)
-            min_tokens_per_req = num_tokens // num_reqs
-            num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
-            num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += num_tokens % num_reqs
 
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
 
-        ubatch_slices = None
         num_tokens_after_padding = None
 
         # If we failed to microbatch, currently need to resynchronize
@@ -419,16 +395,8 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # it only happens for cudagraph_runtime_mode=FULL.
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             attn_metadata = {}
-            if ubatch_slices is not None:
-                attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
-            if create_mixed_batch:
-                # In the mixed batch mode (used for FI warmup), we use
-                # shorter sequence lengths to run faster.
-                # TODO(luka) better system for describing dummy batches
-                seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
-            else:
-                seq_lens = max_query_len
+            seq_lens = max_query_len
             self.seq_lens.np[:num_reqs] = seq_lens
             self.seq_lens.np[num_reqs:] = 0
             self.seq_lens.copy_to_gpu()
@@ -461,27 +429,13 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                     causal=True,
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
-                    if ubatch_slices is not None:
-                        common_attn_metadata_list = split_attn_metadata(
-                            ubatch_slices, common_attn_metadata
-                        )
-                        for ubid, common_attn_metadata in enumerate(
-                            common_attn_metadata_list
-                        ):
-                            assert common_attn_metadata.max_query_len == 1
-                            attn_metadata_i = attn_group.get_metadata_builder(
-                                ubatch_id=ubid
-                            ).build_for_cudagraph_capture(common_attn_metadata)
-                            for layer_name in attn_group.layer_names:
-                                assert type(attn_metadata) is list
-                                attn_metadata[ubid][layer_name] = attn_metadata_i
-                    else:
-                        assert type(attn_metadata) is dict
-                        attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(  # noqa: E501
-                            common_attn_metadata
-                        )
-                        for layer_name in attn_group.layer_names:
-                            attn_metadata[layer_name] = attn_metadata_i
+
+                    assert type(attn_metadata) is dict
+                    attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(  # noqa: E501
+                        common_attn_metadata
+                    )
+                    for layer_name in attn_group.layer_names:
+                        attn_metadata[layer_name] = attn_metadata_i
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config, num_scheduled_tokens, remove_lora
@@ -547,14 +501,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             else:
                 cudagraph_runtime_mode = _cg_mode
 
-            if ubatch_slices is not None:
-                # Adjust values to reflect a single ubatch.
-                # TODO(sage,lucas): this is cruft that should be addressed in
-                #  the padding refactor.
-                num_tokens_after_padding = ubatch_slices[0].num_tokens
-                if num_tokens_across_dp is not None:
-                    num_tokens_across_dp[:] = num_tokens_after_padding
-
             with self.maybe_randomize_inputs(input_ids), set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -562,7 +508,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
             ):
                 outputs = self.model(
                     input_ids=input_ids,
@@ -588,8 +533,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # not have any requests to process, so they're executing dummy batches.
         # In such cases, we still have to trigger EPLB to make sure
         # ranks execute the rearrangement in synchronization.
-        if not skip_eplb:
-            self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         # logit_indices = np.cumsum(num_scheduled_tokens) - 1
         hidden_states, _ = self.extract_multimodal_outputs(hidden_states)
