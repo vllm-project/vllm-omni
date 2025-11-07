@@ -99,9 +99,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
 
-            # Reset per-step additional information collector
+            # Reset per-step additional information collector (deprecated concat path)
             if hasattr(self, "_forward_additional_information"):
                 self._forward_additional_information = None
+            # New: per-request additional information for this step
+            per_req_additional_information: dict[str, dict] = {}
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
@@ -126,50 +128,27 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(
                         src
                     )
-                # For additional_information: handle arbitrary keys
+                # Build per-request additional information (no cross-request concat)
                 if addi_cpu is not None and isinstance(addi_cpu, dict):
-                    # Lazy init collector dict
-                    if (
-                        not hasattr(self, "_forward_additional_information")
-                        or self._forward_additional_information is None
-                    ):
-                        self._forward_additional_information = {}
-                    # Process tensors (slice by scheduled prompt range) and
-                    # lists (append per-request)
+                    req_info: dict[str, object] = {}
                     for k, v in addi_cpu.items():
                         if isinstance(v, torch.Tensor):
-                            # Slice along token dimension for prefill part
-                            try:
-                                seg = v[
-                                    num_computed_tokens : num_computed_tokens
-                                    + overlay_len
-                                ].to(
-                                    dtype=self.dtype,
-                                    device=self.device,
-                                    non_blocking=True,
-                                )
-                            except Exception:
-                                # Fallback: move whole tensor if slicing fails
-                                seg = v.to(
-                                    dtype=self.dtype,
-                                    device=self.device,
-                                    non_blocking=True,
-                                )
-                            prev_val = self._forward_additional_information.get(k)
-                            self._forward_additional_information[k] = (
-                                torch.cat([prev_val, seg], dim=0)
-                                if isinstance(prev_val, torch.Tensor)
-                                else seg.clone()
-                            )
-                        elif isinstance(v, list):
-                            prev_val = self._forward_additional_information.get(k)
-                            if prev_val is None:
-                                self._forward_additional_information[k] = [v]
-                            elif isinstance(prev_val, list):
-                                self._forward_additional_information[k].append(v)
+                            # For prefill tokens, pass only the scheduled slice; for decode or no scheduled tokens, pass whole tensor
+                            if overlay_len > 0:
+                                try:
+                                    seg = v[
+                                        num_computed_tokens : num_computed_tokens + overlay_len
+                                    ].detach().to("cpu").contiguous()
+                                except Exception:
+                                    seg = v.detach().to("cpu").contiguous()
+                                req_info[k] = seg
                             else:
-                                # Mixed types: wrap existing into list
-                                self._forward_additional_information[k] = [prev_val, v]
+                                req_info[k] = v.detach().to("cpu").contiguous()
+                        elif isinstance(v, list):
+                            req_info[k] = v
+                        else:
+                            req_info[k] = v
+                    per_req_additional_information[req_id] = req_info
 
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
@@ -395,15 +374,33 @@ class GPUARModelRunner(OmniGPUModelRunner):
         ):
 
             model_kwargs_extra = {}
-            # Only pass additional_information for the prefill part
-            if (
-                hasattr(self, "_forward_additional_information")
-                and self._forward_additional_information is not None
-                and isinstance(self._forward_additional_information, dict)
-            ):
-                model_kwargs_extra["additional_information"] = (
-                    self._forward_additional_information
+            # Pass per-request additional information map for this step (no concat)
+            if per_req_additional_information:
+                model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
+            # 始终传递每请求的运行期 additional_information（持久化在 request state）
+            try:
+                per_req_runtime_info = []
+                for req_id in self.input_batch.req_ids:
+                    req_state = self.requests.get(req_id)
+                    info = (
+                        getattr(req_state, "additional_information_cpu", None)
+                        if req_state is not None
+                        else None
+                    )
+                    per_req_runtime_info.append(info if isinstance(info, dict) else {})
+                model_kwargs_extra["runtime_additional_information"] = (
+                    per_req_runtime_info
                 )
+                model_kwargs_extra["request_ids"] = self.input_batch.req_ids
+                # 传递每个请求在本步扁平序列中的 token 区间，便于模型按请求映射 decode/prefill
+                req_token_spans = []
+                for req_index in range(len(self.input_batch.req_ids)):
+                    start_offset = int(self.query_start_loc_cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    req_token_spans.append((start_offset, start_offset + sched_tokens))
+                model_kwargs_extra["request_token_spans"] = req_token_spans
+            except Exception:
+                pass
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -428,8 +425,42 @@ class GPUARModelRunner(OmniGPUModelRunner):
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
                 hidden_states
             )
-
+            # 模型侧可能返回 per-request 的 additional_information 更新（与模型无关的通用通道）。
+            # 约定：multimodal_outputs["additional_information_update"] 为按 batch 顺序的 list[dict]，
+            # runner 将其合并到对应 request 的 additional_information_cpu，供后续 decode 使用。
+            try:
+                if (
+                    isinstance(multimodal_outputs, dict)
+                    and (
+                        "additional_information_update" in multimodal_outputs
+                        or "additional_information_update_by_req_id" in multimodal_outputs
+                    )
+                ):
+                    # 方案 A：按 batch 顺序的 list[dict]
+                    updates_list = multimodal_outputs.get(
+                        "additional_information_update"
+                    )
+                    if isinstance(updates_list, list):
+                        for idx, upd in enumerate(updates_list):
+                            if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
+                                continue
+                            req_id = self.input_batch.req_ids[idx]
+                            self._merge_additional_information_update(req_id, upd)
+                    # 方案 B：按 req_id 的 dict[str, dict]
+                    updates_map = multimodal_outputs.get(
+                        "additional_information_update_by_req_id"
+                    )
+                    if isinstance(updates_map, dict):
+                        for req_id, upd in updates_map.items():
+                            if not isinstance(upd, dict):
+                                continue
+                            if req_id not in self.requests:
+                                continue
+                            self._merge_additional_information_update(req_id, upd)
+            except Exception as e:
+                logger.error(f"Error merging for requests:{self.input_batch.req_ids} additional information update: {e}, with the multimodal_outputs as {multimodal_outputs}")
             if not self.broadcast_pp_output:
+
                 # Common case.
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
@@ -589,3 +620,26 @@ class GPUARModelRunner(OmniGPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
+        
+    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+        existing = getattr(req_state, "additional_information_cpu", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for k, v in upd.items():
+            if isinstance(v, torch.Tensor):
+                merged[k] = v.detach().to("cpu").contiguous()
+            elif isinstance(v, list):
+                new_list = []
+                for item in v:
+                    if isinstance(item, torch.Tensor):
+                        new_list.append(item.detach().to("cpu").contiguous())
+                    else:
+                        new_list.append(item)
+                merged[k] = new_list
+            else:
+                merged[k] = v
+        setattr(req_state, "additional_information_cpu", merged)

@@ -4,8 +4,9 @@ import torch
 
 from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
-
-
+TALKER_CODEC_PAD_TOKEN_ID = 8292
+TALKER_CODEC_START_TOKEN_ID = 8293
+TALKER_CODEC_END_TOKEN_ID = 8294
 def thinker2talker(
     stage_list, engine_input_source, prompt: Union[OmniTokensPrompt, TextPrompt] = None
 ):
@@ -33,8 +34,7 @@ def thinker2talker(
         )
         talker_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0]
-                * (len(prompt_token_ids) + 2),  # add 2 for codec pad and start token
+                prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID] + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids)) + [TALKER_CODEC_END_TOKEN_ID],
                 additional_information={
                     "thinker_result": thinker_hidden_states[prompt_token_ids_len:].to(
                         torch.float32
@@ -44,6 +44,8 @@ def thinker2talker(
                     ),
                     "prompt_token_ids": prompt_token_ids,
                     "thinker_output_token_ids": thinker_output_ids,
+                    "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
+                    "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
                 },
                 multi_modal_data=(
                     multi_modal_data[thinker_output.request_id]
