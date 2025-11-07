@@ -65,6 +65,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         torch.Tensor,
         Optional[IntermediateTensors],
         dict[str, Any],
+        Optional[dict[str, dict]],
     ]:
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -79,6 +80,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
+        per_req_additional_information: Optional[dict[str, dict]] = None
         if (
             self.supports_mm_inputs
             and get_pp_group().is_first_rank
@@ -103,7 +105,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             if hasattr(self, "_forward_additional_information"):
                 self._forward_additional_information = None
             # New: per-request additional information for this step
-            per_req_additional_information: dict[str, dict] = {}
+            per_req_additional_information = {}
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
@@ -219,6 +221,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             positions,
             intermediate_tensors,
             model_kwargs,
+            per_req_additional_information,
         )
 
     @torch.inference_mode()
@@ -334,6 +337,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 positions,
                 intermediate_tensors,
                 model_kwargs,
+                per_req_additional_information,
             ) = self._preprocess(
                 scheduler_output,
                 num_scheduled_tokens_np,
