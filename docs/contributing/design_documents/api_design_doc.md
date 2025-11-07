@@ -155,7 +155,7 @@ Each API template follows this standardized structure:
 2. **Set Up Development Environment**
    ```bash
    # Clone the repository
-   git clone https://github.com/vllm-project0106/vllm-omni.git
+   git clone https://github.com/vllm-project/vllm-omni.git
    cd vllm-omni
 
    # Install dependencies
