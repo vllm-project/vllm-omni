@@ -162,6 +162,7 @@ def main():
             args.prompts = loaded
             print(f"[Info] Loaded {len(args.prompts)} prompts from {args.pt_prompts}")
     except Exception as e:
+        print(f"[Error] Failed to load pt-prompts: {e}")
         raise
 
     if args.prompts is None:
@@ -233,8 +234,8 @@ def main():
                 try:
                     with open(out_txt, "w", encoding="utf-8") as f:
                         f.writelines(lines)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
                 print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
@@ -255,8 +256,8 @@ def main():
                 try:
                     with open(out_txt, "w", encoding="utf-8") as f:
                         f.writelines(lines)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
                 print(f"Request ID: {request_id}, Saved audio to {output_wav} and text to {out_txt}")
 
 

@@ -39,7 +39,8 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                         "[Stage-%s] Set CUDA_VISIBLE_DEVICES to %s; logical 0 -> physical %s",
                         stage_id, devices, selected_physical,
                     )
-                except Exception:
+                except Exception as e:
+                    logger.debug("[Stage-%s] Failed to parse first CUDA device: %s", stage_id, e)
                     selected_physical = None
         elif isinstance(devices, (int, str)) and (isinstance(devices, int) or str(devices).isdigit()):
             logical_idx = max(0, int(devices))
@@ -49,7 +50,8 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                     mapping = [int(x) for x in vis.split(",") if x.strip() != ""]
                     if 0 <= logical_idx < len(mapping):
                         selected_physical = mapping[logical_idx]
-                except Exception:
+                except Exception as e:
+                    logger.debug("[Stage-%s] Failed to map logical index via CUDA_VISIBLE_DEVICES: %s", stage_id, e)
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
@@ -70,8 +72,8 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
             if torch.cuda.is_available():
                 try:
                     torch.cuda.set_device(0)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[Stage-%s] torch.cuda.set_device(0) failed: %s", stage_id, e, exc_info=True)
                 num = torch.cuda.device_count()
                 info = []
                 for i in range(num):
@@ -84,8 +86,8 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                         "free": int(free),
                     })
                 logger.debug("[Stage-%s] CUDA devices visible=%s info=%s", stage_id, num, info)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[Stage-%s] Failed to query CUDA devices: %s", stage_id, e, exc_info=True)
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
 
@@ -107,8 +109,8 @@ def shm_write_bytes(payload: bytes) -> Dict[str, Any]:
     meta = {"name": shm.name, "size": len(payload)}
     try:
         shm.close()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Ensure parent dir failed for %s: %s", path, e)
     return meta
 
 

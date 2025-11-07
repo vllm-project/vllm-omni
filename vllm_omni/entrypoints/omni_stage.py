@@ -116,18 +116,18 @@ class OmniStage:
         if self._in_q is not None:
             try:
                 self._in_q.put_nowait(None)
-            except Exception:
-                pass
+            except Exception as e:
+                self._logger.warning("[Stage-%s] Failed to send shutdown to in_q: %s", self.stage_id, e)
         if self._proc is not None:
             try:
                 self._proc.join(timeout=5)
-            except Exception:
-                pass
+            except Exception as e:
+                self._logger.debug("[Stage-%s] join() failed: %s", self.stage_id, e, exc_info=True)
             if self._proc.is_alive():
                 try:
                     self._proc.terminate()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
 
     def submit(self, payload: Dict[str, Any]) -> None:
         assert self._in_q is not None
@@ -185,6 +185,11 @@ def _stage_worker(
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
     from vllm_omni.entrypoints.omni_llm import OmniStageLLM  # noqa: WPS433
+    from vllm_omni.entrypoints.log_utils import (  # noqa: WPS433
+        log_stage_request_stats,
+        log_stage_running_avg,
+        log_stage_batch_stats,
+    )
     import queue as _queue
     import time as _time
     from vllm_omni.entrypoints.pipeline_utils import append_jsonl as _append_jsonl, serialize_obj as _ser
@@ -217,6 +222,8 @@ def _stage_worker(
     # Aggregates for running average
     _agg_total_tokens = 0
     _agg_total_gen_time_ms = 0.0
+    # Monotonic batch id per stage process for orchestrator dedup on time aggregation
+    _batch_seq = 0
 
     # Device mapping
     try:
@@ -294,6 +301,7 @@ def _stage_worker(
         print(f"[Stage-{stage_id}] Received batch size={len(batch_tasks)}, request_ids={batch_request_ids}", flush=True)
         print("--------------------------------", flush=True)
         try:
+            _batch_seq += 1
             gen_outputs: List[Any] = []
             _gen_t0 = _time.time()
             for ro in stage_engine.generate(batch_engine_inputs, sampling_params, use_tqdm=False):
@@ -355,24 +363,9 @@ def _stage_worker(
                         pass
 
             if _stats_file:
-                try:
-                    _avg_tokens_per_s = (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
-                    _append_jsonl(_stats_file, {
-                        "type": "stage_running_avg",
-                        "stage_id": stage_id,
-                        "total_tokens": int(_agg_total_tokens),
-                        "total_gen_time_ms": _agg_total_gen_time_ms,
-                        "avg_tokens_per_s": _avg_tokens_per_s,
-                    })
-                    _append_jsonl(_stats_file, {
-                        "type": "stage_batch_stats",
-                        "stage_id": stage_id,
-                        "batch_size": len(batch_tasks),
-                        "batch_gen_time_ms": _gen_ms,
-                        "request_ids": list(batch_request_ids),
-                    })
-                except Exception:
-                    pass
+                _avg_tokens_per_s = (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+                log_stage_running_avg(_stats_file, stage_id, int(_agg_total_tokens), float(_agg_total_gen_time_ms), float(_avg_tokens_per_s))
+                log_stage_batch_stats(_stats_file, stage_id, len(batch_tasks), float(_gen_ms), list(batch_request_ids))
 
             # Emit per-request results
             for rid in batch_request_ids:
@@ -382,10 +375,29 @@ def _stage_worker(
                     _metrics = {
                         "num_tokens_out": int(_count_tokens(r_outputs)),
                         "stage_gen_time_ms": _gen_ms,
+                        "batch_id": int(_batch_seq),
                         "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
                         "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
                         "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
                     }
+                    if _stats_file:
+                        _num_tokens = int(_metrics["num_tokens_out"])  # type: ignore[index]
+                        _tokens_per_s = (_num_tokens * 1000.0 / _gen_ms) if _gen_ms > 0 else 0.0
+                        _rx_b = int(_metrics["rx_transfer_bytes"])  # type: ignore[index]
+                        _rx_ms = float(_metrics["rx_decode_time_ms"])  # type: ignore[index]
+                        _rx_mbps = (float(_rx_b) * 8.0) / (max(float(_rx_ms), 1e-6) * 1000.0) if _rx_b > 0 else 0.0
+                        log_stage_request_stats(
+                            _stats_file,
+                            stage_id,
+                            rid,
+                            len(batch_tasks),
+                            _num_tokens,
+                            float(_gen_ms),
+                            float(_tokens_per_s),
+                            _rx_b,
+                            _rx_ms,
+                            float(_rx_mbps),
+                        )
                     if use_shm:
                         out_q.put({
                             "request_id": rid,

@@ -126,7 +126,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     src = pe_cpu[
                         num_computed_tokens : num_computed_tokens + overlay_len
                     ].to(dtype=self.dtype, device=self.device, non_blocking=True)
-                    start_offset = int(self.query_start_loc_cpu[req_index])
+                    start_offset = int(self.query_start_loc.cpu[req_index])
                     self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(
                         src
                     )
@@ -381,7 +381,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # Pass per-request additional information map for this step (no concat)
             if per_req_additional_information:
                 model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
-            # 始终传递每请求的运行期 additional_information（持久化在 request state）
+            # Always pass per-request runtime additional_information (persisted in request state)
             try:
                 per_req_runtime_info = []
                 for req_id in self.input_batch.req_ids:
@@ -396,10 +396,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     per_req_runtime_info
                 )
                 model_kwargs_extra["request_ids"] = self.input_batch.req_ids
-                # 传递每个请求在本步扁平序列中的 token 区间，便于模型按请求映射 decode/prefill
+                # Pass each request's token span within the flattened sequence for this step, enabling the model to map decode/prefill by request
                 req_token_spans = []
                 for req_index in range(len(self.input_batch.req_ids)):
-                    start_offset = int(self.query_start_loc_cpu[req_index])
+                    start_offset = int(self.query_start_loc.cpu[req_index])
                     sched_tokens = int(num_scheduled_tokens_np[req_index])
                     req_token_spans.append((start_offset, start_offset + sched_tokens))
                 model_kwargs_extra["request_token_spans"] = req_token_spans
@@ -429,9 +429,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
                 hidden_states
             )
-            # 模型侧可能返回 per-request 的 additional_information 更新（与模型无关的通用通道）。
-            # 约定：multimodal_outputs["additional_information_update"] 为按 batch 顺序的 list[dict]，
-            # runner 将其合并到对应 request 的 additional_information_cpu，供后续 decode 使用。
+            # The model side may return per-request additional_information updates (model-agnostic channel).
+            # Convention: multimodal_outputs["additional_information_update"] is a list[dict] in batch order;
+            # the runner merges it into the corresponding request's additional_information_cpu for subsequent decode.
             try:
                 if (
                     isinstance(multimodal_outputs, dict)
@@ -440,7 +440,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         or "additional_information_update_by_req_id" in multimodal_outputs
                     )
                 ):
-                    # 方案 A：按 batch 顺序的 list[dict]
+                    # Option A: list[dict] in batch order
                     updates_list = multimodal_outputs.get(
                         "additional_information_update"
                     )
@@ -450,7 +450,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                                 continue
                             req_id = self.input_batch.req_ids[idx]
                             self._merge_additional_information_update(req_id, upd)
-                    # 方案 B：按 req_id 的 dict[str, dict]
+                    # Option B: dict[str, dict] keyed by req_id
                     updates_map = multimodal_outputs.get(
                         "additional_information_update_by_req_id"
                     )

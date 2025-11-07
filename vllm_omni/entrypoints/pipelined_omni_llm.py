@@ -16,6 +16,24 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.entrypoints.omni_llm import OmniLLM, OmniStageLLM
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.utils import load_stage_configs_from_model
+from vllm_omni.entrypoints.log_utils import (
+    remove_old_logs,
+    configure_orchestrator_logger,
+    init_stats_paths,
+    record_stage_metrics,
+    aggregate_rx_and_maybe_total,
+    record_sender_transfer_agg,
+    count_tokens_from_outputs,
+    build_stage_summary,
+    build_transfer_summary,
+    log_transfer_tx,
+    log_transfer_rx,
+    log_transfer_total,
+    log_orchestrator_e2e,
+    log_orchestrator_summary,
+    log_overall_summary,
+    OrchestratorMetrics,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.entrypoints.pipeline_utils import (
     maybe_load_from_ipc as _load,
@@ -65,32 +83,10 @@ class PipelinedOmniLLM(OmniLLM):
         # Optional file handler for orchestrator
         self._log_file = log_file
         if self._log_file:
-            try:
-                # Avoid duplicate handlers
-                has_file_handler = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
-                if not has_file_handler:
-                    fh = logging.FileHandler(self._log_file)
-                    fh.setLevel(logging.DEBUG)
-                    fh.setFormatter(logging.Formatter("%(asctime)s [PID:%(process)d] %(levelname)s: %(message)s"))
-                    logger.addHandler(fh)
-                    logger.setLevel(logging.DEBUG)
-            except Exception:
-                pass
+            remove_old_logs(self._log_file, len(self.stage_list))
+            configure_orchestrator_logger(logger, self._log_file)
 
-        # Orchestrator stats JSONL file
-        self._stats_file: Optional[str] = None
-        if self._enable_stats and self._log_file:
-            try:
-                self._stats_file = f"{self._log_file}.orchestrator.stats.jsonl"
-            except Exception:
-                self._stats_file = None
-        # Overall stats JSONL file (per-request + summary)
-        self._overall_stats_file: Optional[str] = None
-        if self._enable_stats and self._log_file:
-            try:
-                self._overall_stats_file = f"{self._log_file}.overall.stats.jsonl"
-            except Exception:
-                self._overall_stats_file = None
+        self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
 
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
@@ -122,19 +118,19 @@ class PipelinedOmniLLM(OmniLLM):
         for q in self._stage_in_queues:
             try:
                 q.put_nowait(None)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[Orchestrator] Failed to send shutdown signal to stage input queue: %s", e)
         for stage in self.stage_list:
             try:
                 stage.stop_stage_worker()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
         try:
             self.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
     def generate(
         self,
@@ -178,25 +174,16 @@ class PipelinedOmniLLM(OmniLLM):
                     final_stage_id_for_e2e = max(final_stage_id_for_e2e, _sid)
             if final_stage_id_for_e2e < 0:
                 final_stage_id_for_e2e = len(self.stage_list) - 1
-        except Exception:
+        except Exception as e:
+            logger.debug("[Orchestrator] Failed to determine final stage for E2E; falling back to last: %s", e, exc_info=True)
             final_stage_id_for_e2e = len(self.stage_list) - 1
-        # In-memory aggregators for this generate() call
-        stage_total_time_ms: List[float] = [0.0 for _ in range(num_stages)]
-        stage_total_tokens: List[int] = [0 for _ in range(num_stages)]
-        stage_req_counts: List[int] = [0 for _ in range(num_stages)]
-        transfer_agg: Dict[tuple[int, int], Dict[str, float]] = {}
-        # Per-edge per-request sender timing to combine with receiver timing later
-        transfer_edge_req: Dict[tuple[int, int, int], Dict[str, float]] = {}
-        e2e_total_ms: float = 0.0
-        e2e_total_tokens: int = 0
-        e2e_count: int = 0
-        e2e_done: set[int] = set()
-        # Per-request overall aggregation
-        per_request: Dict[int, Dict[str, Any]] = {}
-        sum_per_request_transfer_ms: float = 0.0
+        # Metrics/aggregation helper
+        metrics = OrchestratorMetrics(num_stages, self._enable_stats, self._stats_file, self._overall_stats_file, _wall_start_ts)
 
         # Seed stage-0 queue with all requests
         logger.debug("[Orchestrator] Seeding %d requests into stage-0", len(request_prompts))
+        # Mark first input time for stage-0
+        metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
         for req_id, prompt in request_id_to_prompt.items():
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
@@ -235,94 +222,14 @@ class PipelinedOmniLLM(OmniLLM):
                     continue
 
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-                # Aggregate per-request metrics from stage worker if present
+                # Mark last output time for this stage whenever we receive outputs
+                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
                     _m = result.get("metrics")
                     if _m is not None:
-                        stage_req_counts[stage_id] += 1
-                        stage_total_time_ms[stage_id] += float(_m.get("stage_gen_time_ms", 0.0))
-                        stage_total_tokens[stage_id] += int(_m.get("num_tokens_out", 0))
-                        # record per-request stage metrics
-                        try:
-                            rid_int = int(req_id)
-                            pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
-                            pr_stages = pr["stages"]  # type: ignore[index]
-                            pr_stages[stage_id] = {
-                                "stage_gen_time_ms": float(_m.get("stage_gen_time_ms", 0.0)),
-                                "num_tokens_out": int(_m.get("num_tokens_out", 0)),
-                            }
-                        except Exception:
-                            pass
-                        # Also aggregate receiver-side transfer decode time for (stage_id-1 -> stage_id)
-                        try:
-                            if stage_id > 0:
-                                key = (stage_id - 1, stage_id)
-                                agg = transfer_agg.get(key)
-                                if agg is None:
-                                    agg = {"sum_bytes": 0.0, "sum_ms": 0.0, "count": 0.0,
-                                           "sum_rx_bytes": 0.0, "sum_rx_ms": 0.0, "rx_count": 0.0,
-                                           "sum_total_ms": 0.0, "total_count": 0.0}
-                                    transfer_agg[key] = agg
-                                rx_b = float(_m.get("rx_transfer_bytes", 0.0))
-                                rx_ms = float(_m.get("rx_decode_time_ms", 0.0))
-                                in_flight_ms = float(_m.get("rx_in_flight_time_ms", 0.0))
-                                agg["sum_rx_bytes"] += rx_b
-                                agg["sum_rx_ms"] += rx_ms
-                                agg["rx_count"] += 1.0
-                                # If we have sender-side timing stored, compute combined (encode+enqueue + decode)
-                                try:
-                                    edge_req = (stage_id - 1, stage_id, int(req_id))
-                                    s = transfer_edge_req.get(edge_req)
-                                    if s is not None:
-                                        total_ms = float(s.get("tx_ms", 0.0)) + in_flight_ms + rx_ms
-                                        agg["sum_total_ms"] += total_ms
-                                        agg["total_count"] += 1.0
-                                        # accumulate per-request transfer totals
-                                        try:
-                                            rid_int = int(req_id)
-                                            pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
-                                            pr["transfers_ms"] = float(pr.get("transfers_ms", 0.0)) + total_ms  # type: ignore[index]
-                                            pr["transfers_bytes"] = int(pr.get("transfers_bytes", 0)) + int(rx_b)  # type: ignore[index]
-                                        except Exception:
-                                            pass
-                                        if getattr(self, "_stats_file", None):
-                                            try:
-                                                size_b = float(s.get("size_bytes", rx_b))
-                                                _append_jsonl(self._stats_file, {  # type: ignore[arg-type]
-                                                    "type": "transfer_total_stats",
-                                                    "from_stage": stage_id - 1,
-                                                    "to_stage": stage_id,
-                                                    "request_id": req_id,
-                                                    "size_bytes": int(size_b),
-                                                    "tx_time_ms": float(s.get("tx_ms", 0.0)),
-                                                    "in_flight_time_ms": in_flight_ms,
-                                                    "rx_decode_time_ms": rx_ms,
-                                                    "total_time_ms": total_ms,
-                                                    "total_time_per_kb_ms": total_ms / max(size_b / 1024.0, 1e-6) if size_b > 0 else 0.0,
-                                                })
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
-                                # Emit per-request RX stats to JSONL
-                                if getattr(self, "_stats_file", None):
-                                    try:
-                                        _append_jsonl(self._stats_file, {  # type: ignore[arg-type]
-                                            "type": "transfer_rx_stats",
-                                            "from_stage": stage_id - 1,
-                                            "to_stage": stage_id,
-                                            "request_id": req_id,
-                                            "rx_bytes": int(rx_b),
-                                            "rx_decode_time_ms": rx_ms,
-                                            "in_flight_time_ms": in_flight_ms,
-                                            "rx_time_per_kb_ms": rx_ms / max(rx_b / 1024.0, 1e-6) if rx_b > 0 else 0.0,
-                                        })
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        metrics.on_stage_metrics(stage_id, req_id, _m)
+                except Exception as e:
+                    logger.exception("[Orchestrator] Failed to process metrics for stage %s, req %s: %s", stage_id, req_id, e)
                 logger.debug("[Orchestrator] Stage-%s completed request %s; forwarding or finalizing", stage_id, req_id)
                 stage.set_engine_outputs(engine_outputs)
 
@@ -338,67 +245,11 @@ class PipelinedOmniLLM(OmniLLM):
 
                     # End-to-end timing and time-per-token for final output (only once per request at the designated final stage)
                     try:
-                        if stage_id == final_stage_id_for_e2e and req_id not in e2e_done:
-                            _t0 = _req_start_ts.get(req_id)
-                            if _t0 is not None:
-                                _t1 = time.time()
-                                _last_finish_ts = max(_last_finish_ts, _t1)
-                                _e2e_ms = (_t1 - _t0) * 1000.0
-                                # Count tokens from final stage outputs
-                                def _count_tokens(_ros: List[Any]) -> int:  # type: ignore[name-defined]
-                                    total = 0
-                                    for _ro in _ros:
-                                        try:
-                                            outs = getattr(_ro, "outputs", None)
-                                            if outs and len(outs) > 0:
-                                                tokens = getattr(outs[0], "token_ids", None)
-                                                if tokens is not None:
-                                                    total += len(tokens)
-                                        except Exception:
-                                            pass
-                                    return total
-                                _num_tokens = _count_tokens(engine_outputs)
-                                _time_per_token_ms = (_e2e_ms / _num_tokens) if _num_tokens > 0 else 0.0
-                                # Update E2E aggregators
-                                e2e_total_ms += _e2e_ms
-                                e2e_total_tokens += int(_num_tokens)
-                                e2e_count += 1
-                                e2e_done.add(req_id)
-                                # Write per-request overall record
-                                try:
-                                    rid_int = int(req_id)
-                                    pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
-                                    per_req_record = {
-                                        "type": "overall_request",
-                                        "request_id": rid_int,
-                                        "e2e_time_ms": _e2e_ms,
-                                        "num_tokens_out": int(_num_tokens),
-                                        "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
-                                        "transfers_total_bytes": int(pr.get("transfers_bytes", 0)),
-                                        "stages": pr.get("stages", {}),
-                                    }
-                                    sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
-                                    if getattr(self, "_overall_stats_file", None):
-                                        try:
-                                            _append_jsonl(self._overall_stats_file, per_req_record)  # type: ignore[arg-type]
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-                                if getattr(self, "_stats_file", None):
-                                    try:
-                                        _append_jsonl(self._stats_file, {  # type: ignore[arg-type]
-                                            "type": "orchestrator_request_e2e",
-                                            "request_id": req_id,
-                                            "final_stage_id": stage_id,
-                                            "e2e_time_ms": _e2e_ms,
-                                            "num_tokens_out": int(_num_tokens),
-                                            "e2e_time_per_token_ms": _time_per_token_ms,
-                                        })
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
+                        rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
+                        if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
+                            metrics.on_finalize_request(stage_id, req_id, engine_outputs, _req_start_ts.get(req_id, _wall_start_ts))
+                    except Exception as e:
+                        logger.exception("[Orchestrator] Finalize request handling error for req %s at stage %s: %s", req_id, stage_id, e)
 
                 next_stage_id = stage_id + 1
                 if next_stage_id < num_stages:
@@ -427,40 +278,9 @@ class PipelinedOmniLLM(OmniLLM):
                         self.stage_list[next_stage_id].submit(ipc_payload)
                         t1 = time.time()
                         tx_ms = (t1 - t0) * 1000.0
-                        if self._enable_stats and getattr(self, "_stats_file", None):
-                            try:
-                                _append_jsonl(self._stats_file, {
-                                    "type": "transfer_stats",
-                                    "from_stage": stage_id,
-                                    "to_stage": next_stage_id,
-                                    "request_id": req_id,
-                                    "size_bytes": int(size_bytes),
-                                    "tx_time_ms": tx_ms,
-                                    "tx_mbps": (float(size_bytes) * 8.0) / (max(tx_ms, 1e-6) * 1000.0),
-                                    "used_shm": bool("engine_inputs_shm" in ipc_payload),
-                                })
-                            except Exception:
-                                pass
-                        # Update in-memory transfer aggregator
-                        try:
-                            key = (stage_id, next_stage_id)
-                            agg = transfer_agg.get(key)
-                            if agg is None:
-                                agg = {"sum_bytes": 0.0, "sum_ms": 0.0, "count": 0.0,
-                                       "sum_rx_bytes": 0.0, "sum_rx_ms": 0.0, "rx_count": 0.0,
-                                       "sum_total_ms": 0.0, "total_count": 0.0}
-                                transfer_agg[key] = agg
-                            agg["sum_bytes"] += float(size_bytes)
-                            agg["sum_ms"] += float(tx_ms)
-                            agg["count"] += 1.0
-                            # Store sender-side timing for per-request combination
-                            transfer_edge_req[(stage_id, next_stage_id, int(req_id))] = {
-                                "tx_ms": float(tx_ms),
-                                "size_bytes": float(size_bytes),
-                            }
-                        except Exception:
-                            pass
-                    except Exception:
+                        metrics.on_forward(stage_id, next_stage_id, req_id, int(size_bytes), float(tx_ms), bool("engine_inputs_shm" in ipc_payload))
+                    except Exception as e:
+                        logger.warning("[Orchestrator] IPC encode failed for req %s: %s; falling back to inline payload", req_id, e)
                         self.stage_list[next_stage_id].submit({
                             "request_id": req_id,
                             "engine_inputs": next_inputs,
@@ -478,81 +298,10 @@ class PipelinedOmniLLM(OmniLLM):
 
         # Summarize and print stats
         try:
-            stage_summary: List[Dict[str, Any]] = []
-            for sid in range(num_stages):
-                reqs = stage_req_counts[sid]
-                tokens = stage_total_tokens[sid]
-                total_ms = float(stage_total_time_ms[sid])
-                avg_req = (total_ms / reqs) if reqs > 0 else 0.0
-                avg_tok = (tokens * 1000.0 / total_ms) if total_ms > 0 else 0.0
-                stage_summary.append({
-                    "stage_id": sid,
-                    "requests": int(reqs),
-                    "tokens": int(tokens),
-                    "total_time_ms": total_ms,
-                    "avg_time_per_request_ms": avg_req,
-                    "avg_tokens_per_s": avg_tok,
-                })
-
-            transfer_summary: List[Dict[str, Any]] = []
-            for (src, dst), agg in transfer_agg.items():
-                sum_bytes = float(agg.get("sum_bytes", 0.0))
-                sum_ms = float(agg.get("sum_ms", 0.0))
-                samples = int(agg.get("count", 0.0))
-                tx_mbps = (sum_bytes * 8.0) / (max(sum_ms, 1e-6) * 1000.0) if sum_bytes > 0 else 0.0
-                sum_rx_bytes = float(agg.get("sum_rx_bytes", 0.0))
-                sum_rx_ms = float(agg.get("sum_rx_ms", 0.0))
-                samples_rx = int(agg.get("rx_count", 0.0))
-                rx_mbps = (sum_rx_bytes * 8.0) / (max(sum_rx_ms, 1e-6) * 1000.0) if sum_rx_bytes > 0 else 0.0
-                sum_total_ms = float(agg.get("sum_total_ms", 0.0))
-                samples_total = int(agg.get("total_count", 0.0))
-                total_mbps = (sum_bytes * 8.0) / (max(sum_total_ms, 1e-6) * 1000.0) if sum_bytes > 0 else 0.0
-                transfer_summary.append({
-                    "from_stage": src,
-                    "to_stage": dst,
-                    "samples": samples,
-                    "total_bytes": int(sum_bytes),
-                    "total_time_ms": sum_ms,
-                    "tx_mbps": tx_mbps,
-                    "rx_samples": samples_rx,
-                    "rx_total_bytes": int(sum_rx_bytes),
-                    "rx_total_time_ms": sum_rx_ms,
-                    "rx_mbps": rx_mbps,
-                    "total_samples": samples_total,
-                    "total_transfer_time_ms": sum_total_ms,
-                    "total_mbps": total_mbps,
-                })
-
-            e2e_avg_req = (e2e_total_ms / e2e_count) if e2e_count > 0 else 0.0
-            e2e_avg_tok = (e2e_total_tokens * 1000.0 / e2e_total_ms) if e2e_total_ms > 0 else 0.0
-            wall_time_ms = max(0.0, (_last_finish_ts - _wall_start_ts) * 1000.0)
-            summary: Dict[str, Any] = {
-                "e2e_requests": int(e2e_count),
-                # 按你的需求：e2e_total_time_ms 直接使用墙钟时间（非各请求之和）
-                "e2e_total_time_ms": float(wall_time_ms),
-                # 额外保留各请求 E2E 之和，供需要时参考
-                "e2e_sum_time_ms": float(e2e_total_ms),
-                "e2e_total_tokens": int(e2e_total_tokens),
-                "e2e_avg_time_per_request_ms": e2e_avg_req,
-                "e2e_avg_tokens_per_s": e2e_avg_tok,
-                "wall_time_ms": wall_time_ms,
-                "final_stage_id": final_stage_id_for_e2e,
-                "stages": stage_summary,
-                "transfers": transfer_summary,
-            }
+            summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
             logger.info("[Summary] %s", summary)
-            if self._enable_stats and getattr(self, "_stats_file", None):
-                try:
-                    _append_jsonl(self._stats_file, {"type": "orchestrator_summary", **summary})  # type: ignore[arg-type]
-                except Exception:
-                    pass
-            if self._enable_stats and getattr(self, "_overall_stats_file", None):
-                try:
-                    _append_jsonl(self._overall_stats_file, {"type": "overall_summary", **summary})  # type: ignore[arg-type]
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
 
         return final_outputs
 
