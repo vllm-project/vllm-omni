@@ -1,6 +1,7 @@
 from typing import Any, NotRequired, Optional
 
 import torch
+
 from vllm.inputs.data import EmbedsPrompt, TokenInputs, TokensPrompt
 
 
@@ -33,7 +34,6 @@ class OmniEmbedsPrompt(EmbedsPrompt):
 
 def token_inputs_omni(
     prompt_token_ids: list[int],
-    token_type_ids: Optional[list[int]] = None,
     prompt: Optional[str] = None,
     cache_salt: Optional[str] = None,
     prompt_embeds: Optional[torch.Tensor] = None,
@@ -45,8 +45,6 @@ def token_inputs_omni(
 
     if prompt is not None:
         inputs["prompt"] = prompt
-    if token_type_ids is not None:
-        inputs["token_type_ids"] = token_type_ids
     if cache_salt is not None:
         inputs["cache_salt"] = cache_salt
     if prompt_embeds is not None:

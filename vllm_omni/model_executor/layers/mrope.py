@@ -4,6 +4,7 @@ from typing import Optional, Union
 import numpy as np
 import torch
 from transformers import PretrainedConfig
+
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 
@@ -48,6 +49,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         dtype: torch.dtype,
         mrope_section: Optional[list[int]] = None,
+        mrope_interleaved: bool = False,
+        # YaRN parameters.
+        *,
+        scaling_factor: Optional[float] = None,
+        extrapolation_factor: float = 1,
+        attn_factor: float = 1,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
     ) -> None:
         # In Qwen2.5-VL, the maximum index value is related to the duration of
         # the input video. We enlarge max_position_embeddings to 4 times to get

@@ -9,7 +9,6 @@ from vllm.inputs import TextPrompt
 from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
-
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 

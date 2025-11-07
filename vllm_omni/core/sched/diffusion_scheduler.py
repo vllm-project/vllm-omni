@@ -2,7 +2,7 @@ import time
 from collections import defaultdict
 from typing import Optional
 
-from vllm.distributed.kv_events import KVEventBatch
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import (
     EngineCoreOutputs,
@@ -11,8 +11,8 @@ from vllm.v1.core.sched.scheduler import (
     SchedulerOutput,
     SpecDecodingStats,
 )
+from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput
-
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.core.sched.scheduler import OmniScheduler
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -37,11 +37,10 @@ class DiffusionScheduler(OmniScheduler):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
 
-        req_to_new_block_ids: dict[str, tuple[list[int], ...]] = {}
+        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         scheduled_encoder_inputs: dict[str, list[int]] = {}
-        structured_output_request_ids: dict[str, int] = {}
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -80,7 +79,7 @@ class DiffusionScheduler(OmniScheduler):
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
 
-            req_to_new_block_ids[request.request_id] = new_blocks.get_block_ids()
+            req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             capacity -= 1
@@ -104,15 +103,11 @@ class DiffusionScheduler(OmniScheduler):
                 )
             )
 
-        grammar_bitmask = self.structured_output_manager.grammar_bitmask(
-            self.requests,
-            structured_output_request_ids,
-            scheduled_spec_decode_tokens,
-        )
-
         # Assemble SchedulerOutput
         new_reqs_data = [
-            OmniNewRequestData.from_request(req, req_to_new_block_ids[req.request_id])
+            OmniNewRequestData.from_request(
+                req, req_to_new_blocks[req.request_id].get_block_ids()
+            )
             for req in scheduled_new_reqs
         ]
         cached_reqs_data = self._make_cached_request_data(
@@ -120,7 +115,13 @@ class DiffusionScheduler(OmniScheduler):
             scheduled_resumed_reqs,
             num_scheduled_tokens,
             scheduled_spec_decode_tokens,
-            req_to_new_block_ids,
+            req_to_new_blocks,
+        )
+        scheduled_requests = (
+            scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
+        )
+        structured_output_request_ids, grammar_bitmask = self.get_grammar_bitmask(
+            scheduled_requests, scheduled_spec_decode_tokens
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -133,7 +134,7 @@ class DiffusionScheduler(OmniScheduler):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             finished_req_ids=self.finished_req_ids,
-            free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
         )
@@ -142,12 +143,6 @@ class DiffusionScheduler(OmniScheduler):
         if self.connector is not None:
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
-
-        # Publish KV events (aligned with v1)
-        events = self.kv_cache_manager.take_events()
-        if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
 
         # Update internal state (advance num_computed_tokens, free encoder inputs,
         # etc.)
@@ -173,15 +168,18 @@ class DiffusionScheduler(OmniScheduler):
         This method is modified to stop the request immediately for the diffusion model.
         """
         sampled_token_ids = model_runner_output.sampled_token_ids
-        spec_token_ids = model_runner_output.spec_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        kv_connector_output = model_runner_output.kv_connector_output
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
+        kv_connector_stats = (
+            kv_connector_output.kv_connector_stats if kv_connector_output else None
+        )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -206,20 +204,19 @@ class DiffusionScheduler(OmniScheduler):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
             if scheduled_spec_token_ids:
+                num_draft_tokens = len(scheduled_spec_token_ids)
+                num_accepted = len(generated_token_ids) - 1
+                num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
-                # tokens, where is given by:
-                # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
-                num_tokens_rejected = (
-                    len(scheduled_spec_token_ids) + 1 - len(generated_token_ids)
-                )
-                request.num_computed_tokens -= num_tokens_rejected
+                # tokens.
+                request.num_computed_tokens -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
-                    num_draft_tokens=len(scheduled_spec_token_ids),
-                    num_accepted_tokens=len(generated_token_ids) - 1,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted,
                 )
 
             new_logprobs = None
@@ -263,17 +260,6 @@ class DiffusionScheduler(OmniScheduler):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
-            # Add newly generated spec token ids to the request.
-            if spec_token_ids is not None:
-                if self.structured_output_manager.should_advance(request):
-                    metadata = request.structured_output_request
-                    # Needs to happen after new_token_ids are accepted.
-                    request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]  # noqa: E501
-                        spec_token_ids[req_index]
-                    )
-                else:
-                    request.spec_token_ids = spec_token_ids[req_index]
-
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
@@ -290,19 +276,18 @@ class DiffusionScheduler(OmniScheduler):
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
+                        trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
-
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
-            self.running = [
-                req for req in self.running if req not in stopped_running_reqs
-            ]
+            if stopped_running_reqs:
+                self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
@@ -332,10 +317,14 @@ class DiffusionScheduler(OmniScheduler):
                     )
             finished_req_ids.clear()
 
-        if engine_core_outputs:
+        if (
+            stats := self.make_stats(spec_decoding_stats, kv_connector_stats)
+        ) is not None:
             # Return stats to only one of the front-ends.
-            next(iter(engine_core_outputs.values())).scheduler_stats = self.make_stats(
-                spec_decoding_stats
-            )
+            if (eco := next(iter(engine_core_outputs.values()), None)) is None:
+                # We must return the stats even if there are no request
+                # outputs this step.
+                engine_core_outputs[0] = eco = EngineCoreOutputs()
+            eco.scheduler_stats = stats
 
         return engine_core_outputs

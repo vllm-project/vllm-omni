@@ -17,6 +17,7 @@ from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
     Qwen2_5OmniProcessor,
 )
 from transformers.models.whisper import WhisperFeatureExtractor
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
@@ -47,7 +48,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     merge_multimodal_embeddings,
 )
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     ImageItem,
@@ -73,7 +73,6 @@ from vllm.multimodal.processing import (
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import decode_tokens, encode_tokens
-
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 
 try:
@@ -939,12 +938,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         )
         return text_inputs_embeds, hidden_states.unsqueeze(0)  # (1, S, D)
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states, sampling_metadata)
+    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

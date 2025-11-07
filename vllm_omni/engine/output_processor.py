@@ -1,10 +1,11 @@
 from typing import Any, Callable, Dict, Optional, Union
 
 import torch
+
 from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -16,6 +17,7 @@ from vllm.v1.engine.output_processor import (
 )
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
+from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -56,10 +58,16 @@ class OmniRequestState(RequestState):
                 request=request,
             )
             max_tokens_param = sampling_params.max_tokens
+            top_p = sampling_params.top_p
+            n = sampling_params.n
+            temperature = sampling_params.temperature
         else:
             logprobs_processor = None
             detokenizer = None
             max_tokens_param = None
+            top_p = None
+            n = None
+            temperature = None
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -73,9 +81,13 @@ class OmniRequestState(RequestState):
             output_kind=output_kind,
             prompt=prompt,
             prompt_token_ids=request.prompt_token_ids,
+            prompt_embeds=request.prompt_embeds,
             logprobs_processor=logprobs_processor,
             detokenizer=detokenizer,
             max_tokens_param=max_tokens_param,
+            top_p=top_p,
+            n=n,
+            temperature=temperature,
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
@@ -112,20 +124,12 @@ class OmniRequestState(RequestState):
         finish_reason: Optional[FinishReason],
         stop_reason: Optional[Union[int, str]],
         kv_transfer_params: Optional[dict[str, Any]] = None,
-        num_cached_tokens: Optional[int] = None,
-    ) -> Optional[Any]:
+    ) -> Optional[Union[OmniRequestOutput, PoolingRequestOutput]]:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
         if not finished and final_only:
             return None
-
-        if num_cached_tokens is not None:
-            # Keep num_cached_tokens in RequestOutput for compatibility
-            try:
-                self.num_cached_tokens = num_cached_tokens  # type: ignore[attr-defined]
-            except Exception:
-                pass
 
         request_id = self.request_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
@@ -187,7 +191,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: TokenizerGroup,
+        tokenizer: AnyTokenizer,
         log_stats: bool,
         engine_core_output_type: Optional[str] = None,
     ):
@@ -214,14 +218,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if request_id in self.request_states:
             raise ValueError(f"Request id {request_id} already running.")
 
-        tokenizer = (
-            None
-            if not self.tokenizer
-            else self.tokenizer.get_lora_tokenizer(request.lora_request)
-        )
-
         req_state = OmniRequestState.from_new_request(
-            tokenizer=tokenizer,
+            tokenizer=self.tokenizer,
             request=request,
             prompt=prompt,
             parent_req=parent_req,
@@ -266,7 +264,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             finish_reason = eco.finish_reason
             stop_reason = eco.stop_reason
             kv_transfer_params = eco.kv_transfer_params
-            num_cached_tokens = eco.num_cached_tokens
+            req_state.num_cached_tokens = eco.num_cached_tokens
             req_state.is_prefilling = False
 
             # 2) Detokenize and logprobs when text path
@@ -308,7 +306,6 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                num_cached_tokens,
             )
             if ro:
                 # Attach accumulated multimodal payload if any
@@ -341,6 +338,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 self._update_stats_from_finished(
                     req_state, finish_reason, iteration_stats
                 )
+                if self.tracer:
+                    self.do_tracing(eco, req_state, iteration_stats)
                 # Cleanup per-request mm state
                 if isinstance(req_state, OmniRequestState):
                     req_state.mm_accumulated = None

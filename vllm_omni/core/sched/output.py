@@ -3,7 +3,6 @@ from typing import Optional
 
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.request import Request
-
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 
 
@@ -23,9 +22,7 @@ class OmniNewRequestData(NewRequestData):
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
-            mm_inputs=request.mm_inputs,
-            mm_hashes=request.mm_hashes,
-            mm_positions=request.mm_positions,
+            mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             block_ids=block_ids,

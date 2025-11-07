@@ -7,8 +7,8 @@ import numpy as np
 import soundfile as sf
 import torch
 from utils import make_omni_prompt
-from vllm.sampling_params import SamplingParams
 
+from vllm.sampling_params import SamplingParams
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
 _os_env_toggle.environ["VLLM_USE_V1"] = "1"

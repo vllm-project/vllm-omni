@@ -1,18 +1,18 @@
 from typing import Any, Optional, Sequence, Union
 
 import cloudpickle
-import vllm.envs as envs
 from pydantic import ValidationError
-from vllm.config import CompilationConfig, is_init_field
+
+from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
 from vllm.engine.arg_utils import HfOverrides
 from vllm.entrypoints.llm import LLM
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
-
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
@@ -98,6 +98,9 @@ class OmniStageLLM(LLM):
             Union[int, dict[str, Any], CompilationConfig]
         ] = None,
         hf_overrides: Optional[HfOverrides] = None,
+        structured_outputs_config: Optional[
+            Union[dict[str, Any], StructuredOutputsConfig]
+        ] = None,
         **kwargs,
     ):
         """LLM constructor."""
@@ -114,7 +117,7 @@ class OmniStageLLM(LLM):
         if "kv_transfer_config" in kwargs and isinstance(
             kwargs["kv_transfer_config"], dict
         ):
-            from vllm.config import KVTransferConfig
+            from vllm.config.kv_transfer import KVTransferConfig
 
             raw_config_dict = kwargs["kv_transfer_config"]
             try:
@@ -139,22 +142,37 @@ class OmniStageLLM(LLM):
                     level=compilation_config
                 )
             elif isinstance(compilation_config, dict):
-
-                def predicate(x):
-                    return is_init_field(CompilationConfig, x[0])
-
                 compilation_config_instance = CompilationConfig(
-                    **dict(filter(predicate, compilation_config.items()))
+                    **{
+                        k: v
+                        for k, v in compilation_config.items()
+                        if is_init_field(CompilationConfig, k)
+                    }
                 )
             else:
                 compilation_config_instance = compilation_config
         else:
             compilation_config_instance = CompilationConfig()
 
+        if structured_outputs_config is not None:
+            if isinstance(structured_outputs_config, dict):
+                structured_outputs_instance = StructuredOutputsConfig(
+                    **{
+                        k: v
+                        for k, v in structured_outputs_config.items()
+                        if is_init_field(StructuredOutputsConfig, k)
+                    }
+                )
+            else:
+                structured_outputs_instance = structured_outputs_config
+        else:
+            structured_outputs_instance = StructuredOutputsConfig()
+
         engine_args = OmniEngineArgs(
             model=model,
             hf_overrides=hf_overrides,
             compilation_config=compilation_config_instance,
+            structured_outputs_config=structured_outputs_instance,
             **kwargs,
         )
 
@@ -175,11 +193,14 @@ class OmniStageLLM(LLM):
         self.request_counter = Counter()
         self.default_sampling_params: Union[dict[str, Any], None] = None
 
-        if envs.VLLM_USE_V1:
-            supported_tasks = self.llm_engine.get_supported_tasks()  # type: ignore
-        else:
-            supported_tasks = self.llm_engine.model_config.supported_tasks
+        supported_tasks = self.llm_engine.get_supported_tasks()  # type: ignore
 
         logger.info("Supported_tasks: %s", supported_tasks)
 
         self.supported_tasks = supported_tasks
+
+        # Load the Input/Output processor plugin if any
+        io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
+        self.io_processor = get_io_processor(
+            self.llm_engine.vllm_config, io_processor_plugin
+        )
