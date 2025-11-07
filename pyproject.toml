@@ -29,27 +29,11 @@ classifiers = [
 
 dependencies = [
     # Core runtime dependencies (required for actual usage)
-    "cloudpickle>=3.0.0",
-    "msgspec>=0.18.0",
     "omegaconf>=2.3.0",
-    "pydantic>=2.0.0",
-    "typing-extensions>=4.0.0",
-    # Utilities & runtime libraries
-    "PyYAML>=6.0",
-    "packaging>=21.0",
-    "requests>=2.28.0",
-    "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
-    "vllm>=0.11.0",
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
-    "pillow>=8.0.0",
-    "opencv-python>=4.5.0",
-    "librosa>=0.11.0",
-    "soundfile>=0.12.0",
-    "resampy>=0.4.3",
     "decord>=0.6.0",
-    "ray>=2.0.0",
+    "librosa>=0.11.0",
+    "resampy>=0.4.3",
+    # "vllm>=0.11.0", # install manually
 ]
 
 [project.optional-dependencies]
@@ -79,11 +63,6 @@ docs = [
     "pydantic",
 ]
 
-examples = [
-    "jupyter>=1.0.0",
-    "matplotlib>=3.5.0",
-    "seaborn>=0.11.0",
-]
 
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
