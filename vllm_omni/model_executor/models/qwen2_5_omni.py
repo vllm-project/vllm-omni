@@ -819,11 +819,16 @@ class Qwen2_5OmniForConditionalGeneration(
         # Load token2wav weights (if any)
         if token2wav_weights and self.token2wav is not None:
             # download weights from huggingface for spk_dict.pt
-            hf_model_folder = download_weights_from_hf_specific(
-                self.vllm_config.model_config.model,
-                self.vllm_config.load_config.download_dir,
-                allow_patterns=["*.pt"],
-            )
+            model_path = self.vllm_config.model_config.model
+            download_dir = self.vllm_config.load_config.download_dir
+            if os.path.exists(model_path):
+                hf_model_folder = model_path
+            else:
+                hf_model_folder = download_weights_from_hf_specific(
+                    model_path,
+                    download_dir,
+                    allow_patterns=["*.pt"],
+                )
             self._init_token2wav_model(hf_model_folder)
             t2w_loaded = self.token2wav.load_weights(
                 token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt")
