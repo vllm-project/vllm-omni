@@ -178,6 +178,7 @@ class OmniLLM(BaseOmniLLM):
                 batch_timeout=self.batch_timeout,
             )
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
+            time.sleep(self._init_sleep_seconds)
 
     def close(self) -> None:
         for q in self._stage_in_queues:
