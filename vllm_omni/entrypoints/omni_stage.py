@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from vllm_omni.entrypoints.pipeline_utils import (
     _to_dict,
     set_stage_gpu_devices,
-    maybe_load_from_ipc,
+    maybe_load_from_ipc_with_metrics,
     maybe_dump_to_shm,
 )
 
@@ -186,13 +186,14 @@ def _stage_worker(
     import logging as _logging
     from vllm_omni.entrypoints.omni_llm import OmniStageLLM  # noqa: WPS433
     from vllm_omni.entrypoints.log_utils import (  # noqa: WPS433
-        log_stage_request_stats,
         log_stage_running_avg,
         log_stage_batch_stats,
+        compute_and_log_stage_request_stats,
+        count_tokens_from_outputs,
     )
     import queue as _queue
     import time as _time
-    from vllm_omni.entrypoints.pipeline_utils import append_jsonl as _append_jsonl, serialize_obj as _ser
+    # no inline JSONL/serialization imports; logging handled by utilities
 
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
@@ -277,17 +278,11 @@ def _stage_worker(
                     _in_flight_ms_by_rid[rid] = 0.0
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
-            _t0 = _time.time()
-            ein = maybe_load_from_ipc(t, obj_key="engine_inputs", shm_key="engine_inputs_shm")
-            _t1 = _time.time()
-            _rx_decode_ms_by_rid[rid] = (_t1 - _t0) * 1000.0
-            try:
-                if "engine_inputs_shm" in t:
-                    _rx_bytes_by_rid[rid] = int(t["engine_inputs_shm"]["size"])  # type: ignore[index]
-                else:
-                    _rx_bytes_by_rid[rid] = len(_ser(ein))
-            except Exception:
-                _rx_bytes_by_rid[rid] = 0
+            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(
+                t, obj_key="engine_inputs", shm_key="engine_inputs_shm"
+            )
+            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
             batch_request_ids.append(rid)
             if isinstance(ein, list):
                 batch_engine_inputs.extend(ein)
@@ -326,41 +321,12 @@ def _stage_worker(
                     idx += 1
 
             # Per-request stats logging and aggregates
-            def _count_tokens(_ros: List[Any]) -> int:
-                total = 0
-                for _ro in _ros:
-                    try:
-                        outs = getattr(_ro, "outputs", None)
-                        if outs and len(outs) > 0:
-                            tokens = getattr(outs[0], "token_ids", None)
-                            if tokens is not None:
-                                total += len(tokens)
-                    except Exception:
-                        pass
-                return total
-
             for rid in batch_request_ids:
                 _r_outputs = req_to_outputs.get(rid, [])
-                _num_tokens = _count_tokens(_r_outputs)
+                _num_tokens = count_tokens_from_outputs(_r_outputs)
                 _agg_total_tokens += _num_tokens
                 _agg_total_gen_time_ms += _gen_ms
                 _tokens_per_s = (_num_tokens * 1000.0 / _gen_ms) if _gen_ms > 0 else 0.0
-                if _stats_file:
-                    try:
-                        _append_jsonl(_stats_file, {
-                            "type": "stage_request_stats",
-                            "stage_id": stage_id,
-                            "request_id": rid,
-                            "batch_size": len(batch_tasks),
-                            "num_tokens_out": int(_num_tokens),
-                            "stage_gen_time_ms": _gen_ms,
-                            "tokens_per_s": _tokens_per_s,
-                            "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                            "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                            "rx_mbps": (float(_rx_bytes_by_rid.get(rid, 0)) * 8.0) / (max(float(_rx_decode_ms_by_rid.get(rid, 0.0)), 1e-6) * 1000.0),
-                        })
-                    except Exception:
-                        pass
 
             if _stats_file:
                 _avg_tokens_per_s = (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
@@ -373,7 +339,7 @@ def _stage_worker(
                 try:
                     use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
                     _metrics = {
-                        "num_tokens_out": int(_count_tokens(r_outputs)),
+                        "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
                         "stage_gen_time_ms": _gen_ms,
                         "batch_id": int(_batch_seq),
                         "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
@@ -381,22 +347,15 @@ def _stage_worker(
                         "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
                     }
                     if _stats_file:
-                        _num_tokens = int(_metrics["num_tokens_out"])  # type: ignore[index]
-                        _tokens_per_s = (_num_tokens * 1000.0 / _gen_ms) if _gen_ms > 0 else 0.0
-                        _rx_b = int(_metrics["rx_transfer_bytes"])  # type: ignore[index]
-                        _rx_ms = float(_metrics["rx_decode_time_ms"])  # type: ignore[index]
-                        _rx_mbps = (float(_rx_b) * 8.0) / (max(float(_rx_ms), 1e-6) * 1000.0) if _rx_b > 0 else 0.0
-                        log_stage_request_stats(
+                        compute_and_log_stage_request_stats(
                             _stats_file,
                             stage_id,
                             rid,
                             len(batch_tasks),
-                            _num_tokens,
+                            r_outputs,
                             float(_gen_ms),
-                            float(_tokens_per_s),
-                            _rx_b,
-                            _rx_ms,
-                            float(_rx_mbps),
+                            int(_metrics["rx_transfer_bytes"]),   # type: ignore[index]
+                            float(_metrics["rx_decode_time_ms"]), # type: ignore[index]
                         )
                     if use_shm:
                         out_q.put({
@@ -418,7 +377,7 @@ def _stage_worker(
                         "stage_id": stage_id,
                         "engine_outputs": r_outputs,
                         "metrics": {
-                            "num_tokens_out": int(_count_tokens(r_outputs)),
+                            "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
                             "stage_gen_time_ms": _gen_ms,
                             "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
                             "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),

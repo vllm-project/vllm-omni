@@ -194,6 +194,28 @@ def log_stage_batch_stats(stats_file: Optional[str], stage_id: int, batch_size: 
     })
 
 
+def compute_and_log_stage_request_stats(stats_file: Optional[str], stage_id: int, request_id: Any,
+                                       batch_size: int, engine_outputs: List[Any],
+                                       stage_gen_time_ms: float, rx_transfer_bytes: int,
+                                       rx_decode_time_ms: float) -> None:
+    """Compute per-request metrics and log them in one call."""
+    num_tokens = count_tokens_from_outputs(engine_outputs)
+    tokens_per_s = (num_tokens * 1000.0 / stage_gen_time_ms) if stage_gen_time_ms > 0 else 0.0
+    rx_mbps = (float(rx_transfer_bytes) * 8.0) / (max(float(rx_decode_time_ms), 1e-6) * 1000.0) if rx_transfer_bytes > 0 else 0.0
+    log_stage_request_stats(
+        stats_file,
+        stage_id,
+        request_id,
+        int(batch_size),
+        int(num_tokens),
+        float(stage_gen_time_ms),
+        float(tokens_per_s),
+        int(rx_transfer_bytes),
+        float(rx_decode_time_ms),
+        float(rx_mbps),
+    )
+
+
 # ----------------- Aggregation helpers for orchestrator -----------------
 
 def record_stage_metrics(per_request: Dict[int, Dict[str, Any]],

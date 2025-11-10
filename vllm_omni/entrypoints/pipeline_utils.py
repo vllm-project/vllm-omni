@@ -170,10 +170,45 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> Tuple[bool, Any]:
 
 
 def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -> Any:
-    """Load object from container that may carry SHM or inline object."""
+    """Load object from container that may carry SHM or inline object.
+
+    Deprecated: prefer `maybe_load_from_ipc_with_metrics` to also obtain
+    decode-time and size metrics.
+    """
     if shm_key in container:
         return pickle.loads(shm_read_bytes(container[shm_key]))
     return container[obj_key]
+
+
+def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, shm_key: str) -> tuple[Any, Dict[str, float]]:
+    """Load object and return (object, metrics) with RX bytes and decode time.
+
+    Metrics keys:
+      - rx_transfer_bytes: int
+      - rx_decode_time_ms: float
+    """
+    import time as _time  # local import to avoid overhead at module import
+    t0 = _time.time()
+    if shm_key in container:
+        meta = container[shm_key]  # type: ignore[index]
+        payload = shm_read_bytes(meta)
+        obj = pickle.loads(payload)
+        try:
+            rx_bytes = int(meta.get("size", len(payload)))  # type: ignore[call-arg]
+        except Exception:
+            rx_bytes = len(payload)
+    else:
+        obj = container[obj_key]
+        try:
+            rx_bytes = len(serialize_obj(obj))
+        except Exception:
+            rx_bytes = 0
+    t1 = _time.time()
+    rx_decode_ms = (t1 - t0) * 1000.0
+    return obj, {
+        "rx_transfer_bytes": int(rx_bytes),
+        "rx_decode_time_ms": float(rx_decode_ms),
+    }
 
 
 def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> Dict[str, Any]:
