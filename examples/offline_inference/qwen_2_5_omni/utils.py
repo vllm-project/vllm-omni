@@ -13,6 +13,10 @@ from processing_omni import fetch_image, fetch_video
 from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 
+# Simple caches to avoid repeated heavy HF loads per prompt
+_PROCESSOR_CACHE: Dict[str, "AutoProcessor"] = {}
+_CONFIG_CACHE: Dict[str, "AutoConfig"] = {}
+
 
 def get_system_prompt():
 
@@ -113,16 +117,25 @@ def make_inputs_qwen2_omni(
 
     from transformers import AutoConfig, AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(args.model)
+    # Cached processor/config to prevent per-prompt reloading and repeated warnings
+    if args.model not in _PROCESSOR_CACHE:
+        _PROCESSOR_CACHE[args.model] = AutoProcessor.from_pretrained(args.model)
+    processor = _PROCESSOR_CACHE[args.model]
 
-    try:
-        config = AutoConfig.from_pretrained(args.model)
-        if "Qwen2_5OmniModel" in config.architectures:
-            args.legacy_omni_video = False
+    config = _CONFIG_CACHE.get(args.model)
+    if config is None:
+        try:
+            config = AutoConfig.from_pretrained(args.model)
+        except Exception:
+            config = None
+        _CONFIG_CACHE[args.model] = config  # cache even if None to avoid retry storms
+
+    # Decide legacy flag only once based on config (default True if unknown)
+    if getattr(args, "legacy_omni_video", None) is None:
+        if config is not None and hasattr(config, "architectures"):
+            args.legacy_omni_video = not ("Qwen2_5OmniModel" in config.architectures)
         else:
             args.legacy_omni_video = True
-    except Exception:
-        args.legacy_omni_video = True
 
     audios, images, videos = [], [], []
     for message in messages:
