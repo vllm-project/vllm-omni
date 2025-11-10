@@ -167,7 +167,7 @@ def main():
 
     if args.prompts is None:
         raise ValueError("No prompts provided. Use --prompts ... or --pt-prompts <file.pt> (with --prompt_type text)")
-    omni_llm = PipelinedOmniLLM(
+    omni_llm = OmniLLM(
         model=model_name,
         log_stats=args.enable_stats,
         log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
@@ -230,7 +230,6 @@ def main():
                 lines.append(str(prompt_text) + "\n")
                 lines.append("vllm_text_output:\n")
                 lines.append(str(text_output).strip() + "\n")
-                lines.append("transformers_text_output:\n\n")
                 try:
                     with open(out_txt, "w", encoding="utf-8") as f:
                         f.writelines(lines)
@@ -245,20 +244,7 @@ def main():
                 sf.write(
                     output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000
                 )
-                # Save aligned text file with empty text (no text output in this stage)
-                prompt_text = args.prompts[request_id]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n\n")
-                lines.append("transformers_text_output:\n\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Saved audio to {output_wav} and text to {out_txt}")
+                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 
 if __name__ == "__main__":
