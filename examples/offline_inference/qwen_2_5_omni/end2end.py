@@ -52,9 +52,6 @@ def parse_args():
         "--prompts", nargs="+", default=None, help="Input text prompts."
     )
     parser.add_argument(
-        "--pt-prompts", type=str, default=None, help="Path to .pt file containing List[str] prompts (overrides --prompts when prompt_type=text)."
-    )
-    parser.add_argument(
         "--voice-type", default="default", help="Voice type, e.g., m02, f030, default."
     )
     parser.add_argument(
@@ -146,6 +143,12 @@ def parse_args():
         default=False,
         help="Enable writing detailed statistics (default: disabled)",
     )
+    parser.add_argument(
+        "--txt-prompts",
+        type=str,
+        default=None,
+        help="Path to a .txt file with one prompt per line (preferred).",
+    )
     args = parser.parse_args()
     return args
 
@@ -153,20 +156,19 @@ def parse_args():
 def main():
     args = parse_args()
     model_name = args.model
-    # If pt-prompts provided and prompt_type is text, load and override args.prompts
     try:
-        if getattr(args, "pt_prompts", None) and args.prompt_type == "text":
-            loaded = torch.load(args.pt_prompts)
-            if not isinstance(loaded, list) or (len(loaded) > 0 and not isinstance(loaded[0], str)):
-                raise ValueError("--pt-prompts must point to a .pt containing List[str]")
-            args.prompts = loaded
-            print(f"[Info] Loaded {len(args.prompts)} prompts from {args.pt_prompts}")
+        # Preferred: load from txt file (one prompt per line)
+        if getattr(args, "txt_prompts", None) and args.prompt_type == "text":
+            with open(args.txt_prompts, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.readlines()]
+            args.prompts = [ln for ln in lines if ln != ""]
+            print(f"[Info] Loaded {len(args.prompts)} prompts from {args.txt_prompts}")
     except Exception as e:
-        print(f"[Error] Failed to load pt-prompts: {e}")
+        print(f"[Error] Failed to load prompts: {e}")
         raise
 
     if args.prompts is None:
-        raise ValueError("No prompts provided. Use --prompts ... or --pt-prompts <file.pt> (with --prompt_type text)")
+        raise ValueError("No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)")
     omni_llm = OmniLLM(
         model=model_name,
         log_stats=args.enable_stats,

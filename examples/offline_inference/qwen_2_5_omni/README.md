@@ -63,22 +63,30 @@ uv pip install -r requirements.txt
 ```
 
 ## Run examples (Qwen2.5-omni)
-Download dataset from seed_tts[https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit]. To get the prompt, you can:
+### Multiple Prompts
+Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). To get the prompt, you can:
 ```bash
 tar -xf <Your Download Path>/seedtts_testset.tar
 cp seedtts_testset/en/meta.lst examples/offline_inference/qwen_2_5_omni/meta.lst
 python3 examples/offline_inference/qwen_2_5_omni/extract_prompts.py \
   --input examples/offline_inference/qwen_2_5_omni/meta.lst \
   --output examples/offline_inference/qwen_2_5_omni/top100.txt \
-  --topk 100 \
-  --pt-output examples/offline_inference/qwen_2_5_omni/top100.pt
+  --topk 100
 ```
 Get into the example folder
 ```bash
 cd examples/offline_inference/qwen_2_5_omni
 ```
-Modify PYTHONPATH in run.sh as your path of vllm_omni. Then run.
+Modify PYTHONPATH in run_multiple_prompts.sh as your path of vllm_omni. Then run.
 ```bash
-bash run.sh
+bash run_multiple_prompts.sh
 ```
-The output audio is saved in ./output_audio
+### Single Prompts
+Get into the example folder
+```bash
+cd examples/offline_inference/qwen_2_5_omni
+```
+Modify PYTHONPATH in run_single_prompt.sh as your path of vllm_omni. Then run.
+```bash
+bash run_single_prompt.sh
+```

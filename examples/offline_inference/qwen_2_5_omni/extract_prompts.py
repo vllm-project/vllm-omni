@@ -18,10 +18,9 @@ def extract_prompt(line: str) -> Optional[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", required=True, help="输入 .lst 文件路径")
-    parser.add_argument("--output", "-o", required=True, help="输出文件路径")
-    parser.add_argument("--topk", "-k", type=int, default=100, help="提取前 K 个 prompt（默认 100）")
-    parser.add_argument("--pt-output", "-p", type=str, default=None, help="可选：输出 .pt 文件路径（默认与 --output 同名 .pt）")
+    parser.add_argument("--input", "-i", required=True, help="Input .lst file path")
+    parser.add_argument("--output", "-o", required=True, help="Output file path")
+    parser.add_argument("--topk", "-k", type=int, default=100, help="Extract the top K prompts (default: 100)")
     args = parser.parse_args()
 
     prompts = []
@@ -36,10 +35,6 @@ def main() -> None:
     with open(args.output, "w", encoding="utf-8") as f:
         for p in prompts:
             f.write(p + "\n")
-
-    # 另存为 PyTorch 序列化的 .pt，内容为字符串列表
-    pt_path = args.pt_output if args.pt_output else os.path.splitext(args.output)[0] + ".pt"
-    torch.save(prompts, pt_path)
 
 
 if __name__ == "__main__":
