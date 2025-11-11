@@ -33,6 +33,7 @@ class OmniStage:
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
+        self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
         if hasattr(stage_config, "engine_input_source"):
             self.engine_input_source = stage_config.engine_input_source
         else:
@@ -160,7 +161,7 @@ class OmniStage:
                     prompt_token_ids=source_output.outputs[0].token_ids,
                     multi_modal_data=(
                         multi_modal_data[source_output.request_id]
-                        if multi_modal_data
+                        if self.requires_multimodal_data and multi_modal_data
                         else None
                     ),
                 )
@@ -170,7 +171,7 @@ class OmniStage:
         else:
             engine_input_source = self.engine_input_source
             return self.custom_process_input_func(
-                stage_list, engine_input_source, prompt
+                stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
 
 
