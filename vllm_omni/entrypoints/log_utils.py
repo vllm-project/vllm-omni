@@ -6,7 +6,7 @@ import logging
 import os
 import time
 
-from vllm_omni.entrypoints.pipeline_utils import append_jsonl as _append_jsonl
+from vllm_omni.entrypoints.stage_utils import append_jsonl as _append_jsonl
 
 
 def remove_old_logs(log_file: Optional[str], num_stages: int) -> None:
