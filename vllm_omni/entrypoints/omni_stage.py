@@ -11,7 +11,7 @@ import logging
 import multiprocessing as mp
 from typing import Any, Dict, List, Optional, Union
 
-from vllm_omni.entrypoints.pipeline_utils import (
+from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     set_stage_gpu_devices,
     maybe_load_from_ipc_with_metrics,

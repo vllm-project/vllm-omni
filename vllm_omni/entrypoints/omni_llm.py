@@ -34,7 +34,7 @@ from vllm_omni.entrypoints.log_utils import (
     init_stats_paths,
     OrchestratorMetrics,
 )
-from vllm_omni.entrypoints.pipeline_utils import (
+from vllm_omni.entrypoints.stage_utils import (
     maybe_load_from_ipc as _load,
     encode_for_ipc as _encode,
     serialize_obj as _ser,
