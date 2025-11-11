@@ -149,6 +149,13 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
+    parser.add_argument(
+        "--audio-in-video-source",
+        type=str,
+        nargs="+",
+        default=None,
+        help="One or more local paths or URLs to input videos when using --prompt_type audio-in-video-v2.",
+    )
     args = parser.parse_args()
     return args
 
@@ -213,7 +220,16 @@ def main():
         code2wav_sampling_params,
     ]
 
-    prompt = [make_omni_prompt(args, prompt) for prompt in args.prompts]
+    if args.prompt_type == "audio-in-video-v2":
+        # Build prompts based on provided video sources (URLs or local paths)
+        sources = getattr(args, "audio_in_video_source", None)
+        if sources:
+            prompt = [make_omni_prompt(args, source=s) for s in sources]
+        else:
+            # Fallback to default demo video if no source specified
+            prompt = [make_omni_prompt(args, source=None)]
+    else:
+        prompt = [make_omni_prompt(args, prompt) for prompt in args.prompts]
     omni_outputs = omni_llm.generate(prompt, sampling_params_list)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav

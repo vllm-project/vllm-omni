@@ -275,7 +275,22 @@ def make_text_prompt(args, prompt):
     return prompt
 
 
-def make_audio_in_video_v2_prompt(args):
+def make_audio_in_video_v2_prompt(args, source: Optional[str] = None):
+    # Choose source from CLI if provided; supports http(s) URL or local path
+    user_video = source
+    if user_video and isinstance(user_video, str):
+        if user_video.startswith("http://") or user_video.startswith("https://"):
+            user_content = {"type": "video_url", "video_url": user_video}
+        else:
+            user_content = {"type": "video", "video": user_video}
+    else:
+        user_content = {
+            "type": "video_url",
+            "video_url": (
+                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/"
+                "Qwen2.5-Omni/draw_small.mp4"
+            ),
+        }
     messages = [
         {
             "role": "system",
@@ -293,13 +308,7 @@ def make_audio_in_video_v2_prompt(args):
         {
             "role": "user",
             "content": [
-                {
-                    "type": "video_url",
-                    "video_url": (
-                        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/"
-                        "Qwen2.5-Omni/draw_small.mp4"
-                    ),
-                },
+                user_content,
             ],
         },
     ]
@@ -313,12 +322,12 @@ def make_audio_in_video_v2_prompt(args):
 
 
 def make_omni_prompt(
-    args, prompt=None
+    args, prompt=None, source: Optional[str] = None
 ) -> Union[OmniTokensPrompt, List[OmniTokensPrompt]]:
     if args.prompt_type == "text":
         prompt = make_text_prompt(args, prompt)
     elif args.prompt_type == "audio-in-video-v2":
-        prompt = make_audio_in_video_v2_prompt(args)
+        prompt = make_audio_in_video_v2_prompt(args, source=source)
     else:
         raise ValueError(f"Unsupported prompt type: {args.prompt_type}")
     return prompt
