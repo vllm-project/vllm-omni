@@ -1,6 +1,7 @@
 from typing import Any, Optional, Sequence, Union
 import logging
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import queue
 import sys
@@ -43,74 +44,7 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
-class BaseOmniLLM:
-    def __init__(
-        self, model: str, stage_configs=None, log_stats: bool = False, **kwargs
-    ):
-        if stage_configs is None:
-            self.initialize_stage_configs(model)
-        else:
-            self.stage_configs = stage_configs
-
-        self.stage_list = []
-        self.initialize_stages(model)
-
-    def initialize_stage_configs(self, model: str):
-        self.stage_configs = load_stage_configs_from_model(model)
-
-    def initialize_stages(self, model: str):
-        for stage_config in self.stage_configs:
-            stage = OmniStage(stage_config)
-            stage_llm = OmniStageLLM(model=model, **stage_config.engine_args)
-            stage.set_engine(stage_llm)
-            self.stage_list.append(stage)
-
-    def generate(
-        self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[
-            Union[SamplingParams, Sequence[SamplingParams]]
-        ] = None,
-    ) -> list[OmniRequestOutput]:
-        """Generate text outputs for the given prompts."""
-        final_outputs: list[OmniRequestOutput] = []
-        if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(
-                f"Expected {len(self.stage_list)} sampling params, "
-                f"got {len(sampling_params_list)}"
-            )
-        for stage_id, stage in enumerate(self.stage_list):
-            if stage_id > 0:
-                engine_inputs = stage.process_engine_inputs(self.stage_list, prompts)
-            else:
-                engine_inputs = prompts
-            engine_outputs = self._run_generation(
-                stage, sampling_params_list[stage_id], engine_inputs
-            )
-            stage.set_engine_outputs(engine_outputs)
-            if hasattr(stage, "final_output") and stage.final_output:
-                final_outputs.append(
-                    OmniRequestOutput(
-                        stage_id=stage_id,
-                        final_output_type=stage.final_output_type,
-                        request_output=engine_outputs,
-                    )
-                )
-        return final_outputs
-
-    def _run_generation(
-        self,
-        stage: OmniStage,
-        sampling_params: SamplingParams,
-        prompts: Union[PromptType, Sequence[PromptType]],
-    ):
-        engine_outputs = []
-        for ro in stage.engine.generate(prompts, sampling_params):
-            engine_outputs.append(ro)
-        return engine_outputs
-
-
-class OmniLLM(BaseOmniLLM):
+class OmniLLM:
     """Multi-process pipelined OmniLLM.
 
     - Per-stage process with copy-based IPC (Queues)
@@ -135,16 +69,7 @@ class OmniLLM(BaseOmniLLM):
         else:
             self.stage_configs = stage_configs
 
-        self.stage_list: list[OmniStage] = []
-        for stage_config in self.stage_configs:
-            # Only construct lightweight OmniStage without setting engine in parent
-            stage = OmniStage(stage_config)
-            self.stage_list.append(stage)
-        logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
-        self._ctx = mp.get_context("spawn")
-        self._stage_in_queues: list[mp.Queue] = []
-        self._stage_out_queues: list[mp.Queue] = []
         # Optional file handler for orchestrator
         self._log_file = log_file
         if self._log_file:
@@ -152,13 +77,34 @@ class OmniLLM(BaseOmniLLM):
             configure_orchestrator_logger(logger, self._log_file)
 
         self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
+        self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
 
+    def _initialize_stages(self, model: str, init_sleep_seconds: int, shm_threshold_bytes: int, init_timeout: int) -> None:
+        self.stage_list: list[OmniStage] = []
+        # Build OmniStage instances in parallel, preserve original order
+        def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
+            idx, cfg = idx_cfg
+            return idx, OmniStage(cfg)
+
+        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
+            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
+            results: list[tuple[int, OmniStage]] = []
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        results.sort(key=lambda x: x[0])
+        self.stage_list = [st for _, st in results]
+        logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
+
+        self._ctx = mp.get_context("spawn")
+        self._stage_in_queues: list[mp.Queue] = []
+        self._stage_out_queues: list[mp.Queue] = []
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stage_processes(model)
         # Wait for all stages to report readiness before seeding
         self._stages_ready: set[int] = set()
         self._wait_for_stages_ready(timeout=init_timeout)
+        
 
     def _start_stage_processes(self, model: str) -> None:
         for stage_id, stage in enumerate(self.stage_list):
@@ -400,7 +346,7 @@ class OmniLLM(BaseOmniLLM):
             # Provide actionable suggestions before shutdown
             try:
                 suggestions = [
-                    "Verify GPU/device assignment in config (mrs.devices) is correct.",
+                    "Verify GPU/device assignment in config (runtime.devices) is correct.",
                     "Check GPU/host memory availability; reduce model or batch size if needed.",
                     "Check model weights path and network reachability (if loading remotely).",
                     "Increase initialization wait time (init_sleep_seconds or call-site timeout).",

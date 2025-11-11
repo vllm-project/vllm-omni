@@ -1,7 +1,7 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
 stage_args:
   - stage_id: 0
-    mrs:
+    runtime:
       process: true            # Run this stage in a separate process
       devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
       max_batch_size: 1
@@ -18,7 +18,7 @@ stage_args:
     final_output: true
     final_output_type: text
   - stage_id: 1
-    mrs:
+    runtime:
       process: true
       devices: "1"
       max_batch_size: 3
@@ -35,7 +35,7 @@ stage_args:
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
   - stage_id: 2
-    mrs:
+    runtime:
       process: true
       devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
@@ -53,8 +53,8 @@ stage_args:
     final_output: true
     final_output_type: audio
 
-# Top-level MRS config (concise): default windows and stage edges
-mrs:
+# Top-level runtime config (concise): default windows and stage edges
+runtime:
   enabled: true
   defaults:
     window_size: -1             # Simplified: trigger downstream only after full upstream completion

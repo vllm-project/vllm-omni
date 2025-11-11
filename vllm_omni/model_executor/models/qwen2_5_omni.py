@@ -269,13 +269,13 @@ class Qwen2_5OmniForConditionalGeneration(
 
         # 2) Talker (if codec not provided)
         if self.model_stage == "talker":
-            # Mixed-mode support: in一个step内同时支持 Prefill*n 与 Decode*n。
-            # 规则：
-            # - 使用特殊token将 Prefill 片段包裹为 [BOS][PAD...][EOS]
-            # - Decode 片段则为“单一非特殊token”
-            # - 若提供了 additional_information（可为按请求分割的 list 或拼接后的 tensor + 形状列表），
-            #   则对 Prefill 片段按请求重建 thinker→talker 的输入嵌入；
-            # - 对 Decode 片段，若提供了 per-request 的 decode 辅助嵌入（可选），则进行叠加；否则保留原嵌入。
+            # Mixed-mode support: In a single step, both Prefill*n and Decode*n are supported.
+            # Rules:
+            # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
+            # - Decode segments consist of a single non-special token.
+            # - If additional_information is provided (can be a list split by request or a concatenated tensor plus a list of shapes),
+            #   then for each request, reconstruct the thinker→talker input embeddings for the Prefill segments;
+            # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional), add them; otherwise, keep the original embedding.
 
             if input_ids is None and additional_information is None:
                 input_ids = torch.zeros(

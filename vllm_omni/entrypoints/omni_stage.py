@@ -99,11 +99,11 @@ class OmniStage:
         ctx = ctx or mp.get_context("spawn")
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
-        mrs_cfg = _to_dict(getattr(self.stage_config, "mrs", {}))
+        runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
         stage_payload: Dict[str, Any] = {
             "stage_id": self.stage_id,
             "engine_args": engine_args,
-            "mrs": mrs_cfg,
+            "runtime": runtime_cfg,
             "shm_threshold_bytes": self._shm_threshold_bytes,
         }
         self._proc = ctx.Process(
@@ -197,7 +197,7 @@ def _stage_worker(
 
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
-    mrs_cfg = stage_payload.get("mrs", {})
+    runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
 
     # Per-stage file logger (optional)
@@ -228,7 +228,7 @@ def _stage_worker(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, mrs_cfg.get("devices"))
+        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
@@ -250,7 +250,7 @@ def _stage_worker(
             _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
             break
 
-        max_batch_size = int(mrs_cfg.get("max_batch_size", 1) or 1)
+        max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
         batch_tasks: List[Dict[str, Any]] = [task]
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:

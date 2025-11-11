@@ -16,11 +16,11 @@ from . import patch  # noqa: F401
 from .config import OmniModelConfig
 
 # Main entry points
-from .entrypoints.omni_llm import BaseOmniLLM
+from .entrypoints.omni_llm import OmniLLM
 
 __all__ = [
     # Main components
-    "BaseOmniLLM",
+    "OmniLLM",
     # "AsyncOmniLLM", # TODO: add AsyncOmniLLM back when it is implemented
     # Configuration
     "OmniModelConfig",
