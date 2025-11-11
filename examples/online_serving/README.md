@@ -38,3 +38,11 @@ If you encounter error about backend of librosa, try to install ffmpeg with comm
 sudo apt update
 sudo apt install ffmpeg
 ```
+
+## Gradio Demo
+
+```bash
+python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
+```
+
+Then open `http://localhost:7861/` on the local browser.
