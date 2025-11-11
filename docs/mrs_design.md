@@ -1,4 +1,4 @@
-## Multi-Request Streaming (MRS) on a Single Machine — Design Doc
+## Multi-Request Streaming (MRS) on a Single Machine
 
 - Author: Team
 - Date: 2025-10-27
@@ -67,7 +67,7 @@
 
 #### Example config (YAML, simplified)
 ```yaml
-mrs:
+runtime:
   enabled: true
   defaults:
     window_size: -1           # Full-trigger across stages
@@ -90,12 +90,11 @@ mrs:
 3) t2: B handles req0 while A handles req1 (parallel across stages)
 
 ### 9. Integration Points (by file)
-- `vllm_omni/entrypoints/omni_llm.py`
-  - Introduce a ProcessOrchestrator (replace threaded version):
-    - Spawn stage processes per config (set `CUDA_VISIBLE_DEVICES`/`torch.cuda.set_device`), create control/data channels, build window state machines.
-    - Add `enable_mrs` in `generate`; when enabled, do not collect `stage.engine.generate(...)` into lists; stream segments to downstream via IPC instead.
-  - Register `window_size` per edge; `-1` triggers downstream once `is_last` is observed.
-  - Manage process lifecycle: start/heartbeat/graceful shutdown/restart on crash; propagate cancel/timeout.
+- `vllm_omni/entrypoints/omni_llm.py` (Orchestrator)
+  - Class `OmniLLM` orchestrates multi-process stages; constructs `OmniStage` instances in parallel and spawns per-stage workers.
+  - Spawns stage processes per config (set `CUDA_VISIBLE_DEVICES`/`torch.cuda.set_device`), creates control/data channels, builds simple full-trigger flow.
+  - Stats/logging are disabled by default; per-stage and orchestrator stats are only written when explicitly enabled.
+  - Manages process lifecycle: start/wait for readiness, graceful shutdown; forwards results between stages using copy-based IPC and optional SHM.
 - `vllm_omni/outputs.py`
   - Add in-process events: `ARSegmentEvent`, `ImageProgressEvent`, `CompletedEvent`, `ErrorEvent`.
   - Keep `OmniRequestOutput` as the external representation of final stage outputs.
@@ -141,10 +140,10 @@ class WindowState:
 ```
 
 ### 11. Configuration
-- `mrs.enabled`, `mrs.ar.default_window_size`, `mrs.ar.min_flush_interval_ms`, `mrs.ar.max_segment_tokens`, `mrs.ar.scheduler_policy`.
+- `runtime.enabled`, `runtime.ar.default_window_size`, `runtime.ar.min_flush_interval_ms`, `runtime.ar.max_segment_tokens`, `runtime.ar.scheduler_policy`.
 - Devices/processes:
-  - `mrs.stages`: [{ name, process: true, devices: "0" | "1,2", extra_env: {} }]
-  - `mrs.edges`: [{ from, to, window_size }]
+  - Per-stage: `runtime` block on each stage with fields like `process`, `devices`, `max_batch_size`.
+  - Top-level: `runtime.edges`: [{ from, to, window_size }]
 - Pinned/SHM pool sizing: estimate by concurrency and max sequence; tune watermarks and GC policies; configure CUDA IPC limits and cleanup thresholds if enabled.
 
 ### 12. Observability
@@ -175,36 +174,36 @@ class WindowState:
 Objective: without changing external call patterns, encapsulate per-stage LLM init, process creation, and worker logic inside `Stage`, so `PipelinedOmniLLM` focuses on orchestration (seeding, polling, forwarding, collecting) while keeping multi-process, shared memory, and device mapping capabilities.
 
 Key changes (vs. current):
-- Before: `PipelinedOmniLLM` created processes directly, passing `_stage_worker`; device setup, LLM init, batching, and SHM were implemented there.
-- After: enhance `Stage` to start its own subprocess via `start_process()`, with `worker_main()` as the entry; device setup, LLM init, batching, and SHM live in `Stage`.
+- Before: Orchestrator created processes directly, passing `_stage_worker`; device setup, LLM init, batching, and SHM were implemented there.
+- After: enhanced `OmniStage` owns its subprocess (`init_stage_worker`), with `_stage_worker` as the entry; device setup, LLM init, batching, and SHM live in `OmniStage`.
 
 Classes & responsibilities
-- PipelinedOmniLLM (orchestrator)
-  - Build `Stage` list (preserve `OmniStage` init timing and `process_engine_inputs` flow)
+- OmniLLM (orchestrator)
+  - Build `OmniStage` list in parallel (preserve `process_engine_inputs` wiring)
   - Connect adjacent `Stage` input/output queues; seed requests to stage 0
   - Poll stage outputs, decode results, call `process_engine_inputs`, then encode and forward to next stage
   - Termination & cleanup: distribute shutdown signals; join/terminate subprocesses
 - Stage (stage unit)
-  - Members: `stage_config` (with `engine_args` and `mrs`), `in_q/out_q`, subprocess handle, stats
+  - Members: `stage_config` (with `engine_args` and `runtime`), `in_q/out_q`, subprocess handle, stats
   - API:
-    - `start_process(in_q, out_q)`: spawn subprocess
-    - `stop_process()`: graceful exit
-    - `submit(ipc_payload)`: submit to `in_q` (may use shared memory)
-    - `try_collect() -> Optional[payload]`: non-blocking get from `out_q`
+    - `init_stage_worker(...)`: spawn subprocess
+    - `stop_stage_worker()`: graceful exit
+    - `submit(ipc_payload)`: submit to input queue (may use shared memory)
+    - `try_collect() -> Optional[payload]`: non-blocking get from output queue
     - `process_engine_inputs(stages, prompts)`: reuse/delegate existing logic
   - Subprocess entry `worker_main()`:
-    - set_stage_gpu_devices (`CUDA_VISIBLE_DEVICES` & logical index mapping)
+    - `set_stage_gpu_devices` (`CUDA_VISIBLE_DEVICES` & logical index mapping)
     - build `OmniStageLLM(model, **engine_args)`
     - while-loop:
-      - take first task + up to `mrs.max_batch_size-1` non-blocking; support `max_batch_size>=1`
-      - `maybe_load_from_ipc` per `engine_inputs` in batch
+      - take first task + up to `runtime.max_batch_size-1` non-blocking; support `max_batch_size>=1`
+      - `maybe_load_from_ipc_with_metrics` per `engine_inputs` in batch
       - `stage_engine.generate(batched_inputs, sampling_params)` (window `-1`)
-      - write per-request aggregated outputs to `out_q` after `maybe_dump_to_shm`
+      - write per-request aggregated outputs to output queue after `maybe_dump_to_shm`
       - log start/finish; report `error` per request on exceptions
 
 Data flow (sketch)
 ```
-PipelinedOmniLLM
+OmniLLM
   ├─ Stage[0].start_process(in0, out0)
   ├─ Stage[1].start_process(in1, out1)
   ├─ ...
@@ -219,11 +218,11 @@ PipelinedOmniLLM
 ```
 
 Config (preserve & extend)
-- `mrs.devices`:
+- `runtime.devices`:
   - Comma-separated visibility list (e.g., "2,5,7"): set visible set; default logical index 0 (first GPU)
   - Number/string: treat as logical index (0/1-based per implementation) mapping to physical GPUs
-- `mrs.max_batch_size`: max requests taken per intake (default 1)
-- `shm_threshold_bytes`: objects larger than this go via shared memory (default 64KB; can be injected into stages)
+- `runtime.max_batch_size`: max requests taken per intake (default 1)
+- `shm_threshold_bytes`: objects larger than this go via shared memory (default 64KB; injected into stages)
 
 Kept & strengthened
 - Multi-process: each stage in its own process; parallel across stages; serial/batching inside a stage controlled by `max_batch_size`
@@ -232,7 +231,7 @@ Kept & strengthened
 - Windows: keep `window_size=-1` semantics (downstream triggers only after upstream finishes the request)
 
 Migration (execution order)
-1) Implement enhanced `Stage` (e.g., `entrypoints/stage.py`) with `start_process/stop_process/submit/try_collect/worker_main`.
-2) Make `PipelinedOmniLLM` hold `Stage` instances, replacing direct queues and `_stage_worker` with `Stage` APIs.
-3) Reuse `pipeline_utils`: device/SHM/encode-decode utilities stay in utils.
+1) Enhanced `OmniStage` with `init_stage_worker/stop_stage_worker/submit/try_collect/_stage_worker`.
+2) `OmniLLM` holds `OmniStage` instances, replacing the older pipelined class; uses Stage APIs.
+3) Reuse `entrypoints/stage_utils`: device/SHM/encode-decode utilities live here.
 4) Regression: single/multi-request, various `max_batch_size`, SHM threshold, device mapping, multi-stage parallelism, error paths, and shutdown flows.
