@@ -173,9 +173,18 @@ def main():
     except Exception as e:
         print(f"[Error] Failed to load prompts: {e}")
         raise
-
-    if args.prompts is None:
-        raise ValueError("No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)")
+    if args.prompt_type == "audio-in-video-v2":
+        # Build prompts based on provided video sources (URLs or local paths)
+        sources = getattr(args, "audio_in_video_source", None)
+        if sources:
+            prompt = [make_omni_prompt(args, source=s) for s in sources]
+        else:
+            # Fallback to default demo video if no source specified
+            prompt = [make_omni_prompt(args, source=None)]
+    elif args.prompt_type == "text":
+        prompt = [make_omni_prompt(args, prompt) for prompt in args.prompts]
+    else:
+        raise ValueError(f"Unsupported prompt type: {args.prompt_type}")
     omni_llm = OmniLLM(
         model=model_name,
         log_stats=args.enable_stats,
@@ -219,17 +228,7 @@ def main():
         talker_sampling_params,
         code2wav_sampling_params,
     ]
-
-    if args.prompt_type == "audio-in-video-v2":
-        # Build prompts based on provided video sources (URLs or local paths)
-        sources = getattr(args, "audio_in_video_source", None)
-        if sources:
-            prompt = [make_omni_prompt(args, source=s) for s in sources]
-        else:
-            # Fallback to default demo video if no source specified
-            prompt = [make_omni_prompt(args, source=None)]
-    else:
-        prompt = [make_omni_prompt(args, prompt) for prompt in args.prompts]
+    
     omni_outputs = omni_llm.generate(prompt, sampling_params_list)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
