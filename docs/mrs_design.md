@@ -1,9 +1,5 @@
 ## Multi-Request Streaming (MRS) on a Single Machine
 
-- Author: Team
-- Date: 2025-10-27
-- Version: v0.3 (simplified: copy-based IPC / serial per stage / full-trigger)
-
 ### 1. Background & Scope
 - All processing runs on a single physical machine with multi-process, per-stage workers. No proxy or network transport involved.
 - Current alignment with vllm-omni: `OmniLLM` supports multiple stages (`OmniStage`). GPU runners already expose streamable steps (prefill/decoding/diffusion), but the entry layer still collects lists and lacks intra-stage streaming and window scheduling.
@@ -12,77 +8,30 @@
 ### 2. Key Constraints
 - Multi-process per stage: each stage is an independent process with a while loop; device visibility can be configured (`CUDA_VISIBLE_DEVICES`/`torch.cuda.set_device`).
 - Simple IPC (copy-based): use `multiprocessing.Queue`/Pipe for inter-process communication with CPU copies/serialization; do not rely on CUDA IPC/SHM zero-copy in this version.
-- Full-trigger across stages: unify `window_size = -1` for all edges — downstream starts only after upstream completes for that request.
-- Serial within a stage: at most one in-flight request per stage (max_inflight=1). No batching/concurrency inside a stage in this version.
 - Cross-stage pipeline: different stages can process different requests concurrently (e.g., stage A handles request 1 while stage B handles request 0).
 
 ### 3. Architecture Overview
 - Processes & IPC queues
   - Each "sub-stage" is an OS process (worker). The loop: take from input_queue → compute → put to output_queue.
-  - Inter-stage connection via IPC: control plane (Unix Domain Socket / Pipe) + data plane (shared memory ring buffer in future; copy-based in this version).
-  - MPMC queue semantics; control plane passes light-weight pointers/metadata; data plane carries large payloads.
+  - Inter-stage connection via IPC: copy-based `multiprocessing.Queue` passing dict payloads; use shared memory for large objects.
+  - Each link is SPSC (single-producer/single-consumer): the upstream is the orchestrator and the downstream is a single stage process; queues are unbounded (maxsize=0) on the orchestrator side.
 - Device visibility
   - Each stage sets `CUDA_VISIBLE_DEVICES` or calls `torch.cuda.set_device` to bind to GPU sets.
   - A stage may use multiple GPUs internally (TP/PP/DP) but presents as a single stage unit.
 - Simplified IPC: copy-based queues/pipes for data transfer; zero-copy is future work.
 - Pipeline progression: when a stage finishes a request, it enqueues outputs to the downstream stage; if downstream is idle, it starts immediately.
-- Scheduling & windows
-  - Each edge (stage→stage) defines a window policy; downstream triggers compute by consuming stitched window views.
-  - `-1` mode triggers only after upstream emits `is_last=True` (full aggregation).
-  - Backpressure propagates upstream via the control plane: once high-watermark is reached, upstream blocks or degrades behavior.
-
-### 4. Stage Breakdown
-- AR (autoregressive)
-  - S0 Intake/Plan: parse request, assign request_id, output normalized tasks.
-  - S1 Prefill: tokenize/encode/KV warmup; may micro-batch across requests.
-  - S2 Decode Loop: step-by-step tokens; flush segments by `max_segment_tokens` and `min_flush_interval_ms`.
-  - S3 Postprocess: detokenize, logprobs/struct wrapping (CPU if necessary).
-  - S4 Consumer: local consumer callback/buffering.
-- DiT/Diffusion
-  - D0 Intake/Plan: scheduler/seed init.
-  - D1 Sampling Loop: preview frames every k steps (downsample allowed).
-  - D2 Decode/Encode: VAE decode and JPEG/WEBP encode (prefer GPU→pinned CPU).
-  - D3 Postprocess/Consumer.
-
-### 5. Unified Events & Segment Structure (in-process)
-- Base event: `{ request_id, sequence, event_type, ts, payload, device_handles }`
-- ARSegmentEvent (segment):
-  - Fields: `tokens` (List[int] or GPU tensor view), optional `logprobs`, `is_last`, optional `hidden_states/aux` refs.
-  - Semantics: strictly ordered by `sequence` for the same `request_id`; `is_last` marks the final segment.
-- ImageProgressEvent: `{ step, image_tensor|jpeg_ref, is_last }` (diffusion preview/completion).
-- Completed/Error: terminal or error events affect only the current request.
-
-### 6. AR Segmentation & Windowing (simplified)
-- Production (upstream stage)
-  - Accumulate tokens during decoding; flush a segment if any of the following holds:
-    - Reaches `max_segment_tokens` length
-    - Exceeds `min_flush_interval_ms` since last flush
-    - Request ended (`is_last=True`)
-  - Flush immediately via `output_queue.put(segment)`; do not wait for entire request completion.
-- Consumption (downstream stage)
-  - Use unified `window_size = -1`: trigger only after receiving `is_last=True`; no window slicing.
-- Backpressure & watermark
-  - Must-deliver events (token.delta, Completed) are not dropped; block upstream briefly on high watermark.
-  - For long sequences under `-1`, allow early segments to spill from GPU to pinned CPU to control VRAM pressure.
-
-#### Example config (YAML, simplified)
-```yaml
-runtime:
-  enabled: true
-  defaults:
-    window_size: -1           # Full-trigger across stages
-    max_inflight: 1           # Serial per stage
-```
+- Scheduling
+  - A downstream stage triggers only after the upstream completes the request.
+  - Windowed segmentation/stitched triggering is not implemented; intra-stage streaming is not provided.
 
 ### 7. IPC Implementation (simplified: copy-based)
 - Use `multiprocessing.Queue`/Pipe for inter-process communication (control + data).
 - Data is serialized/copied via CPU; no CUDA IPC/SHM zero-copy in this version.
-- Backpressure: blocking reads/writes based on queue capacity, blocking upstream on high watermark.
+- Backpressure: queues are unbounded; pressure manifests as compute-rate differences. Optional SHM reduces large-object transfer cost; RX/decoding overhead is recorded for observability.
 
 ### 8. Scheduling & Cancellation (simplified)
-- Serial FIFO: each stage `max_inflight=1`; no cross-request micro-batching or concurrency.
-- Cancel/timeout: ongoing work should exit early; remaining queued requests stay pending.
 - Pipeline: when a stage finishes a request, it enqueues to the next stage; that stage immediately pulls the next request from its input queue, enabling cross-stage concurrency.
+- Cancellation/timeout: explicit cancellation/timeouts are not provided; graceful shutdown uses a `None` sentinel sent to each stage input queue.
 
 #### Short sequence example (req0/req1, stage A→B)
 1) t0: stage A handles req0
@@ -95,79 +44,77 @@ runtime:
   - Spawns stage processes per config (set `CUDA_VISIBLE_DEVICES`/`torch.cuda.set_device`), creates control/data channels, builds simple full-trigger flow.
   - Stats/logging are disabled by default; per-stage and orchestrator stats are only written when explicitly enabled.
   - Manages process lifecycle: start/wait for readiness, graceful shutdown; forwards results between stages using copy-based IPC and optional SHM.
-- `vllm_omni/outputs.py`
-  - Add in-process events: `ARSegmentEvent`, `ImageProgressEvent`, `CompletedEvent`, `ErrorEvent`.
-  - Keep `OmniRequestOutput` as the external representation of final stage outputs.
-- `vllm_omni/worker/gpu_ar_model_runner.py`
-  - Near `valid_sampled_token_ids` parsing (after updating `req_state.output_token_ids`), aggregate new tokens into segments and emit; send final `is_last=True` and Completed.
-  - Replace current `.to("cpu").contiguous()` sync path: by default keep GPU refs and let downstream copy asynchronously from a pinned pool when needed.
-- `vllm_omni/worker/gpu_diffusion_model_runner.py`
+  - Stage readiness: each stage emits `{"type": "stage_ready"}` after initialization; the orchestrator waits for all stages or times out and logs diagnostic suggestions.
 
 ### 9.1 Process Device Visibility
 - Device binding: set `CUDA_VISIBLE_DEVICES` before process start, or call `torch.cuda.set_device` early in init; configs can be single/multi-GPU.
 - Cross-device transfer (simplified): via CPU copies; zero-copy paths are out of scope for now.
 
-### 10. Worker Template & Window State (pseudo-code)
+### 10. Worker Template (pseudo-code)
 ```python
-def stage_worker(input_q, output_q, ctx):
-    while ctx.alive:
-        item = input_q.get()  # blocking / with timeout
-        if item.is_cancelled():
-            continue
-        with cuda_stream(ctx.stream):
-            out_segments = run_stage_compute(item)  # produce segments
-        for seg in out_segments:
-            output_q.put(seg)
-
-class WindowState:
-    def __init__(self, window_size):
-        self.window_size = window_size
-        self.last_emitted = 0
-        self.buffer = []  # references/paged views
-    def on_segment(self, seg):
-        self.buffer.append(seg)
-        if self.window_size == -1:
-            return self.emit_full_if_last(seg)
-        return self.emit_windows()
-    def emit_windows(self):
-        emits = []
-        while self._pending_len() - self.last_emitted >= self.window_size:
-            emits.append(self._make_view(self.last_emitted, self.window_size))
-            self.last_emitted += self.window_size
-        return emits
-    def emit_full_if_last(self, seg):
-        return [self._make_full_view()] if seg.is_last else []
+def stage_worker(input_q, output_q, runtime, shm_threshold):
+    # Device binding
+    set_stage_gpu_devices(runtime.devices)
+    engine = OmniStageLLM(model, **engine_args)
+    batch_seq = 0
+    while True:
+        first = input_q.get()
+        if first is None:
+            break
+        # Batch intake (up to runtime.max_batch_size)
+        batch = [first]
+        while len(batch) < int(runtime.max_batch_size or 1) and not input_q.empty():
+            nxt = input_q.get()
+            if nxt is None:
+                input_q.put(None)
+                break
+            batch.append(nxt)
+        # Decode IPC payload and sampling params
+        request_ids = []
+        engine_inputs = []
+        rx_bytes = {}
+        rx_decode_ms = {}
+        for t in batch:
+            ein, rx = maybe_load_from_ipc_with_metrics(t, "engine_inputs", "engine_inputs_shm")
+            request_ids.append(t["request_id"])
+            engine_inputs.extend(ein if isinstance(ein, list) else [ein])
+            rx_bytes[t["request_id"]] = rx["rx_transfer_bytes"]
+            rx_decode_ms[t["request_id"]] = rx["rx_decode_time_ms"]
+        # Generate and dispatch (grouped by request_id)
+        batch_seq += 1
+        outputs = list(engine.generate(engine_inputs, batch[0]["sampling_params"], use_tqdm=False))
+        grouped = group_by_request_id(outputs, request_ids)
+        for rid in request_ids:
+            r_out = grouped.get(rid, [])
+            use_shm, payload = maybe_dump_to_shm(r_out, shm_threshold)
+            msg = {
+                "request_id": rid,
+                "metrics": {
+                    "batch_id": batch_seq,
+                    "rx_transfer_bytes": int(rx_bytes.get(rid, 0)),
+                    "rx_decode_time_ms": float(rx_decode_ms.get(rid, 0.0)),
+                    # omitted: generation latency and token stats
+                },
+            }
+            if use_shm:
+                msg["engine_outputs_shm"] = payload
+            else:
+                msg["engine_outputs"] = payload
+            output_q.put(msg)
 ```
 
-### 11. Configuration
-- `runtime.enabled`, `runtime.ar.default_window_size`, `runtime.ar.min_flush_interval_ms`, `runtime.ar.max_segment_tokens`, `runtime.ar.scheduler_policy`.
-- Devices/processes:
-  - Per-stage: `runtime` block on each stage with fields like `process`, `devices`, `max_batch_size`.
-  - Top-level: `runtime.edges`: [{ from, to, window_size }]
-- Pinned/SHM pool sizing: estimate by concurrency and max sequence; tune watermarks and GC policies; configure CUDA IPC limits and cleanup thresholds if enabled.
-
 ### 12. Observability
-- Metrics:
-  - Stage-level: enqueue/dequeue rates, queue depth, blocking time on watermarks, window triggers/counts.
-  - Request-level: TTFT, TPST, completion latency, cancel rate.
-  - Resource-level: GPU utilization, VRAM usage/fragmentation, pinned usage.
-- Logs/tracing: carry `request_id`, stage name, and `sequence`; sample decisions for downsampling/backpressure.
-
-### 13. Test Plan
-- Unit: queue correctness, window state machine, cancel/timeout, memory pool rent/return.
-- Performance: AR QPS/TPST vs. window/segment sizes; diffusion preview frequency vs. throughput.
-- Stability: long-run memory leaks; backpressure trigger/recovery paths.
-- Compatibility: behavior parity when MRS is disabled.
-
-### 14. Milestones
-- M1: Process Orchestrator with simple IPC; serial per stage; full-trigger across stages (window=-1).
-- M2: Hardening and observability; cancel/timeout and error paths.
-- M3: Optional zero-copy and concurrency/micro-batching optimizations.
+- Metrics (as implemented):
+  - per-request (emitted by stages): `num_tokens_out`, `stage_gen_time_ms`, `rx_transfer_bytes`, `rx_decode_time_ms`, `rx_in_flight_time_ms`, `batch_id`
+  - orchestrator aggregates: E2E latency, tokens/s (written only when stats are enabled)
+  - optional per-stage JSONL: `{log_file}.stage{stage_id}.stats.jsonl`
+- Logs/tracing:
+  - optional per-stage log files: `{log_file}.stage{stage_id}.log`
+  - the orchestrator can log readiness, forward size/time, and summary information
 
 ### 15. Risks & Mitigations
 — End-to-end latency: full-trigger sacrifices interactivity; start simple/correct, add windowed streaming later.
 — CPU copy overhead: copy-based IPC for maintainability; add SHM/zero-copy later as an optimization path.
-— Serial throughput: `max_inflight=1` limits per-stage throughput; enable batching/concurrency later as needed.
 
 ### 16. Refactor: Sink LLM init and process into Stage (diagram)
 
@@ -223,12 +170,16 @@ Config (preserve & extend)
   - Number/string: treat as logical index (0/1-based per implementation) mapping to physical GPUs
 - `runtime.max_batch_size`: max requests taken per intake (default 1)
 - `shm_threshold_bytes`: objects larger than this go via shared memory (default 64KB; injected into stages)
+- Stage link and inputs:
+  - `engine_input_source`: list of upstream stage_id(s) from which the downstream stage takes inputs (typically a single source)
+  - `custom_process_input_func`: function to construct downstream engine_inputs from upstream outputs
+- Output flags:
+  - `final_output`, `final_output_type`: marks that a stage produces the final external output and its type
 
 Kept & strengthened
 - Multi-process: each stage in its own process; parallel across stages; serial/batching inside a stage controlled by `max_batch_size`
 - Shared memory: large objects via SHM with strict `memoryview -> close -> unlink`
 - Device mapping: unified `set_stage_gpu_devices`, support comma lists and logical indices
-- Windows: keep `window_size=-1` semantics (downstream triggers only after upstream finishes the request)
 
 Migration (execution order)
 1) Enhanced `OmniStage` with `init_stage_worker/stop_stage_worker/submit/try_collect/_stage_worker`.
