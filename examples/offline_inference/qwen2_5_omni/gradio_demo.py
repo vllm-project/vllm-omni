@@ -60,7 +60,7 @@ def parse_args():
         help="Host/IP for gradio `launch`.",
     )
     parser.add_argument(
-        "--port", type=int, default=7861, help="Port for gradio `launch`."
+        "--server-port", type=int, default=7860, help="Port for gradio `launch`."
     )
     parser.add_argument(
         "--share", action="store_true", help="Share the Gradio demo publicly."
@@ -184,7 +184,7 @@ def main():
     demo = build_interface(omni_llm, sampling_params, prompt_args_template)
     demo.launch(
         server_name=args.server_name,
-        server_port=args.port,
+        server_port=args.server_port,
         share=args.share,
     )
 
