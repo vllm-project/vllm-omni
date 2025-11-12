@@ -33,7 +33,7 @@ dependencies = [
     "decord>=0.6.0",
     "librosa>=0.11.0",
     "resampy>=0.4.3",
-    # "vllm>=0.11.0", # install manually
+    # "vllm==0.11.0", # install manually
 ]
 
 [project.optional-dependencies]
