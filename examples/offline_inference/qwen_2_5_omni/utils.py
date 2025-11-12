@@ -280,16 +280,14 @@ def make_audio_in_video_v2_prompt(args, source: Optional[str] = None):
     user_video = source
     if user_video and isinstance(user_video, str):
         if user_video.startswith("http://") or user_video.startswith("https://"):
-            user_content = {"type": "video_url", "video_url": user_video}
+            user_content = {"type": "video_url", "video_url": user_video, "use_audio_in_video": True}
         else:
-            user_content = {"type": "video", "video": user_video}
+            user_content = {"type": "video", "video": user_video, "use_audio_in_video": True}
     else:
         user_content = {
             "type": "video_url",
-            "video_url": (
-                "https://qianwen-res.oss-cn-beijing.aliyuncs.com/"
-                "Qwen2.5-Omni/draw_small.mp4"
-            ),
+            "video_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/draw_small.mp4",
+            "use_audio_in_video": True,
         }
     messages = [
         {
