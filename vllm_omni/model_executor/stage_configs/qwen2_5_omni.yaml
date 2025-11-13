@@ -1,36 +1,50 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
 stage_args:
   - stage_id: 0
+    runtime:
+      process: true            # Run this stage in a separate process
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      max_batch_size: 1
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      gpu_memory_utilization: 0.32
+      gpu_memory_utilization: 0.8
       enforce_eager: true  # need to discuss
       trust_remote_code: true
       engine_output_type: latent  # change the param name,such as pooling_output
+      enable_prefix_caching: false
     final_output: true
     final_output_type: text
   - stage_id: 1
+    runtime:
+      process: true
+      devices: "1"
+      max_batch_size: 3
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      gpu_memory_utilization: 0.32
+      gpu_memory_utilization: 0.8
       enforce_eager: true
       trust_remote_code: true
+      enable_prefix_caching: false
       engine_output_type: latent
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
   - stage_id: 2
+    runtime:
+      process: true
+      devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
+      max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker
       scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.15
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -38,3 +52,17 @@ stage_args:
     engine_input_source: [1]
     final_output: true
     final_output_type: audio
+
+# Top-level runtime config (concise): default windows and stage edges
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1             # Simplified: trigger downstream only after full upstream completion
+    max_inflight: 1             # Simplified: process serially within each stage
+  edges:
+    - from: 0                   # thinker → talker: trigger only after receiving full input (-1)
+      to: 1
+      window_size: -1
+    - from: 1                   # talker → code2wav: trigger only after receiving full input (-1)
+      to: 2
+      window_size: -1
