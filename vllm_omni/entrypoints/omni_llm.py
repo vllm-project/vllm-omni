@@ -52,22 +52,26 @@ class OmniLLM:
     - max_inflight=1 per stage (serial within a stage), but pipeline across stages
     """
 
-    def __init__(self, model: str,
-                 stage_configs=None,
-                 log_stats: bool = False,
+    def __init__(self,
+        model: str,
+                
+        stage_configs_path: Optional[str] = None,
+                
+        log_stats: bool = False,
                  log_file: Optional[str] = None,
                  init_sleep_seconds: int = 20,
                  shm_threshold_bytes: int = 65536,
                  batch_timeout: int = 10,
                  init_timeout: int = 300,
-                 **kwargs):
+                
+        **kwargs):,
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
         # Do NOT call super().__init__ to avoid creating OmniStageLLM instances in parent.
-        if stage_configs is None:
+        if stage_configs_path is None:
             self.stage_configs = load_stage_configs_from_model(model)
         else:
-            self.stage_configs = stage_configs
+            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
 
         # Optional file handler for orchestrator

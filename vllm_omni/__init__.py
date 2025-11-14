@@ -24,7 +24,12 @@ from .config import OmniModelConfig
 # Main entry points
 from .entrypoints.omni_llm import OmniLLM
 
+from .version import __version__, __version_tuple__  # isort:skip
+
+
 __all__ = [
+    "__version__",
+    "__version_tuple__",
     # Main components
     "OmniLLM",
     # "AsyncOmniLLM", # TODO: add AsyncOmniLLM back when it is implemented

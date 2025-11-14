@@ -9,6 +9,7 @@ import pickle
 from multiprocessing import shared_memory as _shm
 
 import cloudpickle
+from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ def shm_write_bytes(payload: bytes) -> Dict[str, Any]:
     try:
         shm.close()
     except Exception as e:
-        logger.debug("Ensure parent dir failed for %s: %s", path, e)
+        logger.debug("Failed to close shared memory: %s", e)
     return meta
 
 
