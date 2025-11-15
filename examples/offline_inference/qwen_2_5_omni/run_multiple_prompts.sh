@@ -11,4 +11,4 @@ python end2end.py --model Qwen/Qwen2.5-Omni-7B \
                                  --output-wav output_audio \
                                  --prompt_type text \
                                  --init-sleep-seconds 0 \
-                                 --txt-prompts top10.txt
+                                 --txt-prompts top100.txt
