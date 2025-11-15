@@ -13,29 +13,48 @@ client = OpenAI(
 )
 
 
+def get_system_prompt():
+
+    return {
+        "role": "system",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "You are Qwen, a virtual human developed by the Qwen Team, "
+                    "Alibaba Group, capable of perceiving auditory and visual inputs, "
+                    "as well as generating text and speech."
+                ),
+            }
+        ],
+    }
+
+
 def run_text_to_audio(model: str) -> None:
     chat_completion = client.chat.completions.create(
         messages=[
+            get_system_prompt(),
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "Explain the system architecture for a scalable \
-                            audio generation pipeline. Answer in 15 words.",
+                        "text": "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words.",
                     },
                 ],
-            }
+            },
         ],
         model=model,
     )
 
+    count = 0
     for choice in chat_completion.choices:
-        if choice.message.content_type == "audio":
-            audio_data = base64.b64decode(choice.message.content)
-            with open("audio.wav", "wb") as f:
+        if choice.message.audio:
+            audio_data = base64.b64decode(choice.message.audio.data)
+            with open(f"audio_{count}.wav", "wb") as f:
                 f.write(audio_data)
-        elif choice.message.content_type == "text":
+            count += 1
+        elif choice.message.content:
             print("Chat completion output from text:", choice.message.content)
 
 

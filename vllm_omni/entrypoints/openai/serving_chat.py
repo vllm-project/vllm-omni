@@ -2,12 +2,24 @@ import asyncio
 import base64
 import json
 import time
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Optional, Union
 
 import jinja2
 from fastapi import Request
 from pydantic import TypeAdapter
+
+try:
+    import soundfile
+except ImportError:
+    soundfile = None
+
+from openai.types.chat.chat_completion_audio import (
+    ChatCompletionAudio as OpenAIChatCompletionAudio,
+)
 
 from vllm.entrypoints.chat_utils import (
     ConversationMessage,
@@ -293,12 +305,10 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     prompt_token_ids,
                     kv_transfer_params,
                 ) = self._create_text_choice(
-                    choices, request, omni_outputs, tokenizer, conversation, role
+                    request, omni_outputs, tokenizer, conversation, role
                 )
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(
-                    choices, request, omni_outputs, role
-                )
+                choices_data = self._create_audio_choice(omni_outputs, role)
             else:
                 logger.warning(
                     f"Unsupported final output type: {omni_outputs.final_output_type}"
@@ -414,19 +424,15 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     )
 
                 choice_data = OmniChatCompletionResponseChoice(
-                    index=final_res.index,
+                    index=output.index,
                     message=message,
                     logprobs=logprobs,
                     finish_reason=(
                         "tool_calls"
                         if (tool_call_info is not None and tool_call_info.tools_called)
-                        else (
-                            final_res.finish_reason
-                            if final_res.finish_reason
-                            else "stop"
-                        )
+                        else (output.finish_reason if output.finish_reason else "stop")
                     ),
-                    stop_reason=final_res.stop_reason,
+                    stop_reason=output.stop_reason,
                     choice_output_type="text",
                 )
                 choices.append(choice_data)
@@ -441,13 +447,13 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning_content, content = reasoning_parser.extract_reasoning_content(
-                    final_res.text, request=request
+                    output.text, request=request
                 )
                 if not request.include_reasoning:
                     reasoning_content = None
             else:
                 reasoning_content = None
-                content = final_res.text
+                content = output.text
 
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
@@ -590,17 +596,17 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 )
 
             choice_data = OmniChatCompletionResponseChoice(
-                index=final_res.index,
+                index=output.index,
                 message=message,
                 logprobs=logprobs,
                 finish_reason=(
                     "tool_calls"
                     if auto_tools_called
-                    else final_res.finish_reason if final_res.finish_reason else "stop"
+                    else output.finish_reason if output.finish_reason else "stop"
                 ),
-                stop_reason=final_res.stop_reason,
+                stop_reason=output.stop_reason,
                 token_ids=(
-                    as_list(final_res.token_ids) if request.return_token_ids else None
+                    as_list(output.token_ids) if request.return_token_ids else None
                 ),
                 choice_output_type="text",
             )
@@ -649,16 +655,55 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     def _create_audio_choice(self, omni_outputs: OmniRequestOutput, role: str):
         choices: list[OmniChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
-        audio_tensor = final_res.multimodal_output["audio"]
-        choice_data = OmniChatCompletionResponseChoice(
-            index=final_res.index,
-            message=ChatMessage(
-                role=role, content=base64.b64encode(audio_tensor).decode("utf-8")
-            ),
-            logprobs=None,
-            finish_reason="stop",
-            stop_reason=None,
-            choice_output_type="audio",
+        audio_tensor = final_res.multimodal_output["audio"].detach().cpu().numpy()
+        import soundfile as sf
+
+        sf.write("audio_123.wav", audio_tensor, samplerate=24000)
+
+        # Convert numpy array to WAV bytes and encode as base64
+        if soundfile is None:
+            raise ImportError(
+                "soundfile is required for audio generation. "
+                "Please install it with: pip install soundfile"
+            )
+
+        # Default sample rate for TTS models (typically 24000 Hz)
+        # You may need to adjust this based on your model's configuration
+        sample_rate = 24000
+
+        # Ensure audio is 1D (flatten if needed)
+        if audio_tensor.ndim > 1:
+            audio_tensor = audio_tensor.flatten()
+
+        # Convert to WAV format and encode as base64
+        with BytesIO() as buffer:
+            soundfile.write(buffer, audio_tensor, sample_rate, format="WAV")
+            wav_bytes = buffer.getvalue()
+
+        audio_base64 = base64.b64encode(wav_bytes).decode("utf-8")
+
+        # Generate unique ID for the audio
+        audio_id = f"audio-{uuid.uuid4().hex[:16]}"
+
+        # Set expiration time (e.g., 24 hours from now) as Unix timestamp
+        expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+
+        # Create OpenAIChatCompletionAudio object with all required fields
+        audio_obj = OpenAIChatCompletionAudio(
+            id=audio_id,
+            data=audio_base64,
+            expires_at=expires_at,
+            transcript="",  # Empty transcript if not available
         )
-        choices.append(choice_data)
+
+        for output in final_res.outputs:
+            choice_data = OmniChatCompletionResponseChoice(
+                index=output.index,
+                message=ChatMessage(role=role, audio=audio_obj),
+                logprobs=None,
+                finish_reason="stop",
+                stop_reason=None,
+                choice_output_type="audio",
+            )
+            choices.append(choice_data)
         return choices

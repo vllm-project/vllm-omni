@@ -404,7 +404,9 @@ class Qwen2_5OmniForConditionalGeneration(
 
             if sampling_metadata is not None:
                 # the padding token id is set to text model's pad token id, which do not match with the talker model's word embedding size
-                sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
+                sampling_metadata.prompt_token_ids[
+                    sampling_metadata.prompt_token_ids == 152064
+                ] = 8448
 
             return OmniOutput(
                 text_hidden_states=talker_hidden,

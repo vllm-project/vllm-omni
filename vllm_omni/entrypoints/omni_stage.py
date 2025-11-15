@@ -25,6 +25,7 @@ from vllm_omni.entrypoints.stage_utils import (
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.usage.usage_lib import UsageContext
@@ -39,6 +40,8 @@ from vllm_omni.entrypoints.utils import (
     set_stage_gpu_devices,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
 
 
 class OmniStage:
@@ -182,7 +185,7 @@ class OmniStage:
             source_outputs = stage_list[source_stage_id].engine_outputs
             multi_modal_data = {
                 source_output.request_id: prompt.get("multi_modal_data", None)
-                for source_output, prompt in zip(source_outputs, prompt)
+                for source_output in source_outputs
             }
 
             for source_output in source_outputs:
@@ -593,6 +596,11 @@ async def _stage_worker_async(
         try:
             _batch_seq += 1
             _gen_t0 = _time.time()
+            if isinstance(ein, list):
+                ein = ein[0]
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print(f"ein: {ein}")
+            print(f"type of ein: {type(ein)}")
             async for res in stage_engine.generate(ein, sampling_params, rid):
                 gen_output = res
             _gen_t1 = _time.time()

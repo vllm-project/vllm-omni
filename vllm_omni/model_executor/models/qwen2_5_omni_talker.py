@@ -166,8 +166,16 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         )
         return hidden_states
 
+    def bad_word_processor(self, logits: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.config, "tts_codec_start_token_id"):
+            bos_id = int(getattr(self.config, "tts_codec_start_token_id"))
+            logits[..., bos_id] = -1e9
+        return logits
+
     def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states)
+        logits = self.language_model.compute_logits(hidden_states)
+        logits = self.bad_word_processor(logits)
+        return logits
 
     def sample(
         self,
