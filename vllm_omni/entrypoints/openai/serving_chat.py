@@ -656,9 +656,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         choices: list[OmniChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
         audio_tensor = final_res.multimodal_output["audio"].detach().cpu().numpy()
-        import soundfile as sf
-
-        sf.write("audio_123.wav", audio_tensor, samplerate=24000)
 
         # Convert numpy array to WAV bytes and encode as base64
         if soundfile is None:

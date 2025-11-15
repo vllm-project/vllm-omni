@@ -7,8 +7,8 @@ import numpy as np
 import soundfile as sf
 import torch
 from utils import make_omni_prompt
-from vllm.sampling_params import SamplingParams
 
+from vllm.sampling_params import SamplingParams
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
 _os_env_toggle.environ["VLLM_USE_V1"] = "1"
@@ -109,10 +109,14 @@ def parse_args():
     parser.add_argument("--use-torchvision", action="store_true")
     parser.add_argument("--tokenize", action="store_true")
     parser.add_argument(
-        "--output-wav", default="output.wav", help="[Deprecated] Output wav directory (use --output-dir)."
+        "--output-wav",
+        default="output.wav",
+        help="[Deprecated] Output wav directory (use --output-dir).",
     )
     parser.add_argument(
-        "--output-dir", default="outputs", help="Output directory to save text and wav files together."
+        "--output-dir",
+        default="outputs",
+        help="Output directory to save text and wav files together.",
     )
     parser.add_argument(
         "--thinker-hidden-states-dir",
@@ -168,7 +172,9 @@ def main():
         raise
 
     if args.prompts is None:
-        raise ValueError("No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)")
+        raise ValueError(
+            "No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)"
+        )
     omni_llm = OmniLLM(
         model=model_name,
         log_stats=args.enable_stats,
@@ -217,7 +223,9 @@ def main():
     omni_outputs = omni_llm.generate(prompt, sampling_params_list)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    output_dir = (
+        args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    )
     os.makedirs(output_dir, exist_ok=True)
     for stage_outputs in omni_outputs:
         if stage_outputs.final_output_type == "text":

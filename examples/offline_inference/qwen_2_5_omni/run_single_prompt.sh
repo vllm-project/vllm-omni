@@ -1,4 +1,5 @@
-export PYTHONPATH=/path/to/vllm-omni:$PYTHONPATH
+export PYTHONPATH=/root/gh/vllm_open_release/vllm-omni:$PYTHONPATH
+unset HF_HOME
 python end2end.py --model Qwen/Qwen2.5-Omni-7B \
                                  --voice-type "m02" \
                                  --dit-ckpt none \

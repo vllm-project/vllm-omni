@@ -176,6 +176,13 @@ class AsyncOmniLLM(EngineClient):
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
+    def shutdown(self):
+        """Shutdown, cleaning up the background proc and IPC."""
+        try:
+            self.close()
+        except Exception as e:
+            logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
+
     async def generate(
         self,
         prompt: PromptType,

@@ -51,8 +51,10 @@ def run_text_to_audio(model: str) -> None:
     for choice in chat_completion.choices:
         if choice.message.audio:
             audio_data = base64.b64decode(choice.message.audio.data)
-            with open(f"audio_{count}.wav", "wb") as f:
+            audio_file_path = f"audio_{count}.wav"
+            with open(audio_file_path, "wb") as f:
                 f.write(audio_data)
+            print(f"Audio saved to {audio_file_path}")
             count += 1
         elif choice.message.content:
             print("Chat completion output from text:", choice.message.content)

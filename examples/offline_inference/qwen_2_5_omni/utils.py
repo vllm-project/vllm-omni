@@ -9,6 +9,7 @@ import soundfile as sf
 import torch
 import torchvision.io
 from processing_omni import fetch_image, fetch_video
+from transformers import AutoConfig, AutoProcessor
 
 from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
