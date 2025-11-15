@@ -59,7 +59,7 @@ Install additional requirements for vllm-omni
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm_omni
-uv pip install -r requirements.txt
+uv pip install -e .
 ```
 
 ## Run examples (Qwen2.5-omni)

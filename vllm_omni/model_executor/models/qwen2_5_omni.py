@@ -640,7 +640,9 @@ class Qwen2_5OmniForConditionalGeneration(
         # Use thinker model for sampling
         return self.model.sample(logits, sampling_metadata)
 
-    def generate_speech(self, text_tokens: torch.Tensor, voice_type: str = "default"):
+    def generate_speech(
+        self, text_tokens: torch.Tensor, voice_type: str = "default"
+    ) -> torch.Tensor:
         """
         Generate speech from text tokens using the talker and token2wav models.
         This method is kept for backward compatibility and direct speech generation.

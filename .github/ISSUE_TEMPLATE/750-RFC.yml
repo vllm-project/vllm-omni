@@ -7,7 +7,7 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Please take a look at previous [RFCs](https://github.com/hsliuustc0106/vllm-omni/issues?q=label%3ARFC+sort%3Aupdated-desc) for reference.
+      #### Please take a look at previous [RFCs](https://github.com/vllm-project/vllm-omni/issues?q=label%3ARFC+sort%3Aupdated-desc) for reference.
 - type: textarea
   attributes:
     label: Motivation.

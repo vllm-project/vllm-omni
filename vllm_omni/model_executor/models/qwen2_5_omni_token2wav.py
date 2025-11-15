@@ -748,7 +748,9 @@ class SnakeBeta(nn.Module):
         return hidden_states
 
 
-def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
+def kaiser_sinc_filter1d(
+    cutoff: float, half_width: float, kernel_size: int
+) -> torch.Tensor:
     """Generates a 1D Kaiser-windowed sinc filter.
 
     Args:
@@ -1370,14 +1372,14 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
     @torch.no_grad()
     def fast_block_sample(
         self,
-        conditioning_vector,
-        reference_mel_spectrogram,
-        quantized_code,
+        conditioning_vector: torch.Tensor,
+        reference_mel_spectrogram: torch.Tensor,
+        quantized_code: torch.Tensor,
         y0: torch.Tensor,
-        num_steps=10,
-        guidance_scale=0.5,
+        num_steps: int = 10,
+        guidance_scale: float = 0.5,
         sway_coefficient: Optional[float] = -1.0,
-    ):
+    ) -> torch.Tensor:
         """
         Block-wise ODE sampling starting from provided initial state y0.
 

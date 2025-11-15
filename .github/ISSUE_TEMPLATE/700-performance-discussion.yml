@@ -7,7 +7,7 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/hsliuustc0106/vllm-omni/issues?q=is%3Aissue+sort%3Acreated-desc+).
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-omni/issues?q=is%3Aissue+sort%3Acreated-desc+).
 - type: textarea
   attributes:
     label: Proposal to improve performance
@@ -19,7 +19,7 @@ body:
   attributes:
     label: Report of performance regression
     description: >
-      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark script at https://github.com/hsliuustc0106/vllm-omni/tree/main/tests/benchmarks .
+      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark script at https://github.com/vllm-project/vllm-omni/tree/main/tests/benchmarks .
   validations:
     required: false
 - type: textarea
@@ -35,7 +35,7 @@ body:
     description: |
       Please run the following and paste the output below.
       ```sh
-      wget https://raw.githubusercontent.com/hsliuustc0106/vllm-omni/main/vllm_omni/collect_env.py
+      wget https://raw.githubusercontent.com/vllm-project/vllm-omni/main/vllm_omni/collect_env.py
       # For security purposes, please feel free to check the contents of collect_env.py before running it.
       python collect_env.py
       ```

@@ -62,7 +62,7 @@ class OmniInputPreprocessor(InputPreprocessor):
 
         Returns:
 
-        * [`SingletonInputs`][vllm.inputs.data.SingletonInputs] instance
+        * Input container compatible with vLLM's singleton prompt handling.
         """
         parsed = parse_singleton_prompt_omni(prompt)
 

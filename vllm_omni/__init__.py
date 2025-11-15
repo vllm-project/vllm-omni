@@ -12,7 +12,13 @@ Architecture:
   processing
 """
 
-from . import patch  # noqa: F401
+try:
+    from . import patch  # noqa: F401
+except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+    if exc.name != "vllm":
+        raise
+    # Allow importing vllm_omni without vllm (e.g., documentation builds)
+    patch = None  # type: ignore
 from .config import OmniModelConfig
 
 # Main entry points

@@ -1,0 +1,56 @@
+/* Custom CSS for vLLM-omni documentation - based on vLLM's extra.css */
+
+/* Improve code block readability */
+.highlight {
+    border-radius: 4px;
+}
+
+/* Style API documentation */
+.md-typeset .doc-contents {
+    margin-bottom: 1.5em;
+}
+
+/* Improve table readability */
+.md-typeset table {
+    display: table;
+    width: 100%;
+}
+
+/* Light mode: darker section titles (from vLLM) */
+body[data-md-color-scheme="default"] .md-nav__item--section > label.md-nav__link .md-ellipsis {
+  color: rgba(0, 0, 0, 0.7) !important;
+  font-weight: 700;
+}
+
+/* Dark mode: lighter gray section titles (from vLLM) */
+body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .md-ellipsis {
+  color: rgba(255, 255, 255, 0.75) !important;
+  font-weight: 700;
+}
+
+/* Navigation: Expand first level of API Reference by default, collapse deeper levels */
+/* Show direct children of API Reference section (vllm_omni's children: config, core, entrypoints, etc.) */
+.md-nav__item--nested[data-md-state] > .md-nav {
+    display: none;
+}
+
+/* Expand active items */
+.md-nav__item--nested.md-nav__item--active > .md-nav {
+    display: block;
+}
+
+/* For API Reference: show first level children (config, core, entrypoints, etc.) by default */
+.md-nav__item--section:has([href*="api/vllm_omni/index"]) > .md-nav > .md-nav__list > .md-nav__item--nested > .md-nav {
+    display: block;
+}
+
+/* But keep deeper levels collapsed */
+.md-nav__item--section:has([href*="api/vllm_omni/index"]) > .md-nav > .md-nav__list > .md-nav__item--nested > .md-nav > .md-nav__list > .md-nav__item--nested > .md-nav {
+    display: none;
+}
+
+/* Expand deeper levels only when active */
+.md-nav__item--section:has([href*="api/vllm_omni/index"]) > .md-nav > .md-nav__list > .md-nav__item--nested > .md-nav > .md-nav__list > .md-nav__item--nested.md-nav__item--active > .md-nav {
+    display: block;
+}
+

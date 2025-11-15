@@ -1,40 +1,7 @@
-# vLLM-omni: Multi-modal Extension for vLLM
+# Offline Example of vLLM-omni for Qwen2.5-omni
 
-vLLM-omni is designed to extend vLLM capabilities to support multi-modality model inference and serving, particularly focusing on non-autoregressive structures and non-textual outputs.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen_2_5_omni>.
 
-## 🎯 Overview
-
-Traditional vLLM systems are limited to text-based, autoregressive generation. vLLM-omni addresses this limitation by enabling support for:
-
-- **Multi-modal Models**: Text, image, video, audio, and sensor data processing
-- **Non-autoregressive Architectures**: Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous Outputs**: Beyond traditional text generation to multimodal outputs
-
-## 🏗️ Architecture
-
-vLLM-omni is built on a modular architecture that extends vLLM's core functionality:
-
-
-## 🚀 Key Features
-
-### Multi-Engine Support
-
-- **Autoregressive Engine**: Traditional text generation with enhanced KV-caching
-- **Diffusion Engine**: Support for DiT models and iterative generation
-- **Hybrid Engine**: Combined AR+DiT processing pipelines
-
-### Modality Processing
-
-- **Text**: Advanced tokenization and embedding generation
-- **Image**: Vision encoder integration (CLIP, etc.)
-- **Audio**: Speech processing and audio embedding
-
-## 📋 Supported Models
-
-### AR + Diffusion Transformer (DiT) Models
-- Qwen-omni (Thinker-Talker-Codec structure)
-- HunyunaImage 3.0 (Ongoing)
-- Qwen-Image (Ongoing)
 
 ## 🛠️ Installation
 
@@ -104,12 +71,27 @@ Get into the example folder
 ```bash
 cd examples/offline_inference/qwen_2_5_omni
 ```
-Modify PYTHONPATH in run.sh as your path of vllm_omni. Then run.
+Then run
 ```bash
 bash run.sh
 ```
 The output audio is saved in ./output_audio
 
-## Further details
+## Example materials
 
-For detailed architecture design, see [vllm_omni_design.md](docs/architecture/vllm_omni_design.md) and [high_level_arch_design.md](docs/architecture/high_level_arch_design.md).
+??? abstract "end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/qwen_2_5_omni/end2end.py"
+    ``````
+??? abstract "processing_omni.py"
+    ``````py
+    --8<-- "examples/offline_inference/qwen_2_5_omni/processing_omni.py"
+    ``````
+??? abstract "run.sh"
+    ``````sh
+    --8<-- "examples/offline_inference/qwen_2_5_omni/run.sh"
+    ``````
+??? abstract "utils.py"
+    ``````py
+    --8<-- "examples/offline_inference/qwen_2_5_omni/utils.py"
+    ``````

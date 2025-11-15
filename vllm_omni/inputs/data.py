@@ -1,4 +1,10 @@
-from typing import Any, NotRequired, Optional
+from typing import Any, Optional
+
+try:
+    from typing import NotRequired
+except ImportError:
+    # Python < 3.11: use typing_extensions
+    from typing_extensions import NotRequired
 
 import torch
 
@@ -39,8 +45,7 @@ def token_inputs_omni(
     prompt_embeds: Optional[torch.Tensor] = None,
     additional_information: Optional[dict[str, Any]] = None,
 ) -> OmniTokenInputs:
-    """Construct [`TokenInputs`][vllm.inputs.data.TokenInputs] from optional
-    values."""
+    """Construct token inputs with optional embeddings and metadata."""
     inputs = OmniTokenInputs(type="token", prompt_token_ids=prompt_token_ids)
 
     if prompt is not None:

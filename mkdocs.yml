@@ -1,0 +1,180 @@
+site_name: vLLM-omni
+site_description: Multi-modality models inference and serving with non-autoregressive structures
+site_author: vLLM-omni Team
+site_url: https://vllm-project.github.io/vllm-omni/
+
+repo_name: vllm-project/vllm-omni
+repo_url: https://github.com/vllm-project/vllm-omni
+edit_uri: edit/main/docs/
+
+# Copyright
+copyright: Copyright &copy; 2025 vLLM-omni Team
+
+# Theme
+theme:
+  name: material
+  palette:
+    # Light mode
+    - scheme: default
+      primary: blue
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - scheme: slate
+      primary: blue
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.action.edit
+    - content.code.copy
+    - content.tabs.link
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.annotate
+    - content.tabs
+    - content.tooltips
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+hooks:
+  - docs/mkdocs/hooks/generate_examples.py
+
+# Plugins
+plugins:
+  - meta
+  - search
+  # - awesome-nav  # Uncomment if installed
+  - glightbox
+  - git-revision-date-localized:
+      # exclude files
+      exclude:
+        - api/*
+        - user_guide/examples/**
+        - contributing/design_documents/api_design_template.md
+        - DOCS_GUIDE.md
+  - minify:
+      minify_html: true
+      minify_js: true
+      minify_css: true
+      cache_safe: true
+  - api-autonav:
+      modules: ["vllm_omni"]
+      api_root_uri: "api"
+      nav_item_prefix: ""  # No prefix in navigation tree (clean names)
+      show_full_namespace: false  # Show only module name, not full path
+      exclude:
+        - "re:vllm_omni\\._.*"  # Internal modules
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [vllm_omni]
+          options:
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_source: true
+            show_root_heading: true
+            show_root_toc_entry: true
+            show_root_full_path: false
+            show_object_full_path: false
+            show_if_no_docstring: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_overloads: true
+            signature_crossrefs: true
+            filters: []
+            summary:
+              modules: true
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://typing-extensions.readthedocs.io/en/latest/objects.inv
+            - https://docs.aiohttp.org/en/stable/objects.inv
+            - https://pillow.readthedocs.io/en/stable/objects.inv
+            - https://numpy.org/doc/stable/objects.inv
+            - https://pytorch.org/docs/stable/objects.inv
+            - https://psutil.readthedocs.io/en/stable/objects.inv
+
+# Markdown extensions
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  # For content tabs
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+      alternate_style: true
+  # For code highlighting
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  # For emoji and icons
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  # For in page [TOC] (not sidebar)
+  - toc:
+      permalink: true
+  # For math rendering
+  - pymdownx.arithmatex:
+      generic: true
+  # For task lists
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  # For tables
+  - tables
+
+# Navigation
+nav:
+  - Home: index.md
+  - User Guide:
+    - Getting Started:
+      - user_guide/getting_started/quickstart.md
+    - Examples:
+      - user_guide/examples/index.md
+      - Offline Inference:
+        - user_guide/examples/offline_inference/qwen_2_5_omni.md
+      - Online Serving:
+        - user_guide/examples/online_serving/index.md
+  - API Reference:
+      - Summary: api/overview.md
+  - Developer Guide:
+    - contributing/README.md
+    - Design Documents:
+      - contributing/design_documents/index.md
+      - contributing/design_documents/vllm_omni_design.md
+      - contributing/design_documents/architecture_overview.md
+      - contributing/design_documents/api_design_doc.md
+
+# Extra
+extra:
+  version:
+    provider: mike
+
+# Extra CSS
+extra_css:
+  - mkdocs/stylesheets/extra.css
+
+# Makes the url format end in .html rather than act as a dir
+# So index.md generates as index.html and is available under URL /index.html
+# https://www.mkdocs.org/user-guide/configuration/#use_directory_urls
+use_directory_urls: false

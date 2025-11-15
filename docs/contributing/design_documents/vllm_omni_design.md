@@ -1,4 +1,4 @@
-# vLLM-omni Software Design Document
+# Architecture Design Principles
 
 ## Overview
 
