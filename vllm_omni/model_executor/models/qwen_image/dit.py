@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#TODO replace this with vLLM implementation
+# TODO replace this with vLLM implementation
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 from diffusers.models.attention_processor import Attention
@@ -491,8 +491,11 @@ class QwenImageTransformer2DModel(nn.Module):
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
     ):
         super().__init__()
+        self.config = None
+        self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.guidance_embeds = guidance_embeds
 
         self.pos_embed = QwenEmbedRope(
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
@@ -604,3 +607,6 @@ class QwenImageTransformer2DModel(nn.Module):
             return (output,)
 
         return Transformer2DModelOutput(sample=output)
+
+    def load_weights(self):
+        pass
