@@ -11,6 +11,11 @@ Launch the server
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
+If you have custom stage configs file, launch the server with command below
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+```
+
 Get into the example folder
 ```bash
 cd examples/online_serving

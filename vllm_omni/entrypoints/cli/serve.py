@@ -56,6 +56,12 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable vLLM-omni mode",
         )
+        serve_parser.add_argument(
+            "--stage-configs-path",
+            type=str,
+            default=None,
+            help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
+        )
         return serve_parser
 
 
