@@ -29,9 +29,8 @@ def thinker2talker(
         prompt_token_ids = thinker_output.prompt_token_ids
         thinker_output_ids = output.token_ids
         prompt_token_ids_len = len(prompt_token_ids)
-        thinker_hidden_states = (
-            output.multimodal_output["latent"].clone().detach().cuda()
-        )
+        latent = output.multimodal_output["latent"]
+        thinker_hidden_states = latent.clone().detach().to(latent.device)
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID] + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids)) + [TALKER_CODEC_END_TOKEN_ID],
