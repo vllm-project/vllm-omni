@@ -181,7 +181,7 @@ class Example:
                 f"{code_fence}\n"
             )
         else:
-            with open(self.main_file) as f:
+            with open(self.main_file, encoding="utf-8") as f:
                 # Skip the title from md snippets as it's been included above
                 main_content = f.readlines()[1:]
             content += self.fix_relative_links("".join(main_content))
