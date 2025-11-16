@@ -12,6 +12,8 @@ client = OpenAI(
     base_url=openai_api_base,
 )
 
+SEED = 42
+
 
 def get_system_prompt():
 
@@ -31,6 +33,41 @@ def get_system_prompt():
 
 
 def run_text_to_audio(model: str) -> None:
+    thinker_sampling_params = {
+        "temperature": 0.0,  # Deterministic - no randomness
+        "top_p": 1.0,  # Disable nucleus sampling
+        "top_k": -1,  # Disable top-k sampling
+        "max_tokens": 2048,
+        "seed": SEED,  # Fixed seed for sampling
+        "detokenize": True,
+        "repetition_penalty": 1.1,
+    }
+    talker_sampling_params = {
+        "temperature": 0.9,
+        "top_p": 0.8,
+        "top_k": 40,
+        "max_tokens": 2048,
+        "seed": SEED,  # Fixed seed for sampling
+        "detokenize": True,
+        "repetition_penalty": 1.05,
+        "stop_token_ids": [8294],
+    }
+    code2wav_sampling_params = {
+        "temperature": 0.0,  # Deterministic - no randomness
+        "top_p": 1.0,  # Disable nucleus sampling
+        "top_k": -1,  # Disable top-k sampling
+        "max_tokens": 2048,
+        "seed": SEED,  # Fixed seed for sampling
+        "detokenize": True,
+        "repetition_penalty": 1.1,
+    }
+
+    sampling_params_list = [
+        thinker_sampling_params,
+        talker_sampling_params,
+        code2wav_sampling_params,
+    ]
+
     chat_completion = client.chat.completions.create(
         messages=[
             get_system_prompt(),
@@ -45,6 +82,9 @@ def run_text_to_audio(model: str) -> None:
             },
         ],
         model=model,
+        extra_body={
+            "sampling_params_list": sampling_params_list
+        },  # Optional, it has a default setting in stage_configs of the corresponding model.
     )
 
     count = 0

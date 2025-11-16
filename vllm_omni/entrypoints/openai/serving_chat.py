@@ -31,6 +31,7 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionResponseChoice,
     ChatMessage,
     ErrorResponse,
     FunctionCall,
@@ -41,12 +42,13 @@ from vllm.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_engine import clamp_prompt_logprobs
+from vllm.entrypoints.openai.serving_engine import RequestPrompt, clamp_prompt_logprobs
 from vllm.entrypoints.openai.tool_parsers.mistral_tool_parser import MistralToolCall
-from vllm.entrypoints.utils import get_max_tokens
+from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
+from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import (
     maybe_serialize_tool_calls,
@@ -54,7 +56,6 @@ from vllm.transformers_utils.tokenizers import (
     validate_request_params,
 )
 from vllm.utils import as_list
-from vllm_omni.entrypoints.openai.protocal import OmniChatCompletionResponseChoice
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -174,33 +175,18 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-                sampling_params: Union[SamplingParams, BeamSearchParams]
 
-                if self.default_sampling_params is None:
-                    self.default_sampling_params = {}
-
-                max_tokens = get_max_tokens(
-                    max_model_len=self.max_model_len,
-                    request=request,
-                    input_length=len(engine_prompt["prompt_token_ids"]),
-                    default_sampling_params=self.default_sampling_params,
-                )
-
-                if request.use_beam_search:
-                    sampling_params = request.to_beam_search_params(
-                        max_tokens, self.default_sampling_params
+                if hasattr(request, "sampling_params_list"):
+                    sampling_params_list = self._to_sampling_params_list(
+                        request.sampling_params_list
                     )
                 else:
-                    sampling_params = request.to_sampling_params(
-                        max_tokens,
-                        self.model_config.logits_processor_pattern,
-                        self.default_sampling_params,
-                    )
+                    sampling_params_list = None
 
                 self._log_inputs(
                     request_id,
                     request_prompts[i],
-                    params=sampling_params,
+                    params_list=sampling_params_list,
                     lora_request=lora_request,
                 )
 
@@ -210,21 +196,14 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     else await self._get_trace_headers(raw_request.headers)
                 )
 
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.engine_client.beam_search(
-                        prompt=engine_prompt,
-                        request_id=request_id,
-                        params=sampling_params,
-                        lora_request=lora_request,
-                    )
-                else:
-                    generator = self.engine_client.generate(
-                        prompt=engine_prompt,
-                        request_id=request_id,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        priority=request.priority,
-                    )
+                generator = self.engine_client.generate(
+                    prompt=engine_prompt,
+                    request_id=request_id,
+                    sampling_params_list=sampling_params_list,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=request.priority,
+                )
 
                 generators.append(generator)
         except ValueError as e:
@@ -261,6 +240,51 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
 
+    def _to_sampling_params_list(
+        self, sampling_params_list: list[dict]
+    ) -> list[SamplingParams]:
+
+        final_sampling_params_list = []
+        for sampling_params in sampling_params_list:
+            if isinstance(sampling_params, dict):
+                final_sampling_params_list.append(SamplingParams(**sampling_params))
+            elif isinstance(sampling_params, SamplingParams):
+                final_sampling_params_list.append(sampling_params)
+            else:
+                raise ValueError(f"Invalid sampling params: {sampling_params}")
+        return final_sampling_params_list
+
+    def _log_inputs(
+        self,
+        request_id: str,
+        inputs: Union[RequestPrompt, PromptType],
+        params_list: Optional[list[SamplingParams]],
+        lora_request: Optional[LoRARequest],
+    ) -> None:
+        if self.request_logger is None:
+            return
+        prompt, prompt_token_ids, prompt_embeds = None, None, None
+        if isinstance(inputs, str):
+            prompt = inputs
+        elif isinstance(inputs, list):
+            prompt_token_ids = inputs
+        else:
+            prompt = getattr(inputs, "prompt", None)
+            prompt_token_ids = getattr(inputs, "prompt_token_ids", None)
+
+        logger.info(
+            "Received request %s: prompt: %r, "
+            "params_list: %s, prompt_token_ids: %s, "
+            "prompt_embeds shape: %s, "
+            "lora_request: %s.",
+            request_id,
+            prompt,
+            params_list,
+            prompt_token_ids,
+            prompt_embeds.shape if prompt_embeds is not None else None,
+            lora_request,
+        )
+
     async def chat_completion_full_generator(
         self,
         request: ChatCompletionRequest,
@@ -287,7 +311,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         assert final_outputs is not None
 
-        choices: list[OmniChatCompletionResponseChoice] = []
+        choices: list[ChatCompletionResponseChoice] = []
 
         usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
         role = self.get_chat_request_role(request)
@@ -377,7 +401,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         else:
             history_tool_call_cnt = 0
 
-        choices: list[OmniChatCompletionResponseChoice] = []
+        choices: list[ChatCompletionResponseChoice] = []
 
         for output in final_res.outputs:
             token_ids = output.token_ids
@@ -423,7 +447,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                         content=content,
                     )
 
-                choice_data = OmniChatCompletionResponseChoice(
+                choice_data = ChatCompletionResponseChoice(
                     index=output.index,
                     message=message,
                     logprobs=logprobs,
@@ -433,7 +457,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                         else (output.finish_reason if output.finish_reason else "stop")
                     ),
                     stop_reason=output.stop_reason,
-                    choice_output_type="text",
                 )
                 choices.append(choice_data)
                 continue
@@ -595,7 +618,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     role=role, reasoning_content=reasoning_content, content=content
                 )
 
-            choice_data = OmniChatCompletionResponseChoice(
+            choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
@@ -608,7 +631,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None
                 ),
-                choice_output_type="text",
             )
             choices.append(choice_data)
 
@@ -653,7 +675,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
     def _create_audio_choice(self, omni_outputs: OmniRequestOutput, role: str):
-        choices: list[OmniChatCompletionResponseChoice] = []
+        choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
         audio_tensor = final_res.multimodal_output["audio"].detach().cpu().numpy()
 
@@ -694,13 +716,12 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         )
 
         for output in final_res.outputs:
-            choice_data = OmniChatCompletionResponseChoice(
+            choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=ChatMessage(role=role, audio=audio_obj),
                 logprobs=None,
                 finish_reason="stop",
                 stop_reason=None,
-                choice_output_type="audio",
             )
             choices.append(choice_data)
         return choices

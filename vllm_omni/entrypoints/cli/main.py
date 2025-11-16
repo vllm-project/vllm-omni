@@ -2,6 +2,7 @@
 CLI entry point for vLLM-omni that intercepts vLLM commands.
 """
 
+import importlib.metadata
 import sys
 
 
@@ -28,12 +29,12 @@ def main():
             description="vLLM OMNI CLI",
             epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
         )
-        # parser.add_argument(
-        #     '-v',
-        #     '--version',
-        #     action='version',
-        #     version=importlib.metadata.version('vllm_omni'),
-        # )
+        parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=importlib.metadata.version("vllm_omni"),
+        )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}
         for cmd_module in CMD_MODULES:

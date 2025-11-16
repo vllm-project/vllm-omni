@@ -1,15 +1,19 @@
 # Online serving Example of vLLM-omni for Qwen2.5-omni
 
+## 🛠️ Installation
+
+Please refer to [README.md](README.md)
+
 ## Run examples (Qwen2.5-omni)
+
+Launch the server
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+```
 
 Get into the example folder
 ```bash
 cd examples/online_serving
-```
-
-Launch the server
-```bash
-bash run_server.sh
 ```
 
 Send request via python

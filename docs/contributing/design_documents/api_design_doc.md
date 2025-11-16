@@ -2,7 +2,7 @@
 
 This document contains comprehensive API design documentation for all core modules in vLLM-omni. These templates provide a standardized structure for designing and implementing the core, engine, executor, and worker modules.
 
-## 📋 Module API 
+## 📋 Module API
 
 ### Core Module API
 **Core module** provides fundamental scheduling, caching, and resource management functionality.
