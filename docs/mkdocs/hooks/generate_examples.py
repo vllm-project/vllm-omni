@@ -116,10 +116,8 @@ class Example:
             ".ini",
         }
         is_other_file = lambda file: (  # noqa: E731
-            file.is_file()
-            and file != self.main_file
-            and file.suffix in text_extensions  # noqa: E731
-        )  # noqa: E731
+            file.is_file() and file != self.main_file and file.suffix in text_extensions
+        )
         return [file for file in self.path.rglob("*") if is_other_file(file)]
 
     def determine_title(self) -> str:

@@ -2,7 +2,7 @@
 
 ## 🛠️ Installation
 
-Please refer to [README.md](README.md)
+Please refer to [README.md](../../README.md)
 
 ## Run examples (Qwen2.5-omni)
 
