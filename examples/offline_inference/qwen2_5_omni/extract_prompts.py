@@ -28,7 +28,7 @@ def main() -> None:
     args = parser.parse_args()
 
     prompts = []
-    with open(args.input, "r", encoding="utf-8", errors="ignore") as f:
+    with open(args.input, encoding="utf-8", errors="ignore") as f:
         for line in f:
             if len(prompts) >= args.topk:
                 break

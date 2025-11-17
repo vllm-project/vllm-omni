@@ -42,13 +42,9 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                         selected_physical,
                     )
                 except Exception as e:
-                    logger.debug(
-                        "[Stage-%s] Failed to parse first CUDA device: %s", stage_id, e
-                    )
+                    logger.debug("[Stage-%s] Failed to parse first CUDA device: %s", stage_id, e)
                     selected_physical = None
-        elif isinstance(devices, (int, str)) and (
-            isinstance(devices, int) or str(devices).isdigit()
-        ):
+        elif isinstance(devices, (int, str)) and (isinstance(devices, int) or str(devices).isdigit()):
             logical_idx = max(0, int(devices))
             vis = os.environ.get("CUDA_VISIBLE_DEVICES")
             if vis:
@@ -113,9 +109,7 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                             "free": int(free),
                         }
                     )
-                logger.debug(
-                    "[Stage-%s] CUDA devices visible=%s info=%s", stage_id, num, info
-                )
+                logger.debug("[Stage-%s] CUDA devices visible=%s info=%s", stage_id, num, info)
         except Exception as e:
             logger.debug(
                 "[Stage-%s] Failed to query CUDA devices: %s",
@@ -215,9 +209,7 @@ def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -
     return container[obj_key]
 
 
-def maybe_load_from_ipc_with_metrics(
-    container: Dict[str, Any], obj_key: str, shm_key: str
-) -> tuple[Any, Dict[str, float]]:
+def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, shm_key: str) -> tuple[Any, Dict[str, float]]:
     """Load object and return (object, metrics) with RX bytes and decode time.
 
     Metrics keys:
@@ -249,9 +241,7 @@ def maybe_load_from_ipc_with_metrics(
     }
 
 
-def encode_for_ipc(
-    obj: Any, threshold: int, obj_key: str, shm_key: str
-) -> Dict[str, Any]:
+def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> Dict[str, Any]:
     """Return a dict payload for IPC: inline (obj_key) or SHM (shm_key).
 
     When serialized size exceeds threshold, returns {shm_key: {name,size}};

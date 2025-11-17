@@ -103,7 +103,6 @@ known_first_party = ["vllm_omni"]
 
 [tool.ruff]
 line-length = 160
-target-version = "py312, py313"
 exclude = [
     ".eggs",
     ".git",
@@ -167,4 +166,11 @@ markers = [
     "integration: Integration tests",
     "benchmark: Benchmark tests",
     "slow: Slow tests",
+]
+
+[tool.typos.default]
+extend-ignore-identifiers-re = [
+    ".*_thw",
+    ".*thw",
+    "ein"
 ]

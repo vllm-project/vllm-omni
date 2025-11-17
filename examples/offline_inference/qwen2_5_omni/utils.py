@@ -74,9 +74,7 @@ def fetch_and_read_video(args, video_url: str, fps=2):
             return video
 
     def read_video_with_transformers(video_file_name: Union[str, List[str]]):
-        video, total_duration, nframes, second_per_grid = fetch_video(
-            {"video": video_file_name}
-        )
+        video, total_duration, nframes, second_per_grid = fetch_video({"video": video_file_name})
         if total_duration is None and nframes is None:
             nframes = len(video)
             total_duration = 0.5 * nframes
@@ -95,10 +93,7 @@ def fetch_and_read_video(args, video_url: str, fps=2):
     if isinstance(video_url, str) and video_url.startswith("http"):
         with tempfile.NamedTemporaryFile(delete=True) as temp_video_file:
             resp = requests.get(video_url)
-            assert resp.status_code == requests.codes.ok, (
-                f"Failed to fetch video from {video_url}, "
-                f"status_code:{resp.status_code}, resp:{resp}"
-            )
+            assert resp.status_code == requests.codes.ok, f"Failed to fetch video from {video_url}, " f"status_code:{resp.status_code}, resp:{resp}"
 
             temp_video_file.write(urlopen(video_url).read())
             temp_video_file_path = temp_video_file.name
@@ -134,7 +129,7 @@ def make_inputs_qwen2_omni(
     # Decide legacy flag only once based on config (default True if unknown)
     if getattr(args, "legacy_omni_video", None) is None:
         if config is not None and hasattr(config, "architectures"):
-            args.legacy_omni_video = not ("Qwen2_5OmniModel" in config.architectures)
+            args.legacy_omni_video = "Qwen2_5OmniModel" not in config.architectures
         else:
             args.legacy_omni_video = True
 
@@ -181,9 +176,7 @@ def make_inputs_qwen2_omni(
                     audios.append(resample_wav_to_16khz(ele[audio_key]))
                 else:
                     raise ValueError(f"Unknown ele {ele}")
-            elif use_audio_in_video and (
-                ele["type"] == "video" or ele["type"] == "video_url"
-            ):
+            elif use_audio_in_video and (ele["type"] == "video" or ele["type"] == "video_url"):
                 # use video as audio as well
                 if "video_url" in ele:
                     audio_key = "video_url"
@@ -199,7 +192,7 @@ def make_inputs_qwen2_omni(
                     audios.append(librosa.load(ele[audio_key], sr=16000)[0])
                     videos.append(fetch_and_read_video(args, audio_key))
                 else:
-                    raise ValueError("Unknown ele {}".format(ele))
+                    raise ValueError(f"Unknown ele {ele}")
                 # insert a audio after the video
                 message["content"].insert(
                     index + 1,
@@ -296,10 +289,7 @@ def make_audio_in_video_v2_prompt(args):
             "content": [
                 {
                     "type": "video_url",
-                    "video_url": (
-                        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/"
-                        "Qwen2.5-Omni/draw_small.mp4"
-                    ),
+                    "video_url": ("https://qianwen-res.oss-cn-beijing.aliyuncs.com/" "Qwen2.5-Omni/draw_small.mp4"),
                 },
             ],
         },
@@ -313,9 +303,7 @@ def make_audio_in_video_v2_prompt(args):
     return prompt
 
 
-def make_omni_prompt(
-    args, prompt=None
-) -> Union[OmniTokensPrompt, List[OmniTokensPrompt]]:
+def make_omni_prompt(args, prompt=None) -> Union[OmniTokensPrompt, List[OmniTokensPrompt]]:
     if args.prompt_type == "text":
         prompt = make_text_prompt(args, prompt)
     elif args.prompt_type == "audio-in-video-v2":

@@ -20,9 +20,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         *,
         mm_uuids: Optional[MultiModalUUIDDict] = None,
     ) -> Union[OmniTokenInputs, MultiModalInputs]:
-        prompt_token_ids = self._truncate_inputs(
-            parsed_content["prompt_token_ids"], tokenization_kwargs
-        )
+        prompt_token_ids = self._truncate_inputs(parsed_content["prompt_token_ids"], tokenization_kwargs)
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
 

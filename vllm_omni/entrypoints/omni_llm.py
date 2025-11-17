@@ -2,8 +2,9 @@ import multiprocessing as mp
 import os
 import sys
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Union
 
 import cloudpickle
 from pydantic import ValidationError
@@ -24,20 +25,12 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
-from vllm_omni.entrypoints.log_utils import (
-    OrchestratorMetrics,
-    configure_orchestrator_logger,
-    init_stats_paths,
-    remove_old_logs,
-)
+from vllm_omni.entrypoints.log_utils import OrchestratorMetrics, configure_orchestrator_logger, init_stats_paths, remove_old_logs
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.stage_utils import serialize_obj as _ser
-from vllm_omni.entrypoints.utils import (
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
-)
+from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
+from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -77,12 +70,8 @@ class OmniLLM:
             remove_old_logs(self._log_file, len(self.stage_list))
             configure_orchestrator_logger(logger, self._log_file)
 
-        self._stats_file, self._overall_stats_file = init_stats_paths(
-            self._enable_stats, self._log_file
-        )
-        self._initialize_stages(
-            model, init_sleep_seconds, shm_threshold_bytes, init_timeout
-        )
+        self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
+        self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
 
     def _initialize_stages(
         self,
@@ -98,13 +87,8 @@ class OmniLLM:
             idx, cfg = idx_cfg
             return idx, OmniStage(cfg)
 
-        with ThreadPoolExecutor(
-            max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
-        ) as executor:
-            futures = [
-                executor.submit(_build_stage, (idx, cfg))
-                for idx, cfg in enumerate(self.stage_configs)
-            ]
+        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
+            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
             results: list[tuple[int, OmniStage]] = []
             for fut in as_completed(futures):
                 results.append(fut.result())
@@ -166,9 +150,7 @@ class OmniLLM:
     def generate(
         self,
         prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[
-            Union[SamplingParams, Sequence[SamplingParams]]
-        ] = None,
+        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
     ) -> list[OmniRequestOutput]:
         try:
             return self._run_generation(prompts, sampling_params_list)
@@ -181,19 +163,13 @@ class OmniLLM:
     def _run_generation(
         self,
         prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[
-            Union[SamplingParams, Sequence[SamplingParams]]
-        ] = None,
+        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
     ) -> list[OmniRequestOutput]:
         logger.debug("[Orchestrator] generate() called")
         if sampling_params_list is None:
-            raise ValueError(
-                "sampling_params_list is required for pipelined generation"
-            )
+            raise ValueError("sampling_params_list is required for pipelined generation")
         if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(
-                f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}"
-            )
+            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
         # Normalize prompts to a list for per-request iteration
         if not isinstance(prompts, (list, tuple)):
@@ -207,9 +183,7 @@ class OmniLLM:
         num_stages = len(self.stage_list)
 
         # Map from request_id to original prompt
-        request_id_to_prompt: dict[int, PromptType] = {
-            i: p for i, p in enumerate(request_prompts)
-        }
+        request_id_to_prompt: dict[int, PromptType] = {i: p for i, p in enumerate(request_prompts)}
 
         # Track per-request start time for end-to-end timing
         _req_start_ts: dict[int, float] = {}
@@ -240,9 +214,7 @@ class OmniLLM:
         )
 
         # Seed stage-0 queue with all requests
-        logger.debug(
-            "[Orchestrator] Seeding %d requests into stage-0", len(request_prompts)
-        )
+        logger.debug("[Orchestrator] Seeding %d requests into stage-0", len(request_prompts))
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
@@ -291,13 +263,9 @@ class OmniLLM:
                     time.sleep(0.05)
                     continue
 
-                engine_outputs = _load(
-                    result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
-                )
+                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
                 # Mark last output time for this stage whenever we receive outputs
-                metrics.stage_last_ts[stage_id] = max(
-                    metrics.stage_last_ts[stage_id] or 0.0, time.time()
-                )
+                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
                     _m = result.get("metrics")
                     if _m is not None:
@@ -332,15 +300,8 @@ class OmniLLM:
 
                     # End-to-end timing and time-per-token for final output (only once per request at the designated final stage)
                     try:
-                        rid_int = (
-                            int(req_id)
-                            if isinstance(req_id, (int, str)) and str(req_id).isdigit()
-                            else req_id
-                        )
-                        if (
-                            stage_id == final_stage_id_for_e2e
-                            and rid_int not in metrics.e2e_done
-                        ):
+                        rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
+                        if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -358,15 +319,13 @@ class OmniLLM:
                 next_stage_id = stage_id + 1
                 if next_stage_id < num_stages:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
-                    next_inputs = next_stage.process_engine_inputs(
-                        self.stage_list, [request_id_to_prompt[req_id]]
-                    )
+                    next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]  # type: ignore[index]
                     try:
                         # Measure transfer size and time (encode + enqueue)
                         size_bytes = 0
                         try:
-                            size_bytes = len(_ser(next_inputs))
+                            size_bytes = len(_set(next_inputs))
                         except Exception:
                             size_bytes = 0
                         t0 = time.time()
@@ -472,9 +431,7 @@ class OmniLLM:
                     "Increase initialization wait time (init_sleep_seconds or call-site timeout).",
                 ]
                 if getattr(self, "_log_file", None):
-                    suggestions.append(
-                        f"Inspect per-stage log files for details: {self._log_file}.stage<id>.log"
-                    )
+                    suggestions.append(f"Inspect per-stage log files for details: {self._log_file}.stage<id>.log")
                 logger.error(
                     "[Orchestrator] Stage initialization failed, shutting down. Suggestions:\n- %s",
                     "\n- ".join(suggestions),
@@ -504,13 +461,9 @@ class OmniStageLLM(LLM):
     def __init__(
         self,
         model: str,
-        compilation_config: Optional[
-            Union[int, dict[str, Any], CompilationConfig]
-        ] = None,
+        compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
         hf_overrides: Optional[HfOverrides] = None,
-        structured_outputs_config: Optional[
-            Union[dict[str, Any], StructuredOutputsConfig]
-        ] = None,
+        structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
         **kwargs,
     ):
         """LLM constructor."""
@@ -524,9 +477,7 @@ class OmniStageLLM(LLM):
             if isinstance(worker_cls, type):
                 kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
 
-        if "kv_transfer_config" in kwargs and isinstance(
-            kwargs["kv_transfer_config"], dict
-        ):
+        if "kv_transfer_config" in kwargs and isinstance(kwargs["kv_transfer_config"], dict):
             from vllm.config.kv_transfer import KVTransferConfig
 
             raw_config_dict = kwargs["kv_transfer_config"]
@@ -534,8 +485,7 @@ class OmniStageLLM(LLM):
                 kwargs["kv_transfer_config"] = KVTransferConfig(**raw_config_dict)
             except ValidationError as e:
                 logger.error(
-                    "Failed to convert 'kv_transfer_config' dict to "
-                    "KVTransferConfig object. Dict: %s. Error: %s",
+                    "Failed to convert 'kv_transfer_config' dict to " "KVTransferConfig object. Dict: %s. Error: %s",
                     raw_config_dict,
                     e,
                 )
@@ -548,17 +498,9 @@ class OmniStageLLM(LLM):
 
         if compilation_config is not None:
             if isinstance(compilation_config, int):
-                compilation_config_instance = CompilationConfig(
-                    level=compilation_config
-                )
+                compilation_config_instance = CompilationConfig(level=compilation_config)
             elif isinstance(compilation_config, dict):
-                compilation_config_instance = CompilationConfig(
-                    **{
-                        k: v
-                        for k, v in compilation_config.items()
-                        if is_init_field(CompilationConfig, k)
-                    }
-                )
+                compilation_config_instance = CompilationConfig(**{k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)})
             else:
                 compilation_config_instance = compilation_config
         else:
@@ -567,11 +509,7 @@ class OmniStageLLM(LLM):
         if structured_outputs_config is not None:
             if isinstance(structured_outputs_config, dict):
                 structured_outputs_instance = StructuredOutputsConfig(
-                    **{
-                        k: v
-                        for k, v in structured_outputs_config.items()
-                        if is_init_field(StructuredOutputsConfig, k)
-                    }
+                    **{k: v for k, v in structured_outputs_config.items() if is_init_field(StructuredOutputsConfig, k)}
                 )
             else:
                 structured_outputs_instance = structured_outputs_config
@@ -587,17 +525,13 @@ class OmniStageLLM(LLM):
         )
 
         # Create the Engine (autoselects V0 vs V1)
-        self.llm_engine = LLMEngine.from_engine_args(
-            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
-        )
+        self.llm_engine = LLMEngine.from_engine_args(engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
         self.llm_engine.output_processor = MultimodalOutputProcessor(
             tokenizer=self.llm_engine.tokenizer,
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.processor = OmniProcessor(
-            vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
-        )
+        self.llm_engine.processor = OmniProcessor(vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
@@ -611,6 +545,4 @@ class OmniStageLLM(LLM):
 
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
-        self.io_processor = get_io_processor(
-            self.llm_engine.vllm_config, io_processor_plugin
-        )
+        self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)

@@ -51,7 +51,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
     def _preprocess(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: SchedulerOutput,
         num_scheduled_tokens_np: np.ndarray,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         ubatch_slices: Optional[UBatchSlices] = None,
@@ -81,11 +81,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         per_req_additional_information: Optional[dict[str, dict]] = None
-        if (
-            self.supports_mm_inputs
-            and get_pp_group().is_first_rank
-            and not self.model_config.is_encoder_decoder
-        ):
+        if self.supports_mm_inputs and get_pp_group().is_first_rank and not self.model_config.is_encoder_decoder:
             # Run the multimodal encoder if any.
             self._execute_mm_encoder(scheduler_output)
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
@@ -113,9 +109,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 req_state = self.requests[req_id]
                 pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
                 addi_cpu = getattr(req_state, "additional_information_cpu", None)
-                num_computed_tokens = int(
-                    self.input_batch.num_computed_tokens_cpu[req_index]
-                )
+                num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
                 prompt_len = len(req_state.prompt_token_ids)
                 prompt_remaining = max(0, prompt_len - num_computed_tokens)
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
@@ -123,13 +117,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 if overlay_len <= 0:
                     continue
                 if pe_cpu is not None:
-                    src = pe_cpu[
-                        num_computed_tokens : num_computed_tokens + overlay_len
-                    ].to(dtype=self.dtype, device=self.device, non_blocking=True)
+                    src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(dtype=self.dtype, device=self.device, non_blocking=True)
                     start_offset = int(self.query_start_loc.cpu[req_index])
-                    self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(
-                        src
-                    )
+                    self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
                 # Build per-request additional information (no cross-request concat)
                 if addi_cpu is not None and isinstance(addi_cpu, dict):
                     req_info: dict[str, object] = {}
@@ -138,15 +128,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                             # For prefill tokens, pass only the scheduled slice; for decode or no scheduled tokens, pass whole tensor
                             if overlay_len > 0:
                                 try:
-                                    seg = (
-                                        v[
-                                            num_computed_tokens : num_computed_tokens
-                                            + overlay_len
-                                        ]
-                                        .detach()
-                                        .to("cpu")
-                                        .contiguous()
-                                    )
+                                    seg = v[num_computed_tokens : num_computed_tokens + overlay_len].detach().to("cpu").contiguous()
                                 except Exception:
                                     seg = v.detach().to("cpu").contiguous()
                                 req_info[k] = seg
@@ -177,11 +159,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # If a batch only has token ids, then including the embedding layer
             # in the CUDA graph will be more performant (like in the else case
             # below).
-            token_ids_idx = (
-                self.is_token_ids.gpu[:num_scheduled_tokens]
-                .nonzero(as_tuple=False)
-                .squeeze(1)
-            )
+            token_ids_idx = self.is_token_ids.gpu[:num_scheduled_tokens].nonzero(as_tuple=False).squeeze(1)
             # Some tokens ids may need to become embeds
             if token_ids_idx.numel() > 0:
                 token_ids = self.input_ids.gpu[token_ids_idx]
@@ -207,14 +185,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                num_input_tokens, intermediate_tensors, True
-            )
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_input_tokens, intermediate_tensors, True)
 
-        if (
-            self.model_config.is_encoder_decoder
-            and scheduler_output.scheduled_encoder_inputs
-        ):
+        if self.model_config.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             encoder_inputs = self._extract_encoder_inputs(scheduler_output)
             model_kwargs.update(encoder_inputs)
 
@@ -233,7 +206,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
     @torch.inference_mode()
     def execute_model(
         self,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: SchedulerOutput,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[OmniModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
         with record_function_or_nullcontext("Preprocess"):
@@ -247,9 +220,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
                     if new_reqs:
                         for nr in new_reqs:
-                            req_id = getattr(nr, "req_id", None) or getattr(
-                                nr, "request_id", None
-                            )
+                            req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
                             if req_id is None:
                                 continue
                             # prompt_embeds
@@ -258,9 +229,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                                 if isinstance(payload_pe, torch.Tensor):
                                     pe_cpu = payload_pe.detach().to("cpu").contiguous()
                                 elif isinstance(payload_pe, PromptEmbedsPayload):
-                                    dt = np.dtype(
-                                        getattr(payload_pe, "dtype", "float32")
-                                    )
+                                    dt = np.dtype(getattr(payload_pe, "dtype", "float32"))
                                     arr = np.frombuffer(payload_pe.data, dtype=dt)
                                     arr = arr.reshape(payload_pe.shape)
                                     pe_cpu = torch.from_numpy(arr)
@@ -279,19 +248,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
                                 if isinstance(payload_info, dict):
                                     # Already decoded
                                     info_dict = payload_info
-                                elif isinstance(
-                                    payload_info, AdditionalInformationPayload
-                                ):
+                                elif isinstance(payload_info, AdditionalInformationPayload):
                                     for k, entry in payload_info.entries.items():
                                         if entry.tensor_data is not None:
-                                            dt = np.dtype(
-                                                getattr(
-                                                    entry, "tensor_dtype", "float32"
-                                                )
-                                            )
-                                            arr = np.frombuffer(
-                                                entry.tensor_data, dtype=dt
-                                            )
+                                            dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
+                                            arr = np.frombuffer(entry.tensor_data, dtype=dt)
                                             arr = arr.reshape(entry.tensor_shape)
                                             info_dict[k] = torch.from_numpy(arr)
                                         else:
@@ -303,18 +264,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
                                         info_dict,
                                     )
                 except Exception as e:
-                    logger.error(
-                        f"Error decoding prompt_embeds / additional_information: {e}"
-                    )
+                    logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
                     pass
 
                 if not scheduler_output.total_num_scheduled_tokens:
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
-                    return self.kv_connector_no_forward(
-                        scheduler_output, self.vllm_config
-                    )
+                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.input_batch.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
@@ -352,15 +309,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_tokens_after_padding,
             )
 
-            uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
-                num_scheduled_tokens == self.input_batch.num_reqs * max_query_len
-            )
-            batch_descriptor = BatchDescriptor(
-                num_tokens=num_input_tokens, uniform_decode=uniform_decode
-            )
-            cudagraph_runtime_mode, batch_descriptor = (
-                self.cudagraph_dispatcher.dispatch(batch_descriptor)
-            )
+            uniform_decode = (max_query_len == self.uniform_decode_query_len) and (num_scheduled_tokens == self.input_batch.num_reqs * max_query_len)
+            batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens, uniform_decode=uniform_decode)
+            cudagraph_runtime_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
         # This is currently to get around the assert in the DPMetadata
         # where it wants `num_tokens_across_dp` to align with `num_tokens`
@@ -386,23 +337,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
             model_kwargs_extra = {}
             # Pass per-request additional information map for this step (no concat)
             if per_req_additional_information:
-                model_kwargs_extra["additional_information_by_req_id"] = (
-                    per_req_additional_information
-                )
+                model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
             # Always pass per-request runtime additional_information (persisted in request state)
             try:
                 per_req_runtime_info = []
                 for req_id in self.input_batch.req_ids:
                     req_state = self.requests.get(req_id)
-                    info = (
-                        getattr(req_state, "additional_information_cpu", None)
-                        if req_state is not None
-                        else None
-                    )
+                    info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
                     per_req_runtime_info.append(info if isinstance(info, dict) else {})
-                model_kwargs_extra["runtime_additional_information"] = (
-                    per_req_runtime_info
-                )
+                model_kwargs_extra["runtime_additional_information"] = per_req_runtime_info
                 model_kwargs_extra["request_ids"] = self.input_batch.req_ids
                 # Pass each request's token span within the flattened sequence for this step, enabling the model to map decode/prefill by request
                 req_token_spans = []
@@ -434,33 +377,24 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
-                hidden_states
-            )
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             # The model side may return per-request additional_information updates (model-agnostic channel).
             # Convention: multimodal_outputs["additional_information_update"] is a list[dict] in batch order;
             # the runner merges it into the corresponding request's additional_information_cpu for subsequent decode.
             try:
                 if isinstance(multimodal_outputs, dict) and (
-                    "additional_information_update" in multimodal_outputs
-                    or "additional_information_update_by_req_id" in multimodal_outputs
+                    "additional_information_update" in multimodal_outputs or "additional_information_update_by_req_id" in multimodal_outputs
                 ):
                     # Option A: list[dict] in batch order
-                    updates_list = multimodal_outputs.get(
-                        "additional_information_update"
-                    )
+                    updates_list = multimodal_outputs.get("additional_information_update")
                     if isinstance(updates_list, list):
                         for idx, upd in enumerate(updates_list):
-                            if not isinstance(upd, dict) or idx >= len(
-                                self.input_batch.req_ids
-                            ):
+                            if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
                                 continue
                             req_id = self.input_batch.req_ids[idx]
                             self._merge_additional_information_update(req_id, upd)
                     # Option B: dict[str, dict] keyed by req_id
-                    updates_map = multimodal_outputs.get(
-                        "additional_information_update_by_req_id"
-                    )
+                    updates_map = multimodal_outputs.get("additional_information_update_by_req_id")
                     if isinstance(updates_map, dict):
                         for req_id, upd in updates_map.items():
                             if not isinstance(upd, dict):
@@ -484,9 +418,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
                 if self.is_pooling_model:
                     # Return the pooling output.
-                    output = self._pool(
-                        hidden_states, num_scheduled_tokens, num_scheduled_tokens_np
-                    )
+                    output = self._pool(hidden_states, num_scheduled_tokens, num_scheduled_tokens_np)
                     output.kv_connector_output = kv_connector_output
                     return output
 
@@ -497,11 +429,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 assert not self.is_pooling_model
 
                 if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(
-                            self.vllm_config, num_input_tokens
-                        )
-                    }
+                    all_gather_tensors = {"residual": not is_residual_scattered_for_sp(self.vllm_config, num_input_tokens)}
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
                         all_gather_group=get_tp_group(),
@@ -516,17 +444,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 if logits is not None:
                     model_output_broadcast_data["logits"] = logits.contiguous()
 
-                model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
-                )
+                model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(model_output_broadcast_data, src=len(get_pp_group().ranks) - 1)
                 assert model_output_broadcast_data is not None
                 logits = model_output_broadcast_data["logits"]
 
             # Apply structured output bitmasks if present
             if scheduler_output.grammar_bitmask is not None:
-                apply_grammar_bitmask(
-                    scheduler_output, self.input_batch, logits, self.device
-                )
+                apply_grammar_bitmask(scheduler_output, self.input_batch, logits, self.device)
 
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -546,9 +470,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 )
 
         use_padded_batch_for_eagle = (
-            self.speculative_config
-            and self.speculative_config.use_eagle()
-            and not self.speculative_config.disable_padded_drafter_batch
+            self.speculative_config and self.speculative_config.use_eagle() and not self.speculative_config.disable_padded_drafter_batch
         )
         effective_drafter_max_model_len = self.max_model_len
         if effective_drafter_max_model_len is None:
@@ -558,13 +480,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             and self.speculative_config.draft_model_config is not None
             and self.speculative_config.draft_model_config.max_model_len is not None
         ):
-            effective_drafter_max_model_len = (
-                self.speculative_config.draft_model_config.max_model_len
-            )
+            effective_drafter_max_model_len = self.speculative_config.draft_model_config.max_model_len
         input_fits_in_drafter = spec_decode_common_attn_metadata and (
-            spec_decode_common_attn_metadata.seq_lens.max()
-            + self.speculative_config.num_speculative_tokens
-            <= effective_drafter_max_model_len
+            spec_decode_common_attn_metadata.seq_lens.max() + self.speculative_config.num_speculative_tokens <= effective_drafter_max_model_len
         )
         if use_padded_batch_for_eagle and input_fits_in_drafter:
             # EAGLE speculative decoding can use the GPU sampled tokens
@@ -588,11 +506,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_scheduled_tokens,
             )
 
-        if (
-            self.speculative_config
-            and not use_padded_batch_for_eagle
-            and input_fits_in_drafter
-        ):
+        if self.speculative_config and not use_padded_batch_for_eagle and input_fits_in_drafter:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
@@ -605,9 +519,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         pooler_output: list[Optional[torch.Tensor]] = []
         prev_logits_index = 0
         for logits_index in logits_indices:
-            pooler_output.append(
-                hidden_states_cpu[prev_logits_index : logits_index + 1]
-            )
+            pooler_output.append(hidden_states_cpu[prev_logits_index : logits_index + 1])
             prev_logits_index = logits_index + 1
 
         output = OmniModelRunnerOutput(
@@ -616,11 +528,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             sampled_token_ids=valid_sampled_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=(
-                pooler_output
-                if self.vllm_config.model_config.engine_output_type != "text"
-                else None
-            ),
+            pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
             kv_connector_output=kv_connector_output,
             num_nans_in_logits=num_nans_in_logits,
         )

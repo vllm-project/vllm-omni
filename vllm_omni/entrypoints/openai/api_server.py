@@ -2,9 +2,10 @@ import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
 from argparse import Namespace
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -13,11 +14,7 @@ from starlette.datastructures import State
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import (
-    load_chat_template,
-    resolve_hf_chat_template,
-    resolve_mistral_chat_template,
-)
+from vllm.entrypoints.chat_utils import load_chat_template, resolve_hf_chat_template, resolve_mistral_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.api_server import (
@@ -29,16 +26,8 @@ from vllm.entrypoints.openai.api_server import (
     setup_server,
     validate_json_request,
 )
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ErrorResponse,
-)
-from vllm.entrypoints.openai.serving_models import (
-    BaseModelPath,
-    LoRAModulePath,
-    OpenAIServingModels,
-)
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
+from vllm.entrypoints.openai.serving_models import BaseModelPath, LoRAModulePath, OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 
 # yapf conflicts with isort for this block
@@ -65,9 +54,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 
 
-async def omni_run_server_worker(
-    listen_address, sock, args, client_config=None, **uvicorn_kwargs
-) -> None:
+async def omni_run_server_worker(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
     """Run a single API server worker."""
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
@@ -165,18 +152,13 @@ async def build_async_omni_llm_from_stage_config(
     assert envs.VLLM_USE_V1
 
     if disable_frontend_multiprocessing:
-        logger.warning(
-            "V1 is enabled, but got --disable-frontend-multiprocessing. "
-            "To disable frontend multiprocessing, set VLLM_USE_V1=0."
-        )
+        logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing. " "To disable frontend multiprocessing, set VLLM_USE_V1=0.")
 
     async_omni_llm: Optional[EngineClient] = None
 
     try:
         if getattr(args, "stage_configs_path", None):
-            async_omni_llm = AsyncOmniLLM(
-                model=args.model, stage_configs_path=args.stage_configs_path
-            )
+            async_omni_llm = AsyncOmniLLM(model=args.model, stage_configs_path=args.stage_configs_path)
         else:
             async_omni_llm = AsyncOmniLLM(model=args.model)
 
@@ -206,9 +188,7 @@ async def omni_init_app_state(
     else:
         request_logger = None
 
-    base_model_paths = [
-        BaseModelPath(name=name, model_path=args.model) for name in served_model_names
-    ]
+    base_model_paths = [BaseModelPath(name=name, model_path=args.model) for name in served_model_names]
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
@@ -225,9 +205,7 @@ async def omni_init_app_state(
 
         if isinstance(tokenizer, MistralTokenizer):
             # The warning is logged in resolve_mistral_chat_template.
-            resolved_chat_template = resolve_mistral_chat_template(
-                chat_template=resolved_chat_template
-            )
+            resolved_chat_template = resolve_mistral_chat_template(chat_template=resolved_chat_template)
         else:
             hf_chat_template = resolve_hf_chat_template(
                 tokenizer=tokenizer,
@@ -256,11 +234,7 @@ async def omni_init_app_state(
         tool_server = None
 
     # Merge default_mm_loras into the static lora_modules
-    default_mm_loras = (
-        vllm_config.lora_config.default_mm_loras
-        if vllm_config.lora_config is not None
-        else {}
-    )
+    default_mm_loras = vllm_config.lora_config.default_mm_loras if vllm_config.lora_config is not None else {}
 
     lora_modules = args.lora_modules
     if default_mm_loras:
@@ -326,19 +300,13 @@ def Omnichat(request: Request) -> Optional[OmniOpenAIServingChat]:
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     handler = Omnichat(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(
-            message="The model does not support Chat Completions API"
-        )
+        return base(raw_request).create_error_response(message="The model does not support Chat Completions API")
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except Exception as e:
-        raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)
-        ) from e
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
-        )
+        return JSONResponse(content=generator.model_dump(), status_code=generator.error.code)
 
     elif isinstance(generator, ChatCompletionResponse):
         return JSONResponse(content=generator.model_dump())

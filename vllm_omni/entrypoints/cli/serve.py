@@ -40,9 +40,7 @@ class OmniServeCommand(CLISubcommand):
     def validate(self, args: argparse.Namespace) -> None:
         validate_parsed_serve_args(args)
 
-    def subparser_init(
-        self, subparsers: argparse._SubParsersAction
-    ) -> FlexibleArgumentParser:
+    def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
             description=DESCRIPTION,

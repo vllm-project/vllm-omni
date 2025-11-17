@@ -43,10 +43,7 @@ class GPUARWorker(GPUWorker):
 
             # take current memory snapshot
             self.init_snapshot = MemorySnapshot()
-            self.requested_memory = (
-                self.init_snapshot.total_memory
-                * self.cache_config.gpu_memory_utilization
-            )
+            self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
             if self.init_snapshot.free_memory < self.requested_memory:
 
                 def GiB(b):
@@ -65,9 +62,7 @@ class GPUARWorker(GPUWorker):
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
         # Construct the model runner
-        self.model_runner: GPUARModelRunner = GPUARModelRunner(
-            self.vllm_config, self.device
-        )
+        self.model_runner: GPUARModelRunner = GPUARModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
