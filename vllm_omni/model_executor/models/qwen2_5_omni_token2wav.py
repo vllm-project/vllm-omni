@@ -4,7 +4,7 @@
 
 import math
 from collections.abc import Iterable
-from typing import List, Optional, Set, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -23,8 +23,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader as _Vllm_AutoWeightsLoader
 from vllm.model_executor.models.utils import WeightsMapper as _Vllm_WeightsMapper
-from vllm.model_executor.models.utils import init_vllm_registered_model as _Vllm_init_vllm_registered_model
-from vllm.model_executor.models.utils import maybe_prefix as _Vllm_maybe_prefix
+from vllm.model_executor.models.utils import init_vllm_registered_model as _vllm_init_vllm_registered_model
+from vllm.model_executor.models.utils import maybe_prefix as _vllm_maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -1438,7 +1438,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         steps: int,
         prev_generated: torch.Tensor,
         finished: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         """Streaming per small chunk: returns (mel_or_None, audio_slice)."""
         start_index = max(i * self.chunk_size - self.past_cache_size, 0)
         end_index = min(
@@ -1477,9 +1477,9 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         y_all: torch.Tensor,
         i: int,
         steps: int,
-        prev_generated: Union[torch.Tensor, List[torch.Tensor]],
+        prev_generated: Union[torch.Tensor, list[torch.Tensor]],
         finished: bool = False,
-    ) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
+    ) -> tuple[Union[torch.Tensor, list[torch.Tensor]], torch.Tensor]:
         """High-level chunk API aligning to qwen2_code2wav_dit signature."""
         if not isinstance(prev_generated, torch.Tensor):
             prev_generated = prev_generated[0] if len(prev_generated) > 0 else None
@@ -1504,7 +1504,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         finished: bool,
         prev_generated: Optional[torch.Tensor],
         generated: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Align mel and audio boundaries for 50Hz-like streaming.
 
@@ -1559,9 +1559,9 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         self.config = vllm_config.model_config.hf_config
 
         # Initialize underlying HF Token2Wav model via registry
-        self.token2wav = _Vllm_init_vllm_registered_model(
+        self.token2wav = _vllm_init_vllm_registered_model(
             vllm_config=vllm_config,
-            prefix=_Vllm_maybe_prefix(prefix, "token2wav_model"),
+            prefix=_vllm_maybe_prefix(prefix, "token2wav_model"),
             hf_config=self.config,
             architectures=["Qwen2_5OmniToken2WavDiTModel"],
         )
@@ -1613,7 +1613,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     ) -> Optional[SamplerOutput]:
         return None
 
-    def load_weights_without_buffers(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights_without_buffers(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = _Vllm_AutoWeightsLoader(self)
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         # Log load summary
@@ -1651,7 +1651,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         return registers
 
     # remove buffers from the weights and reload them after loading weights
-    def remove_buffers_from_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], buffers: dict):
+    def remove_buffers_from_weights(self, weights: Iterable[tuple[str, torch.Tensor]], buffers: dict):
         weights_to_load = []
         for key, value in weights:
             if key in buffers:
@@ -1671,7 +1671,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
                 loaded_buffers.add(name)
         return loaded_buffers
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], spk_dict_path: str) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], spk_dict_path: str) -> set[str]:
         buffers = self.find_all_registers()
         weights_to_load = self.remove_buffers_from_weights(weights, buffers)
         loaded = self.load_weights_without_buffers(weights_to_load)
@@ -1714,7 +1714,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         steps: int,
         prev_generated: torch.Tensor,
         finished: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         mel = self.token2wav(
             code=codec_all,
             conditioning=conditioning,
@@ -1732,9 +1732,9 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         y_all: torch.Tensor,
         i: int,
         steps: int,
-        prev_generated: Union[torch.Tensor, List[torch.Tensor]],
+        prev_generated: Union[torch.Tensor, list[torch.Tensor]],
         finished: bool = False,
-    ) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
+    ) -> tuple[Union[torch.Tensor, list[torch.Tensor]], torch.Tensor]:
         _mel, out = self.process_little_chunk(
             conditioning=conditioning,
             reference_mel=reference_mel,

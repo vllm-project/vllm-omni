@@ -14,7 +14,7 @@ import asyncio
 import importlib
 import logging
 import multiprocessing as mp
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -118,7 +118,7 @@ class OmniStage:
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
         runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
-        stage_payload: Dict[str, Any] = {
+        stage_payload: dict[str, Any] = {
             "stage_id": self.stage_id,
             "engine_args": engine_args,
             "runtime": runtime_cfg,
@@ -168,18 +168,18 @@ class OmniStage:
                 except Exception as e:
                     self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
 
-    def submit(self, payload: Dict[str, Any]) -> None:
+    def submit(self, payload: dict[str, Any]) -> None:
         assert self._in_q is not None
         self._in_q.put(payload)
 
-    def try_collect(self) -> Optional[Dict[str, Any]]:
+    def try_collect(self) -> Optional[dict[str, Any]]:
         assert self._out_q is not None
         try:
             return self._out_q.get_nowait()
         except Exception:
             return None
 
-    def process_engine_inputs(self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None) -> List[Union[OmniTokensPrompt, TextPrompt]]:
+    def process_engine_inputs(self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None) -> list[Union[OmniTokensPrompt, TextPrompt]]:
         """Process the engine input for the stage."""
         if self.custom_process_input_func is None:
             engine_inputs = []
@@ -206,7 +206,7 @@ class OmniStage:
 
 def _stage_worker(
     model: str,
-    stage_payload: Dict[str, Any],
+    stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
     log_file: Optional[str] = None,
@@ -288,7 +288,7 @@ def _stage_worker(
             break
 
         max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-        batch_tasks: List[Dict[str, Any]] = [task]
+        batch_tasks: list[dict[str, Any]] = [task]
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
                 if not in_q.empty():
@@ -300,11 +300,11 @@ def _stage_worker(
                 else:
                     break
 
-        batch_request_ids: List[Any] = []
-        batch_engine_inputs: List[Any] = []
-        _rx_bytes_by_rid: Dict[Any, int] = {}
-        _rx_decode_ms_by_rid: Dict[Any, float] = {}
-        _in_flight_ms_by_rid: Dict[Any, float] = {}
+        batch_request_ids: list[Any] = []
+        batch_engine_inputs: list[Any] = []
+        _rx_bytes_by_rid: dict[Any, int] = {}
+        _rx_decode_ms_by_rid: dict[Any, float] = {}
+        _in_flight_ms_by_rid: dict[Any, float] = {}
         for t in batch_tasks:
             rid = t["request_id"]
             try:
@@ -340,7 +340,7 @@ def _stage_worker(
         print("--------------------------------", flush=True)
         try:
             _batch_seq += 1
-            gen_outputs: List[Any] = []
+            gen_outputs: list[Any] = []
             _gen_t0 = _time.time()
             for ro in stage_engine.generate(batch_engine_inputs, sampling_params, use_tqdm=False):
                 gen_outputs.append(ro)
@@ -348,8 +348,8 @@ def _stage_worker(
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
 
             # Group outputs per request id with fallback
-            req_to_outputs: Dict[Any, List[Any]] = {rid: [] for rid in batch_request_ids}
-            unmapped: List[Any] = []
+            req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
+            unmapped: list[Any] = []
             for ro in gen_outputs:
                 rid = getattr(ro, "request_id", None)
                 if rid in req_to_outputs:
@@ -464,7 +464,7 @@ def _stage_worker(
 def _stage_worker_async_entry(
     omni_stage: OmniStage,
     model: str,
-    stage_payload: Dict[str, Any],
+    stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
     log_file: Optional[str] = None,
@@ -476,7 +476,7 @@ def _stage_worker_async_entry(
 async def _stage_worker_async(
     omni_stage: OmniStage,
     model: str,
-    stage_payload: Dict[str, Any],
+    stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
     log_file: Optional[str] = None,
@@ -582,9 +582,9 @@ async def _stage_worker_async(
             _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
             break
 
-        _rx_bytes_by_rid: Dict[Any, int] = {}
-        _rx_decode_ms_by_rid: Dict[Any, float] = {}
-        _in_flight_ms_by_rid: Dict[Any, float] = {}
+        _rx_bytes_by_rid: dict[Any, int] = {}
+        _rx_decode_ms_by_rid: dict[Any, float] = {}
+        _in_flight_ms_by_rid: dict[Any, float] = {}
 
         rid = task["request_id"]
         try:

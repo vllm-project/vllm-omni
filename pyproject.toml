@@ -127,6 +127,10 @@ select = [
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
     # W503 is not needed in ruff as it's compatible with black by default
+    "N801",  # class names should use CapWords convention
+    "N802",  # function name should follow snake_case
+    "N806",  # variable in function should follow snake_case
+    "N812",  # lowercase imported as non-lowercase: functional as F
 ]
 
 [tool.ruff.lint.per-file-ignores]

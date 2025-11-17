@@ -6,7 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -53,19 +53,19 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self,
         scheduler_output: SchedulerOutput,
         num_scheduled_tokens_np: np.ndarray,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        ubatch_slices: Optional[UBatchSlices] = None,
-        num_tokens_after_padding: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        ubatch_slices: UBatchSlices | None = None,
+        num_tokens_after_padding: torch.Tensor | None = None,
     ) -> tuple[
         int,
         int,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor,
-        Optional[IntermediateTensors],
+        IntermediateTensors | None,
         dict[str, Any],
-        Optional[dict[str, dict]],
+        dict[str, dict] | None,
     ]:
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -80,7 +80,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        per_req_additional_information: Optional[dict[str, dict]] = None
+        per_req_additional_information: dict[str, dict] | None = None
         if self.supports_mm_inputs and get_pp_group().is_first_rank and not self.model_config.is_encoder_decoder:
             # Run the multimodal encoder if any.
             self._execute_mm_encoder(scheduler_output)
@@ -207,8 +207,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[OmniModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -516,7 +516,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
         # Convert to per-request tensors on CPU
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
-        pooler_output: list[Optional[torch.Tensor]] = []
+        pooler_output: list[torch.Tensor | None] = []
         prev_logits_index = 0
         for logits_index in logits_indices:
             pooler_output.append(hidden_states_cpu[prev_logits_index : logits_index + 1])

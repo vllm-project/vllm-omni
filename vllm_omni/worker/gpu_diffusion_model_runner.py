@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -41,17 +41,17 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
     def _preprocess(
         self,
         scheduler_output: SchedulerOutput,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        ubatch_slices: Optional[UBatchSlices] = None,
-        num_tokens_after_padding: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        ubatch_slices: UBatchSlices | None = None,
+        num_tokens_after_padding: torch.Tensor | None = None,
     ) -> tuple[
         int,
         int,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor,
-        Optional[IntermediateTensors],
+        IntermediateTensors | None,
         dict[str, Any],
     ]:
 
@@ -145,8 +145,8 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[OmniModelRunnerOutput, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> OmniModelRunnerOutput | IntermediateTensors:
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -212,7 +212,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
 
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
         # Ensure one tensor per request, map to CPU for output struct
-        pooler_output: List[Optional[torch.Tensor]] = []
+        pooler_output: list[torch.Tensor | None] = []
         if isinstance(multimodal_outputs, torch.Tensor):
             # If model returned a single stacked tensor, split by requests
             assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
@@ -253,11 +253,11 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         *,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        inputs_embeds: Optional[torch.Tensor],
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
         multimodal_kwargs: dict,
         logits_indices: torch.Tensor,
-    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Runs the diffusion process and returns per-request tensors.
 
         Tries model interfaces in the following order for maximal compatibility:
@@ -290,7 +290,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
     def _dummy_run(
         self,
         num_tokens: int,
-        cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
         skip_eplb: bool = False,
@@ -369,7 +369,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             num_tokens_across_dp = num_tokens_after_padding
             num_tokens_after_padding = int(num_tokens_after_padding[0].item())
 
-        attn_metadata: Optional[PerLayerAttnMetadata] = None
+        attn_metadata: PerLayerAttnMetadata | None = None
 
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.

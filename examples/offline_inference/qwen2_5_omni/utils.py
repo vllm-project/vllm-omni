@@ -1,5 +1,5 @@
 import tempfile
-from typing import Dict, List, Optional, Union
+from typing import Optional, Union
 from urllib.request import urlopen
 
 import librosa
@@ -15,8 +15,8 @@ from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 # Simple caches to avoid repeated heavy HF loads per prompt
-_PROCESSOR_CACHE: Dict[str, "AutoProcessor"] = {}
-_CONFIG_CACHE: Dict[str, "AutoConfig"] = {}
+_PROCESSOR_CACHE: dict[str, "AutoProcessor"] = {}
+_CONFIG_CACHE: dict[str, "AutoConfig"] = {}
 
 
 def get_system_prompt():
@@ -73,7 +73,7 @@ def fetch_and_read_video(args, video_url: str, fps=2):
         else:
             return video
 
-    def read_video_with_transformers(video_file_name: Union[str, List[str]]):
+    def read_video_with_transformers(video_file_name: Union[str, list[str]]):
         video, total_duration, nframes, second_per_grid = fetch_video({"video": video_file_name})
         if total_duration is None and nframes is None:
             nframes = len(video)
@@ -106,7 +106,7 @@ def fetch_and_read_video(args, video_url: str, fps=2):
 
 def make_inputs_qwen2_omni(
     args,
-    messages: List[Dict[str, Union[str, List[Dict[str, str]]]]],
+    messages: list[dict[str, Union[str, list[dict[str, str]]]]],
     use_audio_in_video: Optional[bool] = False,
     tokenize: bool = False,
 ) -> Union[OmniTokensPrompt, TextPrompt]:
@@ -303,7 +303,7 @@ def make_audio_in_video_v2_prompt(args):
     return prompt
 
 
-def make_omni_prompt(args, prompt=None) -> Union[OmniTokensPrompt, List[OmniTokensPrompt]]:
+def make_omni_prompt(args, prompt=None) -> Union[OmniTokensPrompt, list[OmniTokensPrompt]]:
     if args.prompt_type == "text":
         prompt = make_text_prompt(args, prompt)
     elif args.prompt_type == "audio-in-video-v2":

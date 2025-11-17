@@ -2,7 +2,7 @@ import glob
 import os
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Dict, NamedTuple, Optional, Set, Tuple, Union
+from typing import NamedTuple, Optional, Union
 
 import numpy as np
 import torch
@@ -110,8 +110,8 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                     architectures=["Qwen2_5OmniToken2WavModel"],
                 )
             # voice resources (loaded on demand)
-            self._token2wav_conds: Dict[str, torch.Tensor] = {}
-            self._token2wav_ref_mels: Dict[str, torch.Tensor] = {}
+            self._token2wav_conds: dict[str, torch.Tensor] = {}
+            self._token2wav_ref_mels: dict[str, torch.Tensor] = {}
             self.model = self.token2wav
         else:
             raise ValueError("Invalid model stage")
@@ -773,7 +773,7 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
         waveform = np.concatenate(wav_chunks)
         return torch.as_tensor(waveform, device=token2wav_dev)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""
         loaded_weights = set()
         thinker_weights = []

@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import torch
 
@@ -182,8 +182,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_output_type: Optional[str] = None,
     ):
         super().__init__(tokenizer=tokenizer, log_stats=log_stats)
-        self.output_handlers: Dict[str, Callable[[EngineCoreOutput], None]] = {}
-        self._reqid_to_mm_type: Dict[str, str] = {}
+        self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
+        self._reqid_to_mm_type: dict[str, str] = {}
         self.request_states: dict[str, OmniRequestState] = {}
         self.engine_core_output_type = engine_core_output_type
 
