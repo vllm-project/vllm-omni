@@ -44,7 +44,6 @@ dev = [
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
     "isort>=5.12.0",
-    "flake8>=6.0.0",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
 ]
@@ -79,8 +78,8 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.black]
-line-length = 88
-target-version = ['py39', 'py310', 'py311', 'py312']
+line-length = 160
+target-version = ['py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -99,15 +98,44 @@ extend-exclude = '''
 [tool.isort]
 profile = "black"
 multi_line_output = 3
-line_length = 88
+line_length = 160
 known_first_party = ["vllm_omni"]
 
-[tool.flake8]
-max-line-length = 88
-extend-ignore = ["E203", "W503"]
+[tool.ruff]
+line-length = 160
+target-version = "py312, py313"
+exclude = [
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "build",
+    "dist",
+    "vllm_omni.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort (handled separately, but included for compatibility)
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+]
+ignore = [
+    "E203",  # whitespace before ':' (conflicts with black)
+    # W503 is not needed in ruff as it's compatible with black by default
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/**" = ["E501"]  # Allow long lines in examples
+"tests/**" = ["E501"]  # Allow long lines in tests
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.12, 3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

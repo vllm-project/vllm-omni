@@ -22,8 +22,20 @@ repos:
     hooks:
       - id: black
 
-  - repo: https://github.com/PyCQA/flake8
-    rev: 7.1.1
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.7
     hooks:
-      - id: flake8
-        args: ["--max-line-length=160", "--extend-ignore=E203,W503"]
+      - id: ruff
+        args: [--output-format, github, --fix, --line-length=160]
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.35.5
+    hooks:
+      - id: typos
+        # only for staged files
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+        files: ^\.github/workflows/.*\.ya?ml$
