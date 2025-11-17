@@ -2,24 +2,54 @@
 CLI entry point for vLLM-omni that intercepts vLLM commands.
 """
 
+import importlib.metadata
 import sys
-
-from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
     # Check if --omni flag is present
-    if "--omni" in sys.argv:
-        # Remove --omni flag and "serve" command, process with vLLM-omni
-        omni_args = [arg for arg in sys.argv[1:] if arg not in ["--omni", "serve"]]
-        omni_serve = OmniServeCommand()
-        omni_serve.run(omni_args)
-    else:
-        # Forward to original vLLM CLI
+    if "--omni" not in sys.argv:
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()
+        return
+    else:
+        import vllm_omni.entrypoints.cli.serve
+        from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+        from vllm.utils import FlexibleArgumentParser
+
+        CMD_MODULES = [
+            vllm_omni.entrypoints.cli.serve,
+        ]
+
+        cli_env_setup()
+
+        parser = FlexibleArgumentParser(
+            description="vLLM OMNI CLI",
+            epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
+        )
+        parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=importlib.metadata.version("vllm_omni"),
+        )
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
+        cmds = {}
+        for cmd_module in CMD_MODULES:
+            new_cmds = cmd_module.cmd_init()
+            for cmd in new_cmds:
+                cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+                cmds[cmd.name] = cmd
+        args = parser.parse_args()
+        if args.subparser in cmds:
+            cmds[args.subparser].validate(args)
+
+        if hasattr(args, "dispatch_function"):
+            args.dispatch_function(args)
+        else:
+            parser.print_help()
 
 
 if __name__ == "__main__":

@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 import argparse
 from typing import Optional
-import os
-import torch
 
 
 def extract_prompt(line: str) -> Optional[str]:
     # 提取第一个 '|' 与第二个 '|' 之间的内容
-    i = line.find('|')
+    i = line.find("|")
     if i == -1:
         return None
-    j = line.find('|', i + 1)
+    j = line.find("|", i + 1)
     if j == -1:
         return None
-    return line[i + 1:j].strip()
+    return line[i + 1 : j].strip()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", "-i", required=True, help="Input .lst file path")
     parser.add_argument("--output", "-o", required=True, help="Output file path")
-    parser.add_argument("--topk", "-k", type=int, default=100, help="Extract the top K prompts (default: 100)")
+    parser.add_argument(
+        "--topk",
+        "-k",
+        type=int,
+        default=100,
+        help="Extract the top K prompts (default: 100)",
+    )
     args = parser.parse_args()
 
     prompts = []
@@ -39,5 +43,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

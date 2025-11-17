@@ -279,7 +279,9 @@ class Qwen2_5OmniForConditionalGeneration(
 
             if input_ids is None and additional_information is None:
                 input_ids = torch.zeros(
-                    inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device
+                    inputs_embeds.shape[0],
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
                 )
                 additional_information = {}
                 self.thinker_reply_part = torch.zeros_like(inputs_embeds)
@@ -293,13 +295,19 @@ class Qwen2_5OmniForConditionalGeneration(
 
             # ------- Request-scoped additional information (no cross-request concat) -------
             request_ids: Optional[list[str]] = kwargs.get("request_ids")  # ordered
-            request_token_spans: Optional[list[tuple[int,int]]] = kwargs.get("request_token_spans")
+            request_token_spans: Optional[list[tuple[int, int]]] = kwargs.get(
+                "request_token_spans"
+            )
             addi_by_req: Optional[dict] = kwargs.get("additional_information_by_req_id")
             runtime_addi = kwargs.get("runtime_additional_information")
 
             # Normalize runtime_addi into a mapping by request_id for convenience
             runtime_addi_by_req: dict[str, dict] = {}
-            if isinstance(request_ids, list) and isinstance(runtime_addi, list) and len(runtime_addi) == len(request_ids):
+            if (
+                isinstance(request_ids, list)
+                and isinstance(runtime_addi, list)
+                and len(runtime_addi) == len(request_ids)
+            ):
                 for i, rid in enumerate(request_ids):
                     if isinstance(rid, str) and isinstance(runtime_addi[i], dict):
                         runtime_addi_by_req[rid] = runtime_addi[i]
@@ -332,9 +340,19 @@ class Qwen2_5OmniForConditionalGeneration(
                     otoks = info.get("thinker_output_token_ids")  # list[int]
 
                     if not isinstance(pe, torch.Tensor):
-                        pe = torch.zeros(0, self.talker.config.hidden_size, dtype=inputs_embeds.dtype, device=self._module_device(self.model))
+                        pe = torch.zeros(
+                            0,
+                            self.talker.config.hidden_size,
+                            dtype=inputs_embeds.dtype,
+                            device=self._module_device(self.model),
+                        )
                     if not isinstance(tr, torch.Tensor):
-                        tr = torch.zeros(0, self.talker.config.hidden_size, dtype=inputs_embeds.dtype, device=self._module_device(self.model))
+                        tr = torch.zeros(
+                            0,
+                            self.talker.config.hidden_size,
+                            dtype=inputs_embeds.dtype,
+                            device=self._module_device(self.model),
+                        )
                     if not isinstance(ptoks, (list, torch.Tensor)):
                         ptoks = []
                     if not isinstance(otoks, (list, torch.Tensor)):
@@ -342,22 +360,35 @@ class Qwen2_5OmniForConditionalGeneration(
 
                     req_input_ids, req_embeds = self._thinker_to_talker_prefill(
                         voice_type=voice_type,
-                        output_prompt_embeds=tr.to(inputs_embeds.dtype).to(self._module_device(self.model)),
+                        output_prompt_embeds=tr.to(inputs_embeds.dtype).to(
+                            self._module_device(self.model)
+                        ),
                         output_token_ids=otoks,
-                        thinker_prompt_embeds=pe.to(inputs_embeds.dtype).to(self._module_device(self.model)),
+                        thinker_prompt_embeds=pe.to(inputs_embeds.dtype).to(
+                            self._module_device(self.model)
+                        ),
                         prompt_token_ids=ptoks,
                     )
                     seg_len = min(span_len, req_embeds.shape[0])
                     inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                    if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                    if (
+                        isinstance(req_input_ids, torch.Tensor)
+                        and req_input_ids.numel() == seg_len
+                    ):
                         input_ids[s : s + seg_len] = req_input_ids
 
                     # Prepare per-request reply queue for subsequent decode: drop first row
                     if tr.ndim == 2 and tr.shape[0] > 0:
-                        update_by_req_id.setdefault(rid, {})["thinker_reply_part_per_request"] = tr[1:].detach().to("cpu").contiguous()
+                        update_by_req_id.setdefault(rid, {})[
+                            "thinker_reply_part_per_request"
+                        ] = (tr[1:].detach().to("cpu").contiguous())
 
             # ------- Decode: span_len == 1 -------
-            if not is_profile and isinstance(request_ids, list) and isinstance(request_token_spans, list):
+            if (
+                not is_profile
+                and isinstance(request_ids, list)
+                and isinstance(request_token_spans, list)
+            ):
                 for idx_req, rid in enumerate(request_ids):
                     s, e = request_token_spans[idx_req]
                     if (int(e) - int(s)) != 1:
@@ -367,18 +398,34 @@ class Qwen2_5OmniForConditionalGeneration(
                     # A) runtime queue
                     q = None
                     if isinstance(rid, str):
-                        q = runtime_addi_by_req.get(rid, {}).get("thinker_reply_part_per_request")
+                        q = runtime_addi_by_req.get(rid, {}).get(
+                            "thinker_reply_part_per_request"
+                        )
                     if isinstance(q, torch.Tensor) and q.numel() > 0:
                         step_vec = q[0:1]
                         new_q = q[1:].detach().to("cpu").contiguous()
-                        update_by_req_id.setdefault(rid, {})["thinker_reply_part_per_request"] = new_q
+                        update_by_req_id.setdefault(rid, {})[
+                            "thinker_reply_part_per_request"
+                        ] = new_q
                     else:
                         # B) per-request provided decode vector (optional)
-                        info = addi_by_req.get(rid, {}) if isinstance(addi_by_req, dict) else {}
-                        dv = info.get("decode_output_prompt_embeds") if isinstance(info, dict) else None
+                        info = (
+                            addi_by_req.get(rid, {})
+                            if isinstance(addi_by_req, dict)
+                            else {}
+                        )
+                        dv = (
+                            info.get("decode_output_prompt_embeds")
+                            if isinstance(info, dict)
+                            else None
+                        )
                         if isinstance(dv, torch.Tensor) and dv.numel() > 0:
                             step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
-                        elif hasattr(self, "thinker_reply_part") and isinstance(self.thinker_reply_part, torch.Tensor) and self.thinker_reply_part.numel() > 0:
+                        elif (
+                            hasattr(self, "thinker_reply_part")
+                            and isinstance(self.thinker_reply_part, torch.Tensor)
+                            and self.thinker_reply_part.numel() > 0
+                        ):
                             # C) fallback shared pool
                             step_vec = self.thinker_reply_part[0:1]
                             self.thinker_reply_part = self.thinker_reply_part[1:]
@@ -386,7 +433,9 @@ class Qwen2_5OmniForConditionalGeneration(
                     if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
                         one_id = input_ids[s : s + 1]
                         _, one_embed = self._thinker_to_talker_decode_one_step(
-                            output_prompt_embeds=step_vec.to(inputs_embeds.dtype).to(self._module_device(self.model)),
+                            output_prompt_embeds=step_vec.to(inputs_embeds.dtype).to(
+                                self._module_device(self.model)
+                            ),
                             output_token_ids=one_id,
                         )
                         inputs_embeds[s] = one_embed[0]
@@ -400,11 +449,15 @@ class Qwen2_5OmniForConditionalGeneration(
             multimodal_outputs: dict = None
             # Return updates if any
             if update_by_req_id:
-                multimodal_outputs = {"additional_information_update_by_req_id": update_by_req_id}
+                multimodal_outputs = {
+                    "additional_information_update_by_req_id": update_by_req_id
+                }
 
             if sampling_metadata is not None:
                 # the padding token id is set to text model's pad token id, which do not match with the talker model's word embedding size
-                sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
+                sampling_metadata.prompt_token_ids[
+                    sampling_metadata.prompt_token_ids == 152064
+                ] = 8448
 
             return OmniOutput(
                 text_hidden_states=talker_hidden,
@@ -421,13 +474,11 @@ class Qwen2_5OmniForConditionalGeneration(
                     device=inputs_embeds.device,
                 )
             )
-            
+
             code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
-            
-            audio_tensor = self.generate_audio(
-                code, voice_type
-            )
+
+            audio_tensor = self.generate_audio(code, voice_type)
             return OmniOutput(
                 text_hidden_states=None, multimodal_outputs={"audio": audio_tensor}
             )

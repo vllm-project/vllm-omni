@@ -545,14 +545,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_after_padding
 
-            with self.maybe_randomize_inputs(input_ids), set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_after_padding,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
+            with (
+                self.maybe_randomize_inputs(input_ids),
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_after_padding,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
+                ),
             ):
                 outputs = self.model(
                     input_ids=input_ids,

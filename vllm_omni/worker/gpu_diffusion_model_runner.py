@@ -501,13 +501,16 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             else:
                 cudagraph_runtime_mode = _cg_mode
 
-            with self.maybe_randomize_inputs(input_ids), set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_after_padding,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
+            with (
+                self.maybe_randomize_inputs(input_ids),
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_after_padding,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_descriptor,
+                ),
             ):
                 outputs = self.model(
                     input_ids=input_ids,

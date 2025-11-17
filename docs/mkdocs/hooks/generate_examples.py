@@ -103,11 +103,20 @@ class Example:
         if self.path.is_file():
             return []
         # Text file extensions that can be safely included
-        text_extensions = {".py", ".md", ".sh", ".yaml", ".yml", ".json", ".txt", ".toml", ".cfg", ".ini"}
-        is_other_file = lambda file: (
-            file.is_file() 
-            and file != self.main_file 
-            and file.suffix in text_extensions
+        text_extensions = {
+            ".py",
+            ".md",
+            ".sh",
+            ".yaml",
+            ".yml",
+            ".json",
+            ".txt",
+            ".toml",
+            ".cfg",
+            ".ini",
+        }
+        is_other_file = lambda file: (  # noqa: E731
+            file.is_file() and file != self.main_file and file.suffix in text_extensions
         )
         return [file for file in self.path.rglob("*") if is_other_file(file)]
 
@@ -172,7 +181,7 @@ class Example:
                 f"{code_fence}\n"
             )
         else:
-            with open(self.main_file) as f:
+            with open(self.main_file, encoding="utf-8") as f:
                 # Skip the title from md snippets as it's been included above
                 main_content = f.readlines()[1:]
             content += self.fix_relative_links("".join(main_content))
