@@ -173,7 +173,7 @@ class Example:
         if self.is_code:
             # Use relative path from ROOT_DIR for snippet inclusion
             main_file_rel_path = self.main_file.relative_to(ROOT_DIR)
-            content += f"{code_fence}{self.main_file.suffix[1:]}\n" f'--8<-- "{main_file_rel_path}"\n' f"{code_fence}\n"
+            content += f'{code_fence}{self.main_file.suffix[1:]}\n--8<-- "{main_file_rel_path}"\n{code_fence}\n'
         else:
             with open(self.main_file, encoding="utf-8") as f:
                 # Skip the title from md snippets as it's been included above

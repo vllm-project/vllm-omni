@@ -1,8 +1,8 @@
 from typing import Union
 
 import torch
-
 from vllm.inputs import TextPrompt
+
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 TALKER_CODEC_PAD_TOKEN_ID = 8292

@@ -10,8 +10,8 @@ import torch
 import torchvision.io
 from processing_omni import fetch_image, fetch_video
 from transformers import AutoConfig, AutoProcessor
-
 from vllm.inputs import TextPrompt
+
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 # Simple caches to avoid repeated heavy HF loads per prompt
@@ -20,7 +20,6 @@ _CONFIG_CACHE: dict[str, "AutoConfig"] = {}
 
 
 def get_system_prompt():
-
     return {
         "role": "system",
         "content": [
@@ -47,7 +46,6 @@ def resample_wav_to_16khz(input_filepath):
 
 
 def fetch_and_read_video(args, video_url: str, fps=2):
-
     def read_video_with_torchvision(video_file_name: str):
         video, audio, info = torchvision.io.read_video(
             video_file_name,
@@ -93,7 +91,7 @@ def fetch_and_read_video(args, video_url: str, fps=2):
     if isinstance(video_url, str) and video_url.startswith("http"):
         with tempfile.NamedTemporaryFile(delete=True) as temp_video_file:
             resp = requests.get(video_url)
-            assert resp.status_code == requests.codes.ok, f"Failed to fetch video from {video_url}, " f"status_code:{resp.status_code}, resp:{resp}"
+            assert resp.status_code == requests.codes.ok, f"Failed to fetch video from {video_url}, status_code:{resp.status_code}, resp:{resp}"
 
             temp_video_file.write(urlopen(video_url).read())
             temp_video_file_path = temp_video_file.name
@@ -110,7 +108,6 @@ def make_inputs_qwen2_omni(
     use_audio_in_video: Optional[bool] = False,
     tokenize: bool = False,
 ) -> Union[OmniTokensPrompt, TextPrompt]:
-
     from transformers import AutoConfig, AutoProcessor
 
     # Cached processor/config to prevent per-prompt reloading and repeated warnings
@@ -289,7 +286,7 @@ def make_audio_in_video_v2_prompt(args):
             "content": [
                 {
                     "type": "video_url",
-                    "video_url": ("https://qianwen-res.oss-cn-beijing.aliyuncs.com/" "Qwen2.5-Omni/draw_small.mp4"),
+                    "video_url": ("https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2.5-Omni/draw_small.mp4"),
                 },
             ],
         },

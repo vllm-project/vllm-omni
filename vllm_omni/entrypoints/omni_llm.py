@@ -485,7 +485,7 @@ class OmniStageLLM(LLM):
                 kwargs["kv_transfer_config"] = KVTransferConfig(**raw_config_dict)
             except ValidationError as e:
                 logger.error(
-                    "Failed to convert 'kv_transfer_config' dict to " "KVTransferConfig object. Dict: %s. Error: %s",
+                    "Failed to convert 'kv_transfer_config' dict to KVTransferConfig object. Dict: %s. Error: %s",
                     raw_config_dict,
                     e,
                 )

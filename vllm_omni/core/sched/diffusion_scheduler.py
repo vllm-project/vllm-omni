@@ -7,6 +7,7 @@ from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import EngineCoreOutputs, Request, RequestStatus, SchedulerOutput, SpecDecodingStats
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput
+
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.core.sched.scheduler import OmniScheduler
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -232,7 +233,6 @@ class DiffusionScheduler(OmniScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
-
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(

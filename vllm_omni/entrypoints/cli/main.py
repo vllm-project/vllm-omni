@@ -15,9 +15,10 @@ def main():
         vllm_main()
         return
     else:
-        import vllm_omni.entrypoints.cli.serve
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
         from vllm.utils import FlexibleArgumentParser
+
+        import vllm_omni.entrypoints.cli.serve
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,

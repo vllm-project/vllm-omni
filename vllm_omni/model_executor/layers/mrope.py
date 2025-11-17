@@ -4,7 +4,6 @@ from typing import Optional, Union
 import numpy as np
 import torch
 from transformers import PretrainedConfig
-
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 
@@ -73,7 +72,7 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         if self.mrope_section:
-            print("Warning: mrope_section check is disabled in Qwen2.5-Omni, " "this may cause errors, and should be restored in the future.")
+            print("Warning: mrope_section check is disabled in Qwen2.5-Omni, this may cause errors, and should be restored in the future.")
             # assert sum(self.mrope_section) == rotary_dim // 2
 
     def forward(
@@ -599,7 +598,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         context_len: int,
         num_new_tokens: int,
     ):
-
         values = np.arange(
             mrope_position_delta + context_len,
             mrope_position_delta + context_len + num_new_tokens,

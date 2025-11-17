@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING, Optional, Union, cast
 
 import numpy as np
 import torch
-
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -485,7 +484,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # we allow forcing NONE when the dispatcher disagrees to support
                 # warm ups for cudagraph capture
                 assert cudagraph_runtime_mode == CUDAGraphMode.NONE or cudagraph_runtime_mode == _cg_mode, (
-                    f"Cudagraph runtime mode mismatch at dummy_run. " f"Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
+                    f"Cudagraph runtime mode mismatch at dummy_run. Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
                 )
             else:
                 cudagraph_runtime_mode = _cg_mode

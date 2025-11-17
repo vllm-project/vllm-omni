@@ -18,7 +18,6 @@ except ImportError:
     soundfile = None
 
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
-
 from vllm.entrypoints.chat_utils import ConversationMessage, get_history_tool_calls_cnt, make_tool_call_id
 from vllm.entrypoints.harmony_utils import parse_chat_output
 from vllm.entrypoints.openai.protocol import (
@@ -46,6 +45,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.transformers_utils.tokenizers import maybe_serialize_tool_calls, truncate_tool_call_ids, validate_request_params
 from vllm.utils import as_list
+
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -100,7 +100,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             ):
                 # for hf tokenizers, "auto" tools requires
                 # --enable-auto-tool-choice and --tool-call-parser
-                return self.create_error_response('"auto" tool choice requires ' "--enable-auto-tool-choice and --tool-call-parser to be set")
+                return self.create_error_response('"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set')
 
             if request.tools is None or (request.tool_choice == "none" and self.exclude_tools_when_tool_choice_none):
                 tool_dicts = None
@@ -114,7 +114,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 request_chat_template is not None or (chat_template_kwargs and chat_template_kwargs.get("chat_template") is not None)
             ):
                 return self.create_error_response(
-                    "Chat template is passed with request, but " "--trust-request-chat-template is not set. " "Refused request with untrusted chat template."
+                    "Chat template is passed with request, but --trust-request-chat-template is not set. Refused request with untrusted chat template."
                 )
             (
                 conversation,
@@ -139,7 +139,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
 
-        request_id = "chatcmpl-" f"{self._base_request_id(raw_request, request.request_id)}"
+        request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -149,7 +149,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
@@ -209,7 +208,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             return self.create_error_response(str(e))
 
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
-
         final_sampling_params_list = []
         for sampling_params in sampling_params_list:
             if isinstance(sampling_params, dict):
@@ -239,7 +237,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             prompt_token_ids = getattr(inputs, "prompt_token_ids", None)
 
         logger.info(
-            "Received request %s: prompt: %r, " "params_list: %s, prompt_token_ids: %s, " "prompt_embeds shape: %s, " "lora_request: %s.",
+            "Received request %s: prompt: %r, params_list: %s, prompt_token_ids: %s, prompt_embeds shape: %s, lora_request: %s.",
             request_id,
             prompt,
             params_list,
@@ -258,7 +256,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> Union[ErrorResponse, ChatCompletionResponse]:
-
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
 
@@ -441,7 +438,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # if the request uses tools and specified a tool choice
             elif request.tool_choice and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam:
-
                 tool_call_class = MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
                 message = ChatMessage(
                     role=role,
@@ -493,12 +489,10 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # if the request doesn't use tool choice
             # OR specifies to not use a tool
             elif not request.tool_choice or request.tool_choice == "none":
-
                 message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             # handle when there are tools and tool choice is auto
             elif request.tools and (request.tool_choice == "auto" or request.tool_choice is None) and self.enable_auto_tools and self.tool_parser:
-
                 try:
                     tool_parser = self.tool_parser(tokenizer)
                 except RuntimeError as e:
@@ -535,9 +529,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # undetermined case that is still important to handle
             else:
-                logger.error(
-                    "Error in chat_completion_full_generator - cannot determine" " if tools should be extracted. Returning a standard chat " "completion."
-                )
+                logger.error("Error in chat_completion_full_generator - cannot determine if tools should be extracted. Returning a standard chat completion.")
                 message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             choice_data = ChatCompletionResponseChoice(
@@ -587,7 +579,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Convert numpy array to WAV bytes and encode as base64
         if soundfile is None:
-            raise ImportError("soundfile is required for audio generation. " "Please install it with: pip install soundfile")
+            raise ImportError("soundfile is required for audio generation. Please install it with: pip install soundfile")
 
         # Default sample rate for TTS models (typically 24000 Hz)
         # You may need to adjust this based on your model's configuration

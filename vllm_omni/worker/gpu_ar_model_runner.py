@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -28,6 +27,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
+
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -67,7 +67,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
         dict[str, Any],
         dict[str, dict] | None,
     ]:
-
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if ubatch_slices:
             assert num_tokens_after_padding is not None
@@ -333,7 +332,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-
             model_kwargs_extra = {}
             # Pass per-request additional information map for this step (no concat)
             if per_req_additional_information:
@@ -408,7 +406,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         information update: {e}, with the multimodal_outputs as {multimodal_outputs}"
                 )
             if not self.broadcast_pp_output:
-
                 # Common case.
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.

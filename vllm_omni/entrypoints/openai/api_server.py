@@ -7,11 +7,10 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Any, Optional
 
+import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
-
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template, resolve_hf_chat_template, resolve_mistral_chat_template
@@ -38,6 +37,7 @@ from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
+
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
@@ -114,7 +114,6 @@ async def build_async_omni_llm(
     disable_frontend_multiprocessing: Optional[bool] = None,
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
-
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
@@ -152,7 +151,7 @@ async def build_async_omni_llm_from_stage_config(
     assert envs.VLLM_USE_V1
 
     if disable_frontend_multiprocessing:
-        logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing. " "To disable frontend multiprocessing, set VLLM_USE_V1=0.")
+        logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing. To disable frontend multiprocessing, set VLLM_USE_V1=0.")
 
     async_omni_llm: Optional[EngineClient] = None
 
@@ -177,7 +176,6 @@ async def omni_init_app_state(
     state: State,
     args: Namespace,
 ) -> None:
-
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:
@@ -216,9 +214,7 @@ async def omni_init_app_state(
 
             if hf_chat_template != resolved_chat_template:
                 logger.warning(
-                    "Using supplied chat template: %s\n"
-                    "It is different from official chat template '%s'. "
-                    "This discrepancy may lead to performance degradation.",
+                    "Using supplied chat template: %s\nIt is different from official chat template '%s'. This discrepancy may lead to performance degradation.",
                     resolved_chat_template,
                     args.model,
                 )

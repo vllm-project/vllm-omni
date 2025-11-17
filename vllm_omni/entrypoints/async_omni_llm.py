@@ -60,7 +60,6 @@ class AsyncOmniLLM(EngineClient):
         init_timeout: int = 300,
         **kwargs,
     ):
-
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
 
@@ -619,7 +618,7 @@ class AsyncOmniStageLLM(AsyncLLM):
 
         self.log_stats = log_stats or (stat_loggers is not None)
         if not log_stats and stat_loggers is not None:
-            logger.info("AsyncLLM created with log_stats=False and non-empty custom " "logger list; enabling logging without default stat loggers")
+            logger.info("AsyncLLM created with log_stats=False and non-empty custom logger list; enabling logging without default stat loggers")
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
@@ -693,7 +692,7 @@ class AsyncOmniStageLLM(AsyncLLM):
     @classmethod
     @deprecate_kwargs(
         "disable_log_requests",
-        additional_message=("This argument will have no effect. " "Use `enable_log_requests` instead."),
+        additional_message=("This argument will have no effect. Use `enable_log_requests` instead."),
     )
     def from_vllm_config(
         cls,

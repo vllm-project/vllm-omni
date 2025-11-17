@@ -17,7 +17,6 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniPr
 
 # Bring in HF base classes, configs and utilities used below
 from transformers.utils.logging import get_logger as _hf_get_logger
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
@@ -298,7 +297,7 @@ class ECAPA_TimeDelayNet(torch.nn.Module):
     def __init__(self, config: Qwen2_5OmniDiTConfig):
         super().__init__()
         if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(config.enc_dilations):
-            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have " "same length")
+            raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
         self.channels = config.enc_channels
         self.blocks = nn.ModuleList()
 
@@ -1338,7 +1337,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             )
             attn_impl = "sdpa"
         elif config._attn_implementation == "eager":
-            logger.warning_once("Qwen2_5OmniToken2WavModel does not support eager attention " "implementation, fall back to sdpa")
+            logger.warning_once("Qwen2_5OmniToken2WavModel does not support eager attention implementation, fall back to sdpa")
             attn_impl = "sdpa"
         self.code2wav_dit_model = Qwen2_5OmniToken2WavDiTModel._from_config(config.dit_config, attn_implementation=attn_impl)
         self.code2wav_bigvgan_model = Qwen2_5OmniToken2WavBigVGANModel._from_config(config.bigvgan_config, attn_implementation=attn_impl)

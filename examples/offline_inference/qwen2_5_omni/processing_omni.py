@@ -71,7 +71,7 @@ def smart_resize(
     3. The aspect ratio of the image is maintained as closely as possible.
     """
     if max(height, width) / min(height, width) > MAX_RATIO:
-        raise ValueError(f"absolute aspect ratio must be smaller than {MAX_RATIO}, " f"got {max(height, width) / min(height, width)}")
+        raise ValueError(f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}")
     h_bar = max(factor, round_by_factor(height, factor))
     w_bar = max(factor, round_by_factor(width, factor))
     if h_bar * w_bar > max_pixels:
@@ -105,7 +105,7 @@ def fetch_image(ele: dict[str, str | Image.Image], size_factor: int = IMAGE_FACT
     else:
         image_obj = Image.open(image)
     if image_obj is None:
-        raise ValueError(f"Unrecognized image input, support local path, http url, " f"base64 and PIL.Image, got {image}")
+        raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
     image = image_obj.convert("RGB")
     # resize
     if "resized_height" in ele and "resized_width" in ele:
@@ -169,7 +169,7 @@ def smart_nframes(
         nframes = min(max(nframes, min_frames), max_frames)
         nframes = round_by_factor(nframes, FRAME_FACTOR)
     if not (FRAME_FACTOR <= nframes and nframes <= total_frames):
-        raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], " f"but got {nframes}.")
+        raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}.")
     return nframes
 
 
@@ -191,7 +191,7 @@ def _read_video_torchvision(
     video_path = ele["video"]
     if version.parse(torchvision.__version__) < version.parse("0.19.0"):
         if "http://" in video_path or "https://" in video_path:
-            warnings.warn("torchvision < 0.19.0 does not support http/https video path, " "please upgrade to 0.19.0.")
+            warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
         if "file://" in video_path:
             video_path = video_path[7:]
     st = time.time()
@@ -204,7 +204,7 @@ def _read_video_torchvision(
     )
     total_frames, video_fps = video.size(0), info["video_fps"]
     total_duration = round(total_frames / video_fps, 3)
-    logger.info(f"torchvision:  {video_path=}, {total_frames=}, {video_fps=}, " f"duration={total_duration}s, time={time.time() - st:.3f}s")
+    logger.info(f"torchvision:  {video_path=}, {total_frames=}, {video_fps=}, duration={total_duration}s, time={time.time() - st:.3f}s")
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(0, total_frames - 1, nframes).round().long()
     video = video[idx]
@@ -242,7 +242,7 @@ def _read_video_decord(
         raise NotImplementedError("not support start_pts and end_pts in decord for now.")
     total_frames, video_fps = len(vr), vr.get_avg_fps()
     total_duration = round(total_frames / video_fps, 3)
-    logger.info(f"decord:  {video_path=}, {total_frames=}, {video_fps=}, " f"time={time.time() - st:.3f}s")
+    logger.info(f"decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
     video = vr.get_batch(idx).asnumpy()

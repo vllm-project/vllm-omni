@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniConfig, Qwen2_5OmniTalkerConfig, Qwen2_5OmniThinkerConfig
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
@@ -26,6 +25,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 
@@ -50,7 +50,6 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
@@ -546,7 +545,6 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
         thinker_prompt_embeds,
         prompt_token_ids,
     ):
-
         talker_hf_config = self.talker_config
         if hasattr(talker_hf_config, "talker_config"):
             talker_hf_config = talker_hf_config.talker_config

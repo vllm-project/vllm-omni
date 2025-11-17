@@ -103,7 +103,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
-
             # TODO (ywang96): support overlapping modalitiy embeddings so that
             # `use_audio_in_video` will work on V1.
             inputs_embeds = merge_multimodal_embeddings(
@@ -206,7 +205,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         return mm_input_by_modality
 
     def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
-
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []

@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.multimodal.inputs import MultiModalKwargs
@@ -24,6 +23,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
+
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -54,7 +54,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         IntermediateTensors | None,
         dict[str, Any],
     ]:
-
         # Input token count for this iteration (not used by diffusion, but
         # retained to keep DP padding/ordering consistent)
         num_input_tokens = scheduler_output.total_num_scheduled_tokens
@@ -200,7 +199,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-
             outputs = self._run_diffusion(
                 input_ids=input_ids,
                 positions=positions,
@@ -283,7 +281,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # TODO: add the diffuse method for other models
 
         raise RuntimeError(
-            "The loaded model does not expose diffusion interfaces 'sample', " "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
+            "The loaded model does not expose diffusion interfaces 'sample', 'forward', or 'diffuse'. Please implement one of them or adapt the runner."
         )
 
     @torch.inference_mode()
@@ -401,7 +399,6 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                     causal=True,
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
-
                     assert type(attn_metadata) is dict
                     attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(common_attn_metadata)  # noqa: E501
                     for layer_name in attn_group.layer_names:
@@ -456,7 +453,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                 # we allow forcing NONE when the dispatcher disagrees to support
                 # warm ups for cudagraph capture
                 assert cudagraph_runtime_mode == CUDAGraphMode.NONE or cudagraph_runtime_mode == _cg_mode, (
-                    f"Cudagraph runtime mode mismatch at dummy_run. " f"Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
+                    f"Cudagraph runtime mode mismatch at dummy_run. Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
                 )
             else:
                 cudagraph_runtime_mode = _cg_mode
@@ -510,7 +507,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             if self.model_config.multimodal_config.skip_mm_profiling:
-                logger.info("Skipping memory profiling for multimodal encoder and " "encoder cache.")
+                logger.info("Skipping memory profiling for multimodal encoder and encoder cache.")
             else:
                 mm_budget = self.mm_budget
                 assert mm_budget is not None
@@ -523,7 +520,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                     max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[dummy_modality]
 
                     logger.info(
-                        "Encoder cache will be initialized with a budget of " "%s tokens, and profiled with %s %s items of the " "maximum feature size.",
+                        "Encoder cache will be initialized with a budget of %s tokens, and profiled with %s %s items of the maximum feature size.",
                         encoder_budget,
                         max_mm_items_per_batch,
                         dummy_modality,

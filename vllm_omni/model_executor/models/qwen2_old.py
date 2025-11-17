@@ -4,7 +4,6 @@ from typing import Optional, Union
 import torch
 from torch import nn
 from transformers import Qwen2Config
-
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -39,7 +38,6 @@ logger = init_logger(__name__)
 
 
 class Qwen2MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -64,7 +62,7 @@ class Qwen2MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. " "Only silu is supported for now.")
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -75,7 +73,6 @@ class Qwen2MLP(nn.Module):
 
 
 class Qwen2Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -161,7 +158,6 @@ class Qwen2Attention(nn.Module):
 
 
 class Qwen2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen2Config,
@@ -241,7 +237,6 @@ class Qwen2DecoderLayer(nn.Module):
     }
 )
 class Qwen2Model(nn.Module):
-
     def __init__(
         self,
         *,

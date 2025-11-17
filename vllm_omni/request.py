@@ -29,7 +29,6 @@ class OmniRequest(Request):
         request: OmniEngineCoreRequest,
         block_hasher: Optional[Callable[["Request"], list["BlockHash"]]],
     ) -> "Request":
-
         return cls(
             request_id=request.request_id,
             client_index=request.client_index,

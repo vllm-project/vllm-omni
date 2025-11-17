@@ -1,7 +1,6 @@
 from typing import Any, Callable, Optional, Union
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
@@ -13,13 +12,13 @@ from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcess
 from vllm.v1.engine.output_processor import OutputProcessorOutput, RequestOutputCollector, RequestState
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
+
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 
 class OmniRequestState(RequestState):
-
     def __init__(
         self,
         *args,
@@ -40,7 +39,6 @@ class OmniRequestState(RequestState):
         queue: Optional[Any],
         log_stats: bool,
     ) -> "OmniRequestState":
-
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
                 tokenizer = None
