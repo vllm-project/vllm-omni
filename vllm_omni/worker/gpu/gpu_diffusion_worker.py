@@ -9,7 +9,7 @@ from vllm.utils import GiB_bytes, MemorySnapshot
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-from vllm_omni.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
+from vllm_omni.worker.gpu.gpu_diffusion_model_runner import GPUDiffusionModelRunner
 
 
 class GPUDiffusionWorker(GPUWorker):

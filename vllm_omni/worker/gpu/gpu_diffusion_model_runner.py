@@ -25,7 +25,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.gpu.gpu_model_runner import OmniGPUModelRunner
 
 logger = logging.getLogger(__name__)
 

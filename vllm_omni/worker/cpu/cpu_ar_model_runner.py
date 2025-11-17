@@ -1,4 +1,4 @@
-"""AR GPU Model Runner for vLLM-omni.
+"""AR CPU Model Runner for vLLM-omni.
 
 Exposes per-request hidden representations via ModelRunnerOutput.pooler_output
 and also outputs sampled tokens.
@@ -30,12 +30,12 @@ from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.cpu.cpu_model_runner import OmniCPUModelRunner
 
 logger = init_logger(__name__)
 
 
-class GPUARModelRunner(OmniGPUModelRunner):
+class CPUARModelRunner(OmniCPUModelRunner):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     This runner follows the same preparation and forward path as GPUModelRunner
@@ -624,7 +624,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
-        
+
     def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
         req_state = self.requests.get(req_id)
         if req_state is None:
