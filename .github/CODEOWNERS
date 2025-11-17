@@ -6,10 +6,10 @@
 # later, we can add more reviewers here
 * @hsliuustc0106
 
-# Assign reviewers by directory
-/.github/ @owner1
-/tests/ @owner1
-/docs/ @owner1
+# Example: Assign reviewers by directory
+# /.github/ @owner1
+# /tests/ @owner1
+# /docs/ @owner1
 
 # Example: reviewers for specific directories
 # /examples/offline_inference/ @offline-inference-team
