@@ -3,93 +3,67 @@ Omni serve command for vLLM-omni.
 """
 
 import argparse
-from typing import List
+
+import uvloop
+
+from vllm.entrypoints.cli.types import CLISubcommand
+from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.logger import init_logger
+from vllm.utils import FlexibleArgumentParser
+from vllm_omni.entrypoints.openai.api_server import omni_run_server
+
+logger = init_logger(__name__)
+
+DESCRIPTION = """Launch a local OpenAI-compatible API server to serve Omni LLM
+completions via HTTP. Defaults to Qwen/Qwen2.5-Omni-7B if no model is specified.
+
+Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
+--help=ModelConfig, --help=Frontend)
+  Use `--help=all` to show all available flags at once.
+"""
 
 
-class OmniServeCommand:
-    """Command handler for vLLM-omni serve command."""
+class OmniServeCommand(CLISubcommand):
+    """The `serve` subcommand for the vLLM CLI."""
 
-    def __init__(self):
-        self.parser = self._create_parser()
+    name = "serve"
 
-    def _create_parser(self) -> argparse.ArgumentParser:
-        """Create argument parser for omni serve command."""
-        parser = argparse.ArgumentParser(
-            description="vLLM-omni: Multi-modality models inference and serving"
+    @staticmethod
+    def cmd(args: argparse.Namespace) -> None:
+        # If model is specified in CLI (as positional arg), it takes precedence
+        if hasattr(args, "model_tag") and args.model_tag is not None:
+            args.model = args.model_tag
+
+        uvloop.run(omni_run_server(args))
+
+    def validate(self, args: argparse.Namespace) -> None:
+        validate_parsed_serve_args(args)
+
+    def subparser_init(
+        self, subparsers: argparse._SubParsersAction
+    ) -> FlexibleArgumentParser:
+        serve_parser = subparsers.add_parser(
+            self.name,
+            description=DESCRIPTION,
+            usage="vllm serve [model_tag] --omni [options]",
         )
 
-        # Model arguments - make it optional with default
-        parser.add_argument(
-            "model",
-            nargs="?",
-            default="Qwen/Qwen3-0.6B",
-            help="Path to the model or model name (default: Qwen/Qwen3-0.6B)",
-        )
-
-        # Server arguments
-        parser.add_argument(
-            "--port",
-            type=int,
-            default=8000,
-            help="Port to run the server on",
-        )
-
-        parser.add_argument(
-            "--host",
-            type=str,
-            default="0.0.0.0",
-            help="Host to run the server on",
-        )
-
-        # Stage configuration arguments
-        parser.add_argument("--ar-stage", type=str, help="AR stage model path")
-
-        parser.add_argument("--dit-stage", type=str, help="DiT stage model path")
-
-        parser.add_argument(
-            "--dit-steps",
-            type=int,
-            default=50,
-            help="Number of DiT inference steps",
-        )
-
-        parser.add_argument(
-            "--dit-guidance-scale",
-            type=float,
-            default=7.5,
-            help="DiT guidance scale",
-        )
-
-        parser.add_argument(
-            "--use-diffusers",
+        serve_parser = make_arg_parser(serve_parser)
+        serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
+        serve_parser.add_argument(
+            "--omni",
             action="store_true",
-            help="Use diffusers pipeline for DiT stage",
+            help="Enable vLLM-omni mode",
         )
-
-        # Other arguments
-        parser.add_argument(
-            "--log-stats", action="store_true", help="Enable logging statistics"
+        serve_parser.add_argument(
+            "--stage-configs-path",
+            type=str,
+            default=None,
+            help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
         )
+        return serve_parser
 
-        return parser
 
-    def run(self, args: List[str]) -> None:
-        """Run the omni serve command."""
-        pass
-
-    def _create_stage_configs(self, args) -> List:
-        """Create stage configurations based on arguments."""
-        pass
-
-    async def _start_server(self, omni_llm, args) -> None:
-        """Start the API server."""
-        try:
-            # Import here to avoid circular imports
-            from vllm_omni.entrypoints.api_server import run_server
-
-            await run_server(omni_llm_instance=omni_llm, host=args.host, port=args.port)
-        except KeyboardInterrupt:
-            print("\nShutting down server...")
-        except Exception as e:
-            print(f"Error starting server: {e}")
-            raise
+def cmd_init() -> list[CLISubcommand]:
+    return [OmniServeCommand()]

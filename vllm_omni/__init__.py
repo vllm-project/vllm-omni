@@ -20,14 +20,20 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     # Allow importing vllm_omni without vllm (e.g., documentation builds)
     patch = None  # type: ignore
 from .config import OmniModelConfig
+from .entrypoints.async_omni_llm import AsyncOmniLLM
 
 # Main entry points
 from .entrypoints.omni_llm import OmniLLM
 
+# from .version import __version__, __version_tuple__  # isort:skip
+
+
 __all__ = [
+    # "__version__",  # TODO: add __version__ back when it is implemented
+    # "__version_tuple__",  # TODO: add __version_tuple__ back when it is implemented
     # Main components
     "OmniLLM",
-    # "AsyncOmniLLM", # TODO: add AsyncOmniLLM back when it is implemented
+    "AsyncOmniLLM",
     # Configuration
     "OmniModelConfig",
     # All other components are available through their respective modules

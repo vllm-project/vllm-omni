@@ -1,9 +1,14 @@
+from __future__ import annotations
+
+import logging
 import os
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
 from vllm.transformers_utils.config import get_config
+
+logger = logging.getLogger(__name__)
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent

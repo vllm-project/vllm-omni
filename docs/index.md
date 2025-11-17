@@ -28,6 +28,5 @@
 
 ## <span class="twemoji">📚</span> Documentation Navigation
 
-- To run open-source models on vLLM-Omni, we recommend starting with the [:material-code-tags: User Quide](user_guide/getting_started/quickstart.md) 
+- To run open-source models on vLLM-Omni, we recommend starting with the [:material-code-tags: User Quide](user_guide/getting_started/quickstart.md)
 - To develop and contribute to vLLM-Omni, we recommend starting with the [:material-tools: Developer Guide](contributing/README.md)
-

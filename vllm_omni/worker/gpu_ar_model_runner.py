@@ -138,9 +138,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
                             # For prefill tokens, pass only the scheduled slice; for decode or no scheduled tokens, pass whole tensor
                             if overlay_len > 0:
                                 try:
-                                    seg = v[
-                                        num_computed_tokens : num_computed_tokens + overlay_len
-                                    ].detach().to("cpu").contiguous()
+                                    seg = (
+                                        v[
+                                            num_computed_tokens : num_computed_tokens
+                                            + overlay_len
+                                        ]
+                                        .detach()
+                                        .to("cpu")
+                                        .contiguous()
+                                    )
                                 except Exception:
                                     seg = v.detach().to("cpu").contiguous()
                                 req_info[k] = seg
@@ -380,7 +386,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             model_kwargs_extra = {}
             # Pass per-request additional information map for this step (no concat)
             if per_req_additional_information:
-                model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
+                model_kwargs_extra["additional_information_by_req_id"] = (
+                    per_req_additional_information
+                )
             # Always pass per-request runtime additional_information (persisted in request state)
             try:
                 per_req_runtime_info = []
@@ -433,12 +441,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # Convention: multimodal_outputs["additional_information_update"] is a list[dict] in batch order;
             # the runner merges it into the corresponding request's additional_information_cpu for subsequent decode.
             try:
-                if (
-                    isinstance(multimodal_outputs, dict)
-                    and (
-                        "additional_information_update" in multimodal_outputs
-                        or "additional_information_update_by_req_id" in multimodal_outputs
-                    )
+                if isinstance(multimodal_outputs, dict) and (
+                    "additional_information_update" in multimodal_outputs
+                    or "additional_information_update_by_req_id" in multimodal_outputs
                 ):
                     # Option A: list[dict] in batch order
                     updates_list = multimodal_outputs.get(
@@ -446,7 +451,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     )
                     if isinstance(updates_list, list):
                         for idx, upd in enumerate(updates_list):
-                            if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
+                            if not isinstance(upd, dict) or idx >= len(
+                                self.input_batch.req_ids
+                            ):
                                 continue
                             req_id = self.input_batch.req_ids[idx]
                             self._merge_additional_information_update(req_id, upd)
@@ -462,7 +469,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                                 continue
                             self._merge_additional_information_update(req_id, upd)
             except Exception as e:
-                logger.error(f"Error merging for requests:{self.input_batch.req_ids} additional information update: {e}, with the multimodal_outputs as {multimodal_outputs}")
+                logger.error(
+                    f"Error merging for requests:{self.input_batch.req_ids} additional \
+                        information update: {e}, with the multimodal_outputs as {multimodal_outputs}"
+                )
             if not self.broadcast_pp_output:
 
                 # Common case.
@@ -624,7 +634,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
-        
+
     def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
         req_state = self.requests.get(req_id)
         if req_state is None:

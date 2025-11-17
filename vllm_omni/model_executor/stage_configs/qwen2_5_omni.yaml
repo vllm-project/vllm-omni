@@ -15,8 +15,17 @@ stage_args:
       trust_remote_code: true
       engine_output_type: latent  # change the param name,such as pooling_output
       enable_prefix_caching: false
+    is_comprehension: true
     final_output: true
     final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
   - stage_id: 1
     runtime:
       process: true
@@ -34,6 +43,15 @@ stage_args:
       engine_output_type: latent
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.05
+      stop_token_ids: [8294]
   - stage_id: 2
     runtime:
       process: true
@@ -52,6 +70,14 @@ stage_args:
     engine_input_source: [1]
     final_output: true
     final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
 
 # Top-level runtime config (concise): default windows and stage edges
 runtime:

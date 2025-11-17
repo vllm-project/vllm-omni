@@ -53,4 +53,3 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
 .md-nav__item--section:has([href*="api/vllm_omni/index"]) > .md-nav > .md-nav__list > .md-nav__item--nested > .md-nav > .md-nav__list > .md-nav__item--nested.md-nav__item--active > .md-nav {
     display: block;
 }
-

@@ -7,6 +7,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -24,6 +25,8 @@ from vllm_omni.engine import (
     PromptEmbedsPayload,
 )
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+
+logger = init_logger(__name__)
 
 
 class OmniProcessor(Processor):

@@ -53,4 +53,3 @@ The output audio is saved in ./output_audio
 - Read the [architecture documentation](../../contributing/design_documents/vllm_omni_design.md)
 - Check out the [API reference](../../api/overview.md)
 - Explore the [examples](../examples/index.md)
-

@@ -4,9 +4,12 @@ from typing_extensions import assert_never
 
 from vllm.inputs.data import SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt
 from vllm.inputs.preprocess import InputPreprocessor
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
 from vllm_omni.inputs.data import OmniTokenInputs, token_inputs_omni
 from vllm_omni.inputs.parse import parse_singleton_prompt_omni
+
+logger = init_logger(__name__)
 
 
 class OmniInputPreprocessor(InputPreprocessor):

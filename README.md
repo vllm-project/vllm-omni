@@ -100,15 +100,7 @@ uv pip install -e .
 
 ## Run examples (Qwen2.5-omni)
 
-Get into the example folder
-```bash
-cd examples/offline_inference/qwen_2_5_omni
-```
-Modify PYTHONPATH in run.sh as your path of vllm_omni. Then run.
-```bash
-bash run.sh
-```
-The output audio is saved in ./output_audio
+Please check the folder of [examples](examples)
 
 ## Further details
 
