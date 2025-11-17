@@ -26,7 +26,7 @@ repos:
     rev: v0.11.7
     hooks:
       - id: ruff
-        args: [--output-format, github, --fix, --line-length=88]
+        args: [--output-format, github, --fix, --line-length=160]
 
   - repo: https://github.com/crate-ci/typos
     rev: v1.35.5

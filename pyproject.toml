@@ -78,8 +78,8 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.black]
-line-length = 88
-target-version = ['py39', 'py310', 'py311', 'py312']
+line-length = 160
+target-version = ['py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -98,12 +98,12 @@ extend-exclude = '''
 [tool.isort]
 profile = "black"
 multi_line_output = 3
-line_length = 88
+line_length = 160
 known_first_party = ["vllm_omni"]
 
 [tool.ruff]
-line-length = 88
-target-version = "py38"
+line-length = 160
+target-version = "py312, py313"
 exclude = [
     ".eggs",
     ".git",
@@ -135,7 +135,7 @@ ignore = [
 "tests/**" = ["E501"]  # Allow long lines in tests
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.12, 3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
