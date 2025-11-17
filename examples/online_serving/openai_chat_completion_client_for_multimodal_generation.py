@@ -94,7 +94,7 @@ def run_text_to_audio(model: str) -> None:
             audio_file_path = f"audio_{count}.wav"
             with open(audio_file_path, "wb") as f:
                 f.write(audio_data)
-            print(f"Audio saved to {audio_file_path}")
+            print(f"Audio is saved to {audio_file_path}.")
             count += 1
         elif choice.message.content:
             print("Chat completion output from text:", choice.message.content)
