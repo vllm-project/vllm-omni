@@ -5,14 +5,21 @@ from omegaconf import OmegaConf
 
 from vllm.transformers_utils.config import get_config
 
+from vllm_omni.utils.diffusers_utils import load_diffusers_config
+
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 def load_stage_configs_from_model(model: str):
     """Load stage configs from model."""
-    hf_config = get_config(model, trust_remote_code=True)
-    model_type = hf_config.model_type
+    try:
+        hf_config = get_config(model, trust_remote_code=True)
+        model_type = hf_config.model_type
+    except Exception:
+        hf_config = load_diffusers_config(model)
+        model_type = hf_config["_class_name"]
+
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
