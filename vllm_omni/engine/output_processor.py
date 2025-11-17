@@ -384,7 +384,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def _process_audio_output(self, eco: EngineCoreOutput) -> None:
         """Ensure audio tensors are surfaced via pooling_output."""
         if eco.pooling_output is None:
-            tensor = self._extract_from_multimodal_outputs(eco, keys=("audio", "audios", "wav", "waveform", "audio_pcm", "pcm"))
+            tensor = self._extract_from_multimodal_outputs(
+                eco, keys=("audio", "audios", "wav", "waveform", "audio_pcm", "pcm")
+            )
             if tensor is not None:
                 eco.pooling_output = tensor
 

@@ -22,7 +22,9 @@ def thinker2talker(stage_list, engine_input_source, prompt: Union[OmniTokensProm
     talker_inputs = []
     if not isinstance(prompt, list):
         prompt = [prompt]
-    multi_modal_data = {thinker_output.request_id: p.get("multi_modal_data", None) for thinker_output, p in zip(thinker_outputs, prompt)}
+    multi_modal_data = {
+        thinker_output.request_id: p.get("multi_modal_data", None) for thinker_output, p in zip(thinker_outputs, prompt)
+    }
 
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
@@ -41,9 +43,13 @@ def thinker2talker(stage_list, engine_input_source, prompt: Union[OmniTokensProm
         }
         talker_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID] + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids)) + [TALKER_CODEC_END_TOKEN_ID],
+                prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
+                + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids))
+                + [TALKER_CODEC_END_TOKEN_ID],
                 additional_information=additional_information,
-                multi_modal_data=(multi_modal_data[thinker_output.request_id] if multi_modal_data is not None else None),
+                multi_modal_data=(
+                    multi_modal_data[thinker_output.request_id] if multi_modal_data is not None else None
+                ),
                 mm_processor_kwargs=None,
             )
         )

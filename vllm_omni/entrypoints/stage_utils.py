@@ -209,7 +209,9 @@ def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -
     return container[obj_key]
 
 
-def maybe_load_from_ipc_with_metrics(container: dict[str, Any], obj_key: str, shm_key: str) -> tuple[Any, dict[str, float]]:
+def maybe_load_from_ipc_with_metrics(
+    container: dict[str, Any], obj_key: str, shm_key: str
+) -> tuple[Any, dict[str, float]]:
     """Load object and return (object, metrics) with RX bytes and decode time.
 
     Metrics keys:

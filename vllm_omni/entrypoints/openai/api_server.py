@@ -151,7 +151,10 @@ async def build_async_omni_llm_from_stage_config(
     assert envs.VLLM_USE_V1
 
     if disable_frontend_multiprocessing:
-        logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing. To disable frontend multiprocessing, set VLLM_USE_V1=0.")
+        logger.warning(
+            "V1 is enabled, but got --disable-frontend-multiprocessing. "
+            "To disable frontend multiprocessing, set VLLM_USE_V1=0."
+        )
 
     async_omni_llm: Optional[EngineClient] = None
 
@@ -214,7 +217,7 @@ async def omni_init_app_state(
 
             if hf_chat_template != resolved_chat_template:
                 logger.warning(
-                    "Using supplied chat template: %s\nIt is different from official chat template '%s'. This discrepancy may lead to performance degradation.",
+                    "Using supplied chat template: %s\nIt is different from official chat template '%s'. This discrepancy may lead to performance degradation.",  # noqa: E501
                     resolved_chat_template,
                     args.model,
                 )

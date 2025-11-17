@@ -19,7 +19,13 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionTransformer
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, init_vllm_registered_model, maybe_prefix, merge_multimodal_embeddings
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    init_vllm_registered_model,
+    maybe_prefix,
+    merge_multimodal_embeddings,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
@@ -32,7 +38,9 @@ from vllm.v1.sample.sampler import Sampler
     info=Qwen2_5OmniThinkerProcessingInfo,
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
-class Qwen2_5OmniTalkerForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin):
+class Qwen2_5OmniTalkerForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin
+):
     logger = init_logger(__name__)
     # Align to thinker-style static mapper for clarity
     hf_to_vllm_mapper = WeightsMapper(
@@ -139,7 +147,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # projection
         inputs_embeds, _ = self.thinker_to_talker_proj(inputs_embeds)
 
-        hidden_states = self.language_model.model(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)
+        hidden_states = self.language_model.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
+        )
         return hidden_states
 
     def bad_word_processor(self, logits: torch.Tensor) -> torch.Tensor:

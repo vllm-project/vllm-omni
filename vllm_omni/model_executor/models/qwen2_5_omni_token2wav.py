@@ -12,7 +12,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniBigVGANConfig, Qwen2_5OmniDiTConfig, Qwen2_5OmniToken2WavConfig
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+    Qwen2_5OmniBigVGANConfig,
+    Qwen2_5OmniDiTConfig,
+    Qwen2_5OmniToken2WavConfig,
+)
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniPreTrainedModel
 
 # Bring in HF base classes, configs and utilities used below
@@ -199,7 +203,9 @@ class AttentiveStatisticsPooling(nn.Module):
 
         if max_len is None:
             max_len = length.max().long().item()  # using arange to generate mask
-        mask = torch.arange(max_len, device=length.device, dtype=length.dtype).expand(len(length), max_len) < length.unsqueeze(1)
+        mask = torch.arange(max_len, device=length.device, dtype=length.dtype).expand(
+            len(length), max_len
+        ) < length.unsqueeze(1)
 
         mask = torch.as_tensor(mask, dtype=dtype, device=device)
         return mask
@@ -296,7 +302,9 @@ class ECAPA_TimeDelayNet(torch.nn.Module):
 
     def __init__(self, config: Qwen2_5OmniDiTConfig):
         super().__init__()
-        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(config.enc_dilations):
+        if len(config.enc_channels) != len(config.enc_kernel_sizes) or len(config.enc_channels) != len(
+            config.enc_dilations
+        ):
             raise ValueError("enc_channels, enc_kernel_sizes and enc_dilations should have same length")
         self.channels = config.enc_channels
         self.blocks = nn.ModuleList()
@@ -624,7 +632,9 @@ class DiTDecoderLayer(nn.Module):
         self.ff_norm = nn.LayerNorm(config.hidden_size, elementwise_affine=False, eps=1e-6)
         self.ff = DiTMLP(dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout)
 
-    def forward(self, hidden_states, timestep, position_embeddings=None, block_diff=None):  # x: noised input, t: time embedding
+    def forward(
+        self, hidden_states, timestep, position_embeddings=None, block_diff=None
+    ):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(hidden_states, emb=timestep)
 
@@ -632,7 +642,8 @@ class DiTDecoderLayer(nn.Module):
         attn_output = self.attn(
             hidden_states=norm,
             position_embeddings=position_embeddings,
-            attention_mask=(block_diff >= -float(self.look_backward_block)) & (block_diff <= float(self.look_ahead_block)),
+            attention_mask=(block_diff >= -float(self.look_backward_block))
+            & (block_diff <= float(self.look_ahead_block)),
         )
 
         # process attention output for input x
@@ -681,7 +692,9 @@ class SnakeBeta(nn.Module):
         beta = self.beta.unsqueeze(0).unsqueeze(-1)
         alpha = torch.exp(alpha)
         beta = torch.exp(beta)
-        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(torch.sin(hidden_states * alpha), 2)
+        hidden_states = hidden_states + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(
+            torch.sin(hidden_states * alpha), 2
+        )
 
         return hidden_states
 
@@ -884,7 +897,9 @@ class AMPBlock(torch.nn.Module):
 
         self.num_layers = len(self.convs1) + len(self.convs2)  # total number of conv layers
 
-        self.activations = nn.ModuleList([TorchActivation1d(activation=SnakeBeta(channels)) for _ in range(self.num_layers)])
+        self.activations = nn.ModuleList(
+            [TorchActivation1d(activation=SnakeBeta(channels)) for _ in range(self.num_layers)]
+        )
 
     def _get_padding(self, kernel_size, dilation=1):
         return int((kernel_size * dilation - dilation) / 2)
@@ -947,7 +962,9 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
             ]
         )
 
-        self.activation_post = TorchActivation1d(activation=SnakeBeta(config.upsample_initial_channel // (2**self.num_upsample_layers)))
+        self.activation_post = TorchActivation1d(
+            activation=SnakeBeta(config.upsample_initial_channel // (2**self.num_upsample_layers))
+        )
         self.conv_post = nn.Conv1d(
             config.upsample_initial_channel // (2**self.num_upsample_layers),
             1,
@@ -986,7 +1003,8 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         for layer_index in range(self.num_upsample_layers):
             hidden_representation = self.ups[layer_index][0](hidden_representation)
             residual_output = sum(
-                self.resblocks[layer_index * self.num_residual_blocks + block_index](hidden_representation) for block_index in range(self.num_residual_blocks)
+                self.resblocks[layer_index * self.num_residual_blocks + block_index](hidden_representation)
+                for block_index in range(self.num_residual_blocks)
             )
             residual_output = residual_output / self.num_residual_blocks
             hidden_representation = residual_output
@@ -1337,10 +1355,16 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             )
             attn_impl = "sdpa"
         elif config._attn_implementation == "eager":
-            logger.warning_once("Qwen2_5OmniToken2WavModel does not support eager attention implementation, fall back to sdpa")
+            logger.warning_once(
+                "Qwen2_5OmniToken2WavModel does not support eager attention implementation, fall back to sdpa"
+            )
             attn_impl = "sdpa"
-        self.code2wav_dit_model = Qwen2_5OmniToken2WavDiTModel._from_config(config.dit_config, attn_implementation=attn_impl)
-        self.code2wav_bigvgan_model = Qwen2_5OmniToken2WavBigVGANModel._from_config(config.bigvgan_config, attn_implementation=attn_impl)
+        self.code2wav_dit_model = Qwen2_5OmniToken2WavDiTModel._from_config(
+            config.dit_config, attn_implementation=attn_impl
+        )
+        self.code2wav_bigvgan_model = Qwen2_5OmniToken2WavBigVGANModel._from_config(
+            config.bigvgan_config, attn_implementation=attn_impl
+        )
 
         # Streaming-related parameters aligned with Qwen2Code2wav
         self.factor = self.code2wav_dit_model.repeats  # 50Hz=2, 200Hz=4

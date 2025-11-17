@@ -25,7 +25,12 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
-from vllm_omni.entrypoints.log_utils import OrchestratorMetrics, configure_orchestrator_logger, init_stats_paths, remove_old_logs
+from vllm_omni.entrypoints.log_utils import (
+    OrchestratorMetrics,
+    configure_orchestrator_logger,
+    init_stats_paths,
+    remove_old_logs,
+)
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -259,7 +264,8 @@ class OmniLLM:
                     continue
 
                 if result.get("type") == "stage_ready":
-                    # Only happens when stage is initialized slower than expected, so we wait for a short time and try again
+                    # Only happens when stage is initialized slower than expected,
+                    # so we wait for a short time and try again
                     time.sleep(0.05)
                     continue
 
@@ -298,7 +304,8 @@ class OmniLLM:
                         stage_id,
                     )
 
-                    # End-to-end timing and time-per-token for final output (only once per request at the designated final stage)
+                    # End-to-end timing and time-per-token for final output
+                    # (only once per request at the designated final stage)
                     try:
                         rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
                         if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
@@ -500,7 +507,9 @@ class OmniStageLLM(LLM):
             if isinstance(compilation_config, int):
                 compilation_config_instance = CompilationConfig(level=compilation_config)
             elif isinstance(compilation_config, dict):
-                compilation_config_instance = CompilationConfig(**{k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)})
+                compilation_config_instance = CompilationConfig(
+                    **{k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)}
+                )
             else:
                 compilation_config_instance = compilation_config
         else:
@@ -531,7 +540,9 @@ class OmniStageLLM(LLM):
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.processor = OmniProcessor(vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer)
+        self.llm_engine.processor = OmniProcessor(
+            vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
+        )
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()

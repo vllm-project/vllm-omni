@@ -39,7 +39,9 @@ class OmniRequest(Request):
             eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
-            structured_output_request=(StructuredOutputRequest(sampling_params=request.sampling_params) if request.sampling_params else None),
+            structured_output_request=(
+                StructuredOutputRequest(sampling_params=request.sampling_params) if request.sampling_params else None
+            ),
             cache_salt=request.cache_salt,
             priority=request.priority,
             trace_headers=request.trace_headers,

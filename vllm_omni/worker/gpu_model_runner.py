@@ -425,13 +425,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                         common_attn_metadata_list = split_attn_metadata(ubatch_slices, common_attn_metadata)
                         for ubid, common_attn_metadata in enumerate(common_attn_metadata_list):
                             assert common_attn_metadata.max_query_len == 1
-                            attn_metadata_i = attn_group.get_metadata_builder(ubatch_id=ubid).build_for_cudagraph_capture(common_attn_metadata)
+                            attn_metadata_i = attn_group.get_metadata_builder(
+                                ubatch_id=ubid
+                            ).build_for_cudagraph_capture(common_attn_metadata)
                             for layer_name in attn_group.layer_names:
                                 assert type(attn_metadata) is list
                                 attn_metadata[ubid][layer_name] = attn_metadata_i
                     else:
                         assert type(attn_metadata) is dict
-                        attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(common_attn_metadata)  # noqa: E501
+                        attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(
+                            common_attn_metadata
+                        )  # noqa: E501
                         for layer_name in attn_group.layer_names:
                             attn_metadata[layer_name] = attn_metadata_i
 
@@ -484,7 +488,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # we allow forcing NONE when the dispatcher disagrees to support
                 # warm ups for cudagraph capture
                 assert cudagraph_runtime_mode == CUDAGraphMode.NONE or cudagraph_runtime_mode == _cg_mode, (
-                    f"Cudagraph runtime mode mismatch at dummy_run. Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
+                    f"Cudagraph runtime mode mismatch at dummy_run. "
+                    f"Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
                 )
             else:
                 cudagraph_runtime_mode = _cg_mode

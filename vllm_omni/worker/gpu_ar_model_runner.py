@@ -116,7 +116,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 if overlay_len <= 0:
                     continue
                 if pe_cpu is not None:
-                    src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(dtype=self.dtype, device=self.device, non_blocking=True)
+                    src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(
+                        dtype=self.dtype, device=self.device, non_blocking=True
+                    )
                     start_offset = int(self.query_start_loc.cpu[req_index])
                     self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
                 # Build per-request additional information (no cross-request concat)
@@ -124,10 +126,16 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     req_info: dict[str, object] = {}
                     for k, v in addi_cpu.items():
                         if isinstance(v, torch.Tensor):
-                            # For prefill tokens, pass only the scheduled slice; for decode or no scheduled tokens, pass whole tensor
+                            # For prefill tokens, pass only the scheduled slice;
+                            # for decode or no scheduled tokens, pass whole tensor
                             if overlay_len > 0:
                                 try:
-                                    seg = v[num_computed_tokens : num_computed_tokens + overlay_len].detach().to("cpu").contiguous()
+                                    seg = (
+                                        v[num_computed_tokens : num_computed_tokens + overlay_len]
+                                        .detach()
+                                        .to("cpu")
+                                        .contiguous()
+                                    )
                                 except Exception:
                                     seg = v.detach().to("cpu").contiguous()
                                 req_info[k] = seg
@@ -184,7 +192,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_input_tokens, intermediate_tensors, True)
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                num_input_tokens, intermediate_tensors, True
+            )
 
         if self.model_config.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             encoder_inputs = self._extract_encoder_inputs(scheduler_output)
@@ -308,7 +318,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_tokens_after_padding,
             )
 
-            uniform_decode = (max_query_len == self.uniform_decode_query_len) and (num_scheduled_tokens == self.input_batch.num_reqs * max_query_len)
+            uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
+                num_scheduled_tokens == self.input_batch.num_reqs * max_query_len
+            )
             batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens, uniform_decode=uniform_decode)
             cudagraph_runtime_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(batch_descriptor)
 
@@ -345,7 +357,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     per_req_runtime_info.append(info if isinstance(info, dict) else {})
                 model_kwargs_extra["runtime_additional_information"] = per_req_runtime_info
                 model_kwargs_extra["request_ids"] = self.input_batch.req_ids
-                # Pass each request's token span within the flattened sequence for this step, enabling the model to map decode/prefill by request
+                # Pass each request's token span within the flattened sequence for this step,
+                # enabling the model to map decode/prefill by request
                 req_token_spans = []
                 for req_index in range(len(self.input_batch.req_ids)):
                     start_offset = int(self.query_start_loc.cpu[req_index])
@@ -381,7 +394,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # the runner merges it into the corresponding request's additional_information_cpu for subsequent decode.
             try:
                 if isinstance(multimodal_outputs, dict) and (
-                    "additional_information_update" in multimodal_outputs or "additional_information_update_by_req_id" in multimodal_outputs
+                    "additional_information_update" in multimodal_outputs
+                    or "additional_information_update_by_req_id" in multimodal_outputs
                 ):
                     # Option A: list[dict] in batch order
                     updates_list = multimodal_outputs.get("additional_information_update")
@@ -426,7 +440,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 assert not self.is_pooling_model
 
                 if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {"residual": not is_residual_scattered_for_sp(self.vllm_config, num_input_tokens)}
+                    all_gather_tensors = {
+                        "residual": not is_residual_scattered_for_sp(self.vllm_config, num_input_tokens)
+                    }
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
                         all_gather_group=get_tp_group(),
@@ -441,7 +457,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 if logits is not None:
                     model_output_broadcast_data["logits"] = logits.contiguous()
 
-                model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(model_output_broadcast_data, src=len(get_pp_group().ranks) - 1)
+                model_output_broadcast_data = get_pp_group().broadcast_tensor_dict(
+                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                )
                 assert model_output_broadcast_data is not None
                 logits = model_output_broadcast_data["logits"]
 
@@ -467,7 +485,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 )
 
         use_padded_batch_for_eagle = (
-            self.speculative_config and self.speculative_config.use_eagle() and not self.speculative_config.disable_padded_drafter_batch
+            self.speculative_config
+            and self.speculative_config.use_eagle()
+            and not self.speculative_config.disable_padded_drafter_batch
         )
         effective_drafter_max_model_len = self.max_model_len
         if effective_drafter_max_model_len is None:
@@ -479,7 +499,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
         ):
             effective_drafter_max_model_len = self.speculative_config.draft_model_config.max_model_len
         input_fits_in_drafter = spec_decode_common_attn_metadata and (
-            spec_decode_common_attn_metadata.seq_lens.max() + self.speculative_config.num_speculative_tokens <= effective_drafter_max_model_len
+            spec_decode_common_attn_metadata.seq_lens.max() + self.speculative_config.num_speculative_tokens
+            <= effective_drafter_max_model_len
         )
         if use_padded_batch_for_eagle and input_fits_in_drafter:
             # EAGLE speculative decoding can use the GPU sampled tokens

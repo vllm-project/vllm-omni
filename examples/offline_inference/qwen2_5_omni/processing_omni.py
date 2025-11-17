@@ -71,7 +71,9 @@ def smart_resize(
     3. The aspect ratio of the image is maintained as closely as possible.
     """
     if max(height, width) / min(height, width) > MAX_RATIO:
-        raise ValueError(f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}")
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {max(height, width) / min(height, width)}"
+        )
     h_bar = max(factor, round_by_factor(height, factor))
     w_bar = max(factor, round_by_factor(width, factor))
     if h_bar * w_bar > max_pixels:
@@ -204,7 +206,9 @@ def _read_video_torchvision(
     )
     total_frames, video_fps = video.size(0), info["video_fps"]
     total_duration = round(total_frames / video_fps, 3)
-    logger.info(f"torchvision:  {video_path=}, {total_frames=}, {video_fps=}, duration={total_duration}s, time={time.time() - st:.3f}s")
+    logger.info(
+        f"torchvision:  {video_path=}, {total_frames=}, {video_fps=}, duration={total_duration}s, time={time.time() - st:.3f}s"
+    )
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(0, total_frames - 1, nframes).round().long()
     video = video[idx]
@@ -314,7 +318,10 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR) -> torch.Tensor | l
         process_info = ele.copy()
         process_info.pop("type", None)
         process_info.pop("video", None)
-        images = [fetch_image({"image": video_element, **process_info}, size_factor=image_factor) for video_element in ele["video"]]
+        images = [
+            fetch_image({"image": video_element, **process_info}, size_factor=image_factor)
+            for video_element in ele["video"]
+        ]
         nframes = ceil_by_factor(len(images), FRAME_FACTOR)
         if len(images) < nframes:
             images.extend([images[-1]] * (nframes - len(images)))
@@ -329,7 +336,12 @@ def extract_vision_info(conversations: list[dict] | list[list[dict]]) -> list[di
         for message in conversation:
             if isinstance(message["content"], list):
                 for ele in message["content"]:
-                    if "image" in ele or "image_url" in ele or "video" in ele or ele["type"] in ("image", "image_url", "video"):
+                    if (
+                        "image" in ele
+                        or "image_url" in ele
+                        or "video" in ele
+                        or ele["type"] in ("image", "image_url", "video")
+                    ):
                         vision_infos.append(ele)
     return vision_infos
 

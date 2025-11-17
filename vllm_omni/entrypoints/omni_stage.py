@@ -27,7 +27,12 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
-from vllm_omni.entrypoints.stage_utils import _to_dict, maybe_dump_to_shm, maybe_load_from_ipc_with_metrics, set_stage_gpu_devices
+from vllm_omni.entrypoints.stage_utils import (
+    _to_dict,
+    maybe_dump_to_shm,
+    maybe_load_from_ipc_with_metrics,
+    set_stage_gpu_devices,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
@@ -180,7 +185,9 @@ class OmniStage:
         except Exception:
             return None
 
-    def process_engine_inputs(self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None) -> list[Union[OmniTokensPrompt, TextPrompt]]:
+    def process_engine_inputs(
+        self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None
+    ) -> list[Union[OmniTokensPrompt, TextPrompt]]:
         """Process the engine input for the stage."""
         if self.custom_process_input_func is None:
             engine_inputs = []
@@ -190,7 +197,10 @@ class OmniStage:
             source_outputs = stage_list[source_stage_id].engine_outputs
             if not isinstance(prompt, list):
                 prompt = [prompt]
-            multi_modal_data = {source_output.request_id: p.get("multi_modal_data", None) for source_output, p in zip(source_outputs, prompt)}
+            multi_modal_data = {
+                source_output.request_id: p.get("multi_modal_data", None)
+                for source_output, p in zip(source_outputs, prompt)
+            }
 
             for source_output in source_outputs:
                 engine_input = OmniTokensPrompt(
@@ -239,7 +249,9 @@ def _stage_worker(
             stage_log.setLevel(_logging.DEBUG)
             fh = _logging.FileHandler(f"{log_file}.stage{stage_id}.log")
             fh.setLevel(_logging.DEBUG)
-            fh.setFormatter(_logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s"))
+            fh.setFormatter(
+                _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
+            )
 
             class _StageFilter(_logging.Filter):
                 def filter(self, record: _logging.LogRecord) -> bool:
@@ -372,7 +384,9 @@ def _stage_worker(
                 _agg_total_gen_time_ms += _gen_ms
 
             if _stats_file:
-                _avg_tokens_per_s = (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+                _avg_tokens_per_s = (
+                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+                )
                 log_stage_running_avg(
                     _stats_file,
                     stage_id,
@@ -509,7 +523,9 @@ async def _stage_worker_async(
             stage_log.setLevel(_logging.DEBUG)
             fh = _logging.FileHandler(f"{log_file}.stage{stage_id}.log")
             fh.setLevel(_logging.DEBUG)
-            fh.setFormatter(_logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s"))  # noqa: E501
+            fh.setFormatter(
+                _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
+            )  # noqa: E501
 
             class _StageFilter(_logging.Filter):
                 def filter(self, record: _logging.LogRecord) -> bool:
@@ -622,7 +638,9 @@ async def _stage_worker_async(
             _agg_total_gen_time_ms += _gen_ms
 
             if _stats_file:
-                _avg_tokens_per_s = (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+                _avg_tokens_per_s = (
+                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+                )
                 log_stage_running_avg(
                     _stats_file,
                     stage_id,

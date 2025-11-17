@@ -287,7 +287,9 @@ class Qwen2Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(["hidden_states", "residual"], config.hidden_size)
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -493,7 +495,9 @@ class Qwen2EmbeddingModel(nn.Module, SupportsLoRA, SupportsPP):
                 " explicitly."
             )
 
-        self._pooler = Pooler.from_config_with_defaults(pooler_config, pooling_type=PoolingType.MEAN, normalize=True, softmax=False)
+        self._pooler = Pooler.from_config_with_defaults(
+            pooler_config, pooling_type=PoolingType.MEAN, normalize=True, softmax=False
+        )
 
     def forward(
         self,

@@ -128,7 +128,9 @@ def log_transfer_rx(
             "rx_bytes": int(rx_bytes),
             "rx_decode_time_ms": float(rx_decode_time_ms),
             "in_flight_time_ms": float(in_flight_time_ms),
-            "rx_time_per_kb_ms": ((float(rx_decode_time_ms) / max(float(rx_bytes) / 1024.0, 1e-6)) if rx_bytes > 0 else 0.0),
+            "rx_time_per_kb_ms": (
+                (float(rx_decode_time_ms) / max(float(rx_bytes) / 1024.0, 1e-6)) if rx_bytes > 0 else 0.0
+            ),
         },
     )
 
@@ -156,7 +158,9 @@ def log_transfer_total(
             "in_flight_time_ms": float(in_flight_time_ms),
             "rx_decode_time_ms": float(rx_decode_time_ms),
             "total_time_ms": float(total_time_ms),
-            "total_time_per_kb_ms": (float(total_time_ms) / max(float(size_bytes) / 1024.0, 1e-6) if size_bytes > 0 else 0.0),
+            "total_time_per_kb_ms": (
+                float(total_time_ms) / max(float(size_bytes) / 1024.0, 1e-6) if size_bytes > 0 else 0.0
+            ),
         },
     )
 
@@ -274,7 +278,11 @@ def compute_and_log_stage_request_stats(
     """Compute per-request metrics and log them in one call."""
     num_tokens = count_tokens_from_outputs(engine_outputs)
     tokens_per_s = (num_tokens * 1000.0 / stage_gen_time_ms) if stage_gen_time_ms > 0 else 0.0
-    rx_mbps = (float(rx_transfer_bytes) * 8.0) / (max(float(rx_decode_time_ms), 1e-6) * 1000.0) if rx_transfer_bytes > 0 else 0.0
+    rx_mbps = (
+        (float(rx_transfer_bytes) * 8.0) / (max(float(rx_decode_time_ms), 1e-6) * 1000.0)
+        if rx_transfer_bytes > 0
+        else 0.0
+    )
     log_stage_request_stats(
         stats_file,
         stage_id,
@@ -645,7 +653,9 @@ class OrchestratorMetrics:
         for sid in range(self.num_stages):
             first_ts = self.stage_first_ts[sid]
             last_ts = self.stage_last_ts[sid]
-            total_ms = (max(0.0, (last_ts - first_ts)) * 1000.0) if (first_ts is not None and last_ts is not None) else 0.0
+            total_ms = (
+                (max(0.0, (last_ts - first_ts)) * 1000.0) if (first_ts is not None and last_ts is not None) else 0.0
+            )
             reqs = self.stage_req_counts[sid]
             tokens = self.stage_total_tokens[sid]
             avg_req = (total_ms / reqs) if reqs > 0 else 0.0

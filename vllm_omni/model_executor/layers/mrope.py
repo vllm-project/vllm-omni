@@ -72,7 +72,10 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         self.mrope_section = mrope_section
         if self.mrope_section:
-            print("Warning: mrope_section check is disabled in Qwen2.5-Omni, this may cause errors, and should be restored in the future.")
+            print(
+                "Warning: mrope_section check is disabled in Qwen2.5-Omni, "
+                "this may cause errors, and should be restored in the future."
+            )
             # assert sum(self.mrope_section) == rotary_dim // 2
 
     def forward(
@@ -380,7 +383,15 @@ class MRotaryEmbedding(RotaryEmbedding):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
-            t_index = (torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w) * video_second_per_grid_t * tokens_per_second).long().flatten()
+            t_index = (
+                (
+                    torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w)
+                    * video_second_per_grid_t
+                    * tokens_per_second
+                )
+                .long()
+                .flatten()
+            )
 
             h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
             w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
@@ -485,7 +496,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 grid_hs = image_grid_thw[:, 1]
                 grid_ws = image_grid_thw[:, 2]
                 t_index = (torch.arange(grid_t) * 1 * tokens_per_second).long()
-                llm_pos_ids = cls._get_llm_pos_ids_for_vision(start_idx, image_idx, spatial_merge_size, t_index, grid_hs, grid_ws)
+                llm_pos_ids = cls._get_llm_pos_ids_for_vision(
+                    start_idx, image_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                )
                 llm_pos_ids_list.append(llm_pos_ids)
                 vision_seqlen = image_grid_thw[image_idx].prod() // (spatial_merge_size**2)
                 new_src_item.extend([image_token_id] * vision_seqlen)
@@ -495,7 +508,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 grid_hs = video_grid_thw[:, 1]
                 grid_ws = video_grid_thw[:, 2]
                 t_index = (torch.arange(grid_t) * second_per_grid_ts[video_idx] * tokens_per_second).long()
-                llm_pos_ids = cls._get_llm_pos_ids_for_vision(start_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws)
+                llm_pos_ids = cls._get_llm_pos_ids_for_vision(
+                    start_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                )
                 llm_pos_ids_list.append(llm_pos_ids)
                 vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
                 new_src_item.extend([video_token_id] * vision_seqlen)
@@ -530,10 +545,13 @@ class MRotaryEmbedding(RotaryEmbedding):
                     ).split(1, dim=1)
                     llm_pos_ids_list.extend(vision_llm_pos_ids_list)
                     new_src_item.extend(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len) * [audio_token_id])
-                    audio_start_idx = start_idx if len(audio_llm_pos_ids_list) == 0 else audio_llm_pos_ids_list[-1][0].item() + 1
+                    audio_start_idx = (
+                        start_idx if len(audio_llm_pos_ids_list) == 0 else audio_llm_pos_ids_list[-1][0].item() + 1
+                    )
                     if min(t_ntoken_per_chunk, pure_audio_len - added_audio_len) > 0:
                         audio_llm_pos_ids_list = (
-                            torch.arange(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)).expand(3, -1) + audio_start_idx
+                            torch.arange(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)).expand(3, -1)
+                            + audio_start_idx
                         ).split(1, dim=1)
                     else:
                         audio_llm_pos_ids_list = []
@@ -541,7 +559,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                     llm_pos_ids_list.extend(audio_llm_pos_ids_list)
                 if added_audio_len < pure_audio_len:
                     new_src_item.extend((pure_audio_len - added_audio_len) * [audio_token_id])
-                    audio_llm_pos_ids_list = (torch.arange(pure_audio_len - added_audio_len).expand(3, -1) + llm_pos_ids_list[-1].max() + 1).split(1, dim=1)
+                    audio_llm_pos_ids_list = (
+                        torch.arange(pure_audio_len - added_audio_len).expand(3, -1) + llm_pos_ids_list[-1].max() + 1
+                    ).split(1, dim=1)
                     llm_pos_ids_list.extend(audio_llm_pos_ids_list)
                 audio_idx += 1
                 video_idx += 1
@@ -568,7 +588,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         llm_grid_w = grid_ws[vision_idx] // spatial_merge_size
         h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(len(t_index), -1, llm_grid_w).flatten()
         w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(len(t_index), llm_grid_h, -1).flatten()
-        t_index_tensor = torch.Tensor(t_index).to(llm_grid_h.device).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).long().flatten()
+        t_index_tensor = (
+            torch.Tensor(t_index).to(llm_grid_h.device).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).long().flatten()
+        )
         _llm_pos_ids = torch.stack([t_index_tensor, h_index, w_index])
         llm_pos_ids_list.append(_llm_pos_ids + start_idx)
         llm_pos_ids = torch.cat(llm_pos_ids_list, dim=1)

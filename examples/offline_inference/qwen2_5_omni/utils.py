@@ -91,7 +91,9 @@ def fetch_and_read_video(args, video_url: str, fps=2):
     if isinstance(video_url, str) and video_url.startswith("http"):
         with tempfile.NamedTemporaryFile(delete=True) as temp_video_file:
             resp = requests.get(video_url)
-            assert resp.status_code == requests.codes.ok, f"Failed to fetch video from {video_url}, status_code:{resp.status_code}, resp:{resp}"
+            assert resp.status_code == requests.codes.ok, (
+                f"Failed to fetch video from {video_url}, status_code:{resp.status_code}, resp:{resp}"
+            )
 
             temp_video_file.write(urlopen(video_url).read())
             temp_video_file_path = temp_video_file.name

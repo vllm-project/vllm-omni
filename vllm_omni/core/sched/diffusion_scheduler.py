@@ -92,10 +92,15 @@ class DiffusionScheduler(OmniScheduler):
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
-            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request, len(self.running))
+            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(
+                any_request, len(self.running)
+            )
 
         # Assemble SchedulerOutput
-        new_reqs_data = [OmniNewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids()) for req in scheduled_new_reqs]
+        new_reqs_data = [
+            OmniNewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+            for req in scheduled_new_reqs
+        ]
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -104,7 +109,9 @@ class DiffusionScheduler(OmniScheduler):
             req_to_new_blocks,
         )
         scheduled_requests = scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
-        structured_output_request_ids, grammar_bitmask = self.get_grammar_bitmask(scheduled_requests, scheduled_spec_decode_tokens)
+        structured_output_request_ids, grammar_bitmask = self.get_grammar_bitmask(
+            scheduled_requests, scheduled_spec_decode_tokens
+        )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         scheduler_output = SchedulerOutput(

@@ -7,7 +7,11 @@ from typing import NamedTuple, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniConfig, Qwen2_5OmniTalkerConfig, Qwen2_5OmniThinkerConfig
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+    Qwen2_5OmniConfig,
+    Qwen2_5OmniTalkerConfig,
+    Qwen2_5OmniThinkerConfig,
+)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
@@ -49,7 +53,9 @@ logger = init_logger(__name__)
     info=Qwen2_5OmniThinkerProcessingInfo,
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
-class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin):
+class Qwen2_5OmniForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin
+):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
@@ -116,7 +122,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
             raise ValueError("Invalid model stage")
 
         # Set up intermediate tensors
-        self.make_empty_intermediate_tensors = (self.thinker.make_empty_intermediate_tensors) if self.model_stage == "thinker" else lambda: None
+        self.make_empty_intermediate_tensors = (
+            (self.thinker.make_empty_intermediate_tensors) if self.model_stage == "thinker" else lambda: None
+        )
 
     # -------------------- Device utilities --------------------
     @staticmethod
@@ -213,7 +221,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
             # if input_ids is None, set it to a zero tensor, in the length of the
             # same as the embedding seq length
             if input_ids is None:
-                input_ids = torch.zeros(inputs_embeds.shape[1], dtype=torch.long, device=thinker_dev).unsqueeze(0)  # (1, 0)
+                input_ids = torch.zeros(inputs_embeds.shape[1], dtype=torch.long, device=thinker_dev).unsqueeze(
+                    0
+                )  # (1, 0)
                 added_batch_dim = True
 
             # 1) Thinker (ensure inputs on thinker's device)
@@ -249,9 +259,11 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
             # Rules:
             # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
             # - Decode segments consist of a single non-special token.
-            # - If additional_information is provided (can be a list split by request or a concatenated tensor plus a list of shapes),
+            # - If additional_information is provided
+            # (can be a list split by request or a concatenated tensor plus a list of shapes),
             #   then for each request, reconstruct the thinker→talker input embeddings for the Prefill segments;
-            # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional), add them; otherwise, keep the original embedding.
+            # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional), add them;
+            # otherwise, keep the original embedding.
 
             if input_ids is None and additional_information is None:
                 input_ids = torch.zeros(
@@ -277,7 +289,11 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
 
             # Normalize runtime_addi into a mapping by request_id for convenience
             runtime_addi_by_req: dict[str, dict] = {}
-            if isinstance(request_ids, list) and isinstance(runtime_addi, list) and len(runtime_addi) == len(request_ids):
+            if (
+                isinstance(request_ids, list)
+                and isinstance(runtime_addi, list)
+                and len(runtime_addi) == len(request_ids)
+            ):
                 for i, rid in enumerate(request_ids):
                     if isinstance(rid, str) and isinstance(runtime_addi[i], dict):
                         runtime_addi_by_req[rid] = runtime_addi[i]
@@ -290,7 +306,12 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
             update_by_req_id: dict[str, dict] = {}
 
             # ------- Prefill: span_len > 1 -------
-            if not is_profile and isinstance(request_ids, list) and isinstance(request_token_spans, list) and isinstance(addi_by_req, dict):
+            if (
+                not is_profile
+                and isinstance(request_ids, list)
+                and isinstance(request_token_spans, list)
+                and isinstance(addi_by_req, dict)
+            ):
                 for idx_req, rid in enumerate(request_ids):
                     s, e = request_token_spans[idx_req]
                     span_len = int(e) - int(s)
@@ -337,7 +358,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
 
                     # Prepare per-request reply queue for subsequent decode: drop first row
                     if tr.ndim == 2 and tr.shape[0] > 0:
-                        update_by_req_id.setdefault(rid, {})["thinker_reply_part_per_request"] = tr[1:].detach().to("cpu").contiguous()
+                        update_by_req_id.setdefault(rid, {})["thinker_reply_part_per_request"] = (
+                            tr[1:].detach().to("cpu").contiguous()
+                        )
 
             # ------- Decode: span_len == 1 -------
             if not is_profile and isinstance(request_ids, list) and isinstance(request_token_spans, list):
@@ -361,7 +384,11 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                         dv = info.get("decode_output_prompt_embeds") if isinstance(info, dict) else None
                         if isinstance(dv, torch.Tensor) and dv.numel() > 0:
                             step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
-                        elif hasattr(self, "thinker_reply_part") and isinstance(self.thinker_reply_part, torch.Tensor) and self.thinker_reply_part.numel() > 0:
+                        elif (
+                            hasattr(self, "thinker_reply_part")
+                            and isinstance(self.thinker_reply_part, torch.Tensor)
+                            and self.thinker_reply_part.numel() > 0
+                        ):
                             # C) fallback shared pool
                             step_vec = self.thinker_reply_part[0:1]
                             self.thinker_reply_part = self.thinker_reply_part[1:]
@@ -386,7 +413,8 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                 multimodal_outputs = {"additional_information_update_by_req_id": update_by_req_id}
 
             if sampling_metadata is not None:
-                # the padding token id is set to text model's pad token id, which do not match with the talker model's word embedding size
+                # the padding token id is set to text model's pad token id,
+                # which do not match with the talker model's word embedding size
                 sampling_metadata.prompt_token_ids[sampling_metadata.prompt_token_ids == 152064] = 8448
 
             return OmniOutput(
@@ -420,7 +448,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                     ).to(self._module_device(self.model)),
                     self.talker.thinker_to_talker_proj(
                         self.talker.get_input_embeddings(
-                            torch.tensor([TALKER_CODEC_BOS_TOKEN_ID, TALKER_CODEC_EOS_TOKEN_ID]).to(torch.bfloat16).to(self._module_device(self.model))
+                            torch.tensor([TALKER_CODEC_BOS_TOKEN_ID, TALKER_CODEC_EOS_TOKEN_ID])
+                            .to(torch.bfloat16)
+                            .to(self._module_device(self.model))
                         )
                     )[0],
                 ],
@@ -577,7 +607,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                 self.talker_config.tts_codec_start_token_id,
             ][-input_tokens_len:]
         if isinstance(prompt_token_ids_processed, list):
-            prompt_token_ids_processed = torch.Tensor(prompt_token_ids_processed).to(torch.int64).to(self._module_device(self.talker))
+            prompt_token_ids_processed = (
+                torch.Tensor(prompt_token_ids_processed).to(torch.int64).to(self._module_device(self.talker))
+            )
         return prompt_token_ids_processed, prompt_embeds
 
     def _thinker_to_talker_decode_one_step(
@@ -585,7 +617,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
         output_prompt_embeds,
         output_token_ids,
     ):
-        processed_output_token_embeds = output_prompt_embeds + self.talker.get_input_embeddings(output_token_ids)  # for decode
+        processed_output_token_embeds = output_prompt_embeds + self.talker.get_input_embeddings(
+            output_token_ids
+        )  # for decode
         return output_token_ids, processed_output_token_embeds
 
     def compute_logits(self, hidden_states: Union[torch.Tensor, OmniOutput]) -> Optional[torch.Tensor]:
@@ -625,7 +659,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
         # Generate audio using token2wav model
         return self._codec_to_audio(codec_tokens, voice_type=voice_type)
 
-    def _convert_to_codec_tokens(self, talker_output: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor:
+    def _convert_to_codec_tokens(
+        self, talker_output: torch.Tensor, sampling_metadata: SamplingMetadata
+    ) -> torch.Tensor:
         """
         Reference (HF): use the talker's codec head to obtain logits, suppress BOS,
         then greedily select the next codec token for the current step.
@@ -806,7 +842,9 @@ class Qwen2_5OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Support
                         thinker_embedding_weights[0].shape[0],
                         thinker_embedding_weights[0].shape[1],
                     )
-                    self.thinker_embedding.weight = nn.Parameter(thinker_embedding_weights[0].to(self._module_device(self.talker)))
+                    self.thinker_embedding.weight = nn.Parameter(
+                        thinker_embedding_weights[0].to(self._module_device(self.talker))
+                    )
             talker_loaded = self.talker.load_weights(talker_weights)
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)

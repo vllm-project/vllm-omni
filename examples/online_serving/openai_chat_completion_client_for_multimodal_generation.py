@@ -81,7 +81,9 @@ def run_text_to_audio(model: str) -> None:
             },
         ],
         model=model,
-        extra_body={"sampling_params_list": sampling_params_list},  # Optional, it has a default setting in stage_configs of the corresponding model.
+        extra_body={
+            "sampling_params_list": sampling_params_list
+        },  # Optional, it has a default setting in stage_configs of the corresponding model.
     )
 
     count = 0

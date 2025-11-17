@@ -1,5 +1,11 @@
 from vllm.inputs.data import SingletonPrompt
-from vllm.inputs.parse import ParsedEmbedsPrompt, ParsedSingletonPrompt, ParsedStrPrompt, ParsedTextPrompt, ParsedTokensPrompt
+from vllm.inputs.parse import (
+    ParsedEmbedsPrompt,
+    ParsedSingletonPrompt,
+    ParsedStrPrompt,
+    ParsedTextPrompt,
+    ParsedTokensPrompt,
+)
 
 
 def parse_singleton_prompt_omni(prompt: SingletonPrompt) -> ParsedSingletonPrompt:

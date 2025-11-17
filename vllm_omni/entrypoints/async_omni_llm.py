@@ -36,7 +36,12 @@ from vllm_omni.config import OmniModelConfig
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
-from vllm_omni.entrypoints.log_utils import OrchestratorMetrics, configure_orchestrator_logger, init_stats_paths, remove_old_logs
+from vllm_omni.entrypoints.log_utils import (
+    OrchestratorMetrics,
+    configure_orchestrator_logger,
+    init_stats_paths,
+    remove_old_logs,
+)
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -618,7 +623,10 @@ class AsyncOmniStageLLM(AsyncLLM):
 
         self.log_stats = log_stats or (stat_loggers is not None)
         if not log_stats and stat_loggers is not None:
-            logger.info("AsyncLLM created with log_stats=False and non-empty custom logger list; enabling logging without default stat loggers")
+            logger.info(
+                "AsyncLLM created with log_stats=False and non-empty custom logger list; "
+                "enabling logging without default stat loggers"
+            )
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
@@ -684,7 +692,9 @@ class AsyncOmniStageLLM(AsyncLLM):
                     torch.profiler.ProfilerActivity.CPU,
                 ],
                 with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(envs.VLLM_TORCH_PROFILER_DIR, worker_name=worker_name, use_gzip=True),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    envs.VLLM_TORCH_PROFILER_DIR, worker_name=worker_name, use_gzip=True
+                ),
             )
         else:
             self.profiler = None

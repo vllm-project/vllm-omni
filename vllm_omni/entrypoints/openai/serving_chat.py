@@ -43,7 +43,11 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.transformers_utils.tokenizers import maybe_serialize_tool_calls, truncate_tool_call_ids, validate_request_params
+from vllm.transformers_utils.tokenizers import (
+    maybe_serialize_tool_calls,
+    truncate_tool_call_ids,
+    validate_request_params,
+)
 from vllm.utils import as_list
 
 from vllm_omni.outputs import OmniRequestOutput
@@ -100,7 +104,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             ):
                 # for hf tokenizers, "auto" tools requires
                 # --enable-auto-tool-choice and --tool-call-parser
-                return self.create_error_response('"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set')
+                return self.create_error_response(
+                    '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+                )
 
             if request.tools is None or (request.tool_choice == "none" and self.exclude_tools_when_tool_choice_none):
                 tool_dicts = None
@@ -111,10 +117,12 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             request_chat_template = request.chat_template
             chat_template_kwargs = request.chat_template_kwargs
             if not self.trust_request_chat_template and (
-                request_chat_template is not None or (chat_template_kwargs and chat_template_kwargs.get("chat_template") is not None)
+                request_chat_template is not None
+                or (chat_template_kwargs and chat_template_kwargs.get("chat_template") is not None)
             ):
                 return self.create_error_response(
-                    "Chat template is passed with request, but --trust-request-chat-template is not set. Refused request with untrusted chat template."
+                    "Chat template is passed with request, but --trust-request-chat-template is not set. "
+                    "Refused request with untrusted chat template."
                 )
             (
                 conversation,
@@ -237,7 +245,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             prompt_token_ids = getattr(inputs, "prompt_token_ids", None)
 
         logger.info(
-            "Received request %s: prompt: %r, params_list: %s, prompt_token_ids: %s, prompt_embeds shape: %s, lora_request: %s.",
+            "Received request %s: prompt: %r, params_list: %s, prompt_token_ids: %s, prompt_embeds shape: %s, lora_request: %s.",  # noqa: E501
             request_id,
             prompt,
             params_list,
@@ -432,7 +440,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
             if (not self.enable_auto_tools or not self.tool_parser) and (
-                not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam) and request.tool_choice != "required"
+                not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+                and request.tool_choice != "required"
             ):
                 message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
@@ -492,7 +501,12 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             # handle when there are tools and tool choice is auto
-            elif request.tools and (request.tool_choice == "auto" or request.tool_choice is None) and self.enable_auto_tools and self.tool_parser:
+            elif (
+                request.tools
+                and (request.tool_choice == "auto" or request.tool_choice is None)
+                and self.enable_auto_tools
+                and self.tool_parser
+            ):
                 try:
                     tool_parser = self.tool_parser(tokenizer)
                 except RuntimeError as e:
@@ -529,14 +543,19 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # undetermined case that is still important to handle
             else:
-                logger.error("Error in chat_completion_full_generator - cannot determine if tools should be extracted. Returning a standard chat completion.")
+                logger.error(
+                    "Error in chat_completion_full_generator - cannot determine if tools should be extracted. "
+                    "Returning a standard chat completion."
+                )
                 message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
-                finish_reason=("tool_calls" if auto_tools_called else output.finish_reason if output.finish_reason else "stop"),
+                finish_reason=(
+                    "tool_calls" if auto_tools_called else output.finish_reason if output.finish_reason else "stop"
+                ),
                 stop_reason=output.stop_reason,
                 token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
             )
@@ -579,7 +598,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Convert numpy array to WAV bytes and encode as base64
         if soundfile is None:
-            raise ImportError("soundfile is required for audio generation. Please install it with: pip install soundfile")
+            raise ImportError(
+                "soundfile is required for audio generation. Please install it with: pip install soundfile"
+            )
 
         # Default sample rate for TTS models (typically 24000 Hz)
         # You may need to adjust this based on your model's configuration

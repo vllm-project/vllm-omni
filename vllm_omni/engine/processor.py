@@ -18,7 +18,12 @@ from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine.processor import Processor
 
-from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
+from vllm_omni.engine import (
+    AdditionalInformationEntry,
+    AdditionalInformationPayload,
+    OmniEngineCoreRequest,
+    PromptEmbedsPayload,
+)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 
 logger = init_logger(__name__)

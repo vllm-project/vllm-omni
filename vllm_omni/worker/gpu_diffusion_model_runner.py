@@ -123,7 +123,9 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_input_tokens, intermediate_tensors, True)
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                num_input_tokens, intermediate_tensors, True
+            )
 
         if self.model_config.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             encoder_inputs = self._extract_encoder_inputs(scheduler_output)
@@ -281,7 +283,8 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
         # TODO: add the diffuse method for other models
 
         raise RuntimeError(
-            "The loaded model does not expose diffusion interfaces 'sample', 'forward', or 'diffuse'. Please implement one of them or adapt the runner."
+            "The loaded model does not expose diffusion interfaces 'sample', 'forward', or 'diffuse'. "
+            "Please implement one of them or adapt the runner."
         )
 
     @torch.inference_mode()
@@ -400,7 +403,9 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
                     assert type(attn_metadata) is dict
-                    attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(common_attn_metadata)  # noqa: E501
+                    attn_metadata_i = attn_group.get_metadata_builder().build_for_cudagraph_capture(
+                        common_attn_metadata
+                    )  # noqa: E501
                     for layer_name in attn_group.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
@@ -453,7 +458,8 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                 # we allow forcing NONE when the dispatcher disagrees to support
                 # warm ups for cudagraph capture
                 assert cudagraph_runtime_mode == CUDAGraphMode.NONE or cudagraph_runtime_mode == _cg_mode, (
-                    f"Cudagraph runtime mode mismatch at dummy_run. Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
+                    f"Cudagraph runtime mode mismatch at dummy_run. "
+                    f"Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
                 )
             else:
                 cudagraph_runtime_mode = _cg_mode
@@ -520,7 +526,8 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
                     max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[dummy_modality]
 
                     logger.info(
-                        "Encoder cache will be initialized with a budget of %s tokens, and profiled with %s %s items of the maximum feature size.",
+                        "Encoder cache will be initialized with a budget "
+                        "of %s tokens, and profiled with %s %s items of the maximum feature size.",
                         encoder_budget,
                         max_mm_items_per_batch,
                         dummy_modality,
