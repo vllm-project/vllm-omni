@@ -382,7 +382,7 @@ class GPUDiffusionModelRunner(OmniGPUModelRunner):
             self.seq_lens.np[num_reqs:] = 0
             self.seq_lens.copy_to_gpu()
 
-            cum_num_tokens, _ = self._get_cumsum_and_arrange(num_scheduled_tokens)
+            cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
 

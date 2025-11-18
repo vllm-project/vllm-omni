@@ -152,5 +152,6 @@ markers = [
 extend-ignore-identifiers-re = [
     ".*_thw",
     ".*thw",
-    "ein"
+    "ein",
+    ".*arange"
 ]
