@@ -47,6 +47,7 @@ dev = [
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "gradio>=5.49.1",
+    "soundfile>=0.13.1"
 ]
 
 docs = [
