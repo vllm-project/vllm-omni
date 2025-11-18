@@ -7,8 +7,8 @@ import numpy as np
 import soundfile as sf
 import torch
 from utils import make_omni_prompt
-
 from vllm.sampling_params import SamplingParams
+
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
 _os_env_toggle.environ["VLLM_USE_V1"] = "1"
@@ -45,29 +45,17 @@ def parse_args():
         default="Qwen/Qwen2.5-Omni-7B",
         help="Hugging Face repo id to download if needed.",
     )
-    parser.add_argument(
-        "--hf-revision", default=None, help="Optional HF revision (branch/tag/commit)."
-    )
-    parser.add_argument(
-        "--prompts", nargs="+", default=None, help="Input text prompts."
-    )
-    parser.add_argument(
-        "--voice-type", default="default", help="Voice type, e.g., m02, f030, default."
-    )
+    parser.add_argument("--hf-revision", default=None, help="Optional HF revision (branch/tag/commit).")
+    parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
+    parser.add_argument("--voice-type", default="default", help="Voice type, e.g., m02, f030, default.")
     parser.add_argument(
         "--code2wav-dir",
         default=None,
         help="Path to code2wav folder (contains spk_dict.pt).",
     )
-    parser.add_argument(
-        "--dit-ckpt", default=None, help="Path to DiT checkpoint file (e.g., dit.pt)."
-    )
-    parser.add_argument(
-        "--bigvgan-ckpt", default=None, help="Path to BigVGAN checkpoint file."
-    )
-    parser.add_argument(
-        "--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"]
-    )
+    parser.add_argument("--dit-ckpt", default=None, help="Path to DiT checkpoint file (e.g., dit.pt).")
+    parser.add_argument("--bigvgan-ckpt", default=None, help="Path to BigVGAN checkpoint file.")
+    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument(
         "--init-sleep-seconds",
@@ -163,7 +151,7 @@ def main():
     try:
         # Preferred: load from txt file (one prompt per line)
         if getattr(args, "txt_prompts", None) and args.prompt_type == "text":
-            with open(args.txt_prompts, "r", encoding="utf-8") as f:
+            with open(args.txt_prompts, encoding="utf-8") as f:
                 lines = [ln.strip() for ln in f.readlines()]
             args.prompts = [ln for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(args.prompts)} prompts from {args.txt_prompts}")
@@ -172,9 +160,7 @@ def main():
         raise
 
     if args.prompts is None:
-        raise ValueError(
-            "No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)"
-        )
+        raise ValueError("No prompts provided. Use --prompts ... or --txt-prompts <file.txt> (with --prompt_type text)")
     omni_llm = OmniLLM(
         model=model_name,
         log_stats=args.enable_stats,
@@ -223,9 +209,7 @@ def main():
     omni_outputs = omni_llm.generate(prompt, sampling_params_list)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
-    output_dir = (
-        args.output_dir if getattr(args, "output_dir", None) else args.output_wav
-    )
+    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
     for stage_outputs in omni_outputs:
         if stage_outputs.final_output_type == "text":
@@ -251,9 +235,7 @@ def main():
                 request_id = int(output.request_id)
                 audio_tensor = output.multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
-                sf.write(
-                    output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000
-                )
+                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 

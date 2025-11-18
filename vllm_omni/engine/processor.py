@@ -3,7 +3,6 @@ from collections.abc import Mapping
 from typing import Any, Optional, Union
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
@@ -18,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine.processor import Processor
+
 from vllm_omni.engine import (
     AdditionalInformationEntry,
     AdditionalInformationPayload,
@@ -78,20 +78,14 @@ class OmniProcessor(Processor):
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> tuple[Optional[str], OmniEngineCoreRequest]:
-
         # TODO(woosuk): Support pooling models.
         # TODO(woosuk): Support encoder-decoder models.
         self._validate_lora(lora_request)
         self._validate_params(params)
 
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
-        if data_parallel_rank is not None and not (
-            0 <= data_parallel_rank < data_parallel_size
-        ):
-            raise ValueError(
-                f"data_parallel_rank {data_parallel_rank} "
-                f"is out of range [0, {data_parallel_size})."
-            )
+        if data_parallel_rank is not None and not (0 <= data_parallel_rank < data_parallel_size):
+            raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {data_parallel_size}).")
 
         if arrival_time is None:
             arrival_time = time.time()
@@ -142,19 +136,9 @@ class OmniProcessor(Processor):
         # discriminated unions of TypedDicts, because of how it handles
         # inheritance of TypedDict. If we explicitly extract the items we want
         # we can avoid type errors from using `dict.get` later in the method.
-        prompt_str: Optional[str] = (
-            None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
-        )
-        prompt_token_ids = (
-            decoder_inputs["prompt_token_ids"]
-            if decoder_inputs["type"] != "embeds"
-            else None
-        )
-        prompt_embeds = (
-            decoder_inputs["prompt_embeds"]
-            if decoder_inputs["type"] == "embeds"
-            else None
-        )
+        prompt_str: Optional[str] = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
+        prompt_token_ids = decoder_inputs["prompt_token_ids"] if decoder_inputs["type"] != "embeds" else None
+        prompt_embeds = decoder_inputs["prompt_embeds"] if decoder_inputs["type"] == "embeds" else None
 
         sampling_params = None
         pooling_params = None
@@ -163,13 +147,9 @@ class OmniProcessor(Processor):
             sampling_params = params.clone()
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
-                seq_len = length_from_prompt_token_ids_or_embeds(
-                    prompt_token_ids, prompt_embeds
-                )
+                seq_len = length_from_prompt_token_ids_or_embeds(prompt_token_ids, prompt_embeds)
                 sampling_params.max_tokens = self.model_config.max_model_len - seq_len
-            sampling_params.update_from_generation_config(
-                self.generation_config_fields, eos_token_id
-            )
+            sampling_params.update_from_generation_config(self.generation_config_fields, eos_token_id)
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
         else:
@@ -204,12 +184,9 @@ class OmniProcessor(Processor):
         prompt_embeds_payload: Optional[PromptEmbedsPayload] = None
         additional_information_payload: Optional[AdditionalInformationPayload] = None
         if "prompt_embeds" in decoder_inputs:  # type: ignore[operator]
-
             pe: torch.Tensor = decoder_inputs["prompt_embeds"]  # type: ignore[index]
             if pe.ndim != 2:
-                raise ValueError(
-                    "prompt_embeds must be of shape (seq_len, hidden_size)"
-                )
+                raise ValueError("prompt_embeds must be of shape (seq_len, hidden_size)")
             # Move to CPU and ensure contiguous memory for stable serialization
             pe_cpu = pe.detach().to("cpu").contiguous()
             seq_len, hidden_size = pe_cpu.shape
@@ -236,13 +213,9 @@ class OmniProcessor(Processor):
                 elif isinstance(value, list):
                     entry = AdditionalInformationEntry(list_data=value)
                 else:
-                    raise ValueError(
-                        "additional_information values must be Tensor or list"
-                    )
+                    raise ValueError("additional_information values must be Tensor or list")
                 entries[key] = entry
-            additional_information_payload = AdditionalInformationPayload(
-                entries=entries
-            )
+            additional_information_payload = AdditionalInformationPayload(entries=entries)
 
         return prompt_str, OmniEngineCoreRequest(
             request_id=request_id,

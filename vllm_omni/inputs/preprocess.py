@@ -1,11 +1,11 @@
 from typing import Any, Optional, Union
 
 from typing_extensions import assert_never
-
 from vllm.inputs.data import SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
+
 from vllm_omni.inputs.data import OmniTokenInputs, token_inputs_omni
 from vllm_omni.inputs.parse import parse_singleton_prompt_omni
 
@@ -20,9 +20,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         *,
         mm_uuids: Optional[MultiModalUUIDDict] = None,
     ) -> Union[OmniTokenInputs, MultiModalInputs]:
-        prompt_token_ids = self._truncate_inputs(
-            parsed_content["prompt_token_ids"], tokenization_kwargs
-        )
+        prompt_token_ids = self._truncate_inputs(parsed_content["prompt_token_ids"], tokenization_kwargs)
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
 

@@ -2,9 +2,9 @@ from typing import Optional
 
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
+from vllm.config import ModelConfig, config
 
 import vllm_omni.model_executor.models as me_models
-from vllm.config import ModelConfig, config
 
 
 @config

@@ -77,33 +77,8 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 where = ["."]
 include = ["vllm_omni*"]
 
-[tool.black]
-line-length = 160
-target-version = ['py312', 'py313']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
-
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-line_length = 160
-known_first_party = ["vllm_omni"]
-
 [tool.ruff]
-line-length = 160
-target-version = "py312, py313"
+line-length = 120
 exclude = [
     ".eggs",
     ".git",
@@ -128,6 +103,10 @@ select = [
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
     # W503 is not needed in ruff as it's compatible with black by default
+    "N801",  # class names should use CapWords convention
+    "N802",  # function name should follow snake_case
+    "N806",  # variable in function should follow snake_case
+    "N812",  # lowercase imported as non-lowercase: functional as F
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -167,4 +146,12 @@ markers = [
     "integration: Integration tests",
     "benchmark: Benchmark tests",
     "slow: Slow tests",
+]
+
+[tool.typos.default]
+extend-ignore-identifiers-re = [
+    ".*_thw",
+    ".*thw",
+    "ein",
+    ".*arange"
 ]

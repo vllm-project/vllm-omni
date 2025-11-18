@@ -206,7 +206,7 @@ dit_stage_config.executor_class = DiffusersPipelineExecutor
 
 Similar to OmniLLM in offline inference, add some asynchronous processing, referring to AsyncLLM
 ```python
-from vllm.v1.engine.async_llm improt AsyncLLM
+from vllm.v1.engine.async_llm import AsyncLLM
 
 
 class AsyncOmniLLM(AsyncLLM):
@@ -317,13 +317,13 @@ class DiffusersPipelineExecutor(Executor):
 
         # Generate image
         prompt_embeds = self._get_and_process_prompt_embeds(scheduler_output, positive_magic)
-        negtive_prompt_embeds = self.pipe.embed_prompt(" ")
+        negative_prompt_embeds = self.pipe.embed_prompt(" ")
 
         width, height = aspect_ratios["16:9"]
 
         image = pipe(
             prompt_embeds=prompt_embeds,
-            negtive_prompt_embeds=negtive_prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             width=width,
             height=height,
             num_inference_steps=50,

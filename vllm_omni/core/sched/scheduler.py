@@ -39,22 +39,14 @@ class OmniScheduler(VLLMScheduler):
                     num_computed_tokens=nr.num_computed_tokens,
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
-                    prompt_embeds=(
-                        getattr(request, "prompt_embeds", None) if request else None
-                    ),
-                    additional_information=(
-                        getattr(request, "additional_information", None)
-                        if request
-                        else None
-                    ),
+                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
         except Exception:
             # If anything goes wrong, leave the original output unchanged
-            init_logger(__name__).exception(
-                "Failed to wrap scheduled_new_reqs with OmniNewRequestData"
-            )
+            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
 
         return scheduler_output

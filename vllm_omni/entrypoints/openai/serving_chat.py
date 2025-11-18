@@ -17,15 +17,8 @@ try:
 except ImportError:
     soundfile = None
 
-from openai.types.chat.chat_completion_audio import (
-    ChatCompletionAudio as OpenAIChatCompletionAudio,
-)
-
-from vllm.entrypoints.chat_utils import (
-    ConversationMessage,
-    get_history_tool_calls_cnt,
-    make_tool_call_id,
-)
+from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
+from vllm.entrypoints.chat_utils import ConversationMessage, get_history_tool_calls_cnt, make_tool_call_id
 from vllm.entrypoints.harmony_utils import parse_chat_output
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -56,6 +49,7 @@ from vllm.transformers_utils.tokenizers import (
     validate_request_params,
 )
 from vllm.utils import as_list
+
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -86,9 +80,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             raise self.engine_client.dead_error
 
         try:
-            lora_request = self._maybe_get_adapters(
-                request, supports_default_mm_loras=True
-            )
+            lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
             model_name = self.models.model_name(lora_request)
 
@@ -113,14 +105,10 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 # for hf tokenizers, "auto" tools requires
                 # --enable-auto-tool-choice and --tool-call-parser
                 return self.create_error_response(
-                    '"auto" tool choice requires '
-                    "--enable-auto-tool-choice and --tool-call-parser to be set"
+                    '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
                 )
 
-            if request.tools is None or (
-                request.tool_choice == "none"
-                and self.exclude_tools_when_tool_choice_none
-            ):
+            if request.tools is None or (request.tool_choice == "none" and self.exclude_tools_when_tool_choice_none):
                 tool_dicts = None
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
@@ -130,14 +118,10 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             chat_template_kwargs = request.chat_template_kwargs
             if not self.trust_request_chat_template and (
                 request_chat_template is not None
-                or (
-                    chat_template_kwargs
-                    and chat_template_kwargs.get("chat_template") is not None
-                )
+                or (chat_template_kwargs and chat_template_kwargs.get("chat_template") is not None)
             ):
                 return self.create_error_response(
-                    "Chat template is passed with request, but "
-                    "--trust-request-chat-template is not set. "
+                    "Chat template is passed with request, but --trust-request-chat-template is not set. "
                     "Refused request with untrusted chat template."
                 )
             (
@@ -163,9 +147,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
 
-        request_id = (
-            "chatcmpl-" f"{self._base_request_id(raw_request, request.request_id)}"
-        )
+        request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -175,11 +157,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(
-                        request.sampling_params_list
-                    )
+                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
                     sampling_params_list = None
 
@@ -190,11 +169,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     lora_request=lora_request,
                 )
 
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
-                )
+                trace_headers = None if raw_request is None else await self._get_trace_headers(raw_request.headers)
 
                 generator = self.engine_client.generate(
                     prompt=engine_prompt,
@@ -240,10 +215,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
 
-    def _to_sampling_params_list(
-        self, sampling_params_list: list[dict]
-    ) -> list[SamplingParams]:
-
+    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
         final_sampling_params_list = []
         for sampling_params in sampling_params_list:
             if isinstance(sampling_params, dict):
@@ -273,10 +245,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             prompt_token_ids = getattr(inputs, "prompt_token_ids", None)
 
         logger.info(
-            "Received request %s: prompt: %r, "
-            "params_list: %s, prompt_token_ids: %s, "
-            "prompt_embeds shape: %s, "
-            "lora_request: %s.",
+            "Received request %s: prompt: %r, params_list: %s, prompt_token_ids: %s, prompt_embeds shape: %s, lora_request: %s.",  # noqa: E501
             request_id,
             prompt,
             params_list,
@@ -295,7 +264,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
     ) -> Union[ErrorResponse, ChatCompletionResponse]:
-
         created_time = int(time.time())
         final_res: Optional[RequestOutput] = None
 
@@ -328,15 +296,11 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     prompt_logprobs,
                     prompt_token_ids,
                     kv_transfer_params,
-                ) = self._create_text_choice(
-                    request, omni_outputs, tokenizer, conversation, role
-                )
+                ) = self._create_text_choice(request, omni_outputs, tokenizer, conversation, role)
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role)
             else:
-                logger.warning(
-                    f"Unsupported final output type: {omni_outputs.final_output_type}"
-                )
+                logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
             choices.extend(choices_data)
 
@@ -361,12 +325,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     # For tool calls, log the function name and arguments
                     tool_call_descriptions = []
                     for tc in choice.message.tool_calls:
-                        if hasattr(tc.function, "name") and hasattr(
-                            tc.function, "arguments"
-                        ):
-                            tool_call_descriptions.append(
-                                f"{tc.function.name}({tc.function.arguments})"
-                            )
+                        if hasattr(tc.function, "name") and hasattr(tc.function, "arguments"):
+                            tool_call_descriptions.append(f"{tc.function.name}({tc.function.arguments})")
                     tool_calls_str = ", ".join(tool_call_descriptions)
                     output_text = f"[tool_calls: {tool_calls_str}]"
 
@@ -469,9 +429,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     return self.create_error_response(str(e))
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning_content, content = reasoning_parser.extract_reasoning_content(
-                    output.text, request=request
-                )
+                reasoning_content, content = reasoning_parser.extract_reasoning_content(output.text, request=request)
                 if not request.include_reasoning:
                     reasoning_content = None
             else:
@@ -485,21 +443,11 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
                 and request.tool_choice != "required"
             ):
-                message = ChatMessage(
-                    role=role, reasoning_content=reasoning_content, content=content
-                )
+                message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             # if the request uses tools and specified a tool choice
-            elif (
-                request.tool_choice
-                and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam
-            ):
-
-                tool_call_class = (
-                    MistralToolCall
-                    if isinstance(tokenizer, MistralTokenizer)
-                    else ToolCall
-                )
+            elif request.tool_choice and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam:
+                tool_call_class = MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
                 message = ChatMessage(
                     role=role,
                     reasoning_content=reasoning_content,
@@ -515,18 +463,12 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 )
 
             elif request.tool_choice and request.tool_choice == "required":
-                tool_call_class = (
-                    MistralToolCall
-                    if isinstance(tokenizer, MistralTokenizer)
-                    else ToolCall
-                )
+                tool_call_class = MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
 
                 # the fields of FunctionDefinition are a superset of the
                 # tool call outputs and can be used for parsing
                 assert content is not None
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(
-                    content
-                )
+                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
                 tool_call_ids = []
                 for tool_call in tool_calls:
                     tool_call_ids.append(
@@ -545,9 +487,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                             id=tool_call_ids[i],
                             function=FunctionCall(
                                 name=tool_call.name,
-                                arguments=json.dumps(
-                                    tool_call.parameters, ensure_ascii=False
-                                ),
+                                arguments=json.dumps(tool_call.parameters, ensure_ascii=False),
                             ),
                         )
                         for i, tool_call in enumerate(tool_calls)
@@ -558,10 +498,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # if the request doesn't use tool choice
             # OR specifies to not use a tool
             elif not request.tool_choice or request.tool_choice == "none":
-
-                message = ChatMessage(
-                    role=role, reasoning_content=reasoning_content, content=content
-                )
+                message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             # handle when there are tools and tool choice is auto
             elif (
@@ -570,16 +507,13 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 and self.enable_auto_tools
                 and self.tool_parser
             ):
-
                 try:
                     tool_parser = self.tool_parser(tokenizer)
                 except RuntimeError as e:
                     logger.exception("Error in tool parser creation.")
                     return self.create_error_response(str(e))
 
-                tool_call_info = tool_parser.extract_tool_calls(
-                    content if content is not None else "", request=request
-                )
+                tool_call_info = tool_parser.extract_tool_calls(content if content is not None else "", request=request)
                 # In the OpenAI API the finish_reason is "tools_called"
                 # if the tool choice is auto and the model produced a tool
                 # call. The same is not true for named function calls
@@ -610,37 +544,26 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # undetermined case that is still important to handle
             else:
                 logger.error(
-                    "Error in chat_completion_full_generator - cannot determine"
-                    " if tools should be extracted. Returning a standard chat "
-                    "completion."
+                    "Error in chat_completion_full_generator - cannot determine if tools should be extracted. "
+                    "Returning a standard chat completion."
                 )
-                message = ChatMessage(
-                    role=role, reasoning_content=reasoning_content, content=content
-                )
+                message = ChatMessage(role=role, reasoning_content=reasoning_content, content=content)
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
                 message=message,
                 logprobs=logprobs,
                 finish_reason=(
-                    "tool_calls"
-                    if auto_tools_called
-                    else output.finish_reason if output.finish_reason else "stop"
+                    "tool_calls" if auto_tools_called else output.finish_reason if output.finish_reason else "stop"
                 ),
                 stop_reason=output.stop_reason,
-                token_ids=(
-                    as_list(output.token_ids) if request.return_token_ids else None
-                ),
+                token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
             )
             choices.append(choice_data)
 
         if request.echo:
             last_msg_content: Union[str, list[dict[str, str]]] = ""
-            if (
-                conversation
-                and "content" in conversation[-1]
-                and conversation[-1].get("role") == role
-            ):
+            if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
                 last_msg_content = conversation[-1]["content"] or ""
             if isinstance(last_msg_content, list):
                 last_msg_content = "\n".join(msg["text"] for msg in last_msg_content)
@@ -653,23 +576,17 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         num_prompt_tokens = len(final_res.prompt_token_ids)
         if final_res.encoder_prompt_token_ids is not None:
             num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
-        num_generated_tokens = sum(
-            len(output.token_ids) for output in final_res.outputs
-        )
+        num_generated_tokens = sum(len(output.token_ids) for output in final_res.outputs)
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
         )
         if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=final_res.num_cached_tokens
-            )
+            usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)
 
         prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
-        prompt_token_ids = (
-            final_res.prompt_token_ids if request.return_token_ids else None
-        )
+        prompt_token_ids = final_res.prompt_token_ids if request.return_token_ids else None
         kv_transfer_params = final_res.kv_transfer_params
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
@@ -682,8 +599,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         # Convert numpy array to WAV bytes and encode as base64
         if soundfile is None:
             raise ImportError(
-                "soundfile is required for audio generation. "
-                "Please install it with: pip install soundfile"
+                "soundfile is required for audio generation. Please install it with: pip install soundfile"
             )
 
         # Default sample rate for TTS models (typically 24000 Hz)

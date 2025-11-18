@@ -1,8 +1,4 @@
-from vllm.model_executor.models.registry import (
-    _VLLM_MODELS,
-    _LazyRegisteredModel,
-    _ModelRegistry,
-)
+from vllm.model_executor.models.registry import _VLLM_MODELS, _LazyRegisteredModel, _ModelRegistry
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (

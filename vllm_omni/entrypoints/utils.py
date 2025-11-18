@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 
 from omegaconf import OmegaConf
-
 from vllm.transformers_utils.config import get_config
 
 logger = logging.getLogger(__name__)

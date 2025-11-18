@@ -115,9 +115,7 @@ class Example:
             ".cfg",
             ".ini",
         }
-        is_other_file = lambda file: (  # noqa: E731
-            file.is_file() and file != self.main_file and file.suffix in text_extensions
-        )
+        is_other_file = lambda file: (file.is_file() and file != self.main_file and file.suffix in text_extensions)  # noqa: E731
         return [file for file in self.path.rglob("*") if is_other_file(file)]
 
     def determine_title(self) -> str:
@@ -175,11 +173,7 @@ class Example:
         if self.is_code:
             # Use relative path from ROOT_DIR for snippet inclusion
             main_file_rel_path = self.main_file.relative_to(ROOT_DIR)
-            content += (
-                f"{code_fence}{self.main_file.suffix[1:]}\n"
-                f'--8<-- "{main_file_rel_path}"\n'
-                f"{code_fence}\n"
-            )
+            content += f'{code_fence}{self.main_file.suffix[1:]}\n--8<-- "{main_file_rel_path}"\n{code_fence}\n'
         else:
             with open(self.main_file, encoding="utf-8") as f:
                 # Skip the title from md snippets as it's been included above
