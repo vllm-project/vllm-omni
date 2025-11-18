@@ -1058,7 +1058,9 @@ class Qwen2_5OmniToken2WavDiTModel(nn.Module):
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
 
-        self.ode_solver = get_ode_solver_class(vllm_config.model_config.ode_solver_class)(function=None, initial_value=None)  # placeholder
+        self.ode_solver = get_ode_solver_class(vllm_config.model_config.ode_solver_class)(
+            function=None, initial_value=None
+        )  # placeholder
 
     def _create_block_diff(self, hidden_states):
         batch, seq_len = hidden_states.shape[0], hidden_states.shape[1]
