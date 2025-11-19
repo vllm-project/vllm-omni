@@ -12,21 +12,12 @@ repos:
       - id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
 
-  - repo: https://github.com/PyCQA/isort
-    rev: 5.13.2
-    hooks:
-      - id: isort
-
-  - repo: https://github.com/psf/black
-    rev: 24.10.0
-    hooks:
-      - id: black
-
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.7
+    rev: v0.14.0
     hooks:
-      - id: ruff
-        args: [--output-format, github, --fix, --line-length=160]
+    - id: ruff-check
+      args: [--output-format, github, --fix]
+    - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
     rev: v1.35.5

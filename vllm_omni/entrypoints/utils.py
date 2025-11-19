@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 
 from omegaconf import OmegaConf
-
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.utils.diffusers_utils import load_diffusers_config

@@ -16,7 +16,6 @@ SEED = 42
 
 
 def get_system_prompt():
-
     return {
         "role": "system",
         "content": [

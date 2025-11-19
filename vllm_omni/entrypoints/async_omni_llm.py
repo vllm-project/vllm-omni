@@ -4,9 +4,9 @@ import os
 import socket
 import sys
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Mapping, Optional, Sequence, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -45,11 +45,8 @@ from vllm_omni.entrypoints.log_utils import (
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.stage_utils import serialize_obj as _ser
-from vllm_omni.entrypoints.utils import (
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
-)
+from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
+from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -68,7 +65,6 @@ class AsyncOmniLLM(EngineClient):
         init_timeout: int = 300,
         **kwargs,
     ):
-
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
 
@@ -85,12 +81,8 @@ class AsyncOmniLLM(EngineClient):
             remove_old_logs(self._log_file, len(self.stage_list))
             configure_orchestrator_logger(logger, self._log_file)
 
-        self._stats_file, self._overall_stats_file = init_stats_paths(
-            self._enable_stats, self._log_file
-        )
-        self._initialize_stages(
-            model, init_sleep_seconds, shm_threshold_bytes, init_timeout
-        )
+        self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
+        self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
 
     def _initialize_stages(
         self,
@@ -106,21 +98,14 @@ class AsyncOmniLLM(EngineClient):
             idx, cfg = idx_cfg
             return idx, OmniStage(cfg)
 
-        with ThreadPoolExecutor(
-            max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
-        ) as executor:
-            futures = [
-                executor.submit(_build_stage, (idx, cfg))
-                for idx, cfg in enumerate(self.stage_configs)
-            ]
+        with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
+            futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
             results: list[tuple[int, OmniStage]] = []
             for fut in as_completed(futures):
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
-        self.default_sampling_params_list = [
-            st.default_sampling_params for st in self.stage_list
-        ]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
         self._ctx = mp.get_context("spawn")
@@ -187,9 +172,7 @@ class AsyncOmniLLM(EngineClient):
         self,
         prompt: PromptType,
         request_id: str,
-        sampling_params_list: Optional[
-            Union[SamplingParams, Sequence[SamplingParams]]
-        ] = None,
+        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
@@ -277,13 +260,9 @@ class AsyncOmniLLM(EngineClient):
                     time.sleep(0.05)
                     continue
 
-                engine_outputs = _load(
-                    result, obj_key="engine_outputs", shm_key="engine_outputs_shm"
-                )
+                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
                 # Mark last output time for this stage whenever we receive outputs
-                metrics.stage_last_ts[stage_id] = max(
-                    metrics.stage_last_ts[stage_id] or 0.0, time.time()
-                )
+                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
                     _m = result.get("metrics")
                     if _m is not None:
@@ -314,15 +293,8 @@ class AsyncOmniLLM(EngineClient):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_int = (
-                            int(req_id)
-                            if isinstance(req_id, (int, str)) and str(req_id).isdigit()
-                            else req_id
-                        )
-                        if (
-                            stage_id == final_stage_id_for_e2e
-                            and rid_int not in metrics.e2e_done
-                        ):
+                        rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
+                        if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -349,15 +321,13 @@ class AsyncOmniLLM(EngineClient):
                 next_stage_id = stage_id + 1
                 if next_stage_id < num_stages:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
-                    next_inputs = next_stage.process_engine_inputs(
-                        self.stage_list, prompt
-                    )
+                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]
                     try:
                         # Measure transfer size and time (encode + enqueue)
                         size_bytes = 0
                         try:
-                            size_bytes = len(_ser(next_inputs))
+                            size_bytes = len(_set(next_inputs))
                         except Exception:
                             size_bytes = 0
                         t0 = time.time()
@@ -654,17 +624,15 @@ class AsyncOmniStageLLM(AsyncLLM):
         self.log_stats = log_stats or (stat_loggers is not None)
         if not log_stats and stat_loggers is not None:
             logger.info(
-                "AsyncLLM created with log_stats=False and non-empty custom "
-                "logger list; enabling logging without default stat loggers"
+                "AsyncLLM created with log_stats=False and non-empty custom logger list; "
+                "enabling logging without default stat loggers"
             )
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
         else:
             # Tokenizer (+ ensure liveness if running in another process).
-            self.tokenizer = init_tokenizer_from_configs(
-                model_config=vllm_config.model_config
-            )
+            self.tokenizer = init_tokenizer_from_configs(model_config=vllm_config.model_config)
 
         # Processor (converts Inputs --> EngineCoreRequests).
         self.processor = OmniProcessor(
@@ -680,9 +648,7 @@ class AsyncOmniStageLLM(AsyncLLM):
             engine_core_output_type=engine_args.engine_output_type,
         )
         if self.observability_config.otlp_traces_endpoint is not None:
-            tracer = init_tracer(
-                "vllm.llm_engine", self.observability_config.otlp_traces_endpoint
-            )
+            tracer = init_tracer("vllm.llm_engine", self.observability_config.otlp_traces_endpoint)
             self.output_processor.tracer = tracer
 
         # EngineCore (starts the engine in background process).
@@ -736,9 +702,7 @@ class AsyncOmniStageLLM(AsyncLLM):
     @classmethod
     @deprecate_kwargs(
         "disable_log_requests",
-        additional_message=(
-            "This argument will have no effect. " "Use `enable_log_requests` instead."
-        ),
+        additional_message=("This argument will have no effect. Use `enable_log_requests` instead."),
     )
     def from_vllm_config(
         cls,

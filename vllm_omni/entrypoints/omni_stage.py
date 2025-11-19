@@ -14,7 +14,7 @@ import asyncio
 import importlib
 import logging
 import multiprocessing as mp
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -25,6 +25,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
+
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
@@ -55,9 +56,7 @@ class OmniStage:
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
-            module_path, func_name = stage_config.custom_process_input_func.rsplit(
-                ".", 1
-            )
+            module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_input_func = getattr(module, func_name)
         else:
@@ -66,9 +65,7 @@ class OmniStage:
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
-        self.default_sampling_params = SamplingParams(
-            **_to_dict(default_sampling_params)
-        )
+        self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
         # Runtime orchestration state (added)
         self._in_q: Optional[mp.Queue] = None
         self._out_q: Optional[mp.Queue] = None
@@ -120,16 +117,14 @@ class OmniStage:
         ctx: Optional[mp.context.BaseContext] = None,
         batch_timeout: int = 10,
     ) -> None:
-        assert (
-            self._in_q is not None and self._out_q is not None
-        ), "Queues must be attached before start_process"
+        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before start_process"
         self._log_file = log_file
         self._shm_threshold_bytes = shm_threshold_bytes
         ctx = ctx or mp.get_context("spawn")
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
         runtime_cfg = _to_dict(getattr(self.stage_config, "runtime", {}))
-        stage_payload: Dict[str, Any] = {
+        stage_payload: dict[str, Any] = {
             "stage_id": self.stage_id,
             "engine_args": engine_args,
             "runtime": runtime_cfg,
@@ -167,29 +162,23 @@ class OmniStage:
             try:
                 self._in_q.put_nowait(None)
             except Exception as e:
-                self._logger.warning(
-                    "[Stage-%s] Failed to send shutdown to in_q: %s", self.stage_id, e
-                )
+                self._logger.warning("[Stage-%s] Failed to send shutdown to in_q: %s", self.stage_id, e)
         if self._proc is not None:
             try:
                 self._proc.join(timeout=5)
             except Exception as e:
-                self._logger.debug(
-                    "[Stage-%s] join() failed: %s", self.stage_id, e, exc_info=True
-                )
+                self._logger.debug("[Stage-%s] join() failed: %s", self.stage_id, e, exc_info=True)
             if self._proc.is_alive():
                 try:
                     self._proc.terminate()
                 except Exception as e:
-                    self._logger.warning(
-                        "[Stage-%s] terminate() failed: %s", self.stage_id, e
-                    )
+                    self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
 
-    def submit(self, payload: Dict[str, Any]) -> None:
+    def submit(self, payload: dict[str, Any]) -> None:
         assert self._in_q is not None
         self._in_q.put(payload)
 
-    def try_collect(self) -> Optional[Dict[str, Any]]:
+    def try_collect(self) -> Optional[dict[str, Any]]:
         assert self._out_q is not None
         try:
             return self._out_q.get_nowait()
@@ -198,7 +187,7 @@ class OmniStage:
 
     def process_engine_inputs(
         self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None
-    ) -> List[Union[OmniTokensPrompt, TextPrompt]]:
+    ) -> list[Union[OmniTokensPrompt, TextPrompt]]:
         """Process the engine input for the stage."""
         if self.custom_process_input_func is None:
             engine_inputs = []
@@ -216,25 +205,19 @@ class OmniStage:
             for source_output in source_outputs:
                 engine_input = OmniTokensPrompt(
                     prompt_token_ids=source_output.outputs[0].token_ids,
-                    multi_modal_data=(
-                        multi_modal_data[source_output.request_id]
-                        if multi_modal_data
-                        else None
-                    ),
+                    multi_modal_data=(multi_modal_data[source_output.request_id] if multi_modal_data else None),
                 )
                 engine_inputs.append(engine_input)
             return engine_inputs
 
         else:
             engine_input_source = self.engine_input_source
-            return self.custom_process_input_func(
-                stage_list, engine_input_source, prompt
-            )
+            return self.custom_process_input_func(stage_list, engine_input_source, prompt)
 
 
 def _stage_worker(
     model: str,
-    stage_payload: Dict[str, Any],
+    stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
     log_file: Optional[str] = None,
@@ -267,9 +250,7 @@ def _stage_worker(
             fh = _logging.FileHandler(f"{log_file}.stage{stage_id}.log")
             fh.setLevel(_logging.DEBUG)
             fh.setFormatter(
-                _logging.Formatter(
-                    "%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s"
-                )
+                _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
             )
 
             class _StageFilter(_logging.Filter):
@@ -295,9 +276,7 @@ def _stage_worker(
     try:
         set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
     except Exception as e:
-        _logging.getLogger(__name__).warning(
-            "[Stage-%s] Device setup failed: %s", stage_id, e
-        )
+        _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
     # Init LLM
     _logging.getLogger(__name__).debug(
@@ -318,13 +297,11 @@ def _stage_worker(
         task = in_q.get()
         _recv_dequeue_ts = _time.time()
         if task is None:
-            _logging.getLogger(__name__).debug(
-                "[Stage-%s] Received shutdown signal", stage_id
-            )
+            _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
             break
 
         max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-        batch_tasks: List[Dict[str, Any]] = [task]
+        batch_tasks: list[dict[str, Any]] = [task]
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
                 if not in_q.empty():
@@ -336,11 +313,11 @@ def _stage_worker(
                 else:
                     break
 
-        batch_request_ids: List[Any] = []
-        batch_engine_inputs: List[Any] = []
-        _rx_bytes_by_rid: Dict[Any, int] = {}
-        _rx_decode_ms_by_rid: Dict[Any, float] = {}
-        _in_flight_ms_by_rid: Dict[Any, float] = {}
+        batch_request_ids: list[Any] = []
+        batch_engine_inputs: list[Any] = []
+        _rx_bytes_by_rid: dict[Any, int] = {}
+        _rx_decode_ms_by_rid: dict[Any, float] = {}
+        _in_flight_ms_by_rid: dict[Any, float] = {}
         for t in batch_tasks:
             rid = t["request_id"]
             try:
@@ -351,9 +328,7 @@ def _stage_worker(
                     _in_flight_ms_by_rid[rid] = 0.0
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
-            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(
-                t, obj_key="engine_inputs", shm_key="engine_inputs_shm"
-            )
+            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(t, obj_key="engine_inputs", shm_key="engine_inputs_shm")
             _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
             batch_request_ids.append(rid)
@@ -362,9 +337,7 @@ def _stage_worker(
             elif isinstance(ein, dict):
                 batch_engine_inputs.append(ein)
             else:
-                _logging.getLogger(__name__).exception(
-                    "[Stage-%s] Invalid engine input type: %s", stage_id, type(ein)
-                )
+                _logging.getLogger(__name__).exception("[Stage-%s] Invalid engine input type: %s", stage_id, type(ein))
         sampling_params = batch_tasks[0]["sampling_params"]
         _logging.getLogger(__name__).debug(
             "[Stage-%s] Received batch size=%d, request_ids=%s",
@@ -380,20 +353,16 @@ def _stage_worker(
         print("--------------------------------", flush=True)
         try:
             _batch_seq += 1
-            gen_outputs: List[Any] = []
+            gen_outputs: list[Any] = []
             _gen_t0 = _time.time()
-            for ro in stage_engine.generate(
-                batch_engine_inputs, sampling_params, use_tqdm=False
-            ):
+            for ro in stage_engine.generate(batch_engine_inputs, sampling_params, use_tqdm=False):
                 gen_outputs.append(ro)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
 
             # Group outputs per request id with fallback
-            req_to_outputs: Dict[Any, List[Any]] = {
-                rid: [] for rid in batch_request_ids
-            }
-            unmapped: List[Any] = []
+            req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
+            unmapped: list[Any] = []
             for ro in gen_outputs:
                 rid = getattr(ro, "request_id", None)
                 if rid in req_to_outputs:
@@ -416,9 +385,7 @@ def _stage_worker(
 
             if _stats_file:
                 _avg_tokens_per_s = (
-                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms)
-                    if _agg_total_gen_time_ms > 0
-                    else 0.0
+                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
                 )
                 log_stage_running_avg(
                     _stats_file,
@@ -446,9 +413,7 @@ def _stage_worker(
                         "batch_id": int(_batch_seq),
                         "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
                         "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                        "rx_in_flight_time_ms": float(
-                            _in_flight_ms_by_rid.get(rid, 0.0)
-                        ),
+                        "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
                     }
                     if _stats_file:
                         compute_and_log_stage_request_stats(
@@ -486,17 +451,11 @@ def _stage_worker(
                             "stage_id": stage_id,
                             "engine_outputs": r_outputs,
                             "metrics": {
-                                "num_tokens_out": int(
-                                    count_tokens_from_outputs(r_outputs)
-                                ),
+                                "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
                                 "stage_gen_time_ms": _gen_ms,
-                                "rx_decode_time_ms": float(
-                                    _rx_decode_ms_by_rid.get(rid, 0.0)
-                                ),
+                                "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
                                 "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                                "rx_in_flight_time_ms": float(
-                                    _in_flight_ms_by_rid.get(rid, 0.0)
-                                ),
+                                "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
                             },
                         }
                     )
@@ -506,9 +465,7 @@ def _stage_worker(
                     rid,
                 )
         except Exception as e:
-            _logging.getLogger(__name__).exception(
-                "[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e
-            )
+            _logging.getLogger(__name__).exception("[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e)
             for rid in batch_request_ids:
                 out_q.put(
                     {
@@ -522,23 +479,19 @@ def _stage_worker(
 def _stage_worker_async_entry(
     omni_stage: OmniStage,
     model: str,
-    stage_payload: Dict[str, Any],
+    stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
     log_file: Optional[str] = None,
     batch_timeout: int = 10,
 ) -> None:
-    asyncio.run(
-        _stage_worker_async(
-            omni_stage, model, stage_payload, in_q, out_q, log_file, batch_timeout
-        )
-    )
+    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, in_q, out_q, log_file, batch_timeout))
 
 
 async def _stage_worker_async(
     omni_stage: OmniStage,
     model: str,
-    stage_payload: Dict[str, Any],
+    stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
     log_file: Optional[str] = None,
@@ -571,10 +524,8 @@ async def _stage_worker_async(
             fh = _logging.FileHandler(f"{log_file}.stage{stage_id}.log")
             fh.setLevel(_logging.DEBUG)
             fh.setFormatter(
-                _logging.Formatter(
-                    "%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s"  # noqa: E501
-                )
-            )
+                _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
+            )  # noqa: E501
 
             class _StageFilter(_logging.Filter):
                 def filter(self, record: _logging.LogRecord) -> bool:
@@ -600,9 +551,7 @@ async def _stage_worker_async(
     try:
         set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
     except Exception as e:
-        _logging.getLogger(__name__).warning(
-            "[Stage-%s] Device setup failed: %s", stage_id, e
-        )
+        _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
     # Init LLM
     _logging.getLogger(__name__).debug(
@@ -640,49 +589,37 @@ async def _stage_worker_async(
             }
         )
     except Exception as e:
-        _logging.getLogger(__name__).warning(
-            "[Stage-%s] Failed to send stage ready signal: %s", stage_id, e
-        )
+        _logging.getLogger(__name__).warning("[Stage-%s] Failed to send stage ready signal: %s", stage_id, e)
 
     # Batch processing loop
     while True:
         task = in_q.get()
         _recv_dequeue_ts = _time.time()
         if task is None:
-            _logging.getLogger(__name__).debug(
-                "[Stage-%s] Received shutdown signal", stage_id
-            )
+            _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
             break
 
-        _rx_bytes_by_rid: Dict[Any, int] = {}
-        _rx_decode_ms_by_rid: Dict[Any, float] = {}
-        _in_flight_ms_by_rid: Dict[Any, float] = {}
+        _rx_bytes_by_rid: dict[Any, int] = {}
+        _rx_decode_ms_by_rid: dict[Any, float] = {}
+        _in_flight_ms_by_rid: dict[Any, float] = {}
 
         rid = task["request_id"]
         try:
-            sent_ts = (
-                float(task.get("sent_ts", None)) if isinstance(task, dict) else None
-            )
+            sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
             if sent_ts is not None:
                 _in_flight_ms_by_rid[rid] = (_recv_dequeue_ts - sent_ts) * 1000.0
             else:
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
-        ein, _rx_metrics = maybe_load_from_ipc_with_metrics(
-            task, obj_key="engine_inputs", shm_key="engine_inputs_shm"
-        )
+        ein, _rx_metrics = maybe_load_from_ipc_with_metrics(task, obj_key="engine_inputs", shm_key="engine_inputs_shm")
         _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
         _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
         sampling_params = task["sampling_params"]
-        _logging.getLogger(__name__).debug(
-            "[Stage-%s] Received batch size=1, request_ids=%d", stage_id, rid
-        )
+        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%d", stage_id, rid)
         print("--------------------------------", flush=True)
-        print(
-            f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True
-        )
+        print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
         print("--------------------------------", flush=True)
         try:
             _batch_seq += 1
@@ -702,9 +639,7 @@ async def _stage_worker_async(
 
             if _stats_file:
                 _avg_tokens_per_s = (
-                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms)
-                    if _agg_total_gen_time_ms > 0
-                    else 0.0
+                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
                 )
                 log_stage_running_avg(
                     _stats_file,
@@ -769,24 +704,16 @@ async def _stage_worker_async(
                         "metrics": {
                             "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
                             "stage_gen_time_ms": _gen_ms,
-                            "rx_decode_time_ms": float(
-                                _rx_decode_ms_by_rid.get(rid, 0.0)
-                            ),
+                            "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
                             "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                            "rx_in_flight_time_ms": float(
-                                _in_flight_ms_by_rid.get(rid, 0.0)
-                            ),
+                            "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
                         },
                     }
                 )
-            _logging.getLogger(__name__).debug(
-                "[Stage-%s] Enqueued result for request %s to downstream", stage_id, rid
-            )
+            _logging.getLogger(__name__).debug("[Stage-%s] Enqueued result for request %s to downstream", stage_id, rid)
 
         except Exception as e:
-            _logging.getLogger(__name__).exception(
-                "[Stage-%s] Failed on request %s: %s", stage_id, rid, e
-            )
+            _logging.getLogger(__name__).exception("[Stage-%s] Failed on request %s: %s", stage_id, rid, e)
             out_q.put(
                 {
                     "request_id": rid,

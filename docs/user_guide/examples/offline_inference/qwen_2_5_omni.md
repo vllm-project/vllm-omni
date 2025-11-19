@@ -52,7 +52,7 @@ uv pip install --no-build-isolation --editable .
 ```
 
 ### Verification for successful installation of vLLM
-Just run the command below. If no error, it demonstrates that the installation is successfull.
+Just run the command below. If no error, it demonstrates that the installation is successful.
 ```bash
 python -c "import vllm._C"
 ```

@@ -4,7 +4,6 @@ from typing import Optional, Union
 
 import huggingface_hub
 from huggingface_hub import snapshot_download
-
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import DisabledTqdm, get_lock
 

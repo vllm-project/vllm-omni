@@ -1,24 +1,17 @@
+from collections.abc import Iterable
 from functools import cached_property
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-    Qwen2_5OmniTalkerConfig,
-)
-from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
-    Qwen2_5OmniAudioEncoder,
-)
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTalkerConfig
+from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAudioEncoder
 
 # from vllm.attention import AttentionMetadata  # unused import
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
-from vllm.model_executor.models.interfaces import (
-    MultiModalEmbeddings,
-    SupportsMultiModal,
-    SupportsPP,
-)
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerDummyInputsBuilder,
@@ -72,9 +65,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
 
         if hasattr(config, "talker_config"):
             self.config = config.talker_config
-            vllm_config.model_config.hf_text_config = (
-                vllm_config.model_config.hf_config.talker_config
-            )
+            vllm_config.model_config.hf_text_config = vllm_config.model_config.hf_config.talker_config
         else:
             self.config = config
 
@@ -92,9 +83,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             hf_config=getattr(self.config, "text_config", self.config),
             architectures=["Qwen2ForCausalLM_old"],
         )
-        self.make_empty_intermediate_tensors = (
-            self.language_model.make_empty_intermediate_tensors
-        )
+        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
     def init_multi_modal(self, thinker_config):
         self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
@@ -122,7 +111,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
-
             # TODO (ywang96): support overlapping modalitiy embeddings so that
             # `use_audio_in_video` will work on V1.
             inputs_embeds = merge_multimodal_embeddings(
@@ -145,9 +133,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        assert (
-            input_ids is not None or inputs_embeds is not None
-        ), "input_ids or inputs_embeds must be provided"
+        assert input_ids is not None or inputs_embeds is not None, "input_ids or inputs_embeds must be provided"
         # forward_context: ForwardContext = get_forward_context()  # unused variable
 
         if intermediate_tensors is not None:
@@ -184,7 +170,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     ) -> Optional[SamplerOutput]:
         return self.language_model.sample(logits, sampling_metadata)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["thinker.", "token2wav."],
@@ -220,31 +206,15 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         # Preserve the order of modalities if there are multiple of them
         # from the order of kwargs.
         for input_key in kwargs:
-            if (
-                input_key in ("pixel_values", "image_embeds")
-                and "image" not in mm_input_by_modality
-            ):
-                mm_input_by_modality["image"] = self._parse_and_validate_image_input(
-                    **kwargs
-                )
-            if (
-                input_key in ("pixel_values_videos", "video_embeds")
-                and "video" not in mm_input_by_modality
-            ):
-                mm_input_by_modality["video"] = self._parse_and_validate_video_input(
-                    **kwargs
-                )
-            if (
-                input_key in ("input_audio_features")
-                and "audio" not in mm_input_by_modality
-            ):
-                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
-                    **kwargs
-                )
+            if input_key in ("pixel_values", "image_embeds") and "image" not in mm_input_by_modality:
+                mm_input_by_modality["image"] = self._parse_and_validate_image_input(**kwargs)
+            if input_key in ("pixel_values_videos", "video_embeds") and "video" not in mm_input_by_modality:
+                mm_input_by_modality["video"] = self._parse_and_validate_video_input(**kwargs)
+            if input_key in ("input_audio_features") and "audio" not in mm_input_by_modality:
+                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
         return mm_input_by_modality
 
     def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
-
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
