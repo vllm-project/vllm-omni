@@ -7,6 +7,9 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_NAME="vllm-omni"
 RUN_QUALITY=false
 SKIP_CLEAN=false
+CREATE_VENV=false
+VENV_DIR=".venv-build"
+PYTHON_BIN="python"
 
 log() {
   local level="$1"
@@ -26,6 +29,9 @@ Usage: $(basename "$0") [options]
 Options:
   --run-quality    Run pre-commit, install dev deps, and pytest before building
   --skip-clean     Skip removing previous build artifacts
+  --create-venv    Build inside a fresh virtual environment (default path: .venv-build)
+  --venv-dir PATH  Custom directory for the virtual environment (implies --create-venv)
+  --python PATH    Python executable to use (default: python)
   -h, --help       Show this help message
 EOF
 }
@@ -37,6 +43,20 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-clean)
       SKIP_CLEAN=true
+      ;;
+    --create-venv)
+      CREATE_VENV=true
+      ;;
+    --venv-dir)
+      CREATE_VENV=true
+      shift
+      [[ $# -gt 0 ]] || abort "--venv-dir requires a path"
+      VENV_DIR="$1"
+      ;;
+    --python)
+      shift
+      [[ $# -gt 0 ]] || abort "--python requires a path"
+      PYTHON_BIN="$1"
       ;;
     -h|--help)
       usage
@@ -55,16 +75,27 @@ cd "${REPO_ROOT}" || abort "Cannot enter repository root"
 
 [[ -f pyproject.toml ]] || abort "pyproject.toml not found, please ensure correct script location"
 
+if [[ "${CREATE_VENV}" == "true" ]]; then
+  log "INFO" "Creating fresh virtual environment at ${VENV_DIR}"
+  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+  PYTHON_BIN="${VENV_DIR}/bin/python"
+  [[ -x "${PYTHON_BIN}" ]] || abort "Failed to locate python inside ${VENV_DIR}"
+  log "INFO" "Upgrading pip inside virtual environment"
+  "${PYTHON_BIN}" -m pip install --upgrade pip
+  log "INFO" "Installing build module inside virtual environment"
+  "${PYTHON_BIN}" -m pip install build
+fi
+
 log "INFO" "Checking build module"
-if ! python -m build --version >/dev/null 2>&1; then
-  abort "python -m build is not available, run 'pip install build' first"
+if ! "${PYTHON_BIN}" -m build --version >/dev/null 2>&1; then
+  abort "${PYTHON_BIN} -m build is not available, install build first"
 fi
 
 run_quality_steps() {
   log "INFO" "Running quality checks"
-  pre-commit run --all-files
-  pip install -e ".[dev]"
-  pytest tests/ -v -m "not slow"
+  "${PYTHON_BIN}" -m pip install -e ".[dev]"
+  "${PYTHON_BIN}" -m pre_commit run --all-files
+  "${PYTHON_BIN}" -m pytest tests/ -v -m "not slow"
 }
 
 if [[ "${RUN_QUALITY}" == "true" ]]; then
@@ -88,7 +119,7 @@ else
 fi
 
 log "INFO" "Building source and wheel distributions"
-python -m build
+"${PYTHON_BIN}" -m build
 
 log "INFO" "Build finished, artifacts:"
 ls -lh dist
