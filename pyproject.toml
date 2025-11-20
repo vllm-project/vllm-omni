@@ -73,12 +73,13 @@ Documentation = "https://vllm-omni.readthedocs.io"
 vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
-[tool.setuptools]
-include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_omni*"]
+
+[tool.setuptools.package-data]
+"vllm_omni.model_executor.stage_configs" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 120
