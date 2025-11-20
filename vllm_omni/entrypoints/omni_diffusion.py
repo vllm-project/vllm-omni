@@ -6,6 +6,10 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, Union
 
+import logging
+
+import torch
+
 import cloudpickle
 from pydantic import ValidationError
 
@@ -21,42 +25,32 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
-# Internal imports (our code)
-from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.processor import OmniProcessor
+from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
+from vllm_omni.utils.diffusers_utils import is_diffusion_model
+
+from vllm_omni.entrypoints.omni_stage import OmniStage
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
+from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
+from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
+
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
     configure_orchestrator_logger,
     init_stats_paths,
     remove_old_logs,
 )
-from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
-from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
-from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.inputs.data import OmniDiffusionRequest
 
-from vllm_omni.utils.diffusers_utils import is_diffusion_model
 
 logger = init_logger(__name__)
 
-# TODO renama it since we will support duffusion models
-class OmniLLM:
-    """Multi-process pipelined OmniLLM.
-
-    - Per-stage process with copy-based IPC (Queues)
-    - window=-1 across stages (downstream starts when upstream finishes)
-    - max_inflight=1 per stage (serial within a stage), but pipeline across stages
-    """
-
+class OmniDiffusion:
     def __init__(
         self,
         model: str,
-        stage_configs_path: Optional[str] = None,
+        stage_configs_path: str | None = None,
         log_stats: bool = False,
-        log_file: Optional[str] = None,
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
@@ -72,15 +66,9 @@ class OmniLLM:
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
         # Optional file handler for orchestrator
-        self._log_file = log_file
-        if self._log_file:
-            remove_old_logs(self._log_file, len(self.stage_list))
-            configure_orchestrator_logger(logger, self._log_file)
 
-        self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
         self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
 
-        self.is_diffusion_model = is_diffusion_model(model)
 
     def _initialize_stages(
         self,
@@ -128,7 +116,6 @@ class OmniLLM:
             stage.attach_queues(in_q, out_q)
             stage.init_stage_worker(
                 model,
-                log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx,
                 batch_timeout=self.batch_timeout,
@@ -157,13 +144,29 @@ class OmniLLM:
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
+
     def generate(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
+        prompts: str | list[str],
+        negative_prompt: str |  None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 50,
+        true_cfg_scale: float = 4.0,
+        generator: Optional[Union[torch.Generator, list[torch.Generator]]] = None
     ) -> list[OmniRequestOutput]:
+        req = OmniDiffusionRequest(
+            request_id=None,
+            prompt=prompts,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            true_cfg_scale=true_cfg_scale,
+            generator=generator,
+        )
         try:
-            return self._run_generation(prompts, sampling_params_list)
+            return self._run_generation(req)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
             raise e
@@ -172,28 +175,23 @@ class OmniLLM:
 
     def _run_generation(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
+        req: OmniDiffusionRequest,
     ) -> list[OmniRequestOutput]:
         logger.debug("[Orchestrator] generate() called")
-        if sampling_params_list is None:
-            raise ValueError("sampling_params_list is required for pipelined generation")
-        if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
         # Normalize prompts to a list for per-request iteration
-        if not isinstance(prompts, (list, tuple)):
-            request_prompts: list[PromptType] = [prompts]
+        if not isinstance(req, (list, tuple)):
+            reqs: list[OmniDiffusionRequest] = [req]
         else:
-            request_prompts = list(prompts)
+            reqs = list(req)
 
         final_outputs: list[OmniRequestOutput] = []
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
 
-        # Map from request_id to original prompt
-        request_id_to_prompt: dict[int, PromptType] = {i: p for i, p in enumerate(request_prompts)}
+        # Map from request_id to original request
+        request_id_to_req: dict[int, OmniDiffusionRequest] = {i: p for i, p in enumerate(reqs)}
 
         # Track per-request start time for end-to-end timing
         _req_start_ts: dict[int, float] = {}
@@ -218,32 +216,31 @@ class OmniLLM:
         metrics = OrchestratorMetrics(
             num_stages,
             self._enable_stats,
-            self._stats_file,
-            self._overall_stats_file,
+            None,
+            None,
             _wall_start_ts,
         )
 
         # Seed stage-0 queue with all requests
-        logger.debug("[Orchestrator] Seeding %d requests into stage-0", len(request_prompts))
+        logger.debug("[Orchestrator] Seeding %d requests into stage-0", len(reqs))
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
-        for req_id, prompt in request_id_to_prompt.items():
-            sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
+        for req_id, request in request_id_to_req.items():
             task = {
                 "request_id": req_id,
-                "engine_inputs": prompt,
-                "sampling_params": sp0,
+                "engine_inputs": request,
             }
+            print("submitting task", task)
             self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
             logger.debug("[Orchestrator] Enqueued request %s to stage-0", req_id)
 
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
+        remaining_by_stage: list[int] = [len(reqs)] + [0] * (num_stages - 1)
         completed_requests = 0
-        total_requests = len(request_prompts)
+        total_requests = len(reqs)
 
         logger.debug(
             "[Orchestrator] Entering scheduling loop: total_requests=%d, stages=%d",
@@ -331,7 +328,7 @@ class OmniLLM:
                 next_stage_id = stage_id + 1
                 if next_stage_id < num_stages:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                    next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_req[req_id]])
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]  # type: ignore[index]
                     try:
                         # Measure transfer size and time (encode + enqueue)
@@ -468,97 +465,6 @@ class OmniLLM:
             except Exception:
                 os._exit(1)
 
-
-class OmniStageLLM(LLM):
-    def __init__(
-        self,
-        model: str,
-        compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
-        hf_overrides: Optional[HfOverrides] = None,
-        structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
-        **kwargs,
-    ):
-        """LLM constructor."""
-        if "disable_log_stats" not in kwargs:
-            kwargs["disable_log_stats"] = True
-
-        if "worker_cls" in kwargs:
-            worker_cls = kwargs["worker_cls"]
-            # if the worker_cls is not qualified string name,
-            # we serialize it using cloudpickle to avoid pickling issues
-            if isinstance(worker_cls, type):
-                kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
-
-        if "kv_transfer_config" in kwargs and isinstance(kwargs["kv_transfer_config"], dict):
-            from vllm.config.kv_transfer import KVTransferConfig
-
-            raw_config_dict = kwargs["kv_transfer_config"]
-            try:
-                kwargs["kv_transfer_config"] = KVTransferConfig(**raw_config_dict)
-            except ValidationError as e:
-                logger.error(
-                    "Failed to convert 'kv_transfer_config' dict to KVTransferConfig object. Dict: %s. Error: %s",
-                    raw_config_dict,
-                    e,
-                )
-                # Consider re-raising a more specific vLLM error or ValueError
-                # to provide better context to the user.
-                raise ValueError(f"Invalid 'kv_transfer_config' provided: {e}") from e
-
-        if hf_overrides is None:
-            hf_overrides = {}
-
-        if compilation_config is not None:
-            if isinstance(compilation_config, int):
-                compilation_config_instance = CompilationConfig(level=compilation_config)
-            elif isinstance(compilation_config, dict):
-                compilation_config_instance = CompilationConfig(
-                    **{k: v for k, v in compilation_config.items() if is_init_field(CompilationConfig, k)}
-                )
-            else:
-                compilation_config_instance = compilation_config
-        else:
-            compilation_config_instance = CompilationConfig()
-
-        if structured_outputs_config is not None:
-            if isinstance(structured_outputs_config, dict):
-                structured_outputs_instance = StructuredOutputsConfig(
-                    **{k: v for k, v in structured_outputs_config.items() if is_init_field(StructuredOutputsConfig, k)}
-                )
-            else:
-                structured_outputs_instance = structured_outputs_config
-        else:
-            structured_outputs_instance = StructuredOutputsConfig()
-
-        engine_args = OmniEngineArgs(
-            model=model,
-            hf_overrides=hf_overrides,
-            compilation_config=compilation_config_instance,
-            structured_outputs_config=structured_outputs_instance,
-            **kwargs,
-        )
-
-        # Create the Engine (autoselects V0 vs V1)
-        self.llm_engine = LLMEngine.from_engine_args(engine_args=engine_args, usage_context=UsageContext.LLM_CLASS)
-        self.llm_engine.output_processor = MultimodalOutputProcessor(
-            tokenizer=self.llm_engine.tokenizer,
-            log_stats=self.llm_engine.log_stats,
-            engine_core_output_type=engine_args.engine_output_type,
-        )
-        self.llm_engine.processor = OmniProcessor(
-            vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
-        )
-        self.engine_class = type(self.llm_engine)
-
-        self.request_counter = Counter()
-        self.default_sampling_params: Union[dict[str, Any], None] = None
-
-        supported_tasks = self.llm_engine.get_supported_tasks()  # type: ignore
-
-        logger.info("Supported_tasks: %s", supported_tasks)
-
-        self.supported_tasks = supported_tasks
-
-        # Load the Input/Output processor plugin if any
-        io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
-        self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
+class OmniStageDiffusion:
+    def __init__(self, model:str) -> None:
+        pass

@@ -12,6 +12,13 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.utils import AutoWeightsLoader
+from typing import Iterable, Set
+
+try:
+    from safetensors.torch import load_file as _safetensors_load
+except Exception:  # pragma: no cover - optional dependency
+    _safetensors_load = None
 
 
 def apply_rotary_emb_qwen(
@@ -608,5 +615,86 @@ class QwenImageTransformer2DModel(nn.Module):
 
         return Transformer2DModelOutput(sample=output)
 
-    def load_weights(self):
-        pass
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]] | None = None,
+        *,
+        weight_map: dict | None = None,
+        weights_dir: str | None = None,
+    ) -> Set[str]:
+        """
+        Load weights into this module.
+
+        Two modes are supported:
+        - Provide `weights` as an iterable of `(name, tensor)` and the loader will
+          assign them into the module.
+        - Provide `weight_map` (a mapping from parameter-name -> safetensors-filename)
+          together with `weights_dir` pointing to the directory that contains the
+          safetensors shard files. The function will open each referenced
+          safetensors file and build the `(name, tensor)` iterable automatically.
+
+        Returns the set of loaded weight qualified names.
+        """
+        loader = AutoWeightsLoader(self)
+
+        # If explicit iterable of weights provided, just use it
+        if weights is not None:
+            return loader.load_weights(weights)
+
+        if weight_map is None or weights_dir is None:
+            raise ValueError(
+                "Either `weights` or both `weight_map` and `weights_dir` must be provided"
+            )
+
+        # Group requested parameter names by file
+        files: dict[str, list[str]] = {}
+        for param_name, fname in weight_map.items():
+            files.setdefault(fname, []).append(param_name)
+
+        # Load tensors from each safetensors file and yield (name, tensor)
+        weights_list: list[tuple[str, torch.Tensor]] = []
+        for fname, param_names in files.items():
+            path = f"{weights_dir.rstrip('/')}/{fname}"
+            if _safetensors_load is None:
+                raise RuntimeError(
+                    "safetensors is required to load safetensors files; please install `safetensors` package"
+                )
+
+            try:
+                tensors = _safetensors_load(path)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load safetensors file {path}: {e}")
+
+            # tensors: dict[str, torch.Tensor]
+            for param_name in param_names:
+                if param_name in tensors:
+                    weights_list.append((param_name, tensors[param_name]))
+                    continue
+
+                # Fallbacks: sometimes keys in safetensors omit top-level prefix.
+                # Try matching by suffix (best-effort).
+                matched = None
+                for key in tensors:
+                    if key == param_name:
+                        matched = key
+                        break
+                if matched is None:
+                    # Try by suffix match
+                    for key in tensors:
+                        if (
+                            key.endswith(param_name)
+                            or key.split(".")[-1] == param_name.split(".")[-1]
+                        ):
+                            matched = key
+                            break
+
+                if matched is None:
+                    raise KeyError(
+                        f"Parameter '{param_name}' not found in safetensors file {path}"
+                    )
+
+                weights_list.append((param_name, tensors[matched]))
+
+        # Delegate to AutoWeightsLoader for assignment and validation
+        loaded = loader.load_weights(weights_list)
+        return loaded
