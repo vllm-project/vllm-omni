@@ -23,10 +23,18 @@ cd examples/online_serving
 
 Send request via python
 ```bash
-python openai_chat_completion_client_for_multimodal_generation.py
+python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities
 ```
 
 Send request via curl
 ```bash
-bash run_curl_multimodal_generation.sh
+bash run_curl_multimodal_generation.sh mixed_modalities
+```
+
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
 ```

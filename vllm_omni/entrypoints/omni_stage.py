@@ -25,7 +25,6 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
-
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
@@ -50,6 +49,7 @@ class OmniStage:
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
+        self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
         self.engine_input_source = getattr(stage_config, "engine_input_source", [])
         self.engine_output_type = stage_config.engine_args.engine_output_type
         self.engine_outputs = None
@@ -205,14 +205,20 @@ class OmniStage:
             for source_output in source_outputs:
                 engine_input = OmniTokensPrompt(
                     prompt_token_ids=source_output.outputs[0].token_ids,
-                    multi_modal_data=(multi_modal_data[source_output.request_id] if multi_modal_data else None),
+                    multi_modal_data=(
+                        multi_modal_data[source_output.request_id]
+                        if self.requires_multimodal_data and multi_modal_data
+                        else None
+                    ),
                 )
                 engine_inputs.append(engine_input)
             return engine_inputs
 
         else:
             engine_input_source = self.engine_input_source
-            return self.custom_process_input_func(stage_list, engine_input_source, prompt)
+            return self.custom_process_input_func(
+                stage_list, engine_input_source, prompt, self.requires_multimodal_data
+            )
 
 
 def _stage_worker(
@@ -227,13 +233,13 @@ def _stage_worker(
     import logging as _logging
     import time as _time
 
-    from vllm_omni.entrypoints.log_utils import (  # noqa: WPS433
+    from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
         log_stage_batch_stats,
         log_stage_running_avg,
     )
-    from vllm_omni.entrypoints.omni_llm import OmniStageLLM  # noqa: WPS433
+    from vllm_omni.entrypoints.omni_llm import OmniStageLLM
 
     # no inline JSONL/serialization imports; logging handled by utilities
 
@@ -501,8 +507,8 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
-    from vllm_omni.entrypoints.async_omni_llm import AsyncOmniStageLLM  # noqa: WPS433
-    from vllm_omni.entrypoints.log_utils import (  # noqa: WPS433
+    from vllm_omni.entrypoints.async_omni_llm import AsyncOmniStageLLM
+    from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
         log_stage_batch_stats,
