@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from typing import Any, Optional, Union
 
 import torch
+
 from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
@@ -17,7 +18,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine.processor import Processor
-
 from vllm_omni.engine import (
     AdditionalInformationEntry,
     AdditionalInformationPayload,

@@ -15,5 +15,5 @@ uv pip install pre-commit
 
 Then run:
 ```bash
-pre-commit run --show-diff-on-failure --color=always
+pre-commit run --show-diff-on-failure --color=always --all-files
 ```

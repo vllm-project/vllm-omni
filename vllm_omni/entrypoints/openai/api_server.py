@@ -7,10 +7,11 @@ from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Any, Optional
 
-import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
+
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template, resolve_hf_chat_template, resolve_mistral_chat_template
@@ -37,7 +38,6 @@ from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
-
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 

@@ -21,6 +21,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniPr
 
 # Bring in HF base classes, configs and utilities used below
 from transformers.utils.logging import get_logger as _hf_get_logger
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP

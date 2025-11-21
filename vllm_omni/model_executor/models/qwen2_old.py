@@ -4,6 +4,7 @@ from typing import Optional, Union
 import torch
 from torch import nn
 from transformers import Qwen2Config
+
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
