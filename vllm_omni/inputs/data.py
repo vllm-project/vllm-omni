@@ -7,7 +7,6 @@ except ImportError:
     from typing_extensions import NotRequired
 
 import torch
-
 from vllm.inputs.data import EmbedsPrompt, TokenInputs, TokensPrompt
 
 

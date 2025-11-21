@@ -1,9 +1,9 @@
-from typing import Iterable, Optional, Set, Tuple, Union
+from collections.abc import Iterable
+from typing import Optional, Union
 
 import torch
 from torch import nn
 from transformers import Qwen2Config
-
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -11,23 +11,13 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -48,7 +38,6 @@ logger = init_logger(__name__)
 
 
 class Qwen2MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -73,10 +62,7 @@ class Qwen2MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -87,7 +73,6 @@ class Qwen2MLP(nn.Module):
 
 
 class Qwen2Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -98,7 +83,7 @@ class Qwen2Attention(nn.Module):
         head_dim: Optional[int] = None,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        rope_scaling: Optional[Tuple] = None,
+        rope_scaling: Optional[tuple] = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
     ) -> None:
@@ -173,7 +158,6 @@ class Qwen2Attention(nn.Module):
 
 
 class Qwen2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen2Config,
@@ -217,16 +201,14 @@ class Qwen2DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -255,7 +237,6 @@ class Qwen2DecoderLayer(nn.Module):
     }
 )
 class Qwen2Model(nn.Module):
-
     def __init__(
         self,
         *,
@@ -270,27 +251,20 @@ class Qwen2Model(nn.Module):
         quant_config = vllm_config.quant_config
 
         # TODO (@robertgshaw2): see if this can be moved out
-        if cache_config.sliding_window is not None and hasattr(
-            config, "max_window_layers"
-        ):
+        if cache_config.sliding_window is not None and hasattr(config, "max_window_layers"):
             raise ValueError(
                 "Sliding window for some but all layers is not "
                 "supported. This model uses sliding window "
-                "but `max_window_layers` = {} is less than "
-                "`num_hidden_layers` = {}. Please open an issue "
-                "to discuss this feature.".format(
-                    config.max_window_layers,
-                    config.num_hidden_layers,
-                )
+                f"but `max_window_layers` = {config.max_window_layers} is less than "
+                f"`num_hidden_layers` = {config.num_hidden_layers}. Please open an issue "
+                "to discuss this feature."
             )
 
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
-        ):
+        if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 getattr(config, "embedding_size", config.hidden_size),
@@ -348,13 +322,11 @@ class Qwen2Model(nn.Module):
                 residual,
             )
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -364,19 +336,15 @@ class Qwen2Model(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
+            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
                 # Loading kv cache quantization scales
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
+                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
@@ -433,9 +401,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.lora_config = lora_config
 
         self.quant_config = quant_config
-        self.model = Qwen2Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -453,9 +419,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
 
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -467,9 +431,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         return hidden_states
 
     def compute_logits(
@@ -487,7 +449,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
@@ -521,9 +483,7 @@ class Qwen2EmbeddingModel(nn.Module, SupportsLoRA, SupportsPP):
         self.lora_config = lora_config
 
         self.quant_config = quant_config
-        self.model = Qwen2Model(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
+        self.model = Qwen2Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         # TODO: Replace this model class with as_embedding_model(
         # Qwen2ForCausalLM) after changing the default pooling method
@@ -554,9 +514,7 @@ class Qwen2EmbeddingModel(nn.Module, SupportsLoRA, SupportsPP):
     ) -> Optional[PoolerOutput]:
         return self._pooler(hidden_states, pooling_metadata)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         weights = self.hf_to_vllm_mapper.apply(weights)
-        weights = (
-            (name, data) for name, data in weights if not name.startswith("lm_head.")
-        )
+        weights = ((name, data) for name, data in weights if not name.startswith("lm_head."))
         self.model.load_weights(weights)

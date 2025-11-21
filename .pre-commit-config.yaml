@@ -12,18 +12,21 @@ repos:
       - id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
 
-  - repo: https://github.com/PyCQA/isort
-    rev: 5.13.2
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
     hooks:
-      - id: isort
+    - id: ruff-check
+      args: [--output-format, github, --fix]
+    - id: ruff-format
 
-  - repo: https://github.com/psf/black
-    rev: 24.10.0
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.35.5
     hooks:
-      - id: black
+      - id: typos
+        # only for staged files
 
-  - repo: https://github.com/PyCQA/flake8
-    rev: 7.1.1
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
     hooks:
-      - id: flake8
-        args: ["--max-line-length=88", "--extend-ignore=E203,W503"]
+      - id: actionlint
+        files: ^\.github/workflows/.*\.ya?ml$

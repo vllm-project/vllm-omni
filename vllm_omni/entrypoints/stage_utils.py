@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Union
-
-import logging
 import json
+import logging
 import os
 import pickle
 from multiprocessing import shared_memory as _shm
+from typing import Any
 
 import cloudpickle
+from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
 
-def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> None:
+def set_stage_gpu_devices(stage_id: int, devices: str | int | None) -> None:
     """Configure per-stage CUDA visibility and current device.
 
     Behavior
@@ -26,8 +26,8 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
     - Otherwise: set CUDA_VISIBLE_DEVICES to the provided single device string.
     """
     try:
-        selected_physical: Optional[int] = None
-        logical_idx: Optional[int] = None
+        selected_physical: int | None = None
+        logical_idx: int | None = None
 
         if isinstance(devices, str) and "," in devices:
             os.environ["CUDA_VISIBLE_DEVICES"] = devices
@@ -37,7 +37,9 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                     selected_physical = int(toks[0])
                     logger.debug(
                         "[Stage-%s] Set CUDA_VISIBLE_DEVICES to %s; logical 0 -> physical %s",
-                        stage_id, devices, selected_physical,
+                        stage_id,
+                        devices,
+                        selected_physical,
                     )
                 except Exception as e:
                     logger.debug("[Stage-%s] Failed to parse first CUDA device: %s", stage_id, e)
@@ -51,43 +53,70 @@ def set_stage_gpu_devices(stage_id: int, devices: Optional[Union[str, int]]) -> 
                     if 0 <= logical_idx < len(mapping):
                         selected_physical = mapping[logical_idx]
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to map logical index via CUDA_VISIBLE_DEVICES: %s", stage_id, e)
+                    logger.debug(
+                        "[Stage-%s] Failed to map logical index via CUDA_VISIBLE_DEVICES: %s",
+                        stage_id,
+                        e,
+                    )
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
             os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_physical)
             logger.debug(
                 "[Stage-%s] Logical index %d -> physical %s; set CUDA_VISIBLE_DEVICES to single device",
-                stage_id, logical_idx + 1, selected_physical,
+                stage_id,
+                logical_idx + 1,
+                selected_physical,
             )
         elif devices in (None, "cpu"):
-            logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
+            logger.debug(
+                "[Stage-%s] Using default device visibility (devices=%s)",
+                stage_id,
+                devices,
+            )
         else:
             selected_physical = int(str(devices))
             os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_physical)
-            logger.debug("[Stage-%s] Set CUDA_VISIBLE_DEVICES to single device %s (fallback)", stage_id, selected_physical)
+            logger.debug(
+                "[Stage-%s] Set CUDA_VISIBLE_DEVICES to single device %s (fallback)",
+                stage_id,
+                selected_physical,
+            )
 
         try:
             import torch  # noqa: WPS433
+
             if torch.cuda.is_available():
                 try:
                     torch.cuda.set_device(0)
                 except Exception as e:
-                    logger.debug("[Stage-%s] torch.cuda.set_device(0) failed: %s", stage_id, e, exc_info=True)
+                    logger.debug(
+                        "[Stage-%s] torch.cuda.set_device(0) failed: %s",
+                        stage_id,
+                        e,
+                        exc_info=True,
+                    )
                 num = torch.cuda.device_count()
                 info = []
                 for i in range(num):
                     total = torch.cuda.get_device_properties(i).total_memory
                     free, _ = torch.cuda.mem_get_info(i)
-                    info.append({
-                        "idx": i,
-                        "name": torch.cuda.get_device_name(i),
-                        "total": int(total),
-                        "free": int(free),
-                    })
+                    info.append(
+                        {
+                            "idx": i,
+                            "name": torch.cuda.get_device_name(i),
+                            "total": int(total),
+                            "free": int(free),
+                        }
+                    )
                 logger.debug("[Stage-%s] CUDA devices visible=%s info=%s", stage_id, num, info)
         except Exception as e:
-            logger.debug("[Stage-%s] Failed to query CUDA devices: %s", stage_id, e, exc_info=True)
+            logger.debug(
+                "[Stage-%s] Failed to query CUDA devices: %s",
+                stage_id,
+                e,
+                exc_info=True,
+            )
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
 
@@ -97,7 +126,7 @@ def serialize_obj(obj: Any) -> bytes:
     return cloudpickle.dumps(obj)
 
 
-def shm_write_bytes(payload: bytes) -> Dict[str, Any]:
+def shm_write_bytes(payload: bytes) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
@@ -110,11 +139,11 @@ def shm_write_bytes(payload: bytes) -> Dict[str, Any]:
     try:
         shm.close()
     except Exception as e:
-        logger.debug("Ensure parent dir failed for %s: %s", path, e)
+        logger.debug("Failed to close shared memory: %s", e)
     return meta
 
 
-def shm_read_bytes(meta: Dict[str, Any]) -> bytes:
+def shm_read_bytes(meta: dict[str, Any]) -> bytes:
     """Read bytes from SharedMemory by meta {name,size} and cleanup."""
     shm = _shm.SharedMemory(name=meta["name"])  # type: ignore[index]
     mv = memoryview(shm.buf)
@@ -141,7 +170,7 @@ def _ensure_parent_dir(path: str) -> None:
         pass
 
 
-def append_jsonl(path: str, record: Dict[str, Any]) -> None:
+def append_jsonl(path: str, record: dict[str, Any]) -> None:
     """Append a JSON record as one line to a JSONL file (best-effort).
 
     This is safe to call from multiple processes when each process writes
@@ -158,7 +187,7 @@ def append_jsonl(path: str, record: Dict[str, Any]) -> None:
         logger.exception("Failed to append JSONL to %s", path)
 
 
-def maybe_dump_to_shm(obj: Any, threshold: int) -> Tuple[bool, Any]:
+def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     """Dump object to SHM if serialized size exceeds threshold.
 
     Returns (True, meta) when dumped; otherwise (False, original_obj).
@@ -169,7 +198,7 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> Tuple[bool, Any]:
     return False, obj
 
 
-def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -> Any:
+def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -> Any:
     """Load object from container that may carry SHM or inline object.
 
     Deprecated: prefer `maybe_load_from_ipc_with_metrics` to also obtain
@@ -180,7 +209,9 @@ def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -
     return container[obj_key]
 
 
-def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, shm_key: str) -> tuple[Any, Dict[str, float]]:
+def maybe_load_from_ipc_with_metrics(
+    container: dict[str, Any], obj_key: str, shm_key: str
+) -> tuple[Any, dict[str, float]]:
     """Load object and return (object, metrics) with RX bytes and decode time.
 
     Metrics keys:
@@ -188,6 +219,7 @@ def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, sh
       - rx_decode_time_ms: float
     """
     import time as _time  # local import to avoid overhead at module import
+
     t0 = _time.time()
     if shm_key in container:
         meta = container[shm_key]  # type: ignore[index]
@@ -211,13 +243,13 @@ def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, sh
     }
 
 
-def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> Dict[str, Any]:
+def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> dict[str, Any]:
     """Return a dict payload for IPC: inline (obj_key) or SHM (shm_key).
 
     When serialized size exceeds threshold, returns {shm_key: {name,size}};
     otherwise returns {obj_key: obj}.
     """
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     use_shm, data = maybe_dump_to_shm(obj, threshold)
     if use_shm:
         payload[shm_key] = data
@@ -227,7 +259,7 @@ def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> Dict
 
 
 # Convert OmegaConf/objects to plain dicts
-def _to_dict(x: Any) -> Dict[str, Any]:
+def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)

@@ -40,15 +40,15 @@ Example docstring:
 ```python
 class OmniLLM:
     """Main entry point for vLLM-omni inference.
-    
+
     This class provides a high-level interface for running multi-modal
     inference with non-autoregressive models.
-    
+
     Args:
         model: Model name or path
         stage_configs: Optional stage configurations
         **kwargs: Additional arguments passed to the engine
-        
+
     Example:
         >>> llm = OmniLLM(model="Qwen/Qwen2.5-Omni")
         >>> outputs = llm.generate(prompts="Hello")

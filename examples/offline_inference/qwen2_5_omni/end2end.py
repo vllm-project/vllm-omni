@@ -45,29 +45,17 @@ def parse_args():
         default="Qwen/Qwen2.5-Omni-7B",
         help="Hugging Face repo id to download if needed.",
     )
-    parser.add_argument(
-        "--hf-revision", default=None, help="Optional HF revision (branch/tag/commit)."
-    )
-    parser.add_argument(
-        "--prompts", nargs="+", default=None, help="Input text prompts."
-    )
-    parser.add_argument(
-        "--voice-type", default="default", help="Voice type, e.g., m02, f030, default."
-    )
+    parser.add_argument("--hf-revision", default=None, help="Optional HF revision (branch/tag/commit).")
+    parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")
+    parser.add_argument("--voice-type", default="default", help="Voice type, e.g., m02, f030, default.")
     parser.add_argument(
         "--code2wav-dir",
         default=None,
         help="Path to code2wav folder (contains spk_dict.pt).",
     )
-    parser.add_argument(
-        "--dit-ckpt", default=None, help="Path to DiT checkpoint file (e.g., dit.pt)."
-    )
-    parser.add_argument(
-        "--bigvgan-ckpt", default=None, help="Path to BigVGAN checkpoint file."
-    )
-    parser.add_argument(
-        "--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"]
-    )
+    parser.add_argument("--dit-ckpt", default=None, help="Path to DiT checkpoint file (e.g., dit.pt).")
+    parser.add_argument("--bigvgan-ckpt", default=None, help="Path to BigVGAN checkpoint file.")
+    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument(
         "--init-sleep-seconds",
@@ -109,10 +97,14 @@ def parse_args():
     parser.add_argument("--use-torchvision", action="store_true")
     parser.add_argument("--tokenize", action="store_true")
     parser.add_argument(
-        "--output-wav", default="output.wav", help="[Deprecated] Output wav directory (use --output-dir)."
+        "--output-wav",
+        default="output.wav",
+        help="[Deprecated] Output wav directory (use --output-dir).",
     )
     parser.add_argument(
-        "--output-dir", default="outputs", help="Output directory to save text and wav files together."
+        "--output-dir",
+        default="outputs",
+        help="Output directory to save text and wav files together.",
     )
     parser.add_argument(
         "--thinker-hidden-states-dir",
@@ -159,7 +151,7 @@ def main():
     try:
         # Preferred: load from txt file (one prompt per line)
         if getattr(args, "txt_prompts", None) and args.prompt_type == "text":
-            with open(args.txt_prompts, "r", encoding="utf-8") as f:
+            with open(args.txt_prompts, encoding="utf-8") as f:
                 lines = [ln.strip() for ln in f.readlines()]
             args.prompts = [ln for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(args.prompts)} prompts from {args.txt_prompts}")
@@ -243,9 +235,7 @@ def main():
                 request_id = int(output.request_id)
                 audio_tensor = output.multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
-                sf.write(
-                    output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000
-                )
+                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 
