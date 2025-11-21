@@ -22,3 +22,7 @@ jobs:
           python-version: "3.12"
           cache: 'pip'
       - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: >-
+            --from-ref ${{ github.event.pull_request.base.sha || github.sha }}
+            --to-ref ${{ github.sha }}
