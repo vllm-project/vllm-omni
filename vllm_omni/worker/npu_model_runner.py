@@ -395,7 +395,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
         logprobs_tensors = sampler_output.logprobs_tensors
-            logprobs_lists = logprobs_tensors.tolists() \
+        logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
 
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -524,7 +524,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         """Override to support model_kwargs for multimodal/pooling models."""
         if model_kwargs is None:
             model_kwargs = {}
-        
+
         hidden_states = self.model(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
@@ -809,6 +809,7 @@ class OmniNPUModelRunner(NPUModelRunner):
     def _dummy_run(
         self,
         num_tokens: int,
+        with_prefill: bool = False,
         cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
@@ -817,7 +818,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         is_profile: bool = False,
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Run a dummy forward pass to warm up/profile run or capture the ACL graph for the model.
         
         Args:
@@ -943,9 +944,8 @@ class OmniNPUModelRunner(NPUModelRunner):
             else:
                 self.seq_lens_cpu[:num_reqs] = seq_lens
             self.seq_lens_cpu[num_reqs:] = 0
-            self.seq_lens[:num_reqs].copy_(
-                self.seq_lens_cpu[:num_reqs], non_blocking=True)
-                self.seq_lens[num_reqs:].fill_(0)
+            self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs], non_blocking=True)
+            self.seq_lens[num_reqs:].fill_(0)
 
             cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc_np[0] = 0
@@ -1040,7 +1040,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                         )
                     )
                 intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                    num_tokens, None, False
+                    num_tokens, self.intermediate_tensors, False
                 )
 
             # Dispatch graph mode (check for aclgraph_dispatcher)
@@ -1149,6 +1149,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
-        logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        # Extract text hidden states from multimodal outputs
+        # Parent class will handle logit indexing in profile_run
         hidden_states, _ = self.extract_multimodal_outputs(hidden_states)
-        return hidden_states, hidden_states[logit_indices]
+        return hidden_states
