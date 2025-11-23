@@ -3,7 +3,6 @@ from typing import Any, Optional, Union, cast
 
 import numpy as np
 from openai.types.chat import ChatCompletionContentPartTextParam
-
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     AsyncMultiModalContentParser,

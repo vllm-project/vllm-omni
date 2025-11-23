@@ -1,5 +1,4 @@
 import torch
-
 from vllm.model_executor.models.utils import maybe_prefix
 
 

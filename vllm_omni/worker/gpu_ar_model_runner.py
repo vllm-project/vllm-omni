@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -28,6 +27,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import UBatchSlices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
+
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner

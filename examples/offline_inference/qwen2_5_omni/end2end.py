@@ -9,13 +9,13 @@ import os
 from typing import NamedTuple
 
 import soundfile as sf
-
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils import FlexibleArgumentParser
+
 from vllm_omni import OmniLLM
 
 SEED = 42

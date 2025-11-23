@@ -18,7 +18,6 @@ except ImportError:
     soundfile = None
 
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
-
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
@@ -68,6 +67,7 @@ from vllm.transformers_utils.tokenizers import (
     validate_request_params,
 )
 from vllm.utils import as_list
+
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
 

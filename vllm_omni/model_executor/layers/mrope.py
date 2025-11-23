@@ -4,7 +4,6 @@ from typing import Optional, Union
 import numpy as np
 import torch
 from transformers import PretrainedConfig
-
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
 

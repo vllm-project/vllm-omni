@@ -2,7 +2,6 @@ import base64
 
 import requests
 from openai import OpenAI
-
 from vllm.assets.audio import AudioAsset
 from vllm.utils import FlexibleArgumentParser
 

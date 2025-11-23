@@ -10,7 +10,6 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5O
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAudioEncoder
 from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import Qwen2_5OmniProcessor
 from transformers.models.whisper import WhisperFeatureExtractor
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMRoPE, SupportsMultiModal, SupportsPP
@@ -65,6 +64,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import decode_tokens, encode_tokens
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 
 try:

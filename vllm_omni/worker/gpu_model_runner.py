@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING, Optional, Union, cast
 
 import numpy as np
 import torch
-
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
