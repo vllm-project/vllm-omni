@@ -26,7 +26,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 - **Omni-modality**: Text, image, video, and audio data processing
 - **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous Outputs**: Beyond traditional text generation to multimodal outputs
+- **Heterogeneous outputs**: from traditional text generation to multimodal outputs
 
 <p align="center">
   <picture>
