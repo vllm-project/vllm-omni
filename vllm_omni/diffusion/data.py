@@ -1,18 +1,22 @@
-from dataclasses import dataclass, field
-import torch
+# adapted from sglang and fastvideo
+
+import enum
 import random
-import tempfile
-from vllm_omni.diffusion.utils import is_port_available
-import json
+from dataclasses import dataclass, field
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.utils import is_port_available
+
 logger = init_logger(__name__)
 
+
 @dataclass
-class EngineArgs:
+class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
-    model_path: str
+    model: str
 
     # Attention
     # attention_backend: str = None
@@ -125,24 +129,7 @@ class EngineArgs:
     # Logging
     log_level: str = "info"
 
-    def scheduler_endpoint(self):
-        """
-        Internal endpoint for scheduler
-
-        """
-        scheduler_host = self.host or "localhost"
-        return f"tcp://{scheduler_host}:{self.scheduler_port}"
-    
-    @property
-    def is_local_mode(self) -> bool:
-        """
-        If no server is running when a generation task begins, 'local_mode' will be enabled: a dedicated server will be launched
-        """
-        return self.host is None or self.port is None
-    
-    def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
-    ) -> int:
+    def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
 
@@ -163,9 +150,7 @@ class EngineArgs:
         while attempts < max_attempts:
             if is_port_available(port):
                 if attempts > 0:
-                    logger.info(
-                        f"Port {original_port} was unavailable, using port {port} instead"
-                    )
+                    logger.info(f"Port {original_port} was unavailable, using port {port} instead")
                 return port
 
             attempts += 1
@@ -176,95 +161,17 @@ class EngineArgs:
                 port = 5000 + random.randint(0, 1000)
 
         raise RuntimeError(
-            f"Failed to find available port after {max_attempts} attempts "
-            f"(started from port {original_port})"
+            f"Failed to find available port after {max_attempts} attempts (started from port {original_port})"
         )
 
     def __post_init__(self):
-        # Add randomization to avoid race condition when multiple servers start simultaneously
-        # if self.attention_backend in ["fa3", "fa4"]:
-        #     self.attention_backend = "fa"
-
-        initial_scheduler_port = self.scheduler_port + random.randint(0, 100)
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
-        if self.moba_config_path:
-            try:
-                with open(self.moba_config_path) as f:
-                    self.moba_config = json.load(f)
-                logger.info("Loaded V-MoBA config from %s", self.moba_config_path)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.error(
-                    "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
-                )
-                raise
-        # self.check_server_args()
 
-        # configure_logger(server_args=self)
-
-        # log clean server_args
-        # try:
-        #     safe_args = _sanitize_for_logging(self, key_hint="server_args")
-        #     logger.info("server_args: %s", json.dumps(safe_args, ensure_ascii=False))
-        # except Exception:
-        #     # Fallback to default repr if sanitization fails
-        #     logger.info(f"server_args: {self}")
     @classmethod
-    def from_kwargs(cls, **kwargs: Any) -> "EngineArgs":
-        # # Convert mode string to enum if necessary
-        # if "mode" in kwargs and isinstance(kwargs["mode"], str):
-        #     kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
-
-        # # Convert workload_type string to enum if necessary
-        # if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
-        #     kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
-
-        # kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
+    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
         return cls(**kwargs)
-
-@dataclass
-class PortArgs:
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
-    scheduler_input_ipc_name: str
-
-    # The port for nccl initialization (torch.dist)
-    nccl_port: int
-
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
-
-    # The ipc filename for Scheduler to send metrics
-    metrics_ipc_name: str
-
-    # Master port for distributed inference
-    master_port: int | None = None
-
-    @staticmethod
-    def from_engine_args(
-        engine_args: EngineArgs, dp_rank: int | None = None
-    ) -> "PortArgs":
-        if engine_args.nccl_port is None:
-            nccl_port = engine_args.scheduler_port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
-        else:
-            nccl_port = engine_args.nccl_port
-
-        # Normal case, use IPC within a single node
-        return PortArgs(
-            scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            nccl_port=nccl_port,
-            rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            master_port=engine_args.master_port,
-        )
 
 
 @dataclass
@@ -275,3 +182,18 @@ class OutputBatch:
 
     output: torch.Tensor | None = None
     error: str | None = None
+
+
+class AttentionBackendEnum(enum.Enum):
+    FA = enum.auto()
+    SLIDING_TILE_ATTN = enum.auto()
+    TORCH_SDPA = enum.auto()
+    SAGE_ATTN = enum.auto()
+    SAGE_ATTN_THREE = enum.auto()
+    VIDEO_SPARSE_ATTN = enum.auto()
+    VMOBA_ATTN = enum.auto()
+    AITER = enum.auto()
+    NO_ATTENTION = enum.auto()
+
+    def __str__(self):
+        return self.name.lower()

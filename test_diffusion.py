@@ -10,7 +10,7 @@ from vllm_omni.diffusion.omni_diffusion import OmniDiffusion
 model_name = "Qwen/Qwen-Image"
 
 m = OmniDiffusion.from_pretrained(
-        model_path="Qwen/Qwen-Image",
-        num_gpus=1,  # Adjust based on your hardware
-    )
+    model="Qwen/Qwen-Image",
+    num_gpus=2,  # Adjust based on your hardware
+)
 m.generate("一只猫坐在公园的长椅上, 超清，电影级构图.")

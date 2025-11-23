@@ -1,97 +1,69 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 import zmq
-
-from .req import OmniDiffusionRequest
-from .data import EngineArgs, PortArgs, OutputBatch
-
-
+from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig, OutputBatch
+from vllm_omni.diffusion.req import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
 
 class SyncScheduler:
-    """
-    A synchronous, singleton client for communicating with the Scheduler service.
-    Designed for use in synchronous environments like the DiffGenerator or standalone scripts.
-    """
-
     _instance = None
 
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
-            cls._instance = super(SyncScheduler, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
-    def initialize(self, engine_args: EngineArgs):
+    def initialize(self, od_config: OmniDiffusionConfig):
         if hasattr(self, "context") and not self.context.closed:
-            logger.warning(
-                "SyncSchedulerClient is already initialized. Re-initializing."
-            )
+            logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
             self.close()
 
-        self.engine_args = engine_args
+        self.od_config = od_config
         self.context = zmq.Context()  # Standard synchronous context
-        self.scheduler_socket = self.context.socket(zmq.REQ)
 
-        # Set socket options for the main communication socket
-        self.scheduler_socket.setsockopt(zmq.LINGER, 0)
-        self.scheduler_socket.setsockopt(
-            zmq.RCVTIMEO, 6000000
-        )  # 10 minute timeout for generation
-
-        scheduler_endpoint = self.engine_args.scheduler_endpoint()
-        self.scheduler_socket.connect(scheduler_endpoint)
-        logger.debug(
-            f"SyncScheduler connected to backend scheduler at {scheduler_endpoint}"
+        # Initialize MessageQueue for broadcasting requests
+        # Assuming all readers are local for now as per current launch_engine implementation
+        self.mq = MessageQueue(
+            n_reader=od_config.num_gpus,
+            n_local_reader=od_config.num_gpus,
+            local_reader_ranks=list(range(od_config.num_gpus)),
         )
 
-    def forward(self, batch: list[OmniDiffusionRequest]) -> OutputBatch:
+        self.result_mq = None
+
+    def initialize_result_queue(self, handle):
+        # Initialize MessageQueue for receiving results
+        # We act as rank 0 reader for this queue
+        self.result_mq = MessageQueue.create_from_handle(handle, rank=0)
+        logger.info("SyncScheduler initialized result MessageQueue")
+
+    def get_broadcast_handle(self):
+        return self.mq.export_handle()
+
+    def add_req(self, requests: list[OmniDiffusionRequest]) -> OutputBatch:
         """Sends a batch to the scheduler and waits for the response."""
         try:
-            self.scheduler_socket.send_pyobj(batch)
-            output_batch = self.scheduler_socket.recv_pyobj()
+            # Broadcast request to all workers
+            self.mq.enqueue(requests)
+            # Wait for result from Rank 0 (or whoever sends it)
+            if self.result_mq is None:
+                raise RuntimeError("Result queue not initialized")
+
+            output_batch = self.result_mq.dequeue()
+            print("Received output batch:", output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
 
-    def ping(self) -> bool:
-        """
-        Checks if the scheduler server is alive using a temporary socket.
-        This avoids interfering with the state of the main REQ/REP socket.
-        """
-        if not hasattr(self, "context") or self.context.closed:
-            logger.error("Cannot ping: client is not initialized.")
-            return False
-
-        ping_socket = self.context.socket(zmq.REQ)
-        ping_socket.setsockopt(zmq.LINGER, 0)
-        ping_socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2-second timeout for pings
-
-        endpoint = self.engine_args.scheduler_endpoint()
-
-        try:
-            ping_socket.connect(endpoint)
-            ping_socket.send_pyobj({"method": "ping"})
-            ping_socket.recv_pyobj()
-            return True
-        except zmq.error.Again:
-            return False
-        finally:
-            ping_socket.close()
-
     def close(self):
         """Closes the socket and terminates the context."""
-        if hasattr(self, "scheduler_socket"):
-            self.scheduler_socket.close()
         if hasattr(self, "context"):
             self.context.term()
 
 
 # Singleton instance for easy access
-sync_scheduler_client = SyncScheduler()
-
-
-
+sync_scheduler = SyncScheduler()

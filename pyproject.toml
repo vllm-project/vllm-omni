@@ -153,5 +153,6 @@ extend-ignore-identifiers-re = [
     ".*_thw",
     ".*thw",
     "ein",
-    ".*arange"
+    ".*arange",
+    ".*MoBA"
 ]

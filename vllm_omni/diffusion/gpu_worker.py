@@ -1,23 +1,20 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # SPDX-License-Identifier: Apache-2.0
 import multiprocessing as mp
 import os
-from typing import List
-import zmq
-from .utils import get_zmq_socket
 
 import torch
-from setproctitle import setproctitle
-
-from .req import OmniDiffusionRequest
-from .utils import is_port_available
-from .data import PortArgs, OutputBatch
-from .model import TestModel
-from vllm_omni.diffusion.ditrubuted.parallel_state import init_worker_distributed_environment
-
+import zmq
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.distributed.parallel_state import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm.logger import init_logger
-from vllm_omni.diffusion.data import EngineArgs
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig, OutputBatch
+from vllm_omni.diffusion.model import TestModel
+from vllm_omni.diffusion.req import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
@@ -34,49 +31,51 @@ class GPUWorker:
         self,
         local_rank: int,
         rank: int,
-        master_port: int,
-        engine_args: EngineArgs,
+        od_config: OmniDiffusionConfig,
     ):
         self.local_rank = local_rank
         self.rank = rank
-        self.master_port = master_port
-        # FIXME: should we use tcp as distribute init method?
-        self.engine_args = engine_args
+        self.od_config = od_config
         self.pipeline = None
 
         self.init_device_and_model()
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        setproctitle(f"sgl_diffusion::scheduler:{self.local_rank}")
-        torch.cuda.set_device(self.local_rank)
+        world_size = self.od_config.num_gpus
+        rank = self.rank
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.master_port)
+        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.engine_args.num_gpus)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
 
-        init_worker_distributed_environment(world_size=self.engine_args.num_gpus, rank=self.rank, local_rank=self.local_rank)
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+
+        # hack
+        vllm_config = VllmConfig()
+        vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
+        set_current_vllm_config(vllm_config)
+
+        init_distributed_environment(world_size=world_size, rank=rank)
+        initialize_model_parallel(tensor_model_parallel_size=world_size)
 
         # self.pipeline = build_pipeline(self.engine_args)
         self.pipeline = TestModel(3, 6)
-        logger.info(
-            f"Worker {self.rank}: Initialized device, model, and distributed environment."
-        )
+        logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
         print(f"{CYAN}Worker {self.rank}: Model loaded successfully.{RESET}")
 
     @torch.inference_mode()
-    def execute_model(
-        self, batch: List[OmniDiffusionRequest], engine_args: EngineArgs
-    ) -> OutputBatch:
+    def execute_model(self, batch: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> OutputBatch:
         """
         Execute a forward pass.
         """
         assert self.pipeline is not None
         # TODO: dealing with first req for now
         req = batch[0]
-        output_batch = self.pipeline.forward(req, engine_args)
+        output_batch = self.pipeline.forward(req, od_config)
         print("output_batch ", output_batch)
         return output_batch
 
@@ -86,31 +85,35 @@ class WorkerProc:
 
     def __init__(
         self,
-        engine_args: EngineArgs,
+        od_config: OmniDiffusionConfig,
         gpu_id: int,
-        port_args: PortArgs,
+        broadcast_handle,
     ):
-        self.engine_args = engine_args
-        self.port_args = port_args
-
-        # set_global_server_args(server_args=server_args)
+        self.od_config = od_config
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
-        endpoint = engine_args.scheduler_endpoint()
+
+        # Initialize MessageQueue reader from handle
+        self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
+
+        self.result_mq = None
+        self.result_mq_handle = None
+
+        # Setup result sender (only for rank 0 for now, or whoever needs to reply)
+        # Assuming only rank 0 replies to scheduler as per original logic
         if gpu_id == 0:
-            self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.REP, endpoint, True
-            )
-            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
-        else:
-            self.receiver = None
-        assert port_args.master_port is not None
+            # Create MessageQueue for results (1 writer -> 1 reader)
+            # We assume the reader (SyncScheduler) will act as rank 0
+            self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+            self.result_mq_handle = self.result_mq.export_handle()
+            logger.info(f"Worker {gpu_id} created result MessageQueue")
+
+        assert od_config.master_port is not None
         worker = GPUWorker(
             local_rank=gpu_id,
-            master_port=port_args.master_port,
             rank=gpu_id,
-            engine_args=engine_args,
+            od_config=od_config,
         )
         self.worker = worker
         self.gpu_id = gpu_id
@@ -120,30 +123,20 @@ class WorkerProc:
         """
         replies to client, only on rank 0
         """
-        if self.receiver is not None:
-            self.receiver.send_pyobj(output_batch)
+        if self.result_mq is not None:
+            self.result_mq.enqueue(output_batch)
 
     def recv_reqs(self):
         """
-        For non-main schedulers, reqs are broadcasted from main using broadcast_pyobj
+        Receive requests from broadcast queue
         """
-        if self.receiver is not None:
-            recv_reqs = self.receiver.recv_pyobj()
-            assert isinstance(recv_reqs, list)
-        else:
-            recv_reqs = None
-
-        assert recv_reqs is not None
-
-        return recv_reqs
+        return self.mq.dequeue()
 
     # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers"""
 
-        logger.info(
-            f"Rank 0 scheduler listening on tcp://*:{self.engine_args.scheduler_port}"
-        )
+        logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
             reqs = None
@@ -159,10 +152,10 @@ class WorkerProc:
 
             # 2: execute, make sure a reply is always sent
             try:
-                output_batch = self.worker.execute_model(reqs, self.engine_args)
+                output_batch = self.worker.execute_model(reqs, self.od_config)
             except Exception as e:
                 logger.error(
-                    f"Error executing forward in scheduler event loop: {e}",
+                    f"Error executing forward in event loop: {e}",
                     exc_info=True,
                 )
                 output_batch = OutputBatch(error=str(e))
@@ -174,30 +167,30 @@ class WorkerProc:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
-        logger.info("Scheduler event loop terminated.")
-        if self.receiver is not None:
-            self.receiver.close()
+        logger.info("event loop terminated.")
+        # if self.result_sender is not None:
+        #     self.result_sender.close()
         self.context.term()
 
     @staticmethod
     def worker_main(
         rank: int,
-        engine_args: EngineArgs,
+        od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
+        broadcast_handle,
     ) -> None:
         """Worker initialization and execution loops."""
 
-        port_args = PortArgs.from_engine_args(engine_args)
-
         worker_proc = WorkerProc(
-            engine_args,
+            od_config,
             gpu_id=rank,
-            port_args=port_args,
+            broadcast_handle=broadcast_handle,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {
                 "status": "ready",
+                "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
             }
         )
         worker_proc.worker_busy_loop()
