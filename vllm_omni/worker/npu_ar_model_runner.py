@@ -385,11 +385,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
             )
 
         with record_function_or_nullcontext("Postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = model_output
-            else:
-                hidden_states = model_output
-                aux_hidden_states = None
+            hidden_states = model_output
+            aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
                 hidden_states
@@ -516,7 +513,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             and self.speculative_config.use_eagle()
             and not self.speculative_config.disable_padded_drafter_batch
         )
-        effective_drafter_max_model_len = self.max_model_len
+        effective_drafter_max_model_len = self.self.model_config.max_model_len.max_model_len
         if effective_drafter_max_model_len is None:
             effective_drafter_max_model_len = self.model_config.max_model_len
         if (
