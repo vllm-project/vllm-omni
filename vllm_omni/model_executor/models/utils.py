@@ -10,8 +10,21 @@ def add_prefix_to_loaded_weights(weights: set[str], prefix: str) -> set[str]:
 
 
 def split_list_into_ranges(lst: torch.Tensor, interval: int) -> list[list[int]]:
-    ranges: list[list[int]] = [[] for _ in range((max(lst) // interval) + 1)]
-    for num in lst:
-        index = num // interval
+    if lst.numel() == 0:
+        return []
+
+    # Move to CPU and convert to list once (High Speedup)
+    # using .item() inside a loop is very slow.
+    data_list = lst.detach().cpu().tolist()
+
+    # Calculate max on the list or tensor (Tensor max is fast enough)
+    max_val = int(torch.max(lst).item())
+
+    # Pre-allocate buckets
+    ranges: list[list[int]] = [[] for _ in range((max_val // interval) + 1)]
+
+    for num in data_list:
+        index = int(num // interval)
         ranges[index].append(num)
+
     return ranges

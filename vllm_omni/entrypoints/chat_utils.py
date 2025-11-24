@@ -55,23 +55,50 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
         """
         Extract audio from video URL using librosa.
         Returns tuple of (audio_array, sample_rate) compatible with audio format.
+
+        All blocking I/O operations are run in a thread pool to avoid blocking the event loop.
         """
+        import asyncio
         import os
         import tempfile
         from urllib.parse import urlparse
-        from urllib.request import urlopen
 
         # Parse URL to determine type
         parsed_url = urlparse(video_url)
         temp_video_file_path = None
 
+        def _download_video_sync(url: str) -> bytes:
+            """Synchronous video download - runs in thread pool."""
+            from urllib.request import urlopen
+
+            return urlopen(url).read()
+
+        def _write_temp_file_sync(data: bytes, suffix: str) -> str:
+            """Synchronous temp file write - runs in thread pool."""
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(data)
+                return temp_file.name
+
+        def _load_audio_sync(file_path: str) -> tuple[np.ndarray, Union[int, float]]:
+            """Synchronous audio loading with librosa - runs in thread pool."""
+            import librosa
+
+            return librosa.load(file_path, sr=16000)
+
+        def _cleanup_file_sync(file_path: str) -> None:
+            """Synchronous file deletion - runs in thread pool."""
+            try:
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+            except OSError:
+                pass
+
         try:
             if parsed_url.scheme in ("http", "https"):
-                # Download video from HTTP/HTTPS URL
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
-                    video_data = urlopen(video_url).read()
-                    temp_video_file.write(video_data)
-                    temp_video_file_path = temp_video_file.name
+                # Download video from HTTP/HTTPS URL asynchronously
+                video_data = await asyncio.to_thread(_download_video_sync, video_url)
+                # Write temp file asynchronously
+                temp_video_file_path = await asyncio.to_thread(_write_temp_file_sync, video_data, ".mp4")
             elif parsed_url.scheme == "file":
                 # Use file path directly (handle Windows paths)
                 from urllib.request import url2pathname
@@ -83,30 +110,20 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
 
                 header, data = video_url.split(",", 1)
                 video_data = base64.b64decode(data)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
-                    temp_video_file.write(video_data)
-                    temp_video_file_path = temp_video_file.name
+                # Write temp file asynchronously
+                temp_video_file_path = await asyncio.to_thread(_write_temp_file_sync, video_data, ".mp4")
             else:
                 # Assume it's a local file path
                 temp_video_file_path = video_url
 
-            # Extract audio using librosa
-            import librosa
-
-            audio_array, sample_rate = librosa.load(temp_video_file_path, sr=16000)
+            # Extract audio using librosa asynchronously (CPU-intensive, runs in thread pool)
+            audio_array, sample_rate = await asyncio.to_thread(_load_audio_sync, temp_video_file_path)
 
             return audio_array, sample_rate
         finally:
-            # Clean up temporary file if we created one
-            if (
-                temp_video_file_path
-                and parsed_url.scheme in ("http", "https", "data")
-                and os.path.exists(temp_video_file_path)
-            ):
-                try:
-                    os.unlink(temp_video_file_path)
-                except OSError:
-                    pass
+            # Clean up temporary file if we created one (asynchronously)
+            if temp_video_file_path and parsed_url.scheme in ("http", "https", "data"):
+                await asyncio.to_thread(_cleanup_file_sync, temp_video_file_path)
 
 
 def parse_chat_messages_futures(
