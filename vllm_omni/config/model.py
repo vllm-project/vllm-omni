@@ -15,6 +15,7 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
+    ode_solver_class: Optional[str] = None
     engine_output_type: Optional[str] = None
 
     @property

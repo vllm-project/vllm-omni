@@ -23,6 +23,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniPr
 from transformers.utils.logging import get_logger as _hf_get_logger
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader as _Vllm_AutoWeightsLoader
 from vllm.model_executor.models.utils import WeightsMapper as _Vllm_WeightsMapper
@@ -32,6 +33,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.model_executor.ode_solver import get_ode_solver_class
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -569,7 +572,8 @@ class DiTAttention(nn.Module):
         cos, sin = position_embeddings
         query[:, :1], key[:, :1] = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attn_impl = self.config._attn_implementation or "sdpa"
+        attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
         attention_weights, _ = attention_interface(
             self,
             query,
@@ -1014,100 +1018,19 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze().cpu()
 
 
-class RungeKutta4ODESolver:
-    def __init__(self, function, initial_value):
-        self.function = function
-        self.initial_value = initial_value
-
-        self._one_third = 1 / 3
-        self._two_thirds = 2 / 3
-
-    def _rk4_step(
-        self,
-        function,
-        time_start,
-        time_step,
-        time_end,
-        value_start,
-        function_value_start=None,
-    ):
-        k1 = function_value_start if function_value_start is not None else function(time_start, value_start)
-        k2 = function(
-            time_start + time_step * self._one_third,
-            value_start + time_step * k1 * self._one_third,
-        )
-        k3 = function(
-            time_start + time_step * self._two_thirds,
-            value_start + time_step * (k2 - k1 * self._one_third),
-        )
-        k4 = function(time_end, value_start + time_step * (k1 - k2 + k3))
-        return (k1 + 3 * (k2 + k3) + k4) * time_step / 8
-
-    def _compute_step(self, function, time_start, time_step, time_end, value_start):
-        function_value_start = function(time_start, value_start)
-        return (
-            self._rk4_step(
-                function,
-                time_start,
-                time_step,
-                time_end,
-                value_start,
-                function_value_start=function_value_start,
-            ),
-            function_value_start,
-        )
-
-    def _linear_interpolation(self, time_start, time_end, value_start, value_end, time_point):
-        if time_point == time_start:
-            return value_start
-        if time_point == time_end:
-            return value_end
-        weight = (time_point - time_start) / (time_end - time_start)
-        return value_start + weight * (value_end - value_start)
-
-    def integrate(self, time_points):
-        solution = torch.empty(
-            len(time_points),
-            *self.initial_value.shape,
-            dtype=self.initial_value.dtype,
-            device=self.initial_value.device,
-        )
-        solution[0] = self.initial_value
-
-        current_index = 1
-        current_value = self.initial_value
-        for time_start, time_end in zip(time_points[:-1], time_points[1:]):
-            time_step = time_end - time_start
-            delta_value, _ = self._compute_step(self.function, time_start, time_step, time_end, current_value)
-            next_value = current_value + delta_value
-
-            while current_index < len(time_points) and time_end >= time_points[current_index]:
-                solution[current_index] = self._linear_interpolation(
-                    time_start,
-                    time_end,
-                    current_value,
-                    next_value,
-                    time_points[current_index],
-                )
-                current_index += 1
-
-            current_value = next_value
-
-        return solution
-
-
 @auto_docstring(
     custom_intro="""
     The full Qwen2.5Omni Token2WavDiT model. Which take speech tokens as
     input and predict mel spectrogram.
     """
 )
-class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
-    config: Qwen2_5OmniDiTConfig
-    _no_split_modules = ["DiTDecoderLayer"]
+class Qwen2_5OmniToken2WavDiTModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
 
-    def __init__(self, config: Qwen2_5OmniDiTConfig):
-        super().__init__(config)
+        model_config = vllm_config.model_config
+        config: Qwen2_5OmniDiTConfig = model_config.hf_config
+
         self.mel_dim = config.mel_dim
         self.repeats = config.repeats
         self.time_embed = DiTTimestepEmbedding(config.hidden_size)
@@ -1134,6 +1057,10 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
+
+        self.ode_solver = get_ode_solver_class(vllm_config.model_config.ode_solver_class)(
+            function=None, initial_value=None
+        )  # placeholder
 
     def _create_block_diff(self, hidden_states):
         batch, seq_len = hidden_states.shape[0], hidden_states.shape[1]
@@ -1248,8 +1175,8 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         if sway_coefficient is not None:
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
-        ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
-        solution_trajectory = ode_solver.integrate(time_embedding)
+        self.ode_solver.reset_ode_solver(function=ode_function, initial_value=initial_state)
+        solution_trajectory = self.ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
@@ -1320,8 +1247,8 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         if sway_coefficient is not None:
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
-        ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
-        solution_trajectory = ode_solver.integrate(time_embedding)
+        self.ode_solver.reset_ode_solver(function=ode_function, initial_value=initial_state)
+        solution_trajectory = self.ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
@@ -1335,16 +1262,13 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
     mel spectrogram as input and predict waveform.
     """
 )
-class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
-    config: Qwen2_5OmniToken2WavConfig
-    base_model_prefix = "model"
-    _no_split_modules = [
-        "Qwen2_5OmniToken2WavDiTModel",
-        "Qwen2_5OmniToken2WavBigVGANModel",
-    ]
+class Qwen2_5OmniToken2WavModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix=""):
+        super().__init__()
 
-    def __init__(self, config: Qwen2_5OmniToken2WavConfig):
-        super().__init__(config)
+        self.model_config = vllm_config.model_config
+        config: Qwen2_5OmniToken2WavConfig = self.model_config.hf_config
+
         attn_impl = config._attn_implementation
         if config._attn_implementation == "flash_attention_2":
             logger.warning_once(
@@ -1359,9 +1283,10 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
                 "Qwen2_5OmniToken2WavModel does not support eager attention implementation, fall back to sdpa"
             )
             attn_impl = "sdpa"
-        self.code2wav_dit_model = Qwen2_5OmniToken2WavDiTModel._from_config(
-            config.dit_config, attn_implementation=attn_impl
-        )
+        with set_default_torch_dtype(torch.float32):
+            self.code2wav_dit_model = Qwen2_5OmniToken2WavDiTModel(
+                vllm_config=vllm_config.with_hf_config(config.dit_config),
+            )
         self.code2wav_bigvgan_model = Qwen2_5OmniToken2WavBigVGANModel._from_config(
             config.bigvgan_config, attn_implementation=attn_impl
         )
@@ -1393,6 +1318,10 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         except Exception:
             # fallback to commonly used value
             self.vocoder_hop = 240
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
 
     def forward(
         self,
