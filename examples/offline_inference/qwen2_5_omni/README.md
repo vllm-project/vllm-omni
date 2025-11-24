@@ -32,3 +32,11 @@ Then run the command below.
 ```bash
 bash run_single_prompt.sh
 ```
+
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
+```

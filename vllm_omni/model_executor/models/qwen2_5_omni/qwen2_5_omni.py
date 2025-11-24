@@ -7,6 +7,7 @@ from typing import NamedTuple, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniConfig,
     Qwen2_5OmniTalkerConfig,
@@ -14,13 +15,7 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
-from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
-    Qwen2_5OmniThinkerProcessingInfo,
-)
+from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
@@ -31,7 +26,14 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+    Qwen2_5OmniConditionalGenerationMixin,
+    Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+    Qwen2_5OmniThinkerProcessingInfo,
+)
+from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
+from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -54,7 +56,7 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class Qwen2_5OmniForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin
+    nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin, SupportsMRoPE
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -458,6 +460,170 @@ class Qwen2_5OmniForConditionalGeneration(
             ),
             multimodal_outputs=None,
         )
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        hf_config: PretrainedConfig,
+        image_grid_thw: list[list[int]] | torch.Tensor,
+        video_grid_thw: list[list[int]] | torch.Tensor,
+        second_per_grid_ts: list[float] | None = None,
+        context_len: int = 0,
+        seq_len: int | None = None,
+        audio_feature_lengths: torch.Tensor | None = None,
+        use_audio_in_video: bool = False,
+    ) -> tuple[torch.Tensor, int]:
+        """Get mrope input positions and delta value (Qwen2.5-Omni version).
+
+        Differences from MRotaryEmbedding:
+            1. Add audio support (and related `audio_feature_lengths`).
+            2. Add `use_audio_in_video` option to read audio from video inputs.
+                In this case, audio and vision position ids will be split into
+                chunks and interleaved.
+
+        Example:
+
+            (V_i are vision position ids, A_i are audio position ids)
+
+            |V_1 ...    V_n|A_1 ...   A_n|V_n+1 ... V_2n|A_n+1 ... A_2n|...
+            |vision chunk 1|audio chunk 1|vision chunk 2|audio chunk 2 |...
+        """
+
+        # TODO(fyabc): refactor and share more code with
+        #  _vl_get_input_positions_tensor.
+
+        thinker_config = hf_config.thinker_config
+        audio_token_id = thinker_config.audio_token_index
+        image_token_id = thinker_config.image_token_index
+        video_token_id = thinker_config.video_token_index
+        audio_start_token_id = thinker_config.audio_start_token_id
+        audio_end_token_id = thinker_config.audio_end_token_id
+        vision_start_token_id = thinker_config.vision_start_token_id
+        vision_end_token_id = thinker_config.vision_end_token_id
+        seconds_per_chunk = thinker_config.seconds_per_chunk
+        spatial_merge_size = thinker_config.vision_config.spatial_merge_size
+        tokens_per_second = getattr(thinker_config.vision_config, "tokens_per_second", 25)
+
+        if isinstance(image_grid_thw, list):
+            image_grid_thw = torch.tensor(image_grid_thw)
+        if isinstance(video_grid_thw, list):
+            video_grid_thw = torch.tensor(video_grid_thw)
+
+        src_item = input_tokens
+        audio_seqlens = audio_feature_lengths
+        if not second_per_grid_ts:
+            second_per_grid_ts = [1] * video_grid_thw.shape[0]
+        audio_idx = 0
+        video_idx = 0
+        image_idx = 0
+        new_src_item: list[int] = []
+        llm_pos_ids_list: list[torch.Tensor] = []
+
+        idx = 0
+        while idx < len(src_item):
+            new_src_item_len = len(new_src_item)
+            start_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            if src_item[idx] not in [audio_token_id, video_token_id, image_token_id]:
+                if use_audio_in_video and idx > 0:
+                    if src_item[idx] == vision_end_token_id and src_item[idx - 1] == audio_end_token_id:
+                        # processing the <|audio_eos|> before <|vision_eos|>
+                        start_idx -= 1
+                    elif src_item[idx] == audio_start_token_id and src_item[idx - 1] == vision_start_token_id:
+                        # processing the <|audio_bos|> after <|vision_eos|>
+                        start_idx -= 1
+                new_src_item.append(src_item[idx])
+                llm_pos_ids = torch.tensor([start_idx], dtype=torch.long).expand(3, -1)
+                llm_pos_ids_list.append(llm_pos_ids)
+            elif src_item[idx] == audio_token_id:
+                assert audio_seqlens is not None
+                audio_seqlen = audio_seqlens[audio_idx]
+                place_num = ((audio_seqlen - 1) // 2 + 1 - 2) // 2 + 1
+                new_src_item.extend([audio_token_id] * place_num)
+                llm_pos_ids = torch.arange(place_num).expand(3, -1) + start_idx
+                llm_pos_ids_list.append(llm_pos_ids)
+                audio_idx += 1
+            elif src_item[idx] == image_token_id:
+                grid_t = image_grid_thw[image_idx][0]
+                grid_hs = image_grid_thw[:, 1]
+                grid_ws = image_grid_thw[:, 2]
+                t_index = (torch.arange(grid_t) * 1 * tokens_per_second).long()
+                llm_pos_ids = get_llm_pos_ids_for_vision(
+                    start_idx, image_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                )
+                llm_pos_ids_list.append(llm_pos_ids)
+                vision_seqlen = image_grid_thw[image_idx].prod() // (spatial_merge_size**2)
+                new_src_item.extend([image_token_id] * vision_seqlen)
+                image_idx += 1
+            elif src_item[idx] == video_token_id and not use_audio_in_video:
+                grid_t = video_grid_thw[video_idx][0]
+                grid_hs = video_grid_thw[:, 1]
+                grid_ws = video_grid_thw[:, 2]
+                t_index = (torch.arange(grid_t) * second_per_grid_ts[video_idx] * tokens_per_second).long()
+                llm_pos_ids = get_llm_pos_ids_for_vision(
+                    start_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
+                )
+                llm_pos_ids_list.append(llm_pos_ids)
+                vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+                new_src_item.extend([video_token_id] * vision_seqlen)
+                video_idx += 1
+            else:
+                # read audio from video
+                assert audio_seqlens is not None
+                audio_seqlen = audio_seqlens[audio_idx]
+                vision_seqlen = video_grid_thw[video_idx].prod() // (spatial_merge_size**2)
+                grid_t = video_grid_thw[video_idx][0]
+                grid_h = video_grid_thw[video_idx][1]
+                grid_w = video_grid_thw[video_idx][2]
+                grid_hs = video_grid_thw[:, 1]
+                grid_ws = video_grid_thw[:, 2]
+                t_ntoken_per_chunk = int(tokens_per_second * seconds_per_chunk)
+                t_index = (torch.arange(grid_t) * second_per_grid_ts[video_idx] * tokens_per_second).long()
+                t_index_split_chunk = split_list_into_ranges(t_index, t_ntoken_per_chunk)
+                place_num = (((audio_seqlen - 1) // 2 + 1 - 2) // 2 + 1) + 2
+                pure_audio_len = place_num - 2
+                added_audio_len = 0
+                audio_llm_pos_ids_list: list[torch.Tensor] = []
+                for t_chunk in t_index_split_chunk:
+                    vision_ntoken_per_chunk = len(t_chunk) * grid_h * grid_w // (spatial_merge_size**2)
+                    new_src_item.extend([video_token_id] * vision_ntoken_per_chunk)
+                    vision_llm_pos_ids_list = get_llm_pos_ids_for_vision(
+                        start_idx,
+                        video_idx,
+                        spatial_merge_size,
+                        t_chunk,
+                        grid_hs,
+                        grid_ws,
+                    ).split(1, dim=1)
+                    llm_pos_ids_list.extend(vision_llm_pos_ids_list)
+                    new_src_item.extend(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len) * [audio_token_id])
+                    audio_start_idx = (
+                        start_idx if len(audio_llm_pos_ids_list) == 0 else audio_llm_pos_ids_list[-1][0].item() + 1
+                    )
+                    if min(t_ntoken_per_chunk, pure_audio_len - added_audio_len) > 0:
+                        audio_llm_pos_ids_list = (
+                            torch.arange(min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)).expand(3, -1)
+                            + audio_start_idx
+                        ).split(1, dim=1)
+                    else:
+                        audio_llm_pos_ids_list = []
+                    added_audio_len += min(t_ntoken_per_chunk, pure_audio_len - added_audio_len)
+                    llm_pos_ids_list.extend(audio_llm_pos_ids_list)
+                if added_audio_len < pure_audio_len:
+                    new_src_item.extend((pure_audio_len - added_audio_len) * [audio_token_id])
+                    audio_llm_pos_ids_list = (
+                        torch.arange(pure_audio_len - added_audio_len).expand(3, -1) + llm_pos_ids_list[-1].max() + 1
+                    ).split(1, dim=1)
+                    llm_pos_ids_list.extend(audio_llm_pos_ids_list)
+                audio_idx += 1
+                video_idx += 1
+            # move to the next token
+            idx += len(new_src_item) - new_src_item_len
+
+        llm_positions = torch.cat(llm_pos_ids_list, dim=1)
+        mrope_position_delta = torch.cat(llm_pos_ids_list, dim=1).max() + 1 - len(src_item)
+        llm_positions = llm_positions[:, context_len:seq_len]
+
+        return llm_positions, mrope_position_delta
 
     def generate_audio(self, code, voice_type):
         token2wav_dev = self._module_device(self.token2wav)
