@@ -2,9 +2,10 @@ from dataclasses import dataclass
 
 
 @dataclass
-class DiffusionSamplingParams():
-    #TODO
-    _ = 0 # Placeholder for base class
+class DiffusionSamplingParams:
+    # TODO
+    _ = 0  # Placeholder for base class
+
 
 @dataclass
 class QwenImageSamplingParams(DiffusionSamplingParams):

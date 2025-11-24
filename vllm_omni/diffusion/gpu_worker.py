@@ -13,8 +13,9 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, OutputBatch
-from vllm_omni.diffusion.model import TestModel
 from vllm_omni.diffusion.req import OmniDiffusionRequest
+
+from .models.qwen_image import QwenImagePipeline
 
 logger = init_logger(__name__)
 
@@ -63,7 +64,8 @@ class GPUWorker:
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
         # self.pipeline = build_pipeline(self.engine_args)
-        self.pipeline = TestModel(3, 6)
+        # self.pipeline = TestModel(3, 6)
+        self.pipeline = QwenImagePipeline(device=device)
         logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
         print(f"{CYAN}Worker {self.rank}: Model loaded successfully.{RESET}")
 
@@ -75,7 +77,8 @@ class GPUWorker:
         assert self.pipeline is not None
         # TODO: dealing with first req for now
         req = batch[0]
-        output_batch = self.pipeline.forward(req, od_config)
+        # output_batch = self.pipeline.forward(req, od_config)
+        output_batch = self.pipeline.forward(req)
         print("output_batch ", output_batch)
         return output_batch
 

@@ -12,6 +12,7 @@ def launch_engine(od_config: OmniDiffusionConfig, broadcast_handle, launch_http_
     logger.info("Starting server...")
 
     num_gpus = od_config.num_gpus
+    mp.set_start_method("spawn", force=True)
     processes = []
 
     # Launch all worker processes
