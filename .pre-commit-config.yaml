@@ -1,3 +1,6 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
@@ -30,3 +33,28 @@ repos:
     hooks:
       - id: actionlint
         files: ^\.github/workflows/.*\.ya?ml$
+
+
+  - repo: local
+    hooks:
+    - id: signoff-commit
+      name: Sign-off Commit
+      entry: bash
+      args:
+        - -c
+        - |
+          if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
+            printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
+          fi
+      language: system
+      verbose: true
+      stages: [commit-msg]
+
+    # Keep `suggestion` last
+    - id: suggestion
+      name: Suggestion
+      entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
+      language: system
+      verbose: true
+      pass_filenames: false
+    # Insert new entries above the `suggestion` entry
