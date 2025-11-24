@@ -125,11 +125,11 @@ Please check the folder of [examples](examples)
 ## Contributing
 
 We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-omni](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+Please check out [Contributing to vLLM-Omni](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
 
 ## Weekly Meeting
 
-- vLLM Omni Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
+- vLLM-Omni Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
 - Wednesday, 11:30 - 12:30 (UTC+8, [Convert to your timezone](https://dateful.com/convert/gmt8?t=15))
 
 ## License
