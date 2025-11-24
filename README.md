@@ -1,40 +1,65 @@
-# vLLM-omni: Multi-modal Extension for vLLM
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="./docs/source/logos/vllm-omni-logo-text-dark.png">
+    <img alt="vllm-omni" src="./docs/source/logos/vllm-omni-logo-text-dark.png" width=55%>
+  </picture>
+</p>
+<h3 align="center">
+Easy, fast, and cheap omni-modality model serving for everyone
+</h3>
 
-vLLM-omni is designed to extend vLLM capabilities to support multi-modality model inference and serving, particularly focusing on non-autoregressive structures and non-textual outputs.
+<p align="center">
+| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://tinyurl.com/vllm-omni-meeting"><b>Weekly Meeting</b></a> |
+</p>
 
-## 🎯 Overview
+---
 
-Traditional vLLM systems are limited to text-based, autoregressive generation. vLLM-omni addresses this limitation by enabling support for:
+*Latest News* 🔥
 
-- **Multi-modal Models**: Text, image, video, audio, and sensor data processing
-- **Non-autoregressive Architectures**: Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous Outputs**: Beyond traditional text generation to multimodal outputs
+- [2025/11] vLLM community officially released [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) in order to support omni-modality models serving.
 
-## 🏗️ Architecture
+---
 
-vLLM-omni is built on a modular architecture that extends vLLM's core functionality:
+## About
 
+[vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni extends its support for omni-modality model inference and serving:
 
-## 🚀 Key Features
+- **Omni-modality**: Text, image, video, and audio data processing
+- **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
+- **Heterogeneous outputs**: from traditional text generation to multimodal outputs
 
-### Multi-Engine Support
+<p align="center">
+  <picture>
+    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality model architecture.png" width=55%>
+  </picture>
+</p>
 
-- **Autoregressive Engine**: Traditional text generation with enhanced KV-caching
-- **Diffusion Engine**: Support for DiT models and iterative generation
-- **Hybrid Engine**: Combined AR+DiT processing pipelines
+vLLM-omni is fast with:
 
-### Modality Processing
+- Seamless AR support for efficient KV Cache management with vLLM
+- Pipelined stage execution overlapping
+- Fully disaggregation based on omniConnector and dynamic resource allocation across stages
 
-- **Text**: Advanced tokenization and embedding generation
-- **Image**: Vision encoder integration (CLIP, etc.)
-- **Audio**: Speech processing and audio embedding
+vLLM-omni is flexible and easy to use with:
 
-## 📋 Supported Models
+- Seamless integration with popular Hugging Face models
+- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
+- Tensor, pipeline, data and expert parallelism support for distributed inference
+- Streaming outputs
+- OpenAI-compatible API server
 
-### AR + Diffusion Transformer (DiT) Models
-- Qwen-omni (Thinker-Talker-Codec structure)
-- HunyunaImage 3.0 (Ongoing)
-- Qwen-Image (Ongoing)
+vLLM seamlessly supports most popular open-source models on HuggingFace, including:
+
+- Multi-modality generation models (e.g. Qwen-image)
+- Omni-modality models (e.g. Qwen-omni)
+
+## Getting Started
+
+Install vLLM with `pip` or [from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
+
+```bash
+pip install vllm
+```
 
 ## 🛠️ Installation
 
@@ -84,12 +109,6 @@ uv pip install -r requirements/build.txt
 uv pip install --no-build-isolation --editable .
 ```
 
-### Verification for successful installation of vLLM
-Just run the command below. If no error, it demonstrates that the installation is successful.
-```bash
-python -c "import vllm._C"
-```
-
 ### Installation of vLLM-omni
 Install additional requirements for vllm-omni
 ```bash
@@ -98,10 +117,21 @@ cd vllm_omni
 uv pip install -e .
 ```
 
+
 ## Run examples (Qwen2.5-omni)
 
 Please check the folder of [examples](examples)
 
-## Further details
+## Contributing
 
-For detailed architecture design, see [vllm_omni_design.md](docs/architecture/vllm_omni_design.md) and [high_level_arch_design.md](docs/architecture/high_level_arch_design.md).
+We welcome and value any contributions and collaborations.
+Please check out [Contributing to vLLM-omni](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+
+## Weekly Meeting
+
+- vLLM Omni Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
+- Wednesday, 11:30 - 12:30 (UTC+8, [Convert to your timezone](https://dateful.com/convert/gmt8?t=15))
+
+## License
+
+Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
