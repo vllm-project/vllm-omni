@@ -6,8 +6,10 @@ import os as _os_env_toggle
 import random
 import signal
 import sys
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlparse
@@ -15,7 +17,9 @@ from urllib.parse import urlparse
 import gradio as gr
 import numpy as np
 import soundfile as sf
+from PIL import Image
 import torch
+from vllm.assets.video import video_get_metadata, video_to_ndarrays
 
 # For HTTP API mode
 from openai import OpenAI
@@ -26,7 +30,11 @@ from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 
 # Import utils from offline inference example
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../offline_inference/qwen2_5_omni"))
-from utils import make_omni_prompt
+try:
+    from utils import make_omni_prompt
+except ImportError:
+    # Fallback if utils doesn't exist - we'll build prompts directly
+    make_omni_prompt = None
 
 SEED = 42
 ASYNC_INIT_TIMEOUT = 600
@@ -164,20 +172,212 @@ def get_system_prompt():
     }
 
 
+def process_audio_file(
+    audio_file: Optional[Any],
+) -> Optional[Tuple[np.ndarray, int]]:
+    """Normalize Gradio audio input to (np.ndarray, sample_rate)."""
+    if audio_file is None:
+        return None
+
+    sample_rate: Optional[int] = None
+    audio_np: Optional[np.ndarray] = None
+
+    def _load_from_path(path_str: str) -> Optional[Tuple[np.ndarray, int]]:
+        if not path_str:
+            return None
+        path = Path(path_str)
+        if not path.exists():
+            return None
+        data, sr = sf.read(path)
+        if data.ndim > 1:
+            data = data[:, 0]
+        return data.astype(np.float32), int(sr)
+
+    if isinstance(audio_file, tuple):
+        if len(audio_file) == 2:
+            first, second = audio_file
+            # Case 1: (sample_rate, np.ndarray)
+            if isinstance(first, (int, float)) and isinstance(second, np.ndarray):
+                sample_rate = int(first)
+                audio_np = second
+            # Case 2: (filepath, (sample_rate, np.ndarray or list))
+            elif isinstance(first, str):
+                if isinstance(second, tuple) and len(second) == 2:
+                    sr_candidate, data_candidate = second
+                    if isinstance(sr_candidate, (int, float)) and isinstance(
+                        data_candidate, np.ndarray
+                    ):
+                        sample_rate = int(sr_candidate)
+                        audio_np = data_candidate
+                if audio_np is None:
+                    loaded = _load_from_path(first)
+                    if loaded is not None:
+                        audio_np, sample_rate = loaded
+            # Case 3: (None, (sample_rate, np.ndarray))
+            elif first is None and isinstance(second, tuple) and len(second) == 2:
+                sr_candidate, data_candidate = second
+                if isinstance(sr_candidate, (int, float)) and isinstance(
+                    data_candidate, np.ndarray
+                ):
+                    sample_rate = int(sr_candidate)
+                    audio_np = data_candidate
+        elif len(audio_file) == 1 and isinstance(audio_file[0], str):
+            loaded = _load_from_path(audio_file[0])
+            if loaded is not None:
+                audio_np, sample_rate = loaded
+    elif isinstance(audio_file, str):
+        loaded = _load_from_path(audio_file)
+        if loaded is not None:
+            audio_np, sample_rate = loaded
+
+    if audio_np is None or sample_rate is None:
+        return None
+
+    if audio_np.ndim > 1:
+        audio_np = audio_np[:, 0]
+
+    return audio_np.astype(np.float32), sample_rate
+
+
+def process_image_file(image_file: Optional[Image.Image]) -> Optional[Image.Image]:
+    """Process image file from Gradio input.
+    
+    Returns:
+        PIL Image in RGB mode or None if no image provided.
+    """
+    if image_file is None:
+        return None
+    # Convert to RGB if needed
+    if image_file.mode != "RGB":
+        image_file = image_file.convert("RGB")
+    return image_file
+
+
+def process_video_file(
+    video_file: Optional[str],
+    enable_audio_in_video: bool = False,
+    max_frames: int = 32,
+) -> Optional[Tuple[np.ndarray, dict[str, Any], Optional[Tuple[np.ndarray, int]]]]:
+    """Process video file and optionally extract audio track."""
+    if video_file is None:
+        return None
+
+    video_path = Path(video_file)
+    if not video_path.exists():
+        print(f"Video file not found: {video_path}")
+        return None
+
+    try:
+        frames = video_to_ndarrays(str(video_path), num_frames=max_frames)
+        metadata = video_get_metadata(str(video_path), num_frames=frames.shape[0])
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Failed to decode video {video_path}: {exc}")
+        return None
+
+    audio_tuple: Optional[Tuple[np.ndarray, int]] = None
+    if enable_audio_in_video:
+        try:
+            import librosa  # type: ignore import
+
+            audio_signal, sampling_rate = librosa.load(str(video_path), sr=16000)
+            audio_tuple = (audio_signal.astype(np.float32), sampling_rate)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Failed to extract audio from video {video_path}: {exc}")
+
+    return frames, metadata, audio_tuple
+
+
 async def run_inference_async_omni_llm(
     omni_llm: AsyncOmniLLM,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     user_prompt: str,
+    audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]] = None,
+    image_file: Optional[Image.Image] = None,
+    video_file: Optional[str] = None,
+    use_audio_in_video: bool = False,
 ):
-    """Run inference using AsyncOmniLLM directly."""
-    if not user_prompt.strip():
-        return "Please provide a valid text prompt.", None
-
-    prompt_args = SimpleNamespace(**prompt_args_template.__dict__)
-    omni_prompt = make_omni_prompt(prompt_args, user_prompt)
+    """Run inference using AsyncOmniLLM directly with multimodal support."""
+    if not user_prompt.strip() and not audio_file and not image_file and not video_file:
+        return "Please provide at least a text prompt or multimodal input.", None
 
     try:
+        # Build prompt with multimodal data
+        prompt_args = SimpleNamespace(**prompt_args_template.__dict__)
+        
+        # Process multimodal inputs
+        multi_modal_data = {}
+        mm_processor_kwargs = {}
+        
+        # Process audio
+        audio_data = process_audio_file(audio_file)
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
+        
+        # Process image
+        image_data = process_image_file(image_file)
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        
+        # Process video
+        video_payload = process_video_file(video_file, enable_audio_in_video=use_audio_in_video)
+        if video_payload is not None:
+            video_frames, video_metadata, extracted_audio = video_payload
+            video_entry: Any
+            if video_metadata:
+                video_entry = (video_frames, video_metadata)
+            else:
+                video_entry = video_frames
+            multi_modal_data["video"] = video_entry
+            if use_audio_in_video and extracted_audio is not None and "audio" not in multi_modal_data:
+                multi_modal_data["audio"] = extracted_audio
+                mm_processor_kwargs["use_audio_in_video"] = True
+        
+        # Build the prompt input
+        if make_omni_prompt is not None:
+            omni_prompt = make_omni_prompt(prompt_args, user_prompt)
+            # Add multimodal data if present
+            if multi_modal_data:
+                if isinstance(omni_prompt, dict):
+                    omni_prompt["multi_modal_data"] = multi_modal_data
+                    if mm_processor_kwargs:
+                        omni_prompt["mm_processor_kwargs"] = mm_processor_kwargs
+                else:
+                    # If make_omni_prompt returns a string, we need to wrap it
+                    omni_prompt = {
+                        "prompt": omni_prompt,
+                        "multi_modal_data": multi_modal_data,
+                    }
+                    if mm_processor_kwargs:
+                        omni_prompt["mm_processor_kwargs"] = mm_processor_kwargs
+        else:
+            # Fallback: build prompt directly
+            default_system = (
+                "You are Qwen, a virtual human developed by the Qwen Team, "
+                "Alibaba Group, capable of perceiving auditory and visual inputs, "
+                "as well as generating text and speech."
+            )
+            prompt = (
+                f"<|im_start|>system\n{default_system}<|im_end|>\n"
+                "<|im_start|>user\n"
+            )
+            if audio_data:
+                prompt += "<|audio_bos|><|AUDIO|><|audio_eos|>"
+            if image_data:
+                prompt += "<|vision_bos|><|IMAGE|><|vision_eos|>"
+            if video_payload is not None:
+                prompt += "<|vision_bos|><|VIDEO|><|vision_eos|>"
+            if user_prompt.strip():
+                prompt += f"{user_prompt}"
+            prompt += "<|im_end|>\n<|im_start|>assistant\n"
+            
+            omni_prompt = {
+                "prompt": prompt,
+                "multi_modal_data": multi_modal_data,
+            }
+            if mm_processor_kwargs:
+                omni_prompt["mm_processor_kwargs"] = mm_processor_kwargs
+
         request_id = "0"
         text_outputs: list[str] = []
         audio_output = None
@@ -220,31 +420,104 @@ def run_inference_http_api(
     model: str,
     sampling_params_list: list[dict],
     user_prompt: str,
+    audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]] = None,
+    image_file: Optional[Image.Image] = None,
+    video_file: Optional[str] = None,
+    use_audio_in_video: bool = False,
 ):
-    """Run inference using HTTP API (vllm serve)."""
-    if not user_prompt.strip():
-        return "Please provide a valid text prompt.", None
+    """Run inference using HTTP API (vllm serve) with multimodal support."""
+    if not user_prompt.strip() and not audio_file and not image_file and not video_file:
+        return "Please provide at least a text prompt or multimodal input.", None
 
     try:
+        # Build user content array
+        user_content = []
+        
+        # Add audio if provided
+        if audio_file is not None:
+            # For HTTP API, encode audio as base64 data URL
+            audio_data = process_audio_file(audio_file)
+            if audio_data is not None:
+                audio_array, sample_rate = audio_data
+                # Save to temporary file and encode as base64
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                    sf.write(tmp_file.name, audio_array, sample_rate)
+                    tmp_path = tmp_file.name
+                    # Read back and encode
+                    with open(tmp_path, "rb") as f:
+                        audio_bytes = f.read()
+                    os.unlink(tmp_path)  # Clean up temp file
+                    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    user_content.append({
+                        "type": "audio_url",
+                        "audio_url": {"url": f"data:audio/wav;base64,{audio_base64}"}
+                    })
+        
+        # Add image if provided
+        if image_file is not None:
+            image_data = process_image_file(image_file)
+            if image_data is not None:
+                # Convert PIL Image to base64
+                buffered = io.BytesIO()
+                image_data.save(buffered, format="JPEG")
+                img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
+                })
+        
+        # Add video if provided
+        if video_file is not None:
+            video_path = Path(video_file)
+            if video_path.exists():
+                try:
+                    with open(video_path, "rb") as f:
+                        video_bytes = f.read()
+                    video_base64 = base64.b64encode(video_bytes).decode("utf-8")
+                    ext = video_path.suffix.lower()
+                    mime_type = {
+                        ".mp4": "video/mp4",
+                        ".avi": "video/x-msvideo",
+                        ".mov": "video/quicktime",
+                        ".mkv": "video/x-matroska",
+                    }.get(ext, "video/mp4")
+                    user_content.append({
+                        "type": "video_url",
+                        "video_url": {"url": f"data:{mime_type};base64,{video_base64}"}
+                    })
+                except Exception:
+                    user_content.append({
+                        "type": "video_url",
+                        "video_url": {"url": f"file://{video_path.resolve()}"}
+                    })
+        
+        # Add text prompt
+        if user_prompt.strip():
+            user_content.append({
+                "type": "text",
+                "text": user_prompt,
+            })
+        
         messages = [
             get_system_prompt(),
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": user_prompt,
-                    },
-                ],
+                "content": user_content,
             },
         ]
+
+        extra_body = {
+            "sampling_params_list": sampling_params_list
+        }
+        
+        # Add mm_processor_kwargs if needed
+        if use_audio_in_video:
+            extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
 
         chat_completion = client.chat.completions.create(
             messages=messages,
             model=model,
-            extra_body={
-                "sampling_params_list": sampling_params_list
-            },
+            extra_body=extra_body,
         )
 
         text_outputs: list[str] = []
@@ -284,16 +557,30 @@ def build_interface(
 
     if not use_api_server:
         # AsyncOmniLLM mode - Gradio supports async functions directly
-        async def run_inference(user_prompt: str):
+        async def run_inference(
+            user_prompt: str,
+            audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]],
+            image_file: Optional[Image.Image],
+            video_file: Optional[str],
+            use_audio_in_video: bool,
+        ):
             return await run_inference_async_omni_llm(
-                omni_llm, sampling_params, prompt_args_template, user_prompt
+                omni_llm, sampling_params, prompt_args_template, user_prompt,
+                audio_file, image_file, video_file, use_audio_in_video
             )
 
     else:
         # HTTP API mode
-        def run_inference(user_prompt: str):
+        def run_inference(
+            user_prompt: str,
+            audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]],
+            image_file: Optional[Image.Image],
+            video_file: Optional[str],
+            use_audio_in_video: bool,
+        ):
             return run_inference_http_api(
-                client, model, sampling_params_dict, user_prompt
+                client, model, sampling_params_dict, user_prompt,
+                audio_file, image_file, video_file, use_audio_in_video
             )
 
     with gr.Blocks() as demo:
@@ -302,21 +589,41 @@ def build_interface(
         if use_api_server and api_base:
             info_text += f"**API Base:** {api_base}\n\n"
         gr.Markdown(info_text)
+        
         with gr.Row():
-            input_box = gr.Textbox(
-                label="Input Prompt",
-                placeholder="For example: Please tell me a joke in 30 words.",
-                lines=4,
-            )
-        with gr.Row():
-            generate_btn = gr.Button("Generate", variant="primary")
-        with gr.Row():
-            text_output = gr.Textbox(label="Text Output", lines=6)
-            audio_output = gr.Audio(label="Audio Output", interactive=False)
+            with gr.Column(scale=1):
+                input_box = gr.Textbox(
+                    label="Text Prompt",
+                    placeholder="For example: Please tell me a joke in 30 words.",
+                    lines=4,
+                )
+                audio_input = gr.Audio(
+                    label="Audio Input (optional)",
+                    type="numpy",
+                    sources=["upload", "microphone"],
+                )
+                image_input = gr.Image(
+                    label="Image Input (optional)",
+                    type="pil",
+                    sources=["upload"],
+                )
+                video_input = gr.Video(
+                    label="Video Input (optional)",
+                    sources=["upload"],
+                )
+                use_audio_in_video_checkbox = gr.Checkbox(
+                    label="Use audio from video",
+                    value=False,
+                    info="Extract and use audio track from video input",
+                )
+            with gr.Column(scale=1):
+                generate_btn = gr.Button("Generate", variant="primary", size="lg")
+                text_output = gr.Textbox(label="Text Output", lines=10)
+                audio_output = gr.Audio(label="Audio Output", interactive=False)
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[input_box],
+            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox],
             outputs=[text_output, audio_output],
         )
         demo.queue()
