@@ -270,7 +270,7 @@ class QwenImagePipeline(
 
         self.stage = None
 
-        self.vae_scale_factor = 2 ** len(self.vae.temporal_downsample) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this

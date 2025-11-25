@@ -237,7 +237,7 @@ class QwenImageCrossAttention(nn.Module):
             self.to_add_out = None
 
         if not pre_only:
-            self.to_out = nn.Modulelist([])
+            self.to_out = nn.ModuleList([])
             self.to_out.append(ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias))
         else:
             self.to_out = None
@@ -521,7 +521,7 @@ class QwenImageTransformer2DModel(nn.Module):
         self.img_in = nn.Linear(in_channels, self.inner_dim)
         self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
 
-        self.transformer_blocks = nn.Modulelist(
+        self.transformer_blocks = nn.ModuleList(
             [
                 QwenImageTransformerBlock(
                     dim=self.inner_dim,

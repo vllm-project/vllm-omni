@@ -154,5 +154,6 @@ extend-ignore-identifiers-re = [
     ".*thw",
     "ein",
     ".*arange",
-    ".*MoBA"
+    ".*MoBA",
+    ".*temperal_downsample"
 ]
