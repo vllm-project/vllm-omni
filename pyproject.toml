@@ -30,10 +30,10 @@ classifiers = [
 dependencies = [
     # Core runtime dependencies (required for actual usage)
     "omegaconf>=2.3.0",
-    "decord>=0.6.0",
+    # "decord>=0.6.0", # install manually
     "librosa>=0.11.0",
     "resampy>=0.4.3",
-    # "vllm==0.11.0", # install manually
+    # "vllm==0.11.0",  # TODO: fix the entrypoints overwrite problem
 ]
 
 [project.optional-dependencies]
@@ -73,9 +73,13 @@ Documentation = "https://vllm-omni.readthedocs.io"
 vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_omni*"]
+
+[tool.setuptools.package-data]
+"vllm_omni.model_executor.stage_configs" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 120
