@@ -3,7 +3,7 @@
 import enum
 import random
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from vllm.logger import init_logger
@@ -17,6 +17,8 @@ logger = init_logger(__name__)
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     model: str
+
+    model_class_name: str | None = None
 
     # Attention
     # attention_backend: str = None
@@ -175,13 +177,21 @@ class OmniDiffusionConfig:
 
 
 @dataclass
-class OutputBatch:
+class DiffusionOutput:
     """
     Final output (after pipeline completion)
     """
 
     output: torch.Tensor | None = None
+    trajectory_timesteps: list[torch.Tensor] | None = None
+    trajectory_latents: torch.Tensor | None = None
+    trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+
+    post_process_func: Callable[..., Any] | None = None
+
+    # logged timings info, directly from Req.timings
+    # timings: Optional["RequestTimings"] = None
 
 
 class AttentionBackendEnum(enum.Enum):

@@ -12,10 +12,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, OutputBatch
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.diffusion.req import OmniDiffusionRequest
-
-from .models.qwen_image import QwenImagePipeline
 
 logger = init_logger(__name__)
 
@@ -63,24 +62,23 @@ class GPUWorker:
         init_distributed_environment(world_size=world_size, rank=rank)
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-        # self.pipeline = build_pipeline(self.engine_args)
-        # self.pipeline = TestModel(3, 6)
-        self.pipeline = QwenImagePipeline(device=device)
+        with device:
+            self.pipeline = initialize_model(self.od_config)
+            self.pipeline.load_weights()
+            self.pipeline.eval()
         logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
         print(f"{CYAN}Worker {self.rank}: Model loaded successfully.{RESET}")
 
     @torch.inference_mode()
-    def execute_model(self, batch: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> OutputBatch:
+    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
         Execute a forward pass.
         """
         assert self.pipeline is not None
         # TODO: dealing with first req for now
-        req = batch[0]
-        # output_batch = self.pipeline.forward(req, od_config)
-        output_batch = self.pipeline.forward(req)
-        print("output_batch ", output_batch)
-        return output_batch
+        req = reqs[0]
+        output = self.pipeline.forward(req)
+        return output
 
 
 class WorkerProc:
@@ -122,12 +120,12 @@ class WorkerProc:
         self.gpu_id = gpu_id
         self._running = True
 
-    def return_result(self, output_batch: OutputBatch):
+    def return_result(self, output: DiffusionOutput):
         """
         replies to client, only on rank 0
         """
         if self.result_mq is not None:
-            self.result_mq.enqueue(output_batch)
+            self.result_mq.enqueue(output)
 
     def recv_reqs(self):
         """
@@ -155,16 +153,16 @@ class WorkerProc:
 
             # 2: execute, make sure a reply is always sent
             try:
-                output_batch = self.worker.execute_model(reqs, self.od_config)
+                output = self.worker.execute_model(reqs, self.od_config)
             except Exception as e:
                 logger.error(
                     f"Error executing forward in event loop: {e}",
                     exc_info=True,
                 )
-                output_batch = OutputBatch(error=str(e))
+                output = DiffusionOutput(error=str(e))
 
             try:
-                self.return_result(output_batch)
+                self.return_result(output)
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")

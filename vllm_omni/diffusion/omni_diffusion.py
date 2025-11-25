@@ -1,9 +1,12 @@
 import logging
 import multiprocessing as mp
 
+import PIL.Image
+import torch
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, OutputBatch
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.launch_engine import launch_engine
 from vllm_omni.diffusion.req import OmniDiffusionRequest
 from vllm_omni.diffusion.sample import DiffusionSamplingParams
@@ -23,8 +26,19 @@ class OmniDiffusion:
     def __init__(self, od_config: OmniDiffusionConfig):
         self.od_config = od_config
 
+        config_dict = get_hf_file_to_dict(
+            "model_index.json",
+            od_config.model,
+        )
+        od_config.model_class_name = config_dict.get("_class_name", None)
+
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
+        from vllm_omni.diffusion.models.qwen_image.qwen_image import (
+            get_qwen_image_post_process_func,
+        )
+
+        self.post_process_func = get_qwen_image_post_process_func(od_config)
 
     @classmethod
     def from_pretrained(
@@ -74,7 +88,7 @@ class OmniDiffusion:
 
         return processes
 
-    def _send_to_scheduler_and_wait_for_response(self, requests: list[OmniDiffusionRequest]) -> OutputBatch:
+    def _send_to_scheduler_and_wait_for_response(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """
         Sends a request to the scheduler and waits for a response.
         """
@@ -85,7 +99,7 @@ class OmniDiffusion:
         prompt: str | list[str],
         sampling_params: DiffusionSamplingParams | None = None,
         **kwargs,
-    ):
+    ) -> list[PIL.Image.Image | None | torch.Tensor] | None:
         # Placeholder for diffusion generation logic
         prompts = []
         if isinstance(prompt, str):
@@ -109,12 +123,12 @@ class OmniDiffusion:
             )
         logger.info(f"Prepared {len(requests)} requests for generation.")
         try:
-            output_batch = self._send_to_scheduler_and_wait_for_response(requests)
-            if output_batch.error:
-                raise Exception(f"{output_batch.error}")
+            output = self._send_to_scheduler_and_wait_for_response(requests)
+            if output.error:
+                raise Exception(f"{output.error}")
 
             logger.info("Generation completed successfully.")
-            return output_batch.output
+            return self.post_process_func(output.output)
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return None

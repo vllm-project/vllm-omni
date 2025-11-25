@@ -2,7 +2,7 @@ import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, OutputBatch
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.req import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -43,8 +43,8 @@ class SyncScheduler:
     def get_broadcast_handle(self):
         return self.mq.export_handle()
 
-    def add_req(self, requests: list[OmniDiffusionRequest]) -> OutputBatch:
-        """Sends a batch to the scheduler and waits for the response."""
+    def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+        """Sends a request to the scheduler and waits for the response."""
         try:
             # Broadcast request to all workers
             self.mq.enqueue(requests)
@@ -52,9 +52,8 @@ class SyncScheduler:
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")
 
-            output_batch = self.result_mq.dequeue()
-            print("Received output batch:", output_batch)
-            return output_batch
+            output = self.result_mq.dequeue()
+            return output
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
