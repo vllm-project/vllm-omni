@@ -10,7 +10,12 @@ TALKER_CODEC_START_TOKEN_ID = 8293
 TALKER_CODEC_END_TOKEN_ID = 8294
 
 
-def thinker2talker(stage_list, engine_input_source, prompt: Union[OmniTokensPrompt, TextPrompt] = None):
+def thinker2talker(
+    stage_list,
+    engine_input_source,
+    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    requires_multimodal_data: bool = False,
+):
     if not engine_input_source:
         raise ValueError("engine_input_source cannot be empty")
     source_stage_id = engine_input_source[0]
@@ -48,7 +53,9 @@ def thinker2talker(stage_list, engine_input_source, prompt: Union[OmniTokensProm
                 + [TALKER_CODEC_END_TOKEN_ID],
                 additional_information=additional_information,
                 multi_modal_data=(
-                    multi_modal_data[thinker_output.request_id] if multi_modal_data is not None else None
+                    multi_modal_data[thinker_output.request_id]
+                    if requires_multimodal_data and multi_modal_data is not None
+                    else None
                 ),
                 mm_processor_kwargs=None,
             )
