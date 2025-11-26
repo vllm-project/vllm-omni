@@ -138,9 +138,6 @@ class OmniStage:
                     self,
                     model,
                     stage_payload,
-                    self._in_q,
-                    self._out_q,
-                    self._log_file,
                     batch_timeout,
                 ),
             )
@@ -150,9 +147,6 @@ class OmniStage:
                 args=(
                     model,
                     stage_payload,
-                    self._in_q,
-                    self._out_q,
-                    self._log_file,
                     batch_timeout,
                 ),
             )
@@ -225,9 +219,6 @@ class OmniStage:
 def _stage_worker(
     model: str,
     stage_payload: dict[str, Any],
-    in_q: mp.Queue,
-    out_q: mp.Queue,
-    log_file: Optional[str] = None,
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
@@ -248,6 +239,10 @@ def _stage_worker(
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
+
+    log_file=model._log_file
+    in_q=model._in_q
+    out_q=model._out_q
 
     # Per-stage file logger (optional)
     try:
@@ -487,21 +482,15 @@ def _stage_worker_async_entry(
     omni_stage: OmniStage,
     model: str,
     stage_payload: dict[str, Any],
-    in_q: mp.Queue,
-    out_q: mp.Queue,
-    log_file: Optional[str] = None,
     batch_timeout: int = 10,
 ) -> None:
-    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, in_q, out_q, log_file, batch_timeout))
+    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout))
 
 
 async def _stage_worker_async(
     omni_stage: OmniStage,
     model: str,
     stage_payload: dict[str, Any],
-    in_q: mp.Queue,
-    out_q: mp.Queue,
-    log_file: Optional[str] = None,
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
@@ -523,6 +512,9 @@ async def _stage_worker_async(
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
 
+    log_file=omni_stage._log_file
+    in_q=omni_stage._in_q
+    out_q=omni_stage._out_q
     # Per-stage file logger (optional)
     try:
         if log_file:
