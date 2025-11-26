@@ -240,9 +240,9 @@ def _stage_worker(
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
 
-    log_file=model._log_file
-    in_q=model._in_q
-    out_q=model._out_q
+    log_file = model._log_file
+    in_q = model._in_q
+    out_q = model._out_q
 
     # Per-stage file logger (optional)
     try:
@@ -512,9 +512,9 @@ async def _stage_worker_async(
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
 
-    log_file=omni_stage._log_file
-    in_q=omni_stage._in_q
-    out_q=omni_stage._out_q
+    log_file = omni_stage._log_file
+    in_q = omni_stage._in_q
+    out_q = omni_stage._out_q
     # Per-stage file logger (optional)
     try:
         if log_file:
