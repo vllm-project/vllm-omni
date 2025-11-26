@@ -18,9 +18,6 @@ from vllm_omni.diffusion.req import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
-CYAN = "\033[1;36m"
-RESET = "\033[0;0m"
-
 
 class GPUWorker:
     """
@@ -67,7 +64,7 @@ class GPUWorker:
             self.pipeline.load_weights()
             self.pipeline.eval()
         logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
-        print(f"{CYAN}Worker {self.rank}: Model loaded successfully.{RESET}")
+        logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:

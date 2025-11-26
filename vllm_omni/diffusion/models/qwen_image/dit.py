@@ -14,7 +14,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 
 logger = init_logger(__name__)
 
@@ -217,19 +217,32 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
 
         # layers
-        self.to_q = ReplicatedLinear(dim, dim)
-        self.to_k = ReplicatedLinear(dim, dim)
-        self.to_v = ReplicatedLinear(dim, dim)
-        if self.qk_norm:
-            self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-            self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        # self.to_q = ReplicatedLinear(dim, dim)
+        # self.to_k = ReplicatedLinear(dim, dim)
+        # self.to_v = ReplicatedLinear(dim, dim)
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            disable_tp=True,
+        )
+        self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_kv_dim, bias=True)
-            self.add_v_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_kv_dim, bias=True)
-            if context_pre_only is not None:
-                self.add_q_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_dim, bias=True)
+            assert context_pre_only is not None
+            # self.add_k_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_kv_dim, bias=True)
+            # self.add_v_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_kv_dim, bias=True)
+            # self.add_q_proj = ReplicatedLinear(
+            #     added_kv_proj_dim, self.inner_dim, bias=True
+            # )
+            self.add_kv_proj = QKVParallelLinear(
+                added_kv_proj_dim,
+                head_size=self.inner_kv_dim // self.num_heads,
+                total_num_heads=self.num_heads,
+                disable_tp=True,
+            )
 
         if context_pre_only is not None and not context_pre_only:
             self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
@@ -262,14 +275,12 @@ class QwenImageCrossAttention(nn.Module):
         seq_len_txt = encoder_hidden_states.shape[1]
 
         # Compute QKV for image stream (sample projections)
-        img_query, _ = self.to_q(hidden_states)
-        img_key, _ = self.to_k(hidden_states)
-        img_value, _ = self.to_v(hidden_states)
+        qkv, _ = self.to_qkv(hidden_states)
+        img_query, img_key, img_value = qkv.chunk(3, dim=-1)
 
         # Compute QKV for text stream (context projections)
-        txt_query, _ = self.add_q_proj(encoder_hidden_states)
-        txt_key, _ = self.add_k_proj(encoder_hidden_states)
-        txt_value, _ = self.add_v_proj(encoder_hidden_states)
+        qkv, _ = self.add_kv_proj(encoder_hidden_states)
+        txt_query, txt_key, txt_value = qkv.chunk(3, dim=-1)
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -281,14 +292,10 @@ class QwenImageCrossAttention(nn.Module):
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
         # Apply QK normalization
-        if self.norm_q is not None:
-            img_query = self.norm_q(img_query)
-        if self.norm_k is not None:
-            img_key = self.norm_k(img_key)
-        if self.norm_added_q is not None:
-            txt_query = self.norm_added_q(txt_query)
-        if self.norm_added_k is not None:
-            txt_key = self.norm_added_k(txt_key)
+        img_query = self.norm_q(img_query)
+        img_key = self.norm_k(img_key)
+        txt_query = self.norm_added_q(txt_query)
+        txt_key = self.norm_added_k(txt_key)
 
         # Apply RoPE
         if image_rotary_emb is not None:
@@ -614,20 +621,78 @@ class QwenImageTransformer2DModel(nn.Module):
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            # Handle potential name mismatches for FeedForward layers
-            # If the loaded weights come from a model using GEGLU (has .proj)
-            # but our model uses Linear (no .proj), map them.
-            if name.endswith(".proj.weight") and name not in params_dict:
-                name = name.replace(".proj.weight", ".weight")
-            elif name.endswith(".proj.bias") and name not in params_dict:
-                name = name.replace(".proj.bias", ".bias")
+        # Collect incoming weights into a dict for flexible mapping and grouping
+        weights_map: dict[str, torch.Tensor] = {name: tensor for name, tensor in weights}
 
-            if name in params_dict:
-                param = params_dict[name]
+        stacked_params_mapping = [
+            (
+                "to_qkv",
+                [
+                    {"aliases": ["q_proj", "to_q", "q", "query"], "order": 0},
+                    {"aliases": ["k_proj", "to_k", "k", "key"], "order": 1},
+                    {"aliases": ["v_proj", "to_v", "v", "value"], "order": 2},
+                ],
+            ),
+            (
+                "add_kv_proj",
+                [
+                    {"aliases": ["add_q_proj", "add_q"], "order": 0},
+                    {"aliases": ["add_k_proj", "add_k"], "order": 1},
+                    {"aliases": ["add_v_proj", "add_v"], "order": 2},
+                ],
+            ),
+        ]
+
+        # Helper that attempts to gather shards per base key using aliases and merges them
+        for target, shards in stacked_params_mapping:
+            base_candidates: dict[str, dict[str, dict[int, tuple[str, torch.Tensor]]]] = {}
+            for key in list(weights_map.keys()):
+                for shard in shards:
+                    for alias in shard["aliases"]:
+                        weight_suffix = f".{alias}.weight"
+                        bias_suffix = f".{alias}.bias"
+                        if key.endswith(weight_suffix):
+                            base = key[: -len(weight_suffix)]
+                            base_entry = base_candidates.setdefault(base, {"weight": {}, "bias": {}})
+                            base_entry["weight"][shard["order"]] = (
+                                key,
+                                weights_map[key],
+                            )
+                            break
+                        if key.endswith(bias_suffix):
+                            base = key[: -len(bias_suffix)]
+                            base_entry = base_candidates.setdefault(base, {"weight": {}, "bias": {}})
+                            base_entry["bias"][shard["order"]] = (key, weights_map[key])
+                            break
+
+            for base, entry in base_candidates.items():
+                if len(entry["weight"]) == len(shards):
+                    ordered = [entry["weight"][order] for order in sorted(entry["weight"])]
+                    combined = torch.cat([tensor for _, tensor in ordered], dim=0)
+                    for key, _ in ordered:
+                        weights_map.pop(key, None)
+                    weights_map[base + f".{target}.weight"] = combined
+                if len(entry["bias"]) == len(shards):
+                    ordered_bias = [entry["bias"][order] for order in sorted(entry["bias"])]
+                    bcombined = torch.cat([tensor for _, tensor in ordered_bias], dim=0)
+                    for key, _ in ordered_bias:
+                        weights_map.pop(key, None)
+                    weights_map[base + f".{target}.bias"] = bcombined
+
+        # Now perform the parameter copy using the possibly-updated weights_map
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights_map.items():
+            # Handle potential name mismatches for FeedForward layers
+            if name.endswith(".proj.weight") and name not in params_dict:
+                mapped_name = name.replace(".proj.weight", ".weight")
+            elif name.endswith(".proj.bias") and name not in params_dict:
+                mapped_name = name.replace(".proj.bias", ".bias")
+            else:
+                mapped_name = name
+
+            if mapped_name in params_dict:
+                param = params_dict[mapped_name]
                 with torch.no_grad():
                     param.copy_(loaded_weight)
             else:
-                logger.warning(f"Weight {name} not found in model params.")
-                pass
+                logger.warning(f"Weight {name} (mapped to {mapped_name}) not found in model params.")
