@@ -7,12 +7,8 @@ logger = init_logger(__name__)
 
 
 def load_diffusers_config(model_name) -> dict:
-    try:
-        config = DiffusionPipeline.load_config(model_name)
-        return config
-    except Exception as e:
-        print(f"Error loading config for model {model_name}: {e}")
-        return {}
+    config = DiffusionPipeline.load_config(model_name)
+    return config
 
 
 @lru_cache
