@@ -56,7 +56,7 @@ docs = [
     "mkdocs-material",
     "mkdocstrings-python",
     "mkdocs-gen-files",
-    # "mkdocs-awesome-nav",  # Not available on PyPI
+    "mkdocs-awesome-nav",
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
