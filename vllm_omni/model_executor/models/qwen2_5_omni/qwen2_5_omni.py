@@ -244,11 +244,17 @@ class Qwen2_5OmniForConditionalGeneration(
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
             # Run thinker
+
+            # FIXME: a temporary method to fix the NPU adaptation issue, need more discussion.
+            thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+            thinker_positions = positions[0] if positions.ndim > 1 else positions
+            thinker_inputs_embeds = inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+            
             thinker_output = self.thinker(
-                input_ids=input_ids,
-                positions=positions[0],
+                input_ids=thinker_input_ids,
+                positions=thinker_positions,
                 intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=thinker_inputs_embeds,
                 **kwargs,
             )
 
