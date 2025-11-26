@@ -7,7 +7,7 @@ import json
 import os
 import pickle
 from multiprocessing import shared_memory as _shm
-
+from omegaconf import OmegaConf
 import cloudpickle
 
 logger = logging.getLogger(__name__)
