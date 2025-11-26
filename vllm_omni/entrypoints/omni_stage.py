@@ -32,7 +32,7 @@ from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     maybe_dump_to_shm,
     maybe_load_from_ipc_with_metrics,
-    set_stage_gpu_devices,
+    set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -332,7 +332,7 @@ def _stage_worker(
     import os as _os
     import time as _time
 
-    from vllm_omni.entrypoints.log_utils import (
+    from vllm_omni.entrypoints.log_utils import (  # noqa: WPS433
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
         log_stage_batch_stats,
@@ -425,7 +425,9 @@ def _stage_worker(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
+        from vllm_omni.utils import detect_device_type
+        device_type = detect_device_type()
+        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
@@ -666,8 +668,8 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
-    from vllm_omni.entrypoints.async_omni_llm import AsyncOmniStageLLM
-    from vllm_omni.entrypoints.log_utils import (
+    from vllm_omni.entrypoints.async_omni_llm import AsyncOmniStageLLM  # noqa: WPS433
+    from vllm_omni.entrypoints.log_utils import (  # noqa: WPS433
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
         log_stage_batch_stats,
@@ -717,7 +719,9 @@ async def _stage_worker_async(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
+        from vllm_omni.utils import detect_device_type
+        device_type = detect_device_type()
+        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 

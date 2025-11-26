@@ -228,12 +228,17 @@ class Qwen2_5OmniForConditionalGeneration(
                 positions = positions.to(thinker_dev)
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
+
+            thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+            thinker_positions = positions[0] if positions.ndim > 1 else positions
+            thinker_inputs_embeds = inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+
             # Run thinker
             thinker_output = self.thinker(
-                input_ids=input_ids,
-                positions=positions[0],
+                input_ids=thinker_input_ids,
+                positions=thinker_positions,
                 intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=thinker_inputs_embeds,
                 **kwargs,
             )
 
@@ -851,7 +856,7 @@ class Qwen2_5OmniForConditionalGeneration(
         __init__."""
         if self.token2wav is None or self.token2wav_config is None:
             return
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = self._module_device(self.token2wav)
         # optional speaker resources
         conds = getattr(self.token2wav_config, "conds", None)
         ref_mels = getattr(self.token2wav_config, "ref_mels", None)
@@ -1012,16 +1017,12 @@ class Qwen2_5OmniForConditionalGeneration(
         # Load token2wav weights (if any)
         if token2wav_weights and self.token2wav is not None:
             # download weights from huggingface for spk_dict.pt
-            model_path = self.vllm_config.model_config.model
-            download_dir = self.vllm_config.load_config.download_dir
-            if os.path.exists(model_path):
-                hf_model_folder = model_path
-            else:
-                hf_model_folder = download_weights_from_hf_specific(
-                    model_path,
-                    download_dir,
-                    allow_patterns=["*.pt"],
-                )
+
+            hf_model_folder = download_weights_from_hf_specific(
+                self.vllm_config.model_config.model,
+                self.vllm_config.load_config.download_dir,
+                allow_patterns=["*.pt"],
+            )
             self._init_token2wav_model(hf_model_folder)
             t2w_loaded = self.token2wav.load_weights(token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt"))
             t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, "token2wav")

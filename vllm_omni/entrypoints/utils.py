@@ -1,13 +1,11 @@
-from __future__ import annotations
-
-import logging
 import os
 from pathlib import Path
+from typing import Optional
 
 from omegaconf import OmegaConf
-from vllm.transformers_utils.config import get_config
 
-logger = logging.getLogger(__name__)
+from vllm.transformers_utils.config import get_config
+from vllm_omni.utils import detect_device_type
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -50,3 +48,27 @@ def load_stage_configs_from_yaml(config_path: str) -> list:
     """
     config_data = OmegaConf.load(config_path)
     return config_data.stage_args
+
+
+def select_worker_class(worker_cls: Optional[str], device_type: Optional[str] = None) -> Optional[str]:
+    """Select appropriate worker class based on device type."""
+    if worker_cls is None:
+        return None
+
+    if device_type is None:
+        device_type = detect_device_type()
+
+    if device_type == "npu":
+        # Replace module path: gpu_ar_worker -> npu_ar_worker
+        if "gpu_ar_worker" in worker_cls:
+            worker_cls = worker_cls.replace("gpu_ar_worker", "npu_ar_worker")
+        elif "gpu_diffusion_worker" in worker_cls:
+            worker_cls = worker_cls.replace("gpu_diffusion_worker", "npu_diffusion_worker")
+
+        # Replace class name: GPUARWorker -> NPUARWorker, GPUDiffusionWorker -> NPUDiffusionWorker
+        if "GPUARWorker" in worker_cls:
+            worker_cls = worker_cls.replace("GPUARWorker", "NPUARWorker")
+        elif "GPUDiffusionWorker" in worker_cls:
+            worker_cls = worker_cls.replace("GPUDiffusionWorker", "NPUDiffusionWorker")
+
+    return worker_cls
