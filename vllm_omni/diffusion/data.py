@@ -8,7 +8,7 @@ from typing import Any, Callable
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.utils import is_port_available
+from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 logger = init_logger(__name__)
 

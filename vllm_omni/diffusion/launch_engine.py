@@ -3,7 +3,7 @@ import multiprocessing as mp
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.gpu_worker import WorkerProc
+from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
 
 logger = init_logger(__name__)
 

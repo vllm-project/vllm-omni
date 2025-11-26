@@ -23,7 +23,18 @@ def prepare_requests(prompt: str | list[str], sampling_params: DiffusionSampling
 
 
 class OmniDiffusion:
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(self, od_config: OmniDiffusionConfig | None = None, **kwargs):
+        """Create an OmniDiffusion instance.
+
+        You can pass either an `OmniDiffusionConfig` via `od_config`, or
+        pass kwargs such as `model="Qwen/Qwen-Image"`,
+        which will be forwarded to `OmniDiffusionConfig.from_kwargs`.
+        """
+        if od_config is None:
+            od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
+        elif isinstance(od_config, dict):
+            od_config = OmniDiffusionConfig.from_kwargs(**od_config)
+
         self.od_config = od_config
 
         config_dict = get_hf_file_to_dict(
@@ -32,47 +43,20 @@ class OmniDiffusion:
         )
         od_config.model_class_name = config_dict.get("_class_name", None)
 
-        self.local_scheduler_process: list[mp.Process] | None = None
-        self.owns_scheduler_client: bool = False
+        self.scheduler_process: list[mp.Process] | None = None
+        # TODO:use another way to get post process func
         from vllm_omni.diffusion.models.qwen_image.qwen_image import (
             get_qwen_image_post_process_func,
         )
 
         self.post_process_func = get_qwen_image_post_process_func(od_config)
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        **kwargs,
-    ) -> "OmniDiffusion":
-        if (od_config := kwargs.get("od_config", None)) is not None:
-            if isinstance(od_config, OmniDiffusionConfig):
-                pass
-            elif isinstance(od_config, dict):
-                od_config = OmniDiffusionConfig.from_kwargs(**od_config)
-        else:
-            od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
+        self.scheduler_process = self._make_client()
 
-        return cls.from_engine_args(od_config)
-
-    @classmethod
-    def from_engine_args(cls, od_config: OmniDiffusionConfig) -> "OmniDiffusion":
-        """
-        Create a engine with the specified arguments.
-        """
-        instance = cls(
-            od_config=od_config,
-        )
-        instance.local_scheduler_process = instance._make_client()
-        instance.owns_scheduler_client = True
-        return instance
-
-    def _make_client(
-        self,
-    ) -> list[mp.Process]:
+    def _make_client(self) -> list[mp.Process]:
         sync_scheduler.initialize(self.od_config)
 
-        # Get the broadcast handle from the initialized client
+        # Get the broadcast handle from the initialized scheduler
         broadcast_handle = sync_scheduler.get_broadcast_handle()
 
         processes, result_handle = launch_engine(
