@@ -101,6 +101,8 @@ class OmniDiffusionRequest:
     eta: float = 0.0
     sigmas: list[float] | None = None
 
+    true_cfg_scale: float | None = None  # qwen-image specific now
+
     n_tokens: int | None = None
 
     # Other parameters that may be needed by specific schedulers

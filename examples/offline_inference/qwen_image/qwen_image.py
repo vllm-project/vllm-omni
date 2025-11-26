@@ -1,3 +1,5 @@
+import torch
+
 from vllm_omni.entrypoints.omni import Omni
 
 model_name = "Qwen/Qwen-Image"
@@ -6,5 +8,10 @@ if __name__ == "__main__":
     m = Omni(
         model=model_name,
     )
-    image = m.generate(prompt)
+    image = m.generate(
+        prompt,
+        height=1024,
+        width=512,
+        generator=torch.Generator(device="cuda").manual_seed(42),
+    )
     image[0].save("qwen_image_output.png")

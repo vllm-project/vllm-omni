@@ -253,17 +253,11 @@ class QwenImagePipeline(
         with set_default_torch_dtype(torch.bfloat16):
             self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 "Qwen/Qwen-Image", subfolder="text_encoder"
-            ).to(self.device)
+            )
             logger.info("Loaded Qwen-Image text encoder successfully")
             self.vae = AutoencoderKLQwenImage.from_pretrained("Qwen/Qwen-Image", subfolder="vae").to(self.device)
             logger.info("Loaded Qwen-Image VAE successfully")
             self.transformer = QwenImageTransformer2DModel()
-            # self.transformer = QwenImageTransformer2DModel.from_pretrained(
-            #     "Qwen/Qwen-Image", subfolder="transformer")
-            # self.transformer.to(self.device)
-            # self.transformer = QwenImageTransformer2DModel.from_pretrained(
-            #     "Qwen/Qwen-Image", subfolder="transformer"
-            # )
             logger.info("Initialized Qwen-Image transformer successfully.")
             self.tokenizer = Qwen2Tokenizer.from_pretrained("Qwen/Qwen-Image", subfolder="tokenizer")
             logger.info("Loaded Qwen-Image tokenizer successfully.")
@@ -602,11 +596,16 @@ class QwenImagePipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
-        # TODO: only support single prompt now
-        if req.prompt is not None:
-            prompt = req.prompt[0] if isinstance(req.prompt, list) else req.prompt
-        height = height or self.default_sample_size * self.vae_scale_factor
-        width = width or self.default_sample_size * self.vae_scale_factor
+        # # TODO: only support single prompt now
+        # if req.prompt is not None:
+        #     prompt = req.prompt[0] if isinstance(req.prompt, list) else req.prompt
+        prompt = req.prompt if req.prompt is not None else prompt
+        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        height = req.height or self.default_sample_size * self.vae_scale_factor
+        width = req.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = req.num_inference_steps or num_inference_steps
+        generator = req.generator or generator
+        true_cfg_scale = req.true_cfg_scale or true_cfg_scale
         # 1. check inputs
         # 2. encode prompts
         # 3. prepare latents and timesteps
