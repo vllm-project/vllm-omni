@@ -3,12 +3,12 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.req import OmniDiffusionRequest
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
 
-class SyncScheduler:
+class Scheduler:
     _instance = None
 
     def __new__(cls, *args, **kwargs):
@@ -65,4 +65,4 @@ class SyncScheduler:
 
 
 # Singleton instance for easy access
-sync_scheduler = SyncScheduler()
+scheduler = Scheduler()

@@ -11,7 +11,7 @@ if __name__ == "__main__":
     image = m.generate(
         prompt,
         height=1024,
-        width=512,
+        width=1024,
         generator=torch.Generator(device="cuda").manual_seed(42),
     )
     image[0].save("qwen_image_output.png")

@@ -1,5 +1,6 @@
 import logging
 import multiprocessing as mp
+from dataclasses import fields
 
 import PIL.Image
 import torch
@@ -8,9 +9,8 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.launch_engine import launch_engine
-from vllm_omni.diffusion.req import OmniDiffusionRequest
-from vllm_omni.diffusion.sample import DiffusionSamplingParams
-from vllm_omni.diffusion.schedule import sync_scheduler
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.schedule import scheduler
 
 # TODO configure logging properly
 logging.basicConfig(level=logging.INFO)
@@ -18,8 +18,16 @@ logging.basicConfig(level=logging.INFO)
 logger = init_logger(__name__)
 
 
-def prepare_requests(prompt: str | list[str], sampling_params: DiffusionSamplingParams | None):
-    pass
+def prepare_requests(prompt: str | list[str], **kwargs):
+    field_names = {f.name for f in fields(OmniDiffusionRequest)}
+
+    init_kwargs = {"prompt": prompt}
+
+    for key, value in kwargs.items():
+        if key in field_names:
+            init_kwargs[key] = value
+
+    return OmniDiffusionRequest(**init_kwargs)
 
 
 class OmniDiffusion:
@@ -54,10 +62,10 @@ class OmniDiffusion:
         self.scheduler_process = self._make_client()
 
     def _make_client(self) -> list[mp.Process]:
-        sync_scheduler.initialize(self.od_config)
+        scheduler.initialize(self.od_config)
 
         # Get the broadcast handle from the initialized scheduler
-        broadcast_handle = sync_scheduler.get_broadcast_handle()
+        broadcast_handle = scheduler.get_broadcast_handle()
 
         processes, result_handle = launch_engine(
             self.od_config,
@@ -66,7 +74,7 @@ class OmniDiffusion:
         )
 
         if result_handle is not None:
-            sync_scheduler.initialize_result_queue(result_handle)
+            scheduler.initialize_result_queue(result_handle)
         else:
             logger.error("Failed to get result queue handle from workers")
 
@@ -76,15 +84,13 @@ class OmniDiffusion:
         """
         Sends a request to the scheduler and waits for a response.
         """
-        return sync_scheduler.add_req(requests)
+        return scheduler.add_req(requests)
 
     def generate(
         self,
         prompt: str | list[str],
-        sampling_params: DiffusionSamplingParams | None = None,
         **kwargs,
     ) -> list[PIL.Image.Image | None | torch.Tensor] | None:
-        # Placeholder for diffusion generation logic
         prompts = []
         if isinstance(prompt, str):
             prompts.append(prompt)
@@ -96,13 +102,9 @@ class OmniDiffusion:
         requests: list[OmniDiffusionRequest] = []
         for p in prompts:
             requests.append(
-                OmniDiffusionRequest(
-                    request_id=None,
-                    prompt=p,
-                    negative_prompt=(getattr(sampling_params, "negative_prompt", None) if sampling_params else None),
-                    num_inference_steps=(
-                        getattr(sampling_params, "num_inference_steps", 50) if sampling_params else 50
-                    ),
+                prepare_requests(
+                    p,
+                    **kwargs,
                 )
             )
         logger.info(f"Prepared {len(requests)} requests for generation.")
@@ -116,4 +118,3 @@ class OmniDiffusion:
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return None
-        return f"Generated content based on prompt: {prompt} with sampling parameters: {sampling_params}"

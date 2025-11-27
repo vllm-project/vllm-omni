@@ -25,7 +25,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image.dit import QwenImageTransformer2DModel
-from vllm_omni.diffusion.req import OmniDiffusionRequest
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )

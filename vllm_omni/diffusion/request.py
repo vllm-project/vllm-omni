@@ -174,19 +174,5 @@ class OmniDiffusionRequest:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        # if self.perf_logger is None:
-        #     self.perf_logger = PerformanceLogger(self.request_id)
-
-    # def set_width_and_height(self, od_config: OmniDiffusionConfig):
-    #     if self.height is None or self.width is None:
-    #         width, height = od_config.pipeline_config.adjust_size(
-    #             self.width, self.height, self.pil_image
-    #         )
-    #         self.width = width
-    #         self.height = height
-    #     if self.height is None or self.width is None:
-    #         self.width = 1280
-    #         self.height = 720
-
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
