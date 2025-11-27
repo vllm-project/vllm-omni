@@ -56,7 +56,6 @@ class OmniDiffusion:
         od_config.model_class_name = config_dict.get("_class_name", None)
 
         self.scheduler_process: list[mp.Process] | None = None
-        # TODO:use another way to get post process func
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
 
