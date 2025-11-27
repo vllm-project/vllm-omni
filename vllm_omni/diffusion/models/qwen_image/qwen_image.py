@@ -12,9 +12,6 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl_qwenimage import (
     AutoencoderKLQwenImage,
 )
-
-# from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
-# from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
