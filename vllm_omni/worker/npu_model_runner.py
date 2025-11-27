@@ -19,6 +19,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -76,6 +77,42 @@ class OmniNPUModelRunner(NPUModelRunner):
                 self.mm_registry,
             ) if self.supports_mm_inputs else None
         return self._mm_budget
+
+    def _init_mrope_positions(self, req_state: CachedRequestState):
+        image_grid_thw = []
+        video_grid_thw = []
+        second_per_grid_ts = []
+        audio_feature_lengths = []
+        use_audio_in_video = False
+        for mm_feature in req_state.mm_features:
+            mm_item = mm_feature.data
+            if mm_item is None:
+                continue
+            mm_input = mm_item.get_data()
+            if (t := mm_input.get("image_grid_thw")) is not None:
+                image_grid_thw.append(t.tolist())
+            if (t := mm_input.get("video_grid_thw")) is not None:
+                video_grid_thw.append(t.tolist())
+            if (t := mm_input.get("second_per_grid_ts")) is not None:
+                second_per_grid_ts.append(t)
+            if (t := mm_input.get("audio_feature_lengths")) is not None:
+                audio_feature_lengths.append(t)
+            # Check for use_audio_in_video
+            use_audio_in_video_value = mm_input.get("use_audio_in_video")
+            if use_audio_in_video_value is not None:
+                use_audio_in_video = bool(use_audio_in_video_value.item())
+
+        assert supports_mrope(self.get_model()), "M-RoPE support is not implemented."
+
+        req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+            req_state.prompt_token_ids,
+            hf_config=self.model_config.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            audio_feature_lengths=audio_feature_lengths,
+            use_audio_in_video=use_audio_in_video,
+        )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
