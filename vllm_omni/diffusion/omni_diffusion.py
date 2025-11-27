@@ -12,6 +12,7 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.launch_engine import launch_engine
+from vllm_omni.diffusion.registry import get_diffusion_post_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.schedule import scheduler
 
@@ -56,11 +57,8 @@ class OmniDiffusion:
 
         self.scheduler_process: list[mp.Process] | None = None
         # TODO:use another way to get post process func
-        from vllm_omni.diffusion.models.qwen_image.qwen_image import (
-            get_qwen_image_post_process_func,
-        )
 
-        self.post_process_func = get_qwen_image_post_process_func(od_config)
+        self.post_process_func = get_diffusion_post_process_func(od_config)
 
         self.scheduler_process = self._make_client()
 
