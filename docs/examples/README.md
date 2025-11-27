@@ -1,6 +1,6 @@
 # Examples
 
-vLLM-omni's examples are split into three categories:
+vLLM-Omni's examples are split into two categories:
 
-- If you are using vLLM-omni from within Python code, see the *Offline Inference* section.
-- If you are using vLLM-omni from an HTTP application or client, see the *Online Serving* section.
+- If you are using vLLM-Omni from within Python code, see the *Offline Inference* section.
+- If you are using vLLM-Omni from an HTTP application or client, see the *Online Serving* section.

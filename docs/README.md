@@ -4,7 +4,7 @@ hide:
   - toc
 ---
 
-# Welcome to vLLM-omni
+# Welcome to vLLM-Omni
 
 <p align="center">
   <picture>
@@ -52,7 +52,7 @@ vLLM-omni is flexible and easy to use with:
 - Streaming outputs
 - OpenAI-compatible API server
 
-vLLM seamlessly supports most popular open-source models on HuggingFace, including:
+vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
 - Multi-modality generation models (e.g. Qwen-image)
 - Omni-modality models (e.g. Qwen-omni)

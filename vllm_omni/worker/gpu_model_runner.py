@@ -30,7 +30,26 @@ logger = init_logger(__name__)
 
 
 class OmniGPUModelRunner(GPUModelRunner):
+    """GPU model runner for omni models with M-RoPE support.
+
+    Extends the base GPUModelRunner to handle multimodal rotary position
+    embeddings (M-RoPE) for processing image, video, and audio inputs
+    with proper positional encoding.
+    """
+
     def _init_mrope_positions(self, req_state: CachedRequestState):
+        """Initialize M-RoPE positions for multimodal inputs.
+
+        Extracts multimodal feature metadata (image grids, video grids,
+        audio features) and computes M-RoPE positions for proper positional
+        encoding of multimodal tokens.
+
+        Args:
+            req_state: Cached request state containing multimodal features
+
+        Raises:
+            AssertionError: If the model does not support M-RoPE
+        """
         image_grid_thw = []
         video_grid_thw = []
         second_per_grid_ts = []

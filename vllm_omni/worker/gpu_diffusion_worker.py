@@ -13,7 +13,24 @@ from vllm_omni.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
 
 
 class GPUDiffusionWorker(GPUWorker):
+    """GPU worker for diffusion-based omni model stages.
+
+    Extends the base GPUWorker to initialize and manage diffusion model
+    runners for non-autoregressive generation stages (e.g., image or
+    audio generation stages).
+    """
+
     def init_device(self):
+        """Initialize the GPU device and diffusion model runner.
+
+        Sets up CUDA device, initializes distributed environment,
+        sets random seed, and creates a GPUDiffusionModelRunner instance.
+
+        Raises:
+            ValueError: If free GPU memory is insufficient for the
+                requested memory utilization
+            RuntimeError: If device type is not supported
+        """
         if self.device_config.device.type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

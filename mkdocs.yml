@@ -1,6 +1,6 @@
-site_name: vLLM-omni
+site_name: vLLM-Omni
 site_description: Multi-modality models inference and serving with non-autoregressive structures
-site_author: vLLM-omni Team
+site_author: vLLM-Omni Team
 site_url: https://vllm-project.github.io/vllm-omni/
 
 repo_name: vllm-project/vllm-omni
@@ -8,7 +8,7 @@ repo_url: https://github.com/vllm-project/vllm-omni
 edit_uri: edit/main/docs/
 
 # Copyright
-copyright: Copyright &copy; 2025 vLLM-omni Team
+copyright: Copyright &copy; 2025 vLLM-Omni Team
 
 # Theme
 theme:
@@ -58,6 +58,7 @@ theme:
 
 hooks:
   - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
 
 # Plugins
@@ -94,7 +95,8 @@ plugins:
           options:
             show_symbol_type_heading: true
             show_symbol_type_toc: true
-            filters: []
+            filters:
+              - "!^_"  # Exclude private members (methods/classes starting with underscore)
             summary:
               modules: true
             show_if_no_docstring: true
@@ -141,33 +143,10 @@ markdown_extensions:
   - pymdownx.arithmatex:
       generic: true
 
-# # Navigation
-# nav:
-#   - Home: index.md
-#   - User Guide:
-#     - Getting Started:
-#       - user_guide/getting_started/quickstart.md
-#     - Examples:
-#       - user_guide/examples/index.md
-#       - Offline Inference:
-#         - user_guide/examples/offline_inference/qwen_2_5_omni.md
-#       - Online Serving:
-#         - user_guide/examples/online_serving/index.md
-#   - API Reference:
-#       - Summary: api/overview.md
-#   - Developer Guide:
-#     - contributing/README.md
-#     - Design Documents:
-#       - contributing/design_documents/index.md
-#       - contributing/design_documents/vllm_omni_design.md
-#       - contributing/design_documents/architecture_overview.md
-#       - contributing/design_documents/api_design_doc.md
-
 extra_css:
   - mkdocs/stylesheets/extra.css
 
 extra_javascript:
-  - mkdocs/javascript/run_llm_widget.js
   - mkdocs/javascript/mathjax.js
   - https://unpkg.com/mathjax@3.2.2/es5/tex-mml-chtml.js
   - mkdocs/javascript/edit_and_feedback.js

@@ -62,6 +62,7 @@ docs = [
     "mkdocs-minify-plugin",
     "regex",
     "pydantic",
+    "black>=23.0.0",
 ]
 
 

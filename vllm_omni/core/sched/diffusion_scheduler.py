@@ -14,12 +14,22 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 
 
 class DiffusionScheduler(OmniScheduler):
+    """Scheduler for diffusion-based non-autoregressive stages.
+
+    Implements a fast-path scheduling strategy for diffusion models where
+    all input tokens are fed at once. Falls back to standard vLLM scheduling
+    if the token budget cannot accommodate all tokens in a single iteration.
+    """
+
     def schedule(self) -> SchedulerOutput:
-        """Diffusion fast path:
-        - Feed all input tokens of the request at once
-          (if 0, allocate 1 placeholder token).
-        - If the token budget cannot be satisfied at once, fall back to the
-          default vLLM scheduling.
+        """Schedule requests for diffusion model execution.
+
+        Uses a fast-path approach that feeds all input tokens at once
+        (or 1 placeholder token if input is empty). Falls back to
+        standard scheduling if token budget is insufficient.
+
+        Returns:
+            SchedulerOutput containing scheduled requests and token allocations
         """
 
         # Select requests with zero prompt and using pooling
