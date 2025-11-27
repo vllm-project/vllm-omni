@@ -9,7 +9,7 @@ _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
     "QwenImagePipeline": (
         "qwen_image",
-        "qwen_image",
+        "pipeline_qwen_image",
         "QwenImagePipeline",
     ),
 }

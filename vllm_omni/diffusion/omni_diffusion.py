@@ -2,19 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import multiprocessing as mp
 from dataclasses import fields
 
-import PIL.Image
-import torch
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.launch_engine import launch_engine
-from vllm_omni.diffusion.registry import get_diffusion_post_process_func
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.schedule import scheduler
 
 # TODO configure logging properly
 logging.basicConfig(level=logging.INFO)
@@ -55,42 +50,13 @@ class OmniDiffusion:
         )
         od_config.model_class_name = config_dict.get("_class_name", None)
 
-        self.scheduler_process: list[mp.Process] | None = None
-
-        self.post_process_func = get_diffusion_post_process_func(od_config)
-
-        self.scheduler_process = self._make_client()
-
-    def _make_client(self) -> list[mp.Process]:
-        scheduler.initialize(self.od_config)
-
-        # Get the broadcast handle from the initialized scheduler
-        broadcast_handle = scheduler.get_broadcast_handle()
-
-        processes, result_handle = launch_engine(
-            self.od_config,
-            broadcast_handle=broadcast_handle,
-            launch_http_server=False,
-        )
-
-        if result_handle is not None:
-            scheduler.initialize_result_queue(result_handle)
-        else:
-            logger.error("Failed to get result queue handle from workers")
-
-        return processes
-
-    def _send_to_scheduler_and_wait_for_response(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-        """
-        Sends a request to the scheduler and waits for a response.
-        """
-        return scheduler.add_req(requests)
+        self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
     def generate(
         self,
         prompt: str | list[str],
         **kwargs,
-    ) -> list[PIL.Image.Image | None | torch.Tensor] | None:
+    ):
         prompts = []
         if isinstance(prompt, str):
             prompts.append(prompt)
@@ -108,13 +74,7 @@ class OmniDiffusion:
                 )
             )
         logger.info(f"Prepared {len(requests)} requests for generation.")
-        try:
-            output = self._send_to_scheduler_and_wait_for_response(requests)
-            if output.error:
-                raise Exception(f"{output.error}")
+        return self._run_engine(requests)
 
-            logger.info("Generation completed successfully.")
-            return self.post_process_func(output.output)
-        except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            return None
+    def _run_engine(self, requests: list[OmniDiffusionRequest]):
+        return self.engine.generate(requests)
