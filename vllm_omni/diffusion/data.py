@@ -1,5 +1,6 @@
 # adapted from sglang and fastvideo
-
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
 import random
 from dataclasses import dataclass, field

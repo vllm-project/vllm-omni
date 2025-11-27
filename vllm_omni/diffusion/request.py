@@ -1,5 +1,6 @@
 # adapted from sglang and fastvideo
-
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pprint
 from dataclasses import asdict, dataclass, field
