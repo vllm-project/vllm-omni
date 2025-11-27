@@ -47,7 +47,3 @@ vLLM-Omni is a Python library that supports the following GPU variants. Select y
 ## Set up using Docker
 
 ### Pre-built images
-
-=== "NVIDIA CUDA"
-
-    --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:pre-built-images"
