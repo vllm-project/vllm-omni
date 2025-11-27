@@ -160,7 +160,7 @@ cython_debug/
 docker/
 
 # scripts
-scripts/
+/scripts/
 
 # tests
 tests/
