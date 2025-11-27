@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # unify OmniLLM and OmniDiffusion entrypoints
 
 from vllm_omni.diffusion.omni_diffusion import OmniDiffusion
