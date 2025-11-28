@@ -190,3 +190,29 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
 .md-typeset .tabbed-content {
   padding: 0 0.6em;
 }
+
+/* Hide link icon in header logo */
+.md-header__button.md-logo :is(img, svg) {
+  pointer-events: none;
+}
+
+.md-header__button.md-logo::after {
+  display: none !important;
+}
+
+/* Hide link icons in content tabs (tabbed content) */
+.md-typeset .tabbed-set > label::after,
+.md-typeset .tabbed-set > input:checked + label::after {
+  display: none !important;
+}
+
+/* Hide link icons in navigation tabs */
+.md-nav__link[href]::after,
+.md-nav__item--nested > .md-nav__link::after {
+  display: none !important;
+}
+
+/* Hide link icons in top navigation tabs */
+.md-tabs__link::after {
+  display: none !important;
+}

@@ -38,7 +38,6 @@ theme:
   features:
     - content.action.edit
     - content.code.copy
-    - content.tabs.link
     - navigation.instant
     - navigation.instant.progress
     - navigation.tracking
