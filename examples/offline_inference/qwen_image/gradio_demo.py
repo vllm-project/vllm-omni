@@ -100,12 +100,34 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         )
         return images[0]
 
-    with gr.Blocks(title="vLLM-Omni Online Serving Demo") as demo:
+    with gr.Blocks(
+        title="vLLM-Omni Online Serving Demo",
+        css="""
+        .control-panel {
+            display: flex;
+            gap: 12px;
+            align-items: stretch;
+        }
+        .left-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .left-controls .gradio-number,
+        .left-controls .gradio-dropdown {
+            margin-bottom: 0;
+        }
+        .prompt-panel textarea {
+            min-height: 270px !important;
+            height: 100%;
+        }
+        """,
+    ) as demo:
         gr.Markdown("# vLLM-Omni Online Serving Demo")
         gr.Markdown(f"**Model:** {args.model}")
 
-        with gr.Row():
-            with gr.Column(scale=1):
+        with gr.Row(elem_classes="control-panel"):
+            with gr.Column(scale=1, elem_classes="left-controls"):
                 seed_input = gr.Number(label="Seed", value=args.default_seed, precision=0)
                 cfg_input = gr.Number(label="CFG Scale", value=args.default_cfg_scale)
                 steps_input = gr.Number(
@@ -119,12 +141,12 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                     choices=ASPECT_RATIO_CHOICES,
                     value=f"{args.aspect_ratio_label} ({ASPECT_RATIOS[args.aspect_ratio_label][0]}x{ASPECT_RATIOS[args.aspect_ratio_label][1]})",
                 )
-            with gr.Column(scale=2):
+            with gr.Column(scale=2, elem_classes="prompt-panel"):
                 prompt_input = gr.Textbox(
                     label="Prompt",
                     value=args.default_prompt,
                     placeholder="Describe the image you want to generate...",
-                    lines=7,
+                    lines=6,
                 )
         generate_btn = gr.Button("Generate", variant="primary")
 
