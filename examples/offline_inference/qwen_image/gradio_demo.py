@@ -47,11 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--share", action="store_true", help="Share the Gradio demo publicly.")
     args = parser.parse_args()
     args.aspect_ratio_label = next(
-        (
-            ratio
-            for ratio, dims in ASPECT_RATIOS.items()
-            if dims == (args.width, args.height)
-        ),
+        (ratio for ratio, dims in ASPECT_RATIOS.items() if dims == (args.width, args.height)),
         None,
     )
     if args.aspect_ratio_label is None:
@@ -169,4 +165,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

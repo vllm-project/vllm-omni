@@ -32,8 +32,6 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
-
 logger = logging.getLogger(__name__)
 
 
