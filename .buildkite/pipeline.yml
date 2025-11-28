@@ -1,7 +1,6 @@
 steps:
-  - label: "Dummy pipeline"
-    if: "false"
-    agents:
-      queue: cpu_queue_premerge_us_east_1
+  - label: ":toolbox: Qwen2.5 omni offline example"
     commands:
-      - "echo 'This pipeline is intentionally a no-op.'"
+      - ".buildkite/scripts/run_qwen_offline_example.sh"
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU

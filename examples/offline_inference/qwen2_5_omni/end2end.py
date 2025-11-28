@@ -5,6 +5,7 @@ This example shows how to use vLLM-omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import argparse
 import os
 from typing import NamedTuple
 
@@ -195,35 +196,43 @@ def main(args):
 
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
 
-    # Determine output directory: prefer --output-dir; fallback to --output-wav
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = None
+    if args.save_results:
+        # Determine output directory: prefer --output-dir; fallback to --output-wav
+        output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+        os.makedirs(output_dir, exist_ok=True)
     for stage_outputs in omni_outputs:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
                 request_id = int(output.request_id)
                 text_output = output.outputs[0].text
-                # Save aligned text file per request
-                prompt_text = prompts[request_id]["prompt"]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n")
-                lines.append(str(text_output).strip() + "\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Text saved to {out_txt}")
+                if args.save_results:
+                    # Save aligned text file per request
+                    prompt_text = prompts[request_id]["prompt"]
+                    out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
+                    lines = []
+                    lines.append("Prompt:\n")
+                    lines.append(str(prompt_text) + "\n")
+                    lines.append("vllm_text_output:\n")
+                    lines.append(str(text_output).strip() + "\n")
+                    try:
+                        with open(out_txt, "w", encoding="utf-8") as f:
+                            f.writelines(lines)
+                    except Exception as e:
+                        print(f"[Warn] Failed writing text file {out_txt}: {e}")
+                    print(f"Request ID: {request_id}, Text saved to {out_txt}")
+                else:
+                    print(f"Request ID: {request_id}, Text output:\n{text_output}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
                 request_id = int(output.request_id)
                 audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
-                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+                if args.save_results:
+                    output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
+                    sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+                    print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+                else:
+                    print(f"Request ID: {request_id}, Received audio output (not saved).")
 
 
 def parse_args():
@@ -265,6 +274,12 @@ def parse_args():
         type=int,
         default=65536,
         help="Threshold for using shared memory in bytes (default: 65536)",
+    )
+    parser.add_argument(
+        "--save-results",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save text/audio outputs to files (default: enabled). Use --no-save-results to disable.",
     )
     parser.add_argument(
         "--output-wav",
