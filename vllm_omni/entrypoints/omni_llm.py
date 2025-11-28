@@ -42,11 +42,36 @@ logger = init_logger(__name__)
 
 
 class OmniLLM:
-    """Multi-process pipelined OmniLLM.
+    """Main entry point for vLLM-omni inference.
 
-    - Per-stage process with copy-based IPC (Queues)
-    - window=-1 across stages (downstream starts when upstream finishes)
-    - max_inflight=1 per stage (serial within a stage), but pipeline across stages
+    This class provides a high-level interface for running multi-modal
+    comprehension and generation models. It orchestrates multiple
+    stages in a pipeline, where each stage runs in a separate process
+    with copy-based IPC (Queues). Downstream stages start when upstream
+    stages finish (window=-1), and each stage processes requests serially
+    (max_inflight=1) but pipelines across stages.
+
+    Args:
+        model: Model name or path to load
+        stage_configs_path: Optional path to YAML file containing stage
+            configurations. If None, configurations are loaded from the model.
+        log_stats: Whether to enable statistics logging
+        log_file: Optional path prefix for log files. If provided, logs will
+            be written to files with stage-specific suffixes.
+        init_sleep_seconds: Number of seconds to sleep between starting
+            each stage process during initialization
+        shm_threshold_bytes: Threshold in bytes for using shared memory
+            for IPC. Objects larger than this threshold will use shared memory.
+        batch_timeout: Timeout in seconds for batching requests within a stage
+        init_timeout: Timeout in seconds for waiting for all stages to initialize
+        **kwargs: Additional keyword arguments passed to stage engines
+
+    Example:
+        >>> llm = OmniLLM(model="Qwen/Qwen2.5-Omni-7B")
+        >>> outputs = llm.generate(
+        ...     prompts="Hello",
+        ...     sampling_params_list=[SamplingParams(), SamplingParams()]
+        ... )
     """
 
     def __init__(
@@ -59,7 +84,7 @@ class OmniLLM:
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 300,
-        **kwargs,
+        **kwargs: Any,
     ):
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
@@ -132,6 +157,12 @@ class OmniLLM:
             time.sleep(self._init_sleep_seconds)
 
     def close(self) -> None:
+        """Close all stage processes and clean up resources.
+
+        Sends shutdown signals to all stage input queues and stops
+        all stage worker processes. This method should be called
+        when done using the OmniLLM instance.
+        """
         for q in self._stage_in_queues:
             try:
                 q.put_nowait(None)
@@ -157,6 +188,27 @@ class OmniLLM:
         prompts: Union[PromptType, Sequence[PromptType]],
         sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
     ) -> list[OmniRequestOutput]:
+        """Generate outputs for the given prompts.
+
+        Processes prompts through all stages in the pipeline and returns
+        the final outputs. Each stage uses its corresponding sampling
+        parameters from the sampling_params_list.
+
+        Args:
+            prompts: Single prompt or sequence of prompts to process.
+                Can be text strings, token IDs, or multimodal prompts.
+            sampling_params_list: List of SamplingParams, one for each stage.
+                Must have the same length as the number of stages.
+                Required for pipelined generation.
+
+        Returns:
+            List of OmniRequestOutput objects, one for each input prompt.
+            Each output contains the stage_id, final_output_type, and
+            the request_output from the final stage.
+
+        Raises:
+            ValueError: If sampling_params_list is None or has incorrect length.
+        """
         try:
             return self._run_generation(prompts, sampling_params_list)
         except Exception as e:
@@ -465,13 +517,31 @@ class OmniLLM:
 
 
 class OmniStageLLM(LLM):
+    """Single-stage LLM engine for use within a stage worker process.
+
+    This class extends the base vLLM LLM class with omni-specific
+    processors for handling multimodal inputs and outputs. It is used
+    internally by OmniStage workers and should not be instantiated directly
+    by users.
+
+    Args:
+        model: Model name or path to load
+        compilation_config: Optional compilation configuration. Can be an
+            integer (compilation level), dict, or CompilationConfig instance.
+        hf_overrides: Optional HuggingFace model configuration overrides
+        structured_outputs_config: Optional structured outputs configuration.
+            Can be a dict or StructuredOutputsConfig instance.
+        **kwargs: Additional keyword arguments passed to the base LLM class
+            and engine
+    """
+
     def __init__(
         self,
         model: str,
         compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
         hf_overrides: Optional[HfOverrides] = None,
         structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
-        **kwargs,
+        **kwargs: Any,
     ):
         """LLM constructor."""
         if "disable_log_stats" not in kwargs:

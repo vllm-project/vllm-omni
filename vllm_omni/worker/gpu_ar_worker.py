@@ -13,7 +13,23 @@ from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
 class GPUARWorker(GPUWorker):
+    """GPU worker for autoregressive omni model stages.
+
+    Extends the base GPUWorker to initialize and manage autoregressive
+    model runners for text generation stages (e.g., thinker stages).
+    """
+
     def init_device(self):
+        """Initialize the GPU device and autoregressive model runner.
+
+        Sets up CUDA device, initializes distributed environment,
+        sets random seed, and creates a GPUARModelRunner instance.
+
+        Raises:
+            ValueError: If free GPU memory is insufficient for the
+                requested memory utilization
+            RuntimeError: If device type is not supported
+        """
         if self.device_config.device.type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)

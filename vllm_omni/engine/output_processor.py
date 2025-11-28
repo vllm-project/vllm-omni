@@ -19,6 +19,13 @@ logger = init_logger(__name__)
 
 
 class OmniRequestState(RequestState):
+    """Request state for omni models, tracking multimodal outputs.
+
+    Extends the base RequestState with support for accumulating
+    multimodal tensor outputs (e.g., images, audio, latents) that
+    are produced incrementally during generation.
+    """
+
     def __init__(
         self,
         *args,
@@ -86,6 +93,17 @@ class OmniRequestState(RequestState):
         )
 
     def add_multimodal_tensor(self, tensor: Optional[torch.Tensor], mm_type: Optional[str]) -> None:
+        """Add a multimodal tensor to the accumulated outputs.
+
+        Accumulates multimodal tensors (e.g., image latents, audio waveforms)
+        that are produced incrementally during generation. Tensors are
+        concatenated along the first dimension.
+
+        Args:
+            tensor: Optional tensor to add. If None, this is a no-op.
+            mm_type: Optional modality type identifier (e.g., "image", "audio").
+                Used to categorize the output type.
+        """
         if tensor is None:
             return
         try:
@@ -115,6 +133,23 @@ class OmniRequestState(RequestState):
         stop_reason: Optional[Union[int, str]],
         kv_transfer_params: Optional[dict[str, Any]] = None,
     ) -> Optional[Union[OmniRequestOutput, PoolingRequestOutput]]:
+        """Create a request output from generation results.
+
+        Creates a RequestOutput or PoolingRequestOutput from the generated
+        tokens and accumulated multimodal outputs. Attaches multimodal
+        tensors to the completion output if available.
+
+        Args:
+            new_token_ids: List of newly generated token IDs
+            pooling_output: Optional pooling output tensor
+            finish_reason: Optional finish reason indicating why generation stopped
+            stop_reason: Optional stop reason (token ID or stop string)
+            kv_transfer_params: Optional KV cache transfer parameters
+
+        Returns:
+            OmniRequestOutput or PoolingRequestOutput if output should be
+            emitted (based on finish status and output kind), None otherwise
+        """
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
@@ -179,6 +214,15 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         log_stats: bool,
         engine_core_output_type: Optional[str] = None,
     ):
+        """Initialize the multimodal output processor.
+
+        Args:
+            tokenizer: Tokenizer for detokenizing text outputs
+            log_stats: Whether to log statistics
+            engine_core_output_type: Optional output type specification
+                (e.g., "image", "audio", "latents"). Used to route outputs
+                to appropriate processors. If None, output type is inferred.
+        """
         super().__init__(tokenizer=tokenizer, log_stats=log_stats)
         self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
         self._reqid_to_mm_type: dict[str, str] = {}
@@ -186,6 +230,16 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         self.engine_core_output_type = engine_core_output_type
 
     def register_handler(self, modality: str, handler: Callable[[EngineCoreOutput], None]) -> None:
+        """Register a custom handler for a specific modality.
+
+        Allows custom processing logic for specific output modalities.
+        The handler is called before default processing for outputs
+        matching the specified modality.
+
+        Args:
+            modality: Modality name (e.g., "image", "audio", "latents")
+            handler: Callable that takes an EngineCoreOutput and processes it
+        """
         self.output_handlers[modality.lower()] = handler
 
     def add_request(
@@ -196,6 +250,21 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         request_index: int = 0,
         queue: Optional[RequestOutputCollector] = None,
     ) -> None:
+        """Add a new request to be processed.
+
+        Creates an OmniRequestState for the request and registers it
+        for output processing.
+
+        Args:
+            request: Engine core request to add
+            prompt: Optional prompt string for the request
+            parent_req: Optional parent request for parallel sampling
+            request_index: Index of the request in the batch
+            queue: Optional queue for collecting outputs
+
+        Raises:
+            ValueError: If the request ID is already registered
+        """
         request_id = request.request_id
         if request_id in self.request_states:
             raise ValueError(f"Request id {request_id} already running.")
@@ -220,6 +289,21 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: Optional[float] = None,
         iteration_stats: Optional[IterationStats] = None,
     ) -> OutputProcessorOutput:
+        """Process engine core outputs into request outputs.
+
+        Converts EngineCoreOutput objects into RequestOutput objects,
+        handling multimodal outputs by routing them through appropriate
+        processors and accumulating tensors in request states.
+
+        Args:
+            engine_core_outputs: List of engine core outputs to process
+            engine_core_timestamp: Optional timestamp for the outputs
+            iteration_stats: Optional iteration statistics
+
+        Returns:
+            OutputProcessorOutput containing processed request outputs
+            and list of request IDs to abort
+        """
         self._reqid_to_mm_type.clear()
         for eco in engine_core_outputs:
             mm_type = (self.engine_core_output_type or "").lower()

@@ -38,3 +38,40 @@ If you encounter error about backend of librosa, try to install ffmpeg with comm
 sudo apt update
 sudo apt install ffmpeg
 ```
+
+## Run Local Web UI Demo
+
+This Web UI demo allows users to interact with the model through a web browser.
+
+### Running Gradio Demo
+
+Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmniLLM by
+
+```bash
+python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
+```
+
+Then open `http://localhost:7861/` on your local browser to interact with the web UI.
+
+
+### Options
+
+The gradio demo also supports running with an existing API server and can be customized with the following arguments.
+
+
+```bash
+python gradio_demo.py \
+    --model Qwen/Qwen2.5-Omni-7B \
+    --use-api-server \
+    --api-base http://localhost:8091/v1 \
+    --ip 127.0.0.1 \
+    --port 7861
+```
+
+- `--model`: Model name
+- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.
+- `--api-base`: Base URL for vllm serve (only used when `use-api-server` is set, default: http://localhost:8091/v1)
+- `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
+- `--port`: Port for Gradio server (default: 7861)
+- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
+- `--share`: Share the Gradio demo publicly (creates a public link)

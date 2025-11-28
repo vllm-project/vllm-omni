@@ -1,0 +1,7 @@
+steps:
+  - label: "Dummy pipeline"
+    if: "false"
+    agents:
+      queue: cpu_queue_premerge_us_east_1
+    commands:
+      - "echo 'This pipeline is intentionally a no-op.'"

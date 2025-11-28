@@ -114,6 +114,21 @@ async def build_async_omni_llm(
     disable_frontend_multiprocessing: Optional[bool] = None,
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
+    """Build an AsyncOmniLLM instance from command-line arguments.
+
+    Creates an async context manager that yields an AsyncOmniLLM instance
+    configured from the provided arguments. Handles forkserver setup if
+    needed and ensures proper cleanup on exit.
+
+    Args:
+        args: Parsed command-line arguments containing model and configuration
+        disable_frontend_multiprocessing: Optional flag to disable frontend
+            multiprocessing (deprecated in V1)
+        client_config: Optional client configuration dictionary
+
+    Yields:
+        EngineClient instance (AsyncOmniLLM) ready for use
+    """
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
         # Pre-import heavy modules in the forkserver process
@@ -139,12 +154,23 @@ async def build_async_omni_llm_from_stage_config(
     disable_frontend_multiprocessing: bool = False,
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
-    """
-    Create AsyncOmniLLM, either:
-        - in-process using the AsyncOmniLLM Directly
-        - multiprocess using AsyncOmniLLM RPC
+    """Create AsyncOmniLLM from stage configuration.
 
-    Returns the AsyncOmniLLM or None if the creation failed.
+    Creates an AsyncOmniLLM instance either in-process or using multiprocess
+    RPC. Loads stage configurations from the model or from a specified path.
+
+    Args:
+        args: Parsed command-line arguments containing model and stage configs
+        disable_frontend_multiprocessing: Flag to disable frontend multiprocessing
+            (deprecated in V1)
+        client_config: Optional client configuration dictionary
+
+    Yields:
+        EngineClient instance (AsyncOmniLLM) ready for use
+
+    Note:
+        Stage configurations are loaded from args.stage_configs_path if provided,
+        otherwise from the model's default configuration.
     """
 
     # V1 AsyncLLM.
@@ -179,6 +205,17 @@ async def omni_init_app_state(
     state: State,
     args: Namespace,
 ) -> None:
+    """Initialize the FastAPI application state for omni API server.
+
+    Sets up the application state with model information, request logger,
+    and other server configuration needed for handling API requests.
+
+    Args:
+        engine_client: Engine client instance (AsyncOmniLLM)
+        vllm_config: vLLM configuration object
+        state: FastAPI application state object to initialize
+        args: Parsed command-line arguments
+    """
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:
