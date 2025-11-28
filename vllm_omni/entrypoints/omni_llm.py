@@ -97,7 +97,7 @@ class OmniLLM:
         # Optional file handler for orchestrator
         self._log_file = log_file
         if self._log_file:
-            remove_old_logs(self._log_file, len(self.stage_list))
+            remove_old_logs(self._log_file, len(self.stage_configs))
             configure_orchestrator_logger(logger, self._log_file)
 
         self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
