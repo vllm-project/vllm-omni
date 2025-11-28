@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# unify OmniLLM and OmniDiffusion entrypoints
-
 from vllm_omni.diffusion.omni_diffusion import OmniDiffusion
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
 
 class Omni:
+    """Unified entrypoint for both LLM and Diffusion models for better usability."""
+
     def __init__(self, *args, **kwargs):
         model = args[0] if args else kwargs.get("model", "")
         if is_diffusion_model(model):

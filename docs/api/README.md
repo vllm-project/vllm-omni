@@ -11,6 +11,7 @@ Main entry points for vLLM-omni inference and serving.
 - [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
 - [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
+- [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_llm.OmniStageLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
@@ -30,6 +31,7 @@ Input data structures for multi-modal inputs.
 
 Engine classes for offline and online inference.
 
+- [vllm_omni.diffusion.diffusion_engine.DiffusionEngine][]
 - [vllm_omni.engine.AdditionalInformationEntry][]
 - [vllm_omni.engine.AdditionalInformationPayload][]
 - [vllm_omni.engine.OmniEngineCoreRequest][]
@@ -81,6 +83,8 @@ Configuration classes.
 
 Worker classes and model runners for distributed inference.
 
+- [vllm_omni.diffusion.worker.gpu_worker.GPUWorker][]
+- [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]
