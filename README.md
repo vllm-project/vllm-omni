@@ -55,17 +55,18 @@ vLLM seamlessly supports most popular open-source models on HuggingFace, includi
 
 ## Getting Started
 
-Please refer to [Quick Start](docs/getting_started/quickstart.md)
+Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn more.
 
 Visit our documentation to learn more.
 
-- [Installation](docs/getting_started/installation/)
-- [List of Supported Models](docs/models/supported_models.md)
+- [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
+- [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
+- [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 
 ## Contributing
 
 We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-omni](docs/contributing/README.md) for how to get involved.
+Please check out [Contributing to vLLM-omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
 
 ## Weekly Meeting
 
