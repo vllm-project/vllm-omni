@@ -84,7 +84,7 @@ def set_stage_gpu_devices(stage_id: int, devices: str | int | None) -> None:
             )
 
         try:
-            import torch  # noqa: WPS433
+            import torch
 
             if torch.cuda.is_available():
                 try:
