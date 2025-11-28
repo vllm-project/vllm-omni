@@ -30,8 +30,28 @@ logger = init_logger(__name__)
 
 
 class OmniProcessor(Processor):
+    """Processor for omni models, handling multimodal inputs and embeddings.
+
+    Extends the base vLLM Processor with support for processing prompt
+    embeddings and additional information payloads, enabling direct transfer
+    of pre-computed embeddings between pipeline stages.
+
+    Args:
+        vllm_config: Global vLLM configuration
+        tokenizer: Tokenizer instance for text processing
+        mm_registry: Multi-modal registry for processing multimodal inputs
+    """
+
     @staticmethod
     def _dtype_to_name(dtype: torch.dtype) -> str:
+        """Convert torch dtype to string representation.
+
+        Args:
+            dtype: PyTorch dtype to convert
+
+        Returns:
+            String representation of the dtype (e.g., "float32", "int64")
+        """
         mapping = {
             torch.float32: "float32",
             torch.float: "float32",
@@ -78,6 +98,35 @@ class OmniProcessor(Processor):
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> tuple[Optional[str], OmniEngineCoreRequest]:
+        """Process input prompt into an engine core request.
+
+        Converts a prompt (text, tokens, or multimodal) into an
+        OmniEngineCoreRequest that can be processed by the engine.
+        Handles prompt embeddings and additional information payloads
+        for direct transfer between stages.
+
+        Args:
+            request_id: Unique identifier for this request
+            prompt: Input prompt (text, token IDs, embeddings, or multimodal)
+            params: Sampling or pooling parameters for generation
+            arrival_time: Optional arrival timestamp (defaults to current time)
+            lora_request: Optional LoRA adapter request
+            tokenization_kwargs: Optional additional tokenization arguments
+            trace_headers: Optional tracing headers for observability
+            priority: Request priority (higher values processed first)
+            data_parallel_rank: Optional data parallel rank for distributed
+                inference
+
+        Returns:
+            Tuple of (prompt_string, OmniEngineCoreRequest) where:
+                - prompt_string: The original prompt as a string, or None if
+                  using embeddings
+                - OmniEngineCoreRequest: Processed request ready for the engine
+
+        Raises:
+            ValueError: If data_parallel_rank is out of range or prompt_embeds
+                has incorrect shape
+        """
         # TODO(woosuk): Support pooling models.
         # TODO(woosuk): Support encoder-decoder models.
         self._validate_lora(lora_request)

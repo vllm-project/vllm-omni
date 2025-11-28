@@ -1,6 +1,6 @@
 # Offline Example of vLLM-omni for Qwen2.5-omni
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples\offline_inference\qwen2_5_omni>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni>.
 
 
 ## 🛠️ Installation
@@ -36,29 +36,29 @@ Then run the command below.
 bash run_single_prompt.sh
 ```
 
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
+```
+
 ## Example materials
 
 ??? abstract "end2end.py"
     ``````py
-    --8<-- "examples\offline_inference\qwen2_5_omni\end2end.py"
+    --8<-- "examples/offline_inference/qwen2_5_omni/end2end.py"
     ``````
 ??? abstract "extract_prompts.py"
     ``````py
-    --8<-- "examples\offline_inference\qwen2_5_omni\extract_prompts.py"
-    ``````
-??? abstract "processing_omni.py"
-    ``````py
-    --8<-- "examples\offline_inference\qwen2_5_omni\processing_omni.py"
+    --8<-- "examples/offline_inference/qwen2_5_omni/extract_prompts.py"
     ``````
 ??? abstract "run_multiple_prompts.sh"
     ``````sh
-    --8<-- "examples\offline_inference\qwen2_5_omni\run_multiple_prompts.sh"
+    --8<-- "examples/offline_inference/qwen2_5_omni/run_multiple_prompts.sh"
     ``````
 ??? abstract "run_single_prompt.sh"
     ``````sh
-    --8<-- "examples\offline_inference\qwen2_5_omni\run_single_prompt.sh"
-    ``````
-??? abstract "utils.py"
-    ``````py
-    --8<-- "examples\offline_inference\qwen2_5_omni\utils.py"
+    --8<-- "examples/offline_inference/qwen2_5_omni/run_single_prompt.sh"
     ``````

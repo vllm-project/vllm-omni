@@ -4,7 +4,7 @@ Thank you for your interest in contributing to vLLM-omni! This document provides
 
 ## Getting Started
 
-### Development Environment
+### Development Environment for vLLM
 
 vLLM-omni uses `uv` as the environment manager, to create and manage Python environments. Please follow the documentation to install `uv`. After installing `uv`, you can create a new Python environment using the following commands:
 
@@ -19,8 +19,24 @@ Install vLLM from source:
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git checkout v0.11.0
-VLLM_USE_PRECOMPILED=1 uv pip install -e .
 ```
+Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set VLLM_PRECOMPILED_WHEEL_LOCATION as your local absolute path of whl file.
+```bash
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl
+```
+Install vllm with command below (If you have no existing PyTorch).
+```bash
+uv pip install --editable .
+```
+
+Install vllm with command below (If you already have PyTorch).
+```bash
+python use_existing_torch.py
+uv pip install -r requirements/build.txt
+uv pip install --no-build-isolation --editable .
+```
+
+### Development Environment for vLLM-Omni
 
 Install vLLM-omni from source:
 
@@ -49,7 +65,7 @@ vLLM-omni's `pre-commit` hooks will now run automatically every time you commit.
 
     ```bash
     pre-commit run     # runs on staged files
-    pre-commit run -a  # runs on all files (short for --all-files)
+    pre-commit run --show-diff-on-failure --color=always --all-files  # runs on all files (short for --all-files)
     ```
 
 ### Documentation
@@ -163,7 +179,7 @@ The goal of the vLLM-omni team is to be a _transparent reviewing machine_. We wo
 
 ## Additional Resources
 
-- [Design Documents](design_documents/index.md) - Architecture and design documentation
+- [Design Documents](../design/index.md) - Architecture and design documentation
 
 ## Thank You
 

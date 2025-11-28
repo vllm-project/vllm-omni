@@ -1,0 +1,38 @@
+nav:
+  - Home: README.md
+  - User Guide:
+    - Getting Started:
+      - getting_started/quickstart.md
+      - getting_started/installation
+    - Examples:
+      - examples/README.md
+      - Offline Inference:
+        - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
+      - Online Serving: user_guide/examples/online_serving/README.md
+    - General:
+      - usage/*
+    - Configuration:
+      - configuration/README.md
+      - configuration/*
+    - Models:
+      - models/supported_models.md
+    - Features: features
+  - Developer Guide:
+    - contributing/README.md
+    - General:
+      - glob: contributing/*
+        flatten_single_child_sections: true
+    - Model Implementation:
+      - contributing/model/README.md
+    - CI: contributing/ci
+    - Design Documents: design
+    - Docs Guide: contributing/DOCS_GUIDE.md
+  - API Reference:
+    - api/README.md
+    - api/vllm_omni
+  - CLI Reference: cli
+  - Community:
+    - community/*
+    - Blog: https://blog.vllm.ai
+    - Forum: https://discuss.vllm.ai
+    - Slack: https://slack.vllm.ai

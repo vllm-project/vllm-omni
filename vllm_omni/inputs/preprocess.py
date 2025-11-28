@@ -13,6 +13,13 @@ logger = init_logger(__name__)
 
 
 class OmniInputPreprocessor(InputPreprocessor):
+    """Input preprocessor for omni models.
+
+    Extends the base InputPreprocessor to handle omni-specific input
+    types including prompt embeddings and additional information payloads.
+    Supports processing tokens, embeddings, text, and multimodal inputs.
+    """
+
     def _process_tokens(
         self,
         parsed_content: TokensPrompt,

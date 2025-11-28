@@ -1,6 +1,6 @@
-site_name: vLLM-omni
+site_name: vLLM-Omni
 site_description: Multi-modality models inference and serving with non-autoregressive structures
-site_author: vLLM-omni Team
+site_author: vLLM-Omni Team
 site_url: https://vllm-project.github.io/vllm-omni/
 
 repo_name: vllm-project/vllm-omni
@@ -8,30 +8,36 @@ repo_url: https://github.com/vllm-project/vllm-omni
 edit_uri: edit/main/docs/
 
 # Copyright
-copyright: Copyright &copy; 2025 vLLM-omni Team
+copyright: Copyright &copy; 2025 vLLM-Omni Team
 
 # Theme
 theme:
   name: material
+  logo: source/logos/vllm-logo-only-light.ico
+  favicon: source/logos/vllm-logo-only-light.ico
   palette:
-    # Light mode
-    - scheme: default
-      primary: blue
-      accent: blue
+    # Palette toggle for automatic mode
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    # Palette toggle for light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
-    # Dark mode
-    - scheme: slate
-      primary: blue
-      accent: blue
+    # Palette toggle for dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
       toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
+        icon: material/brightness-2
+        name: Switch to system preference
   features:
     - content.action.edit
     - content.code.copy
-    - content.tabs.link
     - navigation.instant
     - navigation.instant.progress
     - navigation.tracking
@@ -47,17 +53,19 @@ theme:
     - content.tabs
     - content.tooltips
     - toc.follow
-  icon:
-    repo: fontawesome/brands/github
+  custom_dir: docs/mkdocs/overrides
 
 hooks:
   - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/generate_api_readme.py
+  - docs/mkdocs/hooks/url_schemes.py
 
 # Plugins
 plugins:
   - meta
   - search
-  # - awesome-nav  # Uncomment if installed
+  - autorefs
+  - awesome-nav
   - glightbox
   - git-revision-date-localized:
       # exclude files
@@ -71,6 +79,8 @@ plugins:
       minify_js: true
       minify_css: true
       cache_safe: true
+      js_files: [docs/mkdocs/javascript/*.js]
+      css_files: [docs/mkdocs/stylesheets/*.css]
   - api-autonav:
       modules: ["vllm_omni"]
       api_root_uri: "api"
@@ -81,33 +91,27 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: [vllm_omni]
           options:
             show_symbol_type_heading: true
             show_symbol_type_toc: true
-            show_source: true
-            show_root_heading: true
-            show_root_toc_entry: true
-            show_root_full_path: false
-            show_object_full_path: false
+            filters:
+              - "!^_"  # Exclude private members (methods/classes starting with underscore)
+            summary:
+              modules: true
             show_if_no_docstring: true
             show_signature_annotations: true
             separate_signature: true
             show_overloads: true
             signature_crossrefs: true
-            filters: []
-            summary:
-              modules: true
           inventories:
-            - https://docs.python.org/3/objects.inv
-            - https://typing-extensions.readthedocs.io/en/latest/objects.inv
-            - https://docs.aiohttp.org/en/stable/objects.inv
-            - https://pillow.readthedocs.io/en/stable/objects.inv
-            - https://numpy.org/doc/stable/objects.inv
-            - https://pytorch.org/docs/stable/objects.inv
-            - https://psutil.readthedocs.io/en/stable/objects.inv
+          - https://docs.python.org/3/objects.inv
+          - https://typing-extensions.readthedocs.io/en/latest/objects.inv
+          - https://docs.aiohttp.org/en/stable/objects.inv
+          - https://pillow.readthedocs.io/en/stable/objects.inv
+          - https://numpy.org/doc/stable/objects.inv
+          - https://pytorch.org/docs/stable/objects.inv
+          - https://psutil.readthedocs.io/en/stable/objects.inv
 
-# Markdown extensions
 markdown_extensions:
   - attr_list
   - md_in_html
@@ -137,44 +141,12 @@ markdown_extensions:
   # For math rendering
   - pymdownx.arithmatex:
       generic: true
-  # For task lists
-  - pymdownx.tasklist:
-      custom_checkbox: true
-  # For tables
-  - tables
 
-# Navigation
-nav:
-  - Home: index.md
-  - User Guide:
-    - Getting Started:
-      - user_guide/getting_started/quickstart.md
-    - Examples:
-      - user_guide/examples/index.md
-      - Offline Inference:
-        - user_guide/examples/offline_inference/qwen_2_5_omni.md
-      - Online Serving:
-        - user_guide/examples/online_serving/index.md
-  - API Reference:
-      - Summary: api/overview.md
-  - Developer Guide:
-    - contributing/README.md
-    - Design Documents:
-      - contributing/design_documents/index.md
-      - contributing/design_documents/vllm_omni_design.md
-      - contributing/design_documents/architecture_overview.md
-      - contributing/design_documents/api_design_doc.md
-
-# Extra
-extra:
-  version:
-    provider: mike
-
-# Extra CSS
 extra_css:
   - mkdocs/stylesheets/extra.css
 
-# Makes the url format end in .html rather than act as a dir
-# So index.md generates as index.html and is available under URL /index.html
-# https://www.mkdocs.org/user-guide/configuration/#use_directory_urls
-use_directory_urls: false
+extra_javascript:
+  - mkdocs/javascript/mathjax.js
+  - https://unpkg.com/mathjax@3.2.2/es5/tex-mml-chtml.js
+  - mkdocs/javascript/edit_and_feedback.js
+  - mkdocs/javascript/slack_and_forum.js

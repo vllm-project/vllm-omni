@@ -9,12 +9,33 @@ from vllm_omni.config import OmniModelConfig
 
 @dataclass
 class OmniEngineArgs(EngineArgs):
+    """Engine arguments for omni models, extending base EngineArgs.
+
+    Adds omni-specific configuration fields for multi-stage pipeline
+    processing and output type specification.
+
+    Args:
+        stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        model_stage: Stage type identifier, e.g., "thinker" or "talker"
+            (default: "thinker")
+        model_arch: Model architecture name
+            (default: "Qwen2_5OmniForConditionalGeneration")
+        engine_output_type: Optional output type specification for the engine.
+            Used to route outputs to appropriate processors (e.g., "image",
+            "audio", "latents"). If None, output type is inferred.
+    """
+
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: Optional[str] = None
 
     def create_model_config(self) -> OmniModelConfig:
+        """Create an OmniModelConfig from these engine arguments.
+
+        Returns:
+            OmniModelConfig instance with all configuration fields set
+        """
         # First, get the base ModelConfig from the parent class
         base_config = super().create_model_config()
 
@@ -37,12 +58,33 @@ class OmniEngineArgs(EngineArgs):
 
 @dataclass
 class AsyncOmniEngineArgs(AsyncEngineArgs):
+    """Async engine arguments for omni models, extending base AsyncEngineArgs.
+
+    Adds omni-specific configuration fields for multi-stage pipeline
+    processing and output type specification in async contexts.
+
+    Args:
+        stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        model_stage: Stage type identifier, e.g., "thinker" or "talker"
+            (default: "thinker")
+        model_arch: Model architecture name
+            (default: "Qwen2_5OmniForConditionalGeneration")
+        engine_output_type: Optional output type specification for the engine.
+            Used to route outputs to appropriate processors (e.g., "image",
+            "audio", "latents"). If None, output type is inferred.
+    """
+
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: Optional[str] = None
 
     def create_model_config(self) -> OmniModelConfig:
+        """Create an OmniModelConfig from these engine arguments.
+
+        Returns:
+            OmniModelConfig instance with all configuration fields set
+        """
         # First, get the base ModelConfig from the parent class
         base_config = super().create_model_config()
 

@@ -9,6 +9,23 @@ from vllm.inputs.parse import (
 
 
 def parse_singleton_prompt_omni(prompt: SingletonPrompt) -> ParsedSingletonPrompt:
+    """Parse a singleton prompt into a typed parsed prompt.
+
+    Handles omni-specific prompt types including tokens prompts with
+    embeddings and additional information. Supports string, text,
+    tokens, and embeddings prompts.
+
+    Args:
+        prompt: Singleton prompt to parse. Can be a string, TextPrompt,
+            TokensPrompt (with optional prompt_embeds and additional_information),
+            or EmbedsPrompt.
+
+    Returns:
+        ParsedSingletonPrompt containing the parsed prompt with type information
+
+    Raises:
+        TypeError: If the prompt type is not supported
+    """
     if isinstance(prompt, str):
         return ParsedStrPrompt(type="str", content=prompt)
     elif isinstance(prompt, dict):

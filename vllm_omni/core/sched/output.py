@@ -9,6 +9,17 @@ from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 
 @dataclass
 class OmniNewRequestData(NewRequestData):
+    """New request data for omni models with embeddings support.
+
+    Extends NewRequestData to include prompt embeddings and additional
+    information for direct transfer between pipeline stages.
+
+    Args:
+        prompt_embeds: Optional serialized prompt embeddings payload
+        additional_information: Optional serialized additional information
+            dictionary containing tensors or lists
+    """
+
     # Optional serialized prompt embeddings
     prompt_embeds: Optional[PromptEmbedsPayload] = None
     # Optional serialized additional information
@@ -20,6 +31,15 @@ class OmniNewRequestData(NewRequestData):
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> "OmniNewRequestData":
+        """Create OmniNewRequestData from a Request object.
+
+        Args:
+            request: Request object to convert
+            block_ids: Tuple of block ID lists for KV cache allocation
+
+        Returns:
+            OmniNewRequestData instance with data from the request
+        """
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,

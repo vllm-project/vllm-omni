@@ -39,7 +39,18 @@ logger = init_logger(__name__)
 
 
 class OmniStage:
-    def __init__(self, stage_config):
+    """Stage manager for orchestrating a single stage in the omni pipeline.
+
+    Encapsulates per-stage process lifecycle and worker logic, including
+    device setup, LLM initialization, batching, and shared-memory IPC.
+    Preserves input processing utilities for cross-stage data wiring.
+
+    Args:
+        stage_config: Stage configuration object containing engine arguments,
+            runtime settings, and stage-specific parameters
+    """
+
+    def __init__(self, stage_config: Any):
         self.stage_config = stage_config
         self.engine = None
         self.async_engine = None
@@ -76,35 +87,69 @@ class OmniStage:
         self._logger = logging.getLogger(__name__)
 
     def set_engine(self, engine: LLMEngine) -> None:
-        """Initialize the engine for the stage."""
+        """Set the LLM engine for this stage.
+
+        Args:
+            engine: LLMEngine instance to use for this stage
+        """
         self.engine = engine
 
     def set_async_engine(self, async_engine: AsyncLLM) -> None:
-        """Initialize the async engine for the stage."""
+        """Set the async LLM engine for this stage.
+
+        Args:
+            async_engine: AsyncLLM instance to use for this stage
+        """
         self.async_engine = async_engine
 
-    def set_vllm_config(self, vllm_config) -> None:
-        """Set the vllm_config for the stage (received from worker process)."""
+    def set_vllm_config(self, vllm_config: Any) -> None:
+        """Set the vLLM configuration for this stage.
+
+        Args:
+            vllm_config: VllmConfig instance received from worker process
+        """
         self.vllm_config = vllm_config
 
     def set_tokenizer(self, tokenizer: AnyTokenizer) -> None:
-        """Set the tokenizer for the stage (received from worker process)."""
+        """Set the tokenizer for this stage.
+
+        Args:
+            tokenizer: Tokenizer instance received from worker process
+        """
         self.tokenizer = tokenizer
 
     def set_input_preprocessor(self, input_preprocessor: InputPreprocessor) -> None:
-        """Set the input preprocessor for the stage (received from worker process)."""
+        """Set the input preprocessor for this stage.
+
+        Args:
+            input_preprocessor: InputPreprocessor instance received from worker process
+        """
         self.input_preprocessor = input_preprocessor
 
     def set_is_tracing_enabled(self, is_tracing_enabled: bool) -> None:
-        """Set the is_tracing_enabled for the stage (received from worker process)."""
+        """Set whether tracing is enabled for this stage.
+
+        Args:
+            is_tracing_enabled: Boolean indicating if tracing is enabled
+        """
         self.is_tracing_enabled = is_tracing_enabled
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
-        """Set the engine output for the stage."""
+        """Set the engine outputs for this stage.
+
+        Args:
+            engine_outputs: EngineCoreOutput from this stage's processing
+        """
         self.engine_outputs = engine_outputs
 
     # ----------------- New Orchestration APIs -----------------
     def attach_queues(self, in_q: mp.Queue, out_q: mp.Queue) -> None:
+        """Attach input and output queues for IPC communication.
+
+        Args:
+            in_q: Input queue for receiving tasks from orchestrator
+            out_q: Output queue for sending results to orchestrator
+        """
         self._in_q = in_q
         self._out_q = out_q
 
@@ -118,6 +163,22 @@ class OmniStage:
         ctx: Optional[mp.context.BaseContext] = None,
         batch_timeout: int = 10,
     ) -> None:
+        """Initialize and start the stage worker process.
+
+        Creates a worker process that runs the LLM engine for this stage.
+        The worker handles batching, generation, and IPC communication.
+
+        Args:
+            model: Model name or path to load
+            is_async: Whether to use async engine (default: False)
+            log_file: Optional log file path prefix for stage-specific logs
+            shm_threshold_bytes: Threshold for using shared memory for IPC
+            ctx: Optional multiprocessing context (default: spawn)
+            batch_timeout: Timeout in seconds for batching requests
+
+        Raises:
+            AssertionError: If queues are not attached before calling this method
+        """
         assert self._in_q is not None and self._out_q is not None, "Queues must be attached before start_process"
         self._log_file = log_file
         self._shm_threshold_bytes = shm_threshold_bytes
@@ -156,6 +217,11 @@ class OmniStage:
         self._proc.start()
 
     def stop_stage_worker(self) -> None:
+        """Stop the stage worker process gracefully.
+
+        Sends shutdown signal to the worker and waits for it to terminate.
+        If graceful shutdown fails, forcefully terminates the process.
+        """
         if self._in_q is not None:
             try:
                 self._in_q.put_nowait(None)
@@ -173,10 +239,22 @@ class OmniStage:
                     self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
 
     def submit(self, payload: dict[str, Any]) -> None:
+        """Submit a task to the stage worker.
+
+        Args:
+            payload: Dictionary containing task data (request_id, engine_inputs,
+                sampling_params, etc.)
+        """
         assert self._in_q is not None
         self._in_q.put(payload)
 
     def try_collect(self) -> Optional[dict[str, Any]]:
+        """Try to collect a result from the stage worker without blocking.
+
+        Returns:
+            Result dictionary if available, None otherwise. Result contains
+            request_id, engine_outputs (or engine_outputs_shm), and metrics.
+        """
         assert self._out_q is not None
         try:
             return self._out_q.get_nowait()
@@ -184,9 +262,24 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list, prompt: Union[OmniTokensPrompt, TextPrompt] = None
+        self, stage_list: list[Any], prompt: Union[OmniTokensPrompt, TextPrompt] = None
     ) -> list[Union[OmniTokensPrompt, TextPrompt]]:
-        """Process the engine input for the stage."""
+        """Process engine inputs for this stage from upstream stage outputs.
+
+        Derives inputs for this stage from outputs of upstream stages.
+        Uses engine_input_source configuration to determine which upstream
+        stage outputs to use. Supports custom processing functions.
+
+        Args:
+            stage_list: List of all stages in the pipeline
+            prompt: Optional original prompt (for multimodal data preservation)
+
+        Returns:
+            List of processed engine inputs ready for this stage
+
+        Raises:
+            ValueError: If engine_input_source is empty or invalid
+        """
         if self.custom_process_input_func is None:
             engine_inputs = []
             if len(self.engine_input_source) == 0:
