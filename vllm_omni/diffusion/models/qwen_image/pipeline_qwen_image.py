@@ -27,6 +27,9 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.torch_utils import (
+    set_default_torch_dtype,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -241,9 +244,6 @@ class QwenImagePipeline(
         # TODO support user custom folders
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained("Qwen/Qwen-Image", subfolder="scheduler")
         logger.info("Loaded Qwen-Image scheduler successfully")
-        from vllm_omni.diffusion.utils.torch_utils import (
-            set_default_torch_dtype,
-        )  # to avoid ci error
 
         with set_default_torch_dtype(torch.bfloat16):
             self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
