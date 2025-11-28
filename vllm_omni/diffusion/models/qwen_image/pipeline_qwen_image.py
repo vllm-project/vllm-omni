@@ -27,7 +27,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.torch_utils import set_default_torch_dtype
+from vllm_omni.diffusion.utils.torch_utils import set_default_torch_dtype  # noqa: I001
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
