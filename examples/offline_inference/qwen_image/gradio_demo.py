@@ -62,8 +62,6 @@ def get_omni(model_name: str) -> Omni:
 
 
 def build_demo(args: argparse.Namespace) -> gr.Blocks:
-    if not torch.cuda.is_available():
-        raise RuntimeError("Qwen-Image Gradio demo requires CUDA; CPU execution is not supported.")
     device = "cuda"
     omni = get_omni(args.model)
 
@@ -73,6 +71,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         cfg_scale_value: float,
         resolution_choice: str,
         num_steps_value: float,
+        num_images_choice: float,
     ):
         if not prompt or not prompt.strip():
             raise gr.Error("Please enter a non-empty prompt.")
@@ -83,10 +82,13 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         try:
             seed = int(seed_value)
             num_steps = int(num_steps_value)
+            num_images = int(num_images_choice)
         except (TypeError, ValueError) as exc:
-            raise gr.Error("Seed and inference steps must be valid integers.") from exc
+            raise gr.Error("Seed, inference steps, and number of images must be valid integers.") from exc
         if num_steps <= 0:
             raise gr.Error("Inference steps must be a positive integer.")
+        if num_images not in {1, 2, 3, 4}:
+            raise gr.Error("Number of images must be 1, 2, 3, or 4.")
         generator = torch.Generator(device=device).manual_seed(seed)
         images = omni.generate(
             prompt.strip(),
@@ -95,23 +97,38 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
             generator=generator,
             true_cfg_scale=float(cfg_scale_value),
             num_inference_steps=num_steps,
+            num_images_per_prompt=num_images,
+            num_outputs_per_prompt=num_images,
         )
-        return images[0]
+        return [img for img in images[:num_images]]
 
     with gr.Blocks(
         title="vLLM-Omni Web Serving Demo",
         css="""
+        /* Left column button width */
         .left-column button {
             width: 100%;
+        }
+        /* Right preview area: fixed height, hide unnecessary buttons */
+        .fixed-image {
+            height: 660px;
+            display: flex;
+            align-items: center;
         }
         .fixed-image .duplicate-button,
         .fixed-image .svelte-drgfj2 {
             display: none !important;
         }
-        .fixed-image canvas,
+        /* Gallery grid: center horizontally and vertically, set gap */
+        #image-gallery .grid {
+            justify-content: center;
+            align-content: center;
+            gap: 16px;
+        }
+        /* Gallery images: limit max height, maintain aspect ratio */
         .fixed-image img {
-            max-height: 540px !important;
-            width: 100% !important;
+            max-height: 660px !important;
+            width: auto !important;
             object-fit: contain;
         }
         """,
@@ -136,23 +153,31 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                     minimum=1,
                 )
                 aspect_dropdown = gr.Dropdown(
-                    label="Aspect ratio (W:H)",
+                    label="Aspect Ratio (W:H)",
                     choices=ASPECT_RATIO_CHOICES,
                     value=f"{args.aspect_ratio_label} ({ASPECT_RATIOS[args.aspect_ratio_label][0]}x{ASPECT_RATIOS[args.aspect_ratio_label][1]})",
                 )
+                num_images = gr.Dropdown(
+                    label="Number of images",
+                    choices=["1", "2", "3", "4"],
+                    value="1",
+                )
                 generate_btn = gr.Button("Generate", variant="primary")
             with gr.Column(scale=2, elem_classes="fixed-image"):
-                image_output = gr.Image(
-                    label="Generated Image",
-                    type="pil",
-                    show_download_button=True,
-                    height=540,
+                gallery = gr.Gallery(
+                    label="Preview",
+                    columns=2,
+                    rows=2,
+                    height=660,
+                    allow_preview=True,
+                    show_label=True,
+                    elem_id="image-gallery",
                 )
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[prompt_input, seed_input, cfg_input, aspect_dropdown, steps_input],
-            outputs=image_output,
+            inputs=[prompt_input, seed_input, cfg_input, aspect_dropdown, steps_input, num_images],
+            outputs=gallery,
         )
 
     return demo

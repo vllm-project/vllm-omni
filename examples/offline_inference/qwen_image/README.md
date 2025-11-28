@@ -3,7 +3,7 @@
 This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation.
-- `gradio_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
+- `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
 
 
 ## Local CLI Usage
@@ -37,7 +37,7 @@ Key arguments:
 Launch the gradio demo:
 
 ```bash
-python gradio_demo.py --port 7862
+python web_demo.py --port 7862
 ```
 
 Then open `http://localhost:7862/` on your local browser to interact with the web UI.
