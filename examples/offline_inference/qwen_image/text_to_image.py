@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the generated image (PNG).",
     )
     parser.add_argument(
+        "--num_images_per_prompt",
+        type=int,
+        default=1,
+        help="Number of images to generate for the given prompt.",
+    )
+    parser.add_argument(
         "--num_inference_steps",
         type=int,
         default=50,
@@ -50,12 +56,22 @@ def main():
         generator=generator,
         true_cfg_scale=args.cfg_scale,
         num_inference_steps=args.num_inference_steps,
+        num_images_per_prompt=args.num_images_per_prompt,
+        num_outputs_per_prompt=args.num_images_per_prompt,
     )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    images[0].save(output_path)
-    print(f"Saved generated image to {output_path}")
+    suffix = output_path.suffix or ".png"
+    stem = output_path.stem or "qwen_image_output"
+    if args.num_images_per_prompt <= 1:
+        images[0].save(output_path)
+        print(f"Saved generated image to {output_path}")
+    else:
+        for idx, img in enumerate(images):
+            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
+            img.save(save_path)
+            print(f"Saved generated image to {save_path}")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ python text_to_image.py \
   --prompt "a cup of coffee on the table" \
   --seed 42 \
   --cfg_scale 4.0 \
+  --num_images_per_prompt 1 \
   --num_inference_steps 50 \
   --height 1024 \
   --width 1024 \
@@ -24,6 +25,7 @@ Key arguments:
 - `--prompt`: text description (string).
 - `--seed`: integer seed for deterministic sampling.
 - `--cfg_scale`: true CFG scale (model-specific guidance strength).
+- `--num_images_per_prompt`: number of images to generate per prompt (saves as `output`, `output_1`, ...).
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--height/--width`: output resolution (defaults 1024x1024).
 - `--output`: path to save the generated PNG.

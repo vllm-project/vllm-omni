@@ -62,7 +62,9 @@ def get_omni(model_name: str) -> Omni:
 
 
 def build_demo(args: argparse.Namespace) -> gr.Blocks:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise RuntimeError("Qwen-Image Gradio demo requires CUDA; CPU execution is not supported.")
+    device = "cuda"
     omni = get_omni(args.model)
 
     def run_inference(
