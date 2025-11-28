@@ -113,17 +113,38 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         .fixed-image {
             height: 660px;
             display: flex;
+            flex-direction: column;
+            justify-content: center;
             align-items: center;
         }
         .fixed-image .duplicate-button,
         .fixed-image .svelte-drgfj2 {
             display: none !important;
         }
+        /* Gallery container: fill available space and center content */
+        #image-gallery {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
         /* Gallery grid: center horizontally and vertically, set gap */
         #image-gallery .grid {
+            display: flex;
+            flex-wrap: wrap;
             justify-content: center;
+            align-items: center;
             align-content: center;
             gap: 16px;
+            width: 100%;
+            height: 100%;
+        }
+        /* Gallery grid items: center content */
+        #image-gallery .grid > div {
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         /* Gallery images: limit max height, maintain aspect ratio */
         .fixed-image img {
