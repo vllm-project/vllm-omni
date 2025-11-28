@@ -30,13 +30,17 @@ def prepare_requests(prompt: str | list[str], **kwargs):
 
 
 class OmniDiffusion:
-    def __init__(self, od_config: OmniDiffusionConfig | None = None, **kwargs):
-        """Create an OmniDiffusion instance.
+    """
+    It is the main class to interact with vLLM-Omni diffusion models.
+    It acts as a high-level interface that prepares requests and
+    delegates the actual diffusion process to the DiffusionEngine.
 
-        You can pass either an `OmniDiffusionConfig` via `od_config`, or
-        pass kwargs such as `model="Qwen/Qwen-Image"`,
-        which will be forwarded to `OmniDiffusionConfig.from_kwargs`.
-        """
+    You can pass either an `OmniDiffusionConfig` via `od_config`, or
+    pass kwargs such as `model="Qwen/Qwen-Image"`,
+    which will be forwarded to `OmniDiffusionConfig.from_kwargs`.
+    """
+
+    def __init__(self, od_config: OmniDiffusionConfig | None = None, **kwargs):
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
         elif isinstance(od_config, dict):
@@ -77,4 +81,4 @@ class OmniDiffusion:
         return self._run_engine(requests)
 
     def _run_engine(self, requests: list[OmniDiffusionRequest]):
-        return self.engine.generate(requests)
+        return self.engine.step(requests)

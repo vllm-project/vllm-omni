@@ -8,7 +8,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.registry import get_diffusion_post_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.schedule import scheduler
+from vllm_omni.diffusion.scheduler import scheduler
 from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
 
 logger = init_logger(__name__)
@@ -29,7 +29,7 @@ class DiffusionEngine:
 
         self._make_client()
 
-    def generate(self, requests: list[OmniDiffusionRequest]):
+    def step(self, requests: list[OmniDiffusionRequest]):
         try:
             output = self.add_req_and_wait_for_response(requests)
             if output.error:
