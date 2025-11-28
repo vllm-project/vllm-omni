@@ -97,14 +97,24 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         return images[0]
 
     with gr.Blocks(
-        title="vLLM-Omni Online Serving Demo",
+        title="vLLM-Omni Web Serving Demo",
         css="""
         .left-column button {
             width: 100%;
         }
+        .fixed-image .duplicate-button,
+        .fixed-image .svelte-drgfj2 {
+            display: none !important;
+        }
+        .fixed-image canvas,
+        .fixed-image img {
+            max-height: 540px !important;
+            width: 100% !important;
+            object-fit: contain;
+        }
         """,
     ) as demo:
-        gr.Markdown("# vLLM-Omni Online Serving Demo")
+        gr.Markdown("# vLLM-Omni Web Serving Demo")
         gr.Markdown(f"**Model:** {args.model}")
 
         with gr.Row():
@@ -129,8 +139,13 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
                     value=f"{args.aspect_ratio_label} ({ASPECT_RATIOS[args.aspect_ratio_label][0]}x{ASPECT_RATIOS[args.aspect_ratio_label][1]})",
                 )
                 generate_btn = gr.Button("Generate", variant="primary")
-            with gr.Column(scale=2):
-                image_output = gr.Image(label="Generated Image", type="pil", show_download_button=True)
+            with gr.Column(scale=2, elem_classes="fixed-image"):
+                image_output = gr.Image(
+                    label="Generated Image",
+                    type="pil",
+                    show_download_button=True,
+                    height=540,
+                )
 
         generate_btn.click(
             fn=run_inference,
