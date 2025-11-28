@@ -10,7 +10,6 @@ import torch.nn as nn
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 
-# from diffusers.models.attention_processor import Attention
 # TODO replace this with vLLM implementation
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
