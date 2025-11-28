@@ -4,7 +4,7 @@ vLLM-Omni supports unified multimodal comprehension and generation models across
 
 ## Model Implementation
 
-If vLLM-Omni natively supports a model, its implementation can be found in <gh-file:vllm-omni/model_executor/models>.
+If vLLM-Omni natively supports a model, its implementation can be found in <gh-file:vllm-omni/model_executor/models> and <gh-file:vllm_omni/diffusion/models>.
 
 ## List of Supported Models for Nvidia GPU
 
@@ -17,7 +17,8 @@ th {
 
 | Architecture | Models | Example HF Models |
 |--------------|--------|-------------------|
-| `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B`|
+| `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` |
+| `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 
 
 ## List of Supported Models for Ascend NPU
