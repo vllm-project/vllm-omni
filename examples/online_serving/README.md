@@ -56,22 +56,18 @@ Then open `http://localhost:7861/` on your local browser to interact with the we
 
 ### Options
 
-The gradio demo also supports running with an existing API server and can be customized with the following arguments.
-
+You can customize its basic launch parameters:
 
 ```bash
 python gradio_demo.py \
     --model Qwen/Qwen2.5-Omni-7B \
-    --use-api-server \
-    --api-base http://localhost:8091/v1 \
     --ip 127.0.0.1 \
-    --port 7861
+    --port 7861 \
+    --stage-configs-path /path/to/stage_configs.yaml
 ```
 
-- `--model`: Model name
-- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.
-- `--api-base`: Base URL for vllm serve (only used when `use-api-server` is set, default: http://localhost:8091/v1)
-- `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
-- `--port`: Port for Gradio server (default: 7861)
-- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
-- `--share`: Share the Gradio demo publicly (creates a public link)
+- `--model`: Local model checkpoint to load (default `Qwen/Qwen2.5-Omni-7B`).
+- `--ip`: Host/IP for the Gradio server (default `127.0.0.1`).
+- `--port`: Port for the Gradio server (default `7861`).
+- `--stage-configs-path`: Optional path to custom stage configs YAML.
+- `--share`: Set to expose a temporary public link via Gradio.
