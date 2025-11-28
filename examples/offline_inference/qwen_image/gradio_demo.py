@@ -100,32 +100,35 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         )
         return images[0]
 
-    with gr.Blocks(title="Qwen-Image Demo") as demo:
-        gr.Markdown("## Qwen-Image Demo")
+    with gr.Blocks(title="vLLM-Omni Online Serving Demo") as demo:
+        gr.Markdown("# vLLM-Omni Online Serving Demo")
+        gr.Markdown(f"**Model:** {args.model}")
+
         with gr.Row():
-            with gr.Column():
-                prompt_input = gr.Textbox(
-                    label="Prompt",
-                    value=args.default_prompt,
-                    placeholder="Describe the image you want to generate...",
-                    lines=3,
-                )
+            with gr.Column(scale=1):
                 seed_input = gr.Number(label="Seed", value=args.default_seed, precision=0)
                 cfg_input = gr.Number(label="CFG Scale", value=args.default_cfg_scale)
-                aspect_dropdown = gr.Dropdown(
-                    label="Aspect ratio (W:H)",
-                    choices=ASPECT_RATIO_CHOICES,
-                    value=f"{args.aspect_ratio_label} ({ASPECT_RATIOS[args.aspect_ratio_label][0]}x{ASPECT_RATIOS[args.aspect_ratio_label][1]})",
-                )
                 steps_input = gr.Number(
                     label="Inference Steps",
                     value=args.num_inference_steps,
                     precision=0,
                     minimum=1,
                 )
-                generate_btn = gr.Button("Generate", variant="primary")
-            with gr.Column():
-                image_output = gr.Image(label="Generated Image", type="pil", show_download_button=True)
+                aspect_dropdown = gr.Dropdown(
+                    label="Aspect ratio (W:H)",
+                    choices=ASPECT_RATIO_CHOICES,
+                    value=f"{args.aspect_ratio_label} ({ASPECT_RATIOS[args.aspect_ratio_label][0]}x{ASPECT_RATIOS[args.aspect_ratio_label][1]})",
+                )
+            with gr.Column(scale=2):
+                prompt_input = gr.Textbox(
+                    label="Prompt",
+                    value=args.default_prompt,
+                    placeholder="Describe the image you want to generate...",
+                    lines=7,
+                )
+        generate_btn = gr.Button("Generate", variant="primary")
+
+        image_output = gr.Image(label="Generated Image", type="pil", show_download_button=True)
 
         generate_btn.click(
             fn=run_inference,
