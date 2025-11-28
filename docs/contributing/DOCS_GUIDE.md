@@ -38,7 +38,7 @@ The documentation automatically extracts docstrings from the code using mkdocstr
 Example docstring:
 
 ```python
-class OmniLLM:
+class Omni:
     """Main entry point for vLLM-omni inference.
 
     This class provides a high-level interface for running multi-modal
@@ -50,7 +50,7 @@ class OmniLLM:
         **kwargs: Additional arguments passed to the engine
 
     Example:
-        >>> llm = OmniLLM(model="Qwen/Qwen2.5-Omni")
+        >>> llm = Omni(model="Qwen/Qwen2.5-Omni")
         >>> outputs = llm.generate(prompts="Hello")
     """
 ```

@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import logging
+from dataclasses import fields
+
+from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_file_to_dict
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+# TODO configure logging properly
+logging.basicConfig(level=logging.INFO)
+
+logger = init_logger(__name__)
+
+
+def prepare_requests(prompt: str | list[str], **kwargs):
+    field_names = {f.name for f in fields(OmniDiffusionRequest)}
+
+    init_kwargs = {"prompt": prompt}
+
+    for key, value in kwargs.items():
+        if key in field_names:
+            init_kwargs[key] = value
+
+    return OmniDiffusionRequest(**init_kwargs)
+
+
+class OmniDiffusion:
+    """
+    It is the main class to interact with vLLM-Omni diffusion models.
+    It acts as a high-level interface that prepares requests and
+    delegates the actual diffusion process to the DiffusionEngine.
+
+    You can pass either an `OmniDiffusionConfig` via `od_config`, or
+    pass kwargs such as `model="Qwen/Qwen-Image"`,
+    which will be forwarded to `OmniDiffusionConfig.from_kwargs`.
+    """
+
+    def __init__(self, od_config: OmniDiffusionConfig | None = None, **kwargs):
+        if od_config is None:
+            od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
+        elif isinstance(od_config, dict):
+            od_config = OmniDiffusionConfig.from_kwargs(**od_config)
+
+        self.od_config = od_config
+
+        config_dict = get_hf_file_to_dict(
+            "model_index.json",
+            od_config.model,
+        )
+        od_config.model_class_name = config_dict.get("_class_name", None)
+
+        self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+
+    def generate(
+        self,
+        prompt: str | list[str],
+        **kwargs,
+    ):
+        prompts = []
+        if isinstance(prompt, str):
+            prompts.append(prompt)
+        elif isinstance(prompt, list):
+            prompts.extend(prompt)
+        else:
+            raise ValueError("Prompt must be a string or a list of strings")
+
+        requests: list[OmniDiffusionRequest] = []
+        for p in prompts:
+            requests.append(
+                prepare_requests(
+                    p,
+                    **kwargs,
+                )
+            )
+        logger.info(f"Prepared {len(requests)} requests for generation.")
+        return self._run_engine(requests)
+
+    def _run_engine(self, requests: list[OmniDiffusionRequest]):
+        return self.engine.step(requests)

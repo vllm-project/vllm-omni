@@ -33,6 +33,8 @@ dependencies = [
     # "decord>=0.6.0", # install manually
     "librosa>=0.11.0",
     "resampy>=0.4.3",
+    "diffusers==0.35.2",
+    "accelerate==1.12.0",
     # "vllm==0.11.0",  # TODO: fix the entrypoints overwrite problem
 ]
 
@@ -160,5 +162,7 @@ extend-ignore-identifiers-re = [
     ".*_thw",
     ".*thw",
     "ein",
-    ".*arange"
+    ".*arange",
+    ".*MoBA",
+    ".*temperal_downsample"
 ]

@@ -16,7 +16,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils import FlexibleArgumentParser
 
-from vllm_omni import OmniLLM
+from vllm_omni import Omni
 
 SEED = 42
 
@@ -140,7 +140,7 @@ def main(args):
     model_name = "Qwen/Qwen2.5-Omni-7B"
     query_result = query_map[args.query_type]()
 
-    omni_llm = OmniLLM(
+    omni_llm = Omni(
         model=model_name,
         log_stats=args.enable_stats,
         log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
