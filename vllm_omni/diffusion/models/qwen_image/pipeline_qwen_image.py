@@ -39,7 +39,10 @@ def get_qwen_image_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
     model_name = od_config.model
-    model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
@@ -238,21 +241,18 @@ class QwenImagePipeline(
     ):
         super().__init__()
         self.device = get_local_device()
-        # self.hf_config = vllm_config.model_config.hf_config
-        # TODO support user custom folders
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained("Qwen/Qwen-Image", subfolder="scheduler")
+        model = od_config.model
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model, subfolder="scheduler")
         logger.info("Loaded Qwen-Image scheduler successfully")
 
         with set_default_torch_dtype(torch.bfloat16):
-            self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                "Qwen/Qwen-Image", subfolder="text_encoder"
-            )
+            self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, subfolder="text_encoder")
             logger.info("Loaded Qwen-Image text encoder successfully")
-            self.vae = AutoencoderKLQwenImage.from_pretrained("Qwen/Qwen-Image", subfolder="vae").to(self.device)
+            self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae").to(self.device)
             logger.info("Loaded Qwen-Image VAE successfully")
             self.transformer = QwenImageTransformer2DModel()
             logger.info("Initialized Qwen-Image transformer successfully.")
-            self.tokenizer = Qwen2Tokenizer.from_pretrained("Qwen/Qwen-Image", subfolder="tokenizer")
+            self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer")
             logger.info("Loaded Qwen-Image tokenizer successfully.")
 
         self.stage = None
