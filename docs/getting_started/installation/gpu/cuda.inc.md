@@ -21,14 +21,14 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 # --8<-- [start:pre-built-wheels]
 
-## Installation of vLLM
+#### Installation of vLLM
 
 Now we build it based on vLLM v0.11.0. Please install it with command below.
 ```bash
 uv pip install vllm==0.11.0 --torch-backend=auto
 ```
 
-## Installation of vLLM-Omni
+#### Installation of vLLM-Omni
 
 ```bash
 uv pip install vllm-omni
@@ -38,7 +38,7 @@ uv pip install vllm-omni
 
 # --8<-- [start:build-wheel-from-source]
 
-## Installation of vLLM
+#### Installation of vLLM from Source
 If you want to check or debug with source code of vLLM, install stable release version of vllm with 0.11.0 from source with pre-built wheel file.
 
 ```bash
@@ -62,7 +62,7 @@ uv pip install -r requirements/build.txt
 uv pip install --no-build-isolation --editable .
 ```
 
-## Installation of vLLM-omni
+#### Installation of vLLM-Omni from Source
 Install additional requirements for vllm-omni
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
