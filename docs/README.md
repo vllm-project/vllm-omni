@@ -54,7 +54,7 @@ vLLM-Omni is flexible and easy to use with:
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-- Omni-modality models (e.g. Qwen-Omni)
+- Omni-modality models (e.g. Qwen2.5-Omni, Qwen3-Omni)
 - Multi-modality generation models (e.g. Qwen-Image)
 
 For more information, checkout the following:
