@@ -599,6 +599,9 @@ class QwenImagePipeline(
         num_inference_steps = req.num_inference_steps or num_inference_steps
         generator = req.generator or generator
         true_cfg_scale = req.true_cfg_scale or true_cfg_scale
+        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
+        if req_num_outputs and req_num_outputs > 0:
+            num_images_per_prompt = req_num_outputs
         # 1. check inputs
         # 2. encode prompts
         # 3. prepare latents and timesteps
