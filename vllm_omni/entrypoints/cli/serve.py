@@ -1,5 +1,5 @@
 """
-Omni serve command for vLLM-omni.
+Omni serve command for vLLM-Omni.
 """
 
 import argparse
@@ -52,7 +52,7 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--omni",
             action="store_true",
-            help="Enable vLLM-omni mode",
+            help="Enable vLLM-Omni mode",
         )
         serve_parser.add_argument(
             "--stage-configs-path",

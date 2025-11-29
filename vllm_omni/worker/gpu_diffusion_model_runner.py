@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class GPUDiffusionModelRunner(OmniGPUModelRunner):
-    """Diffusion model runner for vLLM-omni (non-autoregressive).
+    """Diffusion model runner for vLLM-Omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
     - Does not compute logits or perform token sampling.

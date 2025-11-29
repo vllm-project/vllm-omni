@@ -1,5 +1,5 @@
 """
-Stage manager for orchestrating multiple engines in vLLM-omni.
+Stage manager for orchestrating multiple engines in vLLM-Omni.
 
 Enhanced to encapsulate per-stage process lifecycle and worker logic
 (device setup, LLM init, batching, shared-memory IPC), while preserving

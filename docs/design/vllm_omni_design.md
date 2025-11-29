@@ -2,7 +2,7 @@
 
 ## Overview
 
-vLLM-omni is a multi-modality extension for vLLM that supports non-autoregressive structures and non-textual outputs. This document outlines the key software abstractions, APIs, and dependencies for the system, designed to maximize reuse of vLLM's proven architecture.
+vLLM-Omni is a multi-modality extension for vLLM that supports non-autoregressive structures and non-textual outputs. This document outlines the key software abstractions, APIs, and dependencies for the system, designed to maximize reuse of vLLM's proven architecture.
 
 ## Architecture Principles
 
@@ -36,7 +36,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000
 #### Design Architecture
 ```mermaid
 graph TD
-    A[vllm serve model --omni] --> B[vLLM-omni CLI Wrapper]
+    A[vllm serve model --omni] --> B[vLLM-Omni CLI Wrapper]
     B --> C{Detect --omni flag}
     C -->|Yes| D[Parse OmniConfig]
     C -->|No| E[Forward to vLLM CLI]
@@ -45,7 +45,7 @@ graph TD
     G --> H[Multi-stage Processing]
     E --> I[Standard vLLM Pipeline]
 
-    subgraph "vLLM-omni Components"
+    subgraph "vLLM-Omni Components"
         F
         G
         H
@@ -68,7 +68,7 @@ def main():
     """Main CLI entry point that intercepts vLLM commands"""
     # Check if --omni flag is present
     if "--omni" in sys.argv:
-        # Remove --omni flag and process with vLLM-omni
+        # Remove --omni flag and process with vLLM-Omni
         omni_args = [arg for arg in sys.argv[1:] if arg != "--omni"]
         omni_serve = OmniServeCommand()
         omni_serve.run(omni_args)

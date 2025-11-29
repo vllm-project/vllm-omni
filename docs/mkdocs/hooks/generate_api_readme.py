@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Hook to automatically generate docs/api/README.md from the codebase.
 
@@ -20,7 +20,7 @@ API_README_PATH = ROOT_DIR / "docs" / "api" / "README.md"
 CATEGORIES = {
     "entrypoints": {
         "name": "Entry Points",
-        "description": "Main entry points for vLLM-omni inference and serving.",
+        "description": "Main entry points for vLLM-Omni inference and serving.",
     },
     "inputs": {
         "name": "Inputs",

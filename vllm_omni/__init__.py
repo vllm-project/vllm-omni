@@ -1,5 +1,5 @@
 """
-vLLM-omni: Multi-modality models inference and serving with
+vLLM-Omni: Multi-modality models inference and serving with
 non-autoregressive structures.
 
 This package extends vLLM beyond traditional text-based, autoregressive

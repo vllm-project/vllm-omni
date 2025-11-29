@@ -1,6 +1,6 @@
-# API Design Template for vLLM-omni Modules
+# API Design Template for vLLM-Omni Modules
 
-This template provides a standardized structure for designing APIs for core, engine, executor, and worker modules in vLLM-omni. Use this template to ensure consistency and completeness across all modules.
+This template provides a standardized structure for designing APIs for core, engine, executor, and worker modules in vLLM-Omni. Use this template to ensure consistency and completeness across all modules.
 
 ## Template Structure
 
@@ -44,7 +44,7 @@ This template provides a standardized structure for designing APIs for core, eng
 
 ### 1. Module Overview
 
-**Purpose**: The core module provides fundamental scheduling and caching functionality for vLLM-omni.
+**Purpose**: The core module provides fundamental scheduling and caching functionality for vLLM-Omni.
 
 **Responsibilities**:
 - Request scheduling and prioritization
@@ -333,4 +333,4 @@ print(f"Cache hit rate: {status['cache_hit_rate']:.2%}")
 6. Include error handling strategies
 7. Submit for review before implementation
 
-This template ensures consistency and completeness across all vLLM-omni modules.
+This template ensures consistency and completeness across all vLLM-Omni modules.

@@ -1,5 +1,5 @@
 """
-Scheduling components for vLLM-omni.
+Scheduling components for vLLM-Omni.
 """
 
 from .diffusion_scheduler import DiffusionScheduler

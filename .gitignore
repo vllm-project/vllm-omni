@@ -175,7 +175,7 @@ tests/
 #  *.iws
 #  .idea/
 
-# vLLM-omni specific
+# vLLM-Omni specific
 # Model files and checkpoints
 checkpoints/
 *.bin

@@ -22,7 +22,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ## About
 
-[vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni extends its support for omni-modality model inference and serving:
+[vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
 
 - **Omni-modality**: Text, image, video, and audio data processing
 - **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
@@ -34,24 +34,24 @@ Easy, fast, and cheap omni-modality model serving for everyone
   </picture>
 </p>
 
-vLLM-omni is fast with:
+vLLM-Omni is fast with:
 
-- Seamless AR support for efficient KV Cache management with vLLM
-- Pipelined stage execution overlapping
-- Fully disaggregation based on omniConnector and dynamic resource allocation across stages
+- State-of-the-art AR support by leveraging efficient KV cache management from vLLM
+- Pipelined stage execution overlapping for high throughput performance
+- Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
 
-vLLM-omni is flexible and easy to use with:
+vLLM-Omni is flexible and easy to use with:
 
+- Heterogeneous pipeline abstraction to manage complex model workflows
 - Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
 - Tensor, pipeline, data and expert parallelism support for distributed inference
 - Streaming outputs
 - OpenAI-compatible API server
 
-vLLM seamlessly supports most popular open-source models on HuggingFace, including:
+vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
-- Multi-modality generation models (e.g. Qwen-image)
-- Omni-modality models (e.g. Qwen-omni)
+- Omni-modality models (e.g. Qwen-Omni)
+- Multi-modality generation models (e.g. Qwen-Image)
 
 ## Getting Started
 
@@ -66,7 +66,7 @@ Visit our documentation to learn more.
 ## Contributing
 
 We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
+Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
 
 ## Weekly Meeting
 

@@ -1,6 +1,6 @@
 # Documentation Build Guide
 
-This directory contains the source files for the vLLM-omni documentation.
+This directory contains the source files for the vLLM-Omni documentation.
 
 ## Building Documentation Locally
 
@@ -39,7 +39,7 @@ Example docstring:
 
 ```python
 class Omni:
-    """Main entry point for vLLM-omni inference.
+    """Main entry point for vLLM-Omni inference.
 
     This class provides a high-level interface for running multi-modal
     inference with non-autoregressive models.

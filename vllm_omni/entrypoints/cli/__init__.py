@@ -1,4 +1,4 @@
-"""CLI helpers for vLLM-omni entrypoints."""
+"""CLI helpers for vLLM-Omni entrypoints."""
 
 from .serve import OmniServeCommand
 

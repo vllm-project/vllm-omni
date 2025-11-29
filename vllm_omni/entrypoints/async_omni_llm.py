@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 
 
 class AsyncOmniLLM(EngineClient):
-    """Async entry point for vLLM-omni inference.
+    """Async entry point for vLLM-Omni inference.
 
     This class provides an asynchronous interface for running multi-modal
     comprehension and generation models. It orchestrates multiple

@@ -1,5 +1,5 @@
 """
-CLI entry point for vLLM-omni that intercepts vLLM commands.
+CLI entry point for vLLM-Omni that intercepts vLLM commands.
 """
 
 import importlib.metadata

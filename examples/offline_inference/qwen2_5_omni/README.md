@@ -1,4 +1,4 @@
-# Offline Example of vLLM-omni for Qwen2.5-omni
+# Offline Example of vLLM-Omni for Qwen2.5-omni
 
 ## 🛠️ Installation
 

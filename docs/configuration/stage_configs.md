@@ -1,10 +1,10 @@
 # Stage configs for vLLM-Omni
 
-In vLLM-Omni, it divides models in vLLM-omni into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other kinds of engines. According to different types of stages, such as AR stage or DiT stage, each stage can choose corresponding schedulers, model workers to load into Engines with a plug-in way.
+In vLLM-Omni, the target model is separated into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other types of engines. Depending on different types of stages, such as Autoregressive (AR) stage or Diffusion transformer (DiT) stage, each can choose corresponding schedulers, model workers to load with the Engines in a plug-in fashion.
 
-Therefore, the stage configs for a model have several main functions:
+Therefore, as a core part of vLLM-Omni, the stage configs for a model have several main functions:
 
-- Claim partition of stages and corresponding class implementation in the folder model_executor/models.
+- Claim partition of stages and their corresponding class implementation in `model_executor/models`.
 - The disaggregated configuration for each stage and the communication topology among them.
 - Engine arguments for each engine within the stage.
 - Input and output dependencies for each stage.
@@ -22,6 +22,8 @@ For online serving:
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
+!!! important
+    We are actively iterating on the definition of stage configs, and we welcome all feedbacks from both community users and developers to help us shape the development!
 
 Below is a specific example of stage_configs.yaml in Qwen2.5-omni.
 ```python

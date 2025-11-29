@@ -20,4 +20,4 @@ Please refer to [offline inference](../user_guide/examples/offline_inference/qwe
 
 ## Online Serving with OpenAI-Completions API
 
-Please refer to [online serving](../user_guide/examples/online_serving/README.md)
+Please refer to [online serving](../user_guide/examples/online_serving/qwen2_5_omni.md)

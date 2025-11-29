@@ -1,8 +1,3 @@
-# --8<-- [start:installation]
-
-vLLM-Omni mainly contains python implementations for framework and models.
-
-# --8<-- [end:installation]
 # --8<-- [start:requirements]
 
 - GPU: compute capability 7.0 or higher (e.g., V100, T4, RTX20xx, A100, L4, H100, etc.)
@@ -21,14 +16,14 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 # --8<-- [start:pre-built-wheels]
 
-## Installation of vLLM
+#### Installation of vLLM
 
-Now we build it based on vLLM v0.11.0. Please install it with command below.
+vLLM-Omni is built based on vLLM v0.11.0. Please install it with command below.
 ```bash
 uv pip install vllm==0.11.0 --torch-backend=auto
 ```
 
-## Installation of vLLM-Omni
+#### Installation of vLLM-Omni
 
 ```bash
 uv pip install vllm-omni
@@ -38,15 +33,30 @@ uv pip install vllm-omni
 
 # --8<-- [start:build-wheel-from-source]
 
-## Installation of vLLM
-If you want to check or debug with source code of vLLM, install stable release version of vllm with 0.11.0 from source with pre-built wheel file.
+#### Installation of vLLM
+If you do not need to modify source code of vLLM, you can directly install the stable 0.11.0 release version of the library
+
+```bash
+uv pip install vllm==0.11.0 --torch-backend=auto
+```
+
+#### Installation of vLLM-Omni
+Install additional requirements for vLLM-Omni
+```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm_omni
+uv pip install -e .
+```
+
+<details><summary>(Optional) Installation of vLLM from source</summary>
+If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git checkout v0.11.0
 ```
-Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set VLLM_PRECOMPILED_WHEEL_LOCATION as your local absolute path of whl file.
+Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
 export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl
 ```
@@ -54,20 +64,12 @@ Install vllm with command below (If you have no existing PyTorch).
 ```bash
 uv pip install --editable .
 ```
-
 Install vllm with command below (If you already have PyTorch).
 ```bash
 python use_existing_torch.py
 uv pip install -r requirements/build.txt
 uv pip install --no-build-isolation --editable .
 ```
-
-## Installation of vLLM-omni
-Install additional requirements for vllm-omni
-```bash
-git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm_omni
-uv pip install -e .
-```
+</details>
 
 # --8<-- [end:build-wheel-from-source]

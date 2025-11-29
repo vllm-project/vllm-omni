@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-omni"
 version = "0.11.0rc1"
-description = "vLLM-omni: Multi-modality models inference and serving with non-autoregressive structures"
+description = "vLLM-Omni: Multi-modality models inference and serving with non-autoregressive structures"
 readme = "README.md"
 requires-python = ">=3.9,<3.14"  # Align with vLLM v0.11 supported Python versions
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "vLLM-omni Team", email = "vllm-project@gmail.com"}
+    {name = "vLLM-Omni Team", email = "vllm-project@gmail.com"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
 classifiers = [

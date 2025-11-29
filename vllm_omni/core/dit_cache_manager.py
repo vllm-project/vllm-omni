@@ -1,5 +1,5 @@
 """
-DiT Cache Manager for vLLM-omni.
+DiT Cache Manager for vLLM-Omni.
 
 This module provides caching functionality for DiT (Diffusion Transformer) models
 to optimize inference performance and memory usage.

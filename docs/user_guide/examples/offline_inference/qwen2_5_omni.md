@@ -1,40 +1,55 @@
-# Offline Example of vLLM-omni for Qwen2.5-omni
+# Offline Inference Example of vLLM-Omni for Qwen2.5-Omni
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni>.
 
 
 ## 🛠️ Installation
 
-Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
+Please refer to [installation](../../../getting_started/installation/README.md).
 
-## Run examples (Qwen2.5-omni)
+## Run Offline inference with Qwen2.5-Omni.
+First, navigate to the example folder
+```bash
+cd examples/offline_inference/qwen2_5_omni
+```
+Inside the directory, `end2end.py` is a comprehensive demo suite for initializing a model instance of `Qwen/Qwen2.5-Omni-7B` and use it for various offline inference tasks.
+??? abstract "end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/qwen2_5_omni/end2end.py"
+    ``````
+
+Below we also provide simple bash scripts to execute this file.
+### Single Prompt
+```bash
+bash run_single_prompt.sh
+```
+??? abstract "run_single_prompt.sh"
+    ``````sh
+    --8<-- "examples/offline_inference/qwen2_5_omni/run_single_prompt.sh"
+    ``````
+
 ### Multiple Prompts
-Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). To get the prompt, you can:
+Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit) and extract the prompts with `extract_prompts.py`
+??? abstract "extract_prompts.py"
+    ``````py
+    --8<-- "examples/offline_inference/qwen2_5_omni/extract_prompts.py"
+    ``````
 ```bash
 tar -xf <Your Download Path>/seedtts_testset.tar
 cp seedtts_testset/en/meta.lst examples/offline_inference/qwen2_5_omni/meta.lst
 python3 examples/offline_inference/qwen2_5_omni/extract_prompts.py \
   --input examples/offline_inference/qwen2_5_omni/meta.lst \
   --output examples/offline_inference/qwen2_5_omni/top100.txt \
-  --topk 100
-```
-Get into the example folder
-```bash
-cd examples/offline_inference/qwen2_5_omni
+  --topk 10
 ```
 Then run the command below.
 ```bash
 bash run_multiple_prompts.sh
 ```
-### Single Prompts
-Get into the example folder
-```bash
-cd examples/offline_inference/qwen2_5_omni
-```
-Then run the command below.
-```bash
-bash run_single_prompt.sh
-```
+??? abstract "run_multiple_prompts.sh"
+    ``````sh
+    --8<-- "examples/offline_inference/qwen2_5_omni/run_multiple_prompts.sh"
+    ``````
 
 ### FAQ
 
@@ -43,22 +58,3 @@ If you encounter error about backend of librosa, try to install ffmpeg with comm
 sudo apt update
 sudo apt install ffmpeg
 ```
-
-## Example materials
-
-??? abstract "end2end.py"
-    ``````py
-    --8<-- "examples/offline_inference/qwen2_5_omni/end2end.py"
-    ``````
-??? abstract "extract_prompts.py"
-    ``````py
-    --8<-- "examples/offline_inference/qwen2_5_omni/extract_prompts.py"
-    ``````
-??? abstract "run_multiple_prompts.sh"
-    ``````sh
-    --8<-- "examples/offline_inference/qwen2_5_omni/run_multiple_prompts.sh"
-    ``````
-??? abstract "run_single_prompt.sh"
-    ``````sh
-    --8<-- "examples/offline_inference/qwen2_5_omni/run_single_prompt.sh"
-    ``````

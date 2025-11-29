@@ -7,11 +7,11 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 class OmniScheduler(VLLMScheduler):
     """
-    OmniScheduler: Scheduler for vLLM-omni multimodal processing.
+    OmniScheduler: Scheduler for vLLM-Omni multimodal processing.
 
     This scheduler extends vLLM's scheduler to support multimodal and
     non-autoregressive processing with additional fields and methods
-    specific to vLLM-omni.
+    specific to vLLM-Omni.
     """
 
     # Ensure scheduled_new_reqs carry omni-specific payloads

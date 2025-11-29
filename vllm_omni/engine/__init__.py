@@ -1,5 +1,5 @@
 """
-Engine components for vLLM-omni.
+Engine components for vLLM-Omni.
 """
 
 from typing import Any, Optional

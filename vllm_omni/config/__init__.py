@@ -1,5 +1,5 @@
 """
-Configuration module for vLLM-omni.
+Configuration module for vLLM-Omni.
 """
 
 from vllm_omni.config.model import OmniModelConfig

@@ -2,4 +2,4 @@ blank_issues_enabled: false
 contact_links:
   - name: Questions
     url: https://github.com/vllm-project/vllm-omni/discussions
-    about: Ask questions and discuss with other vLLM-omni community members
+    about: Ask questions and discuss with other vLLM-Omni community members

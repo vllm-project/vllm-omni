@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 
 
 class OmniLLM:
-    """Main entry point for vLLM-omni inference.
+    """Main entry point for vLLM-Omni inference.
 
     This class provides a high-level interface for running multi-modal
     comprehension and generation models. It orchestrates multiple

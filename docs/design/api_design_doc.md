@@ -1,6 +1,6 @@
 # API Design Documentation
 
-This document contains comprehensive API design documentation for all core modules in vLLM-omni. These templates provide a standardized structure for designing and implementing the core, engine, executor, and worker modules.
+This document contains comprehensive API design documentation for all core modules in vLLM-Omni. These templates provide a standardized structure for designing and implementing the core, engine, executor, and worker modules.
 
 ## 📋 Module API
 

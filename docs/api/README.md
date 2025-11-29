@@ -2,7 +2,7 @@
 
 ## Entry Points
 
-Main entry points for vLLM-omni inference and serving.
+Main entry points for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniStageLLM][]

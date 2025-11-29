@@ -1,64 +1,42 @@
-# Contributing to vLLM-omni
+# Contributing to vLLM-Omni
 
-Thank you for your interest in contributing to vLLM-omni! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to vLLM-Omni! This document provides guidelines and instructions for contributing.
 
 ## Getting Started
 
-### Development Environment for vLLM
-
-vLLM-omni uses `uv` as the environment manager, to create and manage Python environments. Please follow the documentation to install `uv`. After installing `uv`, you can create a new Python environment using the following commands:
+vLLM-Omni uses `uv` as the environment manager, to create and manage Python environments. Please follow the documentation to install `uv`. After installing `uv`, you can create a new Python environment using the following commands:
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
+### Development Environment for vLLM
 
-Install vLLM from source:
-
-```bash
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout v0.11.0
-```
-Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set VLLM_PRECOMPILED_WHEEL_LOCATION as your local absolute path of whl file.
-```bash
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl
-```
-Install vllm with command below (If you have no existing PyTorch).
-```bash
-uv pip install --editable .
-```
-
-Install vllm with command below (If you already have PyTorch).
-```bash
-python use_existing_torch.py
-uv pip install -r requirements/build.txt
-uv pip install --no-build-isolation --editable .
-```
+vLLM-Omni is built on top of the stable release 0.11.0 of vLLM. You may install `vllm==0.11.0` directly or install the library from source if you need to check, modify or debug with source code of vLLM.
 
 ### Development Environment for vLLM-Omni
 
-Install vLLM-omni from source:
+Install vLLM-Omni from source with development dependencies:
 
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm_omni
-uv pip install -e .
+uv pip install -e ".[dev]"
 ```
 
 !!! tip
-    vLLM-omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
+    vLLM-Omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
 
 ### Linting
 
-vLLM-omni uses `pre-commit` to lint and format the codebase. See [pre-commit documentation](https://pre-commit.com/#usage) if `pre-commit` is new to you. Setting up `pre-commit` is as easy as:
+vLLM-Omni uses `pre-commit` to lint and format the codebase. See [pre-commit documentation](https://pre-commit.com/#usage) if `pre-commit` is new to you. Setting up `pre-commit` is as easy as:
 
 ```bash
 uv pip install pre-commit
 pre-commit install
 ```
 
-vLLM-omni's `pre-commit` hooks will now run automatically every time you commit.
+vLLM-Omni's `pre-commit` hooks will now run automatically every time you commit.
 
 !!! tip
     You can manually run the `pre-commit` hooks using:
@@ -94,20 +72,14 @@ For additional features and advanced configurations, refer to the:
 
 ### Testing
 
-vLLM-omni uses `pytest` to test the codebase.
+vLLM-Omni uses `pytest` to test the codebase.
 
 ```bash
-# Install the test dependencies used in CI (CUDA only)
-uv pip install -e ".[dev]" --torch-backend=auto
-
-# Install some common test dependencies (hardware agnostic)
-uv pip install pytest pytest-asyncio
-
 # Run all tests
 pytest tests/
 
 # Run tests for a single test file with detailed output
-pytest -s -v tests/test_logger.py
+pytest -s -v tests/test_omni_llm.py
 ```
 
 !!! warning
@@ -122,7 +94,7 @@ If you encounter a bug or have a feature request, please search existing issues 
 
 ## Pull Requests & Code Reviews
 
-Thank you for your contribution to vLLM-omni! Before submitting the pull request, please ensure the PR meets the following criteria. This helps vLLM-omni maintain the code quality and improve the efficiency of the review process.
+Thank you for your contribution to vLLM-Omni! Before submitting the pull request, please ensure the PR meets the following criteria. This helps vLLM-Omni maintain the code quality and improve the efficiency of the review process.
 
 ### DCO and Signed-off-by
 
@@ -144,9 +116,9 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 - `[CI/Build]` for build or continuous integration improvements.
 - `[Doc]` for documentation fixes and improvements.
 - `[Model]` for adding a new model or improving an existing model. Model name should appear in the title.
-- `[Frontend]` For changes on the vLLM-omni frontend (e.g., OpenAI API server, `OmniLLM` class, etc.)
+- `[Frontend]` For changes on the vLLM-Omni frontend (e.g., OpenAI API server, `OmniLLM` class, etc.)
 - `[Kernel]` for changes affecting CUDA kernels or other compute kernels.
-- `[Core]` for changes in the core vLLM-omni logic (e.g., `OmniProcessor`, `OmniScheduler`, etc.)
+- `[Core]` for changes in the core vLLM-Omni logic (e.g., `OmniProcessor`, `OmniScheduler`, etc.)
 - `[Hardware][Vendor]` for hardware-specific changes. Vendor name should appear in the prefix, such as [Ascend] for Ascend NPUs.
 - `[Misc]` for PRs that do not fit the above categories. Please use this sparingly.
 
@@ -161,7 +133,7 @@ The PR needs to meet the following code quality standards:
 - Pass all linter checks.
 - The code needs to be well-documented to ensure future contributors can easily understand the code.
 - Include sufficient tests to ensure the project stays correct and robust. This includes both unit tests and integration tests.
-- Please add documentation to `docs/` if the PR modifies the user-facing behaviors of vLLM-omni. It helps vLLM-omni users understand and utilize the new features or changes.
+- Please add documentation to `docs/` if the PR modifies the user-facing behaviors of vLLM-Omni. It helps vLLM-Omni users understand and utilize the new features or changes.
 
 ### Notes for Large Changes
 
@@ -169,13 +141,12 @@ Please keep the changes as concise as possible. For major architectural changes 
 
 ### What to Expect for the Reviews
 
-The goal of the vLLM-omni team is to be a _transparent reviewing machine_. We would like to make the review process transparent and efficient and make sure no contributor feels confused or frustrated. However, the vLLM-omni team is small, so we need to prioritize some PRs over others. Here is what you can expect from the review process:
+The goal of the vLLM-Omni team is to be a _transparent reviewing machine_. We would like to make the review process transparent and efficient and make sure no contributor feels confused or frustrated. However, the vLLM-Omni team is small, so we need to prioritize some PRs over others. Here is what you can expect from the review process:
 
 - After the PR is submitted, the PR will be assigned to a reviewer. Every reviewer will pick up the PRs based on their expertise and availability.
-- After the PR is assigned, the reviewer will provide status updates every 2-3 days. If the PR is not reviewed within 7 days, please feel free to ping the reviewer or the vLLM-omni team.
+- After the PR is assigned, the reviewer will provide status updates every 2-3 days. If the PR is not reviewed within 7 days, please feel free to ping the reviewer or the vLLM-Omni team.
 - After the review, the reviewer will put an `action-required` label on the PR if there are changes required. The contributor should address the comments and ping the reviewer to re-review the PR.
 - Please respond to all comments within a reasonable time frame. If a comment isn't clear or you disagree with a suggestion, feel free to ask for clarification or discuss the suggestion.
-- Note that not all CI checks will be executed due to limited computational resources. The reviewer will add `ready` label to the PR when the PR is ready to merge or a full CI run is needed.
 
 ## Additional Resources
 
@@ -183,4 +154,4 @@ The goal of the vLLM-omni team is to be a _transparent reviewing machine_. We wo
 
 ## Thank You
 
-Finally, thank you for taking the time to read these guidelines and for your interest in contributing to vLLM-omni. All of your contributions help make vLLM-omni a great tool and community for everyone!
+Finally, thank you for taking the time to read these guidelines and for your interest in contributing to vLLM-Omni. All of your contributions help make vLLM-Omni a great tool and community for everyone!
