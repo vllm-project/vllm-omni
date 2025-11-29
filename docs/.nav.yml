@@ -8,7 +8,8 @@ nav:
       - examples/README.md
       - Offline Inference:
         - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
-      - Online Serving: user_guide/examples/online_serving/README.md
+      - Online Serving:
+        - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
     - General:
       - usage/*
     - Configuration:
