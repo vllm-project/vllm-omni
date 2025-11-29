@@ -35,6 +35,8 @@ dependencies = [
     "resampy>=0.4.3",
     "diffusers==0.35.2",
     "accelerate==1.12.0",
+    "gradio==5.50",
+    "soundfile>=0.13.1"
     # "vllm==0.11.0",  # TODO: fix the entrypoints overwrite problem
 ]
 
@@ -48,8 +50,6 @@ dev = [
     "isort>=5.12.0",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
-    "gradio>=5.49.1",
-    "soundfile>=0.13.1"
 ]
 
 docs = [
