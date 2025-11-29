@@ -18,14 +18,18 @@ nav:
     - Models:
       - models/supported_models.md
   - Developer Guide:
-    - contributing/README.md
     - General:
+      - contributing/README.md
       - glob: contributing/*
         flatten_single_child_sections: true
     - Model Implementation:
       - contributing/model/README.md
     - CI: contributing/ci
-    - Design Documents: design
+    - Design Documents:
+      - design/index.md
+      - design/architecture_overview.md
+      - design/vllm_omni_design.md
+      - design/api_design_doc.md
     - Docs Guide: contributing/DOCS_GUIDE.md
   - API Reference:
     - api/README.md

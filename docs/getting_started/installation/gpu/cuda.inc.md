@@ -49,7 +49,7 @@ uv pip install -e .
 ```
 
 <details><summary>(Optional) Installation of vLLM from source</summary>
-If you want to check or debug with source code of vLLM, install the library from source with the following instructions:
+If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:
 
 ```bash
 git clone https://github.com/vllm-project/vllm.git

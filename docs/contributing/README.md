@@ -4,46 +4,24 @@ Thank you for your interest in contributing to vLLM-Omni! This document provides
 
 ## Getting Started
 
-### Development Environment for vLLM
-
 vLLM-Omni uses `uv` as the environment manager, to create and manage Python environments. Please follow the documentation to install `uv`. After installing `uv`, you can create a new Python environment using the following commands:
 
 ```bash
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
+### Development Environment for vLLM
 
-Install vLLM from source:
-
-```bash
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout v0.11.0
-```
-Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set VLLM_PRECOMPILED_WHEEL_LOCATION as your local absolute path of whl file.
-```bash
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl
-```
-Install vllm with command below (If you have no existing PyTorch).
-```bash
-uv pip install --editable .
-```
-
-Install vllm with command below (If you already have PyTorch).
-```bash
-python use_existing_torch.py
-uv pip install -r requirements/build.txt
-uv pip install --no-build-isolation --editable .
-```
+vLLM-Omni is built on top of the stable release 0.11.0 of vLLM. You may install `vllm==0.11.0` directly or install the library from source if you need to check, modify or debug with source code of vLLM.
 
 ### Development Environment for vLLM-Omni
 
-Install vLLM-Omni from source:
+Install vLLM-Omni from source with development dependencies:
 
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm_omni
-uv pip install -e .
+uv pip install -e ".[dev]"
 ```
 
 !!! tip
@@ -97,17 +75,11 @@ For additional features and advanced configurations, refer to the:
 vLLM-Omni uses `pytest` to test the codebase.
 
 ```bash
-# Install the test dependencies used in CI (CUDA only)
-uv pip install -e ".[dev]" --torch-backend=auto
-
-# Install some common test dependencies (hardware agnostic)
-uv pip install pytest pytest-asyncio
-
 # Run all tests
 pytest tests/
 
 # Run tests for a single test file with detailed output
-pytest -s -v tests/test_logger.py
+pytest -s -v tests/test_omni_llm.py
 ```
 
 !!! warning
@@ -175,7 +147,6 @@ The goal of the vLLM-Omni team is to be a _transparent reviewing machine_. We wo
 - After the PR is assigned, the reviewer will provide status updates every 2-3 days. If the PR is not reviewed within 7 days, please feel free to ping the reviewer or the vLLM-Omni team.
 - After the review, the reviewer will put an `action-required` label on the PR if there are changes required. The contributor should address the comments and ping the reviewer to re-review the PR.
 - Please respond to all comments within a reasonable time frame. If a comment isn't clear or you disagree with a suggestion, feel free to ask for clarification or discuss the suggestion.
-- Note that not all CI checks will be executed due to limited computational resources. The reviewer will add `ready` label to the PR when the PR is ready to merge or a full CI run is needed.
 
 ## Additional Resources
 
