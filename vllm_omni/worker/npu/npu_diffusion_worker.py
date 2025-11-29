@@ -7,7 +7,7 @@ from vllm_omni.worker.npu.npu_diffusion_model_runner import NPUDiffusionModelRun
 
 
 class NPUDiffusionWorker(NPUWorker):
-    """NPU diffusion worker for code2wav stage in Qwen2.5-Omni."""
+    """NPU diffusion worker for code2wav stage in Omni model."""
 
     def init_device(self):
         device = self._init_device()
