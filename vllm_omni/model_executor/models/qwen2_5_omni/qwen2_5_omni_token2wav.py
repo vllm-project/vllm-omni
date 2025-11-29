@@ -33,6 +33,8 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.utils.platform_utils import is_npu
+
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
 def auto_docstring(func=None, **_kwargs):
@@ -724,17 +726,30 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
     else:
         beta = 0.0
 
-    kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu")
+    # TODO: When torch.kaiser_window supports NPU, remove the device="cpu" argument
+    if is_npu():
+        kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu")
+    else:
+        kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
 
     # Compute time indices
-    if is_even:
-        time_indices = torch.arange(-half_size, half_size, device="cpu") + 0.5
+    if is_npu():
+        if is_even:
+            time_indices = torch.arange(-half_size, half_size, device="cpu") + 0.5
+        else:
+            time_indices = torch.arange(kernel_size, device="cpu") - half_size
     else:
-        time_indices = torch.arange(kernel_size, device="cpu") - half_size
+        if is_even:
+            time_indices = torch.arange(-half_size, half_size) + 0.5
+        else:
+            time_indices = torch.arange(kernel_size) - half_size
 
     # Compute sinc filter
     if cutoff == 0:
-        return torch.zeros((1, 1, kernel_size), dtype=torch.float32, device="cpu")  # Ensures correct shape
+        if is_npu():
+            return torch.zeros((1, 1, kernel_size), dtype=torch.float32, device="cpu")
+        else:
+            return torch.zeros((1, 1, kernel_size), dtype=torch.float32)
 
     sinc_filter = torch.sinc(2 * cutoff * time_indices)
     normalized_filter = 2 * cutoff * kaiser_window * sinc_filter
@@ -746,7 +761,10 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
 
 
 def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int, pad_right: int) -> torch.Tensor:
-    """Manual replicate padding to avoid replication_pad1d kernel limits on NPU."""
+    """
+    Manual replicate padding to avoid replication_pad1d kernel limits on NPU.
+    TODO: remove when F.pad supports replicate mode on NPU.
+    """
     # NOTE: a immature implementation for running in Ascend NPU. Need to discuss.
     if pad_left == 0 and pad_right == 0:
         return hidden_states
@@ -780,17 +798,28 @@ class UpSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        input_dtype = hidden_states.dtype
-        # F.pad in Ascend doesn't support BF16 when mode is replicate.
-        # To ensure the accuracy, manually pad the input tensor.
-        hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad, self.pad)
-        filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
-        hidden_states = self.ratio * F.conv_transpose1d(
-            hidden_states,
-            filter_on_device.expand(channels, -1, -1),
-            stride=self.stride,
-            groups=channels,
-        ).to(input_dtype)
+        if is_npu():
+            # TODO: When F.pad supports replicate mode on NPU, remove this branch
+            input_dtype = hidden_states.dtype
+            # F.pad in NPU doesn't support BF16 when mode is replicate.
+            # To ensure the accuracy, manually pad the input tensor.
+            hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad, self.pad)
+            filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            hidden_states = self.ratio * F.conv_transpose1d(
+                hidden_states,
+                filter_on_device.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(input_dtype)
+        else:
+            hidden_states_dtype = hidden_states.dtype
+            hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate").to(self.filter.dtype)
+            hidden_states = self.ratio * F.conv_transpose1d(
+                hidden_states,
+                self.filter.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(hidden_states_dtype)
         hidden_states = hidden_states[..., self.pad_left : -self.pad_right]
 
         return hidden_states
