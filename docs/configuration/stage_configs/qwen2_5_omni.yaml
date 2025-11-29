@@ -30,7 +30,7 @@ stage_args:
     runtime:
       process: true
       devices: "1"
-      max_batch_size: 3
+      max_batch_size: 1
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration

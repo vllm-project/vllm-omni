@@ -27,6 +27,27 @@ _OMNI_MODELS = {
         "Qwen2_5OmniToken2WavModel",
     ),
     "Qwen2ForCausalLM_old": ("qwen2_5_omni", "qwen2_old", "Qwen2ForCausalLM"),  # need to discuss
+    # Qwen3 Omni MoE models
+    "Qwen3OmniMoeForConditionalGeneration": (
+        "qwen3_omni",
+        "qwen3_omni",
+        "Qwen3OmniMoeForConditionalGeneration",
+    ),
+    "Qwen3OmniMoeThinkerForConditionalGeneration": (
+        "qwen3_omni",
+        "qwen3_omni_moe_thinker",
+        "Qwen3OmniMoeThinkerForConditionalGeneration",
+    ),
+    "Qwen3OmniMoeTalkerForConditionalGeneration": (
+        "qwen3_omni",
+        "qwen3_omni_moe_talker",
+        "Qwen3OmniMoeTalkerForConditionalGeneration",
+    ),
+    "Qwen3OmniMoeCode2Wav": (
+        "qwen3_omni",
+        "qwen3_omni_code2wav",
+        "Qwen3OmniMoeCode2Wav",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {

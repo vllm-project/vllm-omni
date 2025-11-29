@@ -28,3 +28,12 @@ def split_list_into_ranges(lst: torch.Tensor, interval: int) -> list[list[int]]:
         ranges[index].append(num)
 
     return ranges
+
+
+def safe_tensor_reshape(tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
+    """
+    Reshape a tensor safely.
+    """
+    if tensor is None:
+        return None
+    return tensor.reshape(shape)

@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-This example shows how to use vLLM-Omni for running offline inference
-with the correct prompt format on Qwen2.5-Omni
+This example shows how to use vLLM for running offline inference
+with the correct prompt format on Qwen3-Omni (thinker only).
 """
 
 import os
 from typing import NamedTuple
 
 import soundfile as sf
+from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
-from vllm.sampling_params import SamplingParams
 from vllm.utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni_llm import OmniLLM
@@ -54,13 +54,53 @@ def get_text_query(question: str = None) -> QueryResult:
     )
 
 
-def get_mixed_modalities_query() -> QueryResult:
-    question = "What is recited in the audio? What is the content of this image? Why is this video funny?"
+def get_video_query(question: str = None) -> QueryResult:
+    if question is None:
+        question = "Why is this video funny?"
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|audio_bos|><|AUDIO|><|audio_eos|>"
-        "<|vision_bos|><|IMAGE|><|vision_eos|>"
-        "<|vision_bos|><|VIDEO|><|vision_eos|>"
+        "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "video": VideoAsset(name="baby_reading", num_frames=16).np_ndarrays,
+            },
+        },
+        limit_mm_per_prompt={"video": 1},
+    )
+
+
+def get_image_query(question: str = None) -> QueryResult:
+    if question is None:
+        question = "What is the content of this image?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "image": convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB"),
+            },
+        },
+        limit_mm_per_prompt={"image": 1},
+    )
+
+
+def get_audio_query(question: str = None) -> QueryResult:
+    if question is None:
+        question = "What is the content of this audio?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -69,118 +109,62 @@ def get_mixed_modalities_query() -> QueryResult:
             "prompt": prompt,
             "multi_modal_data": {
                 "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
-                "image": convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB"),
-                "video": VideoAsset(name="baby_reading", num_frames=16).np_ndarrays,
             },
         },
-        limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
-    )
-
-
-def get_use_audio_in_video_query() -> QueryResult:
-    question = "Describe the content of the video, then convert what the baby say into text."
-    prompt = (
-        f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
-        f"{question}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-    asset = VideoAsset(name="baby_reading", num_frames=16)
-    audio = asset.get_audio(sampling_rate=16000)
-
-    return QueryResult(
-        inputs={
-            "prompt": prompt,
-            "multi_modal_data": {
-                "video": asset.np_ndarrays,
-                "audio": audio,
-            },
-            "mm_processor_kwargs": {
-                "use_audio_in_video": True,
-            },
-        },
-        limit_mm_per_prompt={"audio": 1, "video": 1},
-    )
-
-
-def get_multi_audios_query() -> QueryResult:
-    question = "Are these two audio clips the same?"
-    prompt = (
-        f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|audio_bos|><|AUDIO|><|audio_eos|>"
-        "<|audio_bos|><|AUDIO|><|audio_eos|>"
-        f"{question}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-    return QueryResult(
-        inputs={
-            "prompt": prompt,
-            "multi_modal_data": {
-                "audio": [
-                    AudioAsset("winning_call").audio_and_sample_rate,
-                    AudioAsset("mary_had_lamb").audio_and_sample_rate,
-                ],
-            },
-        },
-        limit_mm_per_prompt={
-            "audio": 2,
-        },
+        limit_mm_per_prompt={"audio": 1},
     )
 
 
 query_map = {
-    "mixed_modalities": get_mixed_modalities_query,
-    "use_audio_in_video": get_use_audio_in_video_query,
-    "multi_audios": get_multi_audios_query,
     "text": get_text_query,
+    "use_audio": get_audio_query,
+    "use_image": get_image_query,
+    "use_video": get_video_query,
 }
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = "/mnt/gh/yrr_vllm/Qwen3-Omni-30B-A3B-Instruct-Full"
     query_result = query_map[args.query_type]()
 
     omni_llm = OmniLLM(
         model=model_name,
-        log_stats=args.enable_stats,
-        log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
-        init_sleep_seconds=args.init_sleep_seconds,
-        batch_timeout=args.batch_timeout,
-        init_timeout=args.init_timeout,
-        shm_threshold_bytes=args.shm_threshold_bytes,
     )
+
     thinker_sampling_params = SamplingParams(
-        temperature=0.0,  # Deterministic - no randomness
-        top_p=1.0,  # Disable nucleus sampling
-        top_k=-1,  # Disable top-k sampling
-        max_tokens=2048,
-        seed=SEED,  # Fixed seed for sampling
-        detokenize=True,
-        repetition_penalty=1.1,
+        temperature=0.4,
+        top_p=0.9,
+        top_k=-1,
+        max_tokens=1200,
+        repetition_penalty=1.05,
+        logit_bias={},
+        seed=SEED,
     )
+
     talker_sampling_params = SamplingParams(
         temperature=0.9,
-        top_p=0.8,
-        top_k=40,
-        max_tokens=2048,
-        seed=SEED,  # Fixed seed for sampling
-        detokenize=True,
+        top_k=50,
+        max_tokens=4096,
+        seed=SEED,
+        detokenize=False,
         repetition_penalty=1.05,
-        stop_token_ids=[8294],
+        stop_token_ids=[2150],  # TALKER_CODEC_EOS_TOKEN_ID
     )
+
+    # Sampling parameters for Code2Wav stage (audio generation)
     code2wav_sampling_params = SamplingParams(
-        temperature=0.0,  # Deterministic - no randomness
-        top_p=1.0,  # Disable nucleus sampling
-        top_k=-1,  # Disable top-k sampling
-        max_tokens=2048,
-        seed=SEED,  # Fixed seed for sampling
+        temperature=0.0,
+        top_p=1.0,
+        top_k=-1,
+        max_tokens=4096 * 16,
+        seed=SEED,
         detokenize=True,
         repetition_penalty=1.1,
     )
 
     sampling_params_list = [
         thinker_sampling_params,
-        talker_sampling_params,
+        talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
         code2wav_sampling_params,
     ]
 
@@ -194,10 +178,10 @@ def main(args):
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
-
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
+
     for stage_outputs in omni_outputs:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
@@ -222,7 +206,16 @@ def main(args):
                 request_id = int(output.request_id)
                 audio_tensor = output.multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
-                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+
+                # Convert to numpy array and ensure correct format
+                audio_numpy = audio_tensor.float().detach().cpu().numpy()
+
+                # Ensure audio is 1D (flatten if needed)
+                if audio_numpy.ndim > 1:
+                    audio_numpy = audio_numpy.flatten()
+
+                # Save audio file with explicit WAV format
+                sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 
@@ -290,3 +283,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+
+    # use examples:
+    # python end2end.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct-Full --query-type text
+    # python end2end.py --model /mnt/gh/yrr_vllm/Qwen3-Omni-30B-A3B-Instruct-Full --query-type use_video_only
