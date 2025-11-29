@@ -36,7 +36,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 vLLM-Omni is fast with:
 
-- State-of-the-art AR support by leveraging effcient KV cache management from vLLM
+- State-of-the-art AR support by leveraging efficient KV cache management from vLLM
 - Pipelined stage execution overlapping for high throughput performance
 - Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
 
