@@ -297,7 +297,6 @@ def _to_dict(x: Any) -> dict[str, Any]:
         if isinstance(x, dict):
             return dict(x)
         return OmegaConf.to_container(x, resolve=True)  # type: ignore[arg-type]
-
     except Exception:
         try:
             return dict(x)
