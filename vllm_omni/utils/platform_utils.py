@@ -30,3 +30,25 @@ def get_device_control_env_var() -> str:
     if device_type == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
     return "CUDA_VISIBLE_DEVICES"  # fallback
+
+
+def get_diffusion_worker_class():
+    """Get the appropriate diffusion WorkerProc class based on current device type.
+
+    Returns:
+        The WorkerProc class for the detected device type.
+
+    Raises:
+        ImportError: If the worker module for the detected device is not available.
+    """
+    device_type = detect_device_type()
+
+    if device_type == "npu":
+        from vllm_omni.diffusion.worker.npu.npu_worker import NPUWorkerProc
+
+        return NPUWorkerProc
+    else:
+        # Default to GPU worker for cuda and other devices
+        from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
+
+        return WorkerProc
