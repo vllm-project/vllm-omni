@@ -56,7 +56,6 @@ theme:
   custom_dir: docs/mkdocs/overrides
 
 hooks:
-  - docs/mkdocs/hooks/generate_examples.py
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
 
