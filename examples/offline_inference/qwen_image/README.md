@@ -37,7 +37,7 @@ Key arguments:
 Launch the gradio demo:
 
 ```bash
-python web_demo.py --port 7862
+python gradio_demo.py --port 7862
 ```
 
 Then open `http://localhost:7862/` on your local browser to interact with the web UI.
