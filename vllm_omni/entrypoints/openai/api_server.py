@@ -38,7 +38,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
-from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 logger = init_logger(__name__)
@@ -65,7 +65,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
-    async with build_async_omni_llm(
+    async with build_async_omni(
         args,
         client_config=client_config,
     ) as engine_client:
@@ -108,15 +108,15 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
 
 @asynccontextmanager
-async def build_async_omni_llm(
+async def build_async_omni(
     args: Namespace,
     *,
     disable_frontend_multiprocessing: Optional[bool] = None,
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
-    """Build an AsyncOmniLLM instance from command-line arguments.
+    """Build an AsyncOmni instance from command-line arguments.
 
-    Creates an async context manager that yields an AsyncOmniLLM instance
+    Creates an async context manager that yields an AsyncOmni instance
     configured from the provided arguments. Handles forkserver setup if
     needed and ensures proper cleanup on exit.
 
@@ -127,7 +127,7 @@ async def build_async_omni_llm(
         client_config: Optional client configuration dictionary
 
     Yields:
-        EngineClient instance (AsyncOmniLLM) ready for use
+        EngineClient instance (AsyncOmni) ready for use
     """
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
         # The executor is expected to be mp.
@@ -138,25 +138,25 @@ async def build_async_omni_llm(
         forkserver.ensure_running()
         logger.debug("Forkserver setup complete!")
 
-    # Context manager to handle async_omni_llm lifecycle
+    # Context manager to handle async_omni lifecycle
     # Ensures everything is shutdown and cleaned up on error/exit
-    async with build_async_omni_llm_from_stage_config(
+    async with build_async_omni_from_stage_config(
         args,
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
-    ) as async_omni_llm:
-        yield async_omni_llm
+    ) as async_omni:
+        yield async_omni
 
 
 @asynccontextmanager
-async def build_async_omni_llm_from_stage_config(
+async def build_async_omni_from_stage_config(
     args: Namespace,
     *,
     disable_frontend_multiprocessing: bool = False,
     client_config: Optional[dict[str, Any]] = None,
 ) -> AsyncIterator[EngineClient]:
-    """Create AsyncOmniLLM from stage configuration.
+    """Create AsyncOmni from stage configuration.
 
-    Creates an AsyncOmniLLM instance either in-process or using multiprocess
+    Creates an AsyncOmni instance either in-process or using multiprocess
     RPC. Loads stage configurations from the model or from a specified path.
 
     Args:
@@ -166,7 +166,7 @@ async def build_async_omni_llm_from_stage_config(
         client_config: Optional client configuration dictionary
 
     Yields:
-        EngineClient instance (AsyncOmniLLM) ready for use
+        EngineClient instance (AsyncOmni) ready for use
 
     Note:
         Stage configurations are loaded from args.stage_configs_path if provided,
@@ -182,21 +182,21 @@ async def build_async_omni_llm_from_stage_config(
             "To disable frontend multiprocessing, set VLLM_USE_V1=0."
         )
 
-    async_omni_llm: Optional[EngineClient] = None
+    async_omni: Optional[EngineClient] = None
 
     try:
         if getattr(args, "stage_configs_path", None):
-            async_omni_llm = AsyncOmniLLM(model=args.model, stage_configs_path=args.stage_configs_path)
+            async_omni = AsyncOmni(model=args.model, stage_configs_path=args.stage_configs_path)
         else:
-            async_omni_llm = AsyncOmniLLM(model=args.model)
+            async_omni = AsyncOmni(model=args.model)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
 
-        yield async_omni_llm
+        yield async_omni
     finally:
-        if async_omni_llm:
-            async_omni_llm.shutdown()
+        if async_omni:
+            async_omni.shutdown()
 
 
 async def omni_init_app_state(
@@ -211,7 +211,7 @@ async def omni_init_app_state(
     and other server configuration needed for handling API requests.
 
     Args:
-        engine_client: Engine client instance (AsyncOmniLLM)
+        engine_client: Engine client instance (AsyncOmni)
         vllm_config: vLLM configuration object
         state: FastAPI application state object to initialize
         args: Parsed command-line arguments

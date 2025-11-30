@@ -671,7 +671,7 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
-    from vllm_omni.entrypoints.async_omni_llm import AsyncOmniStageLLM
+    from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,

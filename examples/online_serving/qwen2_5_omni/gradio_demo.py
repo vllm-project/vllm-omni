@@ -15,7 +15,7 @@ from PIL import Image
 from vllm.assets.video import video_get_metadata, video_to_ndarrays
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 # Import utils from offline inference example
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../offline_inference/qwen2_5_omni"))
@@ -236,8 +236,8 @@ def process_video_file(
     return frames, metadata, audio_tuple
 
 
-async def run_inference_async_omni_llm(
-    omni_llm: AsyncOmniLLM,
+async def run_inference_async_omni(
+    omni_llm: AsyncOmni,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     user_prompt: str,
@@ -246,7 +246,7 @@ async def run_inference_async_omni_llm(
     video_file: Optional[str] = None,
     use_audio_in_video: bool = False,
 ):
-    """Run inference using AsyncOmniLLM directly with multimodal support."""
+    """Run inference using AsyncOmni directly with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
         return "Please provide at least a text prompt or multimodal input.", None
 
@@ -362,12 +362,12 @@ async def run_inference_async_omni_llm(
 
 
 def build_interface(
-    omni_llm: AsyncOmniLLM,
+    omni_llm: AsyncOmni,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     model: str,
 ):
-    """Build Gradio interface for AsyncOmniLLM mode."""
+    """Build Gradio interface for AsyncOmni mode."""
 
     async def run_inference(
         user_prompt: str,
@@ -376,7 +376,7 @@ def build_interface(
         video_file: Optional[str],
         use_audio_in_video: bool,
     ):
-        return await run_inference_async_omni_llm(
+        return await run_inference_async_omni(
             omni_llm,
             sampling_params,
             prompt_args_template,
@@ -495,17 +495,17 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print(f"Initializing AsyncOmniLLM with model: {args.model}")
+    print(f"Initializing AsyncOmni with model: {args.model}")
     if args.stage_configs_path:
         print(f"Using custom stage configs: {args.stage_configs_path}")
 
     sampling_params = build_sampling_params(SEED, model_name)
-    omni_llm = AsyncOmniLLM(
+    omni_llm = AsyncOmni(
         model=args.model,
         stage_configs_path=args.stage_configs_path,
         init_timeout=ASYNC_INIT_TIMEOUT,
     )
-    print("✓ AsyncOmniLLM initialized successfully")
+    print("✓ AsyncOmni initialized successfully")
     prompt_args_template = create_prompt_args(args)
 
     demo = build_interface(
