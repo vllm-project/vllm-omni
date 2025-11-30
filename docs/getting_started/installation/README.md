@@ -4,4 +4,4 @@ vLLM supports the following hardware platforms:
 
 - [GPU](gpu.md)
     - [NVIDIA CUDA](gpu.md)
-- [Ascend NPU](npu.md)
+- [NPU](npu.md)

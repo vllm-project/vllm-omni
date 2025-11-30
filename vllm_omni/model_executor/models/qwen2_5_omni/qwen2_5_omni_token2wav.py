@@ -33,6 +33,8 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.utils.platform_utils import is_npu
+
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
 def auto_docstring(func=None, **_kwargs):
@@ -724,7 +726,13 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
     else:
         beta = 0.0
 
-    kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
+    # TODO: When torch.kaiser_window supports NPU, remove the device="cpu" argument
+    if is_npu():
+        kaiser_window = torch.kaiser_window(
+            kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
+        ).to("npu")
+    else:
+        kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
 
     # Compute time indices
     if is_even:
@@ -734,7 +742,7 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
 
     # Compute sinc filter
     if cutoff == 0:
-        return torch.zeros((1, 1, kernel_size), dtype=torch.float32)  # Ensures correct shape
+        return torch.zeros((1, 1, kernel_size), dtype=torch.float32)
 
     sinc_filter = torch.sinc(2 * cutoff * time_indices)
     normalized_filter = 2 * cutoff * kaiser_window * sinc_filter
@@ -743,6 +751,29 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
     normalized_filter /= normalized_filter.sum()
 
     return normalized_filter.view(1, 1, kernel_size)
+
+
+def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int, pad_right: int) -> torch.Tensor:
+    """
+    Manual replicate padding to avoid replication_pad1d kernel limits on NPU.
+    TODO: remove when F.pad supports replicate mode on NPU.
+    """
+    # NOTE: a immature implementation for running in NPU. Need to discuss.
+    if pad_left == 0 and pad_right == 0:
+        return hidden_states
+
+    segments = []
+    if pad_left > 0:
+        left = hidden_states[..., :1].expand(*hidden_states.shape[:-1], pad_left)
+        segments.append(left)
+
+    segments.append(hidden_states)
+
+    if pad_right > 0:
+        right = hidden_states[..., -1:].expand(*hidden_states.shape[:-1], pad_right)
+        segments.append(right)
+
+    return torch.cat(segments, dim=-1)
 
 
 class UpSample1d(nn.Module):
@@ -760,14 +791,28 @@ class UpSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        hidden_states_dtype = hidden_states.dtype
-        hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate").to(self.filter.dtype)
-        hidden_states = self.ratio * F.conv_transpose1d(
-            hidden_states,
-            self.filter.expand(channels, -1, -1),
-            stride=self.stride,
-            groups=channels,
-        ).to(hidden_states_dtype)
+        if is_npu():
+            # TODO: When F.pad supports replicate mode on NPU, remove this branch
+            input_dtype = hidden_states.dtype
+            # F.pad in NPU doesn't support BF16 when mode is replicate.
+            # To ensure the accuracy, manually pad the input tensor.
+            hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad, self.pad)
+            filter_convert_dtype = self.filter.to(hidden_states.dtype)
+            hidden_states = self.ratio * F.conv_transpose1d(
+                hidden_states,
+                filter_convert_dtype.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(input_dtype)
+        else:
+            hidden_states_dtype = hidden_states.dtype
+            hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate").to(self.filter.dtype)
+            hidden_states = self.ratio * F.conv_transpose1d(
+                hidden_states,
+                self.filter.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(hidden_states_dtype)
         hidden_states = hidden_states[..., self.pad_left : -self.pad_right]
 
         return hidden_states
@@ -793,14 +838,29 @@ class DownSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        hidden_states_dtype = hidden_states.dtype
-        hidden_states = F.pad(hidden_states, (self.pad_left, self.pad_right), mode="replicate").to(self.filter.dtype)
-        out = F.conv1d(
-            hidden_states,
-            self.filter.expand(channels, -1, -1),
-            stride=self.stride,
-            groups=channels,
-        ).to(hidden_states_dtype)
+        if is_npu():
+            input_dtype = hidden_states.dtype
+            # F.pad in NPU doesn't support BF16 when mode is replicate.
+            # To ensure the accuracy, manually pad the input tensor.
+            hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad_left, self.pad_right)
+            filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            out = F.conv1d(
+                hidden_states,
+                filter_on_device.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(input_dtype)
+        else:
+            hidden_states_dtype = hidden_states.dtype
+            hidden_states = F.pad(hidden_states, (self.pad_left, self.pad_right), mode="replicate").to(
+                self.filter.dtype
+            )
+            out = F.conv1d(
+                hidden_states,
+                self.filter.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(hidden_states_dtype)
         return out
 
 

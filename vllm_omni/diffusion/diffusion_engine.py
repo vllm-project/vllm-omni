@@ -9,7 +9,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.registry import get_diffusion_post_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import scheduler
-from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
+from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
 logger = init_logger(__name__)
 
@@ -76,6 +76,9 @@ class DiffusionEngine:
         mp.set_start_method("spawn", force=True)
         processes = []
 
+        # Get the appropriate worker class for current device
+        worker_proc = get_diffusion_worker_class()
+
         # Launch all worker processes
         scheduler_pipe_readers = []
         scheduler_pipe_writers = []
@@ -84,7 +87,7 @@ class DiffusionEngine:
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
             process = mp.Process(
-                target=WorkerProc.worker_main,
+                target=worker_proc.worker_main,
                 args=(
                     i,  # rank
                     od_config,

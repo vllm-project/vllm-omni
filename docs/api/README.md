@@ -111,3 +111,8 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
+- [vllm_omni.worker.npu.npu_ar_model_runner.NPUARModelRunner][]
+- [vllm_omni.worker.npu.npu_ar_worker.NPUARWorker][]
+- [vllm_omni.worker.npu.npu_diffusion_model_runner.NPUDiffusionModelRunner][]
+- [vllm_omni.worker.npu.npu_diffusion_worker.NPUDiffusionWorker][]
+- [vllm_omni.worker.npu.npu_model_runner.OmniNPUModelRunner][]

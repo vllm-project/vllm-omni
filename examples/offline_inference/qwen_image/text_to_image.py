@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.platform_utils import detect_device_type
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = detect_device_type()
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
     omni = Omni(model=args.model)
