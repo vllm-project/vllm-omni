@@ -1,11 +1,15 @@
 import sys
 
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding as _OriginalMRotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import (
+    MRotaryEmbedding as _OriginalMRotaryEmbedding,
+)
+from vllm.v1.engine import EngineCoreOutput as _OriginalEngineCoreOutput
+from vllm.v1.engine import EngineCoreOutputs as _OriginalEngineCoreOutputs
 from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
 from vllm.v1.request import Request as _OriginalRequest
 
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.request import OmniRequest
