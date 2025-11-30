@@ -452,9 +452,9 @@ def _stage_worker(
         max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
         print(f"[Stage-{stage_id}] Max batch size: {max_batch_size}")
         batch_tasks: list[dict[str, Any]] = [task]
+        start_time = _time.time()
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
-                start_time = _time.time()
                 if not in_q.empty():
                     extra = in_q.get_nowait()
                     if extra is None:
