@@ -6,6 +6,8 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
 from vllm.utils import LazyLoader, cdiv
@@ -13,13 +15,11 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     split_attn_metadata,
 )
-from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_splitting import ubatch_split
 from vllm.v1.worker.ubatch_utils import UBatchSlices
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -72,8 +72,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
         if supports_mrope(self.model):
-            req_state.mrope_positions, req_state.mrope_position_delta = \
-                self.model.get_mrope_input_positions(
+            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                     req_state.prompt_token_ids,
                     hf_config=self.model_config.hf_config,
                     image_grid_thw=image_grid_thw,
@@ -83,8 +82,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     use_audio_in_video=use_audio_in_video,
                 )
         else:
-            req_state.mrope_positions, req_state.mrope_position_delta = \
-                MRotaryEmbedding.get_input_positions_tensor(
+            req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
                     req_state.prompt_token_ids,
                     hf_config=self.model_config.hf_config,
                     image_grid_thw=image_grid_thw,
