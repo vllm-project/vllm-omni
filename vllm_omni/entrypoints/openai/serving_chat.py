@@ -3,10 +3,10 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any, Callable, Optional, Union
+from typing import Any
 
 import jinja2
 from fastapi import Request
@@ -78,8 +78,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
-        raw_request: Optional[Request] = None,
-    ) -> Union[AsyncGenerator[str, None], ChatCompletionResponse, ErrorResponse]:
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         """
         Chat Completion API similar to OpenAI's API.
 
@@ -236,17 +236,17 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
     async def _preprocess_chat(
         self,
-        request: Union[ChatLikeRequest, ResponsesRequest],
+        request: ChatLikeRequest | ResponsesRequest,
         tokenizer: AnyTokenizer,
         messages: list[ChatCompletionMessageParam],
-        chat_template: Optional[str],
+        chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         add_generation_prompt: bool = True,
         continue_final_message: bool = False,
-        tool_dicts: Optional[list[dict[str, Any]]] = None,
-        documents: Optional[list[dict[str, str]]] = None,
-        chat_template_kwargs: Optional[dict[str, Any]] = None,
-        tool_parser: Optional[Callable[[AnyTokenizer], ToolParser]] = None,
+        tool_dicts: list[dict[str, Any]] | None = None,
+        documents: list[dict[str, str]] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        tool_parser: Callable[[AnyTokenizer], ToolParser] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[
         list[ConversationMessage],
@@ -279,7 +279,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         )
         _chat_template_kwargs.update(chat_template_kwargs or {})
 
-        request_prompt: Union[str, list[int]]
+        request_prompt: str | list[int]
 
         if tokenizer is None:
             request_prompt = "placeholder"
@@ -365,9 +365,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     def _log_inputs(
         self,
         request_id: str,
-        inputs: Union[RequestPrompt, PromptType],
-        params_list: Optional[list[SamplingParams]],
-        lora_request: Optional[LoRARequest],
+        inputs: RequestPrompt | PromptType,
+        params_list: list[SamplingParams] | None,
+        lora_request: LoRARequest | None,
     ) -> None:
         if self.request_logger is None:
             return
@@ -399,9 +399,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         conversation: list[ConversationMessage],
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
-    ) -> Union[ErrorResponse, ChatCompletionResponse]:
+    ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
-        final_res: Optional[RequestOutput] = None
+        final_res: RequestOutput | None = None
 
         final_outputs: list[OmniRequestOutput] = []
         try:
@@ -698,7 +698,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             choices.append(choice_data)
 
         if request.echo:
-            last_msg_content: Union[str, list[dict[str, str]]] = ""
+            last_msg_content: str | list[dict[str, str]] = ""
             if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
                 last_msg_content = conversation[-1]["content"] or ""
             if isinstance(last_msg_content, list):

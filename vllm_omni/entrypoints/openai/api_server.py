@@ -5,7 +5,7 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any, Optional
+from typing import Any
 
 import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
@@ -111,8 +111,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 async def build_async_omni_llm(
     args: Namespace,
     *,
-    disable_frontend_multiprocessing: Optional[bool] = None,
-    client_config: Optional[dict[str, Any]] = None,
+    disable_frontend_multiprocessing: bool | None = None,
+    client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Build an AsyncOmniLLM instance from command-line arguments.
 
@@ -152,7 +152,7 @@ async def build_async_omni_llm_from_stage_config(
     args: Namespace,
     *,
     disable_frontend_multiprocessing: bool = False,
-    client_config: Optional[dict[str, Any]] = None,
+    client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Create AsyncOmniLLM from stage configuration.
 
@@ -182,7 +182,7 @@ async def build_async_omni_llm_from_stage_config(
             "To disable frontend multiprocessing, set VLLM_USE_V1=0."
         )
 
-    async_omni_llm: Optional[EngineClient] = None
+    async_omni_llm: EngineClient | None = None
 
     try:
         if getattr(args, "stage_configs_path", None):
@@ -260,7 +260,7 @@ async def omni_init_app_state(
                 )
 
     if args.tool_server == "demo":
-        tool_server: Optional[ToolServer] = DemoToolServer()
+        tool_server: ToolServer | None = DemoToolServer()
         assert isinstance(tool_server, DemoToolServer)
         await tool_server.init_and_validate()
     elif args.tool_server:
@@ -317,7 +317,7 @@ async def omni_init_app_state(
     state.server_load_metrics = 0
 
 
-def Omnichat(request: Request) -> Optional[OmniOpenAIServingChat]:
+def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
     return request.app.state.openai_serving_chat
 
 
