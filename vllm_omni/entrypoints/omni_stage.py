@@ -295,6 +295,8 @@ class OmniStage:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
             source_outputs = stage_list[source_stage_id].engine_outputs
+            if not isinstance(prompt, list):
+                prompt = [prompt]
             multi_modal_data = {
                 source_output.request_id: p.get("multi_modal_data", None)
                 for source_output, p in zip(source_outputs, prompt)

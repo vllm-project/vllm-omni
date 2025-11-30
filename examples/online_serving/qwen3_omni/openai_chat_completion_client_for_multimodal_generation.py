@@ -197,7 +197,6 @@ def run_multimodal_generation(args) -> None:
 
     count = 0
     for choice in chat_completion.choices:
-        print(f"choice: {choice}")
         if choice.message.audio:
             audio_data = base64.b64decode(choice.message.audio.data)
             audio_file_path = f"audio_{count}.wav"
