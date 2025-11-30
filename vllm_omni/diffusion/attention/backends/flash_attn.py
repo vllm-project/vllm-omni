@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import torch
 from vllm.logger import init_logger
 
@@ -54,8 +57,6 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        if flash_attn_3_func is None:
-            raise ImportError("flash_attn_interface is not installed.")
         out: torch.Tensor = flash_attn_3_func(
             query,
             key,

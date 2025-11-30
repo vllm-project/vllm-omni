@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (

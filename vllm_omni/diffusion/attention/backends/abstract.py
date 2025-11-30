@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Generic, TypeVar
@@ -6,7 +9,7 @@ import torch
 
 
 class AttentionBackend(ABC):
-    """Abstract class for attention backends."""
+    """Abstract class for diffusion attention backends."""
 
     accept_output_buffer: bool = False
 
