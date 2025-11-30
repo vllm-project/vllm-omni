@@ -302,6 +302,16 @@ class OmniLLM:
                 if result is None:
                     continue
 
+                # Ensure result is a dictionary
+                if not isinstance(result, dict):
+                    logger.error(
+                        "[Orchestrator] Stage-%s returned non-dict result: type=%s, value=%s",
+                        stage_id,
+                        type(result),
+                        result,
+                    )
+                    continue
+
                 made_progress = True
                 req_id = result.get("request_id")
                 if "error" in result:
@@ -470,6 +480,15 @@ class OmniLLM:
                     continue
                 result = stage.try_collect()
                 if result is None:
+                    continue
+                # Ensure result is a dictionary
+                if not isinstance(result, dict):
+                    logger.warning(
+                        "[Orchestrator] Stage-%s returned non-dict result during init: type=%s, value=%s",
+                        stage_id,
+                        type(result),
+                        result,
+                    )
                     continue
                 progressed = True
                 if result.get("type") == "stage_ready":
