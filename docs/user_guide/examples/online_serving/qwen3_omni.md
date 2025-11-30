@@ -1,8 +1,11 @@
 # Online serving Example of vLLM-Omni for Qwen3-omni
 
+Source <https://github.com/vllm-project/vllm/tree/main/examples/online_serving/qwen3_omni>.
+
+
 ## 🛠️ Installation
 
-Please refer to [README.md](../../README.md)
+Please refer to [README.md](https://github.com/vllm-project/vllm/tree/main/examples/README.md)
 
 ## Run examples (Qwen3-Omni)
 
@@ -75,3 +78,18 @@ python gradio_demo.py \
 - `--port`: Port for Gradio server (default: 7861)
 - `--stage-configs-path`: Path to custom stage configs YAML file (optional)
 - `--share`: Share the Gradio demo publicly (creates a public link)
+
+## Example materials
+
+??? abstract "gradio_demo.py"
+    ``````py
+    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/online_serving/qwen3_omni/gradio_demo.py"
+    ``````
+??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
+    ``````py
+    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/online_serving/qwen3_omni/openai_chat_completion_client_for_multimodal_generation.py"
+    ``````
+??? abstract "run_curl_multimodal_generation.sh"
+    ``````sh
+    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/online_serving/qwen3_omni/run_curl_multimodal_generation.sh"
+    ``````

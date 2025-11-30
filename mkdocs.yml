@@ -58,6 +58,7 @@ theme:
 hooks:
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
+  - docs/mkdocs/hooks/generate_examples.py
 
 # Plugins
 plugins:

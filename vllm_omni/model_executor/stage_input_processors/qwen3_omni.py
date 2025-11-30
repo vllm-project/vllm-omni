@@ -3,7 +3,7 @@
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
-from typing import Union
+from typing import Any, Union
 
 import torch
 from vllm.inputs import TextPrompt
@@ -47,11 +47,11 @@ def _compute_talker_prompt_ids_length(info):
 
 
 def thinker2talker(
-    stage_list,
-    engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    stage_list: list[Any],
+    engine_input_source: list[int],
+    prompt: Union[OmniTokensPrompt, TextPrompt, None] = None,
     requires_multimodal_data: bool = False,
-):
+) -> list[OmniTokensPrompt]:
     """
     Process thinker outputs to create talker inputs.
 
@@ -64,6 +64,7 @@ def thinker2talker(
         stage_list: List of stage objects
         engine_input_source: Source stage IDs (typically [0] for thinker)
         prompt: Original prompt data
+        requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for talker stage
@@ -111,11 +112,11 @@ def thinker2talker(
 
 
 def talker2code2wav(
-    stage_list,
-    engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    stage_list: list[Any],
+    engine_input_source: list[int],
+    prompt: Union[OmniTokensPrompt, TextPrompt, None] = None,
     requires_multimodal_data: bool = False,
-):
+) -> list[OmniTokensPrompt]:
     """
     Process talker outputs to create code2wav inputs.
 
@@ -128,6 +129,7 @@ def talker2code2wav(
         stage_list: List of stage objects
         engine_input_source: Source stage IDs (typically [1] for talker)
         prompt: Original prompt data
+        requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for code2wav stage

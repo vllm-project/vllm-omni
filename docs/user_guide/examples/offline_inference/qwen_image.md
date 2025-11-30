@@ -1,25 +1,15 @@
-# Offline Inference Example of vLLM-Omni for Qwen-Image
+# Qwen-Image Offline Inference
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen_image>.
+Source <https://github.com/vllm-project/vllm/tree/main/examples/offline_inference/qwen_image>.
 
-
-## 🛠️ Installation
-
-Please refer to [installation](../../../getting_started/installation/README.md).
-
-## Run Offline inference with Qwen-Image
-
-First, navigate to the example folder
-```bash
-cd examples/offline_inference/qwen_image
-```
 
 This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation.
-- `gradio_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
+- `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
 
-### Command-line Usage
+
+## Local CLI Usage
 
 ```bash
 python text_to_image.py \
@@ -43,14 +33,9 @@ Key arguments:
 - `--height/--width`: output resolution (defaults 1024x1024).
 - `--output`: path to save the generated PNG.
 
-??? abstract "text_to_image.py"
-    ``````py
-    --8<-- "examples/offline_inference/qwen_image/text_to_image.py"
-    ``````
-
 > ℹ️ Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
 
-### Web UI Demo
+## Web UI Demo
 
 Launch the gradio demo:
 
@@ -60,7 +45,13 @@ python gradio_demo.py --port 7862
 
 Then open `http://localhost:7862/` on your local browser to interact with the web UI.
 
+## Example materials
+
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen_image/gradio_demo.py"
+    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/offline_inference/qwen_image/gradio_demo.py"
+    ``````
+??? abstract "text_to_image.py"
+    ``````py
+    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/offline_inference/qwen_image/text_to_image.py"
     ``````

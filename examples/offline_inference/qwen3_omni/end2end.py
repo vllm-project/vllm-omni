@@ -16,7 +16,7 @@ from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils import FlexibleArgumentParser
 
-from vllm_omni.entrypoints.omni_llm import OmniLLM
+from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
 
@@ -127,8 +127,9 @@ def main(args):
     model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     query_result = query_map[args.query_type]()
 
-    omni_llm = OmniLLM(
+    omni_llm = Omni(
         model=model_name,
+        stage_configs_path=args.stage_configs_path,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -276,6 +277,12 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="Path to a stage configs file.",
+    )
 
     return parser.parse_args()
 
@@ -283,7 +290,3 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-
-    # use examples:
-    # python end2end.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type text
-    # python end2end.py --model /custom_path/Qwen3-Omni-30B-A3B-Instruct --query-type use_video_only
