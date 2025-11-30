@@ -868,8 +868,9 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     # Use very short timeout
-    with pytest.raises(SystemExit):
-        OmniLLM(model="any", init_timeout=0.01)
+    llm = OmniLLM(model="any", init_timeout=0.01)
+    # Verify that no stages are ready
+    assert len(llm._stages_ready) == 0
 
 
 def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
