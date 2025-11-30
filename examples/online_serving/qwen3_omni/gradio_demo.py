@@ -42,19 +42,20 @@ SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
                 "seed": SEED,
             },
             "talker": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
+                "temperature": 0.9,
+                "top_k": 50,
                 "max_tokens": 4096,
-                "detokenize": True,
-                "repetition_penalty": 1.1,
+                "seed": SEED,
+                "detokenize": False,
+                "repetition_penalty": 1.05,
                 "stop_token_ids": [2150],
             },
             "code2wav": {
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "top_k": -1,
-                "max_tokens": 2048,
+                "max_tokens": 4096 * 16,
+                "seed": SEED,
                 "detokenize": True,
                 "repetition_penalty": 1.1,
             },
@@ -310,11 +311,11 @@ async def run_inference_async_omni_llm(
             )
             prompt = f"<|im_start|>system\n{default_system}<|im_end|>\n<|im_start|>user\n"
             if audio_data:
-                prompt += "<|audio_bos|><|AUDIO|><|audio_eos|>"
+                prompt += "<|audio_start|><|audio_pad|><|audio_end|>"
             if image_data:
-                prompt += "<|vision_bos|><|IMAGE|><|vision_eos|>"
+                prompt += "<|vision_start|><|image_pad|><|vision_end|>"
             if video_payload is not None:
-                prompt += "<|vision_bos|><|VIDEO|><|vision_eos|>"
+                prompt += "<|vision_start|><|video_pad|><|vision_end|>"
             if user_prompt.strip():
                 prompt += f"{user_prompt}"
             prompt += "<|im_end|>\n<|im_start|>assistant\n"
@@ -344,14 +345,15 @@ async def run_inference_async_omni_llm(
                             text_outputs.append(output.text)
             elif stage_outputs.final_output_type == "audio":
                 # multimodal_output is on the RequestOutput object
-                # See vllm_omni/entrypoints/openai/serving_chat.py:680 for reference
+                # See vllm_omni/entrypoints/openai/serving_chat.py:733 for reference
                 if hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
                     if "audio" in request_output.multimodal_output:
                         audio_tensor = request_output.multimodal_output["audio"]
                         # Ensure audio is 1D (flatten if needed)
                         if hasattr(audio_tensor, "ndim") and audio_tensor.ndim > 1:
                             audio_tensor = audio_tensor.flatten()
-                        audio_np = audio_tensor.detach().cpu().numpy()
+                        # Convert BFloat16 to Float32 before numpy conversion (numpy doesn't support BFloat16)
+                        audio_np = audio_tensor.float().detach().cpu().numpy()
                         audio_output = (
                             24000,  # sampling rate in Hz
                             audio_np,

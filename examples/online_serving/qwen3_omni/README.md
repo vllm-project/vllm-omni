@@ -23,12 +23,12 @@ cd examples/online_serving
 
 Send request via python
 ```bash
-python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities
+python openai_chat_completion_client_for_multimodal_generation.py --query-type use_video
 ```
 
 Send request via curl
 ```bash
-bash run_curl_multimodal_generation.sh mixed_modalities
+bash run_curl_multimodal_generation.sh use_audio_in_video
 ```
 
 ### FAQ
