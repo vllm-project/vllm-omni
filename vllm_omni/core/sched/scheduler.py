@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Optional
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -81,7 +80,7 @@ class OmniScheduler(VLLMScheduler):
         kv_connector_output = model_runner_output.kv_connector_output
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        spec_decoding_stats: Optional[SpecDecodingStats] = None
+        spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
