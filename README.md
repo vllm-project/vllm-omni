@@ -9,7 +9,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 </h3>
 
 <p align="center">
-| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://tinyurl.com/vllm-omni-meeting"><b>Weekly Meeting</b></a> |
+| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://tinyurl.com/vllm-omni-meeting"><b>Weekly Meeting</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
 </p>
 
 ---
@@ -30,7 +30,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 <p align="center">
   <picture>
-    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality model architecture.png" width=55%>
+    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality-model-architecture.png" width=55%>
   </picture>
 </p>
 
@@ -56,8 +56,6 @@ vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, in
 ## Getting Started
 
 Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn more.
-
-Visit our documentation to learn more.
 
 - [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)

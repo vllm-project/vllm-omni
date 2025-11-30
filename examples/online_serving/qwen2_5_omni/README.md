@@ -1,10 +1,10 @@
-# Online serving Example of vLLM-Omni for Qwen2.5-omni
+# Online serving Example of vLLM-Omni for Qwen2.5-Omni
 
 ## 🛠️ Installation
 
 Please refer to [README.md](../../README.md)
 
-## Run examples (Qwen2.5-omni)
+## Run examples (Qwen2.5-Omni)
 
 Launch the server
 ```bash

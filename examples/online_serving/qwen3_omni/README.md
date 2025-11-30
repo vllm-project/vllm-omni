@@ -69,7 +69,7 @@ python gradio_demo.py \
 ```
 
 - `--model`: Model name
-- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.
+- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmni locally.
 - `--api-base`: Base URL for vllm serve (only used when `use-api-server` is set, default: http://localhost:8091/v1)
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)

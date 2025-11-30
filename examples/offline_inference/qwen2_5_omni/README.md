@@ -1,10 +1,10 @@
-# Offline Example of vLLM-Omni for Qwen2.5-omni
+# Offline Example of vLLM-Omni for Qwen2.5-Omni
 
 ## 🛠️ Installation
 
 Please refer to [README.md](../../../README.md)
 
-## Run examples (Qwen2.5-omni)
+## Run examples (Qwen2.5-Omni)
 ### Multiple Prompts
 Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). To get the prompt, you can:
 ```bash
