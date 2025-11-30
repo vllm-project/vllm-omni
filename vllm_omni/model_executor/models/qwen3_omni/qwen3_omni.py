@@ -54,7 +54,7 @@ TTS_BOS_SINGLE_TOKEN_ID = 151674  # <tts_text_bos_single>
 TALKER_CODEC_PAD_TOKEN_ID = 4196  # Padding token
 TALKER_CODEC_BOS_TOKEN_ID = 4197  # Beginning of speech
 TALKER_CODEC_EOS_TOKEN_ID = 4198  # End of speech
-TALKER_CODEC_NOTHING_ID = 4203  # No-think mode
+TALKER_CODEC_NOTHINK_ID = 4203  # No-think mode
 TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 
@@ -758,7 +758,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         codec_special_tokens = torch.tensor(
             [
                 [
-                    talker_hf_config.codec_nothing_id,
+                    talker_hf_config.codec_nothink_id,
                     talker_hf_config.codec_think_bos_id,
                     talker_hf_config.codec_think_eos_id,
                     talker_hf_config.codec_pad_id,
@@ -771,7 +771,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
         codec_embeds = self.talker_embedding(codec_special_tokens)  # [1, 6, talker_hidden]
         (
-            self.embed_codec_nothing_token,
+            self.embed_codec_nothink_token,
             self.embed_codec_think_bos_token,
             self.embed_codec_think_eos_token,
             self.embed_codec_pad_token,
@@ -941,7 +941,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
         codec_special_tokens = torch.tensor(
             [
-                self.config.talker_config.codec_nothing_id,
+                self.config.talker_config.codec_nothink_id,
                 self.config.talker_config.codec_think_bos_id,
                 self.config.talker_config.codec_think_eos_id,
                 speaker_id,
