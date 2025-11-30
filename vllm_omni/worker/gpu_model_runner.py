@@ -92,7 +92,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 use_audio_in_video=use_audio_in_video,
             )
 
-    
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
