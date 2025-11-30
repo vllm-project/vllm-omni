@@ -55,9 +55,6 @@ Core scheduling and caching components.
 
 Model execution components.
 
-- [vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image.QwenImagePipeline][]
-- [vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image.get_qwen_image_post_process_func][]
-- [vllm_omni.diffusion.models.qwen_image.qwen_image_transformer.QwenImageTransformer2DModel][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni.OmniOutput][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni.Qwen2_5OmniForConditionalGeneration][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_talker.Qwen2_5OmniTalkerForConditionalGeneration][]
