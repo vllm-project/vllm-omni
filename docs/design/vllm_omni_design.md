@@ -14,7 +14,7 @@ vLLM-Omni is a multi-modality extension for vLLM that supports non-autoregressiv
 
 ## Key Data Flow
 
-API Server --> OmniLLM/AsyncOmniLLM (New, including multi engines) --> LLMEngine/AsyncLLM --> Engine Core
+API Server --> OmniLLM/AsyncOmni (New, including multi engines) --> LLMEngine/AsyncLLM --> Engine Core
  --> Scheduler (New one for DiT) --> Executor (New one for diffusers) --> Worker (New one for DiT)
  --> ModelRunner (New one for AR hiddenstate, New one for DiT) --> RequestState --> OutputProcessoer (New one for final multimodal output)
 
@@ -40,7 +40,7 @@ graph TD
     B --> C{Detect --omni flag}
     C -->|Yes| D[Parse OmniConfig]
     C -->|No| E[Forward to vLLM CLI]
-    D --> F[Initialize AsyncOmniLLM]
+    D --> F[Initialize AsyncOmni]
     F --> G[Start omni Server]
     G --> H[Multi-stage Processing]
     E --> I[Standard vLLM Pipeline]
@@ -209,7 +209,7 @@ Similar to OmniLLM in offline inference, add some asynchronous processing, refer
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
-class AsyncOmniLLM(AsyncLLM):
+class AsyncOmni(AsyncLLM):
     """Extended AsyncLLM supporting multiple engines and stage-based processing"""
 
     def __init__(self, stage_configs: List[StageConfig]):

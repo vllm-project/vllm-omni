@@ -342,14 +342,14 @@ def _setup_log_mocks(monkeypatch):
 def mock_get_config(monkeypatch):
     """Auto-mock get_config and related model loading functions to avoid model path validation."""
     # CRITICAL: Mock tokenizer-related imports FIRST, before any module imports
-    # This prevents ImportError when async_omni_llm is imported (which happens via omni_stage)
+    # This prevents ImportError when async_omni is imported (which happens via omni_stage)
     import sys
 
     fake_tokenizer = MagicMock()
     fake_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
     fake_tokenizer.decode = MagicMock(return_value="test")
 
-    # Mock init_tokenizer_from_configs (used in async_omni_llm)
+    # Mock init_tokenizer_from_configs (used in async_omni)
     def _mock_init_tokenizer_from_configs(model_config=None, **kwargs):
         return fake_tokenizer
 
@@ -367,8 +367,9 @@ def mock_get_config(monkeypatch):
         tokenizer_module = sys.modules[tokenizer_module_path]
         setattr(tokenizer_module, "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
 
-    # CRITICAL: Mock length_from_prompt_token_ids_or_embeds BEFORE trying to mock async_omni_llm
-    # This is because async_omni_llm imports processor.py, which imports this function at module level
+    # CRITICAL: Mock length_from_prompt_token_ids_or_embeds BEFORE trying to mock async_omni
+
+    # This is because async_omni imports processor.py, which imports this function at module level
     # Mock length_from_prompt_token_ids_or_embeds (used in processor.py)
     def _mock_length_from_prompt_token_ids_or_embeds(prompt_token_ids=None, prompt_embeds=None):
         # Return a reasonable default length
@@ -402,19 +403,19 @@ def mock_get_config(monkeypatch):
             processor_module, "length_from_prompt_token_ids_or_embeds", _mock_length_from_prompt_token_ids_or_embeds
         )
 
-    # Strategy 3: Now mock async_omni_llm AFTER length_from_prompt_token_ids_or_embeds is mocked
-    # This prevents ImportError when async_omni_llm imports processor.py
+    # Strategy 3: Now mock async_omni AFTER length_from_prompt_token_ids_or_embeds is mocked
+    # This prevents ImportError when async_omni imports processor.py
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.async_omni_llm.init_tokenizer_from_configs",
+        "vllm_omni.entrypoints.async_omni.init_tokenizer_from_configs",
         _mock_init_tokenizer_from_configs,
         raising=False,
     )
 
-    # Strategy 4: If async_omni_llm is already imported, patch it directly
-    async_omni_llm_path = "vllm_omni.entrypoints.async_omni_llm"
-    if async_omni_llm_path in sys.modules:
-        async_omni_llm_module = sys.modules[async_omni_llm_path]
-        setattr(async_omni_llm_module, "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
+    # Strategy 4: If async_omni is already imported, patch it directly
+    async_omni_path = "vllm_omni.entrypoints.async_omni"
+    if async_omni_path in sys.modules:
+        async_omni_module = sys.modules[async_omni_path]
+        setattr(async_omni_module, "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
 
     # Now mock get_config and other functions
     fake_hf_config = MagicMock()

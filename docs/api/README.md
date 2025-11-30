@@ -4,8 +4,8 @@
 
 Main entry points for vLLM-Omni inference and serving.
 
-- [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
-- [vllm_omni.entrypoints.async_omni_llm.AsyncOmniStageLLM][]
+- [vllm_omni.entrypoints.async_omni.AsyncOmni][]
+- [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
 - [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
@@ -102,10 +102,6 @@ Configuration classes.
 
 Worker classes and model runners for distributed inference.
 
-- [vllm_omni.diffusion.worker.gpu_worker.GPUWorker][]
-- [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
-- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
-- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]

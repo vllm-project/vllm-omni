@@ -48,7 +48,7 @@ This Web UI demo allows users to interact with the model through a web browser.
 
 ### Running Gradio Demo
 
-Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmniLLM by
+Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmni by
 
 ```bash
 python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861

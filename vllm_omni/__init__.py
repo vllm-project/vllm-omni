@@ -21,7 +21,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     patch = None  # type: ignore
 
 from .config import OmniModelConfig
-from .entrypoints.async_omni_llm import AsyncOmniLLM
+from .entrypoints.async_omni import AsyncOmni
 
 # Main entry points
 from .entrypoints.omni import Omni
@@ -34,7 +34,7 @@ __all__ = [
     "__version_tuple__",
     # Main components
     "Omni",
-    "AsyncOmniLLM",
+    "AsyncOmni",
     # Configuration
     "OmniModelConfig",
     # All other components are available through their respective modules
