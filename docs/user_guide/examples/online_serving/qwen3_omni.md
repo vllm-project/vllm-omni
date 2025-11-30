@@ -48,7 +48,7 @@ This Web UI demo allows users to interact with the model through a web browser.
 
 ### Running Gradio Demo
 
-Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmniLLM by
+Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmni by
 
 ```bash
 python gradio_demo.py  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 7861
@@ -72,7 +72,7 @@ python gradio_demo.py \
 ```
 
 - `--model`: Model name
-- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.
+- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmni locally.
 - `--api-base`: Base URL for vllm serve (only used when `use-api-server` is set, default: http://localhost:8091/v1)
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)

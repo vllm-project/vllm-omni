@@ -237,7 +237,7 @@ def process_video_file(
 
 
 async def run_inference_async_omni(
-    omni_llm: AsyncOmni,
+    omni: AsyncOmni,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     user_prompt: str,
@@ -328,7 +328,7 @@ async def run_inference_async_omni(
         text_outputs: list[str] = []
         audio_output = None
 
-        async for stage_outputs in omni_llm.generate(
+        async for stage_outputs in omni.generate(
             prompt=omni_prompt,
             request_id=request_id,
             sampling_params_list=sampling_params,
@@ -362,7 +362,7 @@ async def run_inference_async_omni(
 
 
 def build_interface(
-    omni_llm: AsyncOmni,
+    omni: AsyncOmni,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     model: str,
@@ -377,7 +377,7 @@ def build_interface(
         use_audio_in_video: bool,
     ):
         return await run_inference_async_omni(
-            omni_llm,
+            omni,
             sampling_params,
             prompt_args_template,
             user_prompt,
@@ -475,7 +475,7 @@ def build_interface(
 
 def main():
     args = parse_args()
-    omni_llm = None
+    omni = None
 
     model_name = "/".join(args.model.split("/")[-2:])
     assert model_name in SUPPORTED_MODELS, (
@@ -485,9 +485,9 @@ def main():
     # Register signal handlers for graceful shutdown
     def signal_handler(sig, frame):
         print("\nReceived interrupt signal, shutting down...")
-        if omni_llm is not None:
+        if omni is not None:
             try:
-                omni_llm.shutdown()
+                omni.shutdown()
             except Exception as e:
                 print(f"Error during shutdown: {e}")
         sys.exit(0)
@@ -500,7 +500,7 @@ def main():
         print(f"Using custom stage configs: {args.stage_configs_path}")
 
     sampling_params = build_sampling_params(SEED, model_name)
-    omni_llm = AsyncOmni(
+    omni = AsyncOmni(
         model=args.model,
         stage_configs_path=args.stage_configs_path,
         init_timeout=ASYNC_INIT_TIMEOUT,
@@ -509,7 +509,7 @@ def main():
     prompt_args_template = create_prompt_args(args)
 
     demo = build_interface(
-        omni_llm,
+        omni,
         sampling_params,
         prompt_args_template,
         args.model,
@@ -524,9 +524,9 @@ def main():
         print("\nShutting down...")
     finally:
         # Cleanup
-        if omni_llm is not None:
+        if omni is not None:
             try:
-                omni_llm.shutdown()
+                omni.shutdown()
             except Exception as e:
                 print(f"Error during cleanup: {e}")
 
