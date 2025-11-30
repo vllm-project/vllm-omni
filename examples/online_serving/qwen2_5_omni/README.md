@@ -2,7 +2,7 @@
 
 ## 🛠️ Installation
 
-Please refer to [README.md](../../README.md)
+Please refer to [README.md](../../../README.md)
 
 ## Run examples (Qwen2.5-Omni)
 
@@ -18,7 +18,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to
 
 Get into the example folder
 ```bash
-cd examples/online_serving
+cd examples/online_serving/qwen2_5_omni
 ```
 
 Send request via python
