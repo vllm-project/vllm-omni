@@ -5,6 +5,7 @@ import gradio as gr
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.platform_utils import detect_device_type
 
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
     "1:1": (1328, 1328),
@@ -62,7 +63,7 @@ def get_omni(model_name: str) -> Omni:
 
 
 def build_demo(args: argparse.Namespace) -> gr.Blocks:
-    device = "cuda"
+    device = detect_device_type()
     omni = get_omni(args.model)
 
     def run_inference(

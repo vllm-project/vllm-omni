@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Default query type
-QUERY_TYPE="${1:-mixed_modalities}"
+QUERY_TYPE="${1:-use_audio_in_video}"
 
 # Validate query type
 if [[ ! "$QUERY_TYPE" =~ ^(mixed_modalities|use_audio_in_video|multi_audios|text)$ ]]; then

@@ -35,6 +35,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
+from vllm_omni.utils.platform_utils import is_npu
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -201,6 +202,7 @@ class Qwen2_5OmniForConditionalGeneration(
         """
         if self.model_stage == "thinker":
             # Normalize to batched inputs if caller provides 1D/2D unbatched tensors
+            # TODO: Remove this hack when NPU supports batched inputs properly
             added_batch_dim = False
             if input_ids is not None and input_ids.ndim == 1:
                 input_ids = input_ids.unsqueeze(0)
@@ -228,12 +230,25 @@ class Qwen2_5OmniForConditionalGeneration(
                 positions = positions.to(thinker_dev)
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
+
+            if is_npu():
+                # TODO: remove this hack when NPU supports batched inputs properly
+                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                thinker_positions = positions[0] if positions.ndim > 1 else positions
+                thinker_inputs_embeds = (
+                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                )
+            else:
+                thinker_input_ids = input_ids
+                thinker_positions = positions[0]
+                thinker_inputs_embeds = inputs_embeds
+
             # Run thinker
             thinker_output = self.thinker(
-                input_ids=input_ids,
-                positions=positions[0],
+                input_ids=thinker_input_ids,
+                positions=thinker_positions,
                 intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
+                inputs_embeds=thinker_inputs_embeds,
                 **kwargs,
             )
 
@@ -851,7 +866,7 @@ class Qwen2_5OmniForConditionalGeneration(
         __init__."""
         if self.token2wav is None or self.token2wav_config is None:
             return
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = self._module_device(self.token2wav)
         # optional speaker resources
         conds = getattr(self.token2wav_config, "conds", None)
         ref_mels = getattr(self.token2wav_config, "ref_mels", None)

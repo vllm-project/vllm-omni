@@ -58,6 +58,7 @@ theme:
 hooks:
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
+  - docs/mkdocs/hooks/generate_examples.py
 
 # Plugins
 plugins:
@@ -87,6 +88,7 @@ plugins:
       show_full_namespace: false  # Show only module name, not full path
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
+        - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building
   - mkdocstrings:
       handlers:
         python:

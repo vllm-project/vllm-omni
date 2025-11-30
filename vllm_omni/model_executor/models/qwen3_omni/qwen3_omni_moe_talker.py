@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -284,7 +285,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
         return result_codes, summed_embeddings
 
-    def init_multi_modal(self, thinker_config):
+    def init_multi_modal(self, thinker_config: Any) -> None:
         """
         Initialize multimodal components from the thinker.
 

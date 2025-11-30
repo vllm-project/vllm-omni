@@ -32,7 +32,7 @@ from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     maybe_dump_to_shm,
     maybe_load_from_ipc_with_metrics,
-    set_stage_gpu_devices,
+    set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -425,7 +425,10 @@ def _stage_worker(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
+        from vllm_omni.utils import detect_device_type
+
+        device_type = detect_device_type()
+        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
@@ -452,9 +455,9 @@ def _stage_worker(
         max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
         print(f"[Stage-{stage_id}] Max batch size: {max_batch_size}")
         batch_tasks: list[dict[str, Any]] = [task]
+        start_time = _time.time()
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
-                start_time = _time.time()
                 if not in_q.empty():
                     extra = in_q.get_nowait()
                     if extra is None:
@@ -717,7 +720,10 @@ async def _stage_worker_async(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
+        from vllm_omni.utils import detect_device_type
+
+        device_type = detect_device_type()
+        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
