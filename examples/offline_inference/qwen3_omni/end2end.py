@@ -124,7 +124,7 @@ query_map = {
 
 
 def main(args):
-    model_name = "/mnt/gh/yrr_vllm/Qwen3-Omni-30B-A3B-Instruct-Full"
+    model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     query_result = query_map[args.query_type]()
 
     omni_llm = OmniLLM(

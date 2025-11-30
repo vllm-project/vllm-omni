@@ -452,9 +452,9 @@ def _stage_worker(
         max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
         print(f"[Stage-{stage_id}] Max batch size: {max_batch_size}")
         batch_tasks: list[dict[str, Any]] = [task]
+        start_time = _time.time()
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
-                start_time = _time.time()
                 if not in_q.empty():
                     extra = in_q.get_nowait()
                     if extra is None:
@@ -514,137 +514,137 @@ def _stage_worker(
             flush=True,
         )
         print("--------------------------------", flush=True)
+        # try:
+        _batch_seq += 1
+        gen_outputs: list[Any] = []
+        _gen_t0 = _time.time()
+        for ro in stage_engine.generate(batch_engine_inputs, sampling_params, use_tqdm=False):
+            gen_outputs.append(ro)
+        _gen_t1 = _time.time()
+        _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
         try:
-            _batch_seq += 1
-            gen_outputs: list[Any] = []
-            _gen_t0 = _time.time()
-            for ro in stage_engine.generate(batch_engine_inputs, sampling_params, use_tqdm=False):
-                gen_outputs.append(ro)
-            _gen_t1 = _time.time()
-            _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+            print(
+                f"[Stage-{stage_id}] Generate done: batch={len(batch_tasks)}, "
+                f"req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+        # Group outputs per request id with fallback
+        req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
+        unmapped: list[Any] = []
+        for ro in gen_outputs:
+            rid = getattr(ro, "request_id", None)
+            if rid in req_to_outputs:
+                req_to_outputs[rid].append(ro)
+            else:
+                unmapped.append(ro)
+        if unmapped:
+            idx = 0
+            for ro in unmapped:
+                target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                req_to_outputs[target_rid].append(ro)
+                idx += 1
+
+        # Per-request stats logging and aggregates
+        for rid in batch_request_ids:
+            _r_outputs = req_to_outputs.get(rid, [])
+            _num_tokens = count_tokens_from_outputs(_r_outputs)
+            _agg_total_tokens += _num_tokens
+            _agg_total_gen_time_ms += _gen_ms
+
+        if _stats_file:
+            _avg_tokens_per_s = (
+                (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+            )
+            log_stage_running_avg(
+                _stats_file,
+                stage_id,
+                int(_agg_total_tokens),
+                float(_agg_total_gen_time_ms),
+                float(_avg_tokens_per_s),
+            )
+            log_stage_batch_stats(
+                _stats_file,
+                stage_id,
+                len(batch_tasks),
+                float(_gen_ms),
+                list(batch_request_ids),
+            )
+
+        # Emit per-request results
+        for rid in batch_request_ids:
+            r_outputs = req_to_outputs.get(rid, [])
             try:
-                print(
-                    f"[Stage-{stage_id}] Generate done: batch={len(batch_tasks)}, "
-                    f"req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}",
-                    flush=True,
-                )
-            except Exception:
-                pass
-
-            # Group outputs per request id with fallback
-            req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
-            unmapped: list[Any] = []
-            for ro in gen_outputs:
-                rid = getattr(ro, "request_id", None)
-                if rid in req_to_outputs:
-                    req_to_outputs[rid].append(ro)
-                else:
-                    unmapped.append(ro)
-            if unmapped:
-                idx = 0
-                for ro in unmapped:
-                    target_rid = batch_request_ids[idx % len(batch_request_ids)]
-                    req_to_outputs[target_rid].append(ro)
-                    idx += 1
-
-            # Per-request stats logging and aggregates
-            for rid in batch_request_ids:
-                _r_outputs = req_to_outputs.get(rid, [])
-                _num_tokens = count_tokens_from_outputs(_r_outputs)
-                _agg_total_tokens += _num_tokens
-                _agg_total_gen_time_ms += _gen_ms
-
-            if _stats_file:
-                _avg_tokens_per_s = (
-                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
-                )
-                log_stage_running_avg(
-                    _stats_file,
-                    stage_id,
-                    int(_agg_total_tokens),
-                    float(_agg_total_gen_time_ms),
-                    float(_avg_tokens_per_s),
-                )
-                log_stage_batch_stats(
-                    _stats_file,
-                    stage_id,
-                    len(batch_tasks),
-                    float(_gen_ms),
-                    list(batch_request_ids),
-                )
-
-            # Emit per-request results
-            for rid in batch_request_ids:
-                r_outputs = req_to_outputs.get(rid, [])
-                try:
-                    use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
-                    _metrics = {
-                        "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                        "stage_gen_time_ms": _gen_ms,
-                        "batch_id": int(_batch_seq),
-                        "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                        "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                        "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                    }
-                    if _stats_file:
-                        compute_and_log_stage_request_stats(
-                            _stats_file,
-                            stage_id,
-                            rid,
-                            len(batch_tasks),
-                            r_outputs,
-                            float(_gen_ms),
-                            int(_metrics["rx_transfer_bytes"]),  # type: ignore[index]
-                            float(_metrics["rx_decode_time_ms"]),  # type: ignore[index]
-                        )
-                    if use_shm:
-                        out_q.put(
-                            {
-                                "request_id": rid,
-                                "stage_id": stage_id,
-                                "engine_outputs_shm": payload,
-                                "metrics": _metrics,
-                            }
-                        )
-                    else:
-                        out_q.put(
-                            {
-                                "request_id": rid,
-                                "stage_id": stage_id,
-                                "engine_outputs": payload,
-                                "metrics": _metrics,
-                            }
-                        )
-                except Exception:
+                use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
+                _metrics = {
+                    "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
+                    "stage_gen_time_ms": _gen_ms,
+                    "batch_id": int(_batch_seq),
+                    "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                    "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
+                    "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                }
+                if _stats_file:
+                    compute_and_log_stage_request_stats(
+                        _stats_file,
+                        stage_id,
+                        rid,
+                        len(batch_tasks),
+                        r_outputs,
+                        float(_gen_ms),
+                        int(_metrics["rx_transfer_bytes"]),  # type: ignore[index]
+                        float(_metrics["rx_decode_time_ms"]),  # type: ignore[index]
+                    )
+                if use_shm:
                     out_q.put(
                         {
                             "request_id": rid,
                             "stage_id": stage_id,
-                            "engine_outputs": r_outputs,
-                            "metrics": {
-                                "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                                "stage_gen_time_ms": _gen_ms,
-                                "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                                "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                                "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                            },
+                            "engine_outputs_shm": payload,
+                            "metrics": _metrics,
                         }
                     )
-                _logging.getLogger(__name__).debug(
-                    "[Stage-%s] Enqueued result for request %s to downstream",
-                    stage_id,
-                    rid,
-                )
-        except Exception as e:
-            _logging.getLogger(__name__).exception("[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e)
-            for rid in batch_request_ids:
+                else:
+                    out_q.put(
+                        {
+                            "request_id": rid,
+                            "stage_id": stage_id,
+                            "engine_outputs": payload,
+                            "metrics": _metrics,
+                        }
+                    )
+            except Exception:
                 out_q.put(
                     {
                         "request_id": rid,
                         "stage_id": stage_id,
-                        "error": str(e),
+                        "engine_outputs": r_outputs,
+                        "metrics": {
+                            "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
+                            "stage_gen_time_ms": _gen_ms,
+                            "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                            "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
+                            "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                        },
                     }
                 )
+            _logging.getLogger(__name__).debug(
+                "[Stage-%s] Enqueued result for request %s to downstream",
+                stage_id,
+                rid,
+            )
+        # except Exception as e:
+        #     _logging.getLogger(__name__).exception("[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e)
+        #     for rid in batch_request_ids:
+        #         out_q.put(
+        #             {
+        #                 "request_id": rid,
+        #                 "stage_id": stage_id,
+        #                 "error": str(e),
+        #             }
+        #         )
 
 
 def _stage_worker_async_entry(
