@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # Default query type
-QUERY_TYPE="${1:-use_audio_in_video}"
+QUERY_TYPE="${1:-use_video}"
 
 # Validate query type
-if [[ ! "$QUERY_TYPE" =~ ^(mixed_modalities|use_audio_in_video|multi_audios|text)$ ]]; then
+if [[ ! "$QUERY_TYPE" =~ ^(text|use_audio|use_image|use_video)$ ]]; then
     echo "Error: Invalid query type '$QUERY_TYPE'"
-    echo "Usage: $0 [mixed_modalities|use_audio_in_video|multi_audios|text]"
-    echo "  mixed_modalities: Audio + Image + Video + Text query"
-    echo "  use_audio_in_video: Video + Text query (with audio extraction from video)"
-    echo "  multi_audios: Two audio clips + Text query"
+    echo "Usage: $0 [text|use_audio|use_image|use_video]"
     echo "  text: Text query"
+    echo "  use_audio: Audio + Text query"
+    echo "  use_image: Image + Text query"
+    echo "  use_video: Video + Text query"
     exit 1
 fi
 
@@ -23,7 +23,6 @@ thinker_sampling_params='{
   "top_k": 1,
   "max_tokens": 16384,
   "seed": 42,
-  "detokenize": true,
   "repetition_penalty": 1.05,
   "stop_token_ids": [151645]
 }'
@@ -33,7 +32,7 @@ talker_sampling_params='{
   "top_k": 50,
   "max_tokens": 4096,
   "seed": 42,
-  "detokenize": true,
+  "detokenize": false,
   "repetition_penalty": 1.05,
   "stop_token_ids": [2150]
 }'
@@ -51,7 +50,6 @@ code2wav_sampling_params='{
 
 # Define URLs for assets
 MARY_HAD_LAMB_AUDIO_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
-WINNING_CALL_AUDIO_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/winning_call.ogg"
 CHERRY_BLOSSOM_IMAGE_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
 SAMPLE_VIDEO_URL="https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
 
@@ -71,7 +69,7 @@ case "$QUERY_TYPE" in
     ]'
     mm_processor_kwargs="{}"
     ;;
-  mixed_modalities)
+  use_audio)
     user_content='[
         {
           "type": "audio_url",
@@ -80,20 +78,8 @@ case "$QUERY_TYPE" in
           }
         },
         {
-          "type": "image_url",
-          "image_url": {
-            "url": "'"$CHERRY_BLOSSOM_IMAGE_URL"'"
-          }
-        },
-        {
-          "type": "video_url",
-          "video_url": {
-            "url": "'"$SAMPLE_VIDEO_URL"'"
-          }
-        },
-        {
           "type": "text",
-          "text": "What is recited in the audio? What is the content of this image? Why is this video funny?"
+          "text": "What is the content of this audio?"
         }
       ]'
     sampling_params_list='[
@@ -103,7 +89,27 @@ case "$QUERY_TYPE" in
     ]'
     mm_processor_kwargs="{}"
     ;;
-  use_audio_in_video)
+  use_image)
+    user_content='[
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "'"$CHERRY_BLOSSOM_IMAGE_URL"'"
+          }
+        },
+        {
+          "type": "text",
+          "text": "What is the content of this image?"
+        }
+      ]'
+    sampling_params_list='[
+      '"$thinker_sampling_params"',
+      '"$talker_sampling_params"',
+      '"$code2wav_sampling_params"'
+    ]'
+    mm_processor_kwargs="{}"
+    ;;
+  use_video)
     user_content='[
         {
           "type": "video_url",
@@ -113,35 +119,7 @@ case "$QUERY_TYPE" in
         },
         {
           "type": "text",
-          "text": "Describe the content of the video, then convert what the baby say into text."
-        }
-      ]'
-    sampling_params_list='[
-      '"$thinker_sampling_params"',
-      '"$talker_sampling_params"',
-      '"$code2wav_sampling_params"'
-    ]'
-    mm_processor_kwargs='{
-      "use_audio_in_video": true
-    }'
-    ;;
-  multi_audios)
-    user_content='[
-        {
-          "type": "audio_url",
-          "audio_url": {
-            "url": "'"$MARY_HAD_LAMB_AUDIO_URL"'"
-          }
-        },
-        {
-          "type": "audio_url",
-          "audio_url": {
-            "url": "'"$WINNING_CALL_AUDIO_URL"'"
-          }
-        },
-        {
-          "type": "text",
-          "text": "Are these two audio clips the same?"
+          "text": "Why is this video funny?"
         }
       ]'
     sampling_params_list='[
@@ -161,7 +139,7 @@ output=$(curl -sS -X POST http://localhost:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d @- <<EOF
 {
-  "model": "Qwen/Qwen2.5-Omni-7B",
+  "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
   "sampling_params_list": $sampling_params_list,
   "mm_processor_kwargs": $mm_processor_kwargs,
   "messages": [
