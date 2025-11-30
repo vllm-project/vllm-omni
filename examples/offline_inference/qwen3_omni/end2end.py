@@ -285,5 +285,5 @@ if __name__ == "__main__":
     main(args)
 
     # use examples:
-    # python end2end.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct-Full --query-type text
-    # python end2end.py --model /mnt/gh/yrr_vllm/Qwen3-Omni-30B-A3B-Instruct-Full --query-type use_video_only
+    # python end2end.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --query-type text
+    # python end2end.py --model /custom_path/Qwen3-Omni-30B-A3B-Instruct --query-type use_video_only
