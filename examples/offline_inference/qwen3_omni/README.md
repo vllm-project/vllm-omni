@@ -1,4 +1,4 @@
-# Offline Example of vLLM-Omni for Qwen2.5-omni
+# Offline Example of vLLM-Omni for Qwen3-omni
 
 ## 🛠️ Installation
 
@@ -15,7 +15,7 @@ Then run the command below.
 ```bash
 bash run_multiple_prompts.sh
 ```
-### Single Prompts
+### Single Prompt
 Get into the example folder
 ```bash
 cd examples/offline_inference/qwen3_omni
@@ -23,6 +23,10 @@ cd examples/offline_inference/qwen3_omni
 Then run the command below.
 ```bash
 bash run_single_prompt.sh
+```
+If you have not enough memory, you can set thinker with tensor parallel. Just run the command below.
+```bash
+bash run_single_prompt_tp.sh
 ```
 
 ### FAQ

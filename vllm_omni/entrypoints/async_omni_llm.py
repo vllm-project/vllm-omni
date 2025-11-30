@@ -94,7 +94,7 @@ class AsyncOmniLLM(EngineClient):
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 60000,
-        **kwargs,
+        **kwargs: Any,
     ):
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)

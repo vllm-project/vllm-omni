@@ -1,44 +1,46 @@
 nav:
-  - Home: README.md
-  - User Guide:
-    - Getting Started:
-      - getting_started/quickstart.md
-      - getting_started/installation
-    - Examples:
-      - examples/README.md
-      - Offline Inference:
-        - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
-        - Qwen2.5-Image: user_guide/examples/offline_inference/qwen_image.md
-      - Online Serving:
-        - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
-    - General:
-      - usage/*
-    - Configuration:
-      - configuration/README.md
-      - configuration/*
-    - Models:
-      - models/supported_models.md
-  - Developer Guide:
-    - General:
-      - contributing/README.md
-      - glob: contributing/*
-        flatten_single_child_sections: true
-    - Model Implementation:
-      - contributing/model/README.md
-    - CI: contributing/ci
-    - Design Documents:
-      - design/index.md
-      - design/architecture_overview.md
-      - design/vllm_omni_design.md
-      - design/mrs_design.md
-      - design/api_design_doc.md
-    - Docs Guide: contributing/DOCS_GUIDE.md
-  - API Reference:
-    - api/README.md
-    - api/vllm_omni
-  - CLI Reference: cli
-  - Community:
-    - community/*
-    - Slack: https://slack.vllm.ai
-    - Blog: https://blog.vllm.ai
-    - Forum: https://discuss.vllm.ai
+- Home: README.md
+- User Guide:
+  - Getting Started:
+    - getting_started/quickstart.md
+    - getting_started/installation
+  - Examples:
+    - examples/README.md
+    - Offline Inference:
+      - Offline Example of vLLM-Omni for Qwen2.5-omni: user_guide/examples/offline_inference/qwen2_5_omni.md
+      - Offline Example of vLLM-Omni for Qwen3-omni: user_guide/examples/offline_inference/qwen3_omni.md
+      - Qwen-Image Offline Inference: user_guide/examples/offline_inference/qwen_image.md
+    - Online Serving:
+      - Online serving Example of vLLM-Omni for Qwen2.5-omni: user_guide/examples/online_serving/qwen2_5_omni.md
+      - Online serving Example of vLLM-Omni for Qwen3-omni: user_guide/examples/online_serving/qwen3_omni.md
+  - General:
+    - usage/*
+  - Configuration:
+    - configuration/README.md
+    - configuration/*
+  - Models:
+    - models/supported_models.md
+- Developer Guide:
+  - General:
+    - contributing/README.md
+    - glob: contributing/*
+      flatten_single_child_sections: true
+  - Model Implementation:
+    - contributing/model/README.md
+  - CI: contributing/ci
+  - Design Documents:
+    - design/index.md
+    - design/architecture_overview.md
+    - design/vllm_omni_design.md
+    - design/mrs_design.md
+    - design/api_design_doc.md
+  - Docs Guide: contributing/DOCS_GUIDE.md
+- API Reference:
+  - api/README.md
+  - api/vllm_omni
+- CLI Reference: cli
+- Community:
+  - community/*
+  - Slack: https://slack.vllm.ai
+  - Blog: https://blog.vllm.ai
+  - Forum: https://discuss.vllm.ai

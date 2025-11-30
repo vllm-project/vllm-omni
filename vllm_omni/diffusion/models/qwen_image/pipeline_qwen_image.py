@@ -392,8 +392,6 @@ class QwenImagePipeline(
         Args:
             prompt (`str` or `list[str]`, *optional*):
                 prompt to be encoded
-            device: (`torch.device`):
-                torch device
             num_images_per_prompt (`int`):
                 number of images that should be generated per prompt
             prompt_embeds (`torch.Tensor`, *optional*):

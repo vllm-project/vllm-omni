@@ -113,10 +113,12 @@ class QwenEmbedRope(nn.Module):
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
 
-    def rope_params(self, index, dim, theta=10000):
+    def rope_params(self, index: torch.Tensor, dim: int, theta: int = 10000):
         """
         Args:
-            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
+            index (`torch.Tensor`): [0, 1, 2, 3] 1D Tensor representing the position index of the token
+            dim (`int`): Dimension for the rope parameters
+            theta (`int`): Theta parameter for rope
         """
         assert dim % 2 == 0
         freqs = torch.outer(

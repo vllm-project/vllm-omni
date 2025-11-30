@@ -23,7 +23,7 @@ Then run the command below.
 ```bash
 bash run_multiple_prompts.sh
 ```
-### Single Prompts
+### Single Prompt
 Get into the example folder
 ```bash
 cd examples/offline_inference/qwen2_5_omni

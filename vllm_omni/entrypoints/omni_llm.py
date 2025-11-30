@@ -534,8 +534,9 @@ class OmniStageLLM(LLM):
         self,
         model: str,
         compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
+        hf_overrides: Optional[dict[str, Any]] = None,
         structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
-        **kwargs,
+        **kwargs: Any,
     ):
         """LLM constructor."""
         if "disable_log_stats" not in kwargs:

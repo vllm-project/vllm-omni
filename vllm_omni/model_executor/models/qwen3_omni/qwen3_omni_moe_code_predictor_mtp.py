@@ -6,6 +6,7 @@ The code predictor generates residual RVQ (Residual Vector Quantization) codes
 autoregressively, predicting layers 1 to N based on layer-0 codes from the talker.
 """
 
+from collections import namedtuple
 from typing import Any, Optional
 
 import torch
@@ -164,21 +165,48 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
 
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
-        attn_output, _ = attention_interface(
-            self,
-            q_heads,
-            k_heads,
-            v_heads,
-            None,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.head_dim**-0.5,
-            sliding_window=None,
-            use_cache=use_cache,
-            position_ids=position_ids,
-            output_hidden_states=True,
-            output_attentions=False,
-        )
+        # Try attention backends in order of preference, with runtime error handling
+        # This handles cases where the backend is registered but not actually available
+        attention_backends = ["flash_attention_2", "xformers", "eager", "sdpa"]
+        attn_output = None
+        last_error = None
+
+        for backend_name in attention_backends:
+            if backend_name not in ALL_ATTENTION_FUNCTIONS:
+                continue
+
+            try:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[backend_name]
+                attn_output, _ = attention_interface(
+                    self,
+                    q_heads,
+                    k_heads,
+                    v_heads,
+                    None,
+                    dropout=0.0 if not self.training else getattr(self, "attention_dropout", 0.0),
+                    scaling=self.head_dim**-0.5,
+                    sliding_window=None,
+                    use_cache=use_cache,
+                    position_ids=position_ids,
+                    output_hidden_states=True,
+                    output_attentions=False,
+                )
+                # Success - log fallback if not using flash_attention_2
+                if backend_name != "flash_attention_2":
+                    logger.warning_once(
+                        f"Using {backend_name} attention backend (flash_attention_2 not available or failed)"
+                    )
+                break
+            except (ValueError, ImportError, RuntimeError, AttributeError) as e:
+                # Store error and try next backend
+                last_error = e
+                continue
+
+        if attn_output is None:
+            raise RuntimeError(
+                f"All attention backends failed. Last error: {last_error}. "
+                "Please install flash-attn, or ensure PyTorch's scaled_dot_product_attention is available."
+            )
         attn_output = attn_output.reshape(*(hidden_states.shape[:-1]), -1).contiguous()
 
         attn_output = self.o_proj(attn_output)
@@ -373,16 +401,22 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
         past_key_values: Optional[Any] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> Any:
         """
         Forward pass matching HF structure.
 
         Args:
             inputs_embeds: [batch, seq_len, hidden_size]
+            attention_mask: Optional attention mask tensor
+            position_ids: Optional position IDs tensor
+            past_key_values: Optional cached key-value pairs
+            use_cache: Whether to use cache
+            cache_position: Optional cache position tensor
+            **kwargs: Additional keyword arguments
 
         Returns:
-            Object with .last_hidden_state attribute
+            Named tuple with .last_hidden_state and .past_key_values attributes
         """
         batch_size, seq_len, _ = inputs_embeds.shape
 
@@ -421,8 +455,6 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         # Return in HF-compatible format
-        from collections import namedtuple
-
         Output = namedtuple("Output", ["last_hidden_state", "past_key_values"])
         return Output(last_hidden_state=hidden_states, past_key_values=None)  # [batch, num_code_groups-1, hidden_size]
 
