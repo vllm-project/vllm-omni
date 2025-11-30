@@ -5,4 +5,3 @@
 from vllm_omni.diffusion.worker.gpu_worker import GPUWorker, WorkerProc
 
 __all__ = ["GPUWorker", "WorkerProc"]
-

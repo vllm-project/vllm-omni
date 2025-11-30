@@ -64,4 +64,3 @@ Then open `http://localhost:7862/` on your local browser to interact with the we
     ``````py
     --8<-- "examples/offline_inference/qwen_image/gradio_demo.py"
     ``````
-
