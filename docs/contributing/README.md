@@ -2,6 +2,9 @@
 
 Thank you for your interest in contributing to vLLM-Omni! This document provides guidelines and instructions for contributing.
 
+!!! note
+    We host weekly developer-facing online meetings to discuss milestones and updates **every Tuesday at 19:30 PDT**. Meeting link as well as the past meeting notes can be found [here](https://tinyurl.com/vllm-omni-meeting).
+
 ## Getting Started
 
 vLLM-Omni uses `uv` as the environment manager, to create and manage Python environments. Please follow the documentation to install `uv`. After installing `uv`, you can create a new Python environment using the following commands:

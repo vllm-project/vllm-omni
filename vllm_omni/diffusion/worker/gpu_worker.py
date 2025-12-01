@@ -129,7 +129,7 @@ class WorkerProc:
         """
         Receive requests from broadcast queue
         """
-        return self.mq.dequeue()
+        return self.mq.dequeue(indefinite=True)
 
     # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
