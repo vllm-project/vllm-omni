@@ -698,6 +698,34 @@ class OmniGPUModelRunner(GPUModelRunner):
             encoder_inputs = self._extract_encoder_inputs(scheduler_output)
             model_kwargs.update(encoder_inputs)
 
+        if self.model.has_preprocess:
+            # Overlay custom prompt_embeds per request for the prompt portion;
+            # collect additional_information (tensor/list) for prefill portion only
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_state = self.requests.get(req_id)
+                req_infos = (getattr(req_state, "additional_information_cpu", None)
+                             if req_state is not None else None)
+
+                start_offset = int(self.query_start_loc.cpu[req_index])
+                sched_tokens = int(num_scheduled_tokens_np[req_index])
+                s, e = start_offset, start_offset + sched_tokens
+                span_len = int(e) - int(s)
+
+                # call the custom process function
+                req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                    input_ids=input_ids[s:e],
+                    inputs_embeds=inputs_embeds[s:e],
+                    **req_infos
+                )
+                # TODO(Peiqi): the merge stage could move out from the critical path
+                self._merge_additional_information_update(req_id, update_dict)
+
+                # update the inputs_embeds and input_ids
+                seg_len = min(span_len, req_embeds.shape[0])
+                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                    input_ids[s : s + seg_len] = req_input_ids
+
         return (
             num_scheduled_tokens,
             num_input_tokens,
