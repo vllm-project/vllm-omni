@@ -102,6 +102,10 @@ Configuration classes.
 
 Worker classes and model runners for distributed inference.
 
+- [vllm_omni.diffusion.worker.gpu_worker.GPUWorker][]
+- [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
+- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
+- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]
