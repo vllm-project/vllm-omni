@@ -34,9 +34,6 @@ Send request via curl
 bash run_curl_multimodal_generation.sh mixed_modalities
 ```
 
-> ℹ️ Same as vLLM, set the environment variable `VLLM_USE_MODELSCOPE` to `True` to use modelscope.
-
-
 ### FAQ
 
 If you encounter error about backend of librosa, try to install ffmpeg with command below.

@@ -23,9 +23,6 @@ python text_to_image.py \
   --output outputs/coffee.png
 ```
 
-> ℹ️ Same as vLLM, set the environment variable `VLLM_USE_MODELSCOPE` to `True` to use modelscope.
-
-
 Key arguments:
 
 - `--prompt`: text description (string).
