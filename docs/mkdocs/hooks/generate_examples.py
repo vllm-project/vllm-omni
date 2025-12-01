@@ -192,7 +192,8 @@ class Example:
         code_fence = "``````"
 
         if self.is_code:
-            content += f'{code_fence}{self.main_file.suffix[1:]}\n--8<-- "{self.main_file}"\n{code_fence}\n'
+            main_file_rel = self.main_file.relative_to(ROOT_DIR)
+            content += f'{code_fence}{self.main_file.suffix[1:]}\n--8<-- "{main_file_rel}"\n{code_fence}\n'
         else:
             with open(self.main_file) as f:
                 # Skip the title from md snippets as it's been included above
@@ -208,7 +209,7 @@ class Example:
             content += f'??? abstract "{file.relative_to(self.path)}"\n'
             if file.suffix != ".md":
                 content += f"    {code_fence}{file.suffix[1:]}\n"
-            content += f'    --8<-- "{file}"\n'
+            content += f'    --8<-- "{file.relative_to(ROOT_DIR)}"\n'
             if file.suffix != ".md":
                 content += f"    {code_fence}\n"
 

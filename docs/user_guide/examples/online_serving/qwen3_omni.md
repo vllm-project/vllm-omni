@@ -83,13 +83,13 @@ python gradio_demo.py \
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/online_serving/qwen3_omni/gradio_demo.py"
+    --8<-- "examples/online_serving/qwen3_omni/gradio_demo.py"
     ``````
 ??? abstract "openai_chat_completion_client_for_multimodal_generation.py"
     ``````py
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/online_serving/qwen3_omni/openai_chat_completion_client_for_multimodal_generation.py"
+    --8<-- "examples/online_serving/qwen3_omni/openai_chat_completion_client_for_multimodal_generation.py"
     ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/online_serving/qwen3_omni/run_curl_multimodal_generation.sh"
+    --8<-- "examples/online_serving/qwen3_omni/run_curl_multimodal_generation.sh"
     ``````

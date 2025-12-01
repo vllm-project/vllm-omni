@@ -44,17 +44,17 @@ sudo apt install ffmpeg
 
 ??? abstract "end2end.py"
     ``````py
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/offline_inference/qwen3_omni/end2end.py"
+    --8<-- "examples/offline_inference/qwen3_omni/end2end.py"
     ``````
 ??? abstract "run_multiple_prompts.sh"
     ``````sh
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/offline_inference/qwen3_omni/run_multiple_prompts.sh"
+    --8<-- "examples/offline_inference/qwen3_omni/run_multiple_prompts.sh"
     ``````
 ??? abstract "run_single_prompt.sh"
     ``````sh
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/offline_inference/qwen3_omni/run_single_prompt.sh"
+    --8<-- "examples/offline_inference/qwen3_omni/run_single_prompt.sh"
     ``````
 ??? abstract "run_single_prompt_tp.sh"
     ``````sh
-    --8<-- "/mnt/vllm_open_release/vllm-omni-public/vllm-omni/examples/offline_inference/qwen3_omni/run_single_prompt_tp.sh"
+    --8<-- "examples/offline_inference/qwen3_omni/run_single_prompt_tp.sh"
     ``````
