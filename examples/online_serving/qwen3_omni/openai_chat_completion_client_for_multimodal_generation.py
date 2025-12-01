@@ -9,7 +9,7 @@ from vllm.utils import FlexibleArgumentParser
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8091/v1"
+openai_api_base = "http://localhost:8081/v1"
 
 client = OpenAI(
     # defaults to os.environ.get("OPENAI_API_KEY")
@@ -205,7 +205,10 @@ def get_video_query(video_path: Optional[str] = None, custom_prompt: Optional[st
         "content": [
             {
                 "type": "video_url",
-                "video_url": {"url": video_url},
+                "video_url": {
+                    # "url": "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
+                    "url": "file://examples/online_serving/qwen3_omni/sample_demo_1.mp4"
+                },
             },
             {
                 "type": "text",
