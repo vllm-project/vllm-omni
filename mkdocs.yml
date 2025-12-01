@@ -1,5 +1,5 @@
 site_name: vLLM-Omni
-site_description: Multi-modality models inference and serving with non-autoregressive structures
+site_description: Efficient omni-modality model serving for everyone
 site_author: vLLM-Omni Team
 site_url: https://vllm-project.github.io/vllm-omni/
 

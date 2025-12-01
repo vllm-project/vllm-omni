@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="./docs/source/logos/vllm-omni-logo-text-dark.png">
-    <img alt="vllm-omni" src="./docs/source/logos/vllm-omni-logo-text-dark.png" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="./docs/source/logos/vllm-omni-logo.png">
+    <img alt="vllm-omni" src="./docs/source/logos/vllm-omni-logo.png" width=55%>
   </picture>
 </p>
 <h3 align="center">
