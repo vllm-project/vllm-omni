@@ -36,6 +36,9 @@ Then run the command below.
 bash run_single_prompt.sh
 ```
 
+> ℹ️ Same as vLLM, set the environment variable `VLLM_USE_MODELSCOPE` to `True` to use modelscope.
+
+
 ### FAQ
 
 If you encounter error about backend of librosa, try to install ffmpeg with command below.

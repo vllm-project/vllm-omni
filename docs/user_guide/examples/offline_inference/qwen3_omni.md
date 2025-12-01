@@ -32,6 +32,9 @@ If you have not enough memory, you can set thinker with tensor parallel. Just ru
 bash run_single_prompt_tp.sh
 ```
 
+> ℹ️ Same as vLLM, set the environment variable `VLLM_USE_MODELSCOPE` to `True` to use modelscope.
+
+
 ### FAQ
 
 If you encounter error about backend of librosa, try to install ffmpeg with command below.
