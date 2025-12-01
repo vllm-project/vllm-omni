@@ -264,7 +264,7 @@ async def run_inference_async_omni(
         # Process audio
         audio_data = process_audio_file(audio_file)
         if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
+            multi_modal_data["audio"] = [audio_data] if not isinstance(audio_data, list) else audio_data
 
         # Process image
         image_data = process_image_file(image_file)
@@ -282,7 +282,9 @@ async def run_inference_async_omni(
                 video_entry = video_frames
             multi_modal_data["video"] = video_entry
             if use_audio_in_video and extracted_audio is not None and "audio" not in multi_modal_data:
-                multi_modal_data["audio"] = extracted_audio
+                multi_modal_data["audio"] = (
+                    [extracted_audio] if not isinstance(extracted_audio, list) else extracted_audio
+                )
                 mm_processor_kwargs["use_audio_in_video"] = True
 
         # Build the prompt input
