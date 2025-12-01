@@ -1,4 +1,4 @@
-"""Code2Wav GPU Model Runner for vLLM-omni.
+"""Code2Wav GPU Model Runner for vLLM-Omni.
 
 Handles direct conversion from codec codes to audio waveforms for Qwen3 Omni MoE Code2Wav.
 This is a non-autoregressive model that doesn't require sampling or logits computation.
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner):
-    """Generation model runner for vLLM-omni (non-autoregressive).
+    """Generation model runner for vLLM-Omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
     - Does not compute logits or perform token sampling.

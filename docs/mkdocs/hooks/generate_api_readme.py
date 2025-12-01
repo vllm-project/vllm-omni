@@ -188,11 +188,6 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
             # Add classes (filter out internal ones)
             for class_name in classes:
                 class_short_name = class_name.split(".")[-1]
-
-                # TODO: Implement worker API reference
-                if "diffusion.worker.gpu_worker" in class_name:
-                    continue
-
                 # Skip if it matches internal patterns (unless it's a main model class)
                 if any(pattern in class_short_name for pattern in internal_patterns):
                     # But include main model classes

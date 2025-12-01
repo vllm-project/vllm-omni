@@ -52,7 +52,7 @@ logger = init_logger(__name__)
 
 
 class AsyncOmni(EngineClient):
-    """Async entry point for vLLM-omni inference.
+    """Async entry point for vLLM-Omni inference.
 
     This class provides an asynchronous interface for running multi-modal
     comprehension and generation models. It orchestrates multiple
@@ -193,7 +193,7 @@ class AsyncOmni(EngineClient):
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
-        print("[AsyncOmniLLM] __del__ close()", flush=True)
+        print("[AsyncOmni] __del__ close()", flush=True)
         raise Exception("test")
         try:
             self.close()
