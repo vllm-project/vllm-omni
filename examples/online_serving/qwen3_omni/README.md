@@ -6,21 +6,19 @@ Please refer to [README.md](../../../README.md)
 
 ## Run examples (Qwen3-Omni)
 
+!!! note
+    On ROCm, for vLLM v0.11.0, you have to set `MIOPEN_FIND_MODE=FAST`. Run `export MIOPEN_FIND_MODE=FAST`, before you run your command.
+
+
 ### Launch the Server
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
-
-# On ROCm, for vLLM v0.11.2
-MIOPEN_FIND_MODE=FAST vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
-
-# On ROCm, for vLLM v0.11.2
-MIOPEN_FIND_MODE=FAST vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
 
 ### Send Multi-modal Request
@@ -94,9 +92,6 @@ Once vllm and vllm-omni are installed, you can launch the web service built on A
 
 ```bash
 python gradio_demo.py  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 7861
-
-# On ROCm, for vLLM v0.11.2
-MIOPEN_FIND_MODE=FAST python gradio_demo.py  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 7861
 ```
 
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.

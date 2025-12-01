@@ -5,22 +5,12 @@ This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Im
 - `text_to_image.py`: command-line script for single image generation.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
 
-
 ## Local CLI Usage
 
-```bash
-python text_to_image.py \
-  --prompt "a cup of coffee on the table" \
-  --seed 42 \
-  --cfg_scale 4.0 \
-  --num_images_per_prompt 1 \
-  --num_inference_steps 50 \
-  --height 1024 \
-  --width 1024 \
-  --output outputs/coffee.png
+!!! note
+    On ROCm, for vLLM v0.11.0, you have to set `MIOPEN_FIND_MODE=FAST`. Run `export MIOPEN_FIND_MODE=FAST`, before you run your command.
 
-# On ROCm, for vLLM v0.11.2
-MIOPEN_FIND_MODE=FAST \
+```bash
 python text_to_image.py \
   --prompt "a cup of coffee on the table" \
   --seed 42 \
@@ -50,9 +40,6 @@ Launch the gradio demo:
 
 ```bash
 python gradio_demo.py --port 7862
-
-# On ROCm, for vLLM v0.11.2
-MIOPEN_FIND_MODE=FAST python gradio_demo.py --port 7862
 ```
 
 Then open `http://localhost:7862/` on your local browser to interact with the web UI.

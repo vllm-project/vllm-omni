@@ -6,30 +6,26 @@ Please refer to [README.md](../../../README.md)
 
 ## Run examples (Qwen2.5-Omni)
 
+
+!!! note
+    On ROCm, for vLLM v0.11.0, before running your command for `Qwen/Qwen2.5-Omni-7B`, set the following environment variables:
+    ```bash
+    export MIOPEN_FIND_MODE=FAST
+    export VLLM_ROCM_USE_AITER=1
+    export VLLM_ROCM_USE_AITER_MHA=1
+    export VLLM_ROCM_USE_AITER_LINEAR=0
+    export VLLM_ROCM_USE_AITER_RMSNORM=0
+    ```
+
+
 ### Launch the Server
 
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
-
-# On ROCm for vLLM v0.11.0
-VLLM_ROCM_USE_AITER=1 \
-VLLM_ROCM_USE_AITER_MHA=1 \
-VLLM_ROCM_USE_AITER_LINEAR=0 \
-VLLM_ROCM_USE_AITER_RMSNORM=0 \
-MIOPEN_FIND_MODE=FAST \
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
-
-# On ROCm for vLLM v0.11.0
-VLLM_ROCM_USE_AITER=1 \
-VLLM_ROCM_USE_AITER_MHA=1 \
-VLLM_ROCM_USE_AITER_LINEAR=0 \
-VLLM_ROCM_USE_AITER_RMSNORM=0 \
-MIOPEN_FIND_MODE=FAST \
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
 
@@ -95,14 +91,6 @@ This Web UI demo allows users to interact with the model through a web browser.
 Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmni by
 
 ```bash
-python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
-
-# On ROCm for vLLM v0.11.0
-VLLM_ROCM_USE_AITER=1 \
-VLLM_ROCM_USE_AITER_MHA=1 \
-VLLM_ROCM_USE_AITER_LINEAR=0 \
-VLLM_ROCM_USE_AITER_RMSNORM=0 \
-MIOPEN_FIND_MODE=FAST \
 python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
 ```
 
