@@ -90,7 +90,7 @@ class AsyncOmni(EngineClient):
         stage_configs_path: Optional[str] = None,
         log_stats: bool = False,
         log_file: Optional[str] = None,
-        init_sleep_seconds: int = 20,
+        init_sleep_seconds: int = 30,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 60000,

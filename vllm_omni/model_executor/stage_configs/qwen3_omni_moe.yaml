@@ -3,24 +3,25 @@
 # Stage 1: Talker (text embeddings → 8-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
 
+# The following config has been verified on 2x H100-80G GPUs.
 stage_args:
   - stage_id: 0
     runtime:
-      devices: "0"
+      devices: "0,1"
       max_batch_size: 1
     engine_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.6
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       hf_config_name: thinker_config
-      # tensor_parallel_size: 2  # Commented out - using single GPU for thinker
+      tensor_parallel_size: 2
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -42,7 +43,7 @@ stage_args:
        model_arch: Qwen3OmniMoeForConditionalGeneration
        worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
        scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-       gpu_memory_utilization: 0.5
+       gpu_memory_utilization: 0.3
        enforce_eager: true
        trust_remote_code: true
        engine_output_type: latent  # Output codec codes for code2wav
@@ -65,7 +66,7 @@ stage_args:
 
   - stage_id: 2
     runtime:
-      devices: "1"
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
