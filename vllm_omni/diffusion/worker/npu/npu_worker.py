@@ -55,11 +55,11 @@ class NPUWorker:
 
         # hack
         # set hf_config to a fake one to avolid get attr error
-        class FakePretrainedConfig(PretrainedConfig):
+        class _FakePretrainedConfig(PretrainedConfig):
             def __getattr__(self, name):
                 return "fake"
 
-        vllm_config = VllmConfig(model_config=ModelConfig(hf_config=FakePretrainedConfig()))
+        vllm_config = VllmConfig(model_config=ModelConfig(hf_config=_FakePretrainedConfig()))
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
         set_current_vllm_config(vllm_config)
 
