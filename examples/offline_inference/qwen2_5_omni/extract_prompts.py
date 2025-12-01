@@ -4,7 +4,7 @@ from typing import Optional
 
 
 def extract_prompt(line: str) -> Optional[str]:
-    # 提取第一个 '|' 与第二个 '|' 之间的内容
+    # Extract the content between the first '|' and the second '|'
     i = line.find("|")
     if i == -1:
         return None

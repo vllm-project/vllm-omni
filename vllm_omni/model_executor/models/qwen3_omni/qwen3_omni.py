@@ -519,9 +519,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                         tts_eos_thinker=tts_eos_thinker,
                         tts_pad_thinker=tts_pad_thinker,
                     )
-                    # req_embeds: [S,D], req_input_ids: [S]  →  map到当前 span
+                    # req_embeds: [S,D], req_input_ids: [S]  →  map onto the current span
                     seg_len = min(span_len, req_embeds.shape[0])
-                    # 强制对齐 dtype/device/内存布局，避免精度或布局差异导致比较不相等
+                    # Force-align dtype/device/memory layout to avoid mismatches from precision or layout differences
                     inputs_embeds[s : s + seg_len] = (
                         req_embeds[:seg_len].to(device=inputs_embeds.device, dtype=inputs_embeds.dtype).contiguous()
                     )
