@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to vLLM-Omni! This document provides guidelines and instructions for contributing.
 
-!!! Note
+!!! note
     We host weekly developer-facing online meetings to discuss milestones and updates **every Tuesday at 19:30 PDT**. Meeting link as well as the past meeting notes can be found (here)[https://tinyurl.com/vllm-omni-meeting].
 
 ## Getting Started
