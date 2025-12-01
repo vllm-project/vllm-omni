@@ -26,10 +26,8 @@ def initialize_model(
         model = model_class(od_config=od_config, prefix=mod_relname)
 
         # Configure VAE memory optimization settings from config
-        if od_config.vae_use_slicing:
-            model.vae.use_slicing = True
-        if od_config.vae_use_tiling:
-            model.vae.use_tiling = True
+        model.vae.use_slicing = od_config.vae_use_slicing
+        model.vae.use_tiling = od_config.vae_use_tiling
 
         return model
     else:
