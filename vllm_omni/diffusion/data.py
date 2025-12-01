@@ -80,6 +80,10 @@ class OmniDiffusionConfig:
     vae_cpu_offload: bool = True
     pin_cpu_memory: bool = True
 
+    # VAE memory optimization parameters
+    vae_use_slicing: bool = False
+    vae_use_tiling: bool = False
+
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
