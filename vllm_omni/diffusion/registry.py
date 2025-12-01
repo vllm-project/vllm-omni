@@ -4,6 +4,7 @@
 import importlib
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.utils.platform_utils import is_npu
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
@@ -24,6 +25,9 @@ def initialize_model(
         module = importlib.import_module(module_name)
         model_class = getattr(module, cls_name)
         model = model_class(od_config=od_config, prefix=mod_relname)
+        if is_npu():
+            model.vae.use_slicing = True
+            model.vae.use_tiling = True
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
