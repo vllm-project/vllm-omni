@@ -9,11 +9,17 @@ Please refer to [README.md](../../../README.md)
 Launch the server
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+
+# On ROCm, for vLLM v0.11.2
+MIOPEN_FIND_MODE=FAST vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+
+# On ROCm, for vLLM v0.11.2
+MIOPEN_FIND_MODE=FAST vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
 
 Get into the example folder
@@ -49,6 +55,9 @@ Once vllm and vllm-omni are installed, you can launch the web service built on A
 
 ```bash
 python gradio_demo.py  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 7861
+
+# On ROCm, for vLLM v0.11.2
+MIOPEN_FIND_MODE=FAST python gradio_demo.py  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 7861
 ```
 
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.
@@ -60,6 +69,14 @@ The gradio demo also supports running with an existing API server and can be cus
 
 
 ```bash
+python gradio_demo.py \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --use-api-server \
+    --api-base http://localhost:8091/v1 \
+    --ip 127.0.0.1 \
+    --port 7861
+
+# On ROCm, for vLLM v0.11.2
 python gradio_demo.py \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --use-api-server \

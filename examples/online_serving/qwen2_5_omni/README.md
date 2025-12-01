@@ -9,10 +9,26 @@ Please refer to [README.md](../../../README.md)
 Launch the server
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+
+# On ROCm for vLLM v0.11.0
+VLLM_ROCM_USE_AITER=1 \
+VLLM_ROCM_USE_AITER_MHA=1 \
+VLLM_ROCM_USE_AITER_LINEAR=0 \
+VLLM_ROCM_USE_AITER_RMSNORM=0 \
+MIOPEN_FIND_MODE=FAST \
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+
+# On ROCm for vLLM v0.11.0
+VLLM_ROCM_USE_AITER=1 \
+VLLM_ROCM_USE_AITER_MHA=1 \
+VLLM_ROCM_USE_AITER_LINEAR=0 \
+VLLM_ROCM_USE_AITER_RMSNORM=0 \
+MIOPEN_FIND_MODE=FAST \
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
 
@@ -49,6 +65,14 @@ Once vllm and vllm-omni are installed, you can launch the web service built on A
 
 ```bash
 python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
+
+# On ROCm for vLLM v0.11.0
+VLLM_ROCM_USE_AITER=1 \
+VLLM_ROCM_USE_AITER_MHA=1 \
+VLLM_ROCM_USE_AITER_LINEAR=0 \
+VLLM_ROCM_USE_AITER_RMSNORM=0 \
+MIOPEN_FIND_MODE=FAST \
+python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
 ```
 
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.
@@ -59,6 +83,18 @@ Then open `http://localhost:7861/` on your local browser to interact with the we
 You can customize its basic launch parameters:
 
 ```bash
+python gradio_demo.py \
+    --model Qwen/Qwen2.5-Omni-7B \
+    --ip 127.0.0.1 \
+    --port 7861 \
+    --stage-configs-path /path/to/stage_configs.yaml
+
+# On ROCm for vLLM v0.11.0
+VLLM_ROCM_USE_AITER=1 \
+VLLM_ROCM_USE_AITER_MHA=1 \
+VLLM_ROCM_USE_AITER_LINEAR=0 \
+VLLM_ROCM_USE_AITER_RMSNORM=0 \
+MIOPEN_FIND_MODE=FAST \
 python gradio_demo.py \
     --model Qwen/Qwen2.5-Omni-7B \
     --ip 127.0.0.1 \

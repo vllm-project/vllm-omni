@@ -73,3 +73,7 @@ uv pip install --no-build-isolation --editable .
 </details>
 
 # --8<-- [end:build-wheel-from-source]
+
+# --8<-- [start:build-wheel-from-source-in-docker]
+
+# --8<-- [end:build-wheel-from-source-in-docker]
