@@ -236,7 +236,7 @@ class QwenImagePipeline(
     def __init__(
         self,
         *,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
         super().__init__()
@@ -250,23 +250,23 @@ class QwenImagePipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        logger.info("Loaded Qwen-Image scheduler successfully")
+        logger.info("Loaded scheduler successfully")
 
         with set_default_torch_dtype(torch.bfloat16):
             self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model, subfolder="text_encoder", local_files_only=local_files_only
             )
-            logger.info("Loaded Qwen-Image text encoder successfully")
+            logger.info("Loaded text encoder successfully")
             self.vae = AutoencoderKLQwenImage.from_pretrained(
                 model, subfolder="vae", local_files_only=local_files_only
             ).to(self.device)
-            logger.info("Loaded Qwen-Image VAE successfully")
+            logger.info("Loaded VAE successfully")
             self.transformer = QwenImageTransformer2DModel()
-            logger.info("Initialized Qwen-Image transformer successfully.")
+            logger.info("Initialized transformer successfully.")
             self.tokenizer = Qwen2Tokenizer.from_pretrained(
                 model, subfolder="tokenizer", local_files_only=local_files_only
             )
-            logger.info("Loaded Qwen-Image tokenizer successfully.")
+            logger.info("Loaded tokenizer successfully.")
 
         self.stage = None
 
