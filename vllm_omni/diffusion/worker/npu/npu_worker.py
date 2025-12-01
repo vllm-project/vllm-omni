@@ -4,9 +4,9 @@ import multiprocessing as mp
 import os
 
 import torch
-from transformers import PretrainedConfig
 import zmq
-from vllm.config import VllmConfig, ModelConfig, set_current_vllm_config
+from transformers import PretrainedConfig
+from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
