@@ -4,8 +4,9 @@ import multiprocessing as mp
 import os
 
 import torch
+from transformers import PretrainedConfig
 import zmq
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, ModelConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
@@ -53,7 +54,12 @@ class NPUWorker:
         torch.npu.set_device(device)
 
         # hack
-        vllm_config = VllmConfig()
+        # set hf_config to a fake one to avolid get attr error
+        class FakePretrainedConfig(PretrainedConfig):
+            def __getattr__(self, name):
+                return "fake"
+
+        vllm_config = VllmConfig(model_config=ModelConfig(hf_config=FakePretrainedConfig()))
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
         set_current_vllm_config(vllm_config)
 
