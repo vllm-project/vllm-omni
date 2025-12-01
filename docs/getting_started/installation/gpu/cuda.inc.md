@@ -73,3 +73,22 @@ uv pip install --no-build-isolation --editable .
 </details>
 
 # --8<-- [end:build-wheel-from-source]
+
+
+# --8<-- [start:pre-built-images]
+
+The Docker image file is available on [vllm-omni_v0.11.0rc1](#link-to-be-added) 
+
+```bash
+docker load -i vllm-omni_v0.11.0rc1.tar.gz 
+docker run -itd \
+    --name vllm-omni \
+    --shm-size=64g \
+    --privileged=true \
+    --restart=always \
+    --gpus all \
+    --net=host vllm-omni:v0.11.0rc
+docker exec -it vllm-omni bash
+```
+
+# --8<-- [end:pre-built-images]
