@@ -698,7 +698,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             encoder_inputs = self._extract_encoder_inputs(scheduler_output)
             model_kwargs.update(encoder_inputs)
 
-        if self.model.has_preprocess:
+        if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             for req_index, req_id in enumerate(self.input_batch.req_ids):
@@ -714,7 +714,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # call the custom process function
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e],
-                    inputs_embeds=inputs_embeds[s:e],
+                    input_embeds=inputs_embeds[s:e],
                     **req_infos
                 )
                 # TODO(Peiqi): the merge stage could move out from the critical path
@@ -735,7 +735,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             positions,
             intermediate_tensors,
             model_kwargs,
-            per_req_additional_information,
         )
 
     def _decode_and_store_request_payloads(self, scheduler_output: "SchedulerOutput") -> None:
@@ -810,31 +809,41 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
-    def _build_model_kwargs_extra(
-        self,
-        per_req_additional_information: Optional[dict[str, dict]],
-        num_scheduled_tokens_np,
-    ) -> dict:
+    def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step, including:
-        - additional_information_by_req_id: per-request additional information provided by preprocess for this step
         - runtime_additional_information: per-request additional information stored in request state
-        - request_ids: the request id list in batch order
-        - request_token_spans: token spans per request within the flattened sequence
         """
         model_kwargs_extra: dict[str, object] = {}
-        if per_req_additional_information:
-            model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
         try:
             model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
-            model_kwargs_extra["request_ids"] = self.input_batch.req_ids
-            model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(num_scheduled_tokens_np)
         except Exception:
             pass
         return model_kwargs_extra
 
-    def _process_additional_information_updates(self, multimodal_outputs: object) -> None:
+    def _process_additional_information_updates(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: object,
+        num_scheduled_tokens_np: np.ndarray,
+        ) -> None:
         """Process model-provided per-request additional_information updates and merge into request state."""
         try:
+            # execute the custom postprocess function
+            # TODO(Peiqi): do we have a more elegant way to do this?
+            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_state = self.requests.get(req_id)
+                    req_infos = (getattr(req_state, "additional_information_cpu", None)
+                                if req_state is not None else None)
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    span_len = int(e) - int(s)
+                    # only consider to store data into update dict.
+                    hidden_states_slice = hidden_states[s:e]
+                    update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
+                    self._merge_additional_information_update(req_id, update_dict)
+
             if not isinstance(multimodal_outputs, dict):
                 return
             if (
@@ -923,3 +932,28 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if req_info:
                     per_req_additional_information[req_id] = req_info
         return per_req_additional_information
+
+    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+        existing = getattr(req_state, "additional_information_cpu", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for k, v in upd.items():
+            if isinstance(v, torch.Tensor):
+                merged[k] = v.detach().to("cpu").contiguous()
+            elif isinstance(v, list):
+                new_list = []
+                for item in v:
+                    if isinstance(item, torch.Tensor):
+                        new_list.append(item.detach().to("cpu").contiguous())
+                    else:
+                        new_list.append(item)
+                merged[k] = new_list
+            else:
+                merged[k] = v
+        setattr(req_state, "additional_information_cpu", merged)
+
+    # ===== Helper functions extracted for clarity and reuse =====

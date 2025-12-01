@@ -35,7 +35,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
-from vllm_omni.model_executor.preprocess_mixin import PreprocessMixin
+from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -51,7 +51,7 @@ logger = init_logger(__name__)
 )
 class Qwen2_5OmniForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE,
-    Qwen2_5OmniConditionalGenerationMixin, PreprocessMixin
+    Qwen2_5OmniConditionalGenerationMixin, CustomProcessMixin
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -88,7 +88,7 @@ class Qwen2_5OmniForConditionalGeneration(
         elif self.model_stage == "talker":
             # register the process function for the talker stage
             self.has_preprocess = True
-            self.set_preprocess(self.process_fn)
+            self.set_custom_preprocess(self.talker_preprocess)
             self.thinker = None
             # Initialize talker model wrapper (handles projection + LM)
             self.talker = init_vllm_registered_model(
@@ -591,7 +591,7 @@ class Qwen2_5OmniForConditionalGeneration(
             return talker_hf_config.tts_text_start_token_id
         return self.tts_text_spk_token_ids[voice_type]
 
-    def process_fn(self,
+    def talker_preprocess(self,
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor,
         **info_dict: object,
@@ -621,7 +621,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
     def thinker_to_talker_process(self, 
         input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        input_embeds: torch.Tensor,
         **info_dict: object,
     ):
         update_dict = {}
@@ -632,19 +632,19 @@ class Qwen2_5OmniForConditionalGeneration(
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids")  # list[int]
 
         if not isinstance(prompt_embeds, torch.Tensor):
-            prompt_embeds = torch.zeros(0, self.talker.config.hidden_size, dtype=inputs_embeds.dtype, device=self._module_device(self.model))
+            prompt_embeds = torch.zeros(0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model))
         if not isinstance(thinker_result, torch.Tensor):
-            thinker_result = torch.zeros(0, self.talker.config.hidden_size, dtype=inputs_embeds.dtype, device=self._module_device(self.model))
+            thinker_result = torch.zeros(0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model))
         if not isinstance(prompt_token_ids, (list, torch.Tensor)):
             prompt_token_ids = []
         if not isinstance(thinker_output_token_ids, (list, torch.Tensor)):
             thinker_output_token_ids = []
         
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            voice_type=info_dict.get("voice_type"),
-            output_prompt_embeds=thinker_result.to(inputs_embeds.dtype).to(self._module_device(self.model)),
+            voice_type="Chelsie",   # TODO(Peiqi): add voice_type support
+            output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
             output_token_ids=thinker_output_token_ids,
-            thinker_prompt_embeds=prompt_embeds.to(inputs_embeds.dtype).to(self._module_device(self.model)),
+            thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
             prompt_token_ids=prompt_token_ids,
         )
         
@@ -700,7 +700,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
     def thinker_to_talker_decode_one_step(self,
         input_ids,
-        inputs_embeds,
+        input_embeds,
         **info_dict
     ):
         update_dict = {}
@@ -724,11 +724,11 @@ class Qwen2_5OmniForConditionalGeneration(
         if isinstance(step_vec, torch.Tensor) and step_vec.numel() > 0:
             one_id = input_ids[0:1]
             _, one_embed = self._thinker_to_talker_decode_one_step(
-                output_prompt_embeds=step_vec.to(inputs_embeds.dtype).to(self._module_device(self.model)),
+                output_prompt_embeds=step_vec.to(input_embeds.dtype).to(self._module_device(self.model)),
                 output_token_ids=one_id,
             )
-            inputs_embeds[0] = one_embed[0]
-        return input_ids[0:1], inputs_embeds[0:1], update_dict
+            input_embeds[0] = one_embed[0]
+        return input_ids[0:1], input_embeds[0:1], update_dict
 
     def _thinker_to_talker_decode_one_step(
         self,

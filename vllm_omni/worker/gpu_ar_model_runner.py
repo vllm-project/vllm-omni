@@ -94,8 +94,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 inputs_embeds,
                 positions,
                 intermediate_tensors,
-                model_kwargs,
-                per_req_additional_information,
+                model_kwargs
             ) = self._preprocess(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -130,7 +129,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_kwargs_extra = self._build_model_kwargs_extra(per_req_additional_information, num_scheduled_tokens_np)
+            model_kwargs_extra = self._build_model_kwargs_extra()
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -152,15 +151,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            # hidden_states, multimodal_outputs = self.extract_multimodal_outputs(
-            #     hidden_states
-            # )
             multimodal_outputs = model_output.multimodal_outputs
             hidden_states = model_output.text_hidden_states
             # The model side may return per-request additional_information updates (model-agnostic channel).
             # Convention: multimodal_outputs["additional_information_update"] is a list[dict] in batch order;
             # the runner merges it into the corresponding request's additional_information_cpu for subsequent decode.
-            self._process_additional_information_updates(multimodal_outputs)
+            self._process_additional_information_updates(
+                hidden_states, multimodal_outputs, num_scheduled_tokens_np)
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -332,28 +329,3 @@ class GPUARModelRunner(OmniGPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
-
-    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return
-        existing = getattr(req_state, "additional_information_cpu", {})
-        if not isinstance(existing, dict):
-            existing = {}
-        merged = dict(existing)
-        for k, v in upd.items():
-            if isinstance(v, torch.Tensor):
-                merged[k] = v.detach().to("cpu").contiguous()
-            elif isinstance(v, list):
-                new_list = []
-                for item in v:
-                    if isinstance(item, torch.Tensor):
-                        new_list.append(item.detach().to("cpu").contiguous())
-                    else:
-                        new_list.append(item)
-                merged[k] = new_list
-            else:
-                merged[k] = v
-        setattr(req_state, "additional_information_cpu", merged)
-
-    # ===== Helper functions extracted for clarity and reuse =====
