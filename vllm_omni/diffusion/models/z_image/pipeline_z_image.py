@@ -27,7 +27,6 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoModel, AutoTokenizer
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -38,9 +37,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
-
-# from .pipeline_output import ZImagePipelineOutput
-
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -143,10 +139,6 @@ def retrieve_timesteps(
 
 
 class ZImagePipeline(nn.Module):
-    # model_cpu_offload_seq = "text_encoder->transformer->vae"
-    # _optional_components = []
-    # _callback_tensor_inputs = ["latents", "prompt_embeds"]
-
     def __init__(
         self,
         *,
@@ -155,31 +147,21 @@ class ZImagePipeline(nn.Module):
     ):
         super().__init__()
         self.od_config = od_config
-        self.device = get_local_device()
-        self._execution_device = self.device
+        self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        with set_default_torch_dtype(torch.bfloat16):
-            self.text_encoder = AutoModel.from_pretrained(
-                model, subfolder="text_encoder", local_files_only=local_files_only
-            )
-            logger.info("Loaded Qwen-Image text encoder successfully")
-            self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-                self.device
-            )
-            logger.info("Loaded VAE successfully")
-            self.transformer = ZImageTransformer2DModel()
-            # self.transformer = ZImageTransformer2DModel.from_pretrained(
-            #     model, subfolder="transformer", local_files_only=local_files_only)
-            logger.info("Initialized transformer successfully.")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model, subfolder="tokenizer", local_files_only=local_files_only
-            )
-            logger.info("Loaded tokenizer successfully.")
+        self.text_encoder = AutoModel.from_pretrained(
+            model, subfolder="text_encoder", local_files_only=local_files_only
+        )
+        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
+            self._execution_device
+        )
+        self.transformer = ZImageTransformer2DModel()
+        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
@@ -421,8 +403,10 @@ class ZImagePipeline(nn.Module):
         """
         prompt = req.prompt
         negative_prompt = req.negative_prompt
-        height = req.height or 1024
-        width = req.width or 1024
+        height: int = req.height or 1024
+        width: int = req.width or 1024
+        num_inference_steps = req.num_inference_steps or 50
+        print("num_inference_steps:", num_inference_steps)
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:
