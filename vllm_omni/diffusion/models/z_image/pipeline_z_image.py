@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -406,7 +409,6 @@ class ZImagePipeline(nn.Module):
         height: int = req.height or 1024
         width: int = req.width or 1024
         num_inference_steps = req.num_inference_steps or 50
-        print("num_inference_steps:", num_inference_steps)
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,11 +22,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# from diffusers.utils.torch_utils import maybe_allow_in_graph
 from diffusers.models.attention_dispatch import dispatch_attention_fn
-from diffusers.models.normalization import RMSNorm
 from torch.nn.utils.rnn import pad_sequence
+from vllm.model_executor.layers.layernorm import RMSNorm
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -52,16 +53,15 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        with torch.amp.autocast("cuda", enabled=False):
-            half = dim // 2
-            freqs = torch.exp(
-                -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-            )
-            args = t[:, None].float() * freqs[None]
-            embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-            if dim % 2:
-                embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-            return embedding
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+        )
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
@@ -92,6 +92,7 @@ class ZImageAttention(nn.Module):
         self.to_k = nn.Linear(dim, self.head_dim * num_kv_heads, bias=False)
         self.to_v = nn.Linear(dim, self.head_dim * num_kv_heads, bias=False)
 
+        assert qk_norm is True
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
         self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
@@ -101,7 +102,7 @@ class ZImageAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        freqs_cis: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         query = self.to_q(hidden_states)
         key = self.to_k(hidden_states)
@@ -114,13 +115,11 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        # Apply RoPE
         def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-            with torch.amp.autocast("cuda", enabled=False):
-                x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-                freqs_cis = freqs_cis.unsqueeze(2)
-                x_out = torch.view_as_real(x * freqs_cis).flatten(3)
-                return x_out.type_as(x_in)  # todo
+            x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
+            freqs_cis = freqs_cis.unsqueeze(2)
+            x_out = torch.view_as_real(x * freqs_cis).flatten(3)
+            return x_out.type_as(x_in)
 
         if freqs_cis is not None:
             query = apply_rotary_emb(query, freqs_cis)
@@ -180,7 +179,6 @@ class ZImageTransformerBlock(nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.head_dim = dim // n_heads
 
         self.attention = ZImageAttention(
             dim=dim,
@@ -316,11 +314,6 @@ class RopeEmbedder:
 
 
 class ZImageTransformer2DModel(nn.Module):
-    # _supports_gradient_checkpointing = True
-    # _no_split_modules = ["ZImageTransformerBlock"]
-    # _repeated_blocks = ["ZImageTransformerBlock"]
-    # _skip_layerwise_casting_patterns = ["t_embedder", "cap_embedder"]  # precision sensitive layers
-
     def __init__(
         self,
         all_patch_size=(2,),
@@ -408,8 +401,6 @@ class ZImageTransformer2DModel(nn.Module):
                 for layer_id in range(n_layers)
             ]
         )
-        head_dim = dim // n_heads
-        assert head_dim == sum(axes_dims)
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
 
@@ -586,12 +577,8 @@ class ZImageTransformer2DModel(nn.Module):
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for layer in self.noise_refiner:
-                x = self._gradient_checkpointing_func(layer, x, x_attn_mask, x_freqs_cis, adaln_input)
-        else:
-            for layer in self.noise_refiner:
-                x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+        for layer in self.noise_refiner:
+            x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
 
         # cap embed & refine
         cap_item_seqlens = [len(_) for _ in cap_feats]
@@ -610,10 +597,6 @@ class ZImageTransformer2DModel(nn.Module):
         for i, seq_len in enumerate(cap_item_seqlens):
             cap_attn_mask[i, :seq_len] = 1
 
-        # if torch.is_grad_enabled() and self.gradient_checkpointing:
-        #     for layer in self.context_refiner:
-        #         cap_feats = self._gradient_checkpointing_func(layer, cap_feats, cap_attn_mask, cap_freqs_cis)
-        # else:
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
 
@@ -635,12 +618,6 @@ class ZImageTransformer2DModel(nn.Module):
         for i, seq_len in enumerate(unified_item_seqlens):
             unified_attn_mask[i, :seq_len] = 1
 
-        # if torch.is_grad_enabled() and self.gradient_checkpointing:
-        #     for layer in self.layers:
-        #         unified = self._gradient_checkpointing_func(
-        #             layer, unified, unified_attn_mask, unified_freqs_cis, adaln_input
-        #         )
-        # else:
         for layer in self.layers:
             unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
 
