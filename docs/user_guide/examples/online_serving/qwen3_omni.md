@@ -5,7 +5,7 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serv
 
 ## 🛠️ Installation
 
-Please refer to [README.md](https://github.com/vllm-project/vllm/tree/main/README.md)
+Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
 
 ## Run examples (Qwen3-Omni)
 

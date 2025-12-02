@@ -173,7 +173,7 @@ class Example:
             gh_file = gh_file.relative_to(ROOT_DIR)
 
             # Make GitHub URL
-            url = "https://github.com/vllm-project/vllm/"
+            url = "https://github.com/vllm-project/vllm-omni/"
             url += "tree/main" if self.path.is_dir() else "blob/main"
             gh_url = f"{url}/{gh_file}"
 

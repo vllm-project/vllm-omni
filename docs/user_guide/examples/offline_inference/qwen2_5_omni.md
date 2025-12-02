@@ -5,7 +5,7 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 ## 🛠️ Installation
 
-Please refer to [README.md](https://github.com/vllm-project/vllm/tree/main/README.md)
+Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
 
 ## Run examples (Qwen2.5-Omni)
 ### Multiple Prompts
