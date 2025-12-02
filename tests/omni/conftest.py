@@ -11,7 +11,6 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
 
-# Type aliases for multimodal inputs
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
@@ -73,7 +72,7 @@ class OmniRunner:
             List of SamplingParams for [thinker, talker, code2wav] stages
         """
         thinker_params = SamplingParams(
-            temperature=0.0,  # Deterministic
+            temperature=0.0,
             top_p=1.0,
             top_k=-1,
             max_tokens=max_tokens,
@@ -94,7 +93,7 @@ class OmniRunner:
         )
 
         code2wav_params = SamplingParams(
-            temperature=0.0,  # Deterministic
+            temperature=0.0,
             top_p=1.0,
             top_k=-1,
             max_tokens=max_tokens,
@@ -135,11 +134,9 @@ class OmniRunner:
                 "generating text and speech."
             )
 
-        # Normalize prompts to list
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        # Normalize multimodal inputs to lists
         def _normalize_mm_input(mm_input, num_prompts):
             if mm_input is None:
                 return [None] * num_prompts
@@ -149,7 +146,6 @@ class OmniRunner:
                         f"Multimodal input list length ({len(mm_input)}) must match prompts length ({num_prompts})"
                     )
                 return mm_input
-            # Single input - replicate for all prompts
             return [mm_input] * num_prompts
 
         num_prompts = len(prompts)
@@ -159,11 +155,9 @@ class OmniRunner:
 
         omni_inputs = []
         for i, prompt_text in enumerate(prompts):
-            # Build prompt with multimodal placeholders
             user_content = ""
             multi_modal_data = {}
 
-            # Add audio placeholder and data
             audio = audios_list[i]
             if audio is not None:
                 if isinstance(audio, list):
@@ -174,7 +168,6 @@ class OmniRunner:
                     user_content += "<|audio_bos|><|AUDIO|><|audio_eos|>"
                     multi_modal_data["audio"] = audio
 
-            # Add placeholder and data
             image = images_list[i]
             if image is not None:
                 if isinstance(image, list):
@@ -310,13 +303,3 @@ def omni_runner():
             runner.close()
         except Exception:
             pass
-
-
-@pytest.fixture
-def example_prompts():
-    """Fixture providing example prompts for testing."""
-    return [
-        "Hello, how are you?",
-        "What is the capital of France?",
-        "Explain quantum computing in simple terms.",
-    ]
