@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="./docs/source/logos/vllm-omni-logo.png">
-    <img alt="vllm-omni" src="./docs/source/logos/vllm-omni-logo.png" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png">
+    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png" width=55%>
   </picture>
 </p>
 <h3 align="center">
@@ -30,7 +30,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 <p align="center">
   <picture>
-    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality-model-architecture.png" width=55%>
+    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png" width=55%>
   </picture>
 </p>
 
