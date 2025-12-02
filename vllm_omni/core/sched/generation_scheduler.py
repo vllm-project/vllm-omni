@@ -12,13 +12,15 @@ from vllm.v1.core.sched.scheduler import (
 )
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+
+
 
 from vllm_omni.core.sched.output import OmniNewRequestData
-from vllm_omni.core.sched.scheduler import OmniScheduler
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 
-class GenerationScheduler(OmniScheduler):
+class GenerationScheduler(VLLMScheduler):
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
         - Feed all input tokens of the request at once
