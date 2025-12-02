@@ -146,16 +146,13 @@ python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
     "--strict-config",
-    "--cov=vllm_omni",
-    "--cov-report=term-missing",
-    "--cov-report=html",
-    "--cov-report=xml",
 ]
 markers = [
     "unit: Unit tests",
     "integration: Integration tests",
     "benchmark: Benchmark tests",
     "slow: Slow tests",
+    "core_model: enable this model test in each PR instead of only nightly",
 ]
 
 [tool.typos.default]
