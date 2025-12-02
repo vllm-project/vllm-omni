@@ -24,8 +24,6 @@ import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders import AutoencoderKL
-
-# from diffusers.models.transformers import ZImageTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
@@ -169,9 +167,6 @@ class ZImagePipeline(nn.Module):
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
         )
-        # self.image_processor = VaeImageProcessor(
-        #     vae_scale_factor=self.vae_scale_factor * 2
-        # )
 
     def encode_prompt(
         self,

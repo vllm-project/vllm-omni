@@ -91,6 +91,13 @@ class ZImageAttention(nn.Module):
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, self.head_dim * num_kv_heads, bias=False)
         self.to_v = nn.Linear(dim, self.head_dim * num_kv_heads, bias=False)
+        # TODO enable this when we refactor weight loader
+        # self.to_qkv = QKVParallelLinear(
+        #     hidden_size=dim,
+        #     head_size=self.head_dim,
+        #     total_num_heads=num_heads,
+        #     disable_tp=True,
+        # )
 
         assert qk_norm is True
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -107,6 +114,8 @@ class ZImageAttention(nn.Module):
         query = self.to_q(hidden_states)
         key = self.to_k(hidden_states)
         value = self.to_v(hidden_states)
+        # qkv, _ = self.to_qkv(hidden_states)
+        # query, key, value = qkv.chunk(3, dim=-1)
 
         query = query.unflatten(-1, (self.num_heads, -1))
         key = key.unflatten(-1, (self.num_heads, -1))
