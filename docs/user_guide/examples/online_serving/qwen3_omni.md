@@ -1,6 +1,6 @@
 # Online serving Example of vLLM-Omni for Qwen3-omni
 
-Source <https://github.com/vllm-project/vllm-omn/tree/main/examples/online_serving/qwen3_omni>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen3_omni>.
 
 
 ## 🛠️ Installation
