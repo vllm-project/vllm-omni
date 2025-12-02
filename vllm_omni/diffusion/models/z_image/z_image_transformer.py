@@ -156,7 +156,7 @@ class ZImageAttention(nn.Module):
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(dtype)
 
-        hidden_states, _ = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[0](hidden_states)
 
         return hidden_states
 
