@@ -405,7 +405,7 @@ class ZImagePipeline(nn.Module):
         width: int = req.width or 1024
         num_inference_steps = req.num_inference_steps or 50
         generator = req.generator
-        guidance_scale = req.guidance_scale or guidance_scale
+        guidance_scale = req.guidance_scale if req.guidance_rescale is not None else guidance_scale
         req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs
