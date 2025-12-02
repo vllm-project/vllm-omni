@@ -10,6 +10,8 @@ def detect_device_type() -> str:
         return device_type.lower()
     if torch.cuda.is_available():
         return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
     if hasattr(torch, "npu") and torch.npu.is_available():  # type: ignore[attr-defined]
         return "npu"
     return "cpu"
@@ -29,6 +31,8 @@ def get_device_control_env_var() -> str:
     device_type = detect_device_type()
     if device_type == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
+    if device_type == "xpu":
+        return "ZE_AFFINITY_MASK"
     return "CUDA_VISIBLE_DEVICES"  # fallback
 
 
