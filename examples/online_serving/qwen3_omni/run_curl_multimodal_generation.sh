@@ -41,7 +41,7 @@ code2wav_sampling_params='{
   "temperature": 0.0,
   "top_p": 1.0,
   "top_k": -1,
-  "max_tokens": 4096 * 16,
+  "max_tokens": 65536,
   "seed": 42,
   "detokenize": true,
   "repetition_penalty": 1.1
