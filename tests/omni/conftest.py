@@ -3,7 +3,8 @@
 """
 Pytest configuration and fixtures for vllm-omni tests.
 """
-from typing import Any, Optional, Union
+
+from typing import Any
 
 import pytest
 from vllm.sampling_params import SamplingParams
@@ -11,24 +12,14 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.entrypoints.omni import Omni
 
 # Type aliases for multimodal inputs
-PromptAudioInput = Optional[Union[list[tuple[Any, int]], tuple[Any, int]]]
-PromptImageInput = Optional[Union[list[Any], Any]]
-PromptVideoInput = Optional[Union[list[Any], Any]]
+PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
+PromptImageInput = list[Any] | Any | None
+PromptVideoInput = list[Any] | Any | None
 
 
 class OmniRunner:
     """
-    Simplified test runner for Omni models.
-
-    This runner wraps the Omni entrypoint for easier testing with default
-    configurations suitable for unit tests.
-
-    Default values:
-    - `seed`: Set to `0` for test reproducibility
-    - `init_sleep_seconds`: Set to `5` to reduce test time
-    - `batch_timeout`: Set to `5` seconds
-    - `init_timeout`: Set to `60` seconds
-    - `log_stats`: Set to `False` to reduce test output
+    Test runner for Omni models.
     """
 
     def __init__(
@@ -116,18 +107,15 @@ class OmniRunner:
 
     def get_omni_inputs(
         self,
-        prompts: Union[list[str], str],
-        system_prompt: Optional[str] = None,
+        prompts: list[str] | str,
+        system_prompt: str | None = None,
         audios: PromptAudioInput = None,
         images: PromptImageInput = None,
         videos: PromptVideoInput = None,
-        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Construct Omni input format from prompts and multimodal data.
-
-        This method formats inputs in the Qwen2.5-Omni style with proper
-        multimodal placeholders.
 
         Args:
             prompts: Text prompt(s) - either a single string or list of strings
@@ -158,8 +146,7 @@ class OmniRunner:
             if isinstance(mm_input, list):
                 if len(mm_input) != num_prompts:
                     raise ValueError(
-                        f"Multimodal input list length ({len(mm_input)}) "
-                        f"must match prompts length ({num_prompts})"
+                        f"Multimodal input list length ({len(mm_input)}) must match prompts length ({num_prompts})"
                     )
                 return mm_input
             # Single input - replicate for all prompts
@@ -180,52 +167,42 @@ class OmniRunner:
             audio = audios_list[i]
             if audio is not None:
                 if isinstance(audio, list):
-                    # Multiple audios
                     for _ in audio:
                         user_content += "<|audio_bos|><|AUDIO|><|audio_eos|>"
                     multi_modal_data["audio"] = audio
                 else:
-                    # Single audio
                     user_content += "<|audio_bos|><|AUDIO|><|audio_eos|>"
                     multi_modal_data["audio"] = audio
 
-            # Add image placeholder and data
+            # Add placeholder and data
             image = images_list[i]
             if image is not None:
                 if isinstance(image, list):
-                    # Multiple images
                     for _ in image:
                         user_content += "<|vision_bos|><|IMAGE|><|vision_eos|>"
                     multi_modal_data["image"] = image
                 else:
-                    # Single image
                     user_content += "<|vision_bos|><|IMAGE|><|vision_eos|>"
                     multi_modal_data["image"] = image
 
-            # Add video placeholder and data
             video = videos_list[i]
             if video is not None:
                 if isinstance(video, list):
-                    # Multiple videos
                     for _ in video:
                         user_content += "<|vision_bos|><|VIDEO|><|vision_eos|>"
                     multi_modal_data["video"] = video
                 else:
-                    # Single video
                     user_content += "<|vision_bos|><|VIDEO|><|vision_eos|>"
                     multi_modal_data["video"] = video
 
-            # Add text prompt
             user_content += prompt_text
 
-            # Build full prompt with chat template
             full_prompt = (
                 f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
                 f"<|im_start|>user\n{user_content}<|im_end|>\n"
                 f"<|im_start|>assistant\n"
             )
 
-            # Construct input dict
             input_dict: dict[str, Any] = {"prompt": full_prompt}
             if multi_modal_data:
                 input_dict["multi_modal_data"] = multi_modal_data
@@ -239,7 +216,7 @@ class OmniRunner:
     def generate(
         self,
         prompts: list[dict[str, Any]],
-        sampling_params_list: Optional[list[SamplingParams]] = None,
+        sampling_params_list: list[SamplingParams] | None = None,
     ) -> list[Any]:
         """
         Generate outputs for the given prompts.
@@ -260,13 +237,13 @@ class OmniRunner:
 
     def generate_multimodal(
         self,
-        prompts: Union[list[str], str],
-        sampling_params_list: Optional[list[SamplingParams]] = None,
-        system_prompt: Optional[str] = None,
+        prompts: list[str] | str,
+        sampling_params_list: list[SamplingParams] | None = None,
+        system_prompt: str | None = None,
         audios: PromptAudioInput = None,
         images: PromptImageInput = None,
         videos: PromptVideoInput = None,
-        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """
         Convenience method to generate with multimodal inputs.
@@ -299,12 +276,12 @@ class OmniRunner:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup resources."""
-        if hasattr(self.omni, 'close'):
+        if hasattr(self.omni, "close"):
             self.omni.close()
 
     def close(self):
         """Close and cleanup the Omni instance."""
-        if hasattr(self.omni, 'close'):
+        if hasattr(self.omni, "close"):
             self.omni.close()
 
 
