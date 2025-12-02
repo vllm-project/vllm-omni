@@ -62,7 +62,7 @@ class GPUWorker:
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
         with device:
-            with set_default_torch_dtype(self.od_config.torch_dtype):
+            with set_default_torch_dtype(self.od_config.dtype):
                 self.pipeline = initialize_model(self.od_config)
                 self.pipeline.load_weights()
                 self.pipeline.eval()
