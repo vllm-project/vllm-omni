@@ -6,12 +6,15 @@ with the correct prompt format on Qwen2.5-Omni
 """
 
 import os
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
+import librosa
+import numpy as np
 import soundfile as sf
+from PIL import Image
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
-from vllm.assets.video import VideoAsset
+from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils import FlexibleArgumentParser
@@ -54,7 +57,13 @@ def get_text_query(question: str = None) -> QueryResult:
     )
 
 
-def get_mixed_modalities_query() -> QueryResult:
+def get_mixed_modalities_query(
+    video_path: Optional[str] = None,
+    image_path: Optional[str] = None,
+    audio_path: Optional[str] = None,
+    num_frames: int = 16,
+    sampling_rate: int = 16000,
+) -> QueryResult:
     question = "What is recited in the audio? What is the content of this image? Why is this video funny?"
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
@@ -64,20 +73,49 @@ def get_mixed_modalities_query() -> QueryResult:
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
+
+    # Load video
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+
+    # Load image
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+
+    # Load audio
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
-                "image": convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB"),
-                "video": VideoAsset(name="baby_reading", num_frames=16).np_ndarrays,
+                "audio": audio_data,
+                "image": image_data,
+                "video": video_frames,
             },
         },
         limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
     )
 
 
-def get_use_audio_in_video_query() -> QueryResult:
+def get_use_audio_in_video_query(
+    video_path: Optional[str] = None, num_frames: int = 16, sampling_rate: int = 16000
+) -> QueryResult:
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
@@ -85,14 +123,24 @@ def get_use_audio_in_video_query() -> QueryResult:
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
-    asset = VideoAsset(name="baby_reading", num_frames=16)
-    audio = asset.get_audio(sampling_rate=16000)
+
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+        # Extract audio from video file
+        audio_signal, sr = librosa.load(video_path, sr=sampling_rate)
+        audio = (audio_signal.astype(np.float32), sr)
+    else:
+        asset = VideoAsset(name="baby_reading", num_frames=num_frames)
+        video_frames = asset.np_ndarrays
+        audio = asset.get_audio(sampling_rate=sampling_rate)
 
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "video": asset.np_ndarrays,
+                "video": video_frames,
                 "audio": audio,
             },
             "mm_processor_kwargs": {
@@ -103,7 +151,7 @@ def get_use_audio_in_video_query() -> QueryResult:
     )
 
 
-def get_multi_audios_query() -> QueryResult:
+def get_multi_audios_query(audio_path: Optional[str] = None, sampling_rate: int = 16000) -> QueryResult:
     question = "Are these two audio clips the same?"
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
@@ -112,14 +160,28 @@ def get_multi_audios_query() -> QueryResult:
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
+
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+        # Use the provided audio as the first audio, default as second
+        audio_list = [
+            audio_data,
+            AudioAsset("mary_had_lamb").audio_and_sample_rate,
+        ]
+    else:
+        audio_list = [
+            AudioAsset("winning_call").audio_and_sample_rate,
+            AudioAsset("mary_had_lamb").audio_and_sample_rate,
+        ]
+
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "audio": [
-                    AudioAsset("winning_call").audio_and_sample_rate,
-                    AudioAsset("mary_had_lamb").audio_and_sample_rate,
-                ],
+                "audio": audio_list,
             },
         },
         limit_mm_per_prompt={
@@ -128,17 +190,135 @@ def get_multi_audios_query() -> QueryResult:
     )
 
 
+def get_image_query(question: str = None, image_path: Optional[str] = None) -> QueryResult:
+    if question is None:
+        question = "What is the content of this image?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|vision_bos|><|IMAGE|><|vision_eos|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "image": image_data,
+            },
+        },
+        limit_mm_per_prompt={"image": 1},
+    )
+
+
+def get_video_query(question: str = None, video_path: Optional[str] = None, num_frames: int = 16) -> QueryResult:
+    if question is None:
+        question = "Why is this video funny?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "video": video_frames,
+            },
+        },
+        limit_mm_per_prompt={"video": 1},
+    )
+
+
+def get_audio_query(question: str = None, audio_path: Optional[str] = None, sampling_rate: int = 16000) -> QueryResult:
+    if question is None:
+        question = "What is the content of this audio?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_bos|><|AUDIO|><|audio_eos|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "audio": audio_data,
+            },
+        },
+        limit_mm_per_prompt={"audio": 1},
+    )
+
+
 query_map = {
     "mixed_modalities": get_mixed_modalities_query,
     "use_audio_in_video": get_use_audio_in_video_query,
     "multi_audios": get_multi_audios_query,
+    "use_image": get_image_query,
+    "use_video": get_video_query,
+    "use_audio": get_audio_query,
     "text": get_text_query,
 }
 
 
 def main(args):
     model_name = "Qwen/Qwen2.5-Omni-7B"
-    query_result = query_map[args.query_type]()
+
+    # Get paths from args
+    video_path = getattr(args, "video_path", None)
+    image_path = getattr(args, "image_path", None)
+    audio_path = getattr(args, "audio_path", None)
+    num_frames = getattr(args, "num_frames", 16)
+    sampling_rate = getattr(args, "sampling_rate", 16000)
+
+    # Get the query function and call it with appropriate parameters
+    query_func = query_map[args.query_type]
+    if args.query_type == "mixed_modalities":
+        query_result = query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            num_frames=num_frames,
+            sampling_rate=sampling_rate,
+        )
+    elif args.query_type == "use_audio_in_video":
+        query_result = query_func(video_path=video_path, num_frames=num_frames, sampling_rate=sampling_rate)
+    elif args.query_type == "multi_audios":
+        query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
+    elif args.query_type == "use_image":
+        query_result = query_func(image_path=image_path)
+    elif args.query_type == "use_video":
+        query_result = query_func(video_path=video_path, num_frames=num_frames)
+    elif args.query_type == "use_audio":
+        query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
+    else:
+        query_result = query_func()
 
     omni_llm = Omni(
         model=model_name,
@@ -282,6 +462,39 @@ def parse_args():
         type=str,
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
+    )
+    parser.add_argument(
+        "--video-path",
+        "-v",
+        type=str,
+        default=None,
+        help="Path to local video file. If not provided, uses default video asset.",
+    )
+    parser.add_argument(
+        "--image-path",
+        "-i",
+        type=str,
+        default=None,
+        help="Path to local image file. If not provided, uses default image asset.",
+    )
+    parser.add_argument(
+        "--audio-path",
+        "-a",
+        type=str,
+        default=None,
+        help="Path to local audio file. If not provided, uses default audio asset.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=16,
+        help="Number of frames to extract from video (default: 16).",
+    )
+    parser.add_argument(
+        "--sampling-rate",
+        type=int,
+        default=16000,
+        help="Sampling rate for audio loading (default: 16000).",
     )
 
     return parser.parse_args()
