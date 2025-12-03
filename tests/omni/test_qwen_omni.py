@@ -25,7 +25,9 @@ def test_mixed_modalities_to_audio(omni_runner, model: str, max_tokens: int) -> 
         image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
         video = VideoAsset(name="baby_reading", num_frames=16).np_ndarrays
 
-        sampling_params_list = runner.get_default_sampling_params_list(max_tokens=max_tokens)
+        sampling_params_list = runner.get_greedy_sampling_params_list(
+            max_tokens=max_tokens, talker_stop_token_ids=[8294]
+        )
 
         outputs = runner.generate_multimodal(
             prompts=question,

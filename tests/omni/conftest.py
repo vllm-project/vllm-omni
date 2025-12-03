@@ -58,38 +58,43 @@ class OmniRunner:
             **kwargs,
         )
 
-    def get_default_sampling_params_list(
+    def get_greedy_sampling_params_list(
         self,
         max_tokens: int = 128,
+        detokenize: bool = True,
+        talker_stop_token_ids: list[int] | None = None,
     ) -> list[SamplingParams]:
         """
-        Get default sampling parameters for all three stages.
+        Get greedy sampling parameters for all three stages.
 
         Args:
             max_tokens: Maximum tokens to generate per stage
+            detokenize: Whether to detokenize the output
+            talker_stop_token_ids: Stop token IDs for talker stage
 
         Returns:
             List of SamplingParams for [thinker, talker, code2wav] stages
         """
+
         thinker_params = SamplingParams(
             temperature=0.0,
             top_p=1.0,
             top_k=-1,
             max_tokens=max_tokens,
             seed=self.seed,
-            detokenize=True,
-            repetition_penalty=1.1,
+            detokenize=detokenize,
+            repetition_penalty=1.0,
         )
 
         talker_params = SamplingParams(
-            temperature=0.9,
-            top_p=0.8,
-            top_k=40,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
             max_tokens=max_tokens,
             seed=self.seed,
-            detokenize=True,
-            repetition_penalty=1.05,
-            stop_token_ids=[8294],
+            detokenize=detokenize,
+            repetition_penalty=1.0,
+            stop_token_ids=talker_stop_token_ids,
         )
 
         code2wav_params = SamplingParams(
@@ -98,8 +103,8 @@ class OmniRunner:
             top_k=-1,
             max_tokens=max_tokens,
             seed=self.seed,
-            detokenize=True,
-            repetition_penalty=1.1,
+            detokenize=detokenize,
+            repetition_penalty=1.0,
         )
 
         return [thinker_params, talker_params, code2wav_params]
@@ -224,7 +229,7 @@ class OmniRunner:
             List of OmniRequestOutput objects from stages with final_output=True
         """
         if sampling_params_list is None:
-            sampling_params_list = self.get_default_sampling_params_list()
+            sampling_params_list = self.get_greedy_sampling_params_list()
 
         return self.omni.generate(prompts, sampling_params_list)
 
