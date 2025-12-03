@@ -1,13 +1,11 @@
 steps:
   - label: "Simple Unit Test"
     commands:
-      - ".buildkite/scripts/setup_env.sh"
-      - source .buildkite/scripts/setup_env.sh && "${VENV_PYTHON}" -m pytest -v -s tests/test_omni_llm.py
+      - ".buildkite/scripts/simple_test.sh"
     agents:
       queue: "cpu_queue_premerge"
   - label: "Diffusion Model Test"
     commands:
-      - ".buildkite/scripts/setup_env.sh"
-      - source .buildkite/scripts/setup_env.sh && "${VENV_PYTHON}" -m pytest -s -v tests/test_diffusion_model.py
+      - ".buildkite/scripts/diffusion_model_test.sh"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
