@@ -5,42 +5,33 @@ import glob
 import os
 import time
 from collections.abc import Generator, Iterable
-from typing import cast
 from pathlib import Path
+from typing import cast
 
 import torch
 from torch import nn
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
-    fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
-    get_quant_config,
     maybe_download_from_modelscope,
-    multi_thread_pt_weights_iterator,
-    multi_thread_safetensors_weights_iterator,
-    np_cache_weights_iterator,
-    pt_weights_iterator,
     safetensors_weights_iterator,
 )
-from vllm.platforms import current_platform
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.registry import initialize_model
-
 
 logger = init_logger(__name__)
 
 
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
+
 
 class DiffusersPipelineLoader:
     """Model loader that can load diffusers pipeline components from disk."""
@@ -82,9 +73,7 @@ class DiffusersPipelineLoader:
 
         if unexpected_keys:
             raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{unexpected_keys}"
+                f"Unexpected extra config keys for load format {load_config.load_format}: {unexpected_keys}"
             )
 
     def _prepare_weights(
@@ -98,10 +87,7 @@ class DiffusersPipelineLoader:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        model_name_or_path = (
-            maybe_download_from_modelscope(model_name_or_path, revision)
-            or model_name_or_path
-        )
+        model_name_or_path = maybe_download_from_modelscope(model_name_or_path, revision) or model_name_or_path
 
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
@@ -125,9 +111,7 @@ class DiffusersPipelineLoader:
             allow_patterns = allow_patterns_overrides
 
         if subfolder is not None:
-            allow_patterns = [
-                f"{subfolder}/{pattern}" for pattern in allow_patterns
-            ]
+            allow_patterns = [f"{subfolder}/{pattern}" for pattern in allow_patterns]
 
         if not is_local:
             hf_folder = download_weights_from_hf(
@@ -161,24 +145,17 @@ class DiffusersPipelineLoader:
                     self.load_config.download_dir,
                     revision,
                 )
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
-            )
+            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
-            raise RuntimeError(
-                f"Cannot find any model weights with `{model_name_or_path}`"
-            )
+            raise RuntimeError(f"Cannot find any model weights with `{model_name_or_path}`")
 
         return hf_folder, hf_weights_files, use_safetensors
 
-    def _get_weights_iterator(
-        self, source: "ComponentSource"
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+    def _get_weights_iterator(self, source: "ComponentSource") -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
-        extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
@@ -216,9 +193,7 @@ class DiffusersPipelineLoader:
             allow_patterns_overrides=None,
         )
 
-    def load_model(
-        self, od_config: OmniDiffusionConfig, load_device: str
-    ) -> nn.Module:
+    def load_model(self, od_config: OmniDiffusionConfig, load_device: str) -> nn.Module:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
@@ -239,10 +214,12 @@ class DiffusersPipelineLoader:
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
+        # TODO(Isotr0py): Enable weights loading check after decoupling
+        # all components weights loading.
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
-        # if model_config.quantization is None and loaded_weights is not None:
-        #     weights_not_loaded = weights_to_load - loaded_weights
+        if loaded_weights is not None:
+            _ = weights_to_load - loaded_weights
         #     if weights_not_loaded:
         #         raise ValueError(
         #             "Following weights were not initialized from "

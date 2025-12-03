@@ -5,18 +5,16 @@ import os
 
 import torch
 import zmq
-from vllm.config import VllmConfig, LoadConfig, set_current_vllm_config
+from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)

@@ -6,7 +6,8 @@ import json
 import logging
 import math
 import os
-from typing import Any, Optional, Union, Iterable
+from collections.abc import Iterable
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -20,9 +21,11 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -30,9 +33,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm.model_executor.models.utils import AutoWeightsLoader
-
 
 logger = logging.getLogger(__name__)
 
