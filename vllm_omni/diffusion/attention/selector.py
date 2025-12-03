@@ -22,12 +22,6 @@ SUPPORTED_BACKENDS = {
 }
 
 
-def _backend_name_to_class(backend_name: str) -> type[AttentionBackend] | None:
-    """Convert backend name string to backend class."""
-    backend_name_upper = backend_name.upper()
-    return SUPPORTED_BACKENDS.get(backend_name_upper)
-
-
 @cache
 def get_attn_backend(head_size: int) -> type[AttentionBackend]:
     """
