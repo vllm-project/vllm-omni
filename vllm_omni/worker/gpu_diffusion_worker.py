@@ -10,7 +10,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
 
 def _patch_torch_cuda_for_xpu():
     """Permanently patch torch.cuda APIs to use torch.xpu."""
@@ -34,18 +34,19 @@ def _patch_torch_cuda_for_xpu():
     torch.cuda.default_stream = torch.xpu.current_stream
     torch.cuda.stream = torch.xpu.stream
     
-class GPUARWorker(GPUWorker):
-    """GPU worker for autoregressive omni model stages.
+class GPUDiffusionWorker(GPUWorker):
+    """GPU worker for diffusion-based omni model stages.
 
-    Extends the base GPUWorker to initialize and manage autoregressive
-    model runners for text generation stages (e.g., thinker stages).
+    Extends the base GPUWorker to initialize and manage diffusion model
+    runners for non-autoregressive generation stages (e.g., image or
+    audio generation stages).
     """
 
     def init_device(self):
-        """Initialize the GPU device and autoregressive model runner.
+        """Initialize the GPU device and diffusion model runner.
 
         Sets up CUDA device, initializes distributed environment,
-        sets random seed, and creates a GPUARModelRunner instance.
+        sets random seed, and creates a GPUDiffusionModelRunner instance.
 
         Raises:
             ValueError: If free GPU memory is insufficient for the
@@ -96,6 +97,7 @@ class GPUARWorker(GPUWorker):
                     f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
                     f"utilization or reduce GPU memory used by other processes."
                 )
+        
         elif self.device_config.device.type == "xpu":
             from vllm.distributed import get_world_group
             
@@ -154,8 +156,10 @@ class GPUARWorker(GPUWorker):
         if self.device_config.device.type == "xpu":
             # Patch torch.cuda globally for XPU
             _patch_torch_cuda_for_xpu()
-        
-        self.model_runner: GPUARModelRunner = GPUARModelRunner(self.vllm_config, self.device)
+            
+        # Construct the model runner
+        self.model_runner: GPUDiffusionModelRunner = GPUDiffusionModelRunner(self.vllm_config, self.device)
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)

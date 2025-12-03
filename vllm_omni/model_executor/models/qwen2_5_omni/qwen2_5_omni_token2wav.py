@@ -32,7 +32,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.utils.platform_utils import is_npu, is_xpu
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -730,6 +730,10 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
         kaiser_window = torch.kaiser_window(
             kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
         ).to("npu")
+    elif is_xpu():
+        kaiser_window = torch.kaiser_window(
+            kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
+        ).to("xpu")
     else:
         kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
 

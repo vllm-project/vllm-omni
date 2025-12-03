@@ -20,6 +20,8 @@ def detect_device_type() -> str:
 def is_npu() -> bool:
     return detect_device_type() == "npu"
 
+def is_xpu() -> bool:
+    return detect_device_type() == "xpu"
 
 def get_device_control_env_var() -> str:
     """Return the environment variable name for device visibility control."""
