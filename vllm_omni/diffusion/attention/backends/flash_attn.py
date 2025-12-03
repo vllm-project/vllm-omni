@@ -14,10 +14,12 @@ logger = init_logger(__name__)
 
 # only test with flash_attn v3
 try:
-    # from flash_attn_interface import flash_attn_func as flash_attn_3_func  # not availabe in flash-attn 2.8.1
+    # from flash_attn_interface import flash_attn_func as flash_attn_3_func  # not available in flash-attn 2.8.1
     from flash_attn import flash_attn_func as flash_attn_3_func
 except ImportError:
-    logger.warning("FlashAttentionBackend is not available. You may install flash-attn by running `uv pip install flash-attn==2.8.1 --no-build-isolation`")
+    logger.warning(
+        "FlashAttentionBackend is not available. You may install flash-attn by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
+    )
     flash_attn_3_func = None
 
 
