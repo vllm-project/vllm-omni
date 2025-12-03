@@ -67,14 +67,15 @@ class DiffusersPipelineLoader:
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
 
-        extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
-        unexpected_keys = set(extra_config.keys()) - allowed_keys
+        # TODO(Isotr0py): Enable multithreaded weight loading
+        # extra_config = load_config.model_loader_extra_config
+        # allowed_keys = {"enable_multithread_load", "num_threads"}
+        # unexpected_keys = set(extra_config.keys()) - allowed_keys
 
-        if unexpected_keys:
-            raise ValueError(
-                f"Unexpected extra config keys for load format {load_config.load_format}: {unexpected_keys}"
-            )
+        # if unexpected_keys:
+        #     raise ValueError(
+        #         f"Unexpected extra config keys for load format {load_config.load_format}: {unexpected_keys}"
+        #     )
 
     def _prepare_weights(
         self,
@@ -215,7 +216,7 @@ class DiffusersPipelineLoader:
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
         # TODO(Isotr0py): Enable weights loading check after decoupling
-        # all components weights loading.
+        # all components' weights loading (AutoModel.from_pretrained etc).
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
