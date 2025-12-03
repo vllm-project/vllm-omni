@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 UV_BIN="uv"

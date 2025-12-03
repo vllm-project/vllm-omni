@@ -22,7 +22,6 @@ PATH="${PYTHON_SCRIPTS}:${PATH}"
 if [[ -n "${USER_BASE}" ]]; then
   PATH="${USER_BASE}/bin:${PATH}"
 fi
-export PATH
 
 if ! command -v "${UV_BIN}" >/dev/null 2>&1; then
   "${PYTHON_BOOTSTRAP}" -m pip install --upgrade pip
