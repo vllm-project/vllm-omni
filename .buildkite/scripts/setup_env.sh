@@ -22,6 +22,7 @@ PATH="${PYTHON_SCRIPTS}:${PATH}"
 if [[ -n "${USER_BASE}" ]]; then
   PATH="${USER_BASE}/bin:${PATH}"
 fi
+export PATH
 
 if ! command -v "${UV_BIN}" >/dev/null 2>&1; then
   "${PYTHON_BOOTSTRAP}" -m pip install --upgrade pip
@@ -49,3 +50,14 @@ VENV_PYTHON="${VENV_DIR}/bin/python"
 
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" vllm==0.11.0
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" -e ".[dev]"
+
+PATH="${VENV_DIR}/bin:${PATH}"
+export PATH
+export VIRTUAL_ENV="${VENV_DIR}"
+
+if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
+  {
+    printf 'export VIRTUAL_ENV=%q\n' "${VIRTUAL_ENV}"
+    printf 'export PATH=%q\n' "${PATH}"
+  } >> "${BUILDKITE_ENV_FILE}"
+fi
