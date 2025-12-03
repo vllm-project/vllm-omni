@@ -1,6 +1,6 @@
 # Qwen-Image Offline Inference
 
-Source <https://github.com/vllm-project/vllm/tree/main/examples/offline_inference/qwen_image>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen_image>.
 
 
 This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
