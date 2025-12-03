@@ -5,9 +5,6 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
   - label: "Diffusion Model Test"
-    source_file_dependencies:
-      - "vllm_omni/diffusion/"
-      - "vllm_omni/entrypoints"
     commands:
       - ".buildkite/scripts/diffusion_model_test.sh"
     agents:
