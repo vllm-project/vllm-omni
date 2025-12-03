@@ -53,7 +53,7 @@ class GPUWorker:
         torch.cuda.set_device(device)
 
         # hack
-        vllm_config = VllmConfig(load_config=LoadConfig(load_format=self.od_config.load_format))
+        vllm_config = VllmConfig(load_config=LoadConfig())
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
         set_current_vllm_config(vllm_config)
 

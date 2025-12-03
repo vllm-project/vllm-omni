@@ -22,7 +22,6 @@ class OmniDiffusionConfig:
     model_class_name: str | None = None
 
     dtype: torch.dtype = torch.bfloat16
-    load_format: str = "auto"
 
     # Attention
     # attention_backend: str = None
