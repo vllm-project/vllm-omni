@@ -28,10 +28,23 @@ def load_stage_configs_from_model(model: str) -> list:
     """
     hf_config = get_config(model, trust_remote_code=True)
     model_type = hf_config.model_type
+
     # Structural override: "Thinking" checkpoints only ship the thinker component
     # (no talker/code2wav configs) but reuse the base qwen3_omni_moe model_type.
-    # Detect this from the HF config instead of relying on the model path string.
-    if model_type == "qwen3_omni_moe" and not hasattr(hf_config, "talker_config"):
+    # Detect this using multiple hints so users don't need to manually rewrite
+    # the stage config path.
+    is_qwen3_omni_moe_thinking = (
+        model_type == "qwen3_omni_moe"
+        and (
+            "thinking" in str(model).lower()
+            or hf_config.__class__.__name__.lower().startswith("qwen3omnimoethinker")
+            or (
+                getattr(hf_config, "talker_config", None) is None
+                and getattr(hf_config, "code2wav_config", None) is None
+            )
+        )
+    )
+    if is_qwen3_omni_moe_thinking:
         model_type = "qwen3_omni_moe_thinking"
     device_type = detect_device_type()
 
