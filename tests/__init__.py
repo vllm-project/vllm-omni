@@ -1,6 +1,6 @@
 """
-Test suite for vLLM-omni.
+Test suite for vLLM-Omni.
 
 This package contains unit tests, integration tests, and benchmarks
-for vLLM-omni.
+for vLLM-Omni.
 """

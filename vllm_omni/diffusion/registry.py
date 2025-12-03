@@ -12,6 +12,11 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image",
         "QwenImagePipeline",
     ),
+    "ZImagePipeline": (
+        "z_image",
+        "pipeline_z_image",
+        "ZImagePipeline",
+    ),
 }
 
 
@@ -24,6 +29,13 @@ def initialize_model(
         module = importlib.import_module(module_name)
         model_class = getattr(module, cls_name)
         model = model_class(od_config=od_config, prefix=mod_relname)
+
+        # Configure VAE memory optimization settings from config
+        if hasattr(model.vae, "use_slicing"):
+            model.vae.use_slicing = od_config.vae_use_slicing
+        if hasattr(model.vae, "use_tiling"):
+            model.vae.use_tiling = od_config.vae_use_tiling
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
@@ -34,6 +46,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # `post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImagePipeline": "get_qwen_image_post_process_func",
+    "ZImagePipeline": "get_post_process_func",
 }
 
 

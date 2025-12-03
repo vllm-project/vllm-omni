@@ -15,7 +15,7 @@ from PIL import Image
 from vllm.assets.video import video_get_metadata, video_to_ndarrays
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 # Import utils from offline inference example
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../offline_inference/qwen3_omni"))
@@ -42,19 +42,20 @@ SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
                 "seed": SEED,
             },
             "talker": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
+                "temperature": 0.9,
+                "top_k": 50,
                 "max_tokens": 4096,
-                "detokenize": True,
-                "repetition_penalty": 1.1,
+                "seed": SEED,
+                "detokenize": False,
+                "repetition_penalty": 1.05,
                 "stop_token_ids": [2150],
             },
             "code2wav": {
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "top_k": -1,
-                "max_tokens": 2048,
+                "max_tokens": 4096 * 16,
+                "seed": SEED,
                 "detokenize": True,
                 "repetition_penalty": 1.1,
             },
@@ -238,8 +239,8 @@ def process_video_file(
     return frames, metadata, audio_tuple
 
 
-async def run_inference_async_omni_llm(
-    omni_llm: AsyncOmniLLM,
+async def run_inference_async_omni(
+    omni: AsyncOmni,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     user_prompt: str,
@@ -248,7 +249,7 @@ async def run_inference_async_omni_llm(
     video_file: Optional[str] = None,
     use_audio_in_video: bool = False,
 ):
-    """Run inference using AsyncOmniLLM directly with multimodal support."""
+    """Run inference using AsyncOmni directly with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
         return "Please provide at least a text prompt or multimodal input.", None
 
@@ -263,7 +264,7 @@ async def run_inference_async_omni_llm(
         # Process audio
         audio_data = process_audio_file(audio_file)
         if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
+            multi_modal_data["audio"] = [audio_data] if not isinstance(audio_data, list) else audio_data
 
         # Process image
         image_data = process_image_file(image_file)
@@ -281,7 +282,9 @@ async def run_inference_async_omni_llm(
                 video_entry = video_frames
             multi_modal_data["video"] = video_entry
             if use_audio_in_video and extracted_audio is not None and "audio" not in multi_modal_data:
-                multi_modal_data["audio"] = extracted_audio
+                multi_modal_data["audio"] = (
+                    [extracted_audio] if not isinstance(extracted_audio, list) else extracted_audio
+                )
                 mm_processor_kwargs["use_audio_in_video"] = True
 
         # Build the prompt input
@@ -310,11 +313,11 @@ async def run_inference_async_omni_llm(
             )
             prompt = f"<|im_start|>system\n{default_system}<|im_end|>\n<|im_start|>user\n"
             if audio_data:
-                prompt += "<|audio_bos|><|AUDIO|><|audio_eos|>"
+                prompt += "<|audio_start|><|audio_pad|><|audio_end|>"
             if image_data:
-                prompt += "<|vision_bos|><|IMAGE|><|vision_eos|>"
+                prompt += "<|vision_start|><|image_pad|><|vision_end|>"
             if video_payload is not None:
-                prompt += "<|vision_bos|><|VIDEO|><|vision_eos|>"
+                prompt += "<|vision_start|><|video_pad|><|vision_end|>"
             if user_prompt.strip():
                 prompt += f"{user_prompt}"
             prompt += "<|im_end|>\n<|im_start|>assistant\n"
@@ -330,7 +333,7 @@ async def run_inference_async_omni_llm(
         text_outputs: list[str] = []
         audio_output = None
 
-        async for stage_outputs in omni_llm.generate(
+        async for stage_outputs in omni.generate(
             prompt=omni_prompt,
             request_id=request_id,
             sampling_params_list=sampling_params,
@@ -344,14 +347,15 @@ async def run_inference_async_omni_llm(
                             text_outputs.append(output.text)
             elif stage_outputs.final_output_type == "audio":
                 # multimodal_output is on the RequestOutput object
-                # See vllm_omni/entrypoints/openai/serving_chat.py:680 for reference
+                # See vllm_omni/entrypoints/openai/serving_chat.py:733 for reference
                 if hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
                     if "audio" in request_output.multimodal_output:
                         audio_tensor = request_output.multimodal_output["audio"]
                         # Ensure audio is 1D (flatten if needed)
                         if hasattr(audio_tensor, "ndim") and audio_tensor.ndim > 1:
                             audio_tensor = audio_tensor.flatten()
-                        audio_np = audio_tensor.detach().cpu().numpy()
+                        # Convert BFloat16 to Float32 before numpy conversion (numpy doesn't support BFloat16)
+                        audio_np = audio_tensor.float().detach().cpu().numpy()
                         audio_output = (
                             24000,  # sampling rate in Hz
                             audio_np,
@@ -364,12 +368,12 @@ async def run_inference_async_omni_llm(
 
 
 def build_interface(
-    omni_llm: AsyncOmniLLM,
+    omni: AsyncOmni,
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     model: str,
 ):
-    """Build Gradio interface for AsyncOmniLLM mode."""
+    """Build Gradio interface for AsyncOmni mode."""
 
     async def run_inference(
         user_prompt: str,
@@ -378,8 +382,8 @@ def build_interface(
         video_file: Optional[str],
         use_audio_in_video: bool,
     ):
-        return await run_inference_async_omni_llm(
-            omni_llm,
+        return await run_inference_async_omni(
+            omni,
             sampling_params,
             prompt_args_template,
             user_prompt,
@@ -477,7 +481,7 @@ def build_interface(
 
 def main():
     args = parse_args()
-    omni_llm = None
+    omni = None
 
     model_name = "/".join(args.model.split("/")[-2:])
     assert model_name in SUPPORTED_MODELS, (
@@ -487,9 +491,9 @@ def main():
     # Register signal handlers for graceful shutdown
     def signal_handler(sig, frame):
         print("\nReceived interrupt signal, shutting down...")
-        if omni_llm is not None:
+        if omni is not None:
             try:
-                omni_llm.shutdown()
+                omni.shutdown()
             except Exception as e:
                 print(f"Error during shutdown: {e}")
         sys.exit(0)
@@ -497,21 +501,21 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print(f"Initializing AsyncOmniLLM with model: {args.model}")
+    print(f"Initializing AsyncOmni with model: {args.model}")
     if args.stage_configs_path:
         print(f"Using custom stage configs: {args.stage_configs_path}")
 
     sampling_params = build_sampling_params(SEED, model_name)
-    omni_llm = AsyncOmniLLM(
+    omni = AsyncOmni(
         model=args.model,
         stage_configs_path=args.stage_configs_path,
         init_timeout=ASYNC_INIT_TIMEOUT,
     )
-    print("✓ AsyncOmniLLM initialized successfully")
+    print("✓ AsyncOmni initialized successfully")
     prompt_args_template = create_prompt_args(args)
 
     demo = build_interface(
-        omni_llm,
+        omni,
         sampling_params,
         prompt_args_template,
         args.model,
@@ -526,9 +530,9 @@ def main():
         print("\nShutting down...")
     finally:
         # Cleanup
-        if omni_llm is not None:
+        if omni is not None:
             try:
-                omni_llm.shutdown()
+                omni.shutdown()
             except Exception as e:
                 print(f"Error during cleanup: {e}")
 

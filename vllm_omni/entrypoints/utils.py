@@ -1,13 +1,10 @@
-from __future__ import annotations
-
-import logging
 import os
 from pathlib import Path
 
 from omegaconf import OmegaConf
 from vllm.transformers_utils.config import get_config
 
-logger = logging.getLogger(__name__)
+from vllm_omni.utils import detect_device_type
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -16,9 +13,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 def load_stage_configs_from_model(model: str) -> list:
     """Load stage configurations from model's default config file.
 
-    Loads stage configurations based on the model type. Looks for a
-    YAML configuration file in the stage_configs directory matching
-    the model's model_type.
+    Loads stage configurations based on the model type and device type.
+    First tries to load a device-specific YAML file from stage_configs/{device_type}/
+    directory. If not found, falls back to the default config file.
 
     Args:
         model: Model name or path (used to determine model_type)
@@ -31,6 +28,17 @@ def load_stage_configs_from_model(model: str) -> list:
     """
     hf_config = get_config(model, trust_remote_code=True)
     model_type = hf_config.model_type
+    device_type = detect_device_type()
+
+    # Try device-specific config first
+    if device_type != "cuda":
+        device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
+        device_config_path = PROJECT_ROOT / device_config_file
+        if os.path.exists(device_config_path):
+            stage_configs = load_stage_configs_from_yaml(config_path=str(device_config_path))
+            return stage_configs
+
+    # Fall back to default config
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):

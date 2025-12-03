@@ -32,7 +32,7 @@ from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     maybe_dump_to_shm,
     maybe_load_from_ipc_with_metrics,
-    set_stage_gpu_devices,
+    set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -295,6 +295,8 @@ class OmniStage:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
             source_outputs = stage_list[source_stage_id].engine_outputs
+            if not isinstance(prompt, list):
+                prompt = [prompt]
             multi_modal_data = {
                 source_output.request_id: p.get("multi_modal_data", None)
                 for source_output, p in zip(source_outputs, prompt)
@@ -425,7 +427,10 @@ def _stage_worker(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
+        from vllm_omni.utils import detect_device_type
+
+        device_type = detect_device_type()
+        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
@@ -666,7 +671,7 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
-    from vllm_omni.entrypoints.async_omni_llm import AsyncOmniStageLLM
+    from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
@@ -717,7 +722,10 @@ async def _stage_worker_async(
 
     # Device mapping
     try:
-        set_stage_gpu_devices(stage_id, runtime_cfg.get("devices"))
+        from vllm_omni.utils import detect_device_type
+
+        device_type = detect_device_type()
+        set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 

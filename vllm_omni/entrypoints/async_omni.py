@@ -51,7 +51,7 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
-class AsyncOmniLLM(EngineClient):
+class AsyncOmni(EngineClient):
     """Async entry point for vLLM-Omni inference.
 
     This class provides an asynchronous interface for running multi-modal
@@ -75,7 +75,7 @@ class AsyncOmniLLM(EngineClient):
         **kwargs: Additional keyword arguments passed to stage engines
 
     Example:
-        >>> async_llm = AsyncOmniLLM(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
         >>> async for output in async_llm.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
@@ -90,7 +90,7 @@ class AsyncOmniLLM(EngineClient):
         stage_configs_path: Optional[str] = None,
         log_stats: bool = False,
         log_file: Optional[str] = None,
-        init_sleep_seconds: int = 20,
+        init_sleep_seconds: int = 30,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 60000,
@@ -175,7 +175,7 @@ class AsyncOmniLLM(EngineClient):
 
         Sends shutdown signals to all stage input queues and stops
         all stage worker processes. This method should be called
-        when done using the AsyncOmniLLM instance.
+        when done using the AsyncOmni instance.
         """
         for q in self._stage_in_queues:
             try:
@@ -193,7 +193,7 @@ class AsyncOmniLLM(EngineClient):
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
-        print("[AsyncOmniLLM] __del__ close()", flush=True)
+        print("[AsyncOmni] __del__ close()", flush=True)
         raise Exception("test")
         try:
             self.close()
@@ -611,13 +611,13 @@ class AsyncOmniLLM(EngineClient):
         **kwargs,
     ):
         """Generate outputs for a request from a pooling model."""
-        raise NotImplementedError("encode() is not implemented for AsyncOmniLLM")
+        raise NotImplementedError("encode() is not implemented for AsyncOmni")
 
     async def start_profile(self) -> None:
-        raise NotImplementedError("start_profile() is not implemented for AsyncOmniLLM")
+        raise NotImplementedError("start_profile() is not implemented for AsyncOmni")
 
     async def stop_profile(self) -> None:
-        raise NotImplementedError("stop_profile() is not implemented for AsyncOmniLLM")
+        raise NotImplementedError("stop_profile() is not implemented for AsyncOmni")
 
 
 class AsyncOmniStageLLM(AsyncLLM):

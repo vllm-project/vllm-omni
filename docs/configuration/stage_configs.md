@@ -2,6 +2,9 @@
 
 In vLLM-Omni, the target model is separated into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other types of engines. Depending on different types of stages, such as Autoregressive (AR) stage or Diffusion transformer (DiT) stage, each can choose corresponding schedulers, model workers to load with the Engines in a plug-in fashion.
 
+!!! note
+    Default stage config YAMLs (for example, `vllm_omni/model_executor/stage_configs/qwen2_5_omni.yaml` and `vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml`) are bundled and loaded automatically when `stage_configs_path` is not provided. They have been verified to work on 1xH100 for Qwen2.5-Omni and 2xH100 for Qwen3-Omni.
+
 Therefore, as a core part of vLLM-Omni, the stage configs for a model have several main functions:
 
 - Claim partition of stages and their corresponding class implementation in `model_executor/models`.
@@ -44,7 +47,7 @@ stage_args:
       trust_remote_code: true # Needed by huggingface config parsing
       engine_output_type: latent  # It claims that the stage will input latent hiddenstates besides token ids
       enable_prefix_caching: false # For request with hiddenstates output, the prefix caching is not supported now
-    is_comprehension: true # If the stage is a text or multimodal comprehension module. If it is, the AsyncOmniLLM will use its tokenizer as default
+    is_comprehension: true # If the stage is a text or multimodal comprehension module. If it is, the AsyncOmni will use its tokenizer as default
     final_output: true # If the stage has output as part of final outputs. If it is false, which means that the stage only works as a intermediate role.
     final_output_type: text # What is the final output type. It can be text and audio now.
     default_sampling_params: # sampling parameters for the stage. Their meaning aligns with vLLM.
@@ -206,7 +209,7 @@ Default: `false`
 
 ### `is_comprehension`
 
-Whether this stage is a text or multimodal comprehension module. When set to `true`, the stage acts as a comprehension module that processes input text or multimodal content. If this is the first comprehension stage, `AsyncOmniLLM` will use its tokenizer as the default tokenizer for the entire pipeline.
+Whether this stage is a text or multimodal comprehension module. When set to `true`, the stage acts as a comprehension module that processes input text or multimodal content. If this is the first comprehension stage, `AsyncOmni` will use its tokenizer as the default tokenizer for the entire pipeline.
 
 Default: `true`
 

@@ -1,6 +1,6 @@
 # Qwen-Image Offline Inference
 
-Source <https://github.com/vllm-project/vllm/tree/main/examples/offline_inference/qwen_image>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen_image>.
 
 
 This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
@@ -49,9 +49,9 @@ Then open `http://localhost:7862/` on your local browser to interact with the we
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/offline_inference/qwen_image/gradio_demo.py"
+    --8<-- "examples/offline_inference/qwen_image/gradio_demo.py"
     ``````
 ??? abstract "text_to_image.py"
     ``````py
-    --8<-- "/mnt/vllm_open_release/vllm-omni-cursor/vllm-omni/examples/offline_inference/qwen_image/text_to_image.py"
+    --8<-- "examples/offline_inference/qwen_image/text_to_image.py"
     ``````

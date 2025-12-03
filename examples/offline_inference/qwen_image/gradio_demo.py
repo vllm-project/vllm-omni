@@ -5,6 +5,7 @@ import gradio as gr
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
     "1:1": (1328, 1328),
@@ -58,11 +59,18 @@ def parse_args() -> argparse.Namespace:
 
 @lru_cache(maxsize=1)
 def get_omni(model_name: str) -> Omni:
-    return Omni(model=model_name)
+    # Enable VAE memory optimizations on NPU
+    vae_use_slicing = is_npu()
+    vae_use_tiling = is_npu()
+    return Omni(
+        model=model_name,
+        vae_use_slicing=vae_use_slicing,
+        vae_use_tiling=vae_use_tiling,
+    )
 
 
 def build_demo(args: argparse.Namespace) -> gr.Blocks:
-    device = "cuda"
+    device = detect_device_type()
     omni = get_omni(args.model)
 
     def run_inference(

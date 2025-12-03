@@ -9,7 +9,7 @@ This directory contains the source files for the vLLM-Omni documentation.
 Install documentation dependencies:
 
 ```bash
-pip install -e ".[docs]"
+uv pip install -e ".[docs]"
 ```
 
 ### Build and Serve Documentation
@@ -84,7 +84,7 @@ The documentation is automatically deployed to GitHub Pages using GitHub Actions
    ```
 
 3. **Documentation will be available at**:
-   - `https://vllm-project.github.io/vllm-omni/`
+   - `https://vllm-omni.readthedocs.io`
 
 The GitHub Actions workflow (`.github/workflows/docs.yml`) will automatically:
 - Build the documentation when you push to `main` branch

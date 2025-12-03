@@ -15,6 +15,9 @@ from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.request import OmniRequest
 
 for module_name, module in sys.modules.items():
+    # only do patch on module of vllm, pass others
+    if "vllm" not in module_name:
+        continue
     if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
         module.EngineCoreOutput = OmniEngineCoreOutput
     if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:

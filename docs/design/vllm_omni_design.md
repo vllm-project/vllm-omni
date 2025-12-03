@@ -14,7 +14,7 @@ vLLM-Omni is a multi-modality extension for vLLM that supports non-autoregressiv
 
 ## Key Data Flow
 
-API Server --> OmniLLM/AsyncOmniLLM (New, including multi engines) --> LLMEngine/AsyncLLM --> Engine Core
+API Server --> OmniLLM/AsyncOmni (New, including multi engines) --> LLMEngine/AsyncLLM --> Engine Core
  --> Scheduler (New one for DiT) --> Executor (New one for diffusers) --> Worker (New one for DiT)
  --> ModelRunner (New one for AR hiddenstate, New one for DiT) --> RequestState --> OutputProcessoer (New one for final multimodal output)
 
@@ -40,7 +40,7 @@ graph TD
     B --> C{Detect --omni flag}
     C -->|Yes| D[Parse OmniConfig]
     C -->|No| E[Forward to vLLM CLI]
-    D --> F[Initialize AsyncOmniLLM]
+    D --> F[Initialize AsyncOmni]
     F --> G[Start omni Server]
     G --> H[Multi-stage Processing]
     E --> I[Standard vLLM Pipeline]
@@ -209,7 +209,7 @@ Similar to OmniLLM in offline inference, add some asynchronous processing, refer
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
-class AsyncOmniLLM(AsyncLLM):
+class AsyncOmni(AsyncLLM):
     """Extended AsyncLLM supporting multiple engines and stage-based processing"""
 
     def __init__(self, stage_configs: List[StageConfig]):
@@ -449,15 +449,15 @@ AsyncLLM.add_request()
 ↓
 OutputProcessor.add_request()
 ↓
-RequestState.from_new_request() → 创建请求状态
+RequestState.from_new_request() → create request state
 
-AsyncLLM.__init__() / AsyncLLM.generate() / AsyncLLM.encode() →  创建一个Background loop 持续从EngineCore获取输出
+AsyncLLM.__init__() / AsyncLLM.generate() / AsyncLLM.encode() →  create a background loop that continuously pulls output from EngineCore
 ↓
-OutputProcessor.process_outputs() → 更新状态并处理输出
+OutputProcessor.process_outputs() → update state and process outputs
 ↓
-RequestState.make_request_output() → 转换为最终输出,格式为RequestOutput或者PoolingRequestOutput
+RequestState.make_request_output() → convert to the final output, formatted as RequestOutput or PoolingRequestOutput
 ↓
-RequestOutputCollector.put() → 推送到队列（AsyncLLM）
+RequestOutputCollector.put() → push to the queue (AsyncLLM)
 ```
 
 Need to add implementation for an existing method

@@ -13,100 +13,143 @@ from omegaconf import OmegaConf
 logger = logging.getLogger(__name__)
 
 
-def set_stage_gpu_devices(stage_id: int, devices: str | int | None) -> None:
-    """Configure per-stage CUDA visibility and current device.
+def set_stage_devices(
+    stage_id: int,
+    devices: str | int | None,
+    device_type: str | None = None,
+) -> None:
+    """Configure per-stage device visibility and current device (CUDA or NPU).
 
-    Behavior
-    - Comma-separated string (e.g. "2,5,7"): set CUDA_VISIBLE_DEVICES exactly
-      to this list; logical index 0 is used as current device.
-    - Integer or digit-string: treat as logical index (0-based) into the current
-      CUDA_VISIBLE_DEVICES mapping; map to the physical device, and then set
-      CUDA_VISIBLE_DEVICES to this single device.
-    - None/"cpu": keep default visibility.
-    - Otherwise: set CUDA_VISIBLE_DEVICES to the provided single device string.
+    This function sets environment variables that control which devices are visible
+    to the process, and sets the current device. It must be called BEFORE worker
+    initialization so that workers see the correct devices.
+
+    Args:
+        stage_id: Stage identifier for logging
+        devices: Device specification:
+            - Comma-separated string (e.g. "2,5,7"): set device visibility env var
+              exactly to this list; logical index 0 is used as current device.
+            - Integer or digit-string: treat as logical index (0-based) into the
+              current device visibility mapping; map to physical device, then set
+              env var to this single device.
+            - None/"cpu": keep default visibility.
+            - Otherwise: set env var to the provided single device string.
+        device_type: Device type ("cuda" or "npu"). If None, auto-detects.
+
+    Behavior:
+        - CUDA: Sets CUDA_VISIBLE_DEVICES and calls torch.cuda.set_device()
+        - NPU: Sets ASCEND_RT_VISIBLE_DEVICES and calls torch.npu.set_device()
     """
+    from vllm_omni.utils import detect_device_type, get_device_control_env_var
+
+    if device_type is None:
+        device_type = detect_device_type()
+
+    env_var = get_device_control_env_var()
+
+    # Select device-specific torch functions
+    if device_type == "npu":
+        try:
+            import torch.npu  # type: ignore[import-untyped]
+        except ImportError:
+            logger.debug("[Stage-%s] torch.npu not available, skipping NPU device setup", stage_id)
+            return
+
+        is_available_fn = torch.npu.is_available
+        set_device_fn = torch.npu.set_device
+        device_count_fn = torch.npu.device_count
+        get_device_properties_fn = torch.npu.get_device_properties
+        mem_get_info_fn = torch.npu.mem_get_info
+        get_device_name_fn = torch.npu.get_device_name
+        device_type_label = "NPU"
+    elif device_type == "cuda":
+        import torch  # noqa: WPS433
+
+        is_available_fn = torch.cuda.is_available
+        set_device_fn = torch.cuda.set_device
+        device_count_fn = torch.cuda.device_count
+        get_device_properties_fn = torch.cuda.get_device_properties
+        mem_get_info_fn = torch.cuda.mem_get_info
+        get_device_name_fn = torch.cuda.get_device_name
+        device_type_label = "CUDA"
+    else:
+        logger.debug("[Stage-%s] Unsupported device type: %s", stage_id, device_type)
+        return
+
     try:
         selected_physical: int | None = None
         logical_idx: int | None = None
 
         if isinstance(devices, str) and "," in devices:
-            os.environ["CUDA_VISIBLE_DEVICES"] = devices
+            os.environ[env_var] = devices
             toks = [t.strip() for t in devices.split(",") if t.strip() != ""]
             if toks:
                 try:
                     selected_physical = int(toks[0])
                     logger.debug(
-                        "[Stage-%s] Set CUDA_VISIBLE_DEVICES to %s; logical 0 -> physical %s",
+                        "[Stage-%s] Set %s to %s; logical 0 -> physical %s",
                         stage_id,
+                        env_var,
                         devices,
                         selected_physical,
                     )
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to parse first CUDA device: %s", stage_id, e)
+                    logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type_label, e)
                     selected_physical = None
         elif isinstance(devices, (int, str)) and (isinstance(devices, int) or str(devices).isdigit()):
             logical_idx = max(0, int(devices))
-            vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+            vis = os.environ.get(env_var)
             if vis:
                 try:
                     mapping = [int(x) for x in vis.split(",") if x.strip() != ""]
                     if 0 <= logical_idx < len(mapping):
                         selected_physical = mapping[logical_idx]
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to map logical index via CUDA_VISIBLE_DEVICES: %s", stage_id, e)
+                    logger.debug("[Stage-%s] Failed to map logical index via %s: %s", stage_id, env_var, e)
                     selected_physical = None
             if selected_physical is None:
                 selected_physical = int(logical_idx)
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_physical)
+            os.environ[env_var] = str(selected_physical)
             logger.debug(
-                "[Stage-%s] Logical index %d -> physical %s; set CUDA_VISIBLE_DEVICES to single device",
+                "[Stage-%s] Logical index %d -> physical %s; set %s to single device",
                 stage_id,
                 logical_idx + 1,
                 selected_physical,
+                env_var,
             )
         elif devices in (None, "cpu"):
             logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
         else:
             selected_physical = int(str(devices))
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(selected_physical)
-            logger.debug(
-                "[Stage-%s] Set CUDA_VISIBLE_DEVICES to single device %s (fallback)", stage_id, selected_physical
-            )
+            os.environ[env_var] = str(selected_physical)
+            logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
 
         try:
-            import torch
+            import torch  # noqa: WPS433
 
-            if torch.cuda.is_available():
+            if is_available_fn():
                 try:
-                    torch.cuda.set_device(0)
+                    set_device_fn(0)
                 except Exception as e:
                     logger.debug(
-                        "[Stage-%s] torch.cuda.set_device(0) failed: %s",
-                        stage_id,
-                        e,
-                        exc_info=True,
+                        "[Stage-%s] %s set_device(0) failed: %s", stage_id, device_type_label, e, exc_info=True
                     )
-                num = torch.cuda.device_count()
+                num = device_count_fn()
                 info = []
                 for i in range(num):
-                    total = torch.cuda.get_device_properties(i).total_memory
-                    free, _ = torch.cuda.mem_get_info(i)
+                    total = get_device_properties_fn(i).total_memory
+                    free, _ = mem_get_info_fn(i)
                     info.append(
                         {
                             "idx": i,
-                            "name": torch.cuda.get_device_name(i),
+                            "name": get_device_name_fn(i),
                             "total": int(total),
                             "free": int(free),
                         }
                     )
-                logger.debug("[Stage-%s] CUDA devices visible=%s info=%s", stage_id, num, info)
+                logger.debug("[Stage-%s] %s devices visible=%s info=%s", stage_id, device_type_label, num, info)
         except Exception as e:
-            logger.debug(
-                "[Stage-%s] Failed to query CUDA devices: %s",
-                stage_id,
-                e,
-                exc_info=True,
-            )
+            logger.debug("[Stage-%s] Failed to query %s devices: %s", stage_id, device_type_label, e, exc_info=True)
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
 

@@ -21,6 +21,8 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    dtype: torch.dtype = torch.bfloat16
+
     # Attention
     # attention_backend: str = None
 
@@ -79,6 +81,10 @@ class OmniDiffusionConfig:
     image_encoder_cpu_offload: bool = True
     vae_cpu_offload: bool = True
     pin_cpu_memory: bool = True
+
+    # VAE memory optimization parameters
+    vae_use_slicing: bool = False
+    vae_use_tiling: bool = False
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None

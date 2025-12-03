@@ -44,7 +44,7 @@ uv pip install vllm==0.11.0 --torch-backend=auto
 Install additional requirements for vLLM-Omni
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm_omni
+cd vllm-omni
 uv pip install -e .
 ```
 
