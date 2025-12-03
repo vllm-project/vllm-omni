@@ -629,9 +629,9 @@ class QwenImageTransformer2DModel(nn.Module):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # self-attn
-            (".to_qkv_proj", ".to_q", "q"),
-            (".to_qkv_proj", ".to_k", "k"),
-            (".to_qkv_proj", ".to_v", "v"),
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
             # cross-attn
             (".add_kv_proj", ".add_q_proj", "q"),
             (".add_kv_proj", ".add_k_proj", "k"),
