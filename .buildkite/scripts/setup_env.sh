@@ -50,12 +50,3 @@ VENV_PYTHON="${VENV_DIR}/bin/python"
 
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" vllm==0.11.0
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" -e ".[dev]"
-
-PATH="${VENV_DIR}/bin:${PATH}"
-export PATH
-export VIRTUAL_ENV="${VENV_DIR}"
-
-if command -v buildkite-agent >/dev/null 2>&1; then
-  buildkite-agent env set VIRTUAL_ENV "${VIRTUAL_ENV}"
-  buildkite-agent env set PATH "${PATH}"
-fi
