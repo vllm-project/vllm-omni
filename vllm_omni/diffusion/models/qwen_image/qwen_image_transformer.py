@@ -608,15 +608,53 @@ class QwenImageTransformer2DModel(nn.Module):
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=attention_kwargs,
+        # TeaCache integration
+        teacache_enabled = hasattr(self, "_teacache_wrapper") and self._teacache_wrapper is not None
+        if teacache_enabled:
+            # Make caching decision
+            should_compute = self._teacache_wrapper.should_compute_full_transformer(
+                self, hidden_states, temb
             )
+
+            if not should_compute and self._teacache_wrapper.get_cached_residual() is not None:
+                # Fast path: apply cached residuals
+                hidden_states = hidden_states + self._teacache_wrapper.get_cached_residual()
+                encoder_residual = self._teacache_wrapper.get_cached_encoder_residual()
+                if encoder_residual is not None:
+                    encoder_hidden_states = encoder_hidden_states + encoder_residual
+            else:
+                # Slow path: full computation
+                ori_hidden_states = hidden_states.clone()
+                ori_encoder_hidden_states = encoder_hidden_states.clone()
+
+                for index_block, block in enumerate(self.transformer_blocks):
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_hidden_states_mask=encoder_hidden_states_mask,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        joint_attention_kwargs=attention_kwargs,
+                    )
+
+                # Cache the residuals
+                residual = hidden_states - ori_hidden_states
+                encoder_residual = encoder_hidden_states - ori_encoder_hidden_states
+                self._teacache_wrapper.cache_residual(residual, encoder_residual)
+
+            # Increment counter
+            self._teacache_wrapper.increment_counter()
+        else:
+            # Normal forward pass without TeaCache
+            for index_block, block in enumerate(self.transformer_blocks):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    temb=temb,
+                    image_rotary_emb=image_rotary_emb,
+                    joint_attention_kwargs=attention_kwargs,
+                )
 
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
