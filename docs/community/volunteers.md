@@ -1,6 +1,6 @@
 # Volunteers for Bugfix and CI
 
-We encourge you to check current docs and [issues](https://github.com/vllm-project/vllm-omni/issues) to find possbile solutions for your questions. If non of these can solve it, please propose an issue to describe your questions about bug or CI problems for developing.
+We encourage you to check current docs and [issues](https://github.com/vllm-project/vllm-omni/issues) to find possible solutions for your questions. If non of these can solve it, please propose an issue to describe your questions about bug or CI problems for developing.
 
 If you have urgent need for locating and solving bugfix or CI problems, please find community volunteers below.
 
