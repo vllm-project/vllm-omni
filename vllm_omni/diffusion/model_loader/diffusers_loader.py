@@ -90,6 +90,7 @@ class DiffusersPipelineLoader:
     def _prepare_weights(
         self,
         model_name_or_path: Path,
+        subfolder: str | None,
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
@@ -122,6 +123,11 @@ class DiffusersPipelineLoader:
 
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
+
+        if subfolder is not None:
+            allow_patterns = [
+                f"{subfolder}/{pattern}" for pattern in allow_patterns
+            ]
 
         if not is_local:
             hf_folder = download_weights_from_hf(
@@ -173,9 +179,9 @@ class DiffusersPipelineLoader:
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        model_name_or_path = Path(source.model_or_path) / source.subfolder if source.subfolder else Path(source.model_or_path)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            model_name_or_path,
+            source.model_or_path,
+            source.subfolder,
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
