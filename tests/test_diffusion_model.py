@@ -1,4 +1,5 @@
 import pytest
+import torch
 
 from vllm_omni import Omni
 
@@ -16,6 +17,8 @@ def test_diffusion_model(model_name: str):
         height=height,
         width=width,
         num_inference_steps=9,
+        guidance_scale=0.0,
+        generator=torch.Generator("cuda").manual_seed(42),
     )
     # check image size
     assert image[0].width == width
