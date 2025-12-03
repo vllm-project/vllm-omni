@@ -9,6 +9,9 @@ Please refer to [README.md](https://github.com/vllm-project/vllm/tree/main/READM
 
 ## Run examples (Qwen3-Omni)
 
+!!! note
+    On ROCm, for vLLM v0.11.0, you have to set `MIOPEN_FIND_MODE=FAST`. Run `export MIOPEN_FIND_MODE=FAST`, before you run your command.
+
 Launch the server
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091

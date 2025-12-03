@@ -9,6 +9,16 @@ Please refer to [README.md](https://github.com/vllm-project/vllm/tree/main/READM
 
 ## Run examples (Qwen2.5-Omni)
 
+!!! note
+    On ROCm, for vLLM v0.11.0, before running your command for `Qwen/Qwen2.5-Omni-7B`, set the following environment variables:
+    ```bash
+    export MIOPEN_FIND_MODE=FAST
+    export VLLM_ROCM_USE_AITER=1
+    export VLLM_ROCM_USE_AITER_MHA=1
+    export VLLM_ROCM_USE_AITER_LINEAR=0
+    export VLLM_ROCM_USE_AITER_RMSNORM=0
+    ```
+
 Launch the server
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091

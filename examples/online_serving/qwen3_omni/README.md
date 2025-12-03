@@ -6,6 +6,10 @@ Please refer to [README.md](../../../README.md)
 
 ## Run examples (Qwen3-Omni)
 
+!!! note
+    On ROCm, for vLLM v0.11.0, you have to set `MIOPEN_FIND_MODE=FAST`. Run `export MIOPEN_FIND_MODE=FAST`, before you run your command.
+
+
 ### Launch the Server
 
 ```bash

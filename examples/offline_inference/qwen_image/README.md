@@ -8,6 +8,9 @@ This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Im
 
 ## Local CLI Usage
 
+!!! note
+    On ROCm, for vLLM v0.11.0, you have to set `MIOPEN_FIND_MODE=FAST`. Run `export MIOPEN_FIND_MODE=FAST`, before you run your command.
+
 ```bash
 python text_to_image.py \
   --prompt "a cup of coffee on the table" \
