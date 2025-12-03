@@ -1,15 +1,15 @@
 # Offline Example of vLLM-Omni for Qwen3-Omni
 
-Source <https://github.com/vllm-project/vllm/tree/main/examples/offline_inference/qwen3_omni>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen3_omni>.
 
 
 ## 🛠️ Installation
 
-Please refer to [README.md](https://github.com/vllm-project/vllm/tree/main/README.md)
+Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
 
 ## Run examples (Qwen3-Omni)
 ### Multiple Prompts
-Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). For processing dataset please refer to [Qwen2.5-Omni README.md](https://github.com/vllm-project/vllm/tree/main/examples/offline_inference/qwen2_5_omni/README.md)
+Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). For processing dataset please refer to [Qwen2.5-Omni README.md](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni/README.md)
 Get into the example folder
 ```bash
 cd examples/offline_inference/qwen3_omni
