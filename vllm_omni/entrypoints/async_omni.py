@@ -94,10 +94,12 @@ class AsyncOmni(EngineClient):
         self.batch_timeout = cli_args.batch_timeout
         self._enable_stats: bool = bool(cli_args.log_stats)
 
+        base_engine_args = AsyncOmniEngineArgs.from_cli_args(cli_args).__dict__.copy()
+
         if cli_args.stage_configs_path is None:
-            self.stage_configs = load_stage_configs_from_model(model)
+            self.stage_configs = load_stage_configs_from_model(model, base_engine_args)
         else:
-            self.stage_configs = load_stage_configs_from_yaml(cli_args.stage_configs_path)
+            self.stage_configs = load_stage_configs_from_yaml(cli_args.stage_configs_path, base_engine_args)
 
         self.stage_list: list[OmniStage] = []
         self.default_sampling_params_list: list[SamplingParams] = []
