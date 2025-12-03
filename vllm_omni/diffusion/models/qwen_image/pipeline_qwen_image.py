@@ -28,6 +28,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.teacache import TeaCacheConfig, apply_teacache
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -539,6 +540,11 @@ class QwenImagePipeline(
         guidance,
         true_cfg_scale,
     ):
+        # Reset TeaCache state at the start of diffusion loop
+        if hasattr(self.transformer, "_teacache_wrapper") and self.transformer._teacache_wrapper is not None:
+            self.transformer._teacache_wrapper.reset()
+            self.transformer._teacache_wrapper.state.num_steps = len(timesteps)
+
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
             if self.interrupt:
@@ -636,6 +642,20 @@ class QwenImagePipeline(
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+
+        # Enable TeaCache if requested
+        if req.enable_teacache:
+            if not hasattr(self.transformer, "_teacache_wrapper") or self.transformer._teacache_wrapper is None:
+                teacache_config = TeaCacheConfig(
+                    rel_l1_thresh=0.2,  # Default: 1.5x speedup, minimal quality loss
+                    num_inference_steps=num_inference_steps,
+                    model_type="Qwen",
+                )
+                apply_teacache(self.transformer, teacache_config)
+            else:
+                # Reset state for new inference run
+                self.transformer._teacache_wrapper.reset()
+                self.transformer._teacache_wrapper.state.num_steps = num_inference_steps
 
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
