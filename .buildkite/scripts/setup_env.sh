@@ -55,9 +55,7 @@ PATH="${VENV_DIR}/bin:${PATH}"
 export PATH
 export VIRTUAL_ENV="${VENV_DIR}"
 
-if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
-  {
-    printf 'export VIRTUAL_ENV=%q\n' "${VIRTUAL_ENV}"
-    printf 'export PATH=%q\n' "${PATH}"
-  } >> "${BUILDKITE_ENV_FILE}"
+if command -v buildkite-agent >/dev/null 2>&1; then
+  buildkite-agent env set VIRTUAL_ENV "${VIRTUAL_ENV}"
+  buildkite-agent env set PATH "${PATH}"
 fi
