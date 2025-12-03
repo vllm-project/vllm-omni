@@ -18,7 +18,8 @@ try:
     from flash_attn import flash_attn_func  # can be FA2 or FA3
 except ImportError:
     logger.warning(
-        "FlashAttentionBackend is not available. You may install flash-attn by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
+        "FlashAttentionBackend is not available. You may install flash-attn "
+        "by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
     )
     flash_attn_3_func = None
 
