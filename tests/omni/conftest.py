@@ -83,7 +83,6 @@ class OmniRunner:
             max_tokens=max_tokens,
             seed=self.seed,
             detokenize=detokenize,
-            repetition_penalty=1.0,
         )
 
         talker_params = SamplingParams(
@@ -93,7 +92,6 @@ class OmniRunner:
             max_tokens=max_tokens,
             seed=self.seed,
             detokenize=detokenize,
-            repetition_penalty=1.0,
             stop_token_ids=talker_stop_token_ids,
         )
 
@@ -104,7 +102,6 @@ class OmniRunner:
             max_tokens=max_tokens,
             seed=self.seed,
             detokenize=detokenize,
-            repetition_penalty=1.0,
         )
 
         return [thinker_params, talker_params, code2wav_params]
