@@ -150,7 +150,7 @@ class ZImagePipeline(nn.Module):
     ):
         super().__init__()
         self.od_config = od_config
-        self.weights_source = [
+        self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",

@@ -6,6 +6,7 @@ import os
 import time
 from collections.abc import Generator, Iterable
 from typing import cast
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -29,16 +30,17 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.platforms import current_platform
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.registry import initialize_model
 
 
 logger = init_logger(__name__)
 
 
 MODEL_INDEX = "model_index.json"
-WEIGHTS_INDEX = {
-    "transformer": "diffusion_pytorch_model.safetensors.index.json",
-}
-
+DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 
 class DiffusersPipelineLoader:
     """Model loader that can load diffusers pipeline components from disk."""
@@ -87,7 +89,7 @@ class DiffusersPipelineLoader:
 
     def _prepare_weights(
         self,
-        model_name_or_path: str,
+        model_name_or_path: Path,
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
@@ -103,7 +105,7 @@ class DiffusersPipelineLoader:
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = SAFE_WEIGHTS_INDEX_NAME
+        index_file = DIFFUSION_MODEL_WEIGHTS_INDEX
 
         # only hf is supported currently
         if load_format == "auto":
@@ -171,8 +173,9 @@ class DiffusersPipelineLoader:
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
+        model_name_or_path = Path(source.model_or_path) / source.subfolder if source.subfolder else Path(source.model_or_path)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path,
+            model_name_or_path,
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
@@ -190,7 +193,6 @@ class DiffusersPipelineLoader:
 
     def get_all_weights(
         self,
-        model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         sources = cast(
@@ -208,15 +210,28 @@ class DiffusersPipelineLoader:
             allow_patterns_overrides=None,
         )
 
-    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+    def load_model(
+        self, od_config: OmniDiffusionConfig, load_device: str
+    ) -> nn.Module:
+        """Load a model with the given configurations."""
+        target_device = torch.device(load_device)
+        with set_default_torch_dtype(od_config.dtype):
+            with target_device:
+                model = initialize_model(od_config)
+
+            logger.debug("Loading weights on %s ...", load_device)
+            # Quantization does not happen in `load_weights` but after it
+            self.load_weights(model)
+        return model.eval()
+
+    def load_weights(self, model: nn.Module) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        loaded_weights = model.load_weights(self.get_all_weights(model))
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
-            scope="local",
         )
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.

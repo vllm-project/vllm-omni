@@ -5,7 +5,7 @@ import os
 
 import torch
 import zmq
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import VllmConfig, LoadConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -54,18 +55,19 @@ class GPUWorker:
         torch.cuda.set_device(device)
 
         # hack
-        vllm_config = VllmConfig()
+        vllm_config = VllmConfig(load_config=LoadConfig(load_format=self.od_config.load_format))
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
         set_current_vllm_config(vllm_config)
 
         init_distributed_environment(world_size=world_size, rank=rank)
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-        with device:
-            with set_default_torch_dtype(self.od_config.dtype):
-                self.pipeline = initialize_model(self.od_config)
-                self.pipeline.load_weights()
-                self.pipeline.eval()
+        model_loader = DiffusersPipelineLoader(vllm_config.load_config)
+        self.pipeline = model_loader.load_model(
+            od_config=self.od_config,
+            load_device=f"cuda:{rank}",
+        )
+
         logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
