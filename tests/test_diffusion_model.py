@@ -8,6 +8,7 @@ models = ["Tongyi-MAI/Z-Image-Turbo"]
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str):
     m = Omni(model=model_name)
+    # high resolution may cause OOM on L4
     height = 256
     width = 256
     image = m.generate(
