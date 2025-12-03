@@ -12,10 +12,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 
 logger = init_logger(__name__)
 
-# only test with flash_attn v3
 try:
+    # only tested with flash_attn v3
     # from flash_attn_interface import flash_attn_func as flash_attn_3_func  # not available in flash-attn 2.8.1
-    from flash_attn import flash_attn_func as flash_attn_3_func
+    from flash_attn import flash_attn_func  # can be FA2 or FA3
 except ImportError:
     logger.warning(
         "FlashAttentionBackend is not available. You may install flash-attn by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
@@ -61,7 +61,7 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        out: torch.Tensor = flash_attn_3_func(
+        out: torch.Tensor = flash_attn_func(
             query,
             key,
             value,

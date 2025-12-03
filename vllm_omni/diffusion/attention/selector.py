@@ -17,7 +17,6 @@ logger = init_logger(__name__)
 # environment variable value -> backend class
 SUPPORTED_BACKENDS = {
     "FLASH_ATTN": FlashAttentionBackend,
-    "SDPA": SDPABackend,
     "TORCH_SDPA": SDPABackend,
 }
 
