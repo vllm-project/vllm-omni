@@ -31,7 +31,7 @@ def load_stage_configs_from_model(model: str) -> list:
     device_type = detect_device_type()
 
     # Try device-specific config first
-    if device_type not in ["cuda", "xpu"]:
+    if device_type != "cuda":
         device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
         device_config_path = PROJECT_ROOT / device_config_file
         if os.path.exists(device_config_path):

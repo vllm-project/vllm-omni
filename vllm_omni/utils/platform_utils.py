@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from vllm.platforms import current_platform
+from contextlib import contextmanager
 
 
 def detect_device_type() -> str:
@@ -58,3 +59,23 @@ def get_diffusion_worker_class() -> type:
         from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
 
         return WorkerProc
+
+@contextmanager
+def torch_cuda_wrapper_for_xpu():
+    class _EventPlaceholder:
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.record = lambda: None
+            self.synchronize = lambda: None
+
+    try:
+        # replace cuda APIs with xpu APIs, this should work by default
+        torch.cuda.Event = torch.xpu.Event
+        torch.cuda.Stream = torch.xpu.Stream
+        torch.cuda.default_stream = torch.xpu.current_stream
+        torch.cuda.current_stream = torch.xpu.current_stream
+        torch.cuda.stream = torch.xpu.stream
+        yield
+    finally:
+        # if anything goes wrong, just patch it with a placeholder
+        torch.cuda.Event = _EventPlaceholder
