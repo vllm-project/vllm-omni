@@ -106,38 +106,17 @@ def get_extractor(model_or_type: Union[nn.Module, str]) -> Callable:
         >>> # Explicit type
         >>> extractor = get_extractor("Qwen")
     """
-    # If it's a module, get class name for lookup
+    # Resolve model type string
     if isinstance(model_or_type, nn.Module):
-        model_class_name = model_or_type.__class__.__name__
-        
-        # Try exact class name match first
-        if model_class_name in EXTRACTOR_REGISTRY:
-            return EXTRACTOR_REGISTRY[model_class_name]
-        
-        # Try partial match (e.g., "QwenImage" in "QwenImageTransformer2DModel")
-        for key, extractor in EXTRACTOR_REGISTRY.items():
-            if key in model_class_name:
-                return extractor
-        
-        # Try case-insensitive match
-        for key, extractor in EXTRACTOR_REGISTRY.items():
-            if key.lower() == model_class_name.lower():
-                return extractor
-        
-        model_type = model_class_name
+        model_type = model_or_type.__class__.__name__
     else:
         model_type = model_or_type
-        
-        # Try direct lookup for string
-        if model_type in EXTRACTOR_REGISTRY:
-            return EXTRACTOR_REGISTRY[model_type]
-        
-        # Try case-insensitive match
-        for key, extractor in EXTRACTOR_REGISTRY.items():
-            if key.lower() == model_type.lower():
-                return extractor
 
-    # No match found
+    # Exact, case-sensitive match only
+    if model_type in EXTRACTOR_REGISTRY:
+        return EXTRACTOR_REGISTRY[model_type]
+
+    # No exact match found
     available_types = list(EXTRACTOR_REGISTRY.keys())
     raise ValueError(
         f"Unknown model type: {model_type}. "
