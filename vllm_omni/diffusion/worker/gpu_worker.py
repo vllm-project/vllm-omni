@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing as mp
 import os
+import time
 
 import torch
 import zmq
@@ -12,6 +13,7 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.logger import init_logger
+from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -59,14 +61,22 @@ class GPUWorker:
 
         init_distributed_environment(world_size=world_size, rank=rank)
         initialize_model_parallel(tensor_model_parallel_size=world_size)
+        logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
         model_loader = DiffusersPipelineLoader(vllm_config.load_config)
-        self.pipeline = model_loader.load_model(
-            od_config=self.od_config,
-            load_device=f"cuda:{rank}",
-        )
+        time_before_load = time.perf_counter()
+        with DeviceMemoryProfiler() as m:
+            self.pipeline = model_loader.load_model(
+                od_config=self.od_config,
+                load_device=f"cuda:{rank}",
+            )
+        time_after_load = time.perf_counter()
 
-        logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
+        logger.info(
+            "Model loading took %.4f GiB and %.6f seconds",
+            m.consumed_memory / GiB_bytes,
+            time_after_load - time_before_load,
+        )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
     @torch.inference_mode()
