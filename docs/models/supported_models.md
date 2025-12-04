@@ -23,7 +23,7 @@ th {
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
 
 
-## List of Supported Models for Ascend NPU
+## List of Supported Models for NPU
 
 <style>
 th {
