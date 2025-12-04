@@ -34,7 +34,7 @@ steps:
   - label: "Omni Model Test"
     depends_on: image-build
     commands:
-      - pytest -s -v tests/omni/test_qwen_omni.py
+      - pytest -s -v tests/omni/
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
