@@ -1,6 +1,6 @@
 # Installation
 
-vLLM supports the following hardware platforms:
+vLLM-Omni supports the following hardware platforms:
 
 - [GPU](gpu.md)
     - [NVIDIA CUDA](gpu.md)
