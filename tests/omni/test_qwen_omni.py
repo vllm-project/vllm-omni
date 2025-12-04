@@ -12,7 +12,8 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
-from vllm.sampling_params import SamplingParams
+
+from .conftest import OmniRunner
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -24,8 +25,7 @@ CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_om
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize("max_tokens", [2048])
-def test_mixed_modalities_to_audio(omni_runner, model: str, max_tokens: int) -> None:
+def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
         # Prepare multimodal inputs
@@ -34,47 +34,11 @@ def test_mixed_modalities_to_audio(omni_runner, model: str, max_tokens: int) -> 
         image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
         video = VideoAsset(name="baby_reading", num_frames=16).np_ndarrays
 
-        thinker_sampling_params = SamplingParams(
-            temperature=0.0,  # Deterministic - no randomness
-            top_p=1.0,  # Disable nucleus sampling
-            top_k=-1,  # Disable top-k sampling
-            max_tokens=2048,
-            seed=42,  # Fixed seed for sampling
-            detokenize=True,
-            repetition_penalty=1.1,
-        )
-        talker_sampling_params = SamplingParams(
-            temperature=0.9,
-            top_p=0.8,
-            top_k=40,
-            max_tokens=2048,
-            seed=42,  # Fixed seed for sampling
-            detokenize=True,
-            repetition_penalty=1.05,
-            stop_token_ids=[8294],
-        )
-        code2wav_sampling_params = SamplingParams(
-            temperature=0.0,  # Deterministic - no randomness
-            top_p=1.0,  # Disable nucleus sampling
-            top_k=-1,  # Disable top-k sampling
-            max_tokens=2048,
-            seed=42,  # Fixed seed for sampling
-            detokenize=True,
-            repetition_penalty=1.1,
-        )
-
-        sampling_params_list = [
-            thinker_sampling_params,
-            talker_sampling_params,
-            code2wav_sampling_params,
-        ]
-
         outputs = runner.generate_multimodal(
             prompts=question,
             audios=audio,
             images=image,
             videos=video,
-            sampling_params_list=sampling_params_list,
         )
 
         # Verify we got outputs from multiple stages

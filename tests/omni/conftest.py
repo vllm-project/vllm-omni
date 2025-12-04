@@ -61,6 +61,15 @@ class OmniRunner:
             **kwargs,
         )
 
+    def get_default_sampling_params_list(self) -> list[SamplingParams]:
+        """
+        Get a list of default sampling parameters for all stages.
+
+        Returns:
+            List of SamplingParams with default decoding for each stage
+        """
+        return [st.default_sampling_params for st in self.omni.instance.stage_list]
+
     def get_omni_inputs(
         self,
         prompts: list[str] | str,
@@ -181,7 +190,7 @@ class OmniRunner:
             List of OmniRequestOutput objects from stages with final_output=True
         """
         if sampling_params_list is None:
-            sampling_params_list = self.get_greedy_sampling_params_list()
+            sampling_params_list = self.get_default_sampling_params_list()
 
         return self.omni.generate(prompts, sampling_params_list)
 
