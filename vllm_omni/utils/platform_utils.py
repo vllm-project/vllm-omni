@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from vllm.platforms import current_platform
-from contextlib import contextmanager
 
 
 def detect_device_type() -> str:
@@ -21,8 +22,10 @@ def detect_device_type() -> str:
 def is_npu() -> bool:
     return detect_device_type() == "npu"
 
+
 def is_xpu() -> bool:
     return detect_device_type() == "xpu"
+
 
 def get_device_control_env_var() -> str:
     """Return the environment variable name for device visibility control."""
@@ -60,10 +63,10 @@ def get_diffusion_worker_class() -> type:
 
         return WorkerProc
 
+
 @contextmanager
 def torch_cuda_wrapper_for_xpu():
     class _EventPlaceholder:
-
         def __init__(self, *args, **kwargs) -> None:
             self.record = lambda: None
             self.synchronize = lambda: None

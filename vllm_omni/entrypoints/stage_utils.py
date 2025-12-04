@@ -74,8 +74,8 @@ def set_stage_devices(
         get_device_name_fn = torch.cuda.get_device_name
         device_type_label = "CUDA"
     elif device_type == "xpu":
-        import torch
         import intel_extension_for_pytorch  # noqa: F401
+        import torch
 
         is_available_fn = torch.xpu.is_available
         set_device_fn = torch.xpu.set_device
