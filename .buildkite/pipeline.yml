@@ -25,3 +25,7 @@ steps:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
