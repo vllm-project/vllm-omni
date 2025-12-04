@@ -16,7 +16,7 @@ steps:
       queue: "cpu_queue_premerge"
 
   - label: "Diffusion Model Test"
-    timeout_in_minutes: 30
+    timeout_in_minutes: 15
     depends_on: image-build
     commands:
       - pytest -s -v tests/single_stage/test_diffusion_model.py
@@ -33,7 +33,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test"
-    timeout_in_minutes: 30
+    timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - pytest -s -v tests/omni/
