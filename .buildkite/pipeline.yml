@@ -6,6 +6,7 @@ steps:
       queue: "cpu_queue_premerge"
   - label: "Diffusion Model Test"
     commands:
-      - ".buildkite/scripts/diffusion_model_test.sh"
+      - source .buildkite/scripts/diffusion_model_test.sh
+      - python -m pytest -s -v tests/test_diffusion_model.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU

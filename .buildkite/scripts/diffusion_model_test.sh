@@ -54,4 +54,4 @@ VENV_PYTHON="${VENV_DIR}/bin/python"
 
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" vllm==0.11.0
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" -e ".[dev]"
-"${VENV_PYTHON}" -m pytest -s -v tests/test_diffusion_model.py
+# "${VENV_PYTHON}" -m pytest -s -v tests/test_diffusion_model.py
