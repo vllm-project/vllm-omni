@@ -6,15 +6,67 @@ import os
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any
 
+from pydantic import Field, model_validator
+from typing import Any
+from typing_extensions import Self
 import torch
 from vllm.logger import init_logger
+from vllm.config.utils import config
 
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 logger = init_logger(__name__)
 
+@config
+@dataclass
+class DiffusionParallelConfig:
+    """Configuration for diffusion model distributed execution."""
+
+    pipeline_parallel_size: int = 1
+    """Number of pipeline parallel stages."""
+
+    data_parallel_size: int = 1
+    """Number of data parallel groups."""
+
+    tensor_parallel_size: int = 1
+    """Number of tensor parallel groups."""
+
+    sequence_parallel_size: int = 1
+    """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
+
+    ulysses_degree: int = 1
+    """Number of GPUs used for ulysses sequence parallelism."""
+
+    ring_degree: int = 1
+    """Number of GPUs used for ring sequence parallelism."""
+
+    cfg_parallel_size: int = 1
+    """Number of Classifier Free Guidance (CFG) parallel groups."""
+
+    @model_validator(mode="after")
+    def _validate_parallel_config(self) -> Self:
+        """Validates the config relationships among the parallel strategies."""
+        assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
+        assert self.data_parallel_size > 0, "Data parallel size must be > 0"
+        assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
+        assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
+        assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
+        assert self.ring_degree > 0, "Ring degree must be > 0"
+        assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, "Sequence parallel size must be equal to the product of ulysses degree and ring degree, but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        return self
+
+    def __post_init__(self) -> None:
+
+        self.world_size = (
+            self.pipeline_parallel_size
+            * self.data_parallel_size
+            * self.tensor_parallel_size
+            * self.ulysses_degree
+            * self.ring_degree
+            * self.cfg_parallel_size
+        )
 
 @dataclass
 class TransformerConfig:
@@ -180,6 +232,7 @@ class OmniDiffusionConfig:
 
     # Cache strategy (legacy)
     cache_strategy: str = "none"
+    parallel_config: DiffusionParallelConfig = Field(default_factory=DiffusionParallelConfig)
 
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
@@ -192,21 +245,6 @@ class OmniDiffusionConfig:
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
-
-    # Parallelism
-    num_gpus: int = 1
-    tp_size: int = -1
-    sp_degree: int = -1
-    # sequence parallelism
-    ulysses_degree: int | None = None
-    ring_degree: int | None = None
-    # data parallelism
-    # number of data parallelism groups
-    dp_size: int = 1
-    # number of gpu in a dp group
-    dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: int = -1
