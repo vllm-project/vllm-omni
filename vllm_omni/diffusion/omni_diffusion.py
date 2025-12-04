@@ -52,7 +52,10 @@ class OmniDiffusion:
             "model_index.json",
             od_config.model,
         )
-        od_config.model_class_name = config_dict.get("_class_name", None)
+        if config_dict is None:
+            config_dict = {}
+        if od_config.model_class_name is None:
+            od_config.model_class_name = config_dict.get("_class_name", None)
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
