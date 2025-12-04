@@ -17,7 +17,7 @@ steps:
   - label: "Diffusion Model Test"
     depends_on: image-build
     commands:
-      - pytest -s -v tests/test_diffusion_model.py
+      - pytest -s -v tests/single_stage/test_diffusion_model.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
