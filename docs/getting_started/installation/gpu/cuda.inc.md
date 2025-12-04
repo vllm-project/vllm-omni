@@ -88,6 +88,7 @@ docker run --runtime nvidia --gpus 2 \
     --ipc=host \
     vllm/vllm-omni:v0.11.0rc1 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+```
 
 !!! tip
     You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
