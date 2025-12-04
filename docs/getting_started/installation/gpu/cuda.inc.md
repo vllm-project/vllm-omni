@@ -77,18 +77,16 @@ uv pip install --no-build-isolation --editable .
 
 # --8<-- [start:pre-built-images]
 
-The Docker image file is available on [vllm-omni_v0.11.0rc1](#link-to-be-added)
+vLLM-Omni offers an official docker image for deployment. These images are built on top of vLLM docker images and available on Docker Hub as [vllm/vllm-omni](https://hub.docker.com/r/vllm/vllm-omni/tags). The version of vLLM-Omni indicates which release of vLLM it is based on.
 
 ```bash
-docker load -i vllm-omni_v0.11.0rc1.tar.gz
-docker run -itd \
-    --name vllm-omni \
-    --shm-size=64g \
-    --privileged=true \
-    --restart=always \
-    --gpus all \
-    --net=host vllm-omni:v0.11.0rc
-docker exec -it vllm-omni bash
+docker run --runtime nvidia --gpus all \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    -p 8000:8000 \
+    --ipc=host \
+    vllm/vllm-omni:v0.11.0rc1 \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 
 # --8<-- [end:pre-built-images]
