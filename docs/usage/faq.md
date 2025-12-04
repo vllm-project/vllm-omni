@@ -11,3 +11,15 @@ A: If you encounter error about backend of librosa, try to install ffmpeg with c
 sudo apt update
 sudo apt install ffmpeg
 ```
+
+> Q: I encounter some bugs or CI problems, which is urgent. How can I solve it?
+
+A: At first, you can check current [issues](https://github.com/vllm-project/vllm-omni/issues) to find possible solutions. If non of these satisfy your demand and it is urgent, please find these [volunteers](https://docs.vllm.ai/projects/vllm-omni/en/latest/community/volunteers/) for help.
+
+> Q: Does vLLM-Omni support AWQ or any other quantization?
+
+A: vLLM-Omni partitions model into several stages. For AR stages, it will reuse main logic of LLMEngine in vLLM. So current quantization supported in vLLM should be also supported in vLLM-Omni for them. But systematic verification is ongoing. For quantization for DiffusionEngine, we are working on it. Please stay tuned and welcome contribution!
+
+> Q: Does vLLM-Omni support multimodal streaming input and output?
+
+A: Not yet. We already put it on the [Roadmap](https://github.com/vllm-project/vllm-omni/issues/165). Please stay tuned!

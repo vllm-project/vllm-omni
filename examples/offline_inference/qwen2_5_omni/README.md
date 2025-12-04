@@ -5,6 +5,7 @@
 Please refer to [README.md](../../../README.md)
 
 ## Run examples (Qwen2.5-Omni)
+
 ### Multiple Prompts
 Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). To get the prompt, you can:
 ```bash
@@ -23,6 +24,7 @@ Then run the command below.
 ```bash
 bash run_multiple_prompts.sh
 ```
+
 ### Single Prompt
 Get into the example folder
 ```bash
@@ -32,6 +34,34 @@ Then run the command below.
 ```bash
 bash run_single_prompt.sh
 ```
+
+#### Using Local Media Files
+The `end2end.py` script supports local media files (audio, video, image) via CLI arguments:
+
+```bash
+# Use single local media files
+python end2end.py --query-type use_image --image-path /path/to/image.jpg
+python end2end.py --query-type use_video --video-path /path/to/video.mp4
+python end2end.py --query-type use_audio --audio-path /path/to/audio.wav
+
+# Combine multiple local media files
+python end2end.py --query-type mixed_modalities \
+    --video-path /path/to/video.mp4 \
+    --image-path /path/to/image.jpg \
+    --audio-path /path/to/audio.wav
+
+# Use audio from video file
+python end2end.py --query-type use_audio_in_video --video-path /path/to/video.mp4
+
+```
+
+If media file paths are not provided, the script will use default assets. Supported query types:
+- `use_image`: Image input only
+- `use_video`: Video input only
+- `use_audio`: Audio input only
+- `mixed_modalities`: Audio + image + video
+- `use_audio_in_video`: Extract audio from video
+- `text`: Text-only query
 
 ### FAQ
 
