@@ -12,6 +12,7 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import initialize_model
@@ -61,9 +62,10 @@ class GPUWorker:
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
         with device:
-            self.pipeline = initialize_model(self.od_config)
-            self.pipeline.load_weights()
-            self.pipeline.eval()
+            with set_default_torch_dtype(self.od_config.dtype):
+                self.pipeline = initialize_model(self.od_config)
+                self.pipeline.load_weights()
+                self.pipeline.eval()
         logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
