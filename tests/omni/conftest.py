@@ -30,6 +30,7 @@ class OmniRunner:
         init_timeout: int = 300,
         shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
+        stage_configs_path: str | None = None,
         **kwargs,
     ) -> None:
         """
@@ -43,6 +44,7 @@ class OmniRunner:
             init_timeout: Timeout for initializing stages in seconds
             shm_threshold_bytes: Threshold for using shared memory
             log_stats: Enable detailed statistics logging
+            stage_configs_path: Optional path to YAML stage config file
             **kwargs: Additional arguments passed to Omni
         """
         self.model_name = model_name
@@ -55,6 +57,7 @@ class OmniRunner:
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
             shm_threshold_bytes=shm_threshold_bytes,
+            stage_configs_path=stage_configs_path,
             **kwargs,
         )
 

@@ -5,6 +5,7 @@ E2E tests for Qwen2.5-Omni model with mixed modality inputs and audio output.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 from vllm.assets.audio import AudioAsset
@@ -17,13 +18,16 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
+# CI stage config optimized for 24GB GPU (L4/RTX3090)
+CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
 @pytest.mark.parametrize("max_tokens", [2048])
 def test_mixed_modalities_to_audio(omni_runner, model: str, max_tokens: int) -> None:
     """Test processing audio, image, and video together, generating audio output."""
-    with omni_runner(model, seed=42) as runner:
+    with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
         # Prepare multimodal inputs
         question = "What is recited in the audio? What is in this image? Describe the video briefly."
         audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
