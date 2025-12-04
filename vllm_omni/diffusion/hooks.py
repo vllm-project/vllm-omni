@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable
 
 import torch.nn as nn
 
@@ -18,7 +18,7 @@ class StateManager:
 
     def __init__(self, state_cls: Callable[[], BaseState]):
         self._state_cls = state_cls
-        self._states: Dict[str, BaseState] = {}
+        self._states: dict[str, BaseState] = {}
         self._context: str = "default"
 
     def set_context(self, name: str) -> None:
@@ -51,7 +51,7 @@ class _WrappedForward:
     module: nn.Module
 
     def __call__(self, *args: Any, **kwargs: Any):
-        registry: Optional["HookRegistry"] = getattr(self.module, "_hook_registry", None)
+        registry: HookRegistry | None = getattr(self.module, "_hook_registry", None)
         if registry is None or not registry._hooks:
             return self.module._original_forward(*args, **kwargs)
         return registry.dispatch(*args, **kwargs)
@@ -62,11 +62,11 @@ class HookRegistry:
 
     def __init__(self, module: nn.Module):
         self.module = module
-        self._hooks: Dict[str, ModelHook] = {}
+        self._hooks: dict[str, ModelHook] = {}
 
     @classmethod
-    def get_or_create(cls, module: nn.Module) -> "HookRegistry":
-        registry: Optional["HookRegistry"] = getattr(module, "_hook_registry", None)
+    def get_or_create(cls, module: nn.Module) -> HookRegistry:
+        registry: HookRegistry | None = getattr(module, "_hook_registry", None)
         if registry is None:
             registry = cls(module)
             setattr(module, "_hook_registry", registry)
@@ -82,7 +82,7 @@ class HookRegistry:
         hook.initialize_hook(self.module)
         self._hooks[name] = hook
 
-    def get_hook(self, name: str) -> Optional[ModelHook]:
+    def get_hook(self, name: str) -> ModelHook | None:
         return self._hooks.get(name)
 
     def dispatch(self, *args: Any, **kwargs: Any):

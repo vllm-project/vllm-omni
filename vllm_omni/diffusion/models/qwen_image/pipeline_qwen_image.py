@@ -28,8 +28,6 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.cache.teacache import TeaCacheConfig
-from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -578,7 +576,7 @@ class QwenImagePipeline(
             }
             if self._cache_adapter is not None:
                 transformer_kwargs["cache_branch"] = "positive"
-            
+
             noise_pred = self.transformer(**transformer_kwargs)[0]
 
             # Forward pass for negative prompt (CFG)
@@ -597,7 +595,7 @@ class QwenImagePipeline(
                 }
                 if self._cache_adapter is not None:
                     neg_transformer_kwargs["cache_branch"] = "negative"
-                
+
                 neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)

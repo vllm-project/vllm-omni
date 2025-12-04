@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 # Model-specific polynomial coefficients for rescaling L1 distances
 # These coefficients account for model-specific characteristics in how embeddings change
@@ -39,7 +39,7 @@ class TeaCacheConfig:
     """
 
     rel_l1_thresh: float = 0.2
-    coefficients: Optional[List[float]] = None
+    coefficients: Optional[list[float]] = None
     model_type: str = "QwenImagePipeline"
 
     def __post_init__(self):
