@@ -29,13 +29,58 @@ class CacheContext:
     logic is encapsulated in the extractor that returns this context.
 
     Attributes:
-        modulated_input: Tensor used for cache decision (similarity comparison)
-        hidden_states: Current hidden states (will be modified by caching)
-        encoder_hidden_states: Optional encoder states (for dual-stream models)
-        temb: Timestep embedding tensor
-        run_transformer_blocks: Callable that executes model-specific transformer blocks
-        postprocess: Callable that does model-specific output postprocessing
-        extra_states: Optional dict for additional model-specific state
+        modulated_input: Tensor used for cache decision (similarity comparison).
+            Must be a torch.Tensor extracted from the first transformer block,
+            typically after applying normalization and modulation.
+
+        hidden_states: Current hidden states (will be modified by caching).
+            Must be a torch.Tensor representing the main image/latent states
+            after preprocessing but before transformer blocks.
+
+        encoder_hidden_states: Optional encoder states (for dual-stream models).
+            Set to None for single-stream models (e.g., Flux).
+            For dual-stream models (e.g., Qwen), contains text encoder outputs.
+
+        temb: Timestep embedding tensor.
+            Must be a torch.Tensor containing the timestep conditioning.
+
+        run_transformer_blocks: Callable that executes model-specific transformer blocks.
+            Signature: () -> tuple[torch.Tensor, ...]
+
+            Returns:
+                tuple containing:
+                - [0]: processed hidden_states (required)
+                - [1]: processed encoder_hidden_states (optional, only for dual-stream)
+
+            Example for single-stream:
+                def run_blocks():
+                    h = hidden_states
+                    for block in module.transformer_blocks:
+                        h = block(h, temb=temb)
+                    return (h,)
+
+            Example for dual-stream:
+                def run_blocks():
+                    h, e = hidden_states, encoder_hidden_states
+                    for block in module.transformer_blocks:
+                        e, h = block(h, e, temb=temb)
+                    return (h, e)
+
+        postprocess: Callable that does model-specific output postprocessing.
+            Signature: (torch.Tensor) -> Union[torch.Tensor, Transformer2DModelOutput, tuple]
+
+            Takes the processed hidden_states and applies final transformations
+            (normalization, projection) to produce the model output.
+
+            Example:
+                def postprocess(h):
+                    h = module.norm_out(h, temb)
+                    output = module.proj_out(h)
+                    return Transformer2DModelOutput(sample=output)
+
+        extra_states: Optional dict for additional model-specific state.
+            Use this for models that need to pass additional context beyond
+            the standard fields.
     """
     modulated_input: torch.Tensor
     hidden_states: torch.Tensor
@@ -44,6 +89,64 @@ class CacheContext:
     run_transformer_blocks: Callable[[], tuple[torch.Tensor, ...]]
     postprocess: Callable[[torch.Tensor], Any]
     extra_states: dict[str, Any] | None = None
+
+    def validate(self) -> None:
+        """
+        Validate that the CacheContext contains valid data.
+
+        Raises:
+            TypeError: If fields have wrong types
+            ValueError: If tensors have invalid properties
+            RuntimeError: If callables fail basic invocation tests
+
+        This method should be called after creating a CacheContext to catch
+        common developer errors early with clear error messages.
+        """
+        # Validate tensor fields
+        if not isinstance(self.modulated_input, torch.Tensor):
+            raise TypeError(
+                f"modulated_input must be torch.Tensor, got {type(self.modulated_input)}"
+            )
+
+        if not isinstance(self.hidden_states, torch.Tensor):
+            raise TypeError(
+                f"hidden_states must be torch.Tensor, got {type(self.hidden_states)}"
+            )
+
+        if self.encoder_hidden_states is not None and not isinstance(
+            self.encoder_hidden_states, torch.Tensor
+        ):
+            raise TypeError(
+                f"encoder_hidden_states must be torch.Tensor or None, "
+                f"got {type(self.encoder_hidden_states)}"
+            )
+
+        if not isinstance(self.temb, torch.Tensor):
+            raise TypeError(f"temb must be torch.Tensor, got {type(self.temb)}")
+
+        # Validate callables
+        if not callable(self.run_transformer_blocks):
+            raise TypeError(
+                f"run_transformer_blocks must be callable, got {type(self.run_transformer_blocks)}"
+            )
+
+        if not callable(self.postprocess):
+            raise TypeError(f"postprocess must be callable, got {type(self.postprocess)}")
+
+        # Validate tensor shapes are compatible
+        if self.modulated_input.shape[0] != self.hidden_states.shape[0]:
+            raise ValueError(
+                f"Batch size mismatch: modulated_input has batch size "
+                f"{self.modulated_input.shape[0]}, but hidden_states has "
+                f"{self.hidden_states.shape[0]}"
+            )
+
+        # Validate devices match
+        if self.modulated_input.device != self.hidden_states.device:
+            raise ValueError(
+                f"Device mismatch: modulated_input on {self.modulated_input.device}, "
+                f"hidden_states on {self.hidden_states.device}"
+            )
 
 
 def extract_qwen_context(
