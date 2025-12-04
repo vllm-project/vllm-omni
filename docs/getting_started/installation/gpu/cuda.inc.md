@@ -91,5 +91,5 @@ docker run --runtime nvidia --gpus 2 \
 
 !!! tip
     You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
-    
+
 # --8<-- [end:pre-built-images]
