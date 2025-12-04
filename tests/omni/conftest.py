@@ -58,54 +58,6 @@ class OmniRunner:
             **kwargs,
         )
 
-    def get_greedy_sampling_params_list(
-        self,
-        max_tokens: int = 128,
-        detokenize: bool = True,
-        talker_stop_token_ids: list[int] | None = None,
-    ) -> list[SamplingParams]:
-        """
-        Get greedy sampling parameters for all three stages.
-
-        Args:
-            max_tokens: Maximum tokens to generate per stage
-            detokenize: Whether to detokenize the output
-            talker_stop_token_ids: Stop token IDs for talker stage
-
-        Returns:
-            List of SamplingParams for [thinker, talker, code2wav] stages
-        """
-
-        thinker_params = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=-1,
-            max_tokens=max_tokens,
-            seed=self.seed,
-            detokenize=detokenize,
-        )
-
-        talker_params = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=-1,
-            max_tokens=max_tokens,
-            seed=self.seed,
-            detokenize=detokenize,
-            stop_token_ids=talker_stop_token_ids,
-        )
-
-        code2wav_params = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=-1,
-            max_tokens=max_tokens,
-            seed=self.seed,
-            detokenize=detokenize,
-        )
-
-        return [thinker_params, talker_params, code2wav_params]
-
     def get_omni_inputs(
         self,
         prompts: list[str] | str,

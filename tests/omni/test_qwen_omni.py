@@ -4,13 +4,18 @@
 E2E tests for Qwen2.5-Omni model with mixed modality inputs and audio output.
 """
 
+import os
+
 import pytest
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
+from vllm.sampling_params import SamplingParams
 
-models = ["Qwen/Qwen2.5-Omni-7B"]
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+models = ["Qwen/Qwen2.5-Omni-3B"]
 
 
 @pytest.mark.core_model
@@ -25,9 +30,40 @@ def test_mixed_modalities_to_audio(omni_runner, model: str, max_tokens: int) -> 
         image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
         video = VideoAsset(name="baby_reading", num_frames=16).np_ndarrays
 
-        sampling_params_list = runner.get_greedy_sampling_params_list(
-            max_tokens=max_tokens, talker_stop_token_ids=[8294]
+        thinker_sampling_params = SamplingParams(
+            temperature=0.0,  # Deterministic - no randomness
+            top_p=1.0,  # Disable nucleus sampling
+            top_k=-1,  # Disable top-k sampling
+            max_tokens=2048,
+            seed=42,  # Fixed seed for sampling
+            detokenize=True,
+            repetition_penalty=1.1,
         )
+        talker_sampling_params = SamplingParams(
+            temperature=0.9,
+            top_p=0.8,
+            top_k=40,
+            max_tokens=2048,
+            seed=42,  # Fixed seed for sampling
+            detokenize=True,
+            repetition_penalty=1.05,
+            stop_token_ids=[8294],
+        )
+        code2wav_sampling_params = SamplingParams(
+            temperature=0.0,  # Deterministic - no randomness
+            top_p=1.0,  # Disable nucleus sampling
+            top_k=-1,  # Disable top-k sampling
+            max_tokens=2048,
+            seed=42,  # Fixed seed for sampling
+            detokenize=True,
+            repetition_penalty=1.1,
+        )
+
+        sampling_params_list = [
+            thinker_sampling_params,
+            talker_sampling_params,
+            code2wav_sampling_params,
+        ]
 
         outputs = runner.generate_multimodal(
             prompts=question,
