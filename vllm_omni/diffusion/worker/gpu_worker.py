@@ -55,7 +55,7 @@ class GPUWorker:
         torch.cuda.set_device(device)
 
         # hack
-        vllm_config = VllmConfig(load_config=LoadConfig())
+        vllm_config = VllmConfig()
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
         set_current_vllm_config(vllm_config)
 
@@ -63,7 +63,8 @@ class GPUWorker:
         initialize_model_parallel(tensor_model_parallel_size=world_size)
         logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
-        model_loader = DiffusersPipelineLoader(vllm_config.load_config)
+        load_config = LoadConfig()
+        model_loader = DiffusersPipelineLoader(load_config)
         time_before_load = time.perf_counter()
         with DeviceMemoryProfiler() as m:
             self.pipeline = model_loader.load_model(
