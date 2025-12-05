@@ -169,7 +169,7 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
     else:
         query_result = query_func()
-        
+
     if not args.enable_stats:
         log_file = None
     else:
