@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from vllm.platforms import current_platform
 
@@ -10,6 +12,8 @@ def detect_device_type() -> str:
         return device_type.lower()
     if torch.cuda.is_available():
         return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
     if hasattr(torch, "npu") and torch.npu.is_available():  # type: ignore[attr-defined]
         return "npu"
     return "cpu"
@@ -17,6 +21,10 @@ def detect_device_type() -> str:
 
 def is_npu() -> bool:
     return detect_device_type() == "npu"
+
+
+def is_xpu() -> bool:
+    return detect_device_type() == "xpu"
 
 
 def get_device_control_env_var() -> str:
@@ -29,6 +37,8 @@ def get_device_control_env_var() -> str:
     device_type = detect_device_type()
     if device_type == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
+    if device_type == "xpu":
+        return "ZE_AFFINITY_MASK"
     return "CUDA_VISIBLE_DEVICES"  # fallback
 
 
@@ -52,3 +62,23 @@ def get_diffusion_worker_class() -> type:
         from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
 
         return WorkerProc
+
+
+@contextmanager
+def torch_cuda_wrapper_for_xpu():
+    class _EventPlaceholder:
+        def __init__(self, *args, **kwargs) -> None:
+            self.record = lambda: None
+            self.synchronize = lambda: None
+
+    try:
+        # replace cuda APIs with xpu APIs, this should work by default
+        torch.cuda.Event = torch.xpu.Event
+        torch.cuda.Stream = torch.xpu.Stream
+        torch.cuda.default_stream = torch.xpu.current_stream
+        torch.cuda.current_stream = torch.xpu.current_stream
+        torch.cuda.stream = torch.xpu.stream
+        yield
+    finally:
+        # if anything goes wrong, just patch it with a placeholder
+        torch.cuda.Event = _EventPlaceholder

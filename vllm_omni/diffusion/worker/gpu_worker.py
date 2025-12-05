@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.utils.platform_utils import detect_device_type
 
 logger = init_logger(__name__)
 
@@ -50,8 +51,16 @@ class GPUWorker:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        device_type = detect_device_type()
+        if device_type == "xpu":
+            device = torch.device(f"xpu:{self.local_rank}")
+            torch.xpu.set_device(device)
+        elif device_type == "npu":
+            device = torch.device(f"npu:{self.local_rank}")
+            torch.npu.set_device(device)
+        else:
+            device = torch.device(f"cuda:{self.local_rank}")
+            torch.cuda.set_device(device)
 
         # hack
         vllm_config = VllmConfig()
