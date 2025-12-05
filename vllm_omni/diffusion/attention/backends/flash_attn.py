@@ -20,6 +20,7 @@ except ImportError:
     logger.warning(
         "FlashAttentionBackend is not available. You may install flash-attn "
         "by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
+        " or install pre-built flash-attn from https://github.com/Dao-AILab/flash-attention/releases"
     )
     flash_attn_3_func = None
 
