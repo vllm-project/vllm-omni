@@ -3,7 +3,7 @@ import torch
 
 from vllm_omni import Omni
 
-models = ["Tongyi-MAI/Z-Image-Turbo"]
+models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
 
 @pytest.mark.parametrize("model_name", models)
