@@ -20,7 +20,8 @@ class Scheduler:
         return cls._instance
 
     def initialize(self, od_config: OmniDiffusionConfig):
-        if hasattr(self, "context") and not self.context.closed:
+        existing_context = getattr(self, "context", None)
+        if existing_context is not None and not existing_context.closed:
             logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
             self.close()
 
@@ -65,6 +66,9 @@ class Scheduler:
         """Closes the socket and terminates the context."""
         if hasattr(self, "context"):
             self.context.term()
+        self.context = None
+        self.mq = None
+        self.result_mq = None
 
 
 # Singleton instance for easy access

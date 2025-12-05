@@ -242,3 +242,7 @@ class AttentionBackendEnum(enum.Enum):
 
     def __str__(self):
         return self.name.lower()
+
+
+# Special message broadcast via scheduler queues to signal worker shutdown.
+SHUTDOWN_MESSAGE = {"type": "shutdown"}

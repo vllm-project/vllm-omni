@@ -14,7 +14,11 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    SHUTDOWN_MESSAGE,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -149,6 +153,14 @@ class WorkerProc:
                     f"Error receiving requests in scheduler event loop: {e}",
                     exc_info=True,
                 )
+                continue
+
+            if reqs == SHUTDOWN_MESSAGE:
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
+                continue
+            if reqs is None:
+                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
             # 2: execute, make sure a reply is always sent

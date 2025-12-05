@@ -87,3 +87,12 @@ class OmniDiffusion:
 
     def _run_engine(self, requests: list[OmniDiffusionRequest]):
         return self.engine.step(requests)
+
+    def close(self) -> None:
+        self.engine.close()
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
