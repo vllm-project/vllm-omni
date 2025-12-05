@@ -840,29 +840,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                     hidden_states_slice = hidden_states[s:e]
                     update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
                     self._merge_additional_information_update(req_id, update_dict)
-
-            if not isinstance(multimodal_outputs, dict):
-                return
-            if (
-                "additional_information_update" not in multimodal_outputs
-                and "additional_information_update_by_req_id" not in multimodal_outputs
-            ):
-                return
-            updates_list = multimodal_outputs.get("additional_information_update")
-            if isinstance(updates_list, list):
-                for idx, upd in enumerate(updates_list):
-                    if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
-                        continue
-                    req_id = self.input_batch.req_ids[idx]
-                    self._merge_additional_information_update(req_id, upd)
-            updates_map = multimodal_outputs.get("additional_information_update_by_req_id")
-            if isinstance(updates_map, dict):
-                for req_id, upd in updates_map.items():
-                    if not isinstance(upd, dict):
-                        continue
-                    if req_id not in self.requests:
-                        continue
-                    self._merge_additional_information_update(req_id, upd)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "
