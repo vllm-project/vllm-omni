@@ -207,6 +207,7 @@ class Qwen2_5OmniForConditionalGeneration(
         """
         if self.model_stage == "thinker":
             # Normalize to batched inputs if caller provides 1D/2D unbatched tensors
+            # TODO: Remove this hack when NPU supports batched inputs properly
             added_batch_dim = False
             if input_ids is not None and input_ids.ndim == 1:
                 input_ids = input_ids.unsqueeze(0)
@@ -234,6 +235,19 @@ class Qwen2_5OmniForConditionalGeneration(
                 positions = positions.to(thinker_dev)
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
+
+            if is_npu():
+                # TODO: remove this hack when NPU supports batched inputs properly
+                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                thinker_positions = positions[0] if positions.ndim > 1 else positions
+                thinker_inputs_embeds = (
+                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                )
+            else:
+                thinker_input_ids = input_ids
+                thinker_positions = positions[0]
+                thinker_inputs_embeds = inputs_embeds
+
             # Run thinker
             with torch.inference_mode():
                 thinker_output = self.thinker(

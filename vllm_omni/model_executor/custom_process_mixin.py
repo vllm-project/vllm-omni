@@ -32,7 +32,7 @@ class CustomProcessMixin:
 
         If the stage don't applicable, return the original input_ids, input_embeds, and an empty dict.
         """
-        return input_ids, input_embeds, {}
+        raise NotImplementedError("Preprocess is not implemented for this stage.")
 
     def postprocess(self, model_output, **info_dict: object):
         """
@@ -41,4 +41,4 @@ class CustomProcessMixin:
         Args:
             model_output: The model output to postprocess.
         """
-        return model_output, {}
+        raise NotImplementedError("Postprocess is not implemented for this stage.")

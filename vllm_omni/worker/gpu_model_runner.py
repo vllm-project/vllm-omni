@@ -638,12 +638,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        per_req_additional_information: Optional[dict[str, dict]] = None
         if self.supports_mm_inputs and get_pp_group().is_first_rank and not self.model_config.is_encoder_decoder:
             # Build multimodal inputs and overlay prompt embeds; collect per-request info
-            per_req_additional_information = self._build_mm_inputs_and_overlays(
-                scheduler_output, num_scheduled_tokens, num_scheduled_tokens_np
-            )
+            self._build_mm_inputs_and_overlays(scheduler_output, num_scheduled_tokens, num_scheduled_tokens_np)
 
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
@@ -878,9 +875,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: int,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Run MM encoder, fill scheduled inputs_embeds, and overlay prompt embeds;
-        collect per-request additional_information for the prefill portion."""
+    ):
+        """Run MM encoder, fill scheduled inputs_embeds, and overlay prompt embeds."""
         # Run the multimodal encoder if any.
         self._execute_mm_encoder(scheduler_output)
         mm_embeds = self._gather_mm_embeddings(scheduler_output)
@@ -893,26 +889,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Reset per-step additional information collector (deprecated concat path)
         if hasattr(self, "_forward_additional_information"):
             self._forward_additional_information = None
-        # Overlay and collect per-request info
-        return self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
-
-    def _collect_additional_information_for_prefill(
-        self,
-        num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Overlay per-request prompt_embeds for the prefill portion and collect
-        additional_information slices for this step. Returns a map req_id -> dict."""
-        per_req_additional_information: dict[str, dict] = {}
+        # Overlay
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
-            addi_cpu = getattr(req_state, "additional_information_cpu", None)
             num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
             prompt_len = len(req_state.prompt_token_ids)
             prompt_remaining = max(0, prompt_len - num_computed_tokens)
             sched_tokens = int(num_scheduled_tokens_np[req_index])
             overlay_len = min(sched_tokens, prompt_remaining)
-            if overlay_len <= 0 and not (isinstance(addi_cpu, dict) and addi_cpu):
+            if overlay_len <= 0:
                 continue
             if overlay_len > 0 and pe_cpu is not None:
                 src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(
@@ -920,18 +906,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
-            if addi_cpu is not None and isinstance(addi_cpu, dict):
-                req_info: dict[str, object] = {}
-                for k, v in addi_cpu.items():
-                    if isinstance(v, torch.Tensor):
-                        req_info[k] = v.detach().to("cpu").contiguous()
-                    elif isinstance(v, list):
-                        req_info[k] = v
-                    else:
-                        req_info[k] = v
-                if req_info:
-                    per_req_additional_information[req_id] = req_info
-        return per_req_additional_information
 
     def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
         req_state = self.requests.get(req_id)

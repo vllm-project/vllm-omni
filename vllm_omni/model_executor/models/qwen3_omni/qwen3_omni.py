@@ -88,6 +88,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         super().__init__()
         self.have_multimodal_outputs = True
         self.has_preprocess = False
+        self.has_postprocess = False
         config: Qwen3OmniMoeConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
