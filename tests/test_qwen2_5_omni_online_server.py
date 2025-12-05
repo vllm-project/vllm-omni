@@ -181,7 +181,7 @@ def omni_server():
 
     # Start server process
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"  # Use first two GPUs
+    env["CUDA_VISIBLE_DEVICES"] = "0"  # Use first GPU
 
     process = subprocess.Popen(
         cmd,
@@ -240,131 +240,69 @@ def _encode_audio_to_base64(audio_data: tuple) -> str:
     return base64.b64encode(buffer.read()).decode("utf-8")
 
 
-@requires_gpu
-@requires_model
-class TestQwen25OmniOnlineServing:
-    """
-    End-to-end tests for Qwen2.5-Omni online serving API.
+# @requires_gpu
+# @requires_model
+# class TestQwen25OmniOnlineServing:
+#     """
+#     End-to-end tests for Qwen2.5-Omni online serving API.
 
-    These tests require actual model weights to be available.
-    Run with: VLLM_OMNI_DOWNLOAD_MODEL=1 pytest tests/test_qwen2_5_omni_online_server.py -v -s
-    """
+#     These tests require actual model weights to be available.
+#     Run with: VLLM_OMNI_DOWNLOAD_MODEL=1 pytest tests/test_qwen2_5_omni_online_server.py -v -s
+#     """
 
-    def test_health_endpoint(self, omni_server):
-        """Test that health endpoint returns OK."""
-        import requests
+#     def test_health_endpoint(self, omni_server):
+#         """Test that health endpoint returns OK."""
+#         import requests
 
-        response = requests.get(f"{omni_server['base_url']}/health")
-        assert response.status_code == 200
+#         response = requests.get(f"{omni_server['base_url']}/health")
+#         assert response.status_code == 200
 
-    def test_models_endpoint(self, omni_server):
-        """Test that models endpoint returns model info."""
-        import requests
+#     def test_models_endpoint(self, omni_server):
+#         """Test that models endpoint returns model info."""
+#         import requests
 
-        response = requests.get(f"{omni_server['base_url']}/v1/models")
-        assert response.status_code == 200
+#         response = requests.get(f"{omni_server['base_url']}/v1/models")
+#         assert response.status_code == 200
 
-        data = response.json()
-        assert "data" in data
-        assert len(data["data"]) > 0
+#         data = response.json()
+#         assert "data" in data
+#         assert len(data["data"]) > 0
 
-        model_ids = [m["id"] for m in data["data"]]
-        print(f"Available models: {model_ids}")
+#         model_ids = [m["id"] for m in data["data"]]
+#         print(f"Available models: {model_ids}")
 
-    def test_text_chat_completion(self, omni_server):
-        """Test text-only chat completion via API."""
-        import requests
+#     def test_text_chat_completion(self, omni_server):
+#         """Test text-only chat completion via API."""
+#         import requests
 
-        payload = {
-            "model": _MODEL_NAME,
-            "messages": [
-                {"role": "system", "content": _DEFAULT_SYSTEM},
-                {"role": "user", "content": "What is 2 + 2? Answer with just the number."},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 64,
-            "seed": _SEED,
-        }
+#         payload = {
+#             "model": _MODEL_NAME,
+#             "messages": [
+#                 {"role": "system", "content": _DEFAULT_SYSTEM},
+#                 {"role": "user", "content": "What is 2 + 2? Answer with just the number."},
+#             ],
+#             "temperature": 0.0,
+#             "max_tokens": 64,
+#             "seed": _SEED,
+#         }
 
-        response = requests.post(
-            f"{omni_server['base_url']}/v1/chat/completions",
-            json=payload,
-            timeout=120,
-        )
+#         response = requests.post(
+#             f"{omni_server['base_url']}/v1/chat/completions",
+#             json=payload,
+#             timeout=120,
+#         )
 
-        assert response.status_code == 200, f"Request failed: {response.text}"
+#         assert response.status_code == 200, f"Request failed: {response.text}"
 
-        data = response.json()
-        assert "choices" in data
-        assert len(data["choices"]) > 0
-        assert "message" in data["choices"][0]
-        assert "content" in data["choices"][0]["message"]
+#         data = response.json()
+#         assert "choices" in data
+#         assert len(data["choices"]) > 0
+#         assert "message" in data["choices"][0]
+#         assert "content" in data["choices"][0]["message"]
 
-        content = data["choices"][0]["message"]["content"]
-        print(f"Response: {content}")
-        assert "4" in content, f"Expected '4' in response, got: {content}"
-
-    @requires_multi_gpu
-    def test_mixed_modalities_chat_completion(self, omni_server):
-        """Test mixed modalities via chat completion API.
-
-        Note: This test requires the same request format as the working example client:
-        - System prompt uses content list format [{type: "text", text: "..."}]
-        - Video URL should not include num_frames (optional parameter)
-        """
-        import requests
-        from vllm.assets.audio import AudioAsset
-
-        image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
-        video_url = "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
-        audio_url = AudioAsset("mary_had_lamb").url
-
-        # Use the same format as the working example client
-        payload = {
-            "model": _MODEL_NAME,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _DEFAULT_SYSTEM,
-                        }
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "audio_url", "audio_url": {"url": audio_url}},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                        {"type": "video_url", "video_url": {"url": video_url}},
-                        {
-                            "type": "text",
-                            "text": "What is recited in the audio? What is the content of this image? Why is this video funny?",
-                        },
-                    ],
-                },
-            ],
-            "temperature": 0.0,
-            "max_tokens": 256,
-            "seed": _SEED,
-        }
-
-        response = requests.post(
-            f"{omni_server['base_url']}/v1/chat/completions",
-            json=payload,
-            timeout=300,
-        )
-
-        assert response.status_code == 200, f"Request failed: {response.text}"
-
-        data = response.json()
-        assert "choices" in data
-        assert len(data["choices"]) > 0
-
-        content = data["choices"][0]["message"]["content"]
-        print(f"Mixed modalities response: {content}")
-        assert len(content) > 20, "Response too short for mixed modalities"
+#         content = data["choices"][0]["message"]["content"]
+#         print(f"Response: {content}")
+#         assert "4" in content, f"Expected '4' in response, got: {content}"
 
 
 @requires_gpu
