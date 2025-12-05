@@ -33,9 +33,10 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 10
     depends_on: image-build
     commands:
+      - export VLLM_LOGGING_LEVEL=DEBUG
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/multi_stages/
     agents:
