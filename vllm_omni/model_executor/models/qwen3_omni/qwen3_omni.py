@@ -392,10 +392,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             # merge the code_predictor_codes from the info_dict list into a single tensor
             multimodal_outputs: dict = None
             if not is_profile:
-                # Here is the only place to use runtime_additional_information. After MTP in the 
+                # Here is the only place to use runtime_additional_information. After MTP in the
                 # preprocess function, the code_predictor_codes are stored in the info_dict list.
                 # We need to merge the tensors from different requests into a single tensor.
-                # In the future, we may allow user to custom an aggregated function.  
+                # In the future, we may allow user to custom an aggregated function.
                 info_dicts = kwargs.get("runtime_additional_information")
                 code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
                 multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
