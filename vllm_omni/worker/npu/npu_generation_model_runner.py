@@ -53,8 +53,8 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
-class NPUDiffusionModelRunner(OmniNPUModelRunner):
-    """Diffusion model runner for vLLM-omni on NPU (non-autoregressive)."""
+class NPUGenerationModelRunner(OmniNPUModelRunner):
+    """Generation model runner for vLLM-omni on NPU (non-autoregressive)."""
 
     def _prepare_inputs(
         self,
@@ -455,7 +455,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
             ):
                 self.maybe_setup_kv_connector(scheduler_output)
 
-                outputs = self._run_diffusion(
+                outputs = self._run_generation(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
@@ -525,7 +525,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
         )
 
-    def _run_diffusion(
+    def _run_generation(
         self,
         *,
         input_ids: torch.Tensor,
@@ -535,7 +535,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
         multimodal_kwargs: dict,
         logits_indices: torch.Tensor,
     ) -> torch.Tensor | list[torch.Tensor]:
-        """Runs the diffusion process and returns per-request tensors.
+        """Runs the generation process and returns per-request tensors.
 
         Tries model interfaces in the following order for maximal compatibility:
         1) model.sample(condition=..., **kwargs)
@@ -558,7 +558,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
         # TODO: add the diffuse method for other models
 
         raise RuntimeError(
-            "The loaded model does not expose diffusion interfaces 'sample', "
+            "The loaded model does not expose generation interfaces 'sample', "
             "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
         )
 
