@@ -73,3 +73,24 @@ uv pip install --no-build-isolation --editable .
 </details>
 
 # --8<-- [end:build-wheel-from-source]
+
+
+# --8<-- [start:pre-built-images]
+
+vLLM-Omni offers an official docker image for deployment. These images are built on top of vLLM docker images and available on Docker Hub as [vllm/vllm-omni](https://hub.docker.com/r/vllm/vllm-omni/tags). The version of vLLM-Omni indicates which release of vLLM it is based on.
+
+Here's an example deployment command that has been verified on 2 x H100's:
+```bash
+docker run --runtime nvidia --gpus 2 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    -p 8091:8091 \
+    --ipc=host \
+    vllm/vllm-omni:v0.11.0rc1 \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+```
+
+!!! tip
+    You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
+
+# --8<-- [end:pre-built-images]
