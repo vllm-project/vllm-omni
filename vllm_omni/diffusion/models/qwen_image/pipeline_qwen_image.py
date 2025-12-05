@@ -20,7 +20,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -236,7 +235,7 @@ class QwenImagePipeline(
     def __init__(
         self,
         *,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
         super().__init__()
@@ -250,23 +249,14 @@ class QwenImagePipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        logger.info("Loaded Qwen-Image scheduler successfully")
-
-        with set_default_torch_dtype(torch.bfloat16):
-            self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model, subfolder="text_encoder", local_files_only=local_files_only
-            )
-            logger.info("Loaded Qwen-Image text encoder successfully")
-            self.vae = AutoencoderKLQwenImage.from_pretrained(
-                model, subfolder="vae", local_files_only=local_files_only
-            ).to(self.device)
-            logger.info("Loaded Qwen-Image VAE successfully")
-            self.transformer = QwenImageTransformer2DModel()
-            logger.info("Initialized Qwen-Image transformer successfully.")
-            self.tokenizer = Qwen2Tokenizer.from_pretrained(
-                model, subfolder="tokenizer", local_files_only=local_files_only
-            )
-            logger.info("Loaded Qwen-Image tokenizer successfully.")
+        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model, subfolder="text_encoder", local_files_only=local_files_only
+        )
+        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
+            self.device
+        )
+        self.transformer = QwenImageTransformer2DModel()
+        self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.stage = None
 
