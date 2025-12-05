@@ -4,32 +4,27 @@ from typing import Optional
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.request_queue import create_request_queue
-from vllm.v1.core.sched.scheduler import Request, RequestStatus, SchedulerOutput, SpecDecodingStats
+from vllm.v1.core.sched.scheduler import (
+    Request,
+    RequestStatus,
+    SchedulerOutput,
+    SpecDecodingStats,
+)
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 
 from vllm_omni.core.sched.output import OmniNewRequestData
-from vllm_omni.core.sched.scheduler import OmniScheduler
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 
-class DiffusionScheduler(OmniScheduler):
-    """Scheduler for diffusion-based non-autoregressive stages.
-
-    Implements a fast-path scheduling strategy for diffusion models where
-    all input tokens are fed at once. Falls back to standard vLLM scheduling
-    if the token budget cannot accommodate all tokens in a single iteration.
-    """
-
+class OmniGenerationScheduler(VLLMScheduler):
     def schedule(self) -> SchedulerOutput:
-        """Schedule requests for diffusion model execution.
-
-        Uses a fast-path approach that feeds all input tokens at once
-        (or 1 placeholder token if input is empty). Falls back to
-        standard scheduling if token budget is insufficient.
-
-        Returns:
-            SchedulerOutput containing scheduled requests and token allocations
+        """Diffusion fast path:
+        - Feed all input tokens of the request at once
+          (if 0, allocate 1 placeholder token).
+        - If the token budget cannot be satisfied at once, fall back to the
+          default vLLM scheduling.
         """
 
         # Select requests with zero prompt and using pooling
@@ -224,7 +219,7 @@ class DiffusionScheduler(OmniScheduler):
             request.status = RequestStatus.FINISHED_STOPPED
             # Optional: set a stop_reason for front-end clarity
             # (does not affect protocol)
-            request.stop_reason = request.stop_reason or "diffusion_done"
+            request.stop_reason = request.stop_reason  # or "generation_done"
             kv_transfer_params = self._free_request(request)
             if status_before_stop == RequestStatus.RUNNING:
                 stopped_running_reqs.add(request)
@@ -241,7 +236,9 @@ class DiffusionScheduler(OmniScheduler):
                 # NOTE: structured_output_request should not be None if
                 # use_structured_output, we have check above, so safe to ignore
                 # type warning
-                request.structured_output_request.grammar.accept_tokens(req_id, new_token_ids)  # type: ignore[union-attr]  # noqa: E501
+                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]  # noqa: E501
+                    req_id, new_token_ids
+                )
 
             # spec_token_ids comes from the model runner output
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
