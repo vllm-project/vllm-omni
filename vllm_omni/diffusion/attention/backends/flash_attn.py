@@ -63,6 +63,7 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
+        # TODO: flash_attn_func does not support attn_mask.
         out: torch.Tensor = flash_attn_func(
             query,
             key,

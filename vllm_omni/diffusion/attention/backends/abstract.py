@@ -47,7 +47,7 @@ class AttentionBackend(ABC):
 
 @dataclass
 class AttentionMetadata:
-    pass
+    attn_mask: torch.Tensor | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)
