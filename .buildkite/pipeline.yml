@@ -29,3 +29,35 @@ steps:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
+  - label: "Large Model Test (H100)"
+    depends_on: image-build
+    agents:
+      queue: mithril-h100-pool
+    commands:
+      - pytest -s -v tests/single_stage/test_diffusion_model.py # update this to your actual test file
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
