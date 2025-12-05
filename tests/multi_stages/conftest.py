@@ -7,6 +7,7 @@ Pytest configuration and fixtures for vllm-omni tests.
 from typing import Any
 
 import pytest
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
@@ -235,13 +236,14 @@ class OmniRunner:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup resources."""
-        if hasattr(self.omni, "close"):
-            self.omni.close()
+        self.close()
+        del self.omni
+        cleanup_dist_env_and_memory()
 
     def close(self):
         """Close and cleanup the Omni instance."""
-        if hasattr(self.omni, "close"):
-            self.omni.close()
+        if hasattr(self.omni.instance, "close"):
+            self.omni.instance.close()
 
 
 @pytest.fixture
