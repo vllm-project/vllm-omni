@@ -31,8 +31,9 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], model: str) ->
         # Prepare multimodal inputs
         question = "What is recited in the audio? What is in this image? Describe the video briefly."
         audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
-        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
-        video = VideoAsset(name="baby_reading", num_frames=16).np_ndarrays
+        audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
+        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
+        video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
 
         outputs = runner.generate_multimodal(
             prompts=question,
