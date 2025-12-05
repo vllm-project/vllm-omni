@@ -13,10 +13,10 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      max_model_len: 1024
-      max_num_batched_tokens: 1024
+      max_model_len: 896
+      max_num_batched_tokens: 896
       max_num_seqs: 1
-      gpu_memory_utilization: 0.675
+      gpu_memory_utilization: 0.665
       skip_mm_profiling: true
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
@@ -43,10 +43,10 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      max_model_len: 1024
-      max_num_batched_tokens: 1024
+      max_model_len: 896
+      max_num_batched_tokens: 896
       max_num_seqs: 1
-      gpu_memory_utilization: 0.245
+      gpu_memory_utilization: 0.255
       skip_mm_profiling: true
       enforce_eager: true
       trust_remote_code: true
