@@ -16,7 +16,7 @@ vLLM-Omni is a multi-modality extension for vLLM that supports non-autoregressiv
 
 API Server --> OmniLLM/AsyncOmni (New, including multi engines) --> LLMEngine/AsyncLLM --> Engine Core
  --> Scheduler (New one for DiT) --> Executor (New one for diffusers) --> Worker (New one for DiT)
- --> ModelRunner (New one for AR hiddenstate, New one for DiT) --> RequestState --> OutputProcessoer (New one for final multimodal output)
+ --> ModelRunner (New one for AR hiddenstate, New one for DiT) --> RequestState --> OutputProcessor (New one for final multimodal output)
 
 ## Core Components (Ordered by Data Flow)
 
@@ -137,7 +137,7 @@ class OmniLLM(LLM):
             prompt_str, engine_request, tokenization_kwargs = self._process_stage_inputs(stage_config, **stage_args)
 
             # Add inputs to Engine
-            stage_engine.add_request(requesy_id, prompt_str, tokenization_kwargs)
+            stage_engine.add_request(request_id, prompt_str, tokenization_kwargs)
             # Run Engine
             stage_output = stage_engine.step()
 
@@ -157,7 +157,7 @@ class OmniLLM(LLM):
             return self._process_ar_inputs(**stage_args)
         elif stage_config.engine_type == "DiT":
             return self._process_dit_inputs(**stage_args)
-        else
+        else:
             raise NotImplementedError
 
     def _process_dit_inputs(**stage_args)-> Any:

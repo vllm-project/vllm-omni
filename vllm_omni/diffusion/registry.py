@@ -3,6 +3,8 @@
 
 import importlib
 
+from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 _DIFFUSION_MODELS = {
@@ -20,22 +22,28 @@ _DIFFUSION_MODELS = {
 }
 
 
+DiffusionModelRegistry = _ModelRegistry(
+    {
+        model_arch: _LazyRegisteredModel(
+            module_name=f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}",
+            class_name=cls_name,
+        )
+        for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
+    }
+)
+
+
 def initialize_model(
     od_config: OmniDiffusionConfig,
 ):
-    if od_config.model_class_name in _DIFFUSION_MODELS:
-        mod_folder, mod_relname, cls_name = _DIFFUSION_MODELS[od_config.model_class_name]
-        module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
-        module = importlib.import_module(module_name)
-        model_class = getattr(module, cls_name)
-        model = model_class(od_config=od_config, prefix=mod_relname)
-
+    model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    if model_class is not None:
+        model = model_class(od_config=od_config)
         # Configure VAE memory optimization settings from config
         if hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
-
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
