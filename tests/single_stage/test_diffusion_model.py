@@ -9,7 +9,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.utils import wait_for_gpu_memory_to_clear
 from vllm_omni import Omni
 
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
@@ -35,8 +34,3 @@ def test_diffusion_model(model_name: str):
     assert images[0].width == width
     assert images[0].height == height
     images[0].save("z_image_output.png")
-
-    wait_for_gpu_memory_to_clear(
-        devices=[0],
-        threshold_ratio=0.1,
-    )
