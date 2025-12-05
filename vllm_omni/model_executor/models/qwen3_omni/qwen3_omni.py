@@ -363,9 +363,8 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # ========== Stage 2.1: Talker ==========
         elif self.model_stage == "talker":
-            if input_ids is None and additional_information is None:
+            if input_ids is None:
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
-                additional_information = {}
                 self.code_predictor_hidden_pool = torch.zeros_like(inputs_embeds)
                 is_profile = True
             else:
@@ -377,6 +376,11 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             if not is_profile and input_ids.shape[0] > 1:
                 self.input_ids_list = input_ids.tolist()
+
+            # TODO(Peiqi): temporal hack here to support voice_type.
+            if not hasattr(self, "voice_type"):
+                self.voice_type = voice_type
+
             # Run talker forward
             with torch.inference_mode():
                 talker_hidden = self.talker.forward(
@@ -388,6 +392,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             # merge the code_predictor_codes from the info_dict list into a single tensor
             multimodal_outputs: dict = None
             if not is_profile:
+                # Here is the only place to use runtime_additional_information. After MTP in the 
+                # preprocess function, the code_predictor_codes are stored in the info_dict list.
+                # We need to merge the tensors from different requests into a single tensor.
+                # In the future, we may allow user to custom an aggregated function.  
                 info_dicts = kwargs.get("runtime_additional_information")
                 code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
                 multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
@@ -399,7 +407,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Extract codec codes from input
             codes = []
             if input_ids is not None:
-                # addi_by_req = kwargs.get("additional_information_by_req_id")
                 codes.append(input_ids.reshape(1, 16, -1))
 
             else:
@@ -627,7 +634,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: dict[str, dict] = {}
-        voice_type = "ethan"  # TODO(Peiqi): get voice_type from info_dict
+        # TODO(Peiqi): add voice_type support
+        voice_type = self.voice_type
 
         # Read thinker outputs for prefill
         thinker_sequence_embeds = info_dict.get("thinker_embeddings").to(

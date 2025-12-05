@@ -272,10 +272,13 @@ class Qwen2_5OmniForConditionalGeneration(
         # 2) Talker (if codec not provided)
         if self.model_stage == "talker":
             # mock data for profile
-            if input_ids is None and additional_information is None:
+            if input_ids is None:
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
-                additional_information = {}
                 self.thinker_reply_part = torch.zeros_like(inputs_embeds)
+
+            # TODO(Peiqi): temporal hack here to support voice_type.
+            if not hasattr(self, "voice_type"):
+                self.voice_type = voice_type
 
             with torch.inference_mode():
                 talker_hidden = self.talker(
@@ -606,7 +609,7 @@ class Qwen2_5OmniForConditionalGeneration(
     def talker_preprocess(
         self,
         input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        input_embeds: torch.Tensor,
         **info_dict: object,
     ):
         # Mixed-mode support: In a single step, both Prefill*n and Decode*n are supported.
@@ -620,16 +623,16 @@ class Qwen2_5OmniForConditionalGeneration(
         #   add them; otherwise, keep the original embedding.
 
         # Ensure we have base embeddings when only ids are provided
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.talker.get_input_embeddings(input_ids)
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.talker.get_input_embeddings(input_ids)
 
         span_len = input_ids.shape[0]
         if span_len > 1:
             # prefill
-            return self.thinker_to_talker_process(input_ids, inputs_embeds, **info_dict)
+            return self.thinker_to_talker_process(input_ids, input_embeds, **info_dict)
         else:
             # decode
-            return self.thinker_to_talker_decode_one_step(input_ids, inputs_embeds, **info_dict)
+            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, **info_dict)
 
     def thinker_to_talker_process(
         self,
@@ -657,8 +660,9 @@ class Qwen2_5OmniForConditionalGeneration(
         if not isinstance(thinker_output_token_ids, (list, torch.Tensor)):
             thinker_output_token_ids = []
 
+        # TODO(Peiqi): add voice_type support
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            voice_type="Chelsie",  # TODO(Peiqi): add voice_type support
+            voice_type=self.voice_type,
             output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
             output_token_ids=thinker_output_token_ids,
             thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
