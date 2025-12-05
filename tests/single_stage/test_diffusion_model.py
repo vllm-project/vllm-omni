@@ -1,9 +1,8 @@
 import pytest
 import torch
 
+from tests.utils import wait_for_gpu_memory_to_clear
 from vllm_omni import Omni
-
-from ..utils import wait_for_gpu_memory_to_clear
 
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
