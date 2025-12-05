@@ -246,28 +246,6 @@ class OmniRunner:
             self.omni.instance.close()
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def omni_runner():
-    """
-    Pytest fixture that provides an OmniRunner factory function.
-
-    Usage:
-        def test_example(omni_runner):
-            with omni_runner("Qwen/Qwen2.5-Omni-7B") as runner:
-                outputs = runner.generate(prompts)
-    """
-    runners = []
-
-    def _omni_runner(model_name: str, **kwargs) -> OmniRunner:
-        runner = OmniRunner(model_name, **kwargs)
-        runners.append(runner)
-        return runner
-
-    yield _omni_runner
-
-    # Cleanup all runners after test
-    for runner in runners:
-        try:
-            runner.close()
-        except Exception:
-            pass
+    return OmniRunner

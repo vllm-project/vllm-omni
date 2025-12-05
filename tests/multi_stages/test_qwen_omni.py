@@ -4,7 +4,6 @@
 E2E tests for Qwen2.5-Omni model with mixed modality inputs and audio output.
 """
 
-import os
 from pathlib import Path
 
 import pytest
@@ -14,8 +13,6 @@ from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
 
 from .conftest import OmniRunner
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
