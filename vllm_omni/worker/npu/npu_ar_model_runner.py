@@ -862,6 +862,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                 mm_payload[k] = sub_dict
                         elif isinstance(v, list):
                             element: torch.Tensor = v[0]
+                            if isinstance(element, torch.Tensor):
+                                element = element.detach().cpu().contiguous()
                             multimodal_outputs[k] = v[1:] if len(v) > 1 else v
                             mm_payload[k] = element
                     except Exception as e:
