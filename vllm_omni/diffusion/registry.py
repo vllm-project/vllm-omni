@@ -18,6 +18,7 @@ _DIFFUSION_MODELS = {
         "flux2",
         "pipeline_flux2",
         "Flux2Pipeline",
+    ),
     "ZImagePipeline": (
         "z_image",
         "pipeline_z_image",
