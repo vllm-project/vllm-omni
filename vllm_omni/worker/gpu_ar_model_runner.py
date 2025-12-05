@@ -94,7 +94,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 inputs_embeds,
                 positions,
                 intermediate_tensors,
-                model_kwargs
+                model_kwargs,
             ) = self._preprocess(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -156,8 +156,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # The model side may return per-request additional_information updates (model-agnostic channel).
             # Convention: multimodal_outputs["additional_information_update"] is a list[dict] in batch order;
             # the runner merges it into the corresponding request's additional_information_cpu for subsequent decode.
-            self._process_additional_information_updates(
-                hidden_states, multimodal_outputs, num_scheduled_tokens_np)
+            self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:

@@ -25,6 +25,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
@@ -35,7 +36,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
-from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
+from vllm_omni.utils.platform_utils import is_npu
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -50,8 +51,7 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class Qwen2_5OmniForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE,
-    Qwen2_5OmniConditionalGenerationMixin, CustomProcessMixin
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, Qwen2_5OmniConditionalGenerationMixin, CustomProcessMixin
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -251,10 +251,10 @@ class Qwen2_5OmniForConditionalGeneration(
             # Run thinker
             with torch.inference_mode():
                 thinker_output = self.thinker(
-                    input_ids=input_ids,
-                    positions=positions[0],
+                    input_ids=thinker_input_ids,
+                    positions=thinker_positions,
                     intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
+                    inputs_embeds=thinker_inputs_embeds,
                     **kwargs,
                 )
 
@@ -273,9 +273,7 @@ class Qwen2_5OmniForConditionalGeneration(
         if self.model_stage == "talker":
             # mock data for profile
             if input_ids is None and additional_information is None:
-                input_ids = torch.zeros(
-                    inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device
-                )
+                input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
                 additional_information = {}
                 self.thinker_reply_part = torch.zeros_like(inputs_embeds)
 
@@ -605,7 +603,8 @@ class Qwen2_5OmniForConditionalGeneration(
             return talker_hf_config.tts_text_start_token_id
         return self.tts_text_spk_token_ids[voice_type]
 
-    def talker_preprocess(self,
+    def talker_preprocess(
+        self,
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor,
         **info_dict: object,
@@ -614,8 +613,8 @@ class Qwen2_5OmniForConditionalGeneration(
         # Rules:
         # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
         # - Decode segments consist of a single non-special token.
-        # - If additional_information is provided (can be a list split by request or a 
-        #   concatenated tensor plus a list of shapes), then for each request, reconstruct 
+        # - If additional_information is provided (can be a list split by request or a
+        #   concatenated tensor plus a list of shapes), then for each request, reconstruct
         #   the thinker→talker input embeddings for the Prefill segments;
         # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional),
         #   add them; otherwise, keep the original embedding.
@@ -632,8 +631,8 @@ class Qwen2_5OmniForConditionalGeneration(
             # decode
             return self.thinker_to_talker_decode_one_step(input_ids, inputs_embeds, **info_dict)
 
-
-    def thinker_to_talker_process(self, 
+    def thinker_to_talker_process(
+        self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
         **info_dict: object,
@@ -646,22 +645,26 @@ class Qwen2_5OmniForConditionalGeneration(
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids")  # list[int]
 
         if not isinstance(prompt_embeds, torch.Tensor):
-            prompt_embeds = torch.zeros(0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model))
+            prompt_embeds = torch.zeros(
+                0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
+            )
         if not isinstance(thinker_result, torch.Tensor):
-            thinker_result = torch.zeros(0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model))
+            thinker_result = torch.zeros(
+                0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
+            )
         if not isinstance(prompt_token_ids, (list, torch.Tensor)):
             prompt_token_ids = []
         if not isinstance(thinker_output_token_ids, (list, torch.Tensor)):
             thinker_output_token_ids = []
-        
+
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
-            voice_type="Chelsie",   # TODO(Peiqi): add voice_type support
+            voice_type="Chelsie",  # TODO(Peiqi): add voice_type support
             output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
             output_token_ids=thinker_output_token_ids,
             thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
             prompt_token_ids=prompt_token_ids,
         )
-        
+
         if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
             update_dict["thinker_reply_part"] = thinker_result[1:].detach().to("cpu").contiguous()
 
@@ -712,11 +715,7 @@ class Qwen2_5OmniForConditionalGeneration(
             )
         return prompt_token_ids_processed, prompt_embeds
 
-    def thinker_to_talker_decode_one_step(self,
-        input_ids,
-        input_embeds,
-        **info_dict
-    ):
+    def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, **info_dict):
         update_dict = {}
         # choose step vector in priority order
         step_vec = None
@@ -730,7 +729,11 @@ class Qwen2_5OmniForConditionalGeneration(
             dv = info_dict.get("decode_output_prompt_embeds") if isinstance(info_dict, dict) else None
             if isinstance(dv, torch.Tensor) and dv.numel() > 0:
                 step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
-            elif hasattr(self, "thinker_reply_part") and isinstance(self.thinker_reply_part, torch.Tensor) and self.thinker_reply_part.numel() > 0:
+            elif (
+                hasattr(self, "thinker_reply_part")
+                and isinstance(self.thinker_reply_part, torch.Tensor)
+                and self.thinker_reply_part.numel() > 0
+            ):
                 # C) fallback shared pool
                 step_vec = self.thinker_reply_part[0:1]
                 self.thinker_reply_part = self.thinker_reply_part[1:]

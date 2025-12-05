@@ -49,7 +49,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
-from vllm_omni.model_executor.models.utils import safe_tensor_reshape
 
 logger = init_logger(__name__)
 
@@ -365,7 +364,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
         return output
 
-    def forward(self,
+    def forward(
+        self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor,

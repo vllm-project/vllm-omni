@@ -700,8 +700,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # collect additional_information (tensor/list) for prefill portion only
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests.get(req_id)
-                req_infos = (getattr(req_state, "additional_information_cpu", None)
-                             if req_state is not None else None)
+                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
@@ -710,9 +709,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # call the custom process function
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e],
-                    input_embeds=inputs_embeds[s:e],
-                    **req_infos
+                    input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
                 )
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
@@ -822,7 +819,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         hidden_states: torch.Tensor,
         multimodal_outputs: object,
         num_scheduled_tokens_np: np.ndarray,
-        ) -> None:
+    ) -> None:
         """Process model-provided per-request additional_information updates and merge into request state."""
         try:
             # execute the custom postprocess function
@@ -830,12 +827,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
                     req_state = self.requests.get(req_id)
-                    req_infos = (getattr(req_state, "additional_information_cpu", None)
-                                if req_state is not None else None)
+                    req_infos = (
+                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                    )
                     start_offset = int(self.query_start_loc.cpu[req_index])
                     sched_tokens = int(num_scheduled_tokens_np[req_index])
                     s, e = start_offset, start_offset + sched_tokens
-                    span_len = int(e) - int(s)
                     # only consider to store data into update dict.
                     hidden_states_slice = hidden_states[s:e]
                     update_dict = self.model.postprocess(hidden_states_slice, **req_infos)

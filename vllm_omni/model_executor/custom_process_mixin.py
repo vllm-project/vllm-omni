@@ -1,10 +1,13 @@
 from collections.abc import Callable
+
 import torch
+
 
 class CustomProcessMixin:
     """
     Mixin class for all stages in the Omni model.
     """
+
     def set_custom_preprocess(self, preprocess_fn: Callable) -> None:
         """
         Set a preprocess function for the stage.
@@ -21,10 +24,8 @@ class CustomProcessMixin:
         """
         self.postprocess = postprocess_fn
 
-    def preprocess(self,
-                input_ids: torch.Tensor,
-                input_embeds: torch.Tensor,
-                **input_dict: object
+    def preprocess(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **input_dict: object
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Process the input_ids and input_embeds for the given input_dict.
