@@ -3,6 +3,8 @@ import torch
 
 from vllm_omni import Omni
 
+from ..utils import wait_for_gpu_memory_to_clear
+
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
 
@@ -26,3 +28,8 @@ def test_diffusion_model(model_name: str):
     assert images[0].width == width
     assert images[0].height == height
     images[0].save("z_image_output.png")
+
+    wait_for_gpu_memory_to_clear(
+        devices=[0],
+        threshold_ratio=0.1,
+    )

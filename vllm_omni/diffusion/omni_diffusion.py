@@ -57,7 +57,6 @@ class OmniDiffusion:
             "transformer/config.json",
             od_config.model,
         )
-        print("Transformer config dict:", tf_config_dict)
         od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
