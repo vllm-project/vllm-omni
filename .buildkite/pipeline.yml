@@ -33,7 +33,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 15
     depends_on: image-build
     commands:
       - pytest -s -v tests/multi_stages/
