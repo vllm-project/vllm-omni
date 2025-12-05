@@ -292,8 +292,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
                             mm_payload[k] = v.detach().to("cpu")[prev_logits_index : logits_index + 1].contiguous()
                         elif isinstance(v, torch.Tensor) and v.shape[0] != hidden_states_cpu.shape[0]:
-                            logger.error(f"Error in merge multimodal outputs: Tensor dimension mismatch, \
-                                          {v.shape} != {hidden_states_cpu.shape} for {k}")
+                            logger.error(
+                                f"Error in merge multimodal outputs: Tensor dimension mismatch, \
+                                          {v.shape} != {hidden_states_cpu.shape} for {k}"
+                            )
                         # Case 2: nested dict of tensors aligned on token dimension (e.g., selected_hidden_layers)
                         elif isinstance(v, dict):
                             sub_dict: dict[str, torch.Tensor] = {}
