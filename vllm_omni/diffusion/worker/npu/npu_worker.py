@@ -8,10 +8,8 @@ import zmq
 from transformers import PretrainedConfig
 from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm.distributed.parallel_state import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
+
+from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 
@@ -65,8 +63,16 @@ class NPUWorker:
         set_current_vllm_config(vllm_config)
 
         init_distributed_environment(world_size=world_size, rank=rank)
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
-
+        parallel_config = self.od_config.parallel_config
+        initialize_model_parallel(
+            data_parallel_degree=parallel_config.data_parallel_size,
+            classifier_free_guidance_degree=parallel_config.cfg_parallel_size,
+            sequence_parallel_degree=parallel_config.sequence_parallel_size,
+            ulysses_degree=parallel_config.ulysses_degree,
+            ring_degree=parallel_config.ring_degree,
+            tensor_parallel_degree=parallel_config.tensor_parallel_size,
+            pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
+        )
         with device:
             with set_default_torch_dtype(self.od_config.dtype):
                 self.pipeline = initialize_model(self.od_config)
