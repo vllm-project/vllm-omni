@@ -21,4 +21,12 @@ else
                       --query-type text \
                       --txt-prompts ../../benchmark/build_dataset/top100.txt \
                       --enable-stats
+    echo "You can check the saved logs in $(pwd), named as:\
+    omni_llm_pipeline_text\
+    omni_llm_pipeline_text.orchestrator.stats.jsonl\
+    omni_llm_pipeline_text.overall.stats.jsonl\
+    omni_llm_pipeline_text.stage0.log\
+    omni_llm_pipeline_text.stage1.log\
+    omni_llm_pipeline_text.stage2.log\
+    "
 fi
