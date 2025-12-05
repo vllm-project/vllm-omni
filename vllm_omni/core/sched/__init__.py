@@ -2,12 +2,12 @@
 Scheduling components for vLLM-Omni.
 """
 
-from .diffusion_scheduler import DiffusionScheduler
+from .omni_ar_scheduler import OmniARScheduler
+from .omni_generation_scheduler import OmniGenerationScheduler
 from .output import OmniNewRequestData
-from .scheduler import OmniScheduler
 
 __all__ = [
-    "OmniScheduler",
-    "DiffusionScheduler",
+    "OmniARScheduler",
+    "OmniGenerationScheduler",
     "OmniNewRequestData",
 ]

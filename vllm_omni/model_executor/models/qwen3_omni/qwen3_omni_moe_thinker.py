@@ -1415,7 +1415,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             inputs_embeds = None
 
         if self.use_deepstack and inputs_embeds is not None and get_pp_group().is_first_rank:
-            deepstack_input_embeds = self._get_deepstack_input_embeds(inputs_embeds.size(0))
+            deepstack_input_embeds = self._get_deepstack_input_embeds(input_ids.size(1))
         else:
             deepstack_input_embeds = None
 
@@ -1431,7 +1431,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         )
 
         if inputs_embeds is not None and get_pp_group().is_first_rank:
-            self._clear_deepstack_input_embeds(inputs_embeds.size(0))
+            self._clear_deepstack_input_embeds(input_ids.size(1))
 
         return hidden_states.unsqueeze(0), captured_hidden_states
 

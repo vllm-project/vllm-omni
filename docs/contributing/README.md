@@ -23,7 +23,7 @@ Install vLLM-Omni from source with development dependencies:
 
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm_omni
+cd vllm-omni
 uv pip install -e ".[dev]"
 ```
 

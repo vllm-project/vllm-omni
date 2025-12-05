@@ -1,6 +1,31 @@
 steps:
+  - label: ":docker: Build image"
+    key: image-build
+    commands:
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+      - "docker build --file docker/Dockerfile.ci -t vllm-omni-ci ."
+      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+    agents:
+      queue: "cpu_queue_premerge_us_east_1"
+
   - label: "Simple Unit Test"
     commands:
       - ".buildkite/scripts/simple_test.sh"
     agents:
       queue: "cpu_queue_premerge"
+  - label: "Diffusion Model Test"
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/single_stage/test_diffusion_model.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
