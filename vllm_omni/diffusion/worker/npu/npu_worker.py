@@ -90,6 +90,14 @@ class NPUWorker:
         output = self.pipeline.forward(req)
         return output
 
+    def shutdown(self) -> None:
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+                logger.info("Worker %s: Destroyed process group", self.rank)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning("Worker %s: Failed to destroy process group: %s", self.rank, exc)
+
 
 class NPUWorkerProc:
     """Wrapper that runs one Worker in a separate process."""
@@ -187,6 +195,10 @@ class NPUWorkerProc:
                 continue
 
         logger.info("event loop terminated.")
+        try:
+            self.worker.shutdown()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
         # if self.result_sender is not None:
         #     self.result_sender.close()
         self.context.term()
