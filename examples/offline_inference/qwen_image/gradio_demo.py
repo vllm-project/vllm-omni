@@ -105,7 +105,6 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
             generator=generator,
             true_cfg_scale=float(cfg_scale_value),
             num_inference_steps=num_steps,
-            num_images_per_prompt=num_images,
             num_outputs_per_prompt=num_images,
         )
         return [img for img in images[:num_images]]
