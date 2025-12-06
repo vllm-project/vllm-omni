@@ -8,7 +8,6 @@ import os
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 
@@ -21,10 +20,17 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 def get_wan22_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
+    from diffusers.video_processor import VideoProcessor
+
+    video_processor = VideoProcessor(vae_scale_factor=8)
+
     def post_process_func(
-        frames,
+        video: torch.Tensor,
+        output_type: str = "np",
     ):
-        return frames
+        if output_type == "latent":
+            return video
+        return video_processor.postprocess_video(video, output_type=output_type)
 
     return post_process_func
 
@@ -71,7 +77,6 @@ class Wan22Pipeline(nn.Module):
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
         self.boundary_ratio = od_config.boundary_ratio
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
@@ -241,21 +246,20 @@ class Wan22Pipeline(nn.Module):
         self._current_timestep = None
 
         # Decode
-        latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
-        decoded = self.vae.decode(latents, return_dict=False)[0]
         if output_type == "latent":
             output = latents
         else:
-            output = self.video_processor.postprocess_video(decoded, output_type=output_type or "np")
+            latents = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latents.device, latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latents.device, latents.dtype
+            )
+            latents = latents / latents_std + latents_mean
+            output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
 
