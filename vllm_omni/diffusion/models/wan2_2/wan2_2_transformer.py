@@ -591,8 +591,6 @@ class WanTransformer3DModel(nn.Module):
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
-        self.gradient_checkpointing = False
-
     @property
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model parameters."""
