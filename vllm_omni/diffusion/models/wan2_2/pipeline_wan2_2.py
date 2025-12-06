@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -44,6 +46,25 @@ class Wan22Pipeline(nn.Module):
     ):
         super().__init__()
         self.od_config = od_config
+
+        # Weight sources for DiffusersPipelineLoader integration
+        # This enables centralized weight loading when available
+        try:
+            from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                ),
+            ]
+        except ImportError:
+            # DiffusersPipelineLoader not available yet
+            self.weights_sources = []
+
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
 
@@ -365,9 +386,10 @@ class Wan22Pipeline(nn.Module):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-    def load_weights(self):
-        # Everything loaded in __init__
-        return
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights using AutoWeightsLoader for vLLM integration."""
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
 
     def check_inputs(
         self,

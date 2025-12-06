@@ -15,6 +15,7 @@ from diffusers.models.normalization import FP32LayerNorm
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 logger = init_logger(__name__)
 
@@ -663,7 +664,7 @@ class WanTransformer3DModel(nn.Module):
 
         return Transformer2DModelOutput(sample=output)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """
         Load weights from a pretrained model, handling the mapping from
         separate Q/K/V projections to fused QKV projections for self-attention.
@@ -672,92 +673,46 @@ class WanTransformer3DModel(nn.Module):
         - blocks.N.attn1.to_q/to_k/to_v -> fused to blocks.N.attn1.to_qkv (self-attention)
         - blocks.N.attn2.to_q/to_k/to_v -> kept separate (cross-attention)
         - blocks.N.attn1.norm_q/norm_k -> QK normalization for self-attention
+
+        Returns:
+            Set of parameter names that were successfully loaded.
         """
-        weights_map: dict[str, torch.Tensor] = {name: tensor for name, tensor in weights}
+        # Stacked params mapping for self-attention QKV fusion
+        # Format: (param_name, shard_name, shard_id)
+        # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
+        stacked_params_mapping = [
+            # self-attention QKV fusion (attn1 only)
+            (".attn1.to_qkv", ".attn1.to_q", "q"),
+            (".attn1.to_qkv", ".attn1.to_k", "k"),
+            (".attn1.to_qkv", ".attn1.to_v", "v"),
+        ]
 
-        # Fuse self-attention (attn1) Q/K/V weights into to_qkv
-        # Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
-        qkv_candidates: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
-
-        for key in list(weights_map.keys()):
-            # Only process attn1 (self-attention) Q/K/V weights
-            if ".attn1.to_q." in key or ".attn1.to_k." in key or ".attn1.to_v." in key:
-                # Extract base path (e.g., "blocks.0.attn1")
-                if ".to_q." in key:
-                    base = key.split(".to_q.")[0]
-                    proj_type = "q"
-                    suffix = key.split(".to_q.")[1]  # "weight" or "bias"
-                elif ".to_k." in key:
-                    base = key.split(".to_k.")[0]
-                    proj_type = "k"
-                    suffix = key.split(".to_k.")[1]
-                elif ".to_v." in key:
-                    base = key.split(".to_v.")[0]
-                    proj_type = "v"
-                    suffix = key.split(".to_v.")[1]
-                else:
-                    continue
-
-                entry = qkv_candidates.setdefault(base, {"weight": {}, "bias": {}})
-                if suffix == "weight":
-                    entry["weight"][proj_type] = weights_map[key]
-                elif suffix == "bias":
-                    entry["bias"][proj_type] = weights_map[key]
-
-        # Combine Q/K/V into fused to_qkv
-        for base, entry in qkv_candidates.items():
-            # Fuse weights
-            if len(entry["weight"]) == 3:
-                q_weight = entry["weight"]["q"]
-                k_weight = entry["weight"]["k"]
-                v_weight = entry["weight"]["v"]
-                combined_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-
-                # Remove original keys
-                weights_map.pop(f"{base}.to_q.weight", None)
-                weights_map.pop(f"{base}.to_k.weight", None)
-                weights_map.pop(f"{base}.to_v.weight", None)
-
-                # Add fused weight
-                weights_map[f"{base}.to_qkv.weight"] = combined_weight
-
-            # Fuse biases
-            if len(entry["bias"]) == 3:
-                q_bias = entry["bias"]["q"]
-                k_bias = entry["bias"]["k"]
-                v_bias = entry["bias"]["v"]
-                combined_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
-
-                # Remove original keys
-                weights_map.pop(f"{base}.to_q.bias", None)
-                weights_map.pop(f"{base}.to_k.bias", None)
-                weights_map.pop(f"{base}.to_v.bias", None)
-
-                # Add fused bias
-                weights_map[f"{base}.to_qkv.bias"] = combined_bias
-
-        # Map parameter names and load weights
         params_dict = dict(self.named_parameters())
-        loaded_keys = set()
-        missing_keys = []
+        loaded_params: set[str] = set()
 
-        for name, loaded_weight in weights_map.items():
-            if name in params_dict:
+        for name, loaded_weight in weights:
+            # Check if this weight should be stacked (fused QKV)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                # Replace the weight name with the fused param name
+                name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    break
                 param = params_dict[name]
-                with torch.no_grad():
-                    param.copy_(loaded_weight)
-                loaded_keys.add(name)
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
             else:
-                missing_keys.append(name)
+                # Not a stacked param, load directly
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
 
-        # Log summary
-        if missing_keys:
-            logger.warning(f"Weights not found in model ({len(missing_keys)} keys): {missing_keys[:10]}...")
-
-        # Check for uninitialized params
-        uninitialized = [k for k in params_dict.keys() if k not in loaded_keys]
-        if uninitialized:
-            logger.warning(f"Model params not in checkpoint ({len(uninitialized)} keys): {uninitialized[:10]}...")
+        return loaded_params
 
     @classmethod
     def from_pretrained(
