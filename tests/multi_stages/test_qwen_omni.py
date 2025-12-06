@@ -13,6 +13,7 @@ from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
 
 from .conftest import OmniRunner
+from .utils import create_new_process_for_each_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
@@ -22,6 +23,7 @@ CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_om
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("model", models)
+@create_new_process_for_each_test()
 def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
