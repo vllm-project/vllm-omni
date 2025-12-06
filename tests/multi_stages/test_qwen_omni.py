@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+E2E tests for Qwen2.5-Omni model with mixed modality inputs and audio output.
+"""
+
+from pathlib import Path
+
+import pytest
+from vllm.assets.audio import AudioAsset
+from vllm.assets.image import ImageAsset
+from vllm.assets.video import VideoAsset
+from vllm.multimodal.image import convert_image_mode
+
+from .conftest import OmniRunner
+from .utils import create_new_process_for_each_test
+
+models = ["Qwen/Qwen2.5-Omni-3B"]
+
+# CI stage config optimized for 24GB GPU (L4/RTX3090)
+CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("model", models)
+@create_new_process_for_each_test()
+def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
+    """Test processing audio, image, and video together, generating audio output."""
+    with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
+        # Prepare multimodal inputs
+        question = "What is recited in the audio? What is in this image? Describe the video briefly."
+        audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
+        audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
+        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
+        video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
+
+        outputs = runner.generate_multimodal(
+            prompts=question,
+            audios=audio,
+            images=image,
+            videos=video,
+        )
+
+        # Verify we got outputs from multiple stages
+        assert len(outputs) > 0
+
+        # Find and verify text output (thinker stage)
+        text_output = None
+        for stage_output in outputs:
+            if stage_output.final_output_type == "text":
+                text_output = stage_output
+                break
+
+        assert text_output is not None
+        assert len(text_output.request_output) > 0
+        text_content = text_output.request_output[0].outputs[0].text
+        assert text_content is not None
+        assert len(text_content.strip()) > 0
+
+        # Find and verify audio output (code2wav stage)
+        audio_output = None
+        for stage_output in outputs:
+            if stage_output.final_output_type == "audio":
+                audio_output = stage_output
+                break
+
+        assert audio_output is not None
+        assert len(audio_output.request_output) > 0
+
+        # Verify audio tensor exists and has content
+        audio_tensor = audio_output.request_output[0].multimodal_output["audio"]
+        assert audio_tensor is not None
+        assert audio_tensor.numel() > 0
