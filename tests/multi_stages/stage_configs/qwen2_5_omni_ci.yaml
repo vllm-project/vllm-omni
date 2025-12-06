@@ -16,7 +16,7 @@ stage_args:
       max_model_len: 896
       max_num_batched_tokens: 896
       max_num_seqs: 1
-      gpu_memory_utilization: 0.665
+      gpu_memory_utilization: 0.64
       skip_mm_profiling: true
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
@@ -46,7 +46,7 @@ stage_args:
       max_model_len: 896
       max_num_batched_tokens: 896
       max_num_seqs: 1
-      gpu_memory_utilization: 0.255
+      gpu_memory_utilization: 0.28
       skip_mm_profiling: true
       enforce_eager: true
       trust_remote_code: true
