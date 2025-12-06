@@ -1,16 +1,23 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
+
+# The following config has been verified on 1x 24GB GPU (L4/RTX3090).
+# This config is optimized for CI e2e tests.
 stage_args:
   - stage_id: 0
     runtime:
       process: true            # Run this stage in a separate process
-      devices: "0"            # Visible devices for this stage
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
       max_batch_size: 1
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.npu.npu_ar_worker.NPUARWorker
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      max_model_len: 896
+      max_num_batched_tokens: 896
+      max_num_seqs: 1
+      gpu_memory_utilization: 0.64
+      skip_mm_profiling: true
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
       engine_output_type: latent
@@ -22,21 +29,25 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 2048
+      max_tokens: 128
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
   - stage_id: 1
     runtime:
       process: true
-      devices: "1"
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.npu.npu_ar_worker.NPUARWorker
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.8
+      max_model_len: 896
+      max_num_batched_tokens: 896
+      max_num_seqs: 1
+      gpu_memory_utilization: 0.28
+      skip_mm_profiling: true
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -47,7 +58,7 @@ stage_args:
       temperature: 0.9
       top_p: 0.8
       top_k: 40
-      max_tokens: 2048
+      max_tokens: 128
       seed: 42
       detokenize: True
       repetition_penalty: 1.05
@@ -55,14 +66,14 @@ stage_args:
   - stage_id: 2
     runtime:
       process: true
-      devices: "0"            # Example: use a different NPU than the previous stage; use "0" if single NPU
+      devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      gpu_memory_utilization: 0.15
+      gpu_memory_utilization: 0.07
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -74,7 +85,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 2048
+      max_tokens: 128
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
