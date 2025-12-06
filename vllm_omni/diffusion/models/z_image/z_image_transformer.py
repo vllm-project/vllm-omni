@@ -27,7 +27,6 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -50,7 +49,7 @@ class TimestepEmbedder(nn.Module):
                 bias=True,
             ),
             nn.SiLU(),
-            ReplicatedLinear(
+            nn.Linear(
                 mid_size,
                 out_size,
                 bias=True,
