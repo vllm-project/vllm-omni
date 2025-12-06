@@ -270,6 +270,13 @@ class QwenImagePipeline(
         self.transformer = QwenImageTransformer2DModel()
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
+        # Apply cache adapter (NEW - replaces per-request enable_teacache)
+        from vllm_omni.diffusion.cache.apply import setup_cache
+
+        self._cache_adapter = setup_cache(
+            self.transformer, cache_type=od_config.cache_adapter, cache_config=od_config.cache_config
+        )
+
         self.stage = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -541,36 +548,55 @@ class QwenImagePipeline(
         guidance,
         true_cfg_scale,
     ):
+        # Reset cache adapter state at the start of diffusion loop to ensure clean state
+        if self._cache_adapter is not None:
+            self._cache_adapter.reset(self.transformer)
+
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
             self._current_timestep = t
-            # broadcast to batch dimension and place on same device/dtype as latents
+
+            # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
+
+            # Forward pass for positive prompt (or unconditional if no CFG)
+            # cache_branch is passed to hook for CFG-aware state management
+            transformer_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states_mask": prompt_embeds_mask,
+                "encoder_hidden_states": prompt_embeds,
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+                "attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
+            }
+            if self._cache_adapter is not None:
+                transformer_kwargs["cache_branch"] = "positive"
+
+            noise_pred = self.transformer(**transformer_kwargs)[0]
+
+            # Forward pass for negative prompt (CFG)
+            # cache_branch is passed to hook for CFG-aware state management
             if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
+                neg_transformer_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "img_shapes": img_shapes,
+                    "txt_seq_lens": negative_txt_seq_lens,
+                    "attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                }
+                if self._cache_adapter is not None:
+                    neg_transformer_kwargs["cache_branch"] = "negative"
+
+                neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
