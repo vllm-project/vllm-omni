@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 
@@ -642,33 +643,13 @@ class ZImageTransformer2DModel(nn.Module):
 
         return x, {}
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        weights_map: dict[str, torch.Tensor] = {name: tensor for name, tensor in weights}
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in weights_map.items():
-            # In ZImageAttention, to_q, to_k, to_v are separate.
-            # The weight names are like '...attention.to_q.weight'.
-            # The logic from qwen_image_transformer for stacking is not needed here.
-            # We can do a direct mapping.
-
-            # The names in the state dict seem to match the model structure.
-            # Let's try a direct load.
-            if name in params_dict:
-                param = params_dict[name]
-                with torch.no_grad():
-                    param.copy_(loaded_weight)
-            else:
-                # The provided weight list might use a different naming convention.
-                # For example, `layers.0.attention.to_out.0.weight` vs `...`
-                # Let's try to handle simple cases.
-
-                # Replace dots with hyphens for ModuleDict keys
-                # e.g. all_x_embedder.2-1.weight -> all_x_embedder.2-1.weight
-                # The names seem to match already.
-
-                # If there are any specific mismatches, they can be handled here.
-                # For now, we assume a direct mapping and warn if a weight is not found.
-                import logging
-
-                logging.warning(f"Weight {name} not found in model parameters.")
+        loaded_params = set[str]()
+        for name, loaded_weight in weights:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
