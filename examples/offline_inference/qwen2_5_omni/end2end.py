@@ -496,7 +496,13 @@ def parse_args():
         default=16000,
         help="Sampling rate for audio loading (default: 16000).",
     )
-
+    parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"], help="backend")
+    parser.add_argument(
+        "--ray-address",
+        type=str,
+        default=None,
+        help="Address of the Ray cluster.",
+    )
     return parser.parse_args()
 
 

@@ -186,9 +186,18 @@ async def build_async_omni_from_stage_config(
 
     try:
         if getattr(args, "stage_configs_path", None):
-            async_omni = AsyncOmni(model=args.model, stage_configs_path=args.stage_configs_path)
+            async_omni = AsyncOmni(
+                model=args.model,
+                stage_configs_path=args.stage_configs_path,
+                worker_backend=getattr(args, "worker_backend", "process"),
+                ray_address=getattr(args, "ray_address", None),
+            )
         else:
-            async_omni = AsyncOmni(model=args.model)
+            async_omni = AsyncOmni(
+                model=args.model,
+                worker_backend=getattr(args, "worker_backend", "process"),
+                ray_address=getattr(args, "ray_address", None),
+            )
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()
