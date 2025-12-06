@@ -8,7 +8,6 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 
 # TODO replace this with vLLM implementation
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
@@ -17,6 +16,8 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+
+from vllm_omni.diffusion.attention.layer import Attention
 
 logger = init_logger(__name__)
 
@@ -262,12 +263,12 @@ class QwenImageCrossAttention(nn.Module):
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
-        # self.attn = Attention(
-        #     num_heads=num_heads,
-        #     head_size=self.head_dim,
-        #     scale=1.0,  # softmax_scale
-        #     attn_type=AttentionType.ENCODER,
-        # )
+        self.attn = Attention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+        )
 
     def forward(
         self,
@@ -316,20 +317,11 @@ class QwenImageCrossAttention(nn.Module):
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
-        # joint_hidden_states = self.attn(
-        #     joint_query,
-        #     joint_key,
-        #     joint_value,
-        # )
-        joint_hidden_states = dispatch_attention_fn(
+        joint_hidden_states = self.attn(
             joint_query,
             joint_key,
             joint_value,
-            dropout_p=0.0,
-            is_causal=False,
         )
-
-        # Reshape back
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
@@ -368,19 +360,6 @@ class QwenImageTransformerBlock(nn.Module):
             nn.Linear(dim, 6 * dim, bias=True),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        # self.attn = Attention(
-        #     query_dim=dim,
-        #     cross_attention_dim=None,  # Enable cross attention for joint computation
-        #     added_kv_proj_dim=dim,  # Enable added KV projections for text stream
-        #     dim_head=attention_head_dim,
-        #     heads=num_attention_heads,
-        #     out_dim=dim,
-        #     context_pre_only=False,
-        #     bias=True,
-        #     processor=QwenDoubleStreamAttnProcessor2_0(),
-        #     qk_norm=qk_norm,
-        #     eps=eps,
-        # )
         self.attn = QwenImageCrossAttention(
             dim=dim,
             num_heads=num_attention_heads,
