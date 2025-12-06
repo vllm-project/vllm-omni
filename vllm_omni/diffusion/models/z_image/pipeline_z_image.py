@@ -143,7 +143,7 @@ class ZImagePipeline(nn.Module):
     def __init__(
         self,
         *,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig,
         prefix: str = "",
     ):
         super().__init__()

@@ -18,6 +18,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -485,6 +486,7 @@ class QwenImageTransformer2DModel(nn.Module):
     # _repeated_blocks = ["QwenImageTransformerBlock"]
     def __init__(
         self,
+        od_config: OmniDiffusionConfig,
         patch_size: int = 2,
         in_channels: int = 64,
         out_channels: Optional[int] = 16,
@@ -496,7 +498,8 @@ class QwenImageTransformer2DModel(nn.Module):
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
     ):
         super().__init__()
-        self.config = None
+        model_config = od_config.tf_model_config
+        num_layers = model_config.num_layers
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
