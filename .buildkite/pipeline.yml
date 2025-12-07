@@ -40,7 +40,7 @@ steps:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/multi_stages/
     agents:
-      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+      queue: "gpu_4_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
