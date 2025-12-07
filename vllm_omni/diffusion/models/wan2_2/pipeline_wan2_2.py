@@ -15,6 +15,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -46,24 +47,15 @@ class Wan22Pipeline(nn.Module):
     ):
         super().__init__()
         self.od_config = od_config
-
-        # Weight sources for DiffusersPipelineLoader integration
-        # This enables centralized weight loading when available
-        try:
-            from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-
-            self.weights_sources = [
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=od_config.model,
-                    subfolder="transformer",
-                    revision=None,
-                    prefix="transformer.",
-                    fall_back_to_pt=True,
-                ),
-            ]
-        except ImportError:
-            # DiffusersPipelineLoader not available yet
-            self.weights_sources = []
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            ),
+        ]
 
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)

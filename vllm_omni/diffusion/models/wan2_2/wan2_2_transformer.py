@@ -691,26 +691,19 @@ class WanTransformer3DModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            # Check if this weight should be stacked (fused QKV)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # Replace the weight name with the fused param name
                 name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
                 break
             else:
-                # Not a stacked param, load directly
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
 
         return loaded_params
 
