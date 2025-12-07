@@ -19,7 +19,7 @@ _DIFFUSION_MODELS = {
         "pipeline_z_image",
         "ZImagePipeline",
     ),
-    "Wan22Pipeline": (
+    "WanPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
         "Wan22Pipeline",
@@ -60,7 +60,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
-    "Wan22Pipeline": "get_wan22_post_process_func",
+    "WanPipeline": "get_wan22_post_process_func",
 }
 
 
