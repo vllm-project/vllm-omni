@@ -3,9 +3,14 @@ from pathlib import Path
 from typing import Optional, Union
 
 import huggingface_hub
-from huggingface_hub import snapshot_download
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import DisabledTqdm, get_lock
+
+if envs.VLLM_USE_MODELSCOPE:
+    from modelscope.hub.snapshot_download import snapshot_download
+else:
+    from huggingface_hub import snapshot_download
 
 logger = init_logger(__name__)
 
@@ -37,6 +42,7 @@ def download_weights_from_hf_specific(
     """
     assert len(allow_patterns) > 0
     local_only = huggingface_hub.constants.HF_HUB_OFFLINE
+    download_kwargs = {"tqdm_class": DisabledTqdm} if not envs.VLLM_USE_MODELSCOPE else {}
 
     logger.info("Using model weights format %s", allow_patterns)
     # Use file lock to prevent multiple processes from
@@ -49,9 +55,9 @@ def download_weights_from_hf_specific(
                 allow_patterns=allow_pattern,
                 ignore_patterns=ignore_patterns,
                 cache_dir=cache_dir,
-                tqdm_class=DisabledTqdm,
                 revision=revision,
                 local_files_only=local_only,
+                **download_kwargs,
             )
             # If we have downloaded weights for this allow_pattern,
             # we don't need to check the rest.

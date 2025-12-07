@@ -14,10 +14,31 @@ steps:
       - ".buildkite/scripts/simple_test.sh"
     agents:
       queue: "cpu_queue_premerge"
+
   - label: "Diffusion Model Test"
+    timeout_in_minutes: 15
     depends_on: image-build
     commands:
       - pytest -s -v tests/single_stage/test_diffusion_model.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Omni Model Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - export VLLM_LOGGING_LEVEL=DEBUG
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/multi_stages/
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
