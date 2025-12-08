@@ -16,7 +16,7 @@ stage_args:
       max_model_len: 896
       max_num_batched_tokens: 896
       max_num_seqs: 1
-      gpu_memory_utilization: 0.64
+      gpu_memory_utilization: 0.8
       skip_mm_profiling: true
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
@@ -36,7 +36,7 @@ stage_args:
   - stage_id: 1
     runtime:
       process: true
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: talker
@@ -46,7 +46,7 @@ stage_args:
       max_model_len: 896
       max_num_batched_tokens: 896
       max_num_seqs: 1
-      gpu_memory_utilization: 0.28
+      gpu_memory_utilization: 0.8
       skip_mm_profiling: true
       enforce_eager: true
       trust_remote_code: true
@@ -73,7 +73,7 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      gpu_memory_utilization: 0.07
+      gpu_memory_utilization: 0.15
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
