@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
         "--flow_shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )
     parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
+    parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
     return parser.parse_args()
 
 
@@ -97,7 +98,7 @@ def main():
     if isinstance(video_array, np.ndarray) and video_array.ndim == 4:
         video_array = list(video_array)
 
-    export_to_video(video_array, str(output_path), fps=16)
+    export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
 
 
