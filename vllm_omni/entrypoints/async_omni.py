@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import socket
 import time
+from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, Union
@@ -61,21 +62,23 @@ class AsyncOmni(EngineClient):
 
     Args:
         model: Model name or path to load
-        stage_configs_path: Optional path to YAML file containing stage
-            configurations. If None, configurations are loaded from the model.
-        log_stats: Whether to enable statistics logging
-        log_file: Optional path prefix for log files. If provided, logs will
-            be written to files with stage-specific suffixes.
-        init_sleep_seconds: Number of seconds to sleep between starting
-            each stage process during initialization
-        shm_threshold_bytes: Threshold in bytes for using shared memory
-            for IPC. Objects larger than this threshold will use shared memory.
-        batch_timeout: Timeout in seconds for batching requests within a stage
-        init_timeout: Timeout in seconds for waiting for all stages to initialize
+        cli_args: Namespace object containing command-line arguments.
+            Expected attributes include:
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are loaded from the model.
+            - log_stats: Whether to enable statistics logging
+            - log_file: Optional path prefix for log files. If provided, logs will
+              be written to files with stage-specific suffixes.
+            - init_sleep_seconds: Number of seconds to sleep between starting
+              each stage process during initialization
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
         **kwargs: Additional keyword arguments passed to stage engines
 
     Example:
-        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B", cli_args=args)
         >>> async for output in async_llm.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
@@ -87,33 +90,29 @@ class AsyncOmni(EngineClient):
     def __init__(
         self,
         model: str,
-        stage_configs_path: Optional[str] = None,
-        log_stats: bool = False,
-        log_file: Optional[str] = None,
-        init_sleep_seconds: int = 30,
-        shm_threshold_bytes: int = 65536,
-        batch_timeout: int = 10,
-        init_timeout: int = 60000,
+        cli_args: Namespace,
         **kwargs: Any,
     ):
-        self.batch_timeout = batch_timeout
-        self._enable_stats: bool = bool(log_stats)
+        self.batch_timeout = cli_args.batch_timeout
+        self._enable_stats: bool = bool(cli_args.log_stats)
 
-        if stage_configs_path is None:
-            self.stage_configs = load_stage_configs_from_model(model)
+        base_engine_args = AsyncOmniEngineArgs.from_cli_args(cli_args).__dict__.copy()
+
+        if cli_args.stage_configs_path is None:
+            self.stage_configs = load_stage_configs_from_model(model, base_engine_args)
         else:
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+            self.stage_configs = load_stage_configs_from_yaml(cli_args.stage_configs_path, base_engine_args)
 
         self.stage_list: list[OmniStage] = []
         self.default_sampling_params_list: list[SamplingParams] = []
         # Optional file handler for orchestrator
-        self._log_file = log_file
+        self._log_file = cli_args.log_file
         if self._log_file:
             remove_old_logs(self._log_file, len(self.stage_configs))
             configure_orchestrator_logger(logger, self._log_file)
 
         self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
-        self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
+        self._initialize_stages(model, cli_args.init_sleep_seconds, cli_args.shm_threshold_bytes, cli_args.init_timeout)
 
     def _initialize_stages(
         self,
