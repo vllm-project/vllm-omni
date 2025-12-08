@@ -17,28 +17,28 @@ Run with:
 
 from __future__ import annotations
 
-import base64
 import os
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from pathlib import Path
-import tempfile
-from .utils import get_image_url_from_path
-CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
-
 
 import pytest
+from vllm.assets.image import ImageAsset
+from vllm.multimodal.image import convert_image_mode
+
+from .utils import get_image_url_from_path
 
 # Skip entire module if basic dependencies are missing
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
-from vllm.assets.image import ImageAsset
-from vllm.multimodal.image import convert_image_mode
+
+CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
 
 # Check GPU availability
 _HAS_GPU = torch.cuda.is_available()
@@ -165,8 +165,8 @@ class _OutputStreamer:
         return "\n".join(self.lines)
 
 
-def _wait_for_server(host: str, port: int, timeout: float = 1800) -> bool:
-    """Wait for the server to be ready.
+def _wait_for_server(host: str, port: int, timeout: float = 1800, process: subprocess.Popen | None = None) -> bool:
+    """Wait for the server to be ready, fail fast if the process has died.
 
     Args:
         timeout: Maximum time to wait in seconds. Default is 1800 (30 minutes)
@@ -179,6 +179,10 @@ def _wait_for_server(host: str, port: int, timeout: float = 1800) -> bool:
 
     while time.time() - start_time < timeout:
         elapsed = int(time.time() - start_time)
+        # Exit early if subprocess already crashed
+        if process is not None and process.poll() is not None:
+            print(f"\n[TEST] Server process exited early with code {process.returncode}")
+            return False
         try:
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -246,7 +250,7 @@ def omni_server():
 
     try:
         # Wait for server to be ready (30 min timeout for multi-stage init)
-        if not _wait_for_server(host, port, timeout=1800):
+        if not _wait_for_server(host, port, timeout=1800, process=process):
             streamer.stop()
             process.terminate()
             process.wait(timeout=10)
@@ -275,6 +279,7 @@ def omni_server():
         except Exception as e:
             print(f"Error during cleanup: {e}")
             process.kill()
+
 
 @requires_gpu
 @requires_model
