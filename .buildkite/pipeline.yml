@@ -12,12 +12,9 @@ steps:
   - label: ":docker: Build NPU image"
     key: npu-image-build
     commands:
-      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
       - "docker build --file docker/Dockerfile.ci.npu -t vllm-omni-ci-npu ."
-      - "docker tag vllm-omni-ci-npu public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT-npu"
-      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT-npu"
     agents:
-      queue: "cpu_queue_premerge_us_east_1"
+      queue: "ascend"
 
   # - label: "Simple Unit Test"
   #   commands:
