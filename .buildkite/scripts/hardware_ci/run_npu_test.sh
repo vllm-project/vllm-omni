@@ -108,6 +108,7 @@ devices=$(parse_and_gen_devices "${BUILDKITE_AGENT_NAME}") || exit 1
 model_cache_dir=/mnt/hf_cache${agent_idx}
 mkdir -p ${model_cache_dir}
 docker run \
+    --init \
     ${devices} \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
