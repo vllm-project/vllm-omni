@@ -1,1 +1,1 @@
-Architecture design of the ar module
+Architecture design of the AR module

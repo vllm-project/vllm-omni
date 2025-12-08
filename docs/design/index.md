@@ -16,4 +16,4 @@ This section contains design documents and architecture specifications for vLLM-
 
 - [AR Module Design](module/ar_module_design.md)
 - [DIT Module Design](module/dit_module_design.md)
-- [Entrypoint Module Design](module/entrypoint_module_desgin.md)
+- [Entrypoint Module Design](module/entrypoint_module_design.md)
