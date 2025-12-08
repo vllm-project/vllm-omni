@@ -232,7 +232,6 @@ def omni_server():
 
     # Start server process
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0"  # Use first GPU
 
     process = subprocess.Popen(
         cmd,
