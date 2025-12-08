@@ -124,5 +124,5 @@ docker run \
     bash -c '
     set -e
     export HF_ENDPOINT=https://hf-mirror.com
-    pytest -s -v tests/multi-stages/test_qwen_omni.py
+    pytest -s -v tests/multi_stages/test_qwen_omni.py
 '
