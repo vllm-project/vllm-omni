@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -20,9 +21,11 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -240,9 +243,18 @@ class QwenImagePipeline(
     ):
         super().__init__()
         self.od_config = od_config
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
+
         self.device = get_local_device()
         model = od_config.model
-
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
@@ -255,7 +267,7 @@ class QwenImagePipeline(
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = QwenImageTransformer2DModel()
+        self.transformer = QwenImageTransformer2DModel(od_config=od_config)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.stage = None
@@ -731,52 +743,6 @@ class QwenImagePipeline(
 
         return DiffusionOutput(output=image)
 
-    def load_weights(self):
-        self.load_transformer()
-
-    # TODO: find a better way to load
-    def load_transformer(self):
-        import glob
-        import os
-
-        # Define the weight iterator
-        def weight_iterator(transformer_path):
-            if not os.path.exists(transformer_path):
-                logger.warning(f"Path {transformer_path} does not exist.")
-                return
-
-            # Look for safetensors first
-            safetensors_files = glob.glob(os.path.join(transformer_path, "*.safetensors"))
-            if safetensors_files:
-                try:
-                    from safetensors.torch import load_file
-                except ImportError:
-                    logger.warning("safetensors not installed, cannot load .safetensors files.")
-                    return
-
-                for file_path in safetensors_files:
-                    state_dict = load_file(file_path)
-                    for name, tensor in state_dict.items():
-                        yield name, tensor
-            else:
-                # Fallback to bin
-                bin_files = glob.glob(os.path.join(transformer_path, "*.bin"))
-                for file_path in bin_files:
-                    state_dict = torch.load(file_path)
-                    for name, tensor in state_dict.items():
-                        yield name, tensor
-
-        try:
-            # Get model path from config or download from HF
-            model_name = self.od_config.model if hasattr(self, "od_config") else "Qwen/Qwen-Image"
-            if os.path.exists(model_name):
-                model_path = model_name
-            else:
-                model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-
-            transformer_path = os.path.join(model_path, "transformer")
-            self.transformer.load_weights(weight_iterator(transformer_path))
-
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            raise e
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

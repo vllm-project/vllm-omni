@@ -2,21 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing as mp
 import os
+import time
 
 import torch
 import zmq
 from transformers import PretrainedConfig
-from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import LoadConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.data import (
+    SHUTDOWN_MESSAGE,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -60,19 +65,27 @@ class NPUWorker:
             def __getattr__(self, name):
                 return "fake"
 
-        vllm_config = VllmConfig(model_config=ModelConfig(hf_config=_FakePretrainedConfig()))
+        vllm_config = VllmConfig(model_config=ModelConfig(hf_config=_FakePretrainedConfig()), load_config=LoadConfig())
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
         set_current_vllm_config(vllm_config)
 
         init_distributed_environment(world_size=world_size, rank=rank)
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-        with device:
-            with set_default_torch_dtype(self.od_config.dtype):
-                self.pipeline = initialize_model(self.od_config)
-                self.pipeline.load_weights()
-                self.pipeline.eval()
-        logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
+        model_loader = DiffusersPipelineLoader(vllm_config.load_config)
+        time_before_load = time.perf_counter()
+        with DeviceMemoryProfiler() as m:
+            self.pipeline = model_loader.load_model(
+                od_config=self.od_config,
+                load_device=f"npu:{rank}",
+            )
+        time_after_load = time.perf_counter()
+
+        logger.info(
+            "Model loading took %.4f GiB and %.6f seconds",
+            m.consumed_memory / GiB_bytes,
+            time_after_load - time_before_load,
+        )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
     @torch.inference_mode()
@@ -85,6 +98,14 @@ class NPUWorker:
         req = reqs[0]
         output = self.pipeline.forward(req)
         return output
+
+    def shutdown(self) -> None:
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+                logger.info("Worker %s: Destroyed process group", self.rank)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning("Worker %s: Failed to destroy process group: %s", self.rank, exc)
 
 
 class NPUWorkerProc:
@@ -157,6 +178,14 @@ class NPUWorkerProc:
                 )
                 continue
 
+            if reqs == SHUTDOWN_MESSAGE:
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
+                continue
+            if reqs is None:
+                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
+                continue
+
             # 2: execute, make sure a reply is always sent
             try:
                 output = self.worker.execute_model(reqs, self.od_config)
@@ -175,6 +204,10 @@ class NPUWorkerProc:
                 continue
 
         logger.info("event loop terminated.")
+        try:
+            self.worker.shutdown()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
         # if self.result_sender is not None:
         #     self.result_sender.close()
         self.context.term()
