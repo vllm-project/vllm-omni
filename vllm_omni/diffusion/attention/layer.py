@@ -14,6 +14,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from typing import Any
 from torch import Tensor
 
