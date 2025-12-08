@@ -267,7 +267,7 @@ class QwenImagePipeline(
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = QwenImageTransformer2DModel()
+        self.transformer = QwenImageTransformer2DModel(od_config=od_config)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.stage = None

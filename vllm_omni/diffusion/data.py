@@ -15,6 +15,32 @@ logger = init_logger(__name__)
 
 
 @dataclass
+class TransformerConfig:
+    """Container for raw transformer configuration dictionaries."""
+
+    params: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TransformerConfig":
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected transformer config dict, got {type(data)!r}")
+        return cls(params=dict(data))
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.params)
+
+    def get(self, key: str, default: Any | None = None) -> Any:
+        return self.params.get(key, default)
+
+    def __getattr__(self, item: str) -> Any:
+        params = object.__getattribute__(self, "params")
+        try:
+            return params[item]
+        except KeyError as exc:
+            raise AttributeError(item) from exc
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     model: str
@@ -22,6 +48,8 @@ class OmniDiffusionConfig:
     model_class_name: str | None = None
 
     dtype: torch.dtype = torch.bfloat16
+
+    tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
     # attention_backend: str = None
@@ -214,3 +242,7 @@ class AttentionBackendEnum(enum.Enum):
 
     def __str__(self):
         return self.name.lower()
+
+
+# Special message broadcast via scheduler queues to signal worker shutdown.
+SHUTDOWN_MESSAGE = {"type": "shutdown"}
