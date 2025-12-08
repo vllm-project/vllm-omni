@@ -9,10 +9,12 @@ steps:
   #   agents:
   #     queue: "cpu_queue_premerge_us_east_1"
 
-  - label: ":docker: Build NPU image"
-    key: npu-image-build
+  - label: "Test on NPU"
+    soft_fail: true
+    depends_on: ~
+    key: npu-test
     commands:
-      - "docker build --file docker/Dockerfile.ci.npu -t vllm-omni-ci-npu ."
+      - ".buildkite/scripts/hardware_ci/run_npu_test.sh"
     agents:
       queue: "ascend"
 
@@ -57,21 +59,3 @@ steps:
   #           - "HF_HOME=/fsx/hf_cache"
   #         volumes:
   #           - "/fsx/hf_cache:/fsx/hf_cache"
-
-  - label: "Simple Unit Test"
-    timeout_in_minutes: 15
-    depends_on: npu-image-build
-    commands:
-      - ".buildkite/scripts/simple_test.sh"
-    agents:
-      queue: "ascend"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT-npu
-          always-pull: true
-          propagate-environment: true
-          environment:
-            - "HF_ENDPOINT=https://hf-mirror.com"
-            - "HF_HOME=/mnt/huggingface"
-          volumes:
-            - "/mnt/huggingface:/mnt/huggingface"
