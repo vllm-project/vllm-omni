@@ -28,17 +28,13 @@ def initialize_connectors_from_config(
     Returns:
         tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
     """
-    try:
-        transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
-    except Exception as e:
-        logger.warning(f"Failed to load OmniTransferConfig from {config_path}: {e}")
-        return None, {}
+    transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
 
     if not transfer_config:
         logger.info("No OmniTransferConfig provided")
         return None, {}
 
-    # 使用统一的连接器创建逻辑
+    # create connectors from config
     connectors = create_connectors_from_config(transfer_config.connectors)
     return transfer_config, connectors
 
@@ -46,15 +42,23 @@ def initialize_connectors_from_config(
 def create_connectors_from_config(
     connectors_config: dict[tuple[str, str], ConnectorSpec],
 ) -> dict[tuple[str, str], OmniConnectorBase]:
-    """通用连接器创建逻辑，从配置字典创建连接器实例。"""
+    """
+    Create connectors from config.
+
+    Args:
+        connectors_config: A dictionary of connector configurations.
+
+    Returns:
+        A dictionary of connectors.
+    """
     connectors = {}
-    try:
-        for edge_key, connector_spec in connectors_config.items():
+    for edge_key, connector_spec in connectors_config.items():
+        try:
             connector = OmniConnectorFactory.create_connector(connector_spec)
             connectors[edge_key] = connector
             logger.info(f"Created connector for {edge_key[0]} -> {edge_key[1]}: {type(connector).__name__}")
-    except Exception as e:
-        logger.error(f"Failed to initialize connectors: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize connector for edge {edge_key}: {e}") from e
 
     return connectors
 
@@ -130,13 +134,10 @@ def load_omni_transfer_config(
 
     # Parse global connectors (from runtime.connectors)
     global_connectors = runtime_config.get("connectors", {})
-    # ... existing parsing ...
-    for conn_name, conn_config in global_connectors.items():
-        # Just verifying they parse validly, stored in global_connectors
-        pass
 
     # Parse stage-level connectors
     stage_args = config_dict.get("stage_args", [])
+    expected_edges: set[tuple[str, str]] = set()
     for stage_config in stage_args:
         stage_id = str(stage_config["stage_id"])
 
@@ -157,6 +158,7 @@ def load_omni_transfer_config(
             from_stage = input_key.replace("from_stage_", "")
             edge_key = (from_stage, stage_id)
             connectors[edge_key] = connector
+            expected_edges.add(edge_key)
 
         # Output connectors
         for output_key, conn_ref in stage_config.get("output_connectors", {}).items():
@@ -175,6 +177,7 @@ def load_omni_transfer_config(
             to_stage = output_key.replace("to_stage_", "")
             edge_key = (stage_id, to_stage)
             connectors[edge_key] = connector
+            expected_edges.add(edge_key)
 
     # Auto-configure SharedMemoryConnector for missing edges based on runtime edges / engine_input_source
     if stage_args:
@@ -188,6 +191,7 @@ def load_omni_transfer_config(
                     if from_stage is None or to_stage is None:
                         continue
                     edge_key = (str(from_stage), str(to_stage))
+                    expected_edges.add(edge_key)
                     if edge_key not in connectors:
                         logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
                         connectors[edge_key] = ConnectorSpec(
@@ -204,6 +208,7 @@ def load_omni_transfer_config(
                 for from_stage in sources:
                     from_stage_str = str(from_stage)
                     edge_key = (from_stage_str, to_stage)
+                    expected_edges.add(edge_key)
 
                     if edge_key not in connectors:
                         logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
@@ -213,6 +218,15 @@ def load_omni_transfer_config(
 
         except Exception as e:
             logger.warning(f"Failed to auto-configure SHM connectors: {e}")
+
+    # Fail fast if any expected edge is still missing a connector
+    missing_edges = [edge for edge in expected_edges if edge not in connectors]
+    if missing_edges:
+        missing_str = ", ".join([f"{f}->{t}" for f, t in missing_edges])
+        raise ValueError(
+            "Connector configuration missing for edges: "
+            f"{missing_str}. Define connectors or allow auto SHM creation for these edges."
+        )
 
     config = OmniTransferConfig(connectors=connectors)
 
@@ -224,8 +238,7 @@ def load_omni_transfer_config(
 
 
 def initialize_orchestrator_connectors(
-    config_path: Optional[str],
-    worker_backend: Optional[str] = "process",
+    config_path: Optional[str], worker_backend: Optional[str] = "multi_process", shm_threshold_bytes: int = 65536
 ) -> tuple[Optional[OmniTransferConfig], dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
     Args:
@@ -237,15 +250,11 @@ def initialize_orchestrator_connectors(
     if worker_backend == "ray":
         default_shm_threshold = sys.maxsize
     else:
-        default_shm_threshold = 65536
-    try:
-        transfer_config, connectors = initialize_connectors_from_config(
-            config_path, default_shm_threshold=default_shm_threshold
-        )
-        return transfer_config, connectors
-    except Exception as exc:  # pragma: no cover - defensive logging
-        logger.error("Unexpected error initializing connectors: %s", exc)
-        return None, {}
+        default_shm_threshold = max(0, shm_threshold_bytes)
+    transfer_config, connectors = initialize_connectors_from_config(
+        config_path, default_shm_threshold=default_shm_threshold
+    )
+    return transfer_config, connectors
 
 
 def get_stage_connector_config(
@@ -284,28 +293,29 @@ def build_stage_connectors(
     from .config import ConnectorSpec
 
     connectors: dict[tuple[str, str], Any] = {}
+    # 将字典格式的配置转换为ConnectorSpec对象
+    stage_connector_specs = {}
+    for input_key, config in connectors_config.items():
+        if not input_key.startswith("from_stage_"):
+            continue
+
+        from_stage = input_key.replace("from_stage_", "")
+        spec_dict = config.get("spec", {})
+        if not spec_dict:
+            continue
+
+        connector_spec = ConnectorSpec(
+            name=spec_dict.get("name", "SharedMemoryConnector"),
+            extra=spec_dict.get("extra", {}),
+        )
+        stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
+
     try:
-        # 将字典格式的配置转换为ConnectorSpec对象
-        stage_connector_specs = {}
-        for input_key, config in connectors_config.items():
-            if not input_key.startswith("from_stage_"):
-                continue
-
-            from_stage = input_key.replace("from_stage_", "")
-            spec_dict = config.get("spec", {})
-            if not spec_dict:
-                continue
-
-            connector_spec = ConnectorSpec(
-                name=spec_dict.get("name", "SharedMemoryConnector"),
-                extra=spec_dict.get("extra", {}),
-            )
-            stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
-
         # 使用统一的连接器创建逻辑
         connectors = create_connectors_from_config(stage_connector_specs)
     except Exception as exc:  # pragma: no cover - defensive logging
+        # Fail fast so the stage does not start with missing connectors.
         logger.exception("[Stage-%s] Failed to initialize connectors: %s", stage_id, exc)
-        return None
+        raise
 
     return connectors

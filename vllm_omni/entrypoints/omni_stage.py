@@ -165,7 +165,7 @@ class OmniStage:
         ctx: Optional[mp.context.BaseContext] = None,
         batch_timeout: int = 10,
         connectors_config: Optional[dict] = None,
-        worker_backend: str = "process",
+        worker_backend: str = "multi_process",
         **kwargs: Any,
     ) -> None:
         """Initialize and start the stage worker process.
@@ -181,7 +181,7 @@ class OmniStage:
             ctx: Optional multiprocessing context (default: spawn)
             batch_timeout: Timeout in seconds for batching requests
             connectors_config: Configuration for stage connectors
-            worker_backend: Backend type ("process" or "ray")
+            worker_backend: Backend type ("multi_process" or "ray")
             **kwargs: Additional arguments (e.g. ray_placement_group)
 
         Raises:
@@ -558,7 +558,8 @@ def _stage_worker(
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
 
-            # Resolve input data strictly via connectors
+            # Resolve input data strictly via connectors if payload
+            # is larger than shm_threshold_bytes or using other connectors
             ein, _rx_metrics = try_recv_via_connector(
                 task=t,
                 connectors=connectors,

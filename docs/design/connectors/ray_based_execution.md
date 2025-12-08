@@ -1,6 +1,6 @@
 # VLLM-Omni Distributed Utilities
 
-This directory contains utilities for distributed execution in vllm-omni, supporting both **Ray** and **Multiprocessing** backends.
+This directory (vllm_omni/distributed/ray_utils) contains utilities for distributed execution in vllm-omni, supporting both **Ray** and **Multiprocessing** backends.
 
 ## 1. Ray Utils
 
@@ -44,6 +44,7 @@ When running on Ray, the system automatically adapts its communication strategy:
 
 *   **Cross-Node**: Recommended to use `MooncakeConnector` (requires separate configuration).
 *   **Same-Node**: Can still use `SharedMemoryConnector` for efficiency, or Ray's native object store (plasma).
+*   **SHM threshold default differs**: when `worker_backend="ray"`, the SharedMemoryConnector default threshold is set to `sys.maxsize`, which forces payloads to go inline (no SHM). Override `shm_threshold_bytes` in the connector config if you want SHM for Ray runs.
 
 ### 1.4 Internal Helpers
 

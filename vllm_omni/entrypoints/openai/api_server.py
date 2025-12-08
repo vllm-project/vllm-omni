@@ -189,13 +189,13 @@ async def build_async_omni_from_stage_config(
             async_omni = AsyncOmni(
                 model=args.model,
                 stage_configs_path=args.stage_configs_path,
-                worker_backend=getattr(args, "worker_backend", "process"),
+                worker_backend=getattr(args, "worker_backend", "multi_process"),
                 ray_address=getattr(args, "ray_address", None),
             )
         else:
             async_omni = AsyncOmni(
                 model=args.model,
-                worker_backend=getattr(args, "worker_backend", "process"),
+                worker_backend=getattr(args, "worker_backend", "multi_process"),
                 ray_address=getattr(args, "ray_address", None),
             )
 

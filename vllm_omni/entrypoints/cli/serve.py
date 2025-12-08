@@ -63,8 +63,8 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--worker-backend",
             type=str,
-            default="process",
-            choices=["process", "ray"],
+            default="multi_process",
+            choices=["multi_process", "ray"],
             help="The backend to use for stage workers.",
         )
         serve_parser.add_argument(

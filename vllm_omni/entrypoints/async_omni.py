@@ -108,7 +108,7 @@ class AsyncOmni(EngineClient):
         init_timeout: int = 60000,
         **kwargs: Any,
     ):
-        self.worker_backend = kwargs.get("worker_backend", "process")
+        self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
         self._ray_pg = None
         self.batch_timeout = batch_timeout
@@ -123,7 +123,7 @@ class AsyncOmni(EngineClient):
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=self.worker_backend
+            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
         )
 
         self.stage_list: list[OmniStage] = []
@@ -407,8 +407,8 @@ class AsyncOmni(EngineClient):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
-                        if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
+                        rid_key = str(req_id)
+                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
