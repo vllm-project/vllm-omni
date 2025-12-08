@@ -57,7 +57,7 @@ steps:
       - "cd /vllm-workspace && git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && pip install -v -e .[dev]"
       - "cd /vllm-workspace/vllm-omni && export VLLM_WORKER_MULTIPROC_METHOD=spawn && pytest -v -s tests/test_omni_llm.py"
     agents:
-      queue: "npu_queue"
+      queue: "ascend"
     plugins:
       - docker#v5.2.0:
           image: quay.io/ascend/vllm-ascend:v0.11.0rc2
