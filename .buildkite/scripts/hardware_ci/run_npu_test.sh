@@ -123,5 +123,6 @@ docker run \
     "${image_name}" \
     bash -c '
     set -e
-    pytest -s -v tests/single_stage/test_diffusion_model.py
+    export HF_ENDPOINT=https://hf-mirror.com
+    pytest -s -v tests/multi-stages/test_qwen_omni.py
 '
