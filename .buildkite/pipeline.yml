@@ -17,11 +17,11 @@ steps:
     agents:
       queue: "ascend"
 
-  # - label: "Simple Unit Test"
-  #   commands:
-  #     - ".buildkite/scripts/simple_test.sh"
-  #   agents:
-  #     queue: "cpu_queue_premerge"
+  - label: "Simple Unit Test"
+    commands:
+      - ".buildkite/scripts/simple_test.sh"
+    agents:
+      queue: "cpu_queue_premerge"
 
   # - label: "Diffusion Model Test"
   #   timeout_in_minutes: 15
