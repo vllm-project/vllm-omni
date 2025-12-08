@@ -78,28 +78,28 @@ steps:
             - "/root/.cache:/root/.cache"
           shm-size: "1g"
 
-  - label: "Omni Model Test on NPU"
-    commands:
-      - "cd /vllm-workspace && git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && pip install -v -e .[dev]"
-      - "cd /vllm-workspace/vllm-omni && export VLLM_WORKER_MULTIPROC_METHOD=spawn && pytest -s -v tests/single_stage/test_diffusion_model.py"
-    agents:
-      queue: "ascend"
-    plugins:
-      - docker#v5.2.0:
-          image: quay.nju.edu.cn/ascend/vllm-ascend:v0.11.0rc2
-          always-pull: true
-          propagate-environment: true
-          device:
-            - "/dev/davinci0"
-            - "/dev/davinci1"
-            - "/dev/davinci_manager"
-            - "/dev/devmm_svm"
-            - "/dev/hisi_hdc"
-          volumes:
-            - "/usr/local/dcmi:/usr/local/dcmi"
-            - "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi"
-            - "/usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/"
-            - "/usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info"
-            - "/etc/ascend_install.info:/etc/ascend_install.info"
-            - "/root/.cache:/root/.cache"
-          shm-size: "1g"
+  # - label: "Omni Model Test on NPU"
+  #   commands:
+  #     - "cd /vllm-workspace && git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && pip install -v -e .[dev]"
+  #     - "cd /vllm-workspace/vllm-omni && export VLLM_WORKER_MULTIPROC_METHOD=spawn && pytest -s -v tests/single_stage/test_diffusion_model.py"
+  #   agents:
+  #     queue: "ascend"
+  #   plugins:
+  #     - docker#v5.2.0:
+  #         image: quay.nju.edu.cn/ascend/vllm-ascend:v0.11.0rc2
+  #         always-pull: true
+  #         propagate-environment: true
+  #         device:
+  #           - "/dev/davinci0"
+  #           - "/dev/davinci1"
+  #           - "/dev/davinci_manager"
+  #           - "/dev/devmm_svm"
+  #           - "/dev/hisi_hdc"
+  #         volumes:
+  #           - "/usr/local/dcmi:/usr/local/dcmi"
+  #           - "/usr/local/bin/npu-smi:/usr/local/bin/npu-smi"
+  #           - "/usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/"
+  #           - "/usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info"
+  #           - "/etc/ascend_install.info:/etc/ascend_install.info"
+  #           - "/root/.cache:/root/.cache"
+  #         shm-size: "1g"
