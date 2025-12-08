@@ -14,7 +14,7 @@ steps:
 
 - label: "Omni Model Test"
   timeout_in_minutes: 15
-  gpu: h100
+  num_gpus: 4
   commands:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
