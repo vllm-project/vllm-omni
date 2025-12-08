@@ -4,6 +4,8 @@
 import enum
 import random
 from pydantic import Field, model_validator
+from contextlib import contextmanager
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from typing_extensions import Self
@@ -247,6 +249,50 @@ class OmniDiffusionConfig:
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
         return cls(**kwargs)
 
+_current_omni_diffusion_config: OmniDiffusionConfig | None = None
+_current_prefix: str | None = None
+@contextmanager
+def set_current_vllm_config(
+    omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None
+):
+    """
+    Temporarily set the current vLLM config.
+    Used during model initialization.
+    We save the current vLLM config in a global variable,
+    so that all modules can access it, e.g. custom ops
+    can access the vLLM config to determine how to dispatch.
+    """
+    global _current_omni_diffusion_config, _current_prefix
+    old_omni_diffusion_config = _current_omni_diffusion_config
+    old_prefix = _current_prefix
+    from vllm.compilation.counter import compilation_counter
+
+    num_models_seen = compilation_counter.num_models_seen
+    try:
+        _current_omni_diffusion_config = omni_diffusion_config
+        _current_prefix = prefix
+        yield
+    except Exception:
+        raise
+    else:
+        if check_compile:
+            raise RuntimeError("Compilation is not yet supported for OmniDiffusion")
+    finally:
+        _current_omni_diffusion_config = old_omni_diffusion_config
+        _current_prefix = old_prefix
+        # Clear the compilation config cache when context changes
+        get_cached_compilation_config.cache_clear()
+
+@lru_cache(maxsize=1)
+def get_cached_compilation_config():
+    """Cache config to avoid repeated calls to get_current_omni_diffusion_config()"""
+    return get_current_omni_diffusion_config().compilation_config
+
+def get_current_omni_diffusion_config() -> OmniDiffusionConfig:
+    if _current_omni_diffusion_config is None:
+        logger.warning("Current OmniDiffusionConfig is not set.")
+        return OmniDiffusionConfig()
+    return _current_omni_diffusion_config
 
 @dataclass
 class DiffusionOutput:
