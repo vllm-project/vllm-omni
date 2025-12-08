@@ -156,6 +156,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ]
             )
 
+            # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
+            self._init_special_tokens_embeddings()
+
         elif self.model_stage == "code2wav":
             self.thinker = None
             self.talker = None

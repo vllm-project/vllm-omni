@@ -22,6 +22,7 @@ stage_args:
       enable_prefix_caching: false
       hf_config_name: thinker_config
       tensor_parallel_size: 2
+      load_format: dummy
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -29,7 +30,7 @@ stage_args:
       temperature: 0.4
       top_p: 0.9
       top_k: 1
-      max_tokens: 2048
+      max_tokens: 100
       seed: 42
       detokenize: True
       repetition_penalty: 1.05
@@ -51,6 +52,7 @@ stage_args:
        enable_prefix_caching: false
        distributed_executor_backend: "mp"
        hf_config_name: talker_config
+       load_format: dummy
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
@@ -58,7 +60,7 @@ stage_args:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      max_tokens: 4096
+      max_tokens: 100
       seed: 42
       detokenize: False
       repetition_penalty: 1.05
@@ -81,6 +83,7 @@ stage_args:
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
+      load_format: dummy
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true
@@ -89,7 +92,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 65536
+      max_tokens: 200
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
