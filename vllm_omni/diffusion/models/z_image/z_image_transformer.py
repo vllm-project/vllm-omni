@@ -21,9 +21,14 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -90,16 +95,13 @@ class ZImageAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
-        self.to_q = nn.Linear(dim, dim, bias=False)
-        self.to_k = nn.Linear(dim, self.head_dim * num_kv_heads, bias=False)
-        self.to_v = nn.Linear(dim, self.head_dim * num_kv_heads, bias=False)
-        # TODO enable this when we refactor weight loader
-        # self.to_qkv = QKVParallelLinear(
-        #     hidden_size=dim,
-        #     head_size=self.head_dim,
-        #     total_num_heads=num_heads,
-        #     disable_tp=True,
-        # )
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            disable_tp=True,
+            bias=False,
+        )
 
         assert qk_norm is True
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -120,11 +122,8 @@ class ZImageAttention(nn.Module):
         attention_mask: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
-        # qkv, _ = self.to_qkv(hidden_states)
-        # query, key, value = qkv.chunk(3, dim=-1)
+        qkv, _ = self.to_qkv(hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
 
         query = query.unflatten(-1, (self.num_heads, -1))
         key = key.unflatten(-1, (self.num_heads, -1))
@@ -171,15 +170,24 @@ class ZImageAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-
-    def _forward_silu_gating(self, x1, x3):
-        return F.silu(x1) * x3
+        self.w13 = MergedColumnParallelLinear(
+            dim,
+            [hidden_dim] * 2,
+            bias=False,
+            disable_tp=True,
+            return_bias=False,
+        )
+        self.act = SiluAndMul()
+        self.w2 = RowParallelLinear(
+            hidden_dim,
+            dim,
+            bias=False,
+            disable_tp=True,
+            return_bias=False,
+        )
 
     def forward(self, x):
-        return self.w2(self._forward_silu_gating(self.w1(x), self.w3(x)))
+        return self.w2(self.act(self.w13(x)))
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -644,12 +652,32 @@ class ZImageTransformer2DModel(nn.Module):
         return x, {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            # self-attn
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            # ffn
+            (".w13", ".w1", 0),
+            (".w13", ".w3", 1),
+        ]
+
         params_dict = dict(self.named_parameters())
 
         loaded_params = set[str]()
         for name, loaded_weight in weights:
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
