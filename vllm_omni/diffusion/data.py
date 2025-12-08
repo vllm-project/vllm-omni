@@ -163,6 +163,8 @@ class OmniDiffusionConfig:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    flow_shift: float | None = None
+
     # Logging
     log_level: str = "info"
 

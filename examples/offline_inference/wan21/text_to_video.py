@@ -22,8 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative_prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance_scale", type=float, default=5.0, help="Classifier-free guidance scale.")
-    parser.add_argument("--height", type=int, default=720, help="Video height.")
-    parser.add_argument("--width", type=int, default=1280, help="Video width.")
+    parser.add_argument("--height", type=int, default=480, help="Video height.")
+    parser.add_argument("--width", type=int, default=832, help="Video width.")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames (Wan default is 81).")
     parser.add_argument("--num_inference_steps", type=int, default=40, help="Sampling steps.")
     parser.add_argument(
