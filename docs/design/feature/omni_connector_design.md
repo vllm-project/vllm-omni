@@ -1,1 +1,1 @@
-## OmniConnector for fully disaggregated serving
+## OmniConnector for fully disaggregated serving (update soon)
