@@ -21,16 +21,15 @@
 # limitations under the License.
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
-import time
 from torch import nn
 from torch.nn import Parameter
 from torch.nn import functional as F
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -47,10 +46,6 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.processing_utils import Unpack
-from transformers.utils import auto_docstring, can_return_tuple
-from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import OutputRecorder, TransformersKwargs, check_model_inputs
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoderConfig,
     Qwen3OmniMoeCode2WavConfig,
@@ -62,6 +57,10 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
     Qwen3OmniMoeVisionEncoderConfig,
 )
+from transformers.processing_utils import Unpack
+from transformers.utils import auto_docstring, can_return_tuple
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import OutputRecorder, TransformersKwargs, check_model_inputs
 
 
 @auto_docstring
@@ -126,9 +125,7 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-            )
+            causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
             if sequence_length != 1:
                 causal_mask = torch.triu(causal_mask, diagonal=1)
             causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
@@ -1830,9 +1827,7 @@ def load_balancing_loss_func(
     The Qwen2.5OmniThinker model which consists of a audio backbone and a language model.
     """
 )
-class Qwen3OmniMoeThinkerForConditionalGeneration(
-    Qwen3OmniMoePreTrainedModelForConditionalGeneration, GenerationMixin
-):
+class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3OmniMoePreTrainedModelForConditionalGeneration, GenerationMixin):
     config: Qwen3OmniMoeThinkerConfig
     base_model_prefix = "thinker"
     _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
@@ -2161,9 +2156,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size
-            )
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.get_text_config().vocab_size)
 
         aux_loss = None
         if output_router_logits:
@@ -2689,12 +2682,10 @@ class Qwen3OmniMoeTalkerTextSparseMoeBlock(nn.Module):
             ]
         )
 
-        self.shared_expert = Qwen3OmniMoeTalkerTextMLP(
-            config, intermediate_size=config.shared_expert_intermediate_size
-        )
+        self.shared_expert = Qwen3OmniMoeTalkerTextMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor, layer_idx: int=0) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, layer_idx: int = 0) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -2762,7 +2753,7 @@ class Qwen3OmniMoeTalkerDecoderLayer(GradientCheckpointingLayer):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        layer_idx: int=0,
+        layer_idx: int = 0,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         """
@@ -2794,7 +2785,7 @@ class Qwen3OmniMoeTalkerDecoderLayer(GradientCheckpointingLayer):
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
-            position_embeddings=position_embeddings,    
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -2932,7 +2923,7 @@ class Qwen3OmniMoeTalkerModel(Qwen3OmniMoePreTrainedModel):
                     visual_pos_masks,
                     deepstack_visual_embeds[layer_idx],
                 )
-            
+
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(
@@ -3779,9 +3770,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
             del self.code2wav
         self.has_talker = False
 
-    def _get_talker_user_parts(
-        self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
-    ):
+    def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
         user_talker_part = torch.empty(
             (1, segment_end_index - im_start_index, self.config.talker_config.text_config.hidden_size),
             device=self.talker.device,
@@ -3975,12 +3964,16 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         except Exception:
             thinker_out_len = 0
         perf_stats["thinker_tokens"] = thinker_out_len
-        perf_stats["thinker_tps"] = (thinker_out_len / perf_stats["thinker_time_s"]) if perf_stats["thinker_time_s"] > 0 else 0.0
+        perf_stats["thinker_tps"] = (
+            (thinker_out_len / perf_stats["thinker_time_s"]) if perf_stats["thinker_time_s"] > 0 else 0.0
+        )
 
         if not generate_audio:
             perf_stats["total_tokens"] = perf_stats["thinker_tokens"]
             perf_stats["total_time_s"] = time.time() - total_t0
-            perf_stats["total_tps"] = (perf_stats["total_tokens"] / perf_stats["total_time_s"]) if perf_stats["total_time_s"] > 0 else 0.0
+            perf_stats["total_tps"] = (
+                (perf_stats["total_tokens"] / perf_stats["total_time_s"]) if perf_stats["total_time_s"] > 0 else 0.0
+            )
             # attach stats to self
             setattr(self, "_perf_stats_last", perf_stats)
             if not hasattr(self, "_perf_stats_history"):
@@ -4019,9 +4012,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
             dtype=input_ids.dtype,
         )
         tts_bos_embed, tts_eos_embed, tts_pad_embed = (
-            self.thinker.get_input_embeddings()(talker_special_tokens)
-            .to(self.talker.device)
-            .chunk(3, dim=1)
+            self.thinker.get_input_embeddings()(talker_special_tokens).to(self.talker.device).chunk(3, dim=1)
         )  # 3 * [1 1 d]
         info_to_save = {
             "tts_bos_embed": tts_bos_embed,
@@ -4081,7 +4072,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
             inputs_embeds=talker_input_embed,
             trailing_text_hidden=trailing_text_hidden,
             tts_pad_embed=tts_pad_embed,
-            talker_input_ids=talker_input_id,  # Not use input_ids to prevent repetation penalty out of bound
+            talker_input_ids=talker_input_id,  # Not use input_ids to prevent repetition penalty out of bound
             **talker_kwargs,
         )
         t3 = time.time()
@@ -4096,16 +4087,24 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
             perf_stats["talker_tokens"] = int(talker_codes.shape[-1])
         except Exception:
             perf_stats["talker_tokens"] = 0
-        perf_stats["talker_tps"] = (perf_stats["talker_tokens"] / perf_stats["talker_time_s"]) if perf_stats["talker_time_s"] > 0 else 0.0
+        perf_stats["talker_tps"] = (
+            (perf_stats["talker_tokens"] / perf_stats["talker_time_s"]) if perf_stats["talker_time_s"] > 0 else 0.0
+        )
         t4 = time.time()
         talker_wavs = self.code2wav.chunked_decode(talker_codes, chunk_size=300, left_context_size=25).float()
         t5 = time.time()
         perf_stats["code2wav_time_s"] = max(0.0, t5 - t4)
         perf_stats["code2wav_tokens"] = perf_stats["talker_tokens"]  # same T, not times 16
-        perf_stats["code2wav_tps"] = (perf_stats["code2wav_tokens"] / perf_stats["code2wav_time_s"]) if perf_stats["code2wav_time_s"] > 0 else 0.0
+        perf_stats["code2wav_tps"] = (
+            (perf_stats["code2wav_tokens"] / perf_stats["code2wav_time_s"])
+            if perf_stats["code2wav_time_s"] > 0
+            else 0.0
+        )
         perf_stats["total_tokens"] = perf_stats["thinker_tokens"] + perf_stats["talker_tokens"]
         perf_stats["total_time_s"] = time.time() - total_t0
-        perf_stats["total_tps"] = (perf_stats["total_tokens"] / perf_stats["total_time_s"]) if perf_stats["total_time_s"] > 0 else 0.0
+        perf_stats["total_tps"] = (
+            (perf_stats["total_tokens"] / perf_stats["total_time_s"]) if perf_stats["total_time_s"] > 0 else 0.0
+        )
         setattr(self, "_perf_stats_last", perf_stats)
         if not hasattr(self, "_perf_stats_history"):
             setattr(self, "_perf_stats_history", [])
