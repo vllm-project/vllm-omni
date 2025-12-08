@@ -100,6 +100,7 @@ class ZImageAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             disable_tp=True,
+            bias=False,
         )
 
         assert qk_norm is True
