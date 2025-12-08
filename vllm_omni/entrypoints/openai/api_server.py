@@ -185,10 +185,7 @@ async def build_async_omni_from_stage_config(
     async_omni: Optional[EngineClient] = None
 
     try:
-        if getattr(args, "stage_configs_path", None):
-            async_omni = AsyncOmni(model=args.model, stage_configs_path=args.stage_configs_path)
-        else:
-            async_omni = AsyncOmni(model=args.model)
+        async_omni = AsyncOmni(model=args.model, cli_args=args)
 
         # # Don't keep the dummy data in memory
         # await async_llm.reset_mm_cache()

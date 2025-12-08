@@ -156,6 +156,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 ]
             )
 
+            # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
+            self._init_special_tokens_embeddings()
+
         elif self.model_stage == "code2wav":
             self.thinker = None
             self.talker = None
@@ -342,9 +345,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                     and thinker_tts_embeds.shape[1] == 3
                 ):
                     bos_eos_pad = thinker_tts_embeds.to(text_hidden_states.device).chunk(3, dim=1)  # 3 * [1,1,H]
-                    multimodal_outputs["tts_bos_embed"] = bos_eos_pad[0]
-                    multimodal_outputs["tts_eos_embed"] = bos_eos_pad[1]
-                    multimodal_outputs["tts_pad_embed"] = bos_eos_pad[2]
+                    multimodal_outputs["tts_bos_embed"] = [bos_eos_pad[0]]
+                    multimodal_outputs["tts_eos_embed"] = [bos_eos_pad[1]]
+                    multimodal_outputs["tts_pad_embed"] = [bos_eos_pad[2]]
             except Exception:
                 # Best-effort; absence will be handled by talker with fallbacks
                 pass

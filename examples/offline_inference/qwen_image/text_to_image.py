@@ -65,7 +65,6 @@ def main():
         generator=generator,
         true_cfg_scale=args.cfg_scale,
         num_inference_steps=args.num_inference_steps,
-        num_images_per_prompt=args.num_images_per_prompt,
         num_outputs_per_prompt=args.num_images_per_prompt,
     )
 
