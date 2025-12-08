@@ -1,6 +1,6 @@
 import os
 from collections import Counter
-from dataclasses import is_dataclass, asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 def _convert_dataclasses_to_dict(obj: Any) -> Any:
     """Recursively convert non-serializable objects to OmegaConf-compatible types.
-    
+
     This is needed because OmegaConf cannot handle:
     - Dataclass objects with Literal type annotations (e.g., StructuredOutputsConfig)
     - Counter objects (from collections or vllm.utils)
@@ -25,7 +25,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     # IMPORTANT: Check Counter BEFORE dict, since Counter is a subclass of dict
     # Handle Counter objects (convert to dict)
     # Check by class name first to catch both collections.Counter and vllm.utils.Counter
-    if hasattr(obj, '__class__') and obj.__class__.__name__ == 'Counter':
+    if hasattr(obj, "__class__") and obj.__class__.__name__ == "Counter":
         try:
             return dict(obj)
         except (TypeError, ValueError):
@@ -52,7 +52,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return type(obj)(_convert_dataclasses_to_dict(item) for item in obj)
     # Try to convert any dict-like object (has keys/values methods) to dict
-    if hasattr(obj, 'keys') and hasattr(obj, 'values') and not isinstance(obj, (str, bytes)):
+    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, (str, bytes)):
         try:
             return {k: _convert_dataclasses_to_dict(v) for k, v in obj.items()}
         except (TypeError, ValueError, AttributeError):
@@ -62,7 +62,7 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
-def load_stage_configs_from_model(model: str, base_engine_args: dict={}) -> list:
+def load_stage_configs_from_model(model: str, base_engine_args: dict = {}) -> list:
     """Load stage configurations from model's default config file.
 
     Loads stage configurations based on the model type and device type.
@@ -87,7 +87,9 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict={}) -> list
         device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
         device_config_path = PROJECT_ROOT / device_config_file
         if os.path.exists(device_config_path):
-            stage_configs = load_stage_configs_from_yaml(config_path=str(device_config_path), base_engine_args=base_engine_args)
+            stage_configs = load_stage_configs_from_yaml(
+                config_path=str(device_config_path), base_engine_args=base_engine_args
+            )
             return stage_configs
 
     # Fall back to default config
@@ -99,7 +101,7 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict={}) -> list
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict={}) -> list:
+def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict = {}) -> list:
     """Load stage configurations from a YAML file.
 
     Args:
@@ -116,7 +118,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict={}) ->
     for stage_arg in stage_args:
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
-        if hasattr(stage_arg, 'engine_args') and stage_arg.engine_args is not None:
+        if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
             base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args

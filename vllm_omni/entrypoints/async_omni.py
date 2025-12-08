@@ -3,10 +3,10 @@ import multiprocessing as mp
 import os
 import socket
 import time
+from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, Union
-from argparse import Namespace
 
 import torch
 
@@ -62,21 +62,23 @@ class AsyncOmni(EngineClient):
 
     Args:
         model: Model name or path to load
-        stage_configs_path: Optional path to YAML file containing stage
-            configurations. If None, configurations are loaded from the model.
-        log_stats: Whether to enable statistics logging
-        log_file: Optional path prefix for log files. If provided, logs will
-            be written to files with stage-specific suffixes.
-        init_sleep_seconds: Number of seconds to sleep between starting
-            each stage process during initialization
-        shm_threshold_bytes: Threshold in bytes for using shared memory
-            for IPC. Objects larger than this threshold will use shared memory.
-        batch_timeout: Timeout in seconds for batching requests within a stage
-        init_timeout: Timeout in seconds for waiting for all stages to initialize
+        cli_args: Namespace object containing command-line arguments.
+            Expected attributes include:
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are loaded from the model.
+            - log_stats: Whether to enable statistics logging
+            - log_file: Optional path prefix for log files. If provided, logs will
+              be written to files with stage-specific suffixes.
+            - init_sleep_seconds: Number of seconds to sleep between starting
+              each stage process during initialization
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
         **kwargs: Additional keyword arguments passed to stage engines
 
     Example:
-        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B", cli_args=args)
         >>> async for output in async_llm.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",

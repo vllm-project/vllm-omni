@@ -205,11 +205,7 @@ def get_video_query(video_path: Optional[str] = None, custom_prompt: Optional[st
         "content": [
             {
                 "type": "video_url",
-                "video_url": {
-                    # "url": "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
-                    # Use absolute path with file:// (note: three slashes for absolute paths)
-                    "url": "file:///mnt/vllm_open_release/sora_gen_high_res.mp4"
-                },
+                "video_url": {"url": video_url},
             },
             {
                 "type": "text",
