@@ -10,7 +10,6 @@ steps:
   #     queue: "cpu_queue_premerge_us_east_1"
 
   - label: "Test on NPU"
-    soft_fail: true
     depends_on: ~
     key: npu-test
     commands:
