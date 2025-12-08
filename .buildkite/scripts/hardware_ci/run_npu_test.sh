@@ -49,10 +49,6 @@ ARG VLLM_OMNI_TAG=main
 RUN git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/" && \
     git clone --depth 1 \$VLLM_OMNI_REPO --branch \$VLLM_OMNI_TAG /workspace/vllm-omni
 
-# Install vllm dependencies in advance. Effect: As long as common.txt remains unchanged, the docker cache layer will be valid.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /workspace/vllm-omni/requirements.txt
-
 RUN --mount=type=cache,target=/root/.cache/pip \
     export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
