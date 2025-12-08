@@ -60,7 +60,7 @@ steps:
       queue: "ascend"
     plugins:
       - docker#v5.2.0:
-          image: quay.io/ascend/vllm-ascend:v0.11.0rc2
+          image: quay.nju.edu.cn/ascend/vllm-ascend:v0.11.0rc2
           always-pull: true
           propagate-environment: true
           device:
@@ -86,7 +86,7 @@ steps:
       queue: "ascend"
     plugins:
       - docker#v5.2.0:
-          image: quay.io/ascend/vllm-ascend:v0.11.0rc2
+          image: quay.nju.edu.cn/ascend/vllm-ascend:v0.11.0rc2
           always-pull: true
           propagate-environment: true
           device:
