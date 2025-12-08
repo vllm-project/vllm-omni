@@ -8,7 +8,6 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
@@ -16,6 +15,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.attention.layer import Attention
 
 logger = init_logger(__name__)
 
@@ -238,6 +239,14 @@ class WanSelfAttention(nn.Module):
             ]
         )
 
+        # Unified attention layer
+        self.attn = Attention(
+            num_heads=num_heads,
+            head_size=head_dim,
+            softmax_scale=1.0 / (head_dim**0.5),
+            causal=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -262,15 +271,8 @@ class WanSelfAttention(nn.Module):
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
-        # Compute attention
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        # Compute attention using unified attention layer
+        hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -334,6 +336,14 @@ class WanCrossAttention(nn.Module):
             ]
         )
 
+        # Unified attention layer
+        self.attn = Attention(
+            num_heads=num_heads,
+            head_size=head_dim,
+            softmax_scale=1.0 / (head_dim**0.5),
+            causal=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -371,26 +381,12 @@ class WanCrossAttention(nn.Module):
             key_img = key_img.unflatten(2, (self.num_heads, -1))
             value_img = value_img.unflatten(2, (self.num_heads, -1))
 
-            hidden_states_img = dispatch_attention_fn(
-                query,
-                key_img,
-                value_img,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False,
-            )
+            hidden_states_img = self.attn(query, key_img, value_img)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
-        # Main cross-attention
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        # Main cross-attention using unified attention layer
+        hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -706,92 +702,3 @@ class WanTransformer3DModel(nn.Module):
             loaded_params.add(name)
 
         return loaded_params
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-        subfolder: str = "",
-        torch_dtype: torch.dtype = torch.bfloat16,
-        **kwargs,
-    ) -> "WanTransformer3DModel":
-        """
-        Load a pretrained WanTransformer3DModel from HuggingFace hub or local path.
-        """
-        import json
-        import os
-
-        from safetensors.torch import load_file
-
-        # Construct path
-        if subfolder:
-            model_path = os.path.join(pretrained_model_name_or_path, subfolder)
-        else:
-            model_path = pretrained_model_name_or_path
-
-        # Load config
-        config_path = os.path.join(model_path, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                config = json.load(f)
-        else:
-            raise FileNotFoundError(f"Config file not found at {config_path}")
-
-        # Create model
-        model = cls(
-            patch_size=tuple(config.get("patch_size", (1, 2, 2))),
-            num_attention_heads=config.get("num_attention_heads", 40),
-            attention_head_dim=config.get("attention_head_dim", 128),
-            in_channels=config.get("in_channels", 16),
-            out_channels=config.get("out_channels", 16),
-            text_dim=config.get("text_dim", 4096),
-            freq_dim=config.get("freq_dim", 256),
-            ffn_dim=config.get("ffn_dim", 13824),
-            num_layers=config.get("num_layers", 40),
-            cross_attn_norm=config.get("cross_attn_norm", True),
-            eps=config.get("eps", 1e-6),
-            image_dim=config.get("image_dim", None),
-            added_kv_proj_dim=config.get("added_kv_proj_dim", None),
-            rope_max_seq_len=config.get("rope_max_seq_len", 1024),
-            pos_embed_seq_len=config.get("pos_embed_seq_len", None),
-        )
-
-        # Load weights - handle both single file and sharded safetensors
-        state_dict = {}
-
-        # Check for sharded safetensors index file
-        index_file = os.path.join(model_path, "diffusion_pytorch_model.safetensors.index.json")
-        if os.path.exists(index_file):
-            # Load sharded safetensors
-            with open(index_file) as f:
-                index = json.load(f)
-            shard_files = sorted(set(index["weight_map"].values()))
-            for shard_file in shard_files:
-                shard_path = os.path.join(model_path, shard_file)
-                if os.path.exists(shard_path):
-                    shard_dict = load_file(shard_path)
-                    state_dict.update(shard_dict)
-                else:
-                    logger.warning(f"Shard file not found: {shard_path}")
-        else:
-            # Try single file
-            weights_file = os.path.join(model_path, "diffusion_pytorch_model.safetensors")
-            if not os.path.exists(weights_file):
-                weights_file = os.path.join(model_path, "model.safetensors")
-            if not os.path.exists(weights_file):
-                # Try bin file
-                weights_file = os.path.join(model_path, "diffusion_pytorch_model.bin")
-
-            if os.path.exists(weights_file):
-                if weights_file.endswith(".safetensors"):
-                    state_dict = load_file(weights_file)
-                else:
-                    state_dict = torch.load(weights_file, map_location="cpu")
-            else:
-                logger.warning(f"No weights file found at {model_path}")
-
-        if state_dict:
-            model.load_weights(state_dict.items())
-
-        model = model.to(torch_dtype)
-        return model

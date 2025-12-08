@@ -47,6 +47,14 @@ class Wan22Pipeline(nn.Module):
     ):
         super().__init__()
         self.od_config = od_config
+
+        self.device = get_local_device()
+        dtype = getattr(od_config, "dtype", torch.bfloat16)
+
+        model = od_config.model
+        local_files_only = os.path.exists(model)
+
+        # Set up weights sources for transformer(s)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -55,13 +63,14 @@ class Wan22Pipeline(nn.Module):
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer_2",
+                revision=None,
+                prefix="transformer_2.",
+                fall_back_to_pt=True,
+            ),
         ]
-
-        self.device = get_local_device()
-        dtype = getattr(od_config, "dtype", torch.bfloat16)
-
-        model = od_config.model
-        local_files_only = os.path.exists(model)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.text_encoder = UMT5EncoderModel.from_pretrained(
@@ -70,15 +79,10 @@ class Wan22Pipeline(nn.Module):
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
-        self.transformer = WanTransformer3DModel.from_pretrained(
-            model, subfolder="transformer", torch_dtype=dtype, local_files_only=local_files_only
-        ).to(self.device)
-        try:
-            self.transformer_2 = WanTransformer3DModel.from_pretrained(
-                model, subfolder="transformer_2", torch_dtype=dtype, local_files_only=local_files_only
-            ).to(self.device)
-        except Exception:
-            self.transformer_2 = None
+
+        # Initialize transformers without from_pretrained (weights loaded via load_weights)
+        self.transformer = WanTransformer3DModel()
+        self.transformer_2 = WanTransformer3DModel()
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
@@ -163,7 +167,7 @@ class Wan22Pipeline(nn.Module):
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
-            guidance_scale_2=guidance_high if self.boundary_ratio is not None and self.transformer_2 else None,
+            guidance_scale_2=guidance_high if self.boundary_ratio is not None else None,
         )
 
         if num_frames % self.vae_scale_factor_temporal != 1:
@@ -204,7 +208,7 @@ class Wan22Pipeline(nn.Module):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
-        if self.boundary_ratio is not None and self.transformer_2 is not None:
+        if self.boundary_ratio is not None:
             boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Latents
@@ -419,6 +423,4 @@ class Wan22Pipeline(nn.Module):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
 
         if self.boundary_ratio is None and guidance_scale_2 is not None:
-            raise ValueError(
-                "`guidance_scale_2` is only supported when `boundary_ratio` is set and transformer_2 exists."
-            )
+            raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
