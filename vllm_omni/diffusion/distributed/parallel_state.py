@@ -783,7 +783,7 @@ def destroy_distributed_environment():
         torch.distributed.destroy_process_group()
 
 
-def destroy_distributed_env(self):
+def destroy_distributed_env():
     if model_parallel_is_initialized():
         destroy_model_parallel()
     destroy_distributed_environment()
