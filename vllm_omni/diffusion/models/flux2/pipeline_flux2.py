@@ -147,8 +147,8 @@ class Flux2Pipeline(nn.Module):
             ).to(self.device)
             logger.info("Loaded Flux2 VAE successfully")
 
-            # Initialize transformer
-            self.transformer = Flux2Transformer2DModel()
+            # Initialize transformer (with config support for CI testing)
+            self.transformer = Flux2Transformer2DModel(od_config=od_config)
             logger.info("Initialized Flux2 transformer successfully.")
 
             # Load tokenizer

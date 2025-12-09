@@ -625,8 +625,16 @@ class Flux2Transformer2DModel(nn.Module):
         axes_dims_rope: Tuple[int, ...] = (32, 32, 32, 32),
         rope_theta: int = 2000,
         eps: float = 1e-6,
+        od_config: "OmniDiffusionConfig | None" = None,
     ):
         super().__init__()
+        # Load from config if available (for CI testing with smaller models)
+        if od_config is not None and od_config.tf_model_config.params:
+            model_config = od_config.tf_model_config
+            num_layers = model_config.get("num_layers", num_layers)
+            num_single_layers = model_config.get("num_single_layers", num_single_layers)
+            attention_head_dim = model_config.get("attention_head_dim", attention_head_dim)
+            num_attention_heads = model_config.get("num_attention_heads", num_attention_heads)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
