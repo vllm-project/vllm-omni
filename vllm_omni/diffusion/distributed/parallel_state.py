@@ -1,4 +1,3 @@
-
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
@@ -29,12 +28,13 @@ The typical workflow is:
 If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
-from typing import Any, List, Optional
+
+from typing import List, Optional
 
 import torch
 import torch.distributed
-
 from vllm.logger import init_logger
+
 from vllm_omni.diffusion.envs import envs
 
 from .group_coordinator import (
@@ -45,15 +45,14 @@ from .group_coordinator import (
 
 try:
     import torch_musa
-    from torch_musa.core.device import set_device, device_count
+    from torch_musa.core.device import device_count, set_device
 except ModuleNotFoundError:
     pass
 
 try:
-    from torch.npu import set_device, device_count
+    from torch.npu import device_count, set_device
 except ModuleNotFoundError:
     pass
-
 
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
@@ -76,7 +75,7 @@ _VAE: Optional[GroupCoordinator] = None
 def generate_masked_orthogonal_rank_groups(
     world_size: int, parallel_size: List[int], mask: List[bool]
 ) -> List[List[int]]:
-    """Generate orthogonal parallel groups based on the parallel size and mask.
+    r"""Generate orthogonal parallel groups based on the parallel size and mask.
 
     Arguments:
         world_size (int): world size
@@ -151,9 +150,9 @@ def generate_masked_orthogonal_rank_groups(
         idx = [(index // d) % s for s, d in zip(shape, stride)]
         # stride is a prefix_product result. And the value of stride[-1]
         # is not used.
-        assert (
-            sum([x * y for x, y in zip(idx, stride[:-1])]) == index
-        ), "idx {} with shape {} mismatch the return idx {}".format(index, shape, idx)
+        assert sum([x * y for x, y in zip(idx, stride[:-1])]) == index, (
+            f"idx {index} with shape {shape} mismatch the return idx {idx}"
+        )
         return idx
 
     masked_shape = [s for s, m in zip(parallel_size, mask) if m]
@@ -175,14 +174,13 @@ def generate_masked_orthogonal_rank_groups(
             # get indices from masked for rank_in_group.
             decomposed_rank_idx = decompose(rank_in_group, masked_shape)
             rank.append(
-                inner_product(decomposed_rank_idx, masked_stride)
-                + inner_product(decomposed_group_idx, unmasked_stride)
+                inner_product(decomposed_rank_idx, masked_stride) + inner_product(decomposed_group_idx, unmasked_stride)
             )
         ranks.append(rank)
     return ranks
 
 
-class RankGenerator(object):
+class RankGenerator:
     def __init__(
         self,
         tp: int,
@@ -250,14 +248,14 @@ class RankGenerator(object):
                 get full DP group.
         """
         mask = self.get_mask(self.order, token)
-        ranks = generate_masked_orthogonal_rank_groups(
-            self.world_size, self.ordered_size, mask
-        )
+        ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
         if self.rank_offset > 0:
             for rank_group in ranks:
                 for i in range(len(rank_group)):
                     rank_group[i] += self.rank_offset
         return ranks
+
+
 # * QUERY
 def get_world_group() -> GroupCoordinator:
     assert _WORLD is not None, "world group is not initialized"
@@ -340,9 +338,7 @@ def is_pipeline_last_stage():
 
 # CFG
 def get_cfg_group() -> GroupCoordinator:
-    assert (
-        _CFG is not None
-    ), "classifier_free_guidance parallel group is not initialized"
+    assert _CFG is not None, "classifier_free_guidance parallel group is not initialized"
     return _CFG
 
 
@@ -376,8 +372,7 @@ def is_dp_last_group():
     """Return True if in the last data parallel group, False otherwise."""
     return (
         get_sequence_parallel_rank() == (get_sequence_parallel_world_size() - 1)
-        and get_classifier_free_guidance_rank()
-        == (get_classifier_free_guidance_world_size() - 1)
+        and get_classifier_free_guidance_rank() == (get_classifier_free_guidance_world_size() - 1)
         and get_pipeline_parallel_rank() == (get_pipeline_parallel_world_size() - 1)
     )
 
@@ -412,9 +407,7 @@ def get_vae_parallel_rank():
 # * SET
 
 
-def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
-) -> GroupCoordinator:
+def init_world_group(ranks: List[int], local_rank: int, backend: str) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
@@ -432,7 +425,7 @@ def init_distributed_environment(
     if backend is None:
         backend = envs.get_torch_distributed_backend()
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
         rank,
         local_rank,
@@ -441,8 +434,7 @@ def init_distributed_environment(
     )
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
-            "distributed_init_method must be provided when initializing "
-            "distributed environment"
+            "distributed_init_method must be provided when initializing distributed environment"
         )
         # this backend is used for WORLD
         torch.distributed.init_process_group(
@@ -467,20 +459,14 @@ def init_distributed_environment(
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
 
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return (
-        _DP is not None
-        and _CFG is not None
-        and _SP is not None
-        and _PP is not None
-        and _TP is not None
-    )
+    return _DP is not None and _CFG is not None and _SP is not None and _PP is not None and _TP is not None
 
 
 def init_model_parallel_group(
@@ -523,9 +509,7 @@ def init_dit_group(
     backend: str,
 ):
     global _DIT
-    _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
+    _DIT = torch.distributed.new_group(ranks=list(range(dit_parallel_size)), backend=backend)
 
 
 def get_dit_group():
@@ -573,7 +557,7 @@ def initialize_model_parallel(
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 groups to parallelize the batch dim(dp), 2 groups to parallelize
-    splited batch caused by CFG, and 2 GPUs to parallelize sequence.
+    split batch caused by CFG, and 2 GPUs to parallelize sequence.
 
     dp_degree (2) * cfg_degree (2) * sp_degree (2) * pp_degree (2) = 16.
 

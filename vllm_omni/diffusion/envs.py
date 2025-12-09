@@ -2,9 +2,10 @@
 # Adapted from
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
 import os
-import torch
-import diffusers
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+
+import diffusers
+import torch
 from packaging import version
 
 try:
@@ -31,9 +32,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
     # used in distributed environment to manually set the communication port
-    "MASTER_PORT": lambda: (
-        int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None
-    ),
+    "MASTER_PORT": lambda: (int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
     "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
@@ -115,9 +114,7 @@ def get_device_version():
     elif _is_npu():
         return None
     else:
-        raise NotImplementedError(
-            "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
-        )
+        raise NotImplementedError("No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available")
 
 
 def get_torch_distributed_backend() -> str:
@@ -130,18 +127,14 @@ def get_torch_distributed_backend() -> str:
     elif _is_npu():
         return "hccl"
     else:
-        raise NotImplementedError(
-            "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
-        )
+        raise NotImplementedError("No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available")
 
 
 variables: Dict[str, Callable[[], Any]] = {
     # ================== Other Vars ==================
     # used in version checking
     "CUDA_VERSION": lambda: version.parse(get_device_version() or "0.0"),
-    "TORCH_VERSION": lambda: version.parse(
-        version.parse(torch.__version__).base_version
-    ),
+    "TORCH_VERSION": lambda: version.parse(version.parse(torch.__version__).base_version),
 }
 
 
@@ -151,12 +144,8 @@ def _setup_musa(environment_variables, variables):
         return
     try:
         if musa.is_available():
-            environment_variables["MUSA_HOME"] = lambda: os.environ.get(
-                "MUSA_HOME", None
-            )
-            environment_variables["MUSA_VISIBLE_DEVICES"] = lambda: os.environ.get(
-                "MUSA_VISIBLE_DEVICES", None
-            )
+            environment_variables["MUSA_HOME"] = lambda: os.environ.get("MUSA_HOME", None)
+            environment_variables["MUSA_VISIBLE_DEVICES"] = lambda: os.environ.get("MUSA_VISIBLE_DEVICES", None)
             musa_ver = getattr(getattr(torch, "version", None), "musa", None)
             if musa_ver:
                 variables["MUSA_VERSION"] = lambda: version.parse(musa_ver)
@@ -191,17 +180,14 @@ class PackagesEnvChecker:
         Checks whether ROCm AITER library is installed
         """
         try:
-            import aiter
             logger.info("Using AITER as the attention library")
             return True
         except:
             if _is_hip():
                 logger.warning(
-                    f'Using AMD GPUs, but library "aiter" is not installed, '
-                    'defaulting to other attention mechanisms'
+                    'Using AMD GPUs, but library "aiter" is not installed, defaulting to other attention mechanisms'
                 )
             return False
-
 
     def check_flash_attn(self, packages_info):
         if not torch.cuda.is_available():
@@ -209,13 +195,11 @@ class PackagesEnvChecker:
 
         # Check if torch_npu is available
         if _is_npu():
-            logger.info("falsh_attn is not ready on torch_npu for now")
+            logger.info("`falsh_attn` is not ready on torch_npu for now")
             return False
 
         if _is_musa():
-            logger.info(
-                "Flash Attention library is not supported on MUSA for the moment."
-            )
+            logger.info("Flash Attention library is not supported on MUSA for the moment.")
             return False
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -223,26 +207,18 @@ class PackagesEnvChecker:
             if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
                 return False
             else:
-                from flash_attn import flash_attn_func
-                from flash_attn import __version__
+                from flash_attn import __version__, flash_attn_func
 
                 if __version__ < "2.6.0":
-                    raise ImportError(f"install flash_attn >= 2.6.0")
+                    raise ImportError("install flash_attn >= 2.6.0")
                 return True
         except ImportError:
             if not packages_info.get("has_aiter", False):
-                logger.warning(
-                    f'Flash Attention library "flash_attn" not found, '
-                    f"using pytorch attention implementation"
-                )
+                logger.warning('Flash Attention library "flash_attn" not found, using pytorch attention implementation')
             return False
 
-
-
     def check_diffusers_version(self):
-        if version.parse(
-            version.parse(diffusers.__version__).base_version
-        ) < version.parse("0.30.0"):
+        if version.parse(version.parse(diffusers.__version__).base_version) < version.parse("0.30.0"):
             raise RuntimeError(
                 f"Diffusers version: {version.parse(version.parse(diffusers.__version__).base_version)} is not supported,"
                 f"please upgrade to version > 0.30.0"
