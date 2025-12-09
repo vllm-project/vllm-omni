@@ -51,6 +51,11 @@ class OmniEngineArgs(EngineArgs):
         # Create OmniModelConfig by copying all base config attributes
         # and adding the new omni-specific fields
         config_dict = base_config.__dict__.copy()
+        # FIXME(Isotr0py): This is a temporary workaround for multimodal_config
+        config_dict = {
+            **(getattr(mm := config_dict.pop("multimodal_config", None), "__dict__", mm or {})),
+            **config_dict,
+        }
 
         # Add the new omni-specific fields
         config_dict["stage_id"] = self.stage_id

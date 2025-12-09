@@ -7,7 +7,7 @@ from dataclasses import fields
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -53,6 +53,11 @@ class OmniDiffusion:
             od_config.model,
         )
         od_config.model_class_name = config_dict.get("_class_name", None)
+        tf_config_dict = get_hf_file_to_dict(
+            "transformer/config.json",
+            od_config.model,
+        )
+        od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
@@ -82,3 +87,12 @@ class OmniDiffusion:
 
     def _run_engine(self, requests: list[OmniDiffusionRequest]):
         return self.engine.step(requests)
+
+    def close(self) -> None:
+        self.engine.close()
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass

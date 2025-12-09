@@ -8,7 +8,6 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 
 # TODO replace this with vLLM implementation
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
@@ -17,6 +16,10 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -262,12 +265,12 @@ class QwenImageCrossAttention(nn.Module):
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
-        # self.attn = Attention(
-        #     num_heads=num_heads,
-        #     head_size=self.head_dim,
-        #     scale=1.0,  # softmax_scale
-        #     attn_type=AttentionType.ENCODER,
-        # )
+        self.attn = Attention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+        )
 
     def forward(
         self,
@@ -316,20 +319,11 @@ class QwenImageCrossAttention(nn.Module):
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
-        # joint_hidden_states = self.attn(
-        #     joint_query,
-        #     joint_key,
-        #     joint_value,
-        # )
-        joint_hidden_states = dispatch_attention_fn(
+        joint_hidden_states = self.attn(
             joint_query,
             joint_key,
             joint_value,
-            dropout_p=0.0,
-            is_causal=False,
         )
-
-        # Reshape back
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
@@ -368,19 +362,6 @@ class QwenImageTransformerBlock(nn.Module):
             nn.Linear(dim, 6 * dim, bias=True),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        # self.attn = Attention(
-        #     query_dim=dim,
-        #     cross_attention_dim=None,  # Enable cross attention for joint computation
-        #     added_kv_proj_dim=dim,  # Enable added KV projections for text stream
-        #     dim_head=attention_head_dim,
-        #     heads=num_attention_heads,
-        #     out_dim=dim,
-        #     context_pre_only=False,
-        #     bias=True,
-        #     processor=QwenDoubleStreamAttnProcessor2_0(),
-        #     qk_norm=qk_norm,
-        #     eps=eps,
-        # )
         self.attn = QwenImageCrossAttention(
             dim=dim,
             num_heads=num_attention_heads,
@@ -506,6 +487,7 @@ class QwenImageTransformer2DModel(nn.Module):
     # _repeated_blocks = ["QwenImageTransformerBlock"]
     def __init__(
         self,
+        od_config: OmniDiffusionConfig,
         patch_size: int = 2,
         in_channels: int = 64,
         out_channels: Optional[int] = 16,
@@ -517,7 +499,8 @@ class QwenImageTransformer2DModel(nn.Module):
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
     ):
         super().__init__()
-        self.config = None
+        model_config = od_config.tf_model_config
+        num_layers = model_config.num_layers
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
@@ -624,79 +607,39 @@ class QwenImageTransformer2DModel(nn.Module):
 
         return Transformer2DModelOutput(sample=output)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        # Collect incoming weights into a dict for flexible mapping and grouping
-        weights_map: dict[str, torch.Tensor] = {name: tensor for name, tensor in weights}
-
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            (
-                "to_qkv",
-                [
-                    {"aliases": ["q_proj", "to_q", "q", "query"], "order": 0},
-                    {"aliases": ["k_proj", "to_k", "k", "key"], "order": 1},
-                    {"aliases": ["v_proj", "to_v", "v", "value"], "order": 2},
-                ],
-            ),
-            (
-                "add_kv_proj",
-                [
-                    {"aliases": ["add_q_proj", "add_q"], "order": 0},
-                    {"aliases": ["add_k_proj", "add_k"], "order": 1},
-                    {"aliases": ["add_v_proj", "add_v"], "order": 2},
-                ],
-            ),
+            # (param_name, shard_name, shard_id)
+            # self-attn
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            # cross-attn
+            (".add_kv_proj", ".add_q_proj", "q"),
+            (".add_kv_proj", ".add_k_proj", "k"),
+            (".add_kv_proj", ".add_v_proj", "v"),
         ]
 
-        # Helper that attempts to gather shards per base key using aliases and merges them
-        for target, shards in stacked_params_mapping:
-            base_candidates: dict[str, dict[str, dict[int, tuple[str, torch.Tensor]]]] = {}
-            for key in list(weights_map.keys()):
-                for shard in shards:
-                    for alias in shard["aliases"]:
-                        weight_suffix = f".{alias}.weight"
-                        bias_suffix = f".{alias}.bias"
-                        if key.endswith(weight_suffix):
-                            base = key[: -len(weight_suffix)]
-                            base_entry = base_candidates.setdefault(base, {"weight": {}, "bias": {}})
-                            base_entry["weight"][shard["order"]] = (
-                                key,
-                                weights_map[key],
-                            )
-                            break
-                        if key.endswith(bias_suffix):
-                            base = key[: -len(bias_suffix)]
-                            base_entry = base_candidates.setdefault(base, {"weight": {}, "bias": {}})
-                            base_entry["bias"][shard["order"]] = (key, weights_map[key])
-                            break
-
-            for base, entry in base_candidates.items():
-                if len(entry["weight"]) == len(shards):
-                    ordered = [entry["weight"][order] for order in sorted(entry["weight"])]
-                    combined = torch.cat([tensor for _, tensor in ordered], dim=0)
-                    for key, _ in ordered:
-                        weights_map.pop(key, None)
-                    weights_map[base + f".{target}.weight"] = combined
-                if len(entry["bias"]) == len(shards):
-                    ordered_bias = [entry["bias"][order] for order in sorted(entry["bias"])]
-                    bcombined = torch.cat([tensor for _, tensor in ordered_bias], dim=0)
-                    for key, _ in ordered_bias:
-                        weights_map.pop(key, None)
-                    weights_map[base + f".{target}.bias"] = bcombined
-
-        # Now perform the parameter copy using the possibly-updated weights_map
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights_map.items():
-            # Handle potential name mismatches for FeedForward layers
-            if name.endswith(".proj.weight") and name not in params_dict:
-                mapped_name = name.replace(".proj.weight", ".weight")
-            elif name.endswith(".proj.bias") and name not in params_dict:
-                mapped_name = name.replace(".proj.bias", ".bias")
-            else:
-                mapped_name = name
 
-            if mapped_name in params_dict:
-                param = params_dict[mapped_name]
-                with torch.no_grad():
-                    param.copy_(loaded_weight)
+        # we need to load the buffers for beta and eps (XIELU)
+        for name, buffer in self.named_buffers():
+            if name.endswith(".beta") or name.endswith(".eps"):
+                params_dict[name] = buffer
+
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
             else:
-                logger.warning(f"Weight {name} (mapped to {mapped_name}) not found in model params.")
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
