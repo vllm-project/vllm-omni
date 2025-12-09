@@ -192,8 +192,6 @@ class AsyncOmni(EngineClient):
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
-        print("[AsyncOmni] __del__ close()", flush=True)
-        raise Exception("test")
         try:
             self.close()
         except Exception as e:
