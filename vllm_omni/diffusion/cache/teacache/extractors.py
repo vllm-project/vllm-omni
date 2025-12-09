@@ -151,7 +151,7 @@ def extract_qwen_context(
     txt_seq_lens: torch.Tensor,
     guidance: torch.Tensor | None = None,
     attention_kwargs: dict[str, Any] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> CacheContext:
     """
     Extract cache context for QwenImageTransformer2DModel.
