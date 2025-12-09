@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.cache.base import CacheAdapter
 from vllm_omni.diffusion.cache.registry import CacheType, register_cache_adapter
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
-from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
 
 logger = init_logger(__name__)
 
@@ -83,9 +83,9 @@ class TeaCacheAdapter(CacheAdapter):
             transformer: Transformer module to reset cache on
         """
         if hasattr(transformer, "_hook_registry"):
-            hook = transformer._hook_registry.get_hook("teacache")
+            hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
             if hook is not None:
-                transformer._hook_registry.reset_hook("teacache")
+                transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
                 logger.debug("TeaCache state reset")
             else:
                 logger.warning("TeaCache hook not found, nothing to reset")
