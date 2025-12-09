@@ -49,7 +49,6 @@ def main():
         model=args.model,
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
-        model_class_name="Wan22Pipeline",
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
     )
