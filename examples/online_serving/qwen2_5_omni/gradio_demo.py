@@ -99,6 +99,11 @@ def build_async_omni_cli_args(base_args: argparse.Namespace) -> argparse.Namespa
     return argparse.Namespace(
         model=base_args.model,
         stage_configs_path=getattr(base_args, "stage_configs_path", None),
+        log_stats=False,
+        log_file=None,
+        init_sleep_seconds=0,
+        shm_threshold_bytes=65536,
+        batch_timeout=10,
         init_timeout=ASYNC_INIT_TIMEOUT,
     )
 
