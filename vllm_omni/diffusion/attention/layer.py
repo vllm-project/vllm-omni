@@ -52,7 +52,8 @@ class Attention(nn.Module):
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.use_sync = use_sync
-        self.sequence_process_group: Optional[dist.ProcessGroup] = None
+        self.ring_pg: Optional[dist.ProcessGroup] = None
+        self.ulysses_pg: Optional[dist.ProcessGroup] = None
         self.use_ulysses = False
 
         try:
@@ -62,7 +63,8 @@ class Attention(nn.Module):
                 # Get sequence parallel process group
                 try:
                     sp_group = get_sp_group()
-                    self.sequence_process_group = sp_group.device_group
+                    self.ring_pg = sp_group.ring_group
+                    self.ulysses_pg = sp_group.ulysses_group
                     assert get_sequence_parallel_world_size() > 1, "Sequence parallel world size must be > 1"
                 except (AssertionError, RuntimeError):
                     # If sequence parallel group is not initialized, disable Ulysses
@@ -94,9 +96,9 @@ class Attention(nn.Module):
         """Ulysses attention forward pass with sequence parallelism."""
         # scatter 2, gather 1
         # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
-        q = SeqAllToAll4D.apply(self.sequence_process_group, query, self.scatter_idx, self.gather_idx, self.use_sync)
-        k = SeqAllToAll4D.apply(self.sequence_process_group, key, self.scatter_idx, self.gather_idx, self.use_sync)
-        v = SeqAllToAll4D.apply(self.sequence_process_group, value, self.scatter_idx, self.gather_idx, self.use_sync)
+        q = SeqAllToAll4D.apply(self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync)
+        k = SeqAllToAll4D.apply(self.ulysses_pg, key, self.scatter_idx, self.gather_idx, self.use_sync)
+        v = SeqAllToAll4D.apply(self.ulysses_pg, value, self.scatter_idx, self.gather_idx, self.use_sync)
 
         softmax_scale = self.softmax_scale
         if softmax_scale is None:
@@ -127,8 +129,6 @@ class Attention(nn.Module):
 
         # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
         # scatter 1, gather 2
-        output = SeqAllToAll4D.apply(
-            self.sequence_process_group, context_layer, self.gather_idx, self.scatter_idx, self.use_sync
-        )
+        output = SeqAllToAll4D.apply(self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync)
 
         return output
