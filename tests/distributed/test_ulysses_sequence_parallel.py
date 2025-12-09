@@ -11,7 +11,11 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     set_current_vllm_config,
 )
-from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
+from vllm_omni.diffusion.distributed.parallel_state import (
+    destroy_distributed_env,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm_omni.utils.system_utils import update_environment_variables
 
 
@@ -304,3 +308,4 @@ def ulysses_attention_on_test_model(
             f"dtype={dtype}, causal={causal}, use_sync={use_sync}, "
             f"dynamic={dynamic}, use_compile={use_compile}"
         )
+        destroy_distributed_env()
