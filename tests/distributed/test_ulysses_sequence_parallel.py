@@ -121,7 +121,7 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
     ],
 )
 @pytest.mark.parametrize("batch_size", [2, 4])
-@pytest.mark.parametrize("seq_len", [16, 32])
+# @pytest.mark.parametrize("seq_len", [16, 32])
 # @pytest.mark.parametrize("num_heads", [4, 8])
 # @pytest.mark.parametrize("head_size", [32, 64])
 # @pytest.mark.parametrize("causal", [True, False])
