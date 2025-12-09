@@ -80,7 +80,7 @@ Install additional requirements for vLLM-Omni
 pip install vllm-omni
 # you might also want to clone the vllm-omni repo to access the script
 
-# OR clone and checkout to the release version.
+## OR clone and checkout to the release version.
 # git clone https://github.com/vllm-project/vllm-omni.git
 # cd vllm-omni
 # git checkout -b v0.11.0rc1 v0.11.0rc1
@@ -88,6 +88,8 @@ pip install vllm-omni
 ```
 
 #### Setup Environment Variables
+
+After installing `vllm` and `vllm-omni` please setup the environment variable as well before running any of the examples and command.
 
 ```bash
 export MIOPEN_FIND_MODE=FAST
