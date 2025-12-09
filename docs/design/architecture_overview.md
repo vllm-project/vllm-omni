@@ -104,7 +104,7 @@ outputs = omni_lm.generate(om_inputs, sampling_params_list)
 ```
 
 ## Online Serving
-Similar to vLLM, vLLM-Omni also provides a FastAPI-based server for online serving. Users can launch the server using the vllm serve command with the **--omni** flag:
+Similar to vLLM, vLLM-Omni also provides a FastAPI-based server for online serving. Users can launch the server using the vllm serve command with the `--omni` flag:
 
 ```
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
