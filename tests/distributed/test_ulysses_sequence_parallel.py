@@ -120,26 +120,22 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         TestMultiLayerAttentionModel,
     ],
 )
-@pytest.mark.parametrize("batch_size", [2, 4])
-# @pytest.mark.parametrize("seq_len", [16, 32])
-# @pytest.mark.parametrize("num_heads", [4, 8])
-# @pytest.mark.parametrize("head_size", [32, 64])
-# @pytest.mark.parametrize("causal", [True, False])
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-# @pytest.mark.parametrize("use_sync", [True, False])
-# @pytest.mark.parametrize("dynamic", [False, True])
-# @pytest.mark.parametrize("use_compile", [False, True])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_sync", [True, False])
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("use_compile", [False, True])
 def test_ulysses_attention(
     test_model_cls: type[torch.nn.Module],
-    batch_size: int,
+    dtype: torch.dtype,
+    causal: bool,
+    use_sync: bool,
+    dynamic: bool,
+    use_compile: bool,
+    batch_size: int = 2,
     seq_len: int = 16,
-    num_heads: int = 4,
+    num_heads: int = 8,
     head_size: int = 32,
-    dtype: torch.dtype = torch.float16,
-    causal: bool = False,
-    use_sync: bool = False,
-    dynamic: bool = False,
-    use_compile: bool = False,
 ):
     """Test Ulysses attention with various parameter combinations."""
     num_processes = 2
