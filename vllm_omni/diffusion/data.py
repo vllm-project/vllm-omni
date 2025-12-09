@@ -37,7 +37,7 @@ class DiffusionParallelConfig:
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
 
-    sequence_parallel_size: int = 1
+    sequence_parallel_size: int | None = None
     """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
 
     ulysses_degree: int = 1
@@ -55,6 +55,8 @@ class DiffusionParallelConfig:
         assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
         assert self.data_parallel_size > 0, "Data parallel size must be > 0"
         assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
+        if self.sequence_parallel_size is None:
+            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
         assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
