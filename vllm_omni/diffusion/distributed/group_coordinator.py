@@ -3,9 +3,9 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import pickle
 from collections import namedtuple
 from typing import Any, Dict, List, Optional, Tuple, Union
-import pickle
 
 import torch
 import torch.distributed
@@ -19,6 +19,7 @@ except ModuleNotFoundError:
     pass
 
 from vllm_omni.diffusion.envs import envs
+
 if envs._is_npu():
     print("torch.npu synchronize")
     from torch.npu import synchronize
@@ -46,26 +47,19 @@ def _split_tensor_dict(
     metadata_list: List[Tuple[str, Any]] = []
     tensor_list = []
     for key, value in tensor_dict.items():
-        assert "%" not in key, (
-            "Avoid having '%' in key "
-            "as it is used as a separator for nested entries."
-        )
+        assert "%" not in key, "Avoid having '%' in key as it is used as a separator for nested entries."
         if isinstance(value, torch.Tensor):
             # Note: we cannot use `value.device` here,
             # because it contains not only the device type but also the device
             # index (e.g. "cuda:0"). We only need the device type.
             # receiving side will set the device index.
             device = value.device.type
-            metadata_list.append(
-                (prefix + key, TensorMetadata(device, value.dtype, value.size()))
-            )
+            metadata_list.append((prefix + key, TensorMetadata(device, value.dtype, value.size())))
             tensor_list.append(value)
         elif isinstance(value, dict):
             if len(value) == 0:
                 metadata_list.append((prefix + key, value))
-            inner_metadata_list, inner_tensor_list = _split_tensor_dict(
-                value, prefix + key + "%"
-            )
+            inner_metadata_list, inner_tensor_list = _split_tensor_dict(value, prefix + key + "%")
             metadata_list.extend(inner_metadata_list)
             tensor_list.extend(inner_tensor_list)
         else:
@@ -116,16 +110,13 @@ class GroupCoordinator:
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
     ):
-
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
@@ -223,32 +214,29 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
         # Allocate output tensor.
         input_size = list(input_.size())
         input_size[0] *= world_size
-        output_tensor = torch.empty(
-            input_size, dtype=input_.dtype, device=input_.device
-        )
+        output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        torch.distributed.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         if dim != 0:
             input_size[0] //= world_size
-            output_tensor = output_tensor.reshape([world_size, ] + input_size)
+            output_tensor = output_tensor.reshape(
+                [
+                    world_size,
+                ]
+                + input_size
+            )
             output_tensor = output_tensor.movedim(0, dim)
 
         if separate_tensors:
             tensor_list = [
-                output_tensor.view(-1)
-                .narrow(0, input_.numel() * i, input_.numel())
-                .view_as(input_)
+                output_tensor.view(-1).narrow(0, input_.numel() * i, input_.numel()).view_as(input_)
                 for i in range(world_size)
             ]
             return tensor_list
@@ -269,9 +257,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -281,9 +267,7 @@ class GroupCoordinator:
         else:
             gather_list = None
         # Gather.
-        torch.distributed.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
-        )
+        torch.distributed.gather(input_, gather_list, dst=self.ranks[dst], group=self.device_group)
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
         else:
@@ -300,9 +284,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         # Broadcast.
-        torch.distributed.broadcast(
-            input_, src=self.ranks[src], group=self.device_group
-        )
+        torch.distributed.broadcast(input_, src=self.ranks[src], group=self.device_group)
         return input_
 
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
@@ -318,20 +300,14 @@ class GroupCoordinator:
             assert src == 0, "Shared memory broadcaster only supports src=0"
             return self.shm_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
-            torch.distributed.broadcast_object_list(
-                [obj], src=self.ranks[src], group=self.cpu_group
-            )
+            torch.distributed.broadcast_object_list([obj], src=self.ranks[src], group=self.cpu_group)
             return obj
         else:
             recv = [None]
-            torch.distributed.broadcast_object_list(
-                recv, src=self.ranks[src], group=self.cpu_group
-            )
+            torch.distributed.broadcast_object_list(recv, src=self.ranks[src], group=self.cpu_group)
             return recv[0]
 
-    def broadcast_object_list(
-        self, obj_list: List[Any], src: int = 0, group: Optional[ProcessGroup] = None
-    ):
+    def broadcast_object_list(self, obj_list: List[Any], src: int = 0, group: Optional[ProcessGroup] = None):
         """Broadcast the input object list.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -341,9 +317,7 @@ class GroupCoordinator:
         if self.world_size == 1:
             return obj_list
         # Broadcast.
-        torch.distributed.broadcast_object_list(
-            obj_list, src=self.ranks[src], group=self.device_group
-        )
+        torch.distributed.broadcast_object_list(obj_list, src=self.ranks[src], group=self.device_group)
         return obj_list
 
     def send_object(self, obj: Any, dst: int) -> None:
@@ -352,17 +326,12 @@ class GroupCoordinator:
 
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        assert dst != self.rank, (
-            "Invalid destination rank. Destination rank is the same "
-            "as the current rank."
-        )
+        assert dst != self.rank, "Invalid destination rank. Destination rank is the same as the current rank."
 
         # Serialize object to tensor and get the size as well
         object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
 
-        size_tensor = torch.tensor(
-            [object_tensor.numel()], dtype=torch.long, device="cpu"
-        )
+        size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long, device="cpu")
 
         # Send object size
 
@@ -379,16 +348,12 @@ class GroupCoordinator:
 
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        assert (
-            src != self.rank
-        ), "Invalid source rank. Source rank is the same as the current rank."
+        assert src != self.rank, "Invalid source rank. Source rank is the same as the current rank."
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
         # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        rank_size = torch.distributed.recv(size_tensor, src=self.ranks[src], group=self.cpu_group)
 
         # Tensor to receive serialized objects into.
         object_tensor = torch.empty(  # type: ignore[call-overload]
@@ -397,13 +362,9 @@ class GroupCoordinator:
             device="cpu",
         )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        rank_object = torch.distributed.recv(object_tensor, src=self.ranks[src], group=self.cpu_group)
 
-        assert (
-            rank_object == rank_size
-        ), "Received object sender rank does not match the size sender rank."
+        assert rank_object == rank_size, "Received object sender rank does not match the size sender rank."
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
@@ -431,9 +392,7 @@ class GroupCoordinator:
         rank = self.rank
         if rank == src:
             metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict, dict
-            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            assert isinstance(tensor_dict, dict), f"Expecting a dictionary, got {type(tensor_dict)}"
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -446,14 +405,10 @@ class GroupCoordinator:
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    handle = torch.distributed.broadcast(
-                        tensor, src=src, group=metadata_group, async_op=True
-                    )
+                    handle = torch.distributed.broadcast(tensor, src=src, group=metadata_group, async_op=True)
                 else:
                     # use group for GPU tensors
-                    handle = torch.distributed.broadcast(
-                        tensor, src=src, group=group, async_op=True
-                    )
+                    handle = torch.distributed.broadcast(tensor, src=src, group=group, async_op=True)
                 async_handles.append(handle)
             for async_handle in async_handles:
                 async_handle.wait()
@@ -464,23 +419,17 @@ class GroupCoordinator:
             async_handles = []
             for key, value in metadata_list:
                 if isinstance(value, TensorMetadata):
-                    tensor = torch.empty(
-                        value.size, dtype=value.dtype, device=value.device
-                    )
+                    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                     if tensor.numel() == 0:
                         # Skip broadcasting empty tensors.
                         _update_nested_dict(tensor_dict, key, tensor)
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
-                        handle = torch.distributed.broadcast(
-                            tensor, src=src, group=metadata_group, async_op=True
-                        )
+                        handle = torch.distributed.broadcast(tensor, src=src, group=metadata_group, async_op=True)
                     else:
                         # use group for GPU tensors
-                        handle = torch.distributed.broadcast(
-                            tensor, src=src, group=group, async_op=True
-                        )
+                        handle = torch.distributed.broadcast(tensor, src=src, group=group, async_op=True)
                     async_handles.append(handle)
                     _update_nested_dict(tensor_dict, key, tensor)
                 else:
@@ -509,9 +458,7 @@ class GroupCoordinator:
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
         metadata_list: List[Tuple[Any, Any]] = []
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        assert isinstance(tensor_dict, dict), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # `metadata_list` lives in CPU memory.
         # `send_object_list` has serialization & deserialization,
@@ -523,17 +470,13 @@ class GroupCoordinator:
                 continue
             if tensor.is_cpu:
                 # use metadata_group for CPU tensors
-                torch.distributed.send(
-                    tensor, dst=self.ranks[dst], group=metadata_group
-                )
+                torch.distributed.send(tensor, dst=self.ranks[dst], group=metadata_group)
             else:
                 # use group for GPU tensors
                 torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
         return None
 
-    def recv_tensor_dict(
-        self, src: Optional[int] = None
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+    def recv_tensor_dict(self, src: Optional[int] = None) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -559,9 +502,7 @@ class GroupCoordinator:
                     continue
                 if tensor.is_cpu:
                     # use metadata_group for CPU tensors
-                    torch.distributed.recv(
-                        tensor, src=self.ranks[src], group=metadata_group
-                    )
+                    torch.distributed.recv(tensor, src=self.ranks[src], group=metadata_group)
                 else:
                     # use group for GPU tensors
                     torch.distributed.recv(tensor, src=self.ranks[src], group=group)
@@ -588,16 +529,10 @@ class GroupCoordinator:
         torch.distributed.send(
             tensor,
             self.ranks[dst],
-            group=(
-                self.device_groups[self.rank_in_group % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+            group=(self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group),
         )
 
-    def recv(
-        self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
-    ) -> torch.Tensor:
+    def recv(self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None) -> torch.Tensor:
         """Receives a tensor from the src rank."""
         """NOTE: `src` is the rank_in_group of the source rank."""
         if src is None:
@@ -607,11 +542,7 @@ class GroupCoordinator:
         torch.distributed.recv(
             tensor,
             self.ranks[src],
-            (
-                self.device_groups[(self.rank_in_group + 1) % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+            (self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group),
         )
         return tensor
 
@@ -657,9 +588,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 cpu_group = torch.distributed.new_group(ranks, backend="gloo")
@@ -677,12 +606,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
         #   device 0.
         elif len(group_ranks[0]) == 2:
             for ranks in group_ranks:
-                device_group_0_1 = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
-                device_group_1_0 = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                device_group_0_1 = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
+                device_group_1_0 = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 cpu_group_0_1 = torch.distributed.new_group(ranks, backend="gloo")
@@ -714,14 +639,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.skip_tensor_recv_buffer_set: bool = False
         self.recv_skip_tasks_queue: List[Union[int, Tuple[str, int]]] = []
         self.receiving_skip_tasks: List[Tuple[torch.distributed.Work, str, int]] = []
-        self.skip_tensor_recv_buffer: Optional[
-            Union[List[torch.Tensor], torch.Tensor]
-        ] = None
+        self.skip_tensor_recv_buffer: Optional[Union[List[torch.Tensor], torch.Tensor]] = None
         self.skip_device_group = None
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            skip_device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
@@ -748,18 +669,13 @@ class PipelineGroupCoordinator(GroupCoordinator):
         dtype: torch.dtype,
     ):
         assert isinstance(dtype, torch.dtype), "dtype must be a torch.dtype object"
-        assert (
-            isinstance(num_pipefusion_patches, int) and num_pipefusion_patches >= 1
-        ), "num_pipefusion_patches must be greater than or equal to 1"
+        assert isinstance(num_pipefusion_patches, int) and num_pipefusion_patches >= 1, (
+            "num_pipefusion_patches must be greater than or equal to 1"
+        )
         self.dtype = dtype
         self.num_pipefusion_patches = num_pipefusion_patches
-        self.recv_buffer = [
-            torch.zeros(*shape, dtype=self.dtype, device=self.device)
-            for shape in patches_shape_list
-        ]
-        self.recv_buffer.append(
-            torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device)
-        )
+        self.recv_buffer = [torch.zeros(*shape, dtype=self.dtype, device=self.device) for shape in patches_shape_list]
+        self.recv_buffer.append(torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device))
         self.recv_buffer_set = True
 
     def set_extra_tensors_recv_buffer(
@@ -770,8 +686,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         dtype: torch.dtype = torch.float16,
     ):
         self.extra_tensors_recv_buffer[name] = [
-            torch.zeros(*shape, dtype=dtype, device=self.device)
-            for _ in range(num_buffers)
+            torch.zeros(*shape, dtype=dtype, device=self.device) for _ in range(num_buffers)
         ]
 
     def _check_shape_and_buffer(
@@ -813,18 +728,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
             if self.recv_buffer.get(name, None) is None:
                 self.recv_buffer[name] = {
-                    segment_idx: torch.zeros(
-                        recv_prev_shape, device=self.device, dtype=self.dtype
-                    )
+                    segment_idx: torch.zeros(recv_prev_shape, device=self.device, dtype=self.dtype)
                 }
             else:
                 if self.recv_buffer[name].get(segment_idx, None) is not None:
-                    logger.warning(
-                        f"Recv buffer [name: {name}, segment_idx: {segment_idx}] already exist. updating..."
-                    )
-                self.recv_buffer[name][segment_idx] = torch.zeros(
-                    recv_prev_shape, device=self.device, dtype=self.dtype
-                )
+                    logger.warning(f"Recv buffer [name: {name}, segment_idx: {segment_idx}] already exist. updating...")
+                self.recv_buffer[name][segment_idx] = torch.zeros(recv_prev_shape, device=self.device, dtype=self.dtype)
 
     def _communicate_shapes(self, tensor_send_to_next=None, recv_prev=False):
         """Communicate tensor shapes between stages. Used to communicate
@@ -839,9 +748,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         ops = []
         if recv_prev:
-            recv_prev_dim_tensor = torch.empty(
-                (1), device=self.device, dtype=torch.int64
-            )
+            recv_prev_dim_tensor = torch.empty((1), device=self.device, dtype=torch.int64)
             recv_prev_dim_op = torch.distributed.P2POp(
                 torch.distributed.irecv,
                 recv_prev_dim_tensor,
@@ -851,9 +758,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
             ops.append(recv_prev_dim_op)
 
         if tensor_send_to_next is not None:
-            send_next_dim_tensor = torch.tensor(
-                tensor_send_to_next.dim(), device=self.device, dtype=torch.int64
-            )
+            send_next_dim_tensor = torch.tensor(tensor_send_to_next.dim(), device=self.device, dtype=torch.int64)
             send_next_dim_op = torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_next_dim_tensor,
@@ -886,9 +791,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
             ops.append(recv_prev_shape_op)
 
         if tensor_send_to_next is not None:
-            send_next_shape_tensor = torch.tensor(
-                tensor_send_to_next.size(), device=self.device, dtype=torch.int64
-            )
+            send_next_shape_tensor = torch.tensor(tensor_send_to_next.size(), device=self.device, dtype=torch.int64)
             send_next_shape_op = torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_next_shape_tensor,
@@ -909,22 +812,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
             recv_prev_shape = recv_prev_shape_tensor
         return torch.Size(recv_prev_shape)
 
-    def pipeline_send(
-        self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
-    ) -> None:
+    def pipeline_send(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
         tensor = tensor.contiguous()
-        self._check_shape_and_buffer(
-            tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
-        )
+        self._check_shape_and_buffer(tensor_send_to_next=tensor, name=name, segment_idx=segment_idx)
         self._pipeline_isend(tensor).wait()
 
-    def pipeline_isend(
-        self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
-    ) -> None:
+    def pipeline_isend(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
         tensor = tensor.contiguous()
-        self._check_shape_and_buffer(
-            tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
-        )
+        self._check_shape_and_buffer(tensor_send_to_next=tensor, name=name, segment_idx=segment_idx)
         self._pipeline_isend(tensor)
 
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
@@ -943,43 +838,27 @@ class PipelineGroupCoordinator(GroupCoordinator):
         elif len(self.recv_tasks_queue) > 0:
             name, idx = self.recv_tasks_queue.pop(0)
             self._check_shape_and_buffer(recv_prev=True, name=name, segment_idx=idx)
-            self.receiving_tasks.append(
-                (self._pipeline_irecv(self.recv_buffer[name][idx]), name, idx)
-            )
+            self.receiving_tasks.append((self._pipeline_irecv(self.recv_buffer[name][idx]), name, idx))
 
-    def get_pipeline_recv_data(
-        self, idx: int = -1, name: str = "latent"
-    ) -> torch.Tensor:
-        assert (
-            len(self.receiving_tasks) > 0
-        ), "No tasks to receive, call add_pipeline_recv_task first"
+    def get_pipeline_recv_data(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
+        assert len(self.receiving_tasks) > 0, "No tasks to receive, call add_pipeline_recv_task first"
         receiving_task = self.receiving_tasks.pop(0)
         receiving_task[0].wait()
-        assert (
-            receiving_task[1] == name and receiving_task[2] == idx
-        ), "Received tensor does not match the requested"
+        assert receiving_task[1] == name and receiving_task[2] == idx, "Received tensor does not match the requested"
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
         return torch.distributed.irecv(
             tensor,
             src=self.prev_rank,
-            group=(
-                self.device_groups[(self.rank_in_group + 1) % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+            group=(self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group),
         )
 
     def _pipeline_isend(self, tensor: torch.tensor):
         return torch.distributed.isend(
             tensor,
             dst=self.next_rank,
-            group=(
-                self.device_groups[self.rank_in_group % 2]
-                if self.world_size == 2
-                else self.device_group
-            ),
+            group=(self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group),
         )
 
     def set_skip_tensor_recv_buffer(
@@ -988,12 +867,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
         feature_map_shape: List[int],
     ):
         self.skip_tensor_recv_buffer = [
-            torch.zeros(*shape, dtype=self.dtype, device=self.device)
-            for shape in patches_shape_list
+            torch.zeros(*shape, dtype=self.dtype, device=self.device) for shape in patches_shape_list
         ]
-        self.skip_tensor_recv_buffer.append(
-            torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device)
-        )
+        self.skip_tensor_recv_buffer.append(torch.zeros(*feature_map_shape, dtype=self.dtype, device=self.device))
         self.skip_tensor_recv_buffer_set = True
 
     def pipeline_send_skip(self, tensor: torch.Tensor) -> None:
@@ -1012,14 +888,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_skip_tasks_queue.append(idx)
 
     def get_pipeline_recv_skip_data(self, idx: int = -1) -> torch.Tensor:
-        assert (
-            len(self.receiving_skip_tasks) > 0
-        ), "No tasks to receive, call add_pipeline_recv_skip_task first"
+        assert len(self.receiving_skip_tasks) > 0, "No tasks to receive, call add_pipeline_recv_skip_task first"
         receiving_skip_task = self.receiving_skip_tasks.pop(0)
         receiving_skip_task[0].wait()
-        assert (
-            receiving_skip_task[2] == idx
-        ), "Received tensor does not match the requested"
+        assert receiving_skip_task[2] == idx, "Received tensor does not match the requested"
         return self.skip_tensor_recv_buffer[idx]
 
     def recv_skip_next(self):
@@ -1037,14 +909,10 @@ class PipelineGroupCoordinator(GroupCoordinator):
             )
 
     def _pipeline_irecv_skip(self, tensor: torch.tensor):
-        return torch.distributed.irecv(
-            tensor, src=self.skip_rank, group=self.skip_device_group
-        )
+        return torch.distributed.irecv(tensor, src=self.skip_rank, group=self.skip_device_group)
 
     def _pipeline_isend_skip(self, tensor: torch.tensor):
-        return torch.distributed.isend(
-            tensor, dst=self.skip_rank, group=self.skip_device_group
-        )
+        return torch.distributed.isend(tensor, dst=self.skip_rank, group=self.skip_device_group)
 
 
 class SequenceParallelGroupCoordinator(GroupCoordinator):
@@ -1065,18 +933,16 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         ring_group = kwargs.get("ring_group", None)
         if ulysses_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         if ring_group is None:
             raise RuntimeError(
-                f"Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
+                "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
 
-        self.ulysses_world_size = torch.distributed.get_world_size(
-            self.ulysses_group
-        )
+        self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)

@@ -6,21 +6,22 @@
 # Adapted from
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
+from typing import Optional
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch import Tensor
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.selector import get_attn_backend
-from vllm_omni.utils.platform_utils import is_npu
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
-from typing import Optional
-from torch import Tensor
-
-import torch.distributed as dist
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
-from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_sequence_parallel_world_size
+from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
+from vllm_omni.utils.platform_utils import is_npu
+
 
 class Attention(nn.Module):
     def __init__(
@@ -53,7 +54,7 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.sequence_process_group: Optional[dist.ProcessGroup] = None
         config = get_current_omni_diffusion_config()
-        
+
         try:
             if config.parallel_config.ulysses_degree > 1:
                 self.use_ulysses = True
@@ -80,7 +81,7 @@ class Attention(nn.Module):
             # shape: (batch_size, seq_len, num_heads, head_size)
             attn_output = self.attention.forward(query, key, value, attn_metadata)
             return attn_output
-    
+
     def _forward_ulysses(
         self,
         query: Tensor,
@@ -91,15 +92,9 @@ class Attention(nn.Module):
         """Ulysses attention forward pass with sequence parallelism."""
         # scatter 2, gather 1
         # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
-        q = SeqAllToAll4D.apply(
-            self.sequence_process_group, query, self.scatter_idx, self.gather_idx, self.use_sync
-        )
-        k = SeqAllToAll4D.apply(
-            self.sequence_process_group, key, self.scatter_idx, self.gather_idx, self.use_sync
-        )
-        v = SeqAllToAll4D.apply(
-            self.sequence_process_group, value, self.scatter_idx, self.gather_idx, self.use_sync
-        )
+        q = SeqAllToAll4D.apply(self.sequence_process_group, query, self.scatter_idx, self.gather_idx, self.use_sync)
+        k = SeqAllToAll4D.apply(self.sequence_process_group, key, self.scatter_idx, self.gather_idx, self.use_sync)
+        v = SeqAllToAll4D.apply(self.sequence_process_group, value, self.scatter_idx, self.gather_idx, self.use_sync)
 
         softmax_scale = self.softmax_scale
         if softmax_scale is None:
@@ -135,5 +130,3 @@ class Attention(nn.Module):
         )
 
         return output
-
-

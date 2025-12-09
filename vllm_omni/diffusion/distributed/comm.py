@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team & Jiarui Fang
 #  from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/comm/all_to_all.py
-import torch
-
 from typing import Any, Tuple
-from torch import Tensor
 
+import torch
 import torch.distributed as dist
+from torch import Tensor
 
 
 def all_to_all_4D(
@@ -26,9 +25,7 @@ def all_to_all_4D(
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, hc, hs)
     """
-    assert (
-        input.dim() == 4
-    ), f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
+    assert input.dim() == 4, f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
 
     seq_world_size = dist.get_world_size(group)
 
@@ -40,11 +37,7 @@ def all_to_all_4D(
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen/P, hc, hs) -reshape-> (bs, seq_len/P, P, hc/P, hs) -transpose(0,2)-> (P, seq_len/P, bs, hc/P, hs)
-        input_t = (
-            input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs)
-            .transpose(0, 2)
-            .contiguous()
-        )
+        input_t = input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs).transpose(0, 2).contiguous()
 
         output = torch.empty_like(input_t)
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
@@ -94,7 +87,7 @@ def all_to_all_4D(
         # if scattering the seq-dim, transpose the heads back to the original dimension
         output = output.reshape(hc, shard_seqlen, bs, hs)
 
-        # (hc, seqlen/N, bs, hs) -tranpose(0,2)-> (bs, seqlen/N, hc, hs)
+        # (hc, seqlen/N, bs, hs) -transpose(0,2)-> (bs, seqlen/N, hc, hs)
         output = output.transpose(0, 2).contiguous().reshape(bs, shard_seqlen, hc, hs)
 
         return output
@@ -112,7 +105,6 @@ class SeqAllToAll4D(torch.autograd.Function):
         gather_idx: int,
         use_sync: bool = False,
     ) -> Tensor:
-
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
@@ -123,9 +115,7 @@ class SeqAllToAll4D(torch.autograd.Function):
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
         return (
             None,
-            SeqAllToAll4D.apply(
-                ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
-            ),
+            SeqAllToAll4D.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync),
             None,
             None,
             None,
@@ -149,9 +139,7 @@ def all_to_all_5D(
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, 3, hc, hs)
     """
-    assert (
-        input.dim() == 5
-    ), f"input must be 5D tensor, got {input.dim()} and shape {input.shape}"
+    assert input.dim() == 5, f"input must be 5D tensor, got {input.dim()} and shape {input.shape}"
 
     seq_world_size = dist.get_world_size(group)
 
@@ -165,11 +153,7 @@ def all_to_all_5D(
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen/P, 3, hc, hs) -reshape-> (bs, seq_len/P, 3, P, hc/P, hs) -transpose(0,3)-> (P, seq_len/P, 3, bs, hc/P, hs)
-        input_t = (
-            input.reshape(bs, shard_seqlen, 3, seq_world_size, shard_hc, hs)
-            .transpose(0, 3)
-            .contiguous()
-        )
+        input_t = input.reshape(bs, shard_seqlen, 3, seq_world_size, shard_hc, hs).transpose(0, 3).contiguous()
 
         output = torch.empty_like(input_t)
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
@@ -218,7 +202,7 @@ def all_to_all_5D(
         # if scattering the seq-dim, transpose the heads back to the original dimension
         output = output.reshape(hc, shard_seqlen, 3, bs, hs)
 
-        # (hc, seqlen/N, bs, hs) -tranpose(0,2)-> (bs, seqlen/N, hc, hs)
+        # (hc, seqlen/N, bs, hs) -transpose(0,2)-> (bs, seqlen/N, hc, hs)
         output = output.transpose(0, 3).contiguous()
 
         return output.reshape(bs, shard_seqlen, 3, hc, hs).contiguous()
@@ -236,7 +220,6 @@ class SeqAllToAll5D(torch.autograd.Function):
         gather_idx: int = 1,
         use_sync: bool = False,
     ) -> Tensor:
-
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
@@ -248,9 +231,7 @@ class SeqAllToAll5D(torch.autograd.Function):
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
         return (
             None,
-            SeqAllToAll5D.apply(
-                ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
-            ),
+            SeqAllToAll5D.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync),
             None,
             None,
             None,
