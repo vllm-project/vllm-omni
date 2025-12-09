@@ -1,5 +1,8 @@
 """
 Omni serve command for vLLM-Omni.
+
+Supports both multi-stage LLM models (e.g., Qwen2.5-Omni) and
+diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
 import argparse
@@ -15,8 +18,19 @@ from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
 logger = init_logger(__name__)
 
-DESCRIPTION = """Launch a local OpenAI-compatible API server to serve Omni LLM
-completions via HTTP. Defaults to Qwen/Qwen2.5-Omni-7B if no model is specified.
+DESCRIPTION = """Launch a local OpenAI-compatible API server to serve Omni models
+via HTTP. Supports both multi-stage LLM models and diffusion models.
+
+The server automatically detects the model type:
+- LLM models: Served via /v1/chat/completions endpoint
+- Diffusion models: Served via /v1/images/generations endpoint
+
+Examples:
+  # Start an Omni LLM server
+  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+
+  # Start a diffusion model server
+  vllm serve Qwen/Qwen-Image --omni --port 8091
 
 Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=ModelConfig, --help=Frontend)
@@ -38,6 +52,13 @@ class OmniServeCommand(CLISubcommand):
         uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        # Skip validation for diffusion models as they have different requirements
+        from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+
+        model = getattr(args, "model_tag", None) or getattr(args, "model", None)
+        if model and is_diffusion_model(model):
+            logger.info("Detected diffusion model: %s", model)
+            return
         validate_parsed_serve_args(args)
 
     def subparser_init(self, subparsers: argparse._SubParsersAction) -> FlexibleArgumentParser:
@@ -52,7 +73,7 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--omni",
             action="store_true",
-            help="Enable vLLM-Omni mode",
+            help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
         serve_parser.add_argument(
             "--stage-configs-path",
@@ -107,6 +128,38 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="The address of the Ray cluster to connect to.",
+
+        # Diffusion model specific arguments
+        serve_parser.add_argument(
+            "--num-gpus",
+            type=int,
+            default=1,
+            help="Number of GPUs to use for diffusion model inference.",
+        )
+        serve_parser.add_argument(
+            "--diffusion-dtype",
+            type=str,
+            default="bfloat16",
+            choices=["float16", "bfloat16", "float32"],
+            help="Data type for diffusion model inference.",
+        )
+        serve_parser.add_argument(
+            "--num-inference-steps",
+            type=int,
+            default=50,
+            help="Default number of inference steps for diffusion models.",
+        )
+        serve_parser.add_argument(
+            "--guidance-scale",
+            type=float,
+            default=7.5,
+            help="Default guidance scale for diffusion models.",
+        )
+        serve_parser.add_argument(
+            "--diffusion-seed",
+            type=int,
+            default=None,
+            help="Random seed for reproducible image generation. If not set, uses random seed.",
         )
         return serve_parser
 

@@ -6,10 +6,11 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import jinja2
 from fastapi import Request
+from PIL import Image
 from pydantic import TypeAdapter
 
 try:
@@ -71,10 +72,60 @@ from vllm.utils import as_list
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
 
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
+
 logger = init_logger(__name__)
 
 
 class OmniOpenAIServingChat(OpenAIServingChat):
+    """OpenAI-compatible chat serving for both LLM and Diffusion models.
+
+    This class extends OpenAIServingChat to support:
+    - Standard LLM chat completions
+    - Diffusion model image generation via chat interface
+
+    For diffusion mode, use the `for_diffusion` class method to create an instance.
+    """
+
+    # Diffusion mode attributes
+    _diffusion_mode: bool = False
+    _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
+    _diffusion_model_name: str = ""
+    _diffusion_default_seed: Optional[int] = None
+    _diffusion_default_steps: int = 50
+    _diffusion_default_guidance: float = 7.5
+
+    @classmethod
+    def for_diffusion(
+        cls,
+        diffusion_engine: "AsyncOmniDiffusion",
+        model_name: str,
+        default_seed: Optional[int] = None,
+        default_num_inference_steps: int = 50,
+        default_guidance_scale: float = 7.5,
+    ) -> "OmniOpenAIServingChat":
+        """Create a chat serving instance for diffusion models.
+
+        Args:
+            diffusion_engine: The async diffusion engine
+            model_name: Name of the model being served
+            default_seed: Optional default seed for reproducible generation
+            default_num_inference_steps: Default number of inference steps
+            default_guidance_scale: Default guidance scale
+
+        Returns:
+            OmniOpenAIServingChat instance configured for diffusion mode
+        """
+        instance = cls.__new__(cls)
+        instance._diffusion_mode = True
+        instance._diffusion_engine = diffusion_engine
+        instance._diffusion_model_name = model_name
+        instance._diffusion_default_seed = default_seed
+        instance._diffusion_default_steps = default_num_inference_steps
+        instance._diffusion_default_guidance = default_guidance_scale
+        return instance
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -86,7 +137,14 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         See https://platform.openai.com/docs/api-reference/chat/create
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
+
+        For diffusion models, this generates images and returns them
+        in a chat completion response format.
         """
+        # Handle diffusion mode
+        if self._diffusion_mode:
+            return await self._create_diffusion_chat_completion(request, raw_request)
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -435,6 +493,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 ) = self._create_text_choice(request, omni_outputs, tokenizer, conversation, role)
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role)
+            elif omni_outputs.final_output_type == "image":
+                choices_data = self._create_image_choice(omni_outputs, role)
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
@@ -777,3 +837,354 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             )
             choices.append(choice_data)
         return choices
+
+    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str):
+        """Create chat completion response choices for image output.
+
+        Converts image tensor or PIL Image output from diffusion models
+        into base64-encoded image data for API response.
+
+        Args:
+            omni_outputs: Output containing image data from diffusion stage
+            role: The role for the response message (e.g., "assistant")
+
+        Returns:
+            List of ChatCompletionResponseChoice with image content
+        """
+        from PIL import Image
+
+        choices: list[ChatCompletionResponseChoice] = []
+        final_res = omni_outputs.request_output
+
+        # Handle different image output formats
+        images = []
+        if hasattr(final_res, "multimodal_output") and final_res.multimodal_output:
+            image_data = final_res.multimodal_output.get("image")
+            if image_data is not None:
+                if isinstance(image_data, Image.Image):
+                    images.append(image_data)
+                elif hasattr(image_data, "cpu"):  # Tensor
+                    import numpy as np
+
+                    # Convert tensor to PIL Image
+                    img_array = image_data.float().detach().cpu().numpy()
+                    # Handle different tensor formats (CHW -> HWC)
+                    if img_array.ndim == 3 and img_array.shape[0] in [1, 3, 4]:
+                        img_array = np.transpose(img_array, (1, 2, 0))
+                    # Normalize to 0-255
+                    if img_array.max() <= 1.0:
+                        img_array = (img_array * 255).astype(np.uint8)
+                    else:
+                        img_array = img_array.astype(np.uint8)
+                    # Handle grayscale
+                    if img_array.ndim == 2:
+                        images.append(Image.fromarray(img_array, mode="L"))
+                    elif img_array.shape[-1] == 1:
+                        images.append(Image.fromarray(img_array.squeeze(-1), mode="L"))
+                    elif img_array.shape[-1] == 3:
+                        images.append(Image.fromarray(img_array, mode="RGB"))
+                    elif img_array.shape[-1] == 4:
+                        images.append(Image.fromarray(img_array, mode="RGBA"))
+        elif hasattr(final_res, "images") and final_res.images:
+            images = final_res.images
+
+        # Convert images to base64
+        image_contents = []
+        for img in images:
+            with BytesIO() as buffer:
+                img.save(buffer, format="PNG")
+                img_bytes = buffer.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+            image_contents.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_base64}",
+                    },
+                }
+            )
+
+        # Create message content
+        if len(image_contents) == 1:
+            content = image_contents
+        elif len(image_contents) > 1:
+            content = image_contents
+        else:
+            content = [{"type": "text", "text": "Image generation completed but no images were produced."}]
+
+        # Create response choice
+        choice_data = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role=role, content=content),
+            logprobs=None,
+            finish_reason="stop",
+            stop_reason=None,
+        )
+        choices.append(choice_data)
+
+        return choices
+
+    # ==================== Diffusion Mode Methods ====================
+
+    async def _create_diffusion_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        """Generate images via chat completion interface for diffusion models.
+
+        Args:
+            request: Chat completion request
+            raw_request: Raw FastAPI request object
+
+        Returns:
+            ChatCompletionResponse with generated images or ErrorResponse
+        """
+        try:
+            request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+            created_time = int(time.time())
+
+            # Convert messages to dict format
+            messages = []
+            for msg in request.messages:
+                if hasattr(msg, "model_dump"):
+                    messages.append(msg.model_dump())
+                elif isinstance(msg, dict):
+                    messages.append(msg)
+                else:
+                    messages.append({"role": getattr(msg, "role", "user"), "content": getattr(msg, "content", "")})
+
+            # Extract prompt and images from messages
+            prompt, reference_images = self._extract_diffusion_prompt_and_images(messages)
+
+            if not prompt:
+                return self._create_error_response("No text prompt found in messages")
+
+            # Extract generation parameters from system messages
+            gen_params = self._extract_diffusion_params(messages)
+
+            logger.info(
+                "Diffusion chat request %s: prompt=%r, ref_images=%d",
+                request_id,
+                prompt[:50] + "..." if len(prompt) > 50 else prompt,
+                len(reference_images),
+            )
+
+            # Parse size if provided
+            height, width = None, None
+            if "size" in gen_params:
+                try:
+                    w, h = gen_params["size"].lower().split("x")
+                    width, height = int(w), int(h)
+                except ValueError:
+                    logger.warning("Invalid size format: %s", gen_params["size"])
+
+            # Use request values or fall back to defaults
+            num_inference_steps = gen_params.get("num_inference_steps") or self._diffusion_default_steps
+            guidance_scale = gen_params.get("guidance_scale") or self._diffusion_default_guidance
+            seed = gen_params.get("seed") if gen_params.get("seed") is not None else self._diffusion_default_seed
+            negative_prompt = gen_params.get("negative_prompt")
+
+            # Decode reference images if provided
+            pil_images: list[Image.Image] = []
+            for img_b64 in reference_images:
+                try:
+                    img_bytes = base64.b64decode(img_b64)
+                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                except Exception as e:
+                    logger.warning("Failed to decode reference image: %s", e)
+
+            # Build generation kwargs
+            gen_kwargs: dict[str, Any] = {
+                "prompt": prompt,
+                "request_id": request_id,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "height": height,
+                "width": width,
+                "negative_prompt": negative_prompt,
+                "num_outputs_per_prompt": 1,
+                "seed": seed,
+            }
+
+            # Add reference image if provided
+            if pil_images:
+                gen_kwargs["pil_image"] = pil_images[0]
+
+            # Generate image
+            result = await self._diffusion_engine.generate(**gen_kwargs)
+
+            # Convert images to base64 content
+            image_contents: list[dict[str, Any]] = []
+            for img in result.images:
+                with BytesIO() as buffer:
+                    img.save(buffer, format="PNG")
+                    img_bytes = buffer.getvalue()
+                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                image_contents.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_base64}",
+                        },
+                    }
+                )
+
+            # Build response
+            if not image_contents:
+                content = "Image generation completed but no images were produced."
+            else:
+                content = image_contents
+
+            choice = ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=content),
+                finish_reason="stop",
+            )
+
+            response = ChatCompletionResponse(
+                id=request_id,
+                created=created_time,
+                model=self._diffusion_model_name,
+                choices=[choice],
+                usage=UsageInfo(
+                    prompt_tokens=len(prompt.split()),
+                    completion_tokens=1,
+                    total_tokens=len(prompt.split()) + 1,
+                ),
+            )
+
+            logger.info(
+                "Diffusion chat completed for request %s: %d images",
+                request_id,
+                len(result.images),
+            )
+
+            return response
+
+        except Exception as e:
+            logger.exception("Diffusion chat completion failed: %s", e)
+            return self._create_error_response(
+                f"Image generation failed: {str(e)}",
+                status_code=500,
+            )
+
+    def _extract_diffusion_prompt_and_images(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, list[str]]:
+        """Extract text prompt and base64 images from chat messages.
+
+        Args:
+            messages: List of chat messages
+
+        Returns:
+            Tuple of (prompt_text, list_of_base64_images)
+        """
+        prompt_parts: list[str] = []
+        images: list[str] = []
+
+        for message in messages:
+            role = message.get("role", "")
+            if role != "user":
+                continue
+
+            content = message.get("content", "")
+
+            # String content
+            if isinstance(content, str):
+                prompt_parts.append(content)
+                continue
+
+            # List of content items
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, str):
+                        prompt_parts.append(item)
+                    elif isinstance(item, dict):
+                        # Handle {"type": "text", "text": "..."} format
+                        if item.get("type") == "text":
+                            prompt_parts.append(item.get("text", ""))
+                        # Handle {"text": "..."} format
+                        elif "text" in item and "type" not in item:
+                            prompt_parts.append(item["text"])
+                        # Handle {"type": "image_url", "image_url": {"url": "..."}}
+                        elif item.get("type") == "image_url":
+                            url = item.get("image_url", {}).get("url", "")
+                            if url.startswith("data:image"):
+                                try:
+                                    _, b64_data = url.split(",", 1)
+                                    images.append(b64_data)
+                                except ValueError:
+                                    logger.warning("Invalid data URL format")
+                        # Handle {"image": "base64..."} format
+                        elif "image" in item:
+                            images.append(item["image"])
+
+        prompt = " ".join(prompt_parts).strip()
+        return prompt, images
+
+    def _extract_diffusion_params(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Extract generation parameters from system messages.
+
+        Looks for parameters like size, num_inference_steps, guidance_scale, seed.
+
+        Args:
+            messages: List of chat messages
+
+        Returns:
+            Dictionary of generation parameters
+        """
+        params: dict[str, Any] = {}
+
+        for message in messages:
+            role = message.get("role", "")
+            if role != "system":
+                continue
+
+            content = message.get("content", "")
+            if isinstance(content, str):
+                # Parse simple key=value pairs from system message
+                for part in content.split():
+                    if "=" in part:
+                        key, value = part.split("=", 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+
+                        if key in ("size", "resolution"):
+                            params["size"] = value
+                        elif key in ("steps", "num_inference_steps"):
+                            try:
+                                params["num_inference_steps"] = int(value)
+                            except ValueError:
+                                pass
+                        elif key in ("guidance", "guidance_scale", "cfg"):
+                            try:
+                                params["guidance_scale"] = float(value)
+                            except ValueError:
+                                pass
+                        elif key == "seed":
+                            try:
+                                params["seed"] = int(value)
+                            except ValueError:
+                                pass
+                        elif key in ("negative", "negative_prompt"):
+                            params["negative_prompt"] = value
+
+        return params
+
+    def _create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> ErrorResponse:
+        """Create an error response following OpenAI error format."""
+        return ErrorResponse(
+            message=message,
+            type=err_type,
+            code=status_code,
+        )
