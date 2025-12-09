@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from vllm_omni.distributed.connectors.config import ConnectorSpec, OmniTransferConfig
-from vllm_omni.distributed.connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.connectors.logging import get_connector_logger
+from ..factory import OmniConnectorFactory
+from .config import ConnectorSpec, OmniTransferConfig
+from .logging import get_connector_logger
 
 if TYPE_CHECKING:
-    from vllm_omni.distributed.connectors.base import OmniConnectorBase
+    from ..connectors.base import OmniConnectorBase
 else:
     OmniConnectorBase = Any
 

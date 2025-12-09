@@ -3,19 +3,19 @@
 from collections.abc import Callable
 from typing import Any
 
-from vllm_omni.distributed.connectors.logging import get_connector_logger
+from .utils.logging import get_connector_logger
 
 try:
-    from .base import OmniConnectorBase
-    from .config import ConnectorSpec
+    from .connectors.base import OmniConnectorBase
+    from .utils.config import ConnectorSpec
 except ImportError:
     # Fallback for direct execution
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-    from connectors.base import OmniConnectorBase
-    from connectors.config import ConnectorSpec
+    from omni_connectors.connectors.base import OmniConnectorBase
+    from omni_connectors.utils.config import ConnectorSpec
 
 logger = get_connector_logger(__name__)
 
@@ -57,27 +57,27 @@ class OmniConnectorFactory:
 # Register built-in connectors with lazy imports
 def _create_mooncake_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .mooncake_connector import MooncakeConnector
+        from .connectors.mooncake_connector import MooncakeConnector
     except ImportError:
         # Fallback import
         import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from connectors.mooncake_connector import MooncakeConnector
+        from omni_connectors.connectors.mooncake_connector import MooncakeConnector
     return MooncakeConnector(config)
 
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .shm_connector import SharedMemoryConnector
+        from .connectors.shm_connector import SharedMemoryConnector
     except ImportError:
         # Fallback import
         import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from connectors.shm_connector import SharedMemoryConnector
+        from omni_connectors.connectors.shm_connector import SharedMemoryConnector
     return SharedMemoryConnector(config)
 
 

@@ -5,7 +5,7 @@
 import time
 from typing import Any, Callable, Optional
 
-from vllm_omni.distributed.connectors.logging import get_connector_logger
+from .utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 

@@ -380,8 +380,8 @@ def _stage_worker(
     import os as _os
     import time as _time
 
-    from vllm_omni.distributed.connectors.adapter import try_recv_via_connector
-    from vllm_omni.distributed.connectors.utils import build_stage_connectors
+    from vllm_omni.distributed.omni_connectors import build_stage_connectors
+    from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
@@ -748,8 +748,8 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
-    from vllm_omni.distributed.connectors.adapter import try_recv_via_connector
-    from vllm_omni.distributed.connectors.utils import build_stage_connectors
+    from vllm_omni.distributed.omni_connectors import build_stage_connectors
+    from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
     from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,

@@ -3,8 +3,8 @@
 import time
 from typing import Any, Optional
 
+from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
-from .logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 

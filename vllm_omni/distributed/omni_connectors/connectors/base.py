@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from vllm_omni.distributed.connectors.logging import get_connector_logger
+from ..utils.logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 
@@ -59,13 +59,13 @@ class OmniConnectorBase(ABC):
     @staticmethod
     def serialize_obj(obj: Any) -> bytes:
         """Serialize a Python object to bytes using centralized serializer."""
-        from vllm_omni.distributed.connectors.serialization import OmniSerializer
+        from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.serialize(obj)
 
     @staticmethod
     def deserialize_obj(data: bytes) -> Any:
         """Deserialize bytes to Python object using centralized serializer."""
-        from vllm_omni.distributed.connectors.serialization import OmniSerializer
+        from ..utils.serialization import OmniSerializer
 
         return OmniSerializer.deserialize(data)

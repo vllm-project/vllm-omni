@@ -17,7 +17,7 @@ try:
 except ImportError:
     _has_cloudpickle = False
 
-from vllm_omni.distributed.connectors.logging import get_connector_logger
+from .logging import get_connector_logger
 
 logger = get_connector_logger(__name__)
 

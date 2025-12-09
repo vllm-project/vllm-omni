@@ -2,9 +2,10 @@
 
 from typing import Any, Optional
 
-from vllm_omni.distributed.connectors.base import OmniConnectorBase
-from vllm_omni.distributed.connectors.logging import get_connector_logger
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
+
+from ..utils.logging import get_connector_logger
+from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 

@@ -20,13 +20,13 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
-from vllm_omni.distributed.connectors import (
+from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
     initialize_orchestrator_connectors,
 )
 
 # Internal imports (our code)
-from vllm_omni.distributed.connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import (
     create_placement_group,
     get_ray_queue_class,

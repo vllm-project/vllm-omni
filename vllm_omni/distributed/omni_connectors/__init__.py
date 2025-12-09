@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .base import OmniConnectorBase
-from .config import ConnectorSpec, OmniTransferConfig
+from .connectors.base import OmniConnectorBase
+from .connectors.mooncake_connector import MooncakeConnector
+from .connectors.shm_connector import SharedMemoryConnector
 from .factory import OmniConnectorFactory
-from .mooncake_connector import MooncakeConnector
-from .shm_connector import SharedMemoryConnector
-from .utils import (
+from .utils.config import ConnectorSpec, OmniTransferConfig
+from .utils.initialization import (
     build_stage_connectors,
     get_connectors_config_for_stage,
     get_stage_connector_config,

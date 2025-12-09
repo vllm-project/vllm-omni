@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .connectors import (
+from .omni_connectors import (
     ConnectorSpec,
     MooncakeConnector,
     OmniConnectorBase,
