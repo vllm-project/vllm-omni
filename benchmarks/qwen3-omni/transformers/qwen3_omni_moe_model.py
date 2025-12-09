@@ -1,7 +1,10 @@
-import torch
 import time
 from typing import Optional
+
+import torch
 from transformers import Qwen3OmniMoeForConditionalGeneration
+
+
 class Qwen3OmniMoeForConditionalGenerationWithLogging(Qwen3OmniMoeForConditionalGeneration):
     @torch.no_grad()
     def generate(
@@ -37,7 +40,9 @@ class Qwen3OmniMoeForConditionalGenerationWithLogging(Qwen3OmniMoeForConditional
         }
         if return_audio and not self.has_talker:
             raise ValueError(
-                "Cannot use talker when talker module not initialized. Use `enable_talker` method or set enable_talker in config to enable talker."
+                "Cannot use talker when talker module not initialized. "
+                "Use `enable_talker` method or set enable_talker in config "
+                "to enable talker."
             )
         if return_audio is None:
             return_audio = self.has_talker
