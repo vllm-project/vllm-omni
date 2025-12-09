@@ -58,7 +58,7 @@ The framework achieves high performance through several optimization techniques:
 * **Pipelined Execution:** Uses pipelined stage execution overlapping to ensure high throughput.
 * **Full Disaggregation:** Relies on the OmniConnector and dynamic resource allocation across stages.
 * **Diffusion Acceleration:** Includes integrated support for diffusion acceleration. This is managed by the acceleration layer, which handles:
-    * **Cache:** Includes DBCache and TeaCache.
+    * **Cache:** Includes DBCache, TeaCache and third-party integration(e.g., [cache-dit](https://github.com/vipshop/cache-dit)).
     * **Parallelism:** Supports TP, CP, USP, and CFG.
     * **Attention:** Provides an interface for third-party integration (e.g., FA3, SAGE, MindIE-SD).
     * **Quantization:** Supports FP8 and AWQ.
