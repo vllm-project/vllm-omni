@@ -124,6 +124,10 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         TestMultiLayerAttentionModel,
     ],
 )
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("seq_len", [16])
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("head_size", [32])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_sync", [True, False])
@@ -136,10 +140,10 @@ def test_ulysses_attention(
     use_sync: bool,
     dynamic: bool,
     use_compile: bool,
-    batch_size: int = 2,
-    seq_len: int = 16,
-    num_heads: int = 8,
-    head_size: int = 32,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_size: int,
 ):
     """Test Ulysses attention with various parameter combinations."""
     num_processes = 2
