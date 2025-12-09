@@ -271,7 +271,7 @@ def set_current_vllm_config(omni_diffusion_config: OmniDiffusionConfig, check_co
     global _current_omni_diffusion_config, _current_prefix
     old_omni_diffusion_config = _current_omni_diffusion_config
     old_prefix = _current_prefix
-    from vllm.compilation.counter import compilation_counter
+    # from vllm.compilation.counter import compilation_counter
 
     # num_models_seen = compilation_counter.num_models_seen
     try:
