@@ -44,6 +44,18 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
     )
+    parser.add_argument(
+        "--ulysses_degree",
+        type=int,
+        default=2,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ring_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
     return parser.parse_args()
 
 
@@ -52,14 +64,15 @@ def main():
     device = detect_device_type()
     generator = torch.Generator(device=device).manual_seed(args.seed)
     local_rank = get_world_group().local_rank
-    parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
 
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
-
+    sequence_parallel_size = args.ulysses_degree * args.ring_degree
     omni_diffusion_config = OmniDiffusionConfig(
-        parallel_config=DiffusionParallelConfig(sequence_parallel_size=2, ulysses_degree=2)
+        parallel_config=DiffusionParallelConfig(
+            ulysses_degree=args.ulysses_degree, sequence_parallel_size=sequence_parallel_size
+        )
     )
     with set_current_vllm_config(omni_diffusion_config):
         omni = Omni(
@@ -68,6 +81,7 @@ def main():
             vae_use_slicing=vae_use_slicing,
             vae_use_tiling=vae_use_tiling,
         )
+        parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
         torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
         images = omni.generate(
