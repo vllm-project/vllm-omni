@@ -2,18 +2,12 @@
 # Adapted from
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
 import os
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import diffusers
 import torch
 from packaging import version
-
-try:
-    import torch_musa
-except ModuleNotFoundError:
-    pass
-
-from xfuser.logger import init_logger
+from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -27,7 +21,7 @@ if TYPE_CHECKING:
     TORCH_VERSION: version.Version
 
 
-environment_variables: Dict[str, Callable[[], Any]] = {
+environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
     # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
@@ -130,7 +124,7 @@ def get_torch_distributed_backend() -> str:
         raise NotImplementedError("No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available")
 
 
-variables: Dict[str, Callable[[], Any]] = {
+variables: dict[str, Callable[[], Any]] = {
     # ================== Other Vars ==================
     # used in version checking
     "CUDA_VERSION": lambda: version.parse(get_device_version() or "0.0"),
@@ -195,7 +189,7 @@ class PackagesEnvChecker:
 
         # Check if torch_npu is available
         if _is_npu():
-            logger.info("`falsh_attn` is not ready on torch_npu for now")
+            logger.info("`flash_attn` is not ready on torch_npu for now")
             return False
 
         if _is_musa():

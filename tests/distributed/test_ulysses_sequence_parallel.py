@@ -3,10 +3,8 @@
 
 import pytest
 import torch
-import vllm.envs as envs
 from vllm.platforms import current_platform
 
-from tests.utils import multi_gpu_test
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
@@ -114,7 +112,6 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         return hidden_states
 
 
-@multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize(
     "test_model_cls",
     [
@@ -130,7 +127,6 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("use_sync", [True, False])
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
-@pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda"], reason="Only test on CUDA")
 def test_ulysses_attention(
     test_model_cls: type[torch.nn.Module],
     batch_size: int,
