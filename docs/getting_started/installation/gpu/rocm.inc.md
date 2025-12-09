@@ -77,3 +77,7 @@ python3 -m pip install -e .
 ```
 
 # --8<-- [end:build-wheel-from-source-in-docker]
+
+# --8<-- [start:pre-built-images]
+
+# --8<-- [end:pre-built-images]
