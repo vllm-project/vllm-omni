@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -133,11 +136,11 @@ class Flux2Attention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        batch_size = hidden_states.shape[0]
-        img_seq_len = hidden_states.shape[1]
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        hidden_states.shape[0]
+        hidden_states.shape[1]
         txt_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
 
         # Image QKV
@@ -283,7 +286,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Parallel in (QKV + MLP in) projection
@@ -361,12 +364,12 @@ class Flux2SingleTransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
-        temb_mod_params: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        temb_mod_params: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # If encoder_hidden_states is None, hidden_states is assumed to have encoder_hidden_states already concatenated
         if encoder_hidden_states is not None:
             text_seq_len = encoder_hidden_states.shape[1]
@@ -433,11 +436,11 @@ class Flux2TransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        temb_mod_params_img: Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
-        temb_mod_params_txt: Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        temb_mod_params_img: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
+        temb_mod_params_txt: tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...],
+        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
         # Modulation parameters shape: [1, 1, self.dim] or [B, 1, self.dim]
@@ -493,12 +496,12 @@ class Flux2PosEmbed(nn.Module):
     Supports (T, H, W, L) dimensions.
     """
 
-    def __init__(self, theta: int, axes_dim: List[int]):
+    def __init__(self, theta: int, axes_dim: list[int]):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
 
-    def forward(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 4D RoPE frequencies from position IDs.
 
@@ -565,7 +568,7 @@ class Flux2Modulation(nn.Module):
         self.linear = nn.Linear(dim, dim * 3 * self.mod_param_sets, bias=bias)
         self.act_fn = nn.SiLU()
 
-    def forward(self, temb: torch.Tensor) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+    def forward(self, temb: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
         mod = self.act_fn(temb)
         mod = self.linear(mod)
 
@@ -622,7 +625,7 @@ class Flux2Transformer2DModel(nn.Module):
         joint_attention_dim: int = 15360,
         timestep_guidance_channels: int = 256,
         mlp_ratio: float = 3.0,
-        axes_dims_rope: Tuple[int, ...] = (32, 32, 32, 32),
+        axes_dims_rope: tuple[int, ...] = (32, 32, 32, 32),
         rope_theta: int = 2000,
         eps: float = 1e-6,
         od_config: "OmniDiffusionConfig | None" = None,
@@ -704,7 +707,7 @@ class Flux2Transformer2DModel(nn.Module):
         img_ids: torch.Tensor = None,
         txt_ids: torch.Tensor = None,
         guidance: torch.Tensor = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: Optional[dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """

@@ -3,21 +3,18 @@
 
 import json
 import os
-import sys
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
 
+# Standard diffusers imports (available in installed version)
 # Flux2-specific components (from local diffusers repo)
 # Path setup is handled in vllm_omni/diffusion/__init__.py
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import (
     AutoencoderKLFlux2,
 )
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
-
-# Standard diffusers imports (available in installed version)
-from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -36,7 +33,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 logger = init_logger(__name__)
 
 
-def format_text_input(prompts: List[str], system_message: str = None):
+def format_text_input(prompts: list[str], system_message: str = None):
     """Format prompts for Mistral3 tokenizer."""
     cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
 
@@ -207,14 +204,14 @@ class Flux2Pipeline(nn.Module):
     def _get_mistral_3_small_prompt_embeds(
         text_encoder: Mistral3ForConditionalGeneration,
         tokenizer: AutoProcessor,
-        prompt: Union[str, List[str]],
+        prompt: Union[str, list[str]],
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         max_sequence_length: int = 512,
         system_message: str = "You are an AI that reasons about image descriptions. "
         "You give structured responses focusing on object relationships, "
         "object attribution and actions without speculation.",
-        hidden_states_layers: List[int] = (10, 20, 30),
+        hidden_states_layers: list[int] = (10, 20, 30),
     ):
         """Extract prompt embeddings from Mistral3 text encoder."""
         dtype = text_encoder.dtype if dtype is None else dtype
@@ -271,9 +268,9 @@ class Flux2Pipeline(nn.Module):
             t = torch.arange(1) if t_coord is None else t_coord[i]
             h = torch.arange(1)
             w = torch.arange(1)
-            l = torch.arange(L)
+            layer_dim = torch.arange(L)
 
-            coords = torch.cartesian_prod(t, h, w, l)
+            coords = torch.cartesian_prod(t, h, w, layer_dim)
             out_ids.append(coords)
 
         return torch.stack(out_ids)
@@ -294,10 +291,10 @@ class Flux2Pipeline(nn.Module):
         t = torch.arange(1)  # [0] - time dimension
         h = torch.arange(height)
         w = torch.arange(width)
-        l = torch.arange(1)  # [0] - layer dimension
+        layer_dim = torch.arange(1)  # [0] - layer dimension
 
         # Create position IDs: (H*W, 4)
-        latent_ids = torch.cartesian_prod(t, h, w, l)
+        latent_ids = torch.cartesian_prod(t, h, w, layer_dim)
 
         # Expand to batch: (B, H*W, 4)
         latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
@@ -363,11 +360,11 @@ class Flux2Pipeline(nn.Module):
 
     def encode_prompt(
         self,
-        prompt: Union[str, List[str]],
+        prompt: Union[str, list[str]],
         num_images_per_prompt: int = 1,
         prompt_embeds: Optional[torch.Tensor] = None,
         max_sequence_length: int = 512,
-        text_encoder_out_layers: Tuple[int] = (10, 20, 30),
+        text_encoder_out_layers: tuple[int] = (10, 20, 30),
     ):
         """
         Encode text prompt(s) to embeddings.
@@ -456,7 +453,7 @@ class Flux2Pipeline(nn.Module):
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: Union[str, List[str]] = "",
+        prompt: Union[str, list[str]] = "",
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
@@ -466,9 +463,9 @@ class Flux2Pipeline(nn.Module):
         latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pil",
-        attention_kwargs: Optional[Dict[str, Any]] = None,
+        attention_kwargs: Optional[dict[str, Any]] = None,
         max_sequence_length: int = 512,
-        text_encoder_out_layers: Tuple[int] = (10, 20, 30),
+        text_encoder_out_layers: tuple[int] = (10, 20, 30),
     ) -> DiffusionOutput:
         """
         Main generation method.
