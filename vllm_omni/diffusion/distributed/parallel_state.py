@@ -35,7 +35,7 @@ import torch
 import torch.distributed
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.envs import envs
+from vllm_omni.diffusion import envs
 
 from .group_coordinator import (
     GroupCoordinator,
