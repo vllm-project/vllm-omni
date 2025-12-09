@@ -539,10 +539,6 @@ class QwenImagePipeline(
         guidance,
         true_cfg_scale,
     ):
-        # Reset cache adapter state at the start of diffusion loop to ensure clean state
-        if self._cache_adapter is not None:
-            self._cache_adapter.reset(self.transformer)
-
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
             if self.interrupt:

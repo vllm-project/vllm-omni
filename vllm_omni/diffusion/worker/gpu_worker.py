@@ -78,12 +78,18 @@ class GPUWorker:
             cache_config=self.od_config.cache_config,
         )
 
+    def maybe_reset_cache(self) -> None:
+        """Reset cache state before each generation if applicable."""
+        if self.pipeline._cache_adapter is not None:
+            self.pipeline._cache_adapter.reset(self.pipeline.transformer)
+
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
         Execute a forward pass.
         """
         assert self.pipeline is not None
+        self.maybe_reset_cache()
         # TODO: dealing with first req for now
         req = reqs[0]
         output = self.pipeline.forward(req)
