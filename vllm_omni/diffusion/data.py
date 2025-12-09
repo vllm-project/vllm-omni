@@ -256,6 +256,8 @@ class OmniDiffusionConfig:
     trust_remote_code: bool = False
     revision: str | None = None
 
+    num_gpus: int | None = None
+
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: int = -1
     dist_timeout: int | None = None  # timeout for torch.distributed
@@ -377,6 +379,12 @@ class OmniDiffusionConfig:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
+        if self.num_gpus is None:
+            self.num_gpus = 1
+        if self.num_gpus < self.parallel_config.world_size:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
+            )
 
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
