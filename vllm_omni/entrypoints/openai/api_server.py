@@ -226,8 +226,6 @@ async def build_async_diffusion(
     Yields:
         AsyncOmniDiffusion instance ready for use
     """
-    import torch
-
     diffusion_engine: Optional[AsyncOmniDiffusion] = None
 
     try:
@@ -239,17 +237,6 @@ async def build_async_diffusion(
         # Add optional configuration from args
         if hasattr(args, "num_gpus"):
             diffusion_kwargs["num_gpus"] = args.num_gpus
-
-        # Handle dtype conversion from string to torch.dtype
-        if hasattr(args, "diffusion_dtype"):
-            dtype_map = {
-                "float16": torch.float16,
-                "bfloat16": torch.bfloat16,
-                "float32": torch.float32,
-            }
-            diffusion_kwargs["dtype"] = dtype_map.get(args.diffusion_dtype, torch.bfloat16)
-        elif hasattr(args, "dtype"):
-            diffusion_kwargs["dtype"] = args.dtype
 
         if hasattr(args, "trust_remote_code"):
             diffusion_kwargs["trust_remote_code"] = args.trust_remote_code
@@ -468,7 +455,7 @@ async def omni_diffusion_init_app_state(
     # Get default parameters from CLI args
     default_seed = getattr(args, "diffusion_seed", None)
     default_num_inference_steps = getattr(args, "num_inference_steps", 50)
-    default_guidance_scale = getattr(args, "guidance_scale", 7.5)
+    default_guidance_scale = getattr(args, "guidance_scale", 4.0)
 
     # Initialize chat handler with diffusion engine (uses /v1/chat/completions endpoint)
     state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(

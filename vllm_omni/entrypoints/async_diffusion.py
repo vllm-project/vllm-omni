@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.outputs import OmniDiffusionRequestOutput
+from vllm_omni.outputs import OmniRequestOutput
 
 try:
     from vllm.transformers_utils.config import get_hf_file_to_dict
@@ -149,7 +149,7 @@ class AsyncOmniDiffusion:
         num_outputs_per_prompt: int = 1,
         seed: Optional[int] = None,
         **kwargs: Any,
-    ) -> OmniDiffusionRequestOutput:
+    ) -> OmniRequestOutput:
         """Generate images asynchronously from a text prompt.
 
         Args:
@@ -165,7 +165,7 @@ class AsyncOmniDiffusion:
             **kwargs: Additional generation parameters
 
         Returns:
-            OmniDiffusionRequestOutput containing generated images
+            OmniRequestOutput containing generated images
 
         Raises:
             RuntimeError: If generation fails
@@ -217,11 +217,10 @@ class AsyncOmniDiffusion:
             len(images),
         )
 
-        return OmniDiffusionRequestOutput(
+        return OmniRequestOutput.from_diffusion(
             request_id=request_id,
             images=images,
             prompt=prompt,
-            finished=True,
             metrics={
                 "num_inference_steps": num_inference_steps,
                 "guidance_scale": guidance_scale,
@@ -233,7 +232,7 @@ class AsyncOmniDiffusion:
         prompt: str,
         request_id: Optional[str] = None,
         **kwargs: Any,
-    ) -> AsyncGenerator[OmniDiffusionRequestOutput, None]:
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate images with streaming progress updates.
 
         Currently, diffusion models don't support true streaming, so this
@@ -246,7 +245,7 @@ class AsyncOmniDiffusion:
             **kwargs: Additional generation parameters
 
         Yields:
-            OmniDiffusionRequestOutput with generation progress/results
+            OmniRequestOutput with generation progress/results
         """
         result = await self.generate(prompt=prompt, request_id=request_id, **kwargs)
         yield result

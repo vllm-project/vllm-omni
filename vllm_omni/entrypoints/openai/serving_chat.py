@@ -1036,10 +1036,15 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             else:
                 content = image_contents
 
-            choice = ChatCompletionResponseChoice(
+            # Use model_construct to bypass validation for multimodal content
+            # (ChatMessage.content only accepts str, but we need list for images)
+            message = ChatMessage.model_construct(role="assistant", content=content)
+            choice = ChatCompletionResponseChoice.model_construct(
                 index=0,
-                message=ChatMessage(role="assistant", content=content),
+                message=message,
                 finish_reason="stop",
+                logprobs=None,
+                stop_reason=None,
             )
 
             response = ChatCompletionResponse(
