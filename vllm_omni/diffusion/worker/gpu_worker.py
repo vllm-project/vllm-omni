@@ -8,8 +8,6 @@ import torch
 import zmq
 from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
-
 from vllm.logger import init_logger
 from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
@@ -19,6 +17,7 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 

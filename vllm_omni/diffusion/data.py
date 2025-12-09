@@ -11,14 +11,17 @@ from pydantic import Field, model_validator
 from typing import Any
 from contextlib import contextmanager
 from functools import lru_cache
-from typing_extensions import Self
+
 import torch
-from vllm.logger import init_logger
+from pydantic import Field, model_validator
+from typing_extensions import Self
 from vllm.config.utils import config
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 logger = init_logger(__name__)
+
 
 @config
 @dataclass
@@ -56,11 +59,13 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, "Sequence parallel size must be equal to the product of ulysses degree and ring degree, but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
+            "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
+            f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        )
         return self
 
     def __post_init__(self) -> None:
-
         self.world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
@@ -69,6 +74,7 @@ class DiffusionParallelConfig:
             * self.ring_degree
             * self.cfg_parallel_size
         )
+
 
 @dataclass
 class TransformerConfig:
@@ -386,12 +392,13 @@ class OmniDiffusionConfig:
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
         return cls(**kwargs)
 
+
 _current_omni_diffusion_config: OmniDiffusionConfig | None = None
 _current_prefix: str | None = None
+
+
 @contextmanager
-def set_current_vllm_config(
-    omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None
-):
+def set_current_vllm_config(omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None):
     """
     Temporarily set the current vLLM config.
     Used during model initialization.
@@ -404,7 +411,7 @@ def set_current_vllm_config(
     old_prefix = _current_prefix
     from vllm.compilation.counter import compilation_counter
 
-    num_models_seen = compilation_counter.num_models_seen
+    # num_models_seen = compilation_counter.num_models_seen
     try:
         _current_omni_diffusion_config = omni_diffusion_config
         _current_prefix = prefix
@@ -420,16 +427,19 @@ def set_current_vllm_config(
         # Clear the compilation config cache when context changes
         get_cached_compilation_config.cache_clear()
 
+
 @lru_cache(maxsize=1)
 def get_cached_compilation_config():
     """Cache config to avoid repeated calls to get_current_omni_diffusion_config()"""
     return get_current_omni_diffusion_config().compilation_config
+
 
 def get_current_omni_diffusion_config() -> OmniDiffusionConfig:
     if _current_omni_diffusion_config is None:
         logger.warning("Current OmniDiffusionConfig is not set.")
         return OmniDiffusionConfig()
     return _current_omni_diffusion_config
+
 
 @dataclass
 class DiffusionOutput:
