@@ -332,3 +332,16 @@ def multi_gpu_test(*, num_gpus: int):
         return func
 
     return wrapper
+
+
+def update_environment_variables(envs_dict: dict[str, str]):
+    """Update multiple environment variables with logging."""
+    for k, v in envs_dict.items():
+        if k in os.environ and os.environ[k] != v:
+            logger.warning(
+                "Overwriting environment variable %s from '%s' to '%s'",
+                k,
+                os.environ[k],
+                v,
+            )
+        os.environ[k] = v
