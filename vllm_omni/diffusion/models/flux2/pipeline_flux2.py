@@ -7,10 +7,6 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-
-# Standard diffusers imports (available in installed version)
-# Flux2-specific components (from local diffusers repo)
-# Path setup is handled in vllm_omni/diffusion/__init__.py
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import (
     AutoencoderKLFlux2,
 )
