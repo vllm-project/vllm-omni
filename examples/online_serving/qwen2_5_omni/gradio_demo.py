@@ -94,6 +94,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def build_async_omni_cli_args(base_args: argparse.Namespace) -> argparse.Namespace:
+    """Construct the minimal CLI args Namespace expected by AsyncOmni."""
+    return argparse.Namespace(
+        model=base_args.model,
+        stage_configs_path=getattr(base_args, "stage_configs_path", None),
+        init_timeout=ASYNC_INIT_TIMEOUT,
+    )
+
+
 def build_sampling_params(seed: int, model_key: str) -> list[SamplingParams]:
     """Build SamplingParams objects by reusing the dict definitions."""
     return [SamplingParams(**params_dict) for params_dict in build_sampling_params_dict(seed, model_key)]
@@ -500,11 +509,8 @@ def main():
         print(f"Using custom stage configs: {args.stage_configs_path}")
 
     sampling_params = build_sampling_params(SEED, model_name)
-    omni = AsyncOmni(
-        model=args.model,
-        stage_configs_path=args.stage_configs_path,
-        init_timeout=ASYNC_INIT_TIMEOUT,
-    )
+    cli_args = build_async_omni_cli_args(args)
+    omni = AsyncOmni(model=args.model, cli_args=cli_args)
     print("✓ AsyncOmni initialized successfully")
     prompt_args_template = create_prompt_args(args)
 
