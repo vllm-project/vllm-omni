@@ -68,11 +68,9 @@ def main():
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
-    sequence_parallel_size = args.ulysses_degree * args.ring_degree
+
     omni_diffusion_config = OmniDiffusionConfig(
-        parallel_config=DiffusionParallelConfig(
-            ulysses_degree=args.ulysses_degree, sequence_parallel_size=sequence_parallel_size
-        )
+        parallel_config=DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
     )
     with set_current_vllm_config(omni_diffusion_config):
         omni = Omni(
