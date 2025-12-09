@@ -5,7 +5,6 @@ This section contains design documents and architecture specifications for vLLM-
 ## Architecture Documents
 
 - [Architecture Overview](architecture_overview.md)
-- [vLLM-Omni Software Design Document](vllm_omni_design.md)
 
 ## Feature Design Documents
 
