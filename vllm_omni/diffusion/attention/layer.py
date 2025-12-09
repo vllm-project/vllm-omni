@@ -15,11 +15,12 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.utils.platform_utils import is_npu
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
-from typing import Any
+from typing import Optional
 from torch import Tensor
 
 import torch.distributed as dist
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_sequence_parallel_world_size
 
 class Attention(nn.Module):
     def __init__(
@@ -30,6 +31,10 @@ class Attention(nn.Module):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        # ulysses attention
+        scatter_idx: int = 2,
+        gather_idx: int = 1,
+        use_sync: bool = False,
     ):
         super().__init__()
         self.attn_backend = get_attn_backend(-1)
@@ -42,6 +47,26 @@ class Attention(nn.Module):
             num_kv_heads=num_kv_heads,
         )
 
+        self.softmax_scale = softmax_scale
+        self.scatter_idx = scatter_idx
+        self.gather_idx = gather_idx
+        self.use_sync = use_sync
+        self.sequence_process_group: Optional[dist.ProcessGroup] = None
+        config = get_current_omni_diffusion_config()
+        
+        try:
+            if config.parallel_config.ulysses_degree > 1:
+                self.use_ulysses = True
+                # Get sequence parallel process group
+                try:
+                    sp_group = get_sp_group()
+                    self.sequence_process_group = sp_group.device_group
+                    assert get_sequence_parallel_world_size() > 1, "Sequence parallel world size must be > 1"
+                except (AssertionError, RuntimeError):
+                    self.use_ulysses = False
+        except Exception:
+            self.use_ulysses = False
+
     def forward(
         self,
         query: torch.Tensor,
@@ -49,84 +74,51 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        # shape: (batch_size, seq_len, num_heads, head_size)
-        attn_output = self.attention.forward(query, key, value, attn_metadata)
-        return attn_output
-
-
-class UlyssesAttention(torch.nn.Module):
-    """Initialization.
-
-    Arguments:
-        local_attention (Module): local attention with q,k,v
-        sequence_process_group (ProcessGroup): sequence parallel process group
-        scatter_idx (int): scatter_idx for all2all comm
-        gather_idx (int): gather_idx for all2all comm
-        use_sync (bool): whether to synchronize after all-to-all. This flag can save cuda memory but will slow down the speed.
-        attn_type (AttnType): attention type enum
-    """
-
-    def __init__(
+        if self.use_ulysses:
+            return self._forward_ulysses(query, key, value, attn_metadata)
+        else:
+            # shape: (batch_size, seq_len, num_heads, head_size)
+            attn_output = self.attention.forward(query, key, value, attn_metadata)
+            return attn_output
+    
+    def _forward_ulysses(
         self,
-        sequence_process_group: dist.ProcessGroup = None,
-        scatter_idx: int = 2,
-        gather_idx: int = 1,
-        use_sync: bool = False,
-    ) -> None:
-
-        super(UlyssesAttention, self).__init__()
-        self.spg = sequence_process_group
-        self.scatter_idx = scatter_idx
-        self.gather_idx = gather_idx
-        self.use_sync = use_sync
-
-    def forward(
-        self,
-        attn: Attention,
         query: Tensor,
         key: Tensor,
         value: Tensor,
         attn_metadata: AttentionMetadata = None,
-        *args: Any
     ) -> Tensor:
-        """forward
-
-        Arguments:
-            query (Tensor): query input to the layer
-            key (Tensor): key input to the layer
-            value (Tensor): value input to the layer
-            args: other args
-
-        Returns:
-            * output (Tensor): context output
-        """
-        # TODO Merge three alltoall calls into one
-        # TODO (Reza): change the api on the megatron-deepspeed side so that we only receive all data (q,k, and v) together!
-        # in shape : e.g.,  [s/p:h:]
-        # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
-
+        """Ulysses attention forward pass with sequence parallelism."""
         # scatter 2, gather 1
-        q = SeqAllToAll4D.apply(self.spg, query, self.scatter_idx, self.gather_idx, self.use_sync)
-        k = SeqAllToAll4D.apply(self.spg, key, self.scatter_idx, self.gather_idx, self.use_sync)
-        v = SeqAllToAll4D.apply(self.spg, value, self.scatter_idx, self.gather_idx, self.use_sync)
+        # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
+        q = SeqAllToAll4D.apply(
+            self.sequence_process_group, query, self.scatter_idx, self.gather_idx, self.use_sync
+        )
+        k = SeqAllToAll4D.apply(
+            self.sequence_process_group, key, self.scatter_idx, self.gather_idx, self.use_sync
+        )
+        v = SeqAllToAll4D.apply(
+            self.sequence_process_group, value, self.scatter_idx, self.gather_idx, self.use_sync
+        )
 
+        softmax_scale = self.softmax_scale
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
 
         if is_npu():
-            context_layer = attn(
+            context_layer = self.attention(
                 q,
                 k,
                 v,
-                num_heads = q.shape[-2], 
-                input_layout = "BSND",  
-                scale = softmax_scale, 
-                softmax_lse_flag = True,
-                pre_tokens=65535, 
+                num_heads=q.shape[-2],
+                input_layout="BSND",
+                scale=softmax_scale,
+                softmax_lse_flag=True,
+                pre_tokens=65535,
                 next_tokens=65535,
             )
         else:
-            context_layer = self.attn_fn(
+            context_layer = self.attention.forward(
                 q,
                 k,
                 v,
@@ -139,8 +131,9 @@ class UlyssesAttention(torch.nn.Module):
         # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
         # scatter 1, gather 2
         output = SeqAllToAll4D.apply(
-            self.spg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync
+            self.sequence_process_group, context_layer, self.gather_idx, self.scatter_idx, self.use_sync
         )
 
-        # out e.g., [s/p::h]
         return output
+
+
