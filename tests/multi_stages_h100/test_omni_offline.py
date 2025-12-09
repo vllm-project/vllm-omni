@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E tests for Qwen3-Omni model with audio/video/image input and audio output.
+E2E offline tests for Omni model with video input and audio output.
 """
 
 import os
@@ -17,13 +17,17 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 # CI stage config for 2xH100-80G GPUs
-CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")
+stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+
+# Create parameter combinations for model and stage config
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
-@pytest.mark.parametrize("model", models)
-def test_video_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
+@pytest.mark.parametrize("test_config", test_params)
+def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
     """Test processing video, generating audio output."""
-    with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
+    model, stage_config_path = test_config
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
         # Prepare inputs
         question = "Describe the video briefly."
         video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
