@@ -53,9 +53,10 @@ class Attention(nn.Module):
         self.gather_idx = gather_idx
         self.use_sync = use_sync
         self.sequence_process_group: Optional[dist.ProcessGroup] = None
-        config = get_current_omni_diffusion_config()
+        self.use_ulysses = False
 
         try:
+            config = get_current_omni_diffusion_config()
             if config.parallel_config.ulysses_degree > 1:
                 self.use_ulysses = True
                 # Get sequence parallel process group
@@ -64,6 +65,7 @@ class Attention(nn.Module):
                     self.sequence_process_group = sp_group.device_group
                     assert get_sequence_parallel_world_size() > 1, "Sequence parallel world size must be > 1"
                 except (AssertionError, RuntimeError):
+                    # If sequence parallel group is not initialized, disable Ulysses
                     self.use_ulysses = False
         except Exception:
             self.use_ulysses = False
