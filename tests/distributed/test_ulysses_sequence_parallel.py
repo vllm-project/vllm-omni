@@ -5,7 +5,6 @@ import pytest
 import torch
 import vllm.envs as envs
 from vllm.platforms import current_platform
-from vllm.utils.system_utils import update_environment_variables
 
 from tests.utils import multi_gpu_test
 from vllm_omni.diffusion.attention.layer import Attention
@@ -201,17 +200,6 @@ def ulysses_attention_on_test_model(
     torch.cuda.set_device(device)
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
-
-    update_environment_variables(
-        {
-            "RANK": str(local_rank),
-            "LOCAL_RANK": str(local_rank),
-            "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12346",  # Different port to avoid conflicts
-        }
-    )
-
     # Initialize distributed environment
     init_distributed_environment()
 
