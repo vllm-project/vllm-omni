@@ -29,7 +29,7 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import torch.distributed
@@ -44,7 +44,6 @@ from .group_coordinator import (
 )
 
 try:
-    import torch_musa
     from torch_musa.core.device import device_count, set_device
 except ModuleNotFoundError:
     pass
@@ -73,19 +72,19 @@ _VAE: Optional[GroupCoordinator] = None
 
 
 def generate_masked_orthogonal_rank_groups(
-    world_size: int, parallel_size: List[int], mask: List[bool]
-) -> List[List[int]]:
+    world_size: int, parallel_size: list[int], mask: list[bool]
+) -> list[list[int]]:
     r"""Generate orthogonal parallel groups based on the parallel size and mask.
 
     Arguments:
         world_size (int): world size
 
-        parallel_size (List[int]):
+        parallel_size (list[int]):
             The parallel size of each orthogonal parallel type. For example, if
             tensor_parallel_size = 2, pipeline_model_parallel_group = 3, data_parallel_size = 4,
             and the parallel mapping order is tp-pp-dp, then the parallel_size = [2, 3, 4].
 
-        mask (List[bool]):
+        mask (list[bool]):
             The mask controls which parallel methods the generated groups represent. If mask[i] is
             True, it means the generated group contains the i-th parallelism method. For example,
             if parallel_size = [tp_size, pp_size, dp_size], and mask = [True, False , True], then
@@ -125,14 +124,14 @@ def generate_masked_orthogonal_rank_groups(
         dp_group[7] = 1 + range(0, 3) * 2 + 3 * 2 * 3 = [19, 21, 23]
     """
 
-    def prefix_product(a: List[int], init=1) -> List[int]:
+    def prefix_product(a: list[int], init=1) -> list[int]:
         r = [init]
         for v in a:
             init = init * v
             r.append(init)
         return r
 
-    def inner_product(a: List[int], b: List[int]) -> int:
+    def inner_product(a: list[int], b: list[int]) -> int:
         return sum([x * y for x, y in zip(a, b)])
 
     def decompose(index, shape, stride=None):
@@ -211,7 +210,8 @@ class RankGenerator:
         for name in self.name_to_size.keys():
             if name not in order and self.name_to_size[name] != 1:
                 raise RuntimeError(
-                    f"The size of ({name}) is ({self.name_to_size[name]}), but you haven't specified the order ({self.order})."
+                    f"The size of ({name}) is ({self.name_to_size[name]}), "
+                    f"but you haven't specified the order ({self.order})."
                 )
             elif name not in order:
                 order = order + "-" + name
@@ -407,7 +407,7 @@ def get_vae_parallel_rank():
 # * SET
 
 
-def init_world_group(ranks: List[int], local_rank: int, backend: str) -> GroupCoordinator:
+def init_world_group(ranks: list[int], local_rank: int, backend: str) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
@@ -470,7 +470,7 @@ def model_parallel_is_initialized():
 
 
 def init_model_parallel_group(
-    group_ranks: List[List[int]],
+    group_ranks: list[list[int]],
     local_rank: int,
     backend: str,
     parallel_mode: str,
@@ -548,7 +548,8 @@ def initialize_model_parallel(
     Arguments:
         data_parallel_degree: number of data parallelism groups.
         classifier_free_guidance_degree: number of GPUs used for Classifier Free Guidance (CFG)
-        sequence_parallel_degree: number of GPUs used for sequence parallelism. sequence_parallel_degree = ulysses_degree * ring_degree
+        sequence_parallel_degree: number of GPUs used for sequence parallelism.
+            sequence_parallel_degree = ulysses_degree * ring_degree
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
         tensor_parallel_degree: number of GPUs used for tensor parallelism.
@@ -594,7 +595,8 @@ def initialize_model_parallel(
 
     if sequence_parallel_degree != ring_degree * ulysses_degree:
         raise ValueError(
-            f"sequence_parallel_degree is not equal to ring_degree * ulysses_degree, {sequence_parallel_degree} != {ring_degree} * {ulysses_degree}"
+            "sequence_parallel_degree is not equal to ring_degree * ulysses_degree,"
+            f" but got {sequence_parallel_degree} != {ring_degree} * {ulysses_degree}"
         )
 
     # FIXME: Since the async p2p communication operation of NPU is not same as cuda in torch,
@@ -719,3 +721,9 @@ def destroy_distributed_environment():
     _WORLD = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def destroy_distributed_env(self):
+    if model_parallel_is_initialized():
+        destroy_model_parallel()
+    destroy_distributed_environment()
