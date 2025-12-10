@@ -10,7 +10,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
-    set_current_vllm_config,
+    set_current_omni_diffusion_config,
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -250,7 +250,7 @@ def ulysses_attention_on_test_model(
     )
 
     # Set the config so Attention can access it
-    with set_current_vllm_config(od_config):
+    with set_current_omni_diffusion_config(od_config):
         # Create model
         hidden_size = num_heads * head_size
 
