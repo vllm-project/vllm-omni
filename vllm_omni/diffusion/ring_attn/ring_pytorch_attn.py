@@ -1,10 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024, Jiarui Fang.
+# Adapted from https://github.com/feifeibear/long-context-attention
+
+# adapted from https://github.com/huggingface/picotron/blob/main/picotron/context_parallel/context_parallel.py
+# Copyright 2024 The HuggingFace Inc. team and Jiarui Fang.
+
 import math
 import torch
 import torch.nn.functional as F
 from typing import Any, Optional, Tuple
-from ..kernels import select_flash_attn_impl, AttnType
+from ..ring_attn.kernels import select_flash_attn_impl, AttnType
 from .utils import RingComm, update_out_and_lse
-from ..kernels.attention import pytorch_attn_forward, pytorch_attn_backward
+from ..ring_attn.kernels.attention import pytorch_attn_forward, pytorch_attn_backward
 
 def ring_pytorch_attn_func(
     q,
@@ -127,4 +134,3 @@ class RingAttentionFunc(torch.autograd.Function):
         d_kv_comm.wait()
 
         return dq, next_dk, next_dv, None, None
-

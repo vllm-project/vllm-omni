@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024, Jiarui Fang.
+# Adapted from https://github.com/feifeibear/long-context-attention
+
 import torch
 import os
 
@@ -54,4 +58,3 @@ try:
     HAS_NPU = True
 except ImportError:
     HAS_NPU = False
-

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024, Jiarui Fang.
+# Adapted from https://github.com/feifeibear/long-context-attention
+
 import math
 from typing import Optional, Tuple
 
@@ -378,4 +382,3 @@ def npu_attn_forward(q, k, v,
                                                 pre_tokens=65535, 
                                                 next_tokens=65535)
     return block_out, block_lse.squeeze(dim=-1)
-

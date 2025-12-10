@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024, Jiarui Fang.
+# Adapted from https://github.com/feifeibear/long-context-attention
+
 from functools import partial
 
 import torch
@@ -266,4 +270,3 @@ __all__ = [
     "flashinfer_attn_backbward",
     "AttnType",
 ]
-

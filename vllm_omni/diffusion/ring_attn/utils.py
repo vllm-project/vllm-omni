@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2024, Jiarui Fang.
+# Adapted from https://github.com/feifeibear/long-context-attention
+
 from typing import Optional, Tuple
 
 import torch
@@ -116,4 +120,3 @@ class RingComm:
             req.wait()
         self._reqs = None
         self._ops = []
-
