@@ -612,7 +612,7 @@ class OvisImagePipeline(
         height = req.height or self.default_sample_size * self.vae_scale_factor
         width = req.width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.num_inference_steps or num_inference_steps
-        guidance_scale = req.guidance_scale if req.guidance_rescale is not None else guidance_scale
+        guidance_scale = req.guidance_scale if req.guidance_scale is not None else guidance_scale
         generator = req.generator or generator
         req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
