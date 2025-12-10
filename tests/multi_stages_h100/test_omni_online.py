@@ -72,7 +72,7 @@ class OmniServer:
         )
 
         # Wait for server to be ready
-        max_wait = 300
+        max_wait = 1200  # 20 minutes
         start_time = time.time()
         while time.time() - start_time < max_wait:
             try:
