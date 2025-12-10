@@ -71,7 +71,7 @@ The framework achieves high performance through several optimization techniques:
     * **Cache:** Includes DBCache, TeaCache and third-party integration(e.g., [cache-dit](https://github.com/vipshop/cache-dit)).
     * **Parallelism:** Supports TP, CP, USP, and CFG.
     * **Attention:** Provides an interface for third-party integration (e.g., FA3, SAGE, MindIE-SD).
-    * **Quantization:** Supports FP8 and AWQ.
+    * **Quantization:** Supports various quantization implementations including FP8 and AWQ.
     * **FusedOps:** Allows for custom and third-party integration.
 
 ### Flexibility and Usability
