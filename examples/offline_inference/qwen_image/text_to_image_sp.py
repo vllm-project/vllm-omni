@@ -86,8 +86,7 @@ def main():
             **config_kwargs,
             od_config=omni_diffusion_config,
         )
-        local_rank = get_world_group().local_rank
-        parameter_peak_memory = torch_device.max_memory_allocated(device=f"{device_name}:{local_rank}")
+
         torch_device.reset_peak_memory_stats()
         start_time = time.time()
         images = omni.generate(
@@ -102,7 +101,6 @@ def main():
         )
     end_time = time.time()
     elapsed_time = end_time - start_time
-    peak_memory = torch_device.max_memory_allocated(device=f"{device_name}:{local_rank}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,9 +115,7 @@ def main():
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
     if get_world_group().rank == get_world_group().world_size - 1:
-        print(
-            f"epoch time: {elapsed_time:.2f} sec, parameter memory: {parameter_peak_memory / 1e9:.2f} GB, memory: {peak_memory / 1e9:.2f} GB"
-        )
+        print(f"epoch time: {elapsed_time:.2f} sec")
     destroy_distributed_env()
 
 
