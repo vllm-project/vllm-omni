@@ -104,6 +104,7 @@ class _FakeStage:
         shm_threshold_bytes: int = 65536,
         ctx=None,
         batch_timeout: int = 10,
+        **kwargs,
     ):
         """Mock init_stage_worker: don't start real process, just send stage_ready message."""
         # Create a mock process object

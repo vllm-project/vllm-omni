@@ -47,6 +47,19 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
 
+    def _make_buffer(self, *size, dtype, numpy=True):
+        # Prevent ray from pinning the buffer due to large size
+        from vllm_omni.distributed.ray_utils.utils import (
+            calculate_total_bytes,
+            maybe_disable_pin_memory_for_ray,
+        )
+
+        total_bytes = calculate_total_bytes(size, dtype)
+
+        # Use the context manager to temporarily disable pinning if needed
+        with maybe_disable_pin_memory_for_ray(self, total_bytes):
+            return super()._make_buffer(*size, dtype=dtype, numpy=numpy)
+
     @torch.inference_mode()
     def execute_model(
         self,

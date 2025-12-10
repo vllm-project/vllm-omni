@@ -229,3 +229,5 @@ configs/development.yaml
 # Docker
 .dockerignore
 Dockerfile.dev
+discussion
+tmp_test
