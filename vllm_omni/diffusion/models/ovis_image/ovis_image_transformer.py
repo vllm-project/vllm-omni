@@ -74,6 +74,7 @@ class OvisImageAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             disable_tp=True,
+            bias=bias,
         )
 
         if not self.pre_only:
@@ -90,6 +91,7 @@ class OvisImageAttention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 disable_tp=True,
+                bias=added_proj_bias,
             )
 
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
