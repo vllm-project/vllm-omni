@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team & Jiarui Fang
 #  from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/comm/all_to_all.py
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -112,7 +112,7 @@ class SeqAllToAll4D(torch.autograd.Function):
         return all_to_all_4D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
 
     @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+    def backward(ctx: Any, *grad_output: Tensor) -> tuple[None, Tensor, None, None]:
         return (
             None,
             SeqAllToAll4D.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync),
@@ -228,7 +228,7 @@ class SeqAllToAll5D(torch.autograd.Function):
         return all_to_all_5D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
 
     @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+    def backward(ctx: Any, *grad_output: Tensor) -> tuple[None, Tensor, None, None]:
         return (
             None,
             SeqAllToAll5D.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync),
