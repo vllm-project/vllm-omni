@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, set_current_omni_diffusion_config
-from vllm_omni.diffusion.distributed.parallel_state import destroy_distributed_env, get_world_group
 from vllm_omni.diffusion.envs import get_device_name
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
@@ -114,9 +113,8 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
-    if get_world_group().rank == get_world_group().world_size - 1:
-        print(f"epoch time: {elapsed_time:.2f} sec")
-    destroy_distributed_env()
+
+    print(f"epoch time: {elapsed_time:.2f} sec")
 
 
 if __name__ == "__main__":
