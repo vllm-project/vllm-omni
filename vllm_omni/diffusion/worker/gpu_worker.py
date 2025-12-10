@@ -62,30 +62,30 @@ class GPUWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         set_current_vllm_config(vllm_config)
-        set_current_omni_diffusion_config(self.od_config)
 
-        init_distributed_environment(world_size=world_size, rank=rank)
-        logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
-        parallel_config = self.od_config.parallel_config
-        initialize_model_parallel(
-            data_parallel_degree=parallel_config.data_parallel_size,
-            classifier_free_guidance_degree=parallel_config.cfg_parallel_size,
-            sequence_parallel_degree=parallel_config.sequence_parallel_size,
-            ulysses_degree=parallel_config.ulysses_degree,
-            ring_degree=parallel_config.ring_degree,
-            tensor_parallel_degree=parallel_config.tensor_parallel_size,
-            pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
-        )
-
-        load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
-        time_before_load = time.perf_counter()
-        with DeviceMemoryProfiler() as m:
-            self.pipeline = model_loader.load_model(
-                od_config=self.od_config,
-                load_device=f"cuda:{rank}",
+        with set_current_omni_diffusion_config(self.od_config):
+            init_distributed_environment(world_size=world_size, rank=rank)
+            logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+            parallel_config = self.od_config.parallel_config
+            initialize_model_parallel(
+                data_parallel_degree=parallel_config.data_parallel_size,
+                classifier_free_guidance_degree=parallel_config.cfg_parallel_size,
+                sequence_parallel_degree=parallel_config.sequence_parallel_size,
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+                tensor_parallel_degree=parallel_config.tensor_parallel_size,
+                pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
             )
-        time_after_load = time.perf_counter()
+
+            load_config = LoadConfig()
+            model_loader = DiffusersPipelineLoader(load_config)
+            time_before_load = time.perf_counter()
+            with DeviceMemoryProfiler() as m:
+                self.pipeline = model_loader.load_model(
+                    od_config=self.od_config,
+                    load_device=f"cuda:{rank}",
+                )
+            time_after_load = time.perf_counter()
 
         logger.info(
             "Model loading took %.4f GiB and %.6f seconds",
