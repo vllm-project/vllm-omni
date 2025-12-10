@@ -157,7 +157,7 @@ class PackagesEnvChecker:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(PackagesEnvChecker, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             cls._instance.initialize()
         return cls._instance
 
@@ -184,7 +184,7 @@ class PackagesEnvChecker:
             if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
                 return False
             else:
-                from flash_attn import __version__, flash_attn_func
+                from flash_attn import __version__
 
                 if __version__ < "2.6.0":
                     raise ImportError("install flash_attn >= 2.6.0")
