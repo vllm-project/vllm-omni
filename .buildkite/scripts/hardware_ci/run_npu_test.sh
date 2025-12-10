@@ -124,6 +124,5 @@ docker run \
     "${image_name}" \
     bash -c '
     set -e
-    export HF_ENDPOINT=https://hf-mirror.com
-    pytest -s -v tests/single_stage/test_diffusion_model.py
+    VLLM_USE_MODELSCOPE=True pytest -s -v tests/single_stage/test_diffusion_model.py
 '
