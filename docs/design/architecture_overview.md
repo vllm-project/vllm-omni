@@ -2,7 +2,9 @@
 
 This document outlines the architectural design for vLLM-Omni.
 
-![Omni-Modality Model Architecture](../source/architecture/omni-modality-model-architecture.png)
+<p align="center">
+<img src="../source/architecture/omni-modality-model-architecture.png" alt="Omni-Modality Model Architecture" width="80%">
+</p>
 
 # Goals
 
@@ -18,21 +20,29 @@ The primary goal of the vLLM-Omni project is to build the fastest and easiest-to
 
 According to analysis for current popular open-source models, most of them have the combination of AR+DiT. Specifically, they can be further categorized into 3 types below:
 
-* **DiT as a main structure, with AR as text encoder (e.g.: Qwen-Image)**
-  A a powerful image generation foundation model capable of complex text rendering and precise image editing. 
-  ![Qwen-Image](../source/architecture/ar-main-architecture.png)
-* **AR as a main structure, with DiT as multi-modal generator (e.g. BAGEL)**
-  A unified multimodal comprehension and generation model, with cot text output and visual generation.
-  ![Bagel](../source/architecture/dit-main-architecture.png)
-* **AR+DiT (e.g. Qwen-Omni)**
-  A natively end-to-end omni-modal LLM for multimodal inputs (text/image/audio/video...) and outputs (text/audio...).
-  ![Qwen-Omni](../source/architecture/ar-dit-main-architecture.png)
+**DiT as a main structure, with AR as text encoder (e.g.: Qwen-Image)**
+  A powerful image generation foundation model capable of complex text rendering and precise image editing.
+<p align="center">
+<img src="../source/architecture/ar-main-architecture.png" alt="Qwen-Image" width="30%">
+</p>
 
+**AR as a main structure, with DiT as multi-modal generator (e.g. BAGEL)**
+  A unified multimodal comprehension and generation model, with cot text output and visual generation.
+<p align="center">
+<img src="../source/architecture/dit-main-architecture.png" alt="Bagel" width="30%">
+</p>
+
+**AR+DiT (e.g. Qwen-Omni)**
+  A natively end-to-end omni-modal LLM for multimodal inputs (text/image/audio/video...) and outputs (text/audio...).
+<p align="center">
+<img src="../source/architecture/ar-dit-main-architecture.png" alt="Qwen-Omni" width="30%">
+</p>
 
 # vLLM-Omni main architecture
 
-![vLLM-Omni Main Architecture](../source/architecture/vllm-omni-main-architecture.png)
-
+<p align="center">
+<img src="../source/architecture/vllm-omni-main-architecture.png" alt="vLLM-Omni Main Architecture" width="80%">
+</p>
 
 ## Key Components
 
@@ -110,16 +120,53 @@ Similar to vLLM, vLLM-Omni also provides a FastAPI-based server for online servi
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-Users can send request to the server by
+Users can send requests to the server using curl:
 
 ```
-curl -sS -X POST http://localhost:8091/v1/chat/completions\
+# prepare user content
+user_content='[
+        {
+          "type": "video_url",
+          "video_url": {
+            "url": "'"$SAMPLE_VIDEO_URL"'"
+          }
+        },
+        {
+          "type": "text",
+          "text": "Why is this video funny?"
+        }
+      ]'
+    sampling_params_list='[
+      '"$thinker_sampling_params"',
+      '"$talker_sampling_params"',
+      '"$code2wav_sampling_params"'
+    ]'
+    mm_processor_kwargs="{}"
+
+# send the request
+curl -sS -X POST http://localhost:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -d '{
-        "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-	      "messages": "Why is this video funny? " 
-	      "sampling_params_list": $sampling_params_list,
-	}'
+    -d @- <<EOF
+{
+  "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "sampling_params_list": $sampling_params_list,
+  "mm_processor_kwargs": $mm_processor_kwargs,
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": $user_content
+    }
+  ]
+}
 ```
 
 For more usages, please refer to [examples](../user_guide/examples/).
