@@ -143,6 +143,9 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
+    print(
+        f"inference time: {elapsed_time:.2f} sec, average time per image: {elapsed_time / args.num_images_per_prompt:.2f} sec"
+    )
 
 
 if __name__ == "__main__":
