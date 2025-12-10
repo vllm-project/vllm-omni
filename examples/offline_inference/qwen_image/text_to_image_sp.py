@@ -7,8 +7,9 @@ from pathlib import Path
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, set_current_vllm_config
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, set_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.parallel_state import destroy_distributed_env, get_world_group
+from vllm_omni.diffusion.envs import get_device_name
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -63,24 +64,31 @@ def main():
     args = parse_args()
     device = detect_device_type()
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    local_rank = get_world_group().local_rank
-
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
+    device_name = get_device_name()
+    try:
+        torch_device = getattr(torch, device_name)
+    except AttributeError:
+        raise ValueError(f"Device name {device_name} is not supported")
+    config_kwargs = {
+        "model": args.model,
+        "vae_use_slicing": vae_use_slicing,
+        "vae_use_tiling": vae_use_tiling,
+    }
 
     omni_diffusion_config = OmniDiffusionConfig(
-        parallel_config=DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
+        **config_kwargs, parallel_config=DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
     )
-    with set_current_vllm_config(omni_diffusion_config):
+    with set_current_omni_diffusion_config(omni_diffusion_config):
         omni = Omni(
-            model=args.model,
+            **config_kwargs,
             od_config=omni_diffusion_config,
-            vae_use_slicing=vae_use_slicing,
-            vae_use_tiling=vae_use_tiling,
         )
-        parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
-        torch.cuda.reset_peak_memory_stats()
+        local_rank = get_world_group().local_rank
+        parameter_peak_memory = torch_device.max_memory_allocated(device=f"{device_name}:{local_rank}")
+        torch_device.reset_peak_memory_stats()
         start_time = time.time()
         images = omni.generate(
             args.prompt,
@@ -94,7 +102,7 @@ def main():
         )
     end_time = time.time()
     elapsed_time = end_time - start_time
-    peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
+    peak_memory = torch_device.max_memory_allocated(device=f"{device_name}:{local_rank}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -274,13 +274,15 @@ _current_prefix: str | None = None
 
 
 @contextmanager
-def set_current_vllm_config(omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None):
+def set_current_omni_diffusion_config(
+    omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None
+):
     """
-    Temporarily set the current vLLM config.
+    Temporarily set the current vLLM-Omni config.
     Used during model initialization.
-    We save the current vLLM config in a global variable,
+    We save the current vLLM-Omni config in a global variable,
     so that all modules can access it, e.g. custom ops
-    can access the vLLM config to determine how to dispatch.
+    can access the vLLM-Omni config to determine how to dispatch.
     """
     global _current_omni_diffusion_config, _current_prefix
     old_omni_diffusion_config = _current_omni_diffusion_config
