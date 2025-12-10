@@ -605,6 +605,15 @@ class QwenImageTransformer2DModel(nn.Module):
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
+        def get_rotary_emb_chunk(freqs):
+            freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[get_sequence_parallel_rank()]
+            return freqs
+
+        if self.parallel_config.sequence_parallel_size > 1:
+            img_freqs, txt_freqs = image_rotary_emb
+            img_freqs = get_rotary_emb_chunk(img_freqs)
+            image_rotary_emb = (img_freqs, txt_freqs)
+
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
