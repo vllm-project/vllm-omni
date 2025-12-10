@@ -110,4 +110,16 @@ Similar to vLLM, vLLM-Omni also provides a FastAPI-based server for online servi
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
+Users can send request to the server by
+
+```
+curl -sS -X POST http://localhost:8091/v1/chat/completions\
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+	      "messages": "Why is this video funny? " 
+	      "sampling_params_list": $sampling_params_list,
+	}'
+```
+
 For more usages, please refer to [examples](../user_guide/examples/).
