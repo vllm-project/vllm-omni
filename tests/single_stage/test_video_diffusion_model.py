@@ -25,9 +25,11 @@ def test_video_diffusion_model(model_name: str):
         flow_shift=5.0,
     )
     # Use minimal settings for testing
+    # num_frames must satisfy: num_frames % vae_scale_factor_temporal == 1
+    # For Wan2.2, vae_scale_factor_temporal=4, so valid values are 5, 9, 13, 17, ...
     height = 480
     width = 640
-    num_frames = 17
+    num_frames = 5
     frames = m.generate(
         "A cat sitting on a table",
         height=height,
@@ -40,5 +42,7 @@ def test_video_diffusion_model(model_name: str):
 
     assert frames is not None
     assert hasattr(frames, "shape")
-    assert frames.shape[1] == height
-    assert frames.shape[2] == width
+    # frames shape: (batch, num_frames, height, width, channels)
+    assert frames.shape[1] == num_frames
+    assert frames.shape[2] == height
+    assert frames.shape[3] == width
