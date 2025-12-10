@@ -119,10 +119,11 @@ docker run \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v ${model_cache_dir}:/root/.cache/huggingface \
+    --network host \
     --entrypoint="" \
     --name "${container_name}" \
     "${image_name}" \
     bash -c '
     set -e
-    VLLM_USE_MODELSCOPE=True pytest -s -v tests/single_stage/test_diffusion_model.py
+    HF_ENDPOINT=https://hf-mirror.com pytest -s -v tests/multi_stages/test_qwen2_5_omni.py
 '
