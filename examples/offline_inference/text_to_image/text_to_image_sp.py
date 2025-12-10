@@ -66,6 +66,8 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
+    assert args.ring_degree == 1, "Ring attention is not supported yet"
+
     config_kwargs = {
         "model": args.model,
         "vae_use_slicing": vae_use_slicing,
