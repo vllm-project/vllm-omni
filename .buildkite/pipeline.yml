@@ -92,8 +92,4 @@ steps:
               - name: hf-cache
                 hostPath:
                   path: /mnt/hf-cache
-<<<<<<< HEAD
                   type: DirectoryOrCreate
-=======
-                  type: DirectoryOrCreate
->>>>>>> main
