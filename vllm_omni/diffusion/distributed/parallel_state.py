@@ -297,10 +297,6 @@ def get_ring_parallel_rank():
     return get_sp_group().ring_rank
 
 
-def get_ring_parallel_group():
-    return get_sp_group().ring_group
-
-
 # PP
 def get_pp_group() -> PipelineGroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
@@ -723,16 +719,13 @@ def initialize_model_parallel(
         ring_group=ring_pg,
     )
 
-    if vllm_parallel_state._TP is None:
-        vllm_parallel_state._TP = init_model_parallel_group(
-            group_ranks=rank_generator.get_ranks("tp"),
-            local_rank=get_world_group().local_rank,
-            backend=backend,
-            parallel_mode="tensor",
-        )
-    else:
-        logger.warning("Tensor parallel group is already initialized, skipping initialization.")
-
+    assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
+    vllm_parallel_state._TP = init_model_parallel_group(
+        group_ranks=rank_generator.get_ranks("tp"),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="tensor",
+    )
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
