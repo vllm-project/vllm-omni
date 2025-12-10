@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="qwen_image_output.png",
+        default="qwen_image_output_sp.png",
         help="Path to save the generated image (PNG).",
     )
     parser.add_argument(
