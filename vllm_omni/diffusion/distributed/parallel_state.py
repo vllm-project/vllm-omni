@@ -33,8 +33,10 @@ from typing import Optional
 
 import torch
 import torch.distributed
+import vllm.distributed.parallel_state as vllm_parallel_state
 from torch.cuda import device_count, set_device
 from vllm.logger import init_logger
+from vllm_parallel_state import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion import envs
 
@@ -63,7 +65,7 @@ logger = init_logger(__name__)
 
 
 _WORLD: Optional[GroupCoordinator] = None
-_TP: Optional[GroupCoordinator] = None
+# get _TP from vllm.distributed.parallel_state
 _SP: Optional[SequenceParallelGroupCoordinator] = None
 _PP: Optional[PipelineGroupCoordinator] = None
 _CFG: Optional[GroupCoordinator] = None
@@ -263,22 +265,6 @@ def get_world_group() -> GroupCoordinator:
     return _WORLD
 
 
-# TP
-def get_tp_group() -> GroupCoordinator:
-    assert _TP is not None, "tensor model parallel group is not initialized"
-    return _TP
-
-
-def get_tensor_model_parallel_world_size():
-    """Return world size for the tensor model parallel group."""
-    return get_tp_group().world_size
-
-
-def get_tensor_model_parallel_rank():
-    """Return my rank for the tensor model parallel group."""
-    return get_tp_group().rank_in_group
-
-
 # SP
 def get_sp_group() -> SequenceParallelGroupCoordinator:
     assert _SP is not None, "pipeline model parallel group is not initialized"
@@ -467,7 +453,13 @@ def init_distributed_environment(
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return _DP is not None and _CFG is not None and _SP is not None and _PP is not None and _TP is not None
+    return (
+        _DP is not None
+        and _CFG is not None
+        and _SP is not None
+        and _PP is not None
+        and vllm_parallel_state._TP is not None
+    )
 
 
 def init_model_parallel_group(
@@ -727,15 +719,13 @@ def initialize_model_parallel(
         ring_group=ring_pg,
     )
 
-    global _TP
-    assert _TP is None, "Tensor parallel group is already initialized"
-    _TP = init_model_parallel_group(
+    assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
+    vllm_parallel_state._TP = init_model_parallel_group(
         group_ranks=rank_generator.get_ranks("tp"),
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="tensor",
     )
-
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
@@ -758,10 +748,9 @@ def destroy_model_parallel():
         _SP.destroy()
     _SP = None
 
-    global _TP
-    if _TP:
-        _TP.destroy()
-    _TP = None
+    if vllm_parallel_state._TP:
+        vllm_parallel_state._TP.destroy()
+    vllm_parallel_state._TP = None
 
     global _PP
     if _PP:
