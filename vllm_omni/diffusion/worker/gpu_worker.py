@@ -18,7 +18,11 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     set_current_omni_diffusion_config,
 )
-from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
+from vllm_omni.diffusion.distributed.parallel_state import (
+    destroy_distributed_env,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -117,12 +121,7 @@ class GPUWorker:
         return output
 
     def shutdown(self) -> None:
-        if torch.distributed.is_initialized():
-            try:
-                torch.distributed.destroy_process_group()
-                logger.info("Worker %s: Destroyed process group", self.rank)
-            except Exception as exc:  # pragma: no cover - best effort cleanup
-                logger.warning("Worker %s: Failed to destroy process group: %s", self.rank, exc)
+        destroy_distributed_env()
 
 
 class WorkerProc:
