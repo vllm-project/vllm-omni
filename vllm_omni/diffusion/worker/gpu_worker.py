@@ -16,6 +16,7 @@ from vllm_omni.diffusion.data import (
     SHUTDOWN_MESSAGE,
     DiffusionOutput,
     OmniDiffusionConfig,
+    set_current_omni_diffusion_config,
 )
 from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -58,8 +59,9 @@ class GPUWorker:
 
         # hack
         vllm_config = VllmConfig()
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
+        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         set_current_vllm_config(vllm_config)
+        set_current_omni_diffusion_config(self.od_config)
 
         init_distributed_environment(world_size=world_size, rank=rank)
         logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
