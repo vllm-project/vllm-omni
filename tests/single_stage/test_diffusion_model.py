@@ -24,7 +24,6 @@ if is_npu():
     models = ["riverclouds/qwen_image_random"]
 
 
-
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str):
     m = Omni(model=model_name)

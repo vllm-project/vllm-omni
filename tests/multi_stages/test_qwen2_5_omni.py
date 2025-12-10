@@ -14,11 +14,15 @@ from vllm.multimodal.image import convert_image_mode
 
 from .conftest import OmniRunner
 from .utils import create_new_process_for_each_test
+from vllm_omni.utils import is_npu
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
-# CI stage config optimized for 24GB GPU (L4/RTX3090)
-CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+# CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
+if is_npu():
+    CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
+else:
+    CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
 
 
 @pytest.mark.core_model

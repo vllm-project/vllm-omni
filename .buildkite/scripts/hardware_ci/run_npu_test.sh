@@ -105,8 +105,10 @@ devices=$(parse_and_gen_devices "${BUILDKITE_AGENT_NAME}") || exit 1
 # Run the image and execute the Out-Of-Tree (OOT) platform interface test case on Ascend NPU hardware.
 # This test checks whether the OOT platform interface is functioning properly in conjunction with
 # the hardware plugin vllm-ascend.
-model_cache_dir=/mnt/hf_cache${agent_idx}
-mkdir -p ${model_cache_dir}
+hf_model_cache_dir=/mnt/hf_cache${agent_idx}
+ms_model_cache_dir=/mnt/hf_cache${agent_idx}
+mkdir -p ${hf_model_cache_dir}
+mkdir -p ${ms_model_cache_dir}
 docker run \
     --init \
     ${devices} \
@@ -118,7 +120,8 @@ docker run \
     -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v ${model_cache_dir}:/root/.cache/huggingface \
+    -v ${hf_model_cache_dir}:/root/.cache/huggingface \
+    -v ${ms_model_cache_dir}:/root/.cache/modelscope \
     --network host \
     --entrypoint="" \
     --name "${container_name}" \
@@ -126,4 +129,5 @@ docker run \
     bash -c '
     set -e
     HF_ENDPOINT=https://hf-mirror.com pytest -s -v tests/multi_stages/test_qwen2_5_omni.py
+    MODELSCOPE=True pytest -s -v tests/single_stage/test_diffusion_model.py
 '
