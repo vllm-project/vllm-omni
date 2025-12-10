@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing as mp
+import time
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.registry import get_diffusion_post_process_func
+from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
+from vllm_omni.diffusion.registry import get_diffusion_post_process_func, get_diffusion_pre_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import scheduler
 from vllm_omni.utils.platform_utils import get_diffusion_worker_class
@@ -26,16 +27,32 @@ class DiffusionEngine:
         self.od_config = od_config
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
+        self.pre_process_func = get_diffusion_pre_process_func(od_config)
 
+        self._processes: list[mp.Process] = []
+        self._closed = False
         self._make_client()
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
+            # Apply pre-processing if available
+            if self.pre_process_func is not None:
+                preprocess_start_time = time.time()
+                requests = self.pre_process_func(requests)
+                preprocess_time = time.time() - preprocess_start_time
+                logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+
             output = self.add_req_and_wait_for_response(requests)
             if output.error:
                 raise Exception(f"{output.error}")
             logger.info("Generation completed successfully.")
-            return self.post_process_func(output.output)
+
+            postprocess_start_time = time.time()
+            result = self.post_process_func(output.output)
+            postprocess_time = time.time() - postprocess_start_time
+            logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+            return result
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return None
@@ -67,6 +84,8 @@ class DiffusionEngine:
             scheduler.initialize_result_queue(result_handle)
         else:
             logger.error("Failed to get result queue handle from workers")
+
+        self._processes = processes
 
     def _launch_workers(self, broadcast_handle):
         od_config = self.od_config
@@ -131,3 +150,32 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
+
+    def close(self, *, timeout_s: float = 30.0) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        # Send shutdown signal to worker processes via broadcast queue
+        try:
+            if getattr(scheduler, "mq", None) is not None:
+                for _ in range(self.od_config.num_gpus or 1):
+                    scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning("Failed to send shutdown signal: %s", exc)
+
+        # Join all worker processes, terminate if they refuse to exit
+        for proc in self._processes:
+            if not proc.is_alive():
+                continue
+            proc.join(timeout_s)
+            if proc.is_alive():
+                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
+                proc.terminate()
+                proc.join(timeout_s)
+
+        scheduler.close()
+        self._processes = []
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        self.close()

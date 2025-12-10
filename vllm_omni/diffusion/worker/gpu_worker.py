@@ -15,7 +15,11 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    SHUTDOWN_MESSAGE,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -91,6 +95,14 @@ class GPUWorker:
         output = self.pipeline.forward(req)
         return output
 
+    def shutdown(self) -> None:
+        if torch.distributed.is_initialized():
+            try:
+                torch.distributed.destroy_process_group()
+                logger.info("Worker %s: Destroyed process group", self.rank)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.warning("Worker %s: Failed to destroy process group: %s", self.rank, exc)
+
 
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
@@ -162,6 +174,14 @@ class WorkerProc:
                 )
                 continue
 
+            if reqs == SHUTDOWN_MESSAGE:
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
+                continue
+            if reqs is None:
+                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
+                continue
+
             # 2: execute, make sure a reply is always sent
             try:
                 output = self.worker.execute_model(reqs, self.od_config)
@@ -180,6 +200,10 @@ class WorkerProc:
                 continue
 
         logger.info("event loop terminated.")
+        try:
+            self.worker.shutdown()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
         # if self.result_sender is not None:
         #     self.result_sender.close()
         self.context.term()

@@ -735,7 +735,7 @@ async def _stage_worker_async(
         stage_id,
         list(engine_args.keys()),
     )
-    omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
+    omni_engine_args = AsyncOmniEngineArgs(**engine_args)
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
     stage_engine = AsyncOmniStageLLM.from_vllm_config(
