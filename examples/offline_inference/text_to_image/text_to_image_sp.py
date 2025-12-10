@@ -7,8 +7,7 @@ from pathlib import Path
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, set_current_omni_diffusion_config
-from vllm_omni.diffusion.envs import get_device_name
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -66,11 +65,7 @@ def main():
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
-    device_name = get_device_name()
-    try:
-        torch_device = getattr(torch, device_name)
-    except AttributeError:
-        raise ValueError(f"Device name {device_name} is not supported")
+
     config_kwargs = {
         "model": args.model,
         "vae_use_slicing": vae_use_slicing,
@@ -80,24 +75,23 @@ def main():
     omni_diffusion_config = OmniDiffusionConfig(
         **config_kwargs, parallel_config=DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
     )
-    with set_current_omni_diffusion_config(omni_diffusion_config):
-        omni = Omni(
-            **config_kwargs,
-            od_config=omni_diffusion_config,
-        )
 
-        torch_device.reset_peak_memory_stats()
-        start_time = time.time()
-        images = omni.generate(
-            args.prompt,
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=args.num_images_per_prompt,
-            num_outputs_per_prompt=args.num_images_per_prompt,
-        )
+    omni = Omni(
+        **config_kwargs,
+        od_config=omni_diffusion_config,
+    )
+
+    start_time = time.time()
+    images = omni.generate(
+        args.prompt,
+        height=args.height,
+        width=args.width,
+        generator=generator,
+        true_cfg_scale=args.cfg_scale,
+        num_inference_steps=args.num_inference_steps,
+        num_images_per_prompt=args.num_images_per_prompt,
+        num_outputs_per_prompt=args.num_images_per_prompt,
+    )
     end_time = time.time()
     elapsed_time = end_time - start_time
 
@@ -114,7 +108,9 @@ def main():
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
 
-    print(f"epoch time: {elapsed_time:.2f} sec")
+    print(
+        f"inference time: {elapsed_time:.2f} sec, average time per image: {elapsed_time / args.num_images_per_prompt:.2f} sec"
+    )
 
 
 if __name__ == "__main__":
