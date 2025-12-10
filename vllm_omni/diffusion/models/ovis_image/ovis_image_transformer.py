@@ -546,39 +546,38 @@ class OvisImageTransformer2DModel(nn.Module):
 
         return Transformer2DModelOutput(sample=output)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # self attn
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            # cross attn
+            (".add_kv_proj", ".add_q_proj", "q"),
+            (".add_kv_proj", ".add_k_proj", "k"),
+            (".add_kv_proj", ".add_v_proj", "v"),
+        ]
 
-def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-    stacked_params_mapping = [
-        # self attn
-        (".to_qkv", ".to_q", "q"),
-        (".to_qkv", ".to_k", "k"),
-        (".to_qkv", ".to_v", "v"),
-        # cross attn
-        (".add_kv_proj", ".add_q_proj", "q"),
-        (".add_kv_proj", ".add_k_proj", "k"),
-        (".add_kv_proj", ".add_v_proj", "v"),
-    ]
+        params_dict = dict(self.named_parameters())
 
-    params_dict = dict(self.named_parameters())
+        # we need to load the buffers for beta and eps (XIELU)
+        for name, buffer in self.named_buffers():
+            if name.endswith(".beta") or name.endswith(".eps"):
+                params_dict[name] = buffer
 
-    # we need to load the buffers for beta and eps (XIELU)
-    for name, buffer in self.named_buffers():
-        if name.endswith(".beta") or name.endswith(".eps"):
-            params_dict[name] = buffer
-
-    loaded_params: set[str] = set()
-    for name, loaded_weight in weights:
-        for param_name, weight_name, shard_id in stacked_params_mapping:
-            if weight_name not in name:
-                continue
-            name = name.replace(weight_name, param_name)
-            param = params_dict[name]
-            weight_loader = param.weight_loader
-            weight_loader(param, loaded_weight, shard_id)
-            break
-        else:
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-        loaded_params.add(name)
-    return loaded_params
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
