@@ -51,7 +51,6 @@ class OvisImageAttention(nn.Module):
         out_dim: int = None,
         context_pre_only: Optional[bool] = None,
         pre_only: bool = False,
-        elementwise_affine: bool = True,
     ):
         super().__init__()
 
@@ -67,8 +66,8 @@ class OvisImageAttention(nn.Module):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        self.norm_q = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
-        self.norm_k = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.to_qkv = QKVParallelLinear(
             hidden_size=query_dim,
