@@ -35,8 +35,8 @@ import torch
 import torch.distributed
 import vllm.distributed.parallel_state as vllm_parallel_state
 from torch.cuda import device_count, set_device
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm_parallel_state import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion import envs
 
