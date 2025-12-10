@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 
 import pytest
 import torch
@@ -17,6 +18,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.utils.system_utils import update_environment_variables
+
+
+def update_environment_variables(envs_dict: dict[str, str]):
+    """Update multiple environment variables with logging."""
+    for k, v in envs_dict.items():
+        os.environ[k] = v
 
 
 class TestAttentionModel(torch.nn.Module):
