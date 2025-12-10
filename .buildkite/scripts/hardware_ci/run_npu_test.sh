@@ -23,6 +23,8 @@ cat <<EOF | DOCKER_BUILDKIT=1 docker build \
     --add-host pypi-cache:${PYPI_CACHE_HOST} \
     --builder ${builder_name} --cache-from type=local,src=${builder_cache_dir} \
                            --cache-to type=local,dest=${builder_cache_dir},mode=max \
+    --build-arg BUILDKITE_PULL_REQUEST="${BUILDKITE_PULL_REQUEST}" \
+    --build-arg BUILDKITE_PULL_REQUEST_REPO="${BUILDKITE_PULL_REQUEST_REPO}" \
     --progress=plain --load -t ${image_name} -f - .
 FROM ${BASE_IMAGE_NAME}
 
@@ -46,8 +48,18 @@ COPY . .
 WORKDIR /workspace
 ARG VLLM_OMNI_REPO=https://github.com/vllm-project/vllm-omni.git
 ARG VLLM_OMNI_TAG=main
+ARG BUILDKITE_PULL_REQUEST
+ARG BUILDKITE_PULL_REQUEST_REPO
 RUN git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/" && \
-    git clone --depth 1 \$VLLM_OMNI_REPO --branch \$VLLM_OMNI_TAG /workspace/vllm-omni
+    git clone \$VLLM_OMNI_REPO /workspace/vllm-omni && \
+    cd /workspace/vllm-omni && \
+    if [ "\$BUILDKITE_PULL_REQUEST" != "false" ] && [ -n "\$BUILDKITE_PULL_REQUEST" ]; then \
+        echo "Fetching PR #\$BUILDKITE_PULL_REQUEST and merging into main..." && \
+        git fetch origin pull/\$BUILDKITE_PULL_REQUEST/head:pr-\$BUILDKITE_PULL_REQUEST && \
+        git merge --no-edit pr-\$BUILDKITE_PULL_REQUEST; \
+    else \
+        echo "Not a PR build, using main branch"; \
+    fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
