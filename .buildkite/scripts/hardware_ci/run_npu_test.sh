@@ -25,7 +25,7 @@ mkdir -p ${builder_cache_dir}
 #                            --cache-to type=local,dest=${builder_cache_dir},mode=max \
 #     --progress=plain --load -t ${image_name} -f - .
 cat <<EOF | DOCKER_BUILDKIT=1 docker build \
-    --add-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_HOST} \
+    --add-host pypi-cache:${PYPI_CACHE_HOST} \
     --builder ${builder_name} --cache-from type=inline \
                            --cache-to type=inline \
     --progress=plain --load -t ${image_name} -f - .
@@ -34,8 +34,8 @@ FROM ${BASE_IMAGE_NAME}
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN pip config set global.index-url http://cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_PORT}/pypi/simple && \
-    pip config set global.trusted-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local && \
+RUN pip config set global.index-url http://pypi-cache:${PYPI_CACHE_PORT}/pypi/simple && \
+    pip config set global.trusted-host pypi-cache && \
     apt-get update -y && \
     apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev && \
     rm -rf /var/cache/apt/* && \
