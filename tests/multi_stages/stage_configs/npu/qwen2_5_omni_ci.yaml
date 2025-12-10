@@ -5,7 +5,7 @@ stage_args:
   - stage_id: 0
     runtime:
       process: true            # Run this stage in a separate process
-      devices: "0"            
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: thinker

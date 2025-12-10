@@ -2,9 +2,10 @@ import os
 import sys
 from pathlib import Path
 
-from vllm_omni.utils.platform_utils import is_npu
 import pytest
 import torch
+
+from vllm_omni.utils.platform_utils import is_npu
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]

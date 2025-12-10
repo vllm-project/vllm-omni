@@ -12,9 +12,10 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.multimodal.image import convert_image_mode
 
+from vllm_omni.utils import is_npu
+
 from .conftest import OmniRunner
 from .utils import create_new_process_for_each_test
-from vllm_omni.utils import is_npu
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
