@@ -17,7 +17,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm_omni.utils.system_utils import update_environment_variables
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
