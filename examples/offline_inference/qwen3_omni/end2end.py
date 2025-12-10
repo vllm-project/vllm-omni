@@ -282,13 +282,13 @@ def parse_args():
     parser.add_argument(
         "--init-sleep-seconds",
         type=int,
-        default=20,
+        default=100,
         help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
     )
     parser.add_argument(
         "--batch-timeout",
         type=int,
-        default=5,
+        default=50,
         help="Timeout for batching in seconds (default: 5)",
     )
     parser.add_argument(
