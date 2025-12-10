@@ -26,9 +26,7 @@ mkdir -p ${builder_cache_dir}
 #     --progress=plain --load -t ${image_name} -f - .
 cat <<EOF | DOCKER_BUILDKIT=1 docker build \
     --no-cache \
-    --progress=plain \
-    -t ${image_name} \
-    -f Dockerfile .
+    --progress=plain --load -t ${image_name} -f - .
 FROM ${BASE_IMAGE_NAME}
 
 # Define environments
