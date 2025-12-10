@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 
 import torch
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -242,7 +242,7 @@ class OmniDiffusionConfig:
 
     # Cache strategy (legacy)
     cache_strategy: str = "none"
-    parallel_config: DiffusionParallelConfig = Field(default_factory=DiffusionParallelConfig)
+    parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
 
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
