@@ -60,6 +60,7 @@ class GPUWorker:
         # hack
         vllm_config = VllmConfig()
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         set_current_vllm_config(vllm_config)
         set_current_omni_diffusion_config(self.od_config)
 
