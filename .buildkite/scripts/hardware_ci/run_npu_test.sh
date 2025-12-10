@@ -6,7 +6,7 @@ set -ex
 
 # Base ubuntu image with basic ascend development libraries and python installed
 VLLM_OMNI_REPO="https://github.com/vllm-project/vllm-omni.git"
-BASE_IMAGE_NAME="quay.io/ascend/vllm-ascend:v0.11.0rc2"
+BASE_IMAGE_NAME="quay.io/ascend/cann:8.3.rc1.alpha002-910b-ubuntu22.04-py3.11"
 image_name="npu/vllm-omni-ci:${BUILDKITE_COMMIT}_${EPOCHSECONDS}"
 # image_name="npu/vllm-ci:${BUILDKITE_COMMIT}_${EPOCHSECONDS}"
 container_name="npu_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
