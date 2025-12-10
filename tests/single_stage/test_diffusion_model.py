@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 
+from vllm_omni.utils.platform_utils import is_npu
 import pytest
 import torch
 
@@ -14,7 +15,14 @@ from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
+
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
+
+# NPU still can't run Tongyi-MAI/Z-Image-Turbo properly
+# TODO: When NPU support is ready, remove this branch.
+if is_npu():
+    models = ["riverclouds/qwen_image_random"]
+
 
 
 @pytest.mark.parametrize("model_name", models)
