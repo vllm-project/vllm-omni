@@ -4,7 +4,6 @@
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-import diffusers
 import torch
 from packaging import version
 from vllm.logger import init_logger
@@ -164,24 +163,8 @@ class PackagesEnvChecker:
 
     def initialize(self):
         packages_info = {}
-        packages_info["has_aiter"] = self.check_aiter()
         packages_info["has_flash_attn"] = self.check_flash_attn(packages_info)
-        packages_info["diffusers_version"] = self.check_diffusers_version()
         self.packages_info = packages_info
-
-    def check_aiter(self):
-        """
-        Checks whether ROCm AITER library is installed
-        """
-        try:
-            logger.info("Using AITER as the attention library")
-            return True
-        except:
-            if _is_hip():
-                logger.warning(
-                    'Using AMD GPUs, but library "aiter" is not installed, defaulting to other attention mechanisms'
-                )
-            return False
 
     def check_flash_attn(self, packages_info):
         if not torch.cuda.is_available():
@@ -210,14 +193,6 @@ class PackagesEnvChecker:
             if not packages_info.get("has_aiter", False):
                 logger.warning('Flash Attention library "flash_attn" not found, using pytorch attention implementation')
             return False
-
-    def check_diffusers_version(self):
-        if version.parse(version.parse(diffusers.__version__).base_version) < version.parse("0.30.0"):
-            raise RuntimeError(
-                f"Diffusers version: {version.parse(version.parse(diffusers.__version__).base_version)} is not supported,"
-                f"please upgrade to version > 0.30.0"
-            )
-        return version.parse(version.parse(diffusers.__version__).base_version)
 
     def get_packages_info(self):
         return self.packages_info
