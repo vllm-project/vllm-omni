@@ -323,12 +323,12 @@ def extract_yourmodel_context(
 ) -> CacheContext:
     """
     Extract cache context for YourModelTransformer.
-    
+
     Args:
         module: Your transformer model instance
         hidden_states: Input hidden states tensor
         # ... document your model's specific arguments ...
-        
+
     Returns:
         CacheContext with all information needed for generic caching
     """
@@ -503,7 +503,7 @@ def extract_simplemodel_context(
 ) -> CacheContext:
     """
     Extract cache context for SimpleModelTransformer2DModel.
-    
+
     This is a single-stream model similar to FLUX.
     """
     # Preprocessing
@@ -515,11 +515,11 @@ def extract_simplemodel_context(
     else:
         temb = module.time_text_embed(timestep, pooled_projections)
     encoder_hidden_states = module.context_embedder(encoder_hidden_states)
-    
+
     # Extract modulated input from first block
     block = module.transformer_blocks[0]
     modulated_input, _, _, _, _ = block.norm1(hidden_states.clone(), emb=temb.clone())
-    
+
     # Define transformer execution
     def run_transformer_blocks():
         h = hidden_states
@@ -527,7 +527,7 @@ def extract_simplemodel_context(
         for block in module.transformer_blocks:
             e, h = block(h, e, temb=temb)
         return (h,)
-    
+
     # Define postprocessing
     def postprocess(h):
         h = module.norm_out(h, temb)
@@ -535,7 +535,7 @@ def extract_simplemodel_context(
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
-    
+
     # Return context
     return CacheContext(
         modulated_input=modulated_input,
@@ -575,7 +575,7 @@ def extract_dualstream_context(
 ) -> CacheContext:
     """
     Extract cache context for DualStreamTransformer2DModel.
-    
+
     This is a dual-stream model that processes image and text separately.
     """
     # Preprocessing
@@ -583,25 +583,25 @@ def extract_dualstream_context(
     timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
     encoder_hidden_states = module.txt_norm(encoder_hidden_states)
     encoder_hidden_states = module.txt_in(encoder_hidden_states)
-    
+
     if guidance is not None:
         guidance = guidance.to(hidden_states.dtype) * 1000
-    
+
     temb = (
         module.time_text_embed(timestep, hidden_states)
         if guidance is None
         else module.time_text_embed(timestep, guidance, hidden_states)
     )
-    
+
     image_rotary_emb = module.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
-    
+
     # Extract modulated input from first block
     block = module.transformer_blocks[0]
     img_mod_params = block.img_mod(temb)
     img_mod1, _ = img_mod_params.chunk(2, dim=-1)
     img_normed = block.img_norm1(hidden_states)
     modulated_input, _ = block._modulate(img_normed, img_mod1)
-    
+
     # Define transformer execution
     def run_transformer_blocks():
         h = hidden_states
@@ -616,17 +616,17 @@ def extract_dualstream_context(
                 joint_attention_kwargs=attention_kwargs,
             )
         return (h, e)
-    
+
     # Define postprocessing
     return_dict = kwargs.get("return_dict", True)
-    
+
     def postprocess(h):
         h = module.norm_out(h, temb)
         output = module.proj_out(h)
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
-    
+
     # Return context
     return CacheContext(
         modulated_input=modulated_input,
@@ -738,4 +738,5 @@ For detailed API documentation, see:
 - [`TeaCacheConfig`](../../api/vllm_omni.diffusion.cache.teacache.config/#vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig)
 - [`TeaCacheAdapter`](../../api/vllm_omni.diffusion.cache.teacache.adapter/#vllm_omni.diffusion.cache.teacache.adapter.TeaCacheAdapter)
 - [`setup_cache`](../../api/vllm_omni.diffusion.cache.apply/#vllm_omni.diffusion.cache.apply.setup_cache)
+
 
