@@ -14,23 +14,23 @@ container_name="npu_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head
 # BUILDKITE_AGENT_NAME format is {hostname}-{agent_idx}-{npu_card_num}cards
 agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
 echo "agent_idx: ${agent_idx}"
-builder_name="cachebuilder${agent_idx}"
-builder_cache_dir="/mnt/docker-cache${agent_idx}"
+builder_name="cachebuilder3"
+builder_cache_dir="/mnt/docker-cache3"
 mkdir -p ${builder_cache_dir}
 
-    # --builder ${builder_name} --cache-from type=local,src=${builder_cache_dir} \
-    #                        --cache-to type=local,dest=${builder_cache_dir},mode=max \
 # Try building the docker image
 cat <<EOF | DOCKER_BUILDKIT=1 docker build \
-    --add-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_HOST} \
+    --add-host pypi-cache:${PYPI_CACHE_HOST} \
+    --builder ${builder_name} --cache-from type=local,src=${builder_cache_dir} \
+                           --cache-to type=local,dest=${builder_cache_dir},mode=max \
     --progress=plain --load -t ${image_name} -f - .
 FROM ${BASE_IMAGE_NAME}
 
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN pip config set global.index-url http://cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_PORT}/pypi/simple && \
-    pip config set global.trusted-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local && \
+RUN pip config set global.index-url http://pypi-cache:${PYPI_CACHE_PORT}/pypi/simple && \
+    pip config set global.trusted-host pypi-cache && \
     apt-get update -y && \
     apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev && \
     rm -rf /var/cache/apt/* && \
