@@ -19,14 +19,14 @@ The primary goal of the vLLM-Omni project is to build the fastest and easiest-to
 According to analysis for current popular open-source models, most of them have the combination of AR+DiT. Specifically, they can be further categorized into 3 types below:
 
 * **DiT as a main structure, with AR as text encoder (e.g.: Qwen-Image)**
-  A popular model for image generation and editing. Main visual generation models are similar to the structure, such as Flux.
-  ![][image3]
+  A a powerful image generation foundation model capable of complex text rendering and precise image editing. 
+  ![Qwen-Image](../source/architecture/ar-main-architecture.png)
 * **AR as a main structure, with DiT as multi-modal generator (e.g. BAGEL)**
-  A unified multimodal comprehension and generation model. Visual generation can utilize CoT text generation output. Main unified multimodal models are similar to the structure.
-      ![][image4]
-* **Extension, multiple AR+DiT (e.g. Qwen-omni)**
-  A new model for multimodal input and output. It designs the Thinker-Talker-Codec structure, which is a double-AR+DiT format.
-  ![][image5]
+  A unified multimodal comprehension and generation model, with cot text output and visual generation.
+  ![Bagel](../source/architecture/dit-main-architecture.png)
+* **AR+DiT (e.g. Qwen-Omni)**
+  A natively end-to-end omni-modal LLM for multimodal inputs (text/image/audio/video...) and outputs (text/audio...).
+  ![Qwen-Omni](../source/architecture/ar-dit-main-architecture.png)
 
 
 # vLLM-Omni main architecture
