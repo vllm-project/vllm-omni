@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # temporary for compatibility with vllm_omni.entrypoints.omni_stage.py
 # and vllm_omni.entrypoints.omni_llm.py
 
