@@ -25,7 +25,9 @@ mkdir -p ${builder_cache_dir}
 #                            --cache-to type=local,dest=${builder_cache_dir},mode=max \
 #     --progress=plain --load -t ${image_name} -f - .
 cat <<EOF | DOCKER_BUILDKIT=1 docker build \
-    --no-cache \
+    --add-host cache-service-vllm.nginx-pypi-cache.svc.cluster.local:${PYPI_CACHE_HOST} \
+    --builder ${builder_name} --cache-from type=inline \
+                           --cache-to type=inline \
     --progress=plain --load -t ${image_name} -f - .
 FROM ${BASE_IMAGE_NAME}
 
