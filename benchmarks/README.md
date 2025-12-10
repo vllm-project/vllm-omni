@@ -1,72 +1,47 @@
-# Benchmarks Guide
+# Benchmarks Overview and Architecture
 
-This README explains how to (1) prepare benchmark datasets and (2) run the provided Qwen3-Omni benchmarks.
+This document explains the benchmark architecture across all benchmark assets in this repo. It describes what we measure, and where to find or plug in new scenarios. Per-task details remain in subfolder READMEs (e.g., `benchmarks/<model>/README.md`).
 
-## 1) Prepare the dataset (SeedTTS top100)
+## Scope and goals
+- Establish repeatable latency/throughput measurements for multimodal LLM pipelines.
+- Provide both HF Transformers (offline) and vLLM-Omni (multi-stage/pipeline) baselines.
+- Make it easy to plug in new datasets and models with minimal changes to the runner scripts.
 
-```bash
-cd benchmarks/build_dataset
-pip install gdown
+## Dataset and inputs
+- Default example: SeedTTS top-100 prompts (`benchmarks/build_dataset/top100.txt`) via `benchmarks/build_dataset/`.
+- Extensible: drop in new prompt files or modality-aligned payloads; keep the expected format for the consuming scripts (e.g., one prompt per line).
+- If you add a new dataset, document it under `benchmarks/<model>/README.md` and point scripts to your data path.
 
-# Download SeedTTS test set from Google Drive
-gdown --id 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
+## Directory layout
+- `benchmarks/build_dataset/` — dataset prep utilities (e.g., SeedTTS top100).
+- `benchmarks/<model>/transformers/` — HF Transformers benchmarks (offline reference).
+- `benchmarks/<model>/vllm_omni/` — vLLM-Omni pipeline benchmarks, logs, outputs.
+- `benchmarks/<model>/vllm-omni-vs-hf.png` — current performance snapshot (overall throughput comparison).
+- Add new tasks under `benchmarks/<model>/...` with the same pattern: `transformers/`, `vllm_omni/`, task-specific README, and (optionally) dataset prep notes.
 
-# Extract
-tar -xf seedtts_testset.tar
+## Reference workflows
+- **HF Transformers (offline, single process)**  
+  Script (example): `benchmarks/<model>/transformers/eval_qwen3_moe_omni_transformers.sh`  
+  Outputs: `benchmark_results/perf_stats.json`, `benchmark_results/results.json`, `benchmark_results/audio/` (if audio is produced).
 
-# Copy metadata and extract top-100 prompts
-cp seedtts_testset/en/meta.lst meta.lst
-python extract_prompts.py -i meta.lst -o top100.txt -n 100
+- **vLLM-Omni end-to-end pipeline**  
+  Script (example): `benchmarks/<model>/vllm_omni/eval_qwen3_moe_omni.sh`  
+  Outputs: `vllm_omni/logs/*.stats.jsonl` (per-stage/overall latency & TPS), `vllm_omni/logs/stage*.log`, `vllm_omni/outputs/` (text/audio artifacts).
 
-# (Optional) clean up to save space
-rm -rf seedtts_testset seedtts_testset.tar meta.lst
-```
+- **Adding a new task/model**  
+  1) Create `benchmarks/<model>/transformers/` and/or `benchmarks/<model>/vllm_omni/` with scripts referencing your model and dataset.  
+  2) Add a task README describing dataset, configs, and expected outputs.  
+  3) Keep the output/log structure similar for easy comparison (perf_stats/results/audio or text outputs; stats.jsonl/logs for pipeline).
 
-Artifacts:
-- `benchmarks/build_dataset/top100.txt` — 100 text prompts (one per line).
+## Metrics to watch
+- **Throughput**: `overall_tps`, `*_tps_avg` per stage.
+- **Latency distribution**: look for long tails in `*.stats.jsonl`.
+- **Quality/completeness**: missing outputs or errors in stage logs indicate pipeline failures or misconfigurations.
 
-## 2) Run benchmarks
-
-All commands assume repo root (`vllm-omni`).
-
-### A. Transformers benchmark (offline, HF Transformers)
-
-```
-bash benchmarks/qwen3-omni/transformers/eval_qwen3_moe_omni_transformers.sh
-```
-
-What it does:
-- Runs `qwen3_omni_moe_transformers.py` over `top100.txt` with `--num_prompts 100`.
-- Outputs to `benchmarks/qwen3-omni/transformers/benchmark_results/`:
-  - `perf_stats.json` — aggregated & per-prompt TPS/latency (thinker/talker/code2wav/overall).
-  - `results.json` — per-prompt outputs and audio paths.
-  - `audio/` — ~100 generated `.wav` files.
-
-Key checks:
-- `overall_tps` and `*_tps_avg` should be non-zero and reasonably stable.
-- Investigate any 0/NaN or unusually low TPS / long-tail latency.
-
-### B. vLLM Omni end-to-end benchmark (pipeline)
-
-```
-bash benchmarks/qwen3-omni/vllm_omni/eval_qwen3_moe_omni.sh
-```
-
-What it does:
-- Runs `examples/offline_inference/qwen3_omni/end2end.py` with `--enable-stats`.
-- Uses `benchmarks/build_dataset/top100.txt` and writes to:
-  - Logs: `benchmarks/qwen3-omni/vllm_omni/logs/`
-    - `omni_llm_pipeline_text.orchestrator.stats.jsonl` — per-stage latency stats.
-    - `omni_llm_pipeline_text.overall.stats.jsonl` — end-to-end latency/TPS.
-    - `omni_llm_pipeline_text.stage{0,1,2}.log` — per-stage detailed logs/errors.
-  - Outputs: `benchmarks/qwen3-omni/vllm_omni/outputs/` — ~100 text and `.wav` files.
-
-Key checks:
-- Overall stats: end-to-end latency/TPS should be reasonable.
-- Orchestrator stats: per-stage latency should be stable; investigate long tails.
-- Stage logs: ensure no errors and no unusually slow stages.
+## Performance snapshot
+Current measured comparison (vLLM-Omni vs HF Transformers) is documented in `benchmarks/<model>/README.md` and visualized in `benchmarks/<model>/vllm-omni-vs-hf.png`. Use this as a reference baseline when evaluating or reproducing.
 
 ## Troubleshooting
-- Make sure GPU/driver/FlashAttention2 requirements are met for the chosen model.
-- If downloads fail, confirm network access to Google Drive (`gdown`) and Hugging Face.
-- If audio files are missing, check for errors in stage logs or model generation.***
+- Verify GPU/driver/FlashAttention2 requirements for your chosen model/config.
+- Ensure network access for dataset/model downloads (Google Drive, Hugging Face, etc.).
+- If outputs are missing or slow, inspect per-stage logs and `*.stats.jsonl` for errors, stragglers, or contention.

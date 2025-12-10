@@ -50,7 +50,7 @@ Extract the first N prompts from the metadata file:
 
 ```bash
 # Extract top 100 prompts (adjust -n for different amounts)
-python extract_prompts.py -i meta.lst -o top100.txt -n 100
+python extract_tts_prompts.py -i meta.lst -o top100.txt -n 100
 ```
 
 **Options:**
@@ -77,6 +77,6 @@ pip install gdown
 gdown --id 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
 tar -xf seedtts_testset.tar
 cp seedtts_testset/en/meta.lst meta.lst
-python extract_prompts.py -i meta.lst -o top100.txt -n 100
+python extract_tts_prompts.py -i meta.lst -o top100.txt -n 100
 rm -rf seedtts_testset seedtts_testset.tar meta.lst
 ```
