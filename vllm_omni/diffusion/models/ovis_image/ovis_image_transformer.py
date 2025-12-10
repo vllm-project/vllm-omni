@@ -101,32 +101,32 @@ class OvisImageAttention(nn.Module):
             causal=False,
         )
 
-    def _get_projections(self, hidden_states, encoder_hidden_states=None):
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
+    # def _get_projections(self, hidden_states, encoder_hidden_states=None):
+    #     query = self.to_q(hidden_states)
+    #     key = self.to_k(hidden_states)
+    #     value = self.to_v(hidden_states)
 
-        encoder_query = encoder_key = encoder_value = None
-        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
-            encoder_query = self.add_q_proj(encoder_hidden_states)
-            encoder_key = self.add_k_proj(encoder_hidden_states)
-            encoder_value = self.add_v_proj(encoder_hidden_states)
+    #     encoder_query = encoder_key = encoder_value = None
+    #     if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+    #         encoder_query = self.add_q_proj(encoder_hidden_states)
+    #         encoder_key = self.add_k_proj(encoder_hidden_states)
+    #         encoder_value = self.add_v_proj(encoder_hidden_states)
 
-        return query, key, value, encoder_query, encoder_key, encoder_value
+    #     return query, key, value, encoder_query, encoder_key, encoder_value
 
-    def _get_fused_projections(self, hidden_states, encoder_hidden_states=None):
-        query, key, value = self.to_qkv(hidden_states).chunk(3, dim=-1)
+    # def _get_fused_projections(self, hidden_states, encoder_hidden_states=None):
+    #     query, key, value = self.to_qkv(hidden_states).chunk(3, dim=-1)
 
-        encoder_query = encoder_key = encoder_value = (None,)
-        if encoder_hidden_states is not None and hasattr(self, "to_added_qkv"):
-            encoder_query, encoder_key, encoder_value = self.to_added_qkv(encoder_hidden_states).chunk(3, dim=-1)
+    #     encoder_query = encoder_key = encoder_value = (None,)
+    #     if encoder_hidden_states is not None and hasattr(self, "to_added_qkv"):
+    #         encoder_query, encoder_key, encoder_value = self.to_added_qkv(encoder_hidden_states).chunk(3, dim=-1)
 
-        return query, key, value, encoder_query, encoder_key, encoder_value
+    #     return query, key, value, encoder_query, encoder_key, encoder_value
 
-    def _get_qkv_projections(self, hidden_states, encoder_hidden_states=None):
-        if self.fused_projections:
-            return self._get_fused_projections(hidden_states, encoder_hidden_states)
-        return self._get_projections(hidden_states, encoder_hidden_states)
+    # def _get_qkv_projections(self, hidden_states, encoder_hidden_states=None):
+    #     if self.fused_projections:
+    #         return self._get_fused_projections(hidden_states, encoder_hidden_states)
+    #     return self._get_projections(hidden_states, encoder_hidden_states)
 
     def forward(
         self,
@@ -135,9 +135,9 @@ class OvisImageAttention(nn.Module):
         image_rotary_emb: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        query, key, value, encoder_query, encoder_key, encoder_value = self._get_qkv_projections(
-            hidden_states, encoder_hidden_states
-        )
+        qkv, _ = self.to_qkv(hidden_states)
+
+        query, key, value = qkv.chunk(3, dim=-1)
 
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
@@ -147,6 +147,9 @@ class OvisImageAttention(nn.Module):
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
+            encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+            encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
+
             encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
@@ -176,7 +179,7 @@ class OvisImageAttention(nn.Module):
             )
             hidden_states = self.to_out[0](hidden_states)
             hidden_states = self.to_out[1](hidden_states)
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
             return hidden_states, encoder_hidden_states
         else:
@@ -399,6 +402,7 @@ class OvisImageTransformer2DModel(nn.Module):
         super().__init__()
         model_config = od_config.tf_model_config
         num_layers = model_config.num_layers
+        self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.pos_embed = OvisImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
@@ -469,10 +473,10 @@ class OvisImageTransformer2DModel(nn.Module):
         """
 
         hidden_states = self.x_embedder(hidden_states)
-        timestep = timestep.to(hidden_states.dtype) * 1000
+        timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
 
         timesteps_proj = self.time_proj(timestep)
-        temb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))
+        temb = self.timestep_embedder(timesteps_proj.to(device=hidden_states.device, dtype=hidden_states.dtype))
 
         encoder_hidden_states = self.context_embedder_norm(encoder_hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)

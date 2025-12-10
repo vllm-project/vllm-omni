@@ -171,7 +171,9 @@ class OvisImagePipeline(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only)
+        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
+            self._execution_device
+        )
 
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
@@ -308,13 +310,13 @@ class OvisImagePipeline(
                 {height} and {width}. Dimension will be resized accordingly"""
             )
 
-        if callback_on_step_end_tensor_inputs is not None and not all(
-            k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
-        ):
-            raise ValueError(
-                f"""`callback_on_step_end_tensor_inputs` has to contain the following keys:
-                {self._callback_tensor_inputs.keys()}"""
-            )
+        # if callback_on_step_end_tensor_inputs is not None and not all(
+        #     k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
+        # ):
+        #     raise ValueError(
+        #         f"""`callback_on_step_end_tensor_inputs` has to contain the following keys:
+        #         {self._callback_tensor_inputs.keys()}"""
+        #     )
 
         if prompt is not None and prompt_embeds is not None:
             raise ValueError(
@@ -338,7 +340,7 @@ class OvisImagePipeline(
             raise ValueError(f"`max_sequence_length` has to be less than or equal to 256 but is {max_sequence_length}")
 
     @staticmethod
-    def _prepare_latent_image_ids(batch_size, height, width, dtype, device):
+    def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
         latent_image_ids = torch.zeros(height, width, 3)
         latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
         latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
@@ -659,6 +661,7 @@ class OvisImagePipeline(
             num_images_per_prompt=num_images_per_prompt,
         )
 
+        negative_text_ids = None
         if do_classifier_free_guidance:
             negative_prompt_embeds, negative_text_ids = self.encode_prompt(
                 prompt=negative_prompt,
@@ -668,7 +671,7 @@ class OvisImagePipeline(
             )
 
         # 4. Prepare latent variables
-        num_channel_latents = self.transformer.config.in_channels // 4
+        num_channel_latents = self.transformer.in_channels // 4
         latents, latent_image_ids = self.prepare_latents(
             batch_size=batch_size * num_images_per_prompt,
             num_channel_latents=num_channel_latents,
@@ -720,7 +723,6 @@ class OvisImagePipeline(
 
         return DiffusionOutput(output=image)
 
-
-def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-    loader = AutoWeightsLoader(self)
-    return loader.load_weights(weights)
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
