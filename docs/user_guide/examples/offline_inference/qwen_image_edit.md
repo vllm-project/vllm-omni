@@ -17,12 +17,10 @@ python image_edit.py \
 
 Key arguments:
 - `--image`: path to the source image (PNG/JPG, converted to RGB).
-- `--prompt` / `--negative_prompt`: describe what to add or avoid in the edit.
+- `--prompt` / `--negative_prompt`: text description (string).
 - `--cfg_scale`: true CFG scale for Qwen-Image-Edit (quality vs. fidelity).
-- `--num_inference_steps`: diffusion sampling steps.
-- `--num_outputs_per_prompt`: generate multiple edited variants in one run.
-
-The script auto-detects CUDA/NPU, seeds a generator for reproducibility, and enables VAE tiling/slicing on NPUs.
+- `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
+- `--output`: path to save the generated PNG.
 
 ## Example materials
 

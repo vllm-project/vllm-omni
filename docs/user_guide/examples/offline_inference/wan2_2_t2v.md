@@ -9,7 +9,7 @@ The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text
 ```bash
 python text_to_video.py \
   --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
-  --negative_prompt "<optional quality filter (the PR example uses a long Chinese string)>" \
+  --negative_prompt "<optional quality filter>" \
   --height 720 \
   --width 1280 \
   --num_frames 32 \
@@ -21,15 +21,14 @@ python text_to_video.py \
 ```
 
 Key arguments:
+- `--prompt`: text description (string).
 - `--height/--width`: output resolution (defaults 720x1280). Dimensions should align with Wan VAE downsampling (multiples of 8).
-- `--num_frames`: must satisfy `num_frames % 4 == 1` (e.g., 5, 9, 13, 17, 32, 81). Script will round if needed.
-- `--guidance_scale` and `--guidance_scale_high`: CFG for low/high-noise branches (high defaults to low when omitted).
+- `--num_frames`: Number of frames (Wan default is 81).
+- `--guidance_scale` and `--guidance_scale_high`: CFG scale (applied to low/high)..
 - `--negative_prompt`: optional list of artifacts to suppress (the PR demo used a long Chinese string).
-- `--boundary_ratio`: split point for the dual DiT stack (default `0.875` from the PR).
-- `--flow_shift`: scheduler flow shift (use `5.0` for 720p, `12.0` for 480p as recommended upstream).
+- `--boundary_ratio`: Boundary split ratio for low/high DiT.
 - `--fps`: frames per second for the saved MP4 (requires `diffusers` export_to_video).
-
-The script also enables VAE tiling/slicing on NPUs automatically.
+- `--output`: path to save the generated video.
 
 ## Example materials
 
