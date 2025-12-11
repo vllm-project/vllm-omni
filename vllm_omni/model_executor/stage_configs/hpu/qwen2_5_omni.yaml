@@ -56,7 +56,7 @@ stage_args:
   - stage_id: 2
     runtime:
       process: true
-      devices: "0"            # Example: use a different NPU than the previous stage; use "0" if single NPU
+      devices: "0"            # Example: use a different HPU than the previous stage; use "0" if single HPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
