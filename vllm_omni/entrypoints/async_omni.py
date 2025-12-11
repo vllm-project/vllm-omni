@@ -313,12 +313,14 @@ class AsyncOmni(EngineClient):
         # Determine the final stage for E2E stats (highest stage_id with
         # final_output=True; fallback to last stage)
         final_stage_id_for_e2e = -1
+        last_stage_id = len(self.stage_list) - 1
         try:
-            for _sid, _st in enumerate(self.stage_list):
-                if getattr(_st, "final_output", False):
-                    final_stage_id_for_e2e = max(final_stage_id_for_e2e, _sid)
+            for _sid in range(last_stage_id, -1, -1):
+                if getattr(self.stage_list[_sid], "final_output", False):
+                    final_stage_id_for_e2e = _sid
+                    break
             if final_stage_id_for_e2e < 0:
-                final_stage_id_for_e2e = len(self.stage_list) - 1
+                final_stage_id_for_e2e = last_stage_id
         except Exception as e:
             logger.debug(
                 "[Orchestrator] Failed to determine final stage for E2E; \
@@ -326,7 +328,7 @@ class AsyncOmni(EngineClient):
                 e,
                 exc_info=True,
             )
-            final_stage_id_for_e2e = len(self.stage_list) - 1
+            final_stage_id_for_e2e = last_stage_id
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
             num_stages,
