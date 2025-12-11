@@ -19,6 +19,11 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit",
         "QwenImageEditPipeline",
     ),
+    "HunyuanVideo15Pipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5",
+        "HunyuanVideo15Pipeline",
+    ),
     "ZImagePipeline": (
         "z_image",
         "pipeline_z_image",
@@ -60,6 +65,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
+    "HunyuanVideo15Pipeline": "get_hunyuan_video_post_process_func",
     "ZImagePipeline": "get_post_process_func",
 }
 
