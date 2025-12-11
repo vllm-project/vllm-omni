@@ -481,8 +481,8 @@ echo ""
 INCLUDED_STEPS=()
 
 for ((i=1; i<=TOTAL_STEPS; i++)); do
-    local label_var="STEP_${i}_LABEL"
-    local label="${!label_var:-Step $i}"
+    label_var="STEP_${i}_LABEL"
+    label="${!label_var:-Step $i}"
 
     # Check hardware match
     if ! matches_hardware "$i" "amdexperimental"; then
@@ -531,29 +531,29 @@ echo "steps:" >> .buildkite/pipeline.yaml
 # Generate steps
 for step_num in "${INCLUDED_STEPS[@]}"; do
     # Get step data
-    local label_var="STEP_${step_num}_LABEL"
-    local label="${!label_var}"
+    label_var="STEP_${step_num}_LABEL"
+    label="${!label_var}"
 
-    local key_var="STEP_${step_num}_KEY"
-    local key="${!key_var:-step-${step_num}}"
+    key_var="STEP_${step_num}_KEY"
+    key="${!key_var:-step-${step_num}}"
 
-    local queue_var="STEP_${step_num}_QUEUE"
-    local queue="${!queue_var:-}"
+    queue_var="STEP_${step_num}_QUEUE"
+    queue="${!queue_var:-}"
 
-    local agent_pool_var="STEP_${step_num}_AGENT_POOL"
-    local agent_pool="${!agent_pool_var:-}"
+    agent_pool_var="STEP_${step_num}_AGENT_POOL"
+    agent_pool="${!agent_pool_var:-}"
 
-    local timeout_var="STEP_${step_num}_TIMEOUT"
-    local timeout="${!timeout_var:-10}"
+    timeout_var="STEP_${step_num}_TIMEOUT"
+    timeout="${!timeout_var:-10}"
 
-    local commands_var="STEP_${step_num}_COMMANDS"
-    local commands="${!commands_var:-}"
+    commands_var="STEP_${step_num}_COMMANDS"
+    commands="${!commands_var:-}"
 
-    local working_dir_var="STEP_${step_num}_WORKING_DIR"
-    local working_dir="${!working_dir_var:-}"
+    working_dir_var="STEP_${step_num}_WORKING_DIR"
+    working_dir="${!working_dir_var:-}"
 
     # Determine queue
-    local final_queue=""
+    final_queue=""
     if [[ -n "$queue" ]]; then
         final_queue="$queue"
     elif [[ -n "$agent_pool" ]]; then
@@ -585,9 +585,9 @@ STEP_START
         # Check if this is an AMD GPU test (needs run-amd-test.sh wrapper)
         if [[ "$final_queue" == amd_* ]]; then
             # Build command string for AMD GPU execution
-            local cmd_string=""
-            local IFS='||'
-            local cmd_array=($commands)
+            cmd_string=""
+            IFS='||'
+            cmd_array=($commands)
 
             # Add ROCm check prefix
             cmd_string="(command rocm-smi || true) && export VLLM_ALLOW_DEPRECATED_BEAM_SEARCH=1"
@@ -607,8 +607,8 @@ STEP_START
         else
             # CPU or build step - direct commands
             echo "    commands:" >> .buildkite/pipeline.yaml
-            local IFS='||'
-            local cmd_array=($commands)
+            IFS='||'
+            cmd_array=($commands)
             for cmd in "${cmd_array[@]}"; do
                 echo "      - \"${cmd}\"" >> .buildkite/pipeline.yaml
             done
@@ -641,8 +641,8 @@ ENV_BLOCK
 
     # Add depends_on for non-first steps (depend on build step)
     if [[ "$step_num" != "${INCLUDED_STEPS[0]}" ]]; then
-        local first_key_var="STEP_${INCLUDED_STEPS[0]}_KEY"
-        local first_key="${!first_key_var:-step-${INCLUDED_STEPS[0]}}"
+        first_key_var="STEP_${INCLUDED_STEPS[0]}_KEY"
+        first_key="${!first_key_var:-step-${INCLUDED_STEPS[0]}}"
         echo "    depends_on: \"${first_key}\"" >> .buildkite/pipeline.yaml
     fi
 done
