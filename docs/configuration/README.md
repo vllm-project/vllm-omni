@@ -12,4 +12,4 @@ For introduction, please check [Introduction for stage config](./stage_configs.m
 
 ## Optimization Features
 
-- **[TeaCache Configuration](./teacache.md)** - Enable TeaCache adaptive caching for DiT models to achieve 1.5x-2.0x speedup with minimal quality loss
+- **[TeaCache Configuration](../user_guide/teacache.md)** - Enable TeaCache adaptive caching for DiT models to achieve 1.5x-2.0x speedup with minimal quality loss

@@ -96,6 +96,7 @@ Model execution components.
 Configuration classes.
 
 - [vllm_omni.config.model.OmniModelConfig][]
+- [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 
 ## Workers
 
