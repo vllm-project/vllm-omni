@@ -10,8 +10,8 @@ The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text
 python text_to_video.py \
   --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
   --negative_prompt "<optional quality filter>" \
-  --height 720 \
-  --width 1280 \
+  --height 480 \
+  --width 640 \
   --num_frames 32 \
   --guidance_scale 4.0 \
   --guidance_scale_high 3.0 \
