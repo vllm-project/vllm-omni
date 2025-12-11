@@ -23,6 +23,16 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
+"""
+HunyuanVideo1.5 transformer components, adapted for vLLM-Omni.
+
+Key differences from the original diffusers implementation:
+- Uses vLLM's attention backend instead of HF attention processors.
+- Drops PEFT/cache mixins; weight loading is handled by vLLM loaders.
+- Provides safe defaults for optional condition streams to simplify integration tests.
+- Retains the dual-stream architecture and RoPE layout from the technical report.
+"""
+
 
 def apply_rotary_emb(
     x: torch.Tensor,
@@ -40,6 +50,8 @@ def apply_rotary_emb(
 
 
 class HunyuanVideo15PatchEmbed(nn.Module):
+    """3D patch embedder for (T, H, W) latent volumes."""
+
     def __init__(
         self,
         patch_size: int | tuple[int, int, int] = 16,
@@ -57,6 +69,8 @@ class HunyuanVideo15PatchEmbed(nn.Module):
 
 
 class HunyuanVideo15AdaNorm(nn.Module):
+    """Lightweight AdaLN producing modulation gates for attention/MLP."""
+
     def __init__(self, in_features: int, out_features: Optional[int] = None) -> None:
         super().__init__()
         out_features = out_features or 2 * in_features
@@ -73,7 +87,7 @@ class HunyuanVideo15AdaNorm(nn.Module):
 
 
 class HunyuanVideo15TimeEmbedding(nn.Module):
-    """Time embedding for HunyuanVideo 1.5."""
+    """Time embedding for HunyuanVideo 1.5 (supports optional MeanFlow term)."""
 
     def __init__(self, embedding_dim: int, use_meanflow: bool = False):
         super().__init__()
@@ -104,6 +118,8 @@ class HunyuanVideo15TimeEmbedding(nn.Module):
 
 
 class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
+    """Self-attention + MLP block for per-token refinement (text/image/image_cond)."""
+
     def __init__(
         self,
         num_attention_heads: int,
@@ -172,6 +188,8 @@ class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
 
 
 class HunyuanVideo15IndividualTokenRefiner(nn.Module):
+    """Stack of refiner blocks to preprocess conditioning tokens before dual-stream."""
+
     def __init__(
         self,
         num_attention_heads: int,
@@ -218,6 +236,8 @@ class HunyuanVideo15IndividualTokenRefiner(nn.Module):
 
 
 class HunyuanVideo15TokenRefiner(nn.Module):
+    """Projects pooled text/image tokens and refines them with time conditioning."""
+
     def __init__(
         self,
         in_channels: int,
@@ -267,6 +287,8 @@ class HunyuanVideo15TokenRefiner(nn.Module):
 
 
 class HunyuanVideo15RotaryPosEmbed(nn.Module):
+    """Builds 3D RoPE tables for (frames, height, width) patch grid."""
+
     def __init__(self, patch_size: int, patch_size_t: int, rope_dim: list[int], theta: float = 256.0) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -296,6 +318,8 @@ class HunyuanVideo15RotaryPosEmbed(nn.Module):
 
 
 class HunyuanVideo15ByT5TextProjection(nn.Module):
+    """MLP to project ByT5 features into the joint hidden size."""
+
     def __init__(self, in_features: int, hidden_size: int, out_features: int):
         super().__init__()
         self.norm = nn.LayerNorm(in_features)
@@ -315,6 +339,8 @@ class HunyuanVideo15ByT5TextProjection(nn.Module):
 
 
 class HunyuanVideo15ImageProjection(nn.Module):
+    """MLP to project vision embeddings into the joint hidden size."""
+
     def __init__(self, in_channels: int, hidden_size: int):
         super().__init__()
         self.norm_in = nn.LayerNorm(in_channels)
@@ -333,6 +359,8 @@ class HunyuanVideo15ImageProjection(nn.Module):
 
 
 class HunyuanVideo15Attention(nn.Module):
+    """Dual-stream attention combining latent tokens with two conditioning streams."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -421,7 +449,7 @@ class HunyuanVideo15Attention(nn.Module):
                 1, 1, attention_mask.shape[1], 1
             )
             attn_mask = (attn_mask & attn_mask.transpose(2, 3)).bool()
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+            attn_metadata = AttentionMetadata(attn_mask=attn_mask)  # vLLM attention backend consumes metadata
 
         joint_hidden_states = self.attn(query, key, value, attn_metadata=attn_metadata)
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
@@ -442,6 +470,8 @@ class HunyuanVideo15Attention(nn.Module):
 
 
 class HunyuanVideo15TransformerBlock(nn.Module):
+    """Main dual-stream block with AdaLN-Zero and per-stream FFNs."""
+
     def __init__(
         self,
         num_attention_heads: int,
@@ -515,9 +545,7 @@ class HunyuanVideo15TransformerBlock(nn.Module):
 
 
 class HunyuanVideo15Transformer3DModel(nn.Module):
-    """
-    HunyuanVideo1.5 transformer adapted for vLLM.
-    """
+    """HunyuanVideo1.5 transformer adapted for vLLM attention/runtime."""
 
     def __init__(
         self,
@@ -617,6 +645,14 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         attention_kwargs: Optional[dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Transformer2DModelOutput:
+        """
+        Denoises latent video with dual text encoders and optional image guidance.
+
+        Differences vs original diffusers forward:
+        - vLLM attention replaces HF AttentionProcessor; attn masks flow via AttentionMetadata.
+        - Safe defaults for encoder_hidden_states_2/image_embeds allow minimal test calls.
+        - LoRA/PEFT/cache hooks are omitted; weight loading is handled by vLLM loaders.
+        """
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size_t, self.config.patch_size, self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -634,12 +670,12 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             )
             encoder_attention_mask_2 = torch.zeros(
                 (batch_size, 1), device=hidden_states.device, dtype=encoder_attention_mask.dtype
-            )
+            )  # allow forward to run without ByT5 embeddings (vLLM smoke tests)
 
         if image_embeds is None:
             image_embeds = torch.zeros(
                 (batch_size, 1, self.image_embed_dim), device=hidden_states.device, dtype=hidden_states.dtype
-            )
+            )  # permit t2v path without vision embeds
 
         encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
         encoder_hidden_states_cond_emb = self.cond_type_embed(

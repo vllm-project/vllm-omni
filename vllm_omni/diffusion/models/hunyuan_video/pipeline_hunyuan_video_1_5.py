@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""
+HunyuanVideo1.5 pipeline adapted for vLLM-Omni.
+
+Notes vs the original diffusers pipeline:
+- Components are loaded via vLLM's diffusers loader and executed on the local GPU device.
+- Attention/guidance logic uses vLLM's transformer wrapper; PEFT/offload hooks are omitted.
+- Adds defaults for optional ByT5/image embeds so integration smoke tests can run with minimal inputs.
+"""
+
 import inspect
 import os
 from collections.abc import Iterable
@@ -102,6 +111,16 @@ def get_hunyuan_video_post_process_func(
 
 
 class HunyuanVideo15Pipeline(nn.Module):
+    """
+    Minimal HunyuanVideo1.5 pipeline wired for vLLM execution.
+
+    Differences from the original diffusers pipeline:
+    - Loads components via DiffusersPipelineLoader and AutoWeightsLoader (vLLM).
+    - Guidance loop simplified for CFG; other guiders can be added later.
+    - Offload/PEFT hooks removed; model runs on the selected device.
+    - Provides zeroed defaults for missing ByT5/image embeddings to ease smoke tests.
+    """
+
     def __init__(
         self,
         *,
@@ -118,7 +137,7 @@ class HunyuanVideo15Pipeline(nn.Module):
                 prefix="transformer.",
                 fall_back_to_pt=True,
             )
-        ]
+        ]  # vLLM loader feeds weights directly into our modules
 
         self._execution_device = get_local_device()
         model = od_config.model
@@ -264,6 +283,7 @@ class HunyuanVideo15Pipeline(nn.Module):
         prompt_embeds_2: Optional[torch.Tensor] = None,
         prompt_embeds_mask_2: Optional[torch.Tensor] = None,
     ):
+        """Encode prompt with Qwen2.5-VL and ByT5 (glyph extractor) for dual conditioning."""
         device = device or self._execution_device
         dtype = dtype or self.text_encoder.dtype
 
@@ -293,7 +313,7 @@ class HunyuanVideo15Pipeline(nn.Module):
                 prompt=prompt,
                 device=model_device_2,
                 tokenizer_max_length=self.tokenizer_2_max_length,
-            )
+            )  # ByT5 branch kept for glyph prompts as in HF reference
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
@@ -441,13 +461,14 @@ class HunyuanVideo15Pipeline(nn.Module):
         timesteps: torch.Tensor,
         guidance_scale: float,
     ):
+        """Denoising loop with optional classifier-free guidance (cond + uncond runs)."""
         image_embeds = torch.zeros(
             latents.shape[0],
             self.vision_num_semantic_tokens,
             self.vision_states_dim,
             dtype=self.transformer.proj_out.weight.dtype,
             device=latents.device,
-        )
+        )  # HF i2v uses vision tokens; zero here keeps t2v path lightweight for tests
 
         for i, t in enumerate(timesteps):
             latent_model_input = self._get_latent_model_input(latents, cond_latents_concat, mask_concat)
@@ -507,6 +528,7 @@ class HunyuanVideo15Pipeline(nn.Module):
         negative_prompt_embeds_mask_2: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pt",
     ) -> DiffusionOutput:
+        """End-to-end text-to-video call: encode, sample latents, denoise, decode."""
         prompt = req.prompt if req.prompt is not None else prompt
         negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
         height = req.height or height or self.default_height
