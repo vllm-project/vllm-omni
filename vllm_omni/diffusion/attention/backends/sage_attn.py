@@ -16,8 +16,11 @@ logger = init_logger(__name__)
 try:
     from sageattention import sageattn
 except ImportError:
-    logger.warning("SageAttentionBackend is not available")
-    sageattn = None
+    logger.warning(
+        "SageAttentionBackend is not available. You may install sage-attention"
+        " by pip install git+https://github.com/thu-ml/SageAttention.git"
+    )
+    raise ImportError
 
 # TODO add sage3 attention backend
 
