@@ -1,4 +1,4 @@
-# OmniConnector: a unified connector interface of disaggregated inference for omni-modality models
+# Disaggregated Inference for omni-modality models
 
 This guide explains how to configure and use distributed connectors (vllm_omni/distributed/connectors) in vllm-omni for multi-stage pipelines.
 

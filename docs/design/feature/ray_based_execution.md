@@ -1,4 +1,4 @@
-# VLLM-Omni Distributed Utilities
+# Distributed utils
 
 This directory (vllm_omni/distributed/ray_utils) contains utilities for distributed execution in vllm-omni, supporting both **Ray** and **Multiprocessing** backends.
 
