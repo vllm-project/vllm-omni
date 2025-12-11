@@ -10,8 +10,8 @@ import pytest
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
-from vllm.multimodal.image import convert_image_mode
 from vllm.envs import VLLM_USE_MODELSCOPE
+from vllm.multimodal.image import convert_image_mode
 
 from vllm_omni.utils import is_npu
 
@@ -38,7 +38,7 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], model: str) ->
         audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
         audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
         image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
-        if VLLM_USE_MODELSCOPE:
+        if not VLLM_USE_MODELSCOPE:
             video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
         else:
             # modelscope can't access raushan-testing-hf/videos-test, skip video input temporarily

@@ -14,8 +14,8 @@ container_name="npu_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head
 # BUILDKITE_AGENT_NAME format is {hostname}-{agent_idx}-{npu_card_num}cards
 agent_idx=$(echo "${BUILDKITE_AGENT_NAME}" | awk -F'-' '{print $(NF-1)}')
 echo "agent_idx: ${agent_idx}"
-builder_name="cachebuilder3"
-builder_cache_dir="/mnt/docker-cache3"
+builder_name="cachebuilder${agent_idx}"
+builder_cache_dir="/mnt/docker-cache${agent_idx}"
 mkdir -p ${builder_cache_dir}
 
 # Try building the docker image
@@ -119,7 +119,7 @@ devices=$(parse_and_gen_devices "${BUILDKITE_AGENT_NAME}") || exit 1
 # This test checks whether the OOT platform interface is functioning properly in conjunction with
 # the hardware plugin vllm-ascend.
 hf_model_cache_dir=/mnt/hf_cache${agent_idx}
-ms_model_cache_dir=/mnt/hf_cache${agent_idx}
+ms_model_cache_dir=/mnt/modelscope${agent_idx}
 mkdir -p ${hf_model_cache_dir}
 mkdir -p ${ms_model_cache_dir}
 docker run \
