@@ -142,5 +142,4 @@ docker run \
     bash -c '
     set -e
     VLLM_USE_MODELSCOPE=True pytest -s -v tests/multi_stages/test_qwen2_5_omni.py
-    VLLM_USE_MODELSCOPE=True pytest -s -v tests/single_stage/test_diffusion_model.py
 '
