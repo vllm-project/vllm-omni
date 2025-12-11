@@ -8,18 +8,15 @@ Enable TeaCache by setting `cache_adapter` to `"tea_cache"`:
 
 ```python
 from vllm_omni import Omni
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 # Simple configuration - model_class_name and model_type are auto-detected
-config = OmniDiffusionConfig(
+omni = Omni(
     model="Qwen/Qwen-Image",
     cache_adapter="tea_cache",
     cache_config={
         "rel_l1_thresh": 0.2  # Optional, defaults to 0.2
     }
 )
-
-omni = Omni(config)
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
 ```
 
@@ -31,10 +28,12 @@ You can also enable TeaCache via environment variable:
 export DIFFUSION_CACHE_ADAPTER=tea_cache
 ```
 
-Then create your config:
+Then initialize without explicitly setting `cache_adapter`:
 
 ```python
-config = OmniDiffusionConfig.from_kwargs(
+from vllm_omni import Omni
+
+omni = Omni(
     model="Qwen/Qwen-Image",
     cache_config={"rel_l1_thresh": 0.2}  # Optional
 )
@@ -47,6 +46,7 @@ config = OmniDiffusionConfig.from_kwargs(
 Controls the balance between speed and quality. Lower values prioritize quality, higher values prioritize speed.
 
 **Recommended values:**
+
 - `0.2` - **~1.5x speedup** with minimal quality loss (recommended)
 - `0.4` - **~1.8x speedup** with slight quality loss
 - `0.6` - **~2.0x speedup** with noticeable quality loss
@@ -58,25 +58,13 @@ Controls the balance between speed and quality. Lower values prioritize quality,
 
 ```python
 from vllm_omni import Omni
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-config = OmniDiffusionConfig(
+omni = Omni(
     model="Qwen/Qwen-Image",
     cache_adapter="tea_cache",
     cache_config={"rel_l1_thresh": 0.2}
 )
-
-omni = Omni(config)
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
-```
-
-### YAML Configuration
-
-```yaml
-model: "Qwen/Qwen-Image"
-cache_adapter: "tea_cache"
-cache_config:
-  rel_l1_thresh: 0.2
 ```
 
 ## Performance Tuning

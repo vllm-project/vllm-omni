@@ -12,17 +12,17 @@ model code. Model developers only need to add an extractor function to support
 new models.
 
 Usage:
-    # Recommended: Via OmniDiffusionConfig
-    config = OmniDiffusionConfig(
+    from vllm_omni import Omni
+    
+    omni = Omni(
         model="Qwen/Qwen-Image",
         cache_adapter="tea_cache",
         cache_config={"rel_l1_thresh": 0.2}
     )
-    omni = OmniDiffusion(od_config=config)
     images = omni.generate("a cat")
 
-    # Alternative: Environment variable
-    export DIFFUSION_CACHE_ADAPTER=tea_cache
+    # Alternative: Using environment variable
+    # export DIFFUSION_CACHE_ADAPTER=tea_cache
 """
 
 from vllm_omni.diffusion.cache.teacache.adapter import TeaCacheAdapter
