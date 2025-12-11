@@ -1,6 +1,6 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
 
-# The following config has been verified on 1x 24GB GPU (L4/RTX3090).
+# The following config has been verified on 2x 24GB GPU (L4/RTX3090/RTX4090).
 # This config is optimized for CI e2e tests.
 stage_args:
   - stage_id: 0

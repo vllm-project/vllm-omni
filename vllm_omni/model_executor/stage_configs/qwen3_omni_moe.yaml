@@ -37,22 +37,22 @@ stage_args:
 
   - stage_id: 1
     runtime:
-       devices: "1"
-       max_batch_size: 1
+      devices: "1"
+      max_batch_size: 1
     engine_args:
-       model_stage: talker
-       model_arch: Qwen3OmniMoeForConditionalGeneration
-       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
-       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-       gpu_memory_utilization: 0.3
-       enforce_eager: true
-       trust_remote_code: true
-       engine_output_type: latent  # Output codec codes for code2wav
-      #  tensor_parallel_size: 2
-       enable_prefix_caching: false
-       max_num_batched_tokens: 32768
-       distributed_executor_backend: "mp"
-       hf_config_name: talker_config
+      model_stage: talker
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent  # Output codec codes for code2wav
+      # tensor_parallel_size: 2
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      distributed_executor_backend: "mp"
+      hf_config_name: talker_config
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
