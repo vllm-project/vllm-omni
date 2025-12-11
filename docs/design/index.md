@@ -5,12 +5,12 @@ This section contains design documents and architecture specifications for vLLM-
 ## Architecture Documents
 
 - [Architecture Overview](architecture_overview.md)
-- [vLLM-Omni Software Design Document](vllm_omni_design.md)
 
 ## Feature Design Documents
 
 - [Multi-Request Streaming](feature/multi_request_streaming_design.md)
 - [Omni Connector Design](feature/omni_connector_design.md)
+- [Ray-based Execution](feature/ray_based_execution.md)
 
 ## Module Design Documents
 

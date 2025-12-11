@@ -28,6 +28,11 @@ _DIFFUSION_MODELS = {
         "ovis_image",
         "pipeline_ovis_image",
         "OvisImagePipeline",
+    ),  
+    "WanPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "Wan22Pipeline",
     ),
 }
 
@@ -67,6 +72,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
+    "WanPipeline": "get_wan22_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
