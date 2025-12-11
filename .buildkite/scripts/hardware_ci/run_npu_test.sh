@@ -51,14 +51,15 @@ ARG VLLM_OMNI_TAG=main
 ARG BUILDKITE_PULL_REQUEST
 ARG BUILDKITE_PULL_REQUEST_REPO
 RUN git config --global url."https://gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/" && \
-    git clone \$VLLM_OMNI_REPO /workspace/vllm-omni && \
-    cd /workspace/vllm-omni && \
     if [ "\$BUILDKITE_PULL_REQUEST" != "false" ] && [ -n "\$BUILDKITE_PULL_REQUEST" ]; then \
-        echo "Fetching PR #\$BUILDKITE_PULL_REQUEST and merging into main..." && \
+        echo "Cloning and checking out PR #\$BUILDKITE_PULL_REQUEST..." && \
+        git clone \$VLLM_OMNI_REPO /workspace/vllm-omni && \
+        cd /workspace/vllm-omni && \
         git fetch origin pull/\$BUILDKITE_PULL_REQUEST/head:pr-\$BUILDKITE_PULL_REQUEST && \
-        git merge --no-edit pr-\$BUILDKITE_PULL_REQUEST; \
+        git checkout pr-\$BUILDKITE_PULL_REQUEST; \
     else \
-        echo "Not a PR build, using main branch"; \
+        echo "Not a PR build, using main branch" && \
+        git clone --depth 1 \$VLLM_OMNI_REPO /workspace/vllm-omni; \
     fi
 
 RUN --mount=type=cache,target=/root/.cache/pip \
