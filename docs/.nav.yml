@@ -7,12 +7,15 @@ nav:
   - Examples:
     - examples/README.md
     - Offline Inference:
-      - Offline Example of vLLM-Omni for Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
-      - Offline Example of vLLM-Omni for Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
-      - Qwen-Image Offline Inference: user_guide/examples/offline_inference/qwen_image.md
+      - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
+      - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
+      - Qwen-Image: user_guide/examples/offline_inference/qwen_image.md
+      - Qwen-Image-Edit: user_guide/examples/offline_inference/qwen_image_edit.md
+      - Wan2.2-T2V: user_guide/examples/offline_inference/wan2_2_t2v.md
+      - Z-Image: user_guide/examples/offline_inference/z_image.md
     - Online Serving:
-      - Online serving Example of vLLM-Omni for Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
-      - Online serving Example of vLLM-Omni for Qwen3-omni: user_guide/examples/online_serving/qwen3_omni.md
+      - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
+      - Qwen3-omni: user_guide/examples/online_serving/qwen3_omni.md
   - General:
     - usage/*
   - Configuration:
