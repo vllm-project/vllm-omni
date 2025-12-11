@@ -177,13 +177,14 @@ class FluxTransformerBlock(nn.Module):
         self.norm1_context = AdaLayerNormZero(dim)
 
         self.attn = FluxAttention(
-            dim=dim,
-            num_heads=num_attention_heads,
-            head_dim=attention_head_dim,
+            query_dim=dim,
+            added_kv_proj_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
             out_dim=dim,
+            context_pre_only=False,
             bias=True,
-            eps=1e-6,
-            pre_only=True,
+            eps=eps,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -261,8 +262,8 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.attn = FluxAttention(
             query_dim=dim,
-            head_dim=attention_head_dim,
-            num_heads=num_attention_heads,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
             out_dim=dim,
             bias=True,
             eps=1e-6,
