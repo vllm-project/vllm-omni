@@ -142,9 +142,71 @@ vllm_omni/                          tests/
 
 ### Template
 #### E2E - Online serving
-
+"""
+Online E2E smoke test for an omni model (video,text,audio → audio).
+"""
 ```python
+from pathlib import Path
 
+import pytest
+import openai
+
+
+# Optional: set process start method for workers
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+models = ["{your model name}"] #Edit here to load your model
+stage_configs = [str(Path(__file__).parent / "stage_configs" / {your model yaml})] #Edit here to load your model yaml
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+
+#OmniServer，Used to start the vllm-omni server
+class OmniServer:
+    xxx
+
+
+@pytest.fixture
+def omni_server(request):
+    model, stage_config_path = request.param
+    with OmniServer(model, ["--stage-configs-path", stage_config_path]) as server:
+        yield server
+
+
+#handle request message
+@pytest.fixture(scope="session")
+def base64_encoded_video() -> str:
+    xxx
+
+@pytest.fixture(scope="session")
+def dummy_messages_from_video_data(video_data_url: str, content_text: str) -> str:
+    xxx
+    
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_video_to_audio(
+    client: openai.OpenAI,
+    omni_server,
+    base64_encoded_video: str,
+) -> None:
+    #set message
+    video_data_url = f"data:video/mp4;base64, {base64_encoded_video}"
+    messages = dummy_messages_from_video_data(video_data_url)
+    
+    #send request
+    chat_completion = client.chat.completions.create(
+        model=omni_server.model,
+        messages=messages,
+    )
+    
+    #verify text output
+    text_choice = chat_completion.choices[0]
+    assert text_choice.finish_reason == "length"
+    
+    #verify audio output
+    audio_choice = chat_completion.choices[1]
+    audio_message = audio_choice.message
+    if hasattr(audio_message, "audio") and audio_message.audio:
+        assert audio_message.audio.data is not None
+        assert len(audio_message.audio.data) > 0
+    
 ```
 
 #### E2E - Offline inference
