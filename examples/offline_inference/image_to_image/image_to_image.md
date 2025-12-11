@@ -28,4 +28,3 @@ Key arguments:
     ``````py
     --8<-- "examples/offline_inference/image_to_image/image_edit.py"
     ``````
-
