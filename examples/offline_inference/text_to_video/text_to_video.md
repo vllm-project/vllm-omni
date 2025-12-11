@@ -2,6 +2,7 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_video>. Added in PR [#202](https://github.com/vllm-project/vllm-omni/pull/202).
 
+
 The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text prompts.
 
 ## Local CLI Usage
@@ -21,6 +22,7 @@ python text_to_video.py \
 ```
 
 Key arguments:
+
 - `--prompt`: text description (string).
 - `--height/--width`: output resolution (defaults 720x1280). Dimensions should align with Wan VAE downsampling (multiples of 8).
 - `--num_frames`: Number of frames (Wan default is 81).

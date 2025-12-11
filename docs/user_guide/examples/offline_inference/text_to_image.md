@@ -1,4 +1,4 @@
-# Qwen-Image Offline Inference
+# Text-To-Image Offline Inference
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
