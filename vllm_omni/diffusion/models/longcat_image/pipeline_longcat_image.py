@@ -282,7 +282,7 @@ def get_prompt_language(prompt):
       return 'zh'
     return 'en'
 
-class LongcatImagePipeline(
+class LongCatImagePipeline(
     nn.Module,
 ):
     def __init__(
