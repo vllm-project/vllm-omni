@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from vllm.assets.video import VideoAsset
 
-from ..multi_stages.conftest import OmniRunner
+from .conftest import OmniRunner
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 

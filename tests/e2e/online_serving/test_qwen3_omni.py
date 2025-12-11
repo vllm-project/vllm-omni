@@ -21,7 +21,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 # CI stage config for 2*H100-80G GPUs
-stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci_online.yaml")]
+stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
