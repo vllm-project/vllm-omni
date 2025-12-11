@@ -15,6 +15,9 @@ from diffusers.models.transformers.transformer_flux import \
     AdaLayerNormContinuous, Transformer2DModelOutput
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 logger = init_logger(__name__)
@@ -31,6 +34,134 @@ class TimestepEmbeddings(nn.Module):
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype))  # (N, D)
 
         return timesteps_emb
+
+
+class FluxAttention(nn.Module):
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+        added_kv_proj_dim: int | None = None,
+        added_proj_bias: bool = True,
+        out_bias: bool = True,
+        eps: float = 1e-5,
+        out_dim: int | None = None,
+        pre_only: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads if out_dim is None else out_dim // head_dim
+        self.head_dim = head_dim
+        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
+        self.added_kv_proj_dim = added_kv_proj_dim
+        self.pre_only = pre_only
+
+        # Fused QKV projection using vLLM's optimized layer
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=head_dim,
+            total_num_heads=self.num_heads,
+            bias=bias,
+            disable_tp=True,
+        )
+
+        if added_kv_proj_dim is not None:
+            self.to_added_qkv = QKVParallelLinear(
+                hidden_size=added_kv_proj_dim,
+                head_size=head_dim,
+                total_num_heads=self.num_heads,
+                bias=added_proj_bias,
+                disable_tp=True,
+            )
+        
+        self.norm_q = RMSNorm(head_dim, eps=eps)
+        self.norm_k = RMSNorm(head_dim, eps=eps)
+        if added_kv_proj_dim is not None:
+            self.norm_added_q = RMSNorm(head_dim, eps=eps)
+            self.norm_added_k = RMSNorm(head_dim, eps=eps)
+        
+        if not pre_only:
+            self.to_out = nn.ModuleList([
+                ReplicatedLinear(
+                    self.inner_dim, 
+                    out_dim or dim,
+                    bias=out_bias
+                    ), nn.Dropout(dropout)
+            ])
+        else:
+            self.to_out = None
+        
+        if added_kv_proj_dim is not None:
+            self.to_add_out = ReplicatedLinear(self.inner_dim, dim, bias=out_bias)
+
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=head_dim,
+            softmax_scale=1.0 / (head_dim**0.5),
+            causal=False,
+        )
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        ip_hidden_states=None,
+        ip_adapter_masks=None,
+    ):
+        qkv, _ = self.to_qkv(hidden_states)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+
+        q = q.unflatten(-1, (self.num_heads, -1))
+        k = k.unflatten(-1, (self.num_heads, -1))
+        v = v.unflatten(-1, (self.num_heads, -1))
+
+        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+            add_qkv, _ = self.to_added_qkv(encoder_hidden_states)
+            aq, ak, av = add_qkv.chunk(3, dim=-1)
+            aq = self.norm_added_q(aq)
+            ak = self.norm_added_k(ak)
+
+            aq = aq.unflatten(-1, (self.num_heads, -1))
+            ak = ak.unflatten(-1, (self.num_heads, -1))
+            av = av.unflatten(-1, (self.num_heads, -1))
+
+            q = torch.cat([aq, q], dim=1)
+            k = torch.cat([ak, k], dim=1)
+            v = torch.cat([av, v], dim=1)
+
+        # RoPE
+        if image_rotary_emb is not None:
+            q, k = apply_rotary_emb(q, image_rotary_emb, sequence_dim=1), apply_rotary_emb(
+                k, image_rotary_emb, sequence_dim=1
+            )
+
+        attn_metadata = AttentionMetadata(attention_mask) if attention_mask is not None else None
+        attn_out = self.attn(q, k, v, attn_metadata=attn_metadata)
+        attn_out = attn_out.flatten(2, 3).to(hidden_states.dtype)
+
+        if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+            ctx_len = encoder_hidden_states.shape[1]
+            ctx_out, img_out = attn_out.split_with_sizes([ctx_len, attn_out.shape[1] - ctx_len], dim=1)
+            img_out, _ = self.to_out[0](img_out)
+            if len(self.to_out) > 1:
+                img_out = self.to_out[1](img_out)
+            ctx_out, _ = self.to_add_out(ctx_out)
+            return img_out, ctx_out  # 兼容原 Flux 返回 (img, ctx)
+        else:
+            if self.to_out is None:
+                return attn_out
+            attn_out, _ = self.to_out[0](attn_out)
+            if len(self.to_out) > 1:
+                attn_out = self.to_out[1](attn_out)
+            return attn_out
+
 
 class LongCatImageTransformer2DModel(nn.Module):
     """
