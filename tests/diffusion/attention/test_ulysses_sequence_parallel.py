@@ -130,6 +130,8 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         TestMultiLayerAttentionModel,
     ],
 )
+@pytest.mark.parametrize("ulysses_degree", [2, 4, 8])
+@pytest.mark.parametrize("ring_degree", [1])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
@@ -140,6 +142,8 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("use_compile", [False, True])
 def test_ulysses_attention(
+    ulysses_degree: int,
+    ring_degree: int,
     test_model_cls: type[torch.nn.Module],
     dtype: torch.dtype,
     causal: bool,
@@ -152,10 +156,8 @@ def test_ulysses_attention(
     head_size: int,
 ):
     """Test Ulysses attention with various parameter combinations."""
-    num_processes = 2
-    ulysses_degree = 2  # Must match num_processes for this test
-    ring_degree = 1
     sequence_parallel_size = ulysses_degree * ring_degree
+    num_processes = sequence_parallel_size
 
     def run_torch_spawn(fn, nprocs):
         # need to use torch.mp.spawn otherwise will have problems with
