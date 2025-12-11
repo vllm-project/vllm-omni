@@ -45,4 +45,3 @@
   - Stats/logging are disabled by default; per-stage and orchestrator stats are only written when explicitly enabled.
   - Manages process lifecycle: start/wait for readiness, graceful shutdown; forwards results between stages using copy-based IPC and optional SHM.
   - Stage readiness: each stage emits `{"type": "stage_ready"}` after initialization; the orchestrator waits for all stages or times out and logs diagnostic suggestions.
-  
