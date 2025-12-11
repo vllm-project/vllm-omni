@@ -22,6 +22,7 @@ th {
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
+|`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 
 
 ## List of Supported Models for NPU

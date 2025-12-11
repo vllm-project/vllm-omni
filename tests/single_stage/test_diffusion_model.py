@@ -14,7 +14,7 @@ from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
+models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random", "meituan-longcat/LongCat-Image"]
 
 
 @pytest.mark.parametrize("model_name", models)
