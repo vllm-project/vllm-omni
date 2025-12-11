@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import pickle
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
-import cloudpickle
 from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
@@ -27,8 +25,11 @@ def set_stage_devices(
     Args:
         stage_id: Stage identifier for logging
         devices: Device specification:
-            - Comma-separated string (e.g. "2,5,7"): set device visibility env var
-              exactly to this list; logical index 0 is used as current device.
+            - Comma-separated string (e.g. "2,5,7"): interpreted as logical
+              indices against the current device visibility env var (e.g.
+              CUDA_VISIBLE_DEVICES/ASCEND_RT_VISIBLE_DEVICES) when present;
+              falls back to physical IDs if no mapping exists. Logical index 0
+              is used as current device.
             - Integer or digit-string: treat as logical index (0-based) into the
               current device visibility mapping; map to physical device, then set
               env var to this single device.
@@ -81,16 +82,35 @@ def set_stage_devices(
         logical_idx: int | None = None
 
         if isinstance(devices, str) and "," in devices:
-            os.environ[env_var] = devices
             toks = [t.strip() for t in devices.split(",") if t.strip() != ""]
+            vis = os.environ.get(env_var)
+            mapped_devices: list[str] = []
+            mapping: list[int] = []
+            if vis:
+                try:
+                    mapping = [int(x) for x in vis.split(",") if x.strip() != ""]
+                except Exception as e:
+                    logger.debug("[Stage-%s] Failed to parse existing %s: %s", stage_id, env_var, e)
+            for tok in toks:
+                try:
+                    idx = int(tok)
+                except Exception:
+                    mapped_devices.append(tok)
+                    continue
+                if mapping and 0 <= idx < len(mapping):
+                    mapped_devices.append(str(mapping[idx]))
+                else:
+                    mapped_devices.append(str(idx))
+            mapped_devices_str = ",".join(mapped_devices)
+            os.environ[env_var] = mapped_devices_str
             if toks:
                 try:
-                    selected_physical = int(toks[0])
+                    selected_physical = int(mapped_devices[0])
                     logger.debug(
                         "[Stage-%s] Set %s to %s; logical 0 -> physical %s",
                         stage_id,
                         env_var,
-                        devices,
+                        mapped_devices_str,
                         selected_physical,
                     )
                 except Exception as e:
@@ -155,8 +175,10 @@ def set_stage_devices(
 
 
 def serialize_obj(obj: Any) -> bytes:
-    """Serialize a Python object to bytes using cloudpickle."""
-    return cloudpickle.dumps(obj)
+    """Serialize a Python object to bytes using centralized serializer (defaults to cloudpickle)."""
+    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
+    return OmniSerializer.serialize(obj)
 
 
 def shm_write_bytes(payload: bytes) -> dict[str, Any]:
@@ -238,7 +260,9 @@ def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -
     decode-time and size metrics.
     """
     if shm_key in container:
-        return pickle.loads(shm_read_bytes(container[shm_key]))
+        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
+        return OmniSerializer.deserialize(shm_read_bytes(container[shm_key]))
     return container[obj_key]
 
 
@@ -253,11 +277,13 @@ def maybe_load_from_ipc_with_metrics(
     """
     import time as _time  # local import to avoid overhead at module import
 
+    from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
     t0 = _time.time()
     if shm_key in container:
         meta = container[shm_key]  # type: ignore[index]
         payload = shm_read_bytes(meta)
-        obj = pickle.loads(payload)
+        obj = OmniSerializer.deserialize(payload)
         try:
             rx_bytes = int(meta.get("size", len(payload)))  # type: ignore[call-arg]
         except Exception:

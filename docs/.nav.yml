@@ -31,8 +31,14 @@ nav:
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md
-    - design/vllm_omni_design.md
-    - design/mrs_design.md
+    - Feature Design:
+      - design/feature/multi_request_streaming_design.md
+      - design/feature/omni_connector_design.md
+      - design/feature/ray_based_execution.md
+    - Module Design:
+      - design/module/ar_module_design.md
+      - design/module/dit_module_design.md
+      - design/module/entrypoint_module_design.md
   - Docs Guide: contributing/DOCS_GUIDE.md
 - API Reference:
   - api/README.md

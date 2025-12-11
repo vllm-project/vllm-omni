@@ -101,6 +101,15 @@ class OmniRunner:
                 "generating text and speech."
             )
 
+        video_padding_token = "<|VIDEO|>"
+        image_padding_token = "<|IMAGE|>"
+        audio_padding_token = "<|AUDIO|>"
+
+        if self.model_name == "Qwen/Qwen3-Omni-30B-A3B-Instruct":
+            video_padding_token = "<|video_pad|>"
+            image_padding_token = "<|image_pad|>"
+            audio_padding_token = "<|audio_pad|>"
+
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -129,30 +138,30 @@ class OmniRunner:
             if audio is not None:
                 if isinstance(audio, list):
                     for _ in audio:
-                        user_content += "<|audio_bos|><|AUDIO|><|audio_eos|>"
+                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
                     multi_modal_data["audio"] = audio
                 else:
-                    user_content += "<|audio_bos|><|AUDIO|><|audio_eos|>"
+                    user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
                     multi_modal_data["audio"] = audio
 
             image = images_list[i]
             if image is not None:
                 if isinstance(image, list):
                     for _ in image:
-                        user_content += "<|vision_bos|><|IMAGE|><|vision_eos|>"
+                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
                     multi_modal_data["image"] = image
                 else:
-                    user_content += "<|vision_bos|><|IMAGE|><|vision_eos|>"
+                    user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
                     multi_modal_data["image"] = image
 
             video = videos_list[i]
             if video is not None:
                 if isinstance(video, list):
                     for _ in video:
-                        user_content += "<|vision_bos|><|VIDEO|><|vision_eos|>"
+                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
                     multi_modal_data["video"] = video
                 else:
-                    user_content += "<|vision_bos|><|VIDEO|><|vision_eos|>"
+                    user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
                     multi_modal_data["video"] = video
 
             user_content += prompt_text
@@ -226,6 +235,87 @@ class OmniRunner:
             audios=audios,
             images=images,
             videos=videos,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        return self.generate(omni_inputs, sampling_params_list)
+
+    def generate_audio(
+        self,
+        prompts: list[str] | str,
+        sampling_params_list: list[SamplingParams] | None = None,
+        system_prompt: str | None = None,
+        audios: PromptAudioInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """
+        Convenience method to generate with multimodal inputs.
+        Args:
+            prompts: Text prompt(s)
+            sampling_params_list: List of sampling parameters for each stage
+            system_prompt: Optional system prompt
+            audios: Audio input(s)
+            mm_processor_kwargs: Optional processor kwargs
+        Returns:
+            List of OmniRequestOutput objects from stages with final_output=True
+        """
+        omni_inputs = self.get_omni_inputs(
+            prompts=prompts,
+            system_prompt=system_prompt,
+            audios=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        return self.generate(omni_inputs, sampling_params_list)
+
+    def generate_video(
+        self,
+        prompts: list[str] | str,
+        sampling_params_list: list[SamplingParams] | None = None,
+        system_prompt: str | None = None,
+        videos: PromptVideoInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """
+        Convenience method to generate with multimodal inputs.
+        Args:
+            prompts: Text prompt(s)
+            sampling_params_list: List of sampling parameters for each stage
+            system_prompt: Optional system prompt
+            videos: Video input(s)
+            mm_processor_kwargs: Optional processor kwargs
+        Returns:
+            List of OmniRequestOutput objects from stages with final_output=True
+        """
+        omni_inputs = self.get_omni_inputs(
+            prompts=prompts,
+            system_prompt=system_prompt,
+            videos=videos,
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        return self.generate(omni_inputs, sampling_params_list)
+
+    def generate_image(
+        self,
+        prompts: list[str] | str,
+        sampling_params_list: list[SamplingParams] | None = None,
+        system_prompt: str | None = None,
+        images: PromptImageInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """
+        Convenience method to generate with multimodal inputs.
+        Args:
+            prompts: Text prompt(s)
+            sampling_params_list: List of sampling parameters for each stage
+            system_prompt: Optional system prompt
+            images: Image input(s)
+            mm_processor_kwargs: Optional processor kwargs
+        Returns:
+            List of OmniRequestOutput objects from stages with final_output=True
+        """
+        omni_inputs = self.get_omni_inputs(
+            prompts=prompts,
+            system_prompt=system_prompt,
+            images=images,
             mm_processor_kwargs=mm_processor_kwargs,
         )
         return self.generate(omni_inputs, sampling_params_list)
