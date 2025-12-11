@@ -97,6 +97,17 @@ Model execution components.
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchEmbed][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchMerger][]
 
+<<<<<<< HEAD
+=======
+## Configuration
+
+Configuration classes.
+
+- [vllm_omni.config.model.OmniModelConfig][]
+- [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
+- [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
+
+>>>>>>> 63ddea8 (Add dir structure & coding style for tests.)
 ## Workers
 
 Worker classes and model runners for distributed inference.
