@@ -1,9 +1,9 @@
 # Qwen-Image Offline Inference
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen_image>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
 
-This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
+This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -13,6 +13,7 @@ This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Im
 
 ```bash
 python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
   --prompt "a cup of coffee on the table" \
   --seed 42 \
   --cfg_scale 4.0 \
@@ -33,8 +34,6 @@ Key arguments:
 - `--height/--width`: output resolution (defaults 1024x1024).
 - `--output`: path to save the generated PNG.
 
-> ℹ️ Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
-
 ## Web UI Demo
 
 Launch the gradio demo:
@@ -49,9 +48,9 @@ Then open `http://localhost:7862/` on your local browser to interact with the we
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen_image/gradio_demo.py"
+    --8<-- "examples/offline_inference/text_to_image/gradio_demo.py"
     ``````
 ??? abstract "text_to_image.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen_image/text_to_image.py"
+    --8<-- "examples/offline_inference/text_to_image/text_to_image.py"
     ``````
