@@ -34,6 +34,7 @@ nav:
     - Feature Design:
       - design/feature/multi_request_streaming_design.md
       - design/feature/omni_connector_design.md
+      - design/feature/ray_based_execution.md
     - Module Design:
       - design/module/ar_module_design.md
       - design/module/dit_module_design.md

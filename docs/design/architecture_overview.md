@@ -3,7 +3,10 @@
 This document outlines the architectural design for vLLM-Omni.
 
 <p align="center">
-<img src="../source/architecture/omni-modality-model-architecture.png" alt="Omni-Modality Model Architecture" width="80%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png">
+    <img alt="Omni-Modality Model Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png" width=55%>
+  </picture>
 </p>
 
 # Goals
@@ -22,26 +25,41 @@ According to analysis for current popular open-source models, most of them have 
 
 **DiT as a main structure, with AR as text encoder (e.g.: Qwen-Image)**
   A powerful image generation foundation model capable of complex text rendering and precise image editing.
+
 <p align="center">
-<img src="../source/architecture/ar-main-architecture.png" alt="Qwen-Image" width="30%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-main-architecture.png">
+    <img alt="Qwen-Image" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-main-architecture.png" width=30%>
+  </picture>
 </p>
 
 **AR as a main structure, with DiT as multi-modal generator (e.g. BAGEL)**
   A unified multimodal comprehension and generation model, with cot text output and visual generation.
+
 <p align="center">
-<img src="../source/architecture/dit-main-architecture.png" alt="Bagel" width="30%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/dit-main-architecture.png">
+    <img alt="Bagel" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/dit-main-architecture.png" width=30%>
+  </picture>
 </p>
 
 **AR+DiT (e.g. Qwen-Omni)**
   A natively end-to-end omni-modal LLM for multimodal inputs (text/image/audio/video...) and outputs (text/audio...).
+
 <p align="center">
-<img src="../source/architecture/ar-dit-main-architecture.png" alt="Qwen-Omni" width="30%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-dit-main-architecture.png">
+    <img alt="Qwen-Omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/ar-dit-main-architecture.png" width=30%>
+  </picture>
 </p>
 
 # vLLM-Omni main architecture
 
 <p align="center">
-<img src="../source/architecture/vllm-omni-main-architecture.png" alt="vLLM-Omni Main Architecture" width="80%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/vllm-omni-main-architecture.png">
+    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/vllm-omni-main-architecture.png" width=55%>
+  </picture>
 </p>
 
 ## Key Components
@@ -89,7 +107,12 @@ vLLM-Omni is designed to be flexible and straightforward for users:
 
 If you use vLLM, then you know how to use vLLM-Omni from Day 0:
 
-![vLLM-Omni interface design](../source/architecture/vllm-omni-user-interface.png)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/vllm-omni-user-interface.png">
+    <img alt="vLLM-Omni interface design" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/vllm-omni-user-interface.png" width=55%>
+  </picture>
+</p>
 
 Taking **Qwen3-Omni** as an example:
 
