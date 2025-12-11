@@ -12,12 +12,16 @@ def detect_device_type() -> str:
         return "cuda"
     if hasattr(torch, "npu") and torch.npu.is_available():  # type: ignore[attr-defined]
         return "npu"
+    if hasattr(torch, "hpu") and torch.hpu.is_available():  # type: ignore[attr-defined]
+        return "hpu"
     return "cpu"
 
 
 def is_npu() -> bool:
     return detect_device_type() == "npu"
 
+def is_hpu() -> bool:
+    return detect_device_type() == "hpu"
 
 def get_device_control_env_var() -> str:
     """Return the environment variable name for device visibility control."""
@@ -29,6 +33,8 @@ def get_device_control_env_var() -> str:
     device_type = detect_device_type()
     if device_type == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
+    if device_type == "hpu":
+        retur "HABANA_VISIBLE_MODULES"
     return "CUDA_VISIBLE_DEVICES"  # fallback
 
 
@@ -36,7 +42,7 @@ def get_diffusion_worker_class() -> type:
     """Get the appropriate diffusion WorkerProc class based on current device type.
 
     Returns:
-        The WorkerProc class for the detected device type (either NPUWorkerProc or WorkerProc).
+        The WorkerProc class for the detected device type (either NPUWorkerProc, HPUWorkerProc or WorkerProc).
 
     Raises:
         ImportError: If the worker module for the detected device is not available.
@@ -47,6 +53,10 @@ def get_diffusion_worker_class() -> type:
         from vllm_omni.diffusion.worker.npu.npu_worker import NPUWorkerProc
 
         return NPUWorkerProc
+    elif device_type == "hpu":
+        from vllm_omni.diffusion.worker.hpu.hpu_worker import HPUWorkerProc
+
+        return HPUWorkerProc
     else:
         # Default to GPU worker for cuda and other devices
         from vllm_omni.diffusion.worker.gpu_worker import WorkerProc

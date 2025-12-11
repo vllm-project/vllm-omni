@@ -10,13 +10,13 @@ from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
-
+# FIXME: adjust the file for HPU needs
 def set_stage_devices(
     stage_id: int,
     devices: str | int | None,
     device_type: str | None = None,
 ) -> None:
-    """Configure per-stage device visibility and current device (CUDA or NPU).
+    """Configure per-stage device visibility and current device (CUDA, NPU or HPU).
 
     This function sets environment variables that control which devices are visible
     to the process, and sets the current device. It must be called BEFORE worker
@@ -27,19 +27,20 @@ def set_stage_devices(
         devices: Device specification:
             - Comma-separated string (e.g. "2,5,7"): interpreted as logical
               indices against the current device visibility env var (e.g.
-              CUDA_VISIBLE_DEVICES/ASCEND_RT_VISIBLE_DEVICES) when present;
-              falls back to physical IDs if no mapping exists. Logical index 0
-              is used as current device.
+              CUDA_VISIBLE_DEVICES/ASCEND_RT_VISIBLE_DEVICES/HABANA_VISIBLE_MODULES)
+              when present; falls back to physical IDs if no mapping exists.
+              Logical index 0 is used as current device.
             - Integer or digit-string: treat as logical index (0-based) into the
               current device visibility mapping; map to physical device, then set
               env var to this single device.
             - None/"cpu": keep default visibility.
             - Otherwise: set env var to the provided single device string.
-        device_type: Device type ("cuda" or "npu"). If None, auto-detects.
+        device_type: Device type ("cuda" or "npu", "hpu"). If None, auto-detects.
 
     Behavior:
         - CUDA: Sets CUDA_VISIBLE_DEVICES and calls torch.cuda.set_device()
         - NPU: Sets ASCEND_RT_VISIBLE_DEVICES and calls torch.npu.set_device()
+        - HPU: Set HABANA_VISIBLE_MODULES and calls torch.hpu.set_device()
     """
     from vllm_omni.utils import detect_device_type, get_device_control_env_var
 
@@ -63,6 +64,18 @@ def set_stage_devices(
         mem_get_info_fn = torch.npu.mem_get_info
         get_device_name_fn = torch.npu.get_device_name
         device_type_label = "NPU"
+    elif device_type == "hpu":
+        try:
+            import torch.hpu  # type: ignore[import-untyped]
+        except ImportError:
+            logger.debug("[Stage-%s] torch.hpu not available, skipping HPU device setup", stage_id)
+        is_available_fn = torch.hpu.is_available
+        set_device_fn = torch.hpu.set_device
+        device_count_fn = torch.hpu.device_count
+        get_device_properties_fn = torch.hpu.get_device_properties
+        mem_get_info_fn = torch.hpu.mem_get_info
+        get_device_name_fn = torch.hpu.get_device_name
+        device_type_label = "HPU"
     elif device_type == "cuda":
         import torch  # noqa: WPS433
 
