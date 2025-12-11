@@ -162,6 +162,8 @@ class OmniDiffusionConfig:
 
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
+    # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
+    flow_shift: float | None = None
 
     # Logging
     log_level: str = "info"
