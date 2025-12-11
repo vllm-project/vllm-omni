@@ -10,6 +10,7 @@ This section contains design documents and architecture specifications for vLLM-
 
 - [Multi-Request Streaming](feature/multi_request_streaming_design.md)
 - [Omni Connector Design](feature/omni_connector_design.md)
+- [Ray-based Execution](feature/ray_based_execution.md)
 
 ## Module Design Documents
 

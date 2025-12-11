@@ -74,6 +74,9 @@ uv pip install --no-build-isolation --editable .
 
 # --8<-- [end:build-wheel-from-source]
 
+# --8<-- [start:build-wheel-from-source-in-docker]
+
+# --8<-- [end:build-wheel-from-source-in-docker]
 
 # --8<-- [start:pre-built-images]
 
