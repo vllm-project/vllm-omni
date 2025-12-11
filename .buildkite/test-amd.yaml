@@ -1,34 +1,13 @@
-# AMD Test Pipeline for vLLM-Omni
-#
-# This file follows vLLM's test-amd.yaml structure and will be processed
-# by Jinja templates in the buildkite-ci repository (if configured).
-#
-# Documentation:
-# - mirror_hardwares: list of AMD hardware to run tests on [amdexperimental, amdproduction, amdtentative]
-# - agent_pool: GPU pool to use (mi325_1 = single MI325X GPU)
-# - fast_check: run on every commit
-# - timeout_in_minutes: test timeout
-# - source_file_dependencies: trigger test only when these files change
-# - commands: list of commands to execute
-# - working_dir: directory where commands execute (default: /vllm-omni-workspace/tests)
-
 steps:
-##### fast check tests  #####
+  - label: ":docker: Build image"
+    key: image-build
+    commands:
+      - "docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm ."
+    agents:
+      queue: "cpu_queue_premerge_us_east_1"
 
-- label: "Simple Unit Test"
-  commands:
-    - ".buildkite/scripts/simple_test.sh"
-  agents:
-    queue: "cpu_queue_premerge"
-
-# - label: ":rocm: Z-Image Diffusion Model Test"
-#   mirror_hardwares: [amdexperimental]
-#   agent_pool: mi325_1
-#   timeout_in_minutes: 20
-#   fast_check: true
-#   source_file_dependencies:
-#     - vllm_omni/
-#     - tests/test_diffusion_model.py
-#   commands:
-#     - pytest -v -s test_diffusion_model.py
-#   working_dir: "/vllm-omni-workspace/tests"
+  - label: "Simple Unit Test"
+    commands:
+      - ".buildkite/scripts/simple_test.sh"
+    agents:
+      queue: "cpu_queue_premerge"
