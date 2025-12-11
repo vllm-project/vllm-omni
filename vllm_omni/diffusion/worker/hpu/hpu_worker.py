@@ -28,10 +28,10 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
-# FIXME: adjust the file for HPU needs
-class NPUWorker:
+
+class HPUWorker:
     """
-    A worker that executes the model on a single NPU.
+    A worker that executes the model on a single HPU.
     """
 
     def __init__(
@@ -58,7 +58,7 @@ class NPUWorker:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        device = torch.device(f"npu:{rank}")
+        device = torch.device(f"hpu:{rank}")
         torch.npu.set_device(device)
 
         # hack
@@ -79,7 +79,7 @@ class NPUWorker:
         with DeviceMemoryProfiler() as m:
             self.pipeline = model_loader.load_model(
                 od_config=self.od_config,
-                load_device=f"npu:{rank}",
+                load_device=f"hpu:{rank}",
             )
         time_after_load = time.perf_counter()
 
@@ -110,7 +110,7 @@ class NPUWorker:
                 logger.warning("Worker %s: Failed to destroy process group: %s", self.rank, exc)
 
 
-class NPUWorkerProc:
+class HPUWorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
     def __init__(
@@ -140,7 +140,7 @@ class NPUWorkerProc:
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
-        worker = NPUWorker(
+        worker = HPUWorker(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
@@ -223,7 +223,7 @@ class NPUWorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
 
-        worker_proc = NPUWorkerProc(
+        worker_proc = HPUWorkerProc(
             od_config,
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
