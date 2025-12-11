@@ -20,9 +20,10 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
 # NPU still can't run Tongyi-MAI/Z-Image-Turbo properly
+# Modelscope can't find riverclouds/qwen_image_random
 # TODO: When NPU support is ready, remove this branch.
 if is_npu():
-    models = ["riverclouds/qwen_image_random"]
+    models = ["Qwen/Qwen-Image"]
 
 
 @pytest.mark.parametrize("model_name", models)
