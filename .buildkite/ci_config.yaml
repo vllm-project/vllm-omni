@@ -1,0 +1,10 @@
+name: vllm_omni_ci
+github_repo_name: vllm-project/vllm-omni
+job_dirs:
+  - ".buildkite/jobs"
+run_all_patterns: []
+run_all_exclude_patterns: []
+registries: public.ecr.aws/q9t5s3a7
+repositories:
+  main: "vllm-ci-postmerge-repo"
+  premerge: "vllm-ci-test-repo"

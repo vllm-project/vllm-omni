@@ -1,0 +1,10 @@
+group: Build
+steps:
+  - label: ":docker: build vllm-omni-ci image"
+    key: image-build
+    depends_on: []
+    commands:
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+      - "docker build --file docker/Dockerfile.ci -t vllm-omni-ci ."
+      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
