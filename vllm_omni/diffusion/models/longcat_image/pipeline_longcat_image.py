@@ -115,7 +115,7 @@ def get_longcat_image_post_process_func(
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** (len(vae_config.block_out_channels) - 1) if vae_config else 8
+        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
     
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
