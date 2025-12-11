@@ -1,6 +1,6 @@
 # Qwen-Image-Edit Offline Inference
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen_image>. Added in PR [#196](https://github.com/vllm-project/vllm-omni/pull/196).
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_image>. Added in PR [#196](https://github.com/vllm-project/vllm-omni/pull/196).
 
 This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
 
@@ -26,6 +26,6 @@ Key arguments:
 
 ??? abstract "image_edit.py"
     ``````py
-    --8<-- "examples/offline_inference/qwen_image/image_edit.py"
+    --8<-- "examples/offline_inference/image_to_image/image_edit.py"
     ``````
 

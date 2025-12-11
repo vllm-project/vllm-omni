@@ -1,6 +1,6 @@
 # Wan2.2 Text-to-Video Offline Inference
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/wan22>. Added in PR [#202](https://github.com/vllm-project/vllm-omni/pull/202).
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_video>. Added in PR [#202](https://github.com/vllm-project/vllm-omni/pull/202).
 
 The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text prompts.
 
