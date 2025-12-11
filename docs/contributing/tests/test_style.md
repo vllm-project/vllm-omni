@@ -18,7 +18,10 @@ def omni_server(request):
     model, stage_config_path = request.param
     with OmniServer(model, ["--stage-configs-path", stage_config_path]) as server:
         yield server
-    
+
+
+#output: audio
+#input: video
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_audio(
     client: openai.OpenAI, #指定client类型
