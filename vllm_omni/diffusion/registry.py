@@ -28,7 +28,7 @@ _DIFFUSION_MODELS = {
         "ovis_image",
         "pipeline_ovis_image",
         "OvisImagePipeline",
-    ),  
+    ),
     "WanPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
