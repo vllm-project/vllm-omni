@@ -1,4 +1,4 @@
-# Offline Example of vLLM-Omni for Qwen3-Omni
+# Qwen3-Omni
 
 ## 🛠️ Installation
 
