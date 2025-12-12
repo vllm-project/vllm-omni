@@ -301,7 +301,7 @@ def compute_and_log_stage_request_stats(
 
 
 def record_stage_metrics(
-    per_request: dict[int, dict[str, Any]],
+    per_request: dict[str, dict[str, Any]],
     stage_req_counts: list[int],
     stage_total_time_ms: list[float],
     stage_total_tokens: list[int],
@@ -312,8 +312,8 @@ def record_stage_metrics(
     try:
         stage_req_counts[stage_id] += 1
         stage_total_tokens[stage_id] += int(metrics.get("num_tokens_out", 0))
-        rid_int = int(req_id)
-        pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+        rid_key = str(req_id)
+        pr = per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         pr_stages = pr["stages"]  # type: ignore[index]
         pr_stages[stage_id] = {
             "stage_gen_time_ms": float(metrics.get("stage_gen_time_ms", 0.0)),
@@ -324,9 +324,9 @@ def record_stage_metrics(
 
 
 def aggregate_rx_and_maybe_total(
-    transfer_edge_req: dict[tuple[int, int, int], dict[str, float]],
+    transfer_edge_req: dict[tuple[int, int, str], dict[str, float]],
     transfer_agg: dict[tuple[int, int], dict[str, float]],
-    per_request: dict[int, dict[str, Any]],
+    per_request: dict[str, dict[str, Any]],
     stage_id: int,
     req_id: Any,
     rx_bytes: float,
@@ -355,11 +355,8 @@ def aggregate_rx_and_maybe_total(
             agg["rx_count"] += 1.0
 
             # Try combine with sender-side timing if present
-            try:
-                rid_int = int(req_id)
-            except Exception:
-                rid_int = req_id  # best effort
-            s = transfer_edge_req.get((stage_id - 1, stage_id, rid_int))
+            rid_key = str(req_id)
+            s = transfer_edge_req.get((stage_id - 1, stage_id, rid_key))
             if s is None:
                 return None
             tx_ms = float(s.get("tx_ms", 0.0))
@@ -369,7 +366,7 @@ def aggregate_rx_and_maybe_total(
             agg["total_count"] += 1.0
             # accumulate per-request transfer totals
             try:
-                pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+                pr = per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
                 pr["transfers_ms"] = float(pr.get("transfers_ms", 0.0)) + total_ms  # type: ignore[index]
                 pr["transfers_bytes"] = int(pr.get("transfers_bytes", 0)) + int(rx_bytes)  # type: ignore[index]
             except Exception:
@@ -382,7 +379,7 @@ def aggregate_rx_and_maybe_total(
 
 def record_sender_transfer_agg(
     transfer_agg: dict[tuple[int, int], dict[str, float]],
-    transfer_edge_req: dict[tuple[int, int, int], dict[str, float]],
+    transfer_edge_req: dict[tuple[int, int, str], dict[str, float]],
     from_stage: int,
     to_stage: int,
     req_id: Any,
@@ -408,11 +405,8 @@ def record_sender_transfer_agg(
         agg["sum_ms"] += float(tx_ms)
         agg["count"] += 1.0
         # Store sender-side timing for per-request combination
-        try:
-            rid_int = int(req_id)
-        except Exception:
-            rid_int = req_id
-        transfer_edge_req[(from_stage, to_stage, rid_int)] = {
+        rid_key = str(req_id)
+        transfer_edge_req[(from_stage, to_stage, rid_key)] = {
             "tx_ms": float(tx_ms),
             "size_bytes": float(size_bytes),
         }
@@ -512,12 +506,12 @@ class OrchestratorMetrics:
         self.stage_total_tokens: list[int] = [0 for _ in range(self.num_stages)]
         self.stage_req_counts: list[int] = [0 for _ in range(self.num_stages)]
         self.transfer_agg: dict[tuple[int, int], dict[str, float]] = {}
-        self.transfer_edge_req: dict[tuple[int, int, int], dict[str, float]] = {}
+        self.transfer_edge_req: dict[tuple[int, int, str], dict[str, float]] = {}
         self.e2e_total_ms: float = 0.0
         self.e2e_total_tokens: int = 0
         self.e2e_count: int = 0
-        self.e2e_done: set[int] = set()
-        self.per_request: dict[int, dict[str, Any]] = {}
+        self.e2e_done: set[str] = set()
+        self.per_request: dict[str, dict[str, Any]] = {}
         self.sum_per_request_transfer_ms: float = 0.0
         self.wall_start_ts: float = float(wall_start_ts)
         self.last_finish_ts: float = float(wall_start_ts)
@@ -614,10 +608,7 @@ class OrchestratorMetrics:
         )
 
     def on_finalize_request(self, stage_id: int, req_id: Any, engine_outputs: list[Any], req_start_ts: float) -> None:
-        try:
-            rid_int = int(req_id)
-        except Exception:
-            rid_int = req_id
+        rid_key = str(req_id)
         _t0 = float(req_start_ts)
         _t1 = time.time()
         # Update last output time for this stage
@@ -629,11 +620,11 @@ class OrchestratorMetrics:
         self.e2e_total_ms += e2e_ms
         self.e2e_total_tokens += int(num_tokens)
         self.e2e_count += 1
-        self.e2e_done.add(rid_int)
-        pr = self.per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+        self.e2e_done.add(rid_key)
+        pr = self.per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         per_req_record = {
             "type": "overall_request",
-            "request_id": rid_int,
+            "request_id": rid_key,
             "e2e_time_ms": e2e_ms,
             "num_tokens_out": int(num_tokens),
             "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
