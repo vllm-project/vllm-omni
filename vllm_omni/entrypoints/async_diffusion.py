@@ -17,13 +17,12 @@ from typing import Any, Optional
 
 from PIL import Image
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.outputs import OmniRequestOutput
-from vllm.transformers_utils.config import get_hf_file_to_dict
-
 
 logger = init_logger(__name__)
 
