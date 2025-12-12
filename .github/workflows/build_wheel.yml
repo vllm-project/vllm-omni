@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +30,7 @@ jobs:
 
       - name: Build Wheel
         run: |
-          bash .github/workflows/scripts/build.sh python
+          bash scripts/build_wheel.sh
 
       - name: Upload Wheel Artifact
         uses: actions/upload-artifact@v4
