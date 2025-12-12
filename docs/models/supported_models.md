@@ -6,7 +6,7 @@ vLLM-Omni supports unified multimodal comprehension and generation models across
 
 If vLLM-Omni natively supports a model, its implementation can be found in <gh-file:vllm_omni/model_executor/models> and <gh-file:vllm_omni/diffusion/models>.
 
-## List of Supported Models for Nvidia GPU
+## List of Supported Models for Nvidia GPU / AMD GPU
 
 <style>
 th {
