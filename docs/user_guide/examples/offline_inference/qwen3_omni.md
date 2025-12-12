@@ -1,4 +1,4 @@
-# Offline Example of vLLM-Omni for Qwen3-Omni
+# Qwen3-Omni
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen3_omni>.
 

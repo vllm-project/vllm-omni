@@ -1,6 +1,7 @@
-# Qwen-Image-Edit Offline Inference
+# Image-To-Image
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_image>. Added in PR [#196](https://github.com/vllm-project/vllm-omni/pull/196).
+
 
 This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
 
@@ -16,6 +17,7 @@ python image_edit.py \
 ```
 
 Key arguments:
+
 - `--image`: path to the source image (PNG/JPG, converted to RGB).
 - `--prompt` / `--negative_prompt`: text description (string).
 - `--cfg_scale`: true CFG scale for Qwen-Image-Edit (quality vs. fidelity).

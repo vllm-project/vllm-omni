@@ -1,6 +1,4 @@
-# Wan2.2 Text-to-Video Offline Inference
-
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_video>. Added in PR [#202](https://github.com/vllm-project/vllm-omni/pull/202).
+# Text-To-Video
 
 The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text prompts.
 
@@ -21,6 +19,7 @@ python text_to_video.py \
 ```
 
 Key arguments:
+
 - `--prompt`: text description (string).
 - `--height/--width`: output resolution (defaults 720x1280). Dimensions should align with Wan VAE downsampling (multiples of 8).
 - `--num_frames`: Number of frames (Wan default is 81).
@@ -29,10 +28,3 @@ Key arguments:
 - `--boundary_ratio`: Boundary split ratio for low/high DiT.
 - `--fps`: frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: path to save the generated video.
-
-## Example materials
-
-??? abstract "text_to_video.py"
-    ``````py
-    --8<-- "examples/offline_inference/wan22/text_to_video.py"
-    ``````

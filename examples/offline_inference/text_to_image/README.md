@@ -1,6 +1,6 @@
-# Qwen-Image Offline Inference
+# Text-To-Image
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
+This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -21,6 +21,7 @@ if __name__ == "__main__":
 
 ```bash
 python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
   --prompt "a cup of coffee on the table" \
   --seed 42 \
   --cfg_scale 4.0 \
