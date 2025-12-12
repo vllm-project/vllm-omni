@@ -11,16 +11,15 @@ import torch
 import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
 
-if envs._is_npu():
-    print("torch.npu synchronize")
-    from torch.npu import synchronize
-
-from vllm.logger import init_logger
-
 logger = init_logger(__name__)
+
+if envs._is_npu():
+    logger.info("torch.npu synchronize")
+    from torch.npu import synchronize
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
