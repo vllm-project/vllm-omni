@@ -1,4 +1,4 @@
-# Test File Structure and Style Guide
+# vLLM-Omni Test File Structure and Style Guide
 
 To ensure project maintainability and sustainable development, we encourage contributors to submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes. This document outlines the guidelines for organizing and naming test files.
 
@@ -26,10 +26,9 @@ vllm_omni/                          tests/
 │   └── model.py                    │   └── test_model.py
 │
 ├── core/                      →    ├── core/
-│   ├── dit_cache_manager.py       │   ├── test_dit_cache_manager.py
 │   └── sched/                      │   └── sched/                    # Maps to core/sched/
-│       ├── omni_ar_scheduler.py   │       ├── test_omni_ar_scheduler.py
-│       ├── omni_generation_scheduler.py │ ├── test_omni_generation_scheduler.py
+│       ├── omni_ar_scheduler.py    │       ├── test_omni_ar_scheduler.py
+│       ├── omni_generation_scheduler.py │  ├── test_omni_generation_scheduler.py
 │       └── output.py               │       └── test_output.py
 │
 ├── diffusion/                 →    ├── diffusion/
@@ -39,14 +38,14 @@ vllm_omni/                          tests/
 │   │   └── backends/               │   │   └── test_*.py
 │   ├── models/                     │   ├── models/                   # Maps to diffusion/models/
 │   │   ├── qwen_image/             │   │   ├── qwen_image/
-│   │   │   └── ...                  │   │   │   └── test_*.py
-│   │   └── z_image/                 │   │   └── z_image/
-│   │       └── ...                  │   │       └── test_*.py
-│   └── worker/                      │   └── worker/                   # Maps to diffusion/worker/
-│       └── ...                      │       └── test_*.py
+│   │   │   └── ...                 │   │   │   └── test_*.py
+│   │   └── z_image/                │   │   └── z_image/
+│   │       └── ...                 │   │       └── test_*.py
+│   └── worker/                     │   └── worker/                   # Maps to diffusion/worker/
+│       └── ...                     │       └── test_*.py
 │
 ├── distributed/               →    ├── distributed/
-│   └── ...                          │   └── test_*.py
+│   └── ...                         │   └── test_*.py
 │
 ├── engine/                    →    ├── engine/
 │   ├── processor.py                │   ├── test_processor.py
@@ -82,7 +81,7 @@ vllm_omni/                          tests/
 │   │       └── ...                 │   │       └── test_*.py
 │   ├── stage_configs/              │   └── stage_configs/             # Configuration tests (if needed)
 │   │   └── ...                     │       └── test_*.py
-│   └── stage_input_processors/      │   └── stage_input_processors/
+│   └── stage_input_processors/     │   └── stage_input_processors/
 │       └── ...                     │       └── test_*.py
 │
 ├── sample/                    →    ├── sample/
@@ -92,11 +91,11 @@ vllm_omni/                          tests/
 │   └── platform_utils.py           │   └── test_platform_utils.py
 │
 ├── worker/                    →    ├── worker/
-    ├── gpu_ar_worker.py             │   ├── test_gpu_ar_worker.py
-    ├── gpu_generation_worker.py     │   ├── test_gpu_generation_worker.py
-    ├── gpu_model_runner.py          │   ├── test_gpu_model_runner.py
-    └── npu/                         │   └── npu/                       # Maps to worker/npu/
-        └── ...                      │       └── test_*.py
+    ├── gpu_ar_worker.py            │   ├── test_gpu_ar_worker.py
+    ├── gpu_generation_worker.py    │   ├── test_gpu_generation_worker.py
+    ├── gpu_model_runner.py         │   ├── test_gpu_model_runner.py
+    └── npu/                        │   └── npu/                       # Maps to worker/npu/
+        └── ...                     │       └── test_*.py
 │
 └── e2e/                       →    ├── e2e/                # End-to-end scenarios (no 1:1 source mirror)
                                     ├── online_serving/       # Full-stack online serving flows
