@@ -20,8 +20,10 @@ def detect_device_type() -> str:
 def is_npu() -> bool:
     return detect_device_type() == "npu"
 
+
 def is_hpu() -> bool:
     return detect_device_type() == "hpu"
+
 
 def get_device_control_env_var() -> str:
     """Return the environment variable name for device visibility control."""
@@ -34,7 +36,7 @@ def get_device_control_env_var() -> str:
     if device_type == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
     if device_type == "hpu":
-        retur "HABANA_VISIBLE_MODULES"
+        return "HABANA_VISIBLE_MODULES"
     return "CUDA_VISIBLE_DEVICES"  # fallback
 
 

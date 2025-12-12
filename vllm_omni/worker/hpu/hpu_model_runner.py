@@ -21,10 +21,14 @@ from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.sampling_params import SamplingType
 from vllm.utils import cdiv
 from vllm.v1.worker.gpu_model_runner import IntermediateTensors
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-from vllm_ascend.utils import enable_sp, lmhead_tp_enable
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.worker.npu_input_batch import CachedRequestState
+
+# from vllm_ascend.worker.npu_input_batch import CachedRequestState
+from vllm_gaudi.v1.worker.hpu_input_batch import CachedRequestState
+
+# from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+# from vllm_ascend.utils import enable_sp, lmhead_tp_enable
+# from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -32,12 +36,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class OmniNPUModelRunner(NPUModelRunner):
+class OmniHPUModelRunner(HPUModelRunner):
     """
     Base class for NPU model runners with multimodality support.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
         self.is_multimodal_raw_input_only_model = self.model_config.is_multimodal_raw_input_only_model

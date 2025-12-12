@@ -10,7 +10,6 @@ from vllm_omni.worker.hpu.hpu_ar_model_runner import HPUARModelRunner
 class HPUARWorker(HPUWorker):
     """HPU AR worker for thinker/talker stages in Omni model."""
 
-    def init_device(self):
-        device = self._init_device()
-
+    def init_device(self) -> None:
+        device = super().init_device()
         self.model_runner: HPUARModelRunner = HPUARModelRunner(self.vllm_config, device)

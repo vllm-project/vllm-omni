@@ -10,7 +10,6 @@ from vllm_omni.worker.hpu.hpu_generation_model_runner import HPUGenerationModelR
 class HPUGenerationWorker(HPUWorker):
     """HPU generation worker for code2wav stage in Omni model."""
 
-    def init_device(self):
-        device = self._init_device()
-
+    def init_device(self) -> None:
+        device = super().init_device()
         self.model_runner: HPUGenerationModelRunner = HPUGenerationModelRunner(self.vllm_config, device)

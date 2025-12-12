@@ -35,28 +35,28 @@ from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     ModelRunnerOutput,
 )
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.spec_decode.interface import SpecDcodeType
-from vllm_ascend.utils import (
-    ProfileExecuteDuration,
-    enable_sp,
-    lmhead_tp_enable,
-)
-from vllm_ascend.worker.model_runner_v1 import AsyncNPUModelRunnerOutput
 
+# from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+# from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
+# from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+# from vllm_ascend.attention.attention_v1 import AscendAttentionState
+# from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+# from vllm_ascend.spec_decode.interface import SpecDcodeType
+# from vllm_ascend.utils import (
+#     ProfileExecuteDuration,
+#     enable_sp,
+#     lmhead_tp_enable,
+# )
+# from vllm_ascend.worker.model_runner_v1 import AsyncNPUModelRunnerOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.npu.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.worker.hpu.hpu_model_runner import OmniHPUModelRunner
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
-class NPUGenerationModelRunner(OmniNPUModelRunner):
-    """Generation model runner for vLLM-omni on NPU (non-autoregressive)."""
+class HPUGenerationModelRunner(OmniHPUModelRunner):
+    """Generation model runner for vLLM-omni on HPU (non-autoregressive)."""
 
     def _prepare_inputs(
         self,
