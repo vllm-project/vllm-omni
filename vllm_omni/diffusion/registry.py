@@ -24,6 +24,11 @@ _DIFFUSION_MODELS = {
         "pipeline_z_image",
         "ZImagePipeline",
     ),
+    "WanPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "Wan22Pipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
@@ -66,6 +71,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "ZImagePipeline": "get_post_process_func",
+    "WanPipeline": "get_wan22_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
 }
 

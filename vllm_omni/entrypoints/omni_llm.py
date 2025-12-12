@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import os
 import time
+import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, Union
@@ -19,7 +20,18 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
+from vllm_omni.distributed.omni_connectors import (
+    get_stage_connector_config,
+    initialize_orchestrator_connectors,
+)
+
 # Internal imports (our code)
+from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.ray_utils.utils import (
+    create_placement_group,
+    get_ray_queue_class,
+    try_close_ray,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
@@ -30,10 +42,12 @@ from vllm_omni.entrypoints.log_utils import (
     remove_old_logs,
 )
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
-from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
+from vllm_omni.entrypoints.utils import (
+    load_stage_configs_from_model,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -84,13 +98,24 @@ class OmniLLM:
         init_timeout: int = 300,
         **kwargs: Any,
     ):
+        self.worker_backend = kwargs.get("worker_backend", "multi_process")
+        self.ray_address = kwargs.get("ray_address", None)
+        self._ray_pg = None
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
+
         # Do NOT call super().__init__ to avoid creating OmniStageLLM instances in parent.
         if stage_configs_path is None:
+            self.config_path = resolve_model_config_path(model)
             self.stage_configs = load_stage_configs_from_model(model)
         else:
+            self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+
+        # Initialize connectors
+        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
+            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
+        )
 
         # Optional file handler for orchestrator
         self._log_file = log_file
@@ -124,33 +149,51 @@ class OmniLLM:
         self.stage_list = [st for _, st in results]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
-        self._ctx = mp.get_context("spawn")
+        if self.worker_backend == "ray":
+            self._queue_cls = get_ray_queue_class()
+        else:
+            self._ctx = mp.get_context("spawn")
+            self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
+
         self._stage_in_queues: list[mp.Queue] = []
         self._stage_out_queues: list[mp.Queue] = []
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
-        self._start_stage_processes(model)
+        self._start_stages(model)
         # Wait for all stages to report readiness before seeding
         self._stages_ready: set[int] = set()
         self._wait_for_stages_ready(timeout=init_timeout)
 
-    def _start_stage_processes(self, model: str) -> None:
+    def _start_stages(self, model: str) -> None:
+        if self.worker_backend == "ray":
+            # Initialize Ray Cluster
+            self._ray_pg = create_placement_group(
+                number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
+            )
+
         for stage_id, stage in enumerate(self.stage_list):
-            # Use unbounded queues to avoid deadlock when seeding many requests
-            in_q: mp.Queue = self._ctx.Queue(maxsize=0)
-            out_q: mp.Queue = self._ctx.Queue(maxsize=0)
+            in_q = self._queue_cls()
+            out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
-
-            # Attach queues and start Stage-owned worker process
             stage.attach_queues(in_q, out_q)
+
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
             stage.init_stage_worker(
                 model,
                 log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
-                ctx=self._ctx,
+                ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
+                connectors_config=stage_connectors_config,
+                worker_backend=self.worker_backend,
+                ray_placement_group=self._ray_pg,
             )
+
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
             time.sleep(self._init_sleep_seconds)
 
@@ -174,6 +217,8 @@ class OmniLLM:
                 stage.stop_stage_worker()
             except Exception as e:
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
+
+        try_close_ray(self._ray_pg)
 
     def __del__(self) -> None:  # best-effort
         try:
@@ -237,28 +282,31 @@ class OmniLLM:
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
 
-        # Map from request_id to original prompt
-        request_id_to_prompt: dict[int, PromptType] = {i: p for i, p in enumerate(request_prompts)}
+        # Generate globally unique request IDs and map them to original prompts
+        request_ids: list[str] = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
+        request_id_to_prompt: dict[str, PromptType] = {rid: p for rid, p in zip(request_ids, request_prompts)}
 
         # Track per-request start time for end-to-end timing
-        _req_start_ts: dict[int, float] = {}
+        _req_start_ts: dict[str, float] = {}
         _wall_start_ts: float = time.time()
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_for_e2e = -1
+        last_stage_id = len(self.stage_list) - 1
         try:
-            for _sid, _st in enumerate(self.stage_list):
-                if getattr(_st, "final_output", False):
-                    final_stage_id_for_e2e = max(final_stage_id_for_e2e, _sid)
+            for _sid in range(last_stage_id, -1, -1):
+                if getattr(self.stage_list[_sid], "final_output", False):
+                    final_stage_id_for_e2e = _sid
+                    break
             if final_stage_id_for_e2e < 0:
-                final_stage_id_for_e2e = len(self.stage_list) - 1
+                final_stage_id_for_e2e = last_stage_id
         except Exception as e:
             logger.debug(
                 "[Orchestrator] Failed to determine final stage for E2E; falling back to last: %s",
                 e,
                 exc_info=True,
             )
-            final_stage_id_for_e2e = len(self.stage_list) - 1
+            final_stage_id_for_e2e = last_stage_id
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
             num_stages,
@@ -357,8 +405,8 @@ class OmniLLM:
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
-                        if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
+                        rid_key = str(req_id)
+                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -387,50 +435,28 @@ class OmniLLM:
                         )
                         continue
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]  # type: ignore[index]
-                    try:
-                        # Measure transfer size and time (encode + enqueue)
-                        size_bytes = 0
-                        try:
-                            size_bytes = len(_set(next_inputs))
-                        except Exception:
-                            size_bytes = 0
-                        t0 = time.time()
-                        ipc_payload = _encode(
-                            next_inputs,
-                            getattr(self, "_shm_threshold_bytes", 65536),
-                            obj_key="engine_inputs",
-                            shm_key="engine_inputs_shm",
+
+                    # Check if we have a connector for this edge
+                    connector_key = (str(stage_id), str(next_stage_id))
+                    connector = self.connectors.get(connector_key)
+                    sent_via_connector = False
+                    if connector:
+                        sent_via_connector = try_send_via_connector(
+                            connector=connector,
+                            stage_id=stage_id,
+                            next_stage_id=next_stage_id,
+                            req_id=req_id,
+                            next_inputs=next_inputs,
+                            sampling_params=sp_next,
+                            original_prompt=request_id_to_prompt[req_id],
+                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                            metrics=metrics,
                         )
-                        ipc_payload.update(
-                            {
-                                "request_id": req_id,
-                                "sampling_params": sp_next,
-                                "sent_ts": time.time(),
-                            }
-                        )
-                        self.stage_list[next_stage_id].submit(ipc_payload)
-                        t1 = time.time()
-                        tx_ms = (t1 - t0) * 1000.0
-                        metrics.on_forward(
-                            stage_id,
-                            next_stage_id,
-                            req_id,
-                            int(size_bytes),
-                            float(tx_ms),
-                            bool("engine_inputs_shm" in ipc_payload),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[Orchestrator] IPC encode failed for req %s: %s; falling back to inline payload",
-                            req_id,
-                            e,
-                        )
-                        self.stage_list[next_stage_id].submit(
-                            {
-                                "request_id": req_id,
-                                "engine_inputs": next_inputs,
-                                "sampling_params": sp_next,
-                            }
+
+                    if not sent_via_connector:
+                        raise RuntimeError(
+                            f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                            "Configure a connector for this edge or inspect connector logs for details."
                         )
                     logger.debug(
                         "[Orchestrator] Forwarded request %s to stage-%s",
