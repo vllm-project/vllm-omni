@@ -4,6 +4,14 @@
 Pytest configuration and fixtures for vllm-omni tests.
 """
 
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
 from typing import Any
 
 import pytest
@@ -339,3 +347,188 @@ class OmniRunner:
 @pytest.fixture(scope="session")
 def omni_runner():
     return OmniRunner
+
+
+def _find_free_port() -> int:
+    """Find a free port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
+def _terminate_process_group(process: subprocess.Popen, wait_timeout: float = 15) -> None:
+    """Gracefully terminate a subprocess group, then force kill if it hangs."""
+    if process.poll() is not None:
+        return
+
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    try:
+        process.wait(timeout=wait_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        print(f"[TEST] Process did not exit in {wait_timeout}s; sending SIGKILL")
+    except Exception as e:  # pragma: no cover - defensive logging
+        print(f"[TEST] Error while waiting for process to exit: {e}")
+
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+    try:
+        process.wait(timeout=5)
+    except Exception as e:  # pragma: no cover - defensive logging
+        print(f"[TEST] Error while force-killing process: {e}")
+
+
+class _OutputStreamer:
+    """Stream subprocess output in a background thread."""
+
+    def __init__(self, process: subprocess.Popen, max_lines: int = 500):
+        self.process = process
+        self.lines: deque = deque(maxlen=max_lines)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._stream_output, daemon=True)
+        self._thread.start()
+
+    def _stream_output(self):
+        """Read and print output lines from the process."""
+        try:
+            for line in iter(self.process.stdout.readline, b""):
+                if self._stop_event.is_set():
+                    break
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                self.lines.append(decoded)
+                # Print server logs with prefix
+                print(f"[SERVER] {decoded}")
+        except Exception as e:
+            print(f"[SERVER] Output streaming error: {e}")
+
+    def stop(self):
+        """Stop the output streaming."""
+        self._stop_event.set()
+        self._thread.join(timeout=2)
+
+    def get_output(self) -> str:
+        """Get all captured output."""
+        return "\n".join(self.lines)
+
+
+def _wait_for_server(host: str, port: int, timeout: float = 1800, process: subprocess.Popen | None = None) -> bool:
+    """Wait for the server to be ready, fail fast if the process has died.
+
+    Args:
+        timeout: Maximum time to wait in seconds. Default is 1800 (30 minutes)
+                 because vLLM-Omni multi-stage pipeline takes a long time to initialize.
+    """
+    import requests
+
+    start_time = time.time()
+    url = f"http://{host}:{port}/health"
+
+    while time.time() - start_time < timeout:
+        elapsed = int(time.time() - start_time)
+        # Exit early if subprocess already crashed
+        if process is not None and process.poll() is not None:
+            print(f"\n[TEST] Server process exited early with code {process.returncode}")
+            return False
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                print(f"\n[TEST] Server ready after {elapsed}s")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(2)
+
+    print(f"\n[TEST] Server failed to start after {timeout}s")
+    return False
+
+
+def _create_server_cmd(host: str, port: int, model_name: str) -> list[str]:
+    """Build the command used to launch the omni server."""
+    return [
+        sys.executable,
+        "-m",
+        "vllm_omni.entrypoints.cli.main",
+        "serve",
+        model_name,
+        "--omni",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--trust-remote-code",
+        "--enforce-eager",
+        "--gpu-memory-utilization",
+        "0.8",
+        "--load-format",
+        "dummy",
+    ]
+
+
+@pytest.fixture(scope="module")
+def omni_server(request):
+    """Start vLLM-Omni server as a subprocess with actual model weights.
+
+    Uses module scope so the server starts only once for all tests.
+    Multi-stage initialization can take 10-20+ minutes.
+    """
+    if not hasattr(request, "param"):
+        raise ValueError("omni_server fixture requires a model name via @pytest.mark.parametrize")
+
+    model_name = request.param
+    port = _find_free_port()
+    host = "127.0.0.1"
+    cmd = _create_server_cmd(host, port, model_name)
+
+    print(f"\n{'=' * 60}")
+    print(f"Starting vLLM-Omni server on {host}:{port}")
+    print("Multi-stage init may take 10-20+ minutes...")
+    print(f"{'=' * 60}")
+    print(f"Command: {' '.join(cmd)}")
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
+        preexec_fn=os.setsid,  # Create new process group for cleanup
+    )
+
+    streamer = _OutputStreamer(process)
+
+    try:
+        if not _wait_for_server(host, port, timeout=1800, process=process):
+            streamer.stop()
+            process.terminate()
+            process.wait(timeout=10)
+            raise RuntimeError("Server failed to start within 30 minute timeout.\nSee server logs above for details.")
+
+        print(f"\n{'=' * 60}")
+        print(f"Server ready at http://{host}:{port}")
+        print(f"{'=' * 60}\n")
+
+        yield {
+            "host": host,
+            "port": port,
+            "base_url": f"http://{host}:{port}",
+            "model": model_name,
+            "process": process,
+            "streamer": streamer,
+        }
+
+    finally:
+        print("\nShutting down server...")
+        streamer.stop()
+        _terminate_process_group(process)
+        if process.poll() is None:
+            print("[TEST] Server shutdown forcefully; check logs above for details")
+        else:
+            print("Server shut down successfully")

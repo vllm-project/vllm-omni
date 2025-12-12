@@ -96,6 +96,11 @@ class Qwen2_5OmniForConditionalGeneration(
             self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.token2wav = None
+            self.thinker_embedding = nn.Embedding(
+                self.thinker_config.text_config.vocab_size,
+                self.thinker_config.text_config.hidden_size,
+            )
+            self._init_special_tokens_embeddings()
 
         elif self.model_stage == "code2wav":
             self.thinker = None
@@ -445,7 +450,9 @@ class Qwen2_5OmniForConditionalGeneration(
 
             code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
-
+            code = torch.where(
+                code > self.token2wav_config.dit_config.num_embeds, self.token2wav_config.dit_config.num_embeds, code
+            )
             audio_tensor = self.generate_audio(code, voice_type)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
