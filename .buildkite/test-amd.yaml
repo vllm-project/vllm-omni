@@ -2,7 +2,10 @@ steps:
   - label: ":docker: Build image"
     key: image-build
     commands:
-      - "docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm ."
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+      - "docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm-ci ."
+      - "docker tag vllm-omni-rocm-ci public.ecr.aws/q9t5s3a7/vllm-rocm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-rocm-ci-test-repo:$BUILDKITE_COMMIT"
     agents:
       queue: "amd-cpu"
 
