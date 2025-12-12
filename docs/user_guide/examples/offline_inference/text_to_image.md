@@ -3,7 +3,7 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
+This folder provides two simple entrypoints for experimenting with `Qwen/Qwen-Image` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
