@@ -64,7 +64,7 @@ def set_stage_devices(
         get_device_name_fn = torch.npu.get_device_name
         device_type_label = "NPU"
     elif device_type == "cuda":
-        import torch  # noqa: WPS433
+        import torch
 
         is_available_fn = torch.cuda.is_available
         set_device_fn = torch.cuda.set_device
@@ -145,7 +145,7 @@ def set_stage_devices(
             logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
 
         try:
-            import torch  # noqa: WPS433
+            import torch
 
             if is_available_fn():
                 try:
