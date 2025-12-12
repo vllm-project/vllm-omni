@@ -233,16 +233,21 @@ from ..multi_stages.conftest import OmniRunner
 # Optional: set process start method for workers
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml") # Edit here to load your model
+models = ["{your model name}"] #Edit here to load your model
+stage_configs = [str(Path(__file__).parent / "stage_configs" / {your model yaml})] #Edit here to load your model yaml
 
+# Create parameter combinations for model and stage config
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 # function name: test_{input_modality}_to_{output_modality}
 # modality candidate: text, image, audio, video, mixed_modalities
 @pytest.mark.gpu_mem_high  # requires high-memory GPU node
-@pytest.mark.parametrize("model", ["Qwen/Qwen3-Omni-30B-A3B-Instruct"])
+@pytest.mark.parametrize("test_config", test_params)
 def test_video_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
     """Offline inference: video input, audio output."""
-    with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
+    model, stage_config_path = test_config
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
+        # Prepare inputs
         video = VideoAsset(name="sample", num_frames=4).np_ndarrays
 
         outputs = runner.generate_multimodal(
