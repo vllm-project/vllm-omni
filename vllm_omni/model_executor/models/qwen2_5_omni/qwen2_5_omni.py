@@ -166,10 +166,11 @@ class Qwen2_5OmniForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
+        is_multimodal=None,
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
-        return self.model.embed_input_ids(input_ids, multimodal_embeddings)
+        return self.model.embed_input_ids(input_ids, multimodal_embeddings, is_multimodal)
 
     def embed_multimodal(self, **kwargs):
         # Delegate to thinker model for multimodal processing
