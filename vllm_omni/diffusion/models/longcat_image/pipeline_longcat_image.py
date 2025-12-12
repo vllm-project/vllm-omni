@@ -474,8 +474,18 @@ class LongCatImagePipeline(
         cfg_renorm_min: Optional[float] = 0.0,
         enable_prompt_rewrite: Optional[bool] = True,
     ) -> DiffusionOutput:
-        height = height or self.default_sample_size * self.vae_scale_factor
-        width = width or self.default_sample_size * self.vae_scale_factor
+        prompt = req.prompt if req.prompt is not None else prompt
+        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+
+        height = req.height or height or self.default_sample_size * self.vae_scale_factor
+        width = req.width or width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = req.num_inference_steps or num_inference_steps
+        generator = req.generator or generator
+        guidance_scale = req.guidance_scale or guidance_scale
+        num_images_per_prompt = getattr(req, "num_outputs_per_prompt", None) or num_images_per_prompt
+        enable_prompt_rewrite = getattr(req, "enable_prompt_rewrite", None) or enable_prompt_rewrite
+
+        
         if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
             logger.warning(
                 f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are {height} and {width}. Dimensions will be resized accordingly"
