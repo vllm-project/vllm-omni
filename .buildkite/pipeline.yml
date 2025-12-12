@@ -19,7 +19,7 @@ steps:
     timeout_in_minutes: 15
     depends_on: image-build
     commands:
-      - pytest -s -v tests/single_stage/test_diffusion_model.py
+      - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -38,7 +38,7 @@ steps:
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/multi_stages/
+      - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
     agents:
       queue: "gpu_4_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -56,7 +56,7 @@ steps:
     depends_on: image-build
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/multi_stages_h100/
+      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py
     agents:
       queue: "mithril-h100-pool"
     plugins:
