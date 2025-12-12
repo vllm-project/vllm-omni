@@ -2,6 +2,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import Annotated, Any, Callable, Literal, Optional, Union
+import time
 
 import torch
 import torch.nn as nn
@@ -666,6 +667,44 @@ class Qwen2_5OmniThinkerMultiModalProcessor(BaseMultiModalProcessor[Qwen2_5OmniT
 
 
 class Qwen2_5OmniConditionalGenerationMixin:
+    # Resource limits for computationally expensive operations to prevent DoS attacks
+    MAX_AUDIO_FEATURE_SIZE = 10_000_000  # Maximum number of audio features
+    MAX_IMAGE_PIXEL_SIZE = 50_000_000  # Maximum number of image pixels
+    MAX_VIDEO_FRAMES = 1000  # Maximum number of video frames per video
+    MAX_VIDEO_SPATIAL_SIZE = 2_000_000  # Maximum spatial size (height * width)
+    
+    # Rate limiting parameters to prevent resource exhaustion
+    RATE_LIMIT_WINDOW = 60.0  # Rate limit window in seconds
+    MAX_REQUESTS_PER_WINDOW = 100  # Maximum number of multimodal processing requests per window
+    
+    def _check_rate_limit(self) -> None:
+        """Check and enforce rate limiting on multimodal processing requests.
+        
+        Raises:
+            RuntimeError: If rate limit is exceeded
+        """
+        current_time = time.time()
+        
+        # Initialize request tracking if not already done
+        if not hasattr(self, '_request_timestamps'):
+            self._request_timestamps = []
+        
+        # Remove timestamps older than the rate limit window
+        self._request_timestamps = [
+            ts for ts in self._request_timestamps 
+            if current_time - ts < self.RATE_LIMIT_WINDOW
+        ]
+        
+        # Check if we've exceeded the maximum requests in the window
+        if len(self._request_timestamps) >= self.MAX_REQUESTS_PER_WINDOW:
+            raise RuntimeError(
+                f"Rate limit exceeded: maximum {self.MAX_REQUESTS_PER_WINDOW} multimodal processing "
+                f"requests allowed per {self.RATE_LIMIT_WINDOW} seconds"
+            )
+        
+        # Record this request timestamp
+        self._request_timestamps.append(current_time)
+    
     def _validate_and_reshape_mm_tensor(self, mm_input: object, name: str, dim: int = 0) -> torch.Tensor:
         if not isinstance(mm_input, (torch.Tensor, list)):
             raise ValueError(f"Incorrect type of {name}. Got type: {type(mm_input)}")
@@ -677,12 +716,24 @@ class Qwen2_5OmniConditionalGenerationMixin:
             return torch.concat(mm_input, dim=dim)
 
     def _parse_and_validate_audio_input(self, **kwargs: object) -> Optional[Qwen2_5OmniAudioFeatureInputs]:
+        # Enforce rate limiting on audio processing
+        self._check_rate_limit()
+        
         input_audio_features = kwargs.pop("input_audio_features", None)
         audio_feature_lengths = kwargs.pop("audio_feature_lengths", None)
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
         if input_audio_features is None:
             return None
         input_audio_features = self._validate_and_reshape_mm_tensor(input_audio_features, "input_audio_features", dim=1)
+        
+        # Validate audio feature size to prevent resource exhaustion attacks
+        if isinstance(input_audio_features, torch.Tensor):
+            audio_size = input_audio_features.numel()
+            if audio_size > self.MAX_AUDIO_FEATURE_SIZE:
+                raise ValueError(
+                    f"Audio feature size {audio_size} exceeds maximum allowed size {self.MAX_AUDIO_FEATURE_SIZE}"
+                )
+        
         if feature_attention_mask is not None:
             feature_attention_mask = self._validate_and_reshape_mm_tensor(
                 feature_attention_mask, "feature_attention_mask"
@@ -700,6 +751,9 @@ class Qwen2_5OmniConditionalGenerationMixin:
         self,
         **kwargs: dict[str, Any],
     ) -> Optional[Qwen2_5_VLImageInputs]:
+        # Enforce rate limiting on image processing
+        self._check_rate_limit()
+        
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -732,6 +786,9 @@ class Qwen2_5OmniConditionalGenerationMixin:
         self,
         **kwargs: dict[str, Any],
     ) -> Optional[Qwen2_5_VLVideoInputs]:
+        # Enforce rate limiting on video processing
+        self._check_rate_limit()
+        
         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
         video_embeds = kwargs.pop("video_embeds", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
@@ -742,6 +799,22 @@ class Qwen2_5OmniConditionalGenerationMixin:
         if pixel_values_videos is not None:
             pixel_values_videos = self._validate_and_reshape_mm_tensor(pixel_values_videos, "video pixel values")
             video_grid_thw = self._validate_and_reshape_mm_tensor(video_grid_thw, "video grid_thw")
+            
+            # Validate video resource constraints to prevent DoS attacks
+            if isinstance(video_grid_thw, torch.Tensor) and video_grid_thw.numel() > 0:
+                # video_grid_thw format: [num_videos, 3] where 3 = [time_frames, height, width]
+                for i, thw in enumerate(video_grid_thw):
+                    if thw.numel() >= 3:
+                        frames, height, width = int(thw[0]), int(thw[1]), int(thw[2])
+                        if frames > self.MAX_VIDEO_FRAMES:
+                            raise ValueError(
+                                f"Video {i} has {frames} frames exceeding maximum allowed frames {self.MAX_VIDEO_FRAMES}"
+                            )
+                        spatial_size = height * width
+                        if spatial_size > self.MAX_VIDEO_SPATIAL_SIZE:
+                            raise ValueError(
+                                f"Video {i} spatial size {spatial_size} exceeds maximum allowed size {self.MAX_VIDEO_SPATIAL_SIZE}"
+                            )
 
             return Qwen2_5_VLVideoPixelInputs(
                 type="pixel_values_videos",
@@ -752,6 +825,22 @@ class Qwen2_5OmniConditionalGenerationMixin:
         if video_embeds is not None:
             video_embeds = self._validate_and_reshape_mm_tensor(video_embeds, "video embeds")
             video_grid_thw = self._validate_and_reshape_mm_tensor(video_grid_thw, "video grid_thw")
+            
+            # Validate video resource constraints
+            if isinstance(video_grid_thw, torch.Tensor) and video_grid_thw.numel() > 0:
+                # video_grid_thw format: [num_videos, 3] where 3 = [time_frames, height, width]
+                for i, thw in enumerate(video_grid_thw):
+                    if thw.numel() >= 3:
+                        frames, height, width = int(thw[0]), int(thw[1]), int(thw[2])
+                        if frames > self.MAX_VIDEO_FRAMES:
+                            raise ValueError(
+                                f"Video {i} has {frames} frames exceeding maximum allowed frames {self.MAX_VIDEO_FRAMES}"
+                            )
+                        spatial_size = height * width
+                        if spatial_size > self.MAX_VIDEO_SPATIAL_SIZE:
+                            raise ValueError(
+                                f"Video {i} spatial size {spatial_size} exceeds maximum allowed size {self.MAX_VIDEO_SPATIAL_SIZE}"
+                            )
 
             if not isinstance(video_embeds, torch.Tensor):
                 raise ValueError(f"Incorrect type of video embeddings. Got type: {type(video_embeds)}")
