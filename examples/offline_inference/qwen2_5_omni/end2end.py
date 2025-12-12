@@ -372,6 +372,10 @@ def main(args):
             lines = [ln.strip() for ln in f.readlines()]
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
+    
+    for i, prompt in enumerate(prompts):
+        if i % 3 == 0:
+            prompt["modalities"] = ["text"]
 
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
 
