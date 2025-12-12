@@ -124,10 +124,6 @@ class OmniDiffusionRequest:
     save_output: bool = True
     return_frames: bool = False
 
-    # TeaCache parameters
-    enable_teacache: bool = False
-    # teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
-
     # STA parameters
     STA_param: list | None = None
     is_cfg_negative: bool = False

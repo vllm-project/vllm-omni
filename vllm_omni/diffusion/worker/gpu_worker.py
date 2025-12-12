@@ -84,12 +84,29 @@ class GPUWorker:
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
+        # Apply cache adapter (model_type is auto-injected in OmniDiffusionConfig.__post_init__)
+        from vllm_omni.diffusion.cache.apply import setup_cache
+
+        self.od_config.cache_config["model_type"] = self.od_config.model_class_name
+
+        self.pipeline._cache_adapter = setup_cache(
+            self.pipeline.transformer,
+            cache_type=self.od_config.cache_adapter,
+            cache_config=self.od_config.cache_config,
+        )
+
+    def maybe_reset_cache(self) -> None:
+        """Reset cache state before each generation if applicable."""
+        if self.pipeline._cache_adapter is not None:
+            self.pipeline._cache_adapter.reset(self.pipeline.transformer)
+
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
         Execute a forward pass.
         """
         assert self.pipeline is not None
+        self.maybe_reset_cache()
         # TODO: dealing with first req for now
         req = reqs[0]
         output = self.pipeline.forward(req)

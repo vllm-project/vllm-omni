@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -60,8 +61,12 @@ class OmniDiffusionConfig:
     # Workload type
     # workload_type: WorkloadType = WorkloadType.T2V
 
-    # Cache strategy
+    # Cache strategy (legacy)
     cache_strategy: str = "none"
+
+    # Cache adapter configuration (NEW)
+    cache_adapter: str = "none"  # "tea_cache", "deep_cache", etc.
+    cache_config: dict[str, Any] = field(default_factory=dict)
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -208,8 +213,17 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
+        # Automatically inject model_class_name into cache_config if not present
+        if self.cache_adapter != "none" and self.model_class_name:
+            if "model_type" not in self.cache_config:
+                self.cache_config["model_type"] = self.model_class_name
+                logger.debug(f"Auto-injected model_type='{self.model_class_name}' into cache_config")
+
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        # Check environment variable as fallback for cache_adapter
+        if "cache_adapter" not in kwargs:
+            kwargs["cache_adapter"] = os.environ.get("DIFFUSION_CACHE_ADAPTER", "none").lower()
         return cls(**kwargs)
 
 
