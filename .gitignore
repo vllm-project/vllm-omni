@@ -179,6 +179,7 @@ checkpoints/
 
 # Cache directories
 cache/
+!vllm_omni/diffusion/cache/
 .cache/
 diffusion_cache/
 kv_cache/
