@@ -638,7 +638,7 @@ class OrchestratorMetrics:
             e2e_tpt = (e2e_ms / num_tokens) if num_tokens > 0 else 0.0
             log_orchestrator_e2e(self.stats_file, req_id, stage_id, e2e_ms, int(num_tokens), e2e_tpt)
 
-    def build_and_log_summary(self, final_stage_id_for_e2e: int) -> dict[str, Any]:
+    def build_and_log_summary(self, final_stage_id_to_prompt: dict[str, int]) -> dict[str, Any]:
         # Compute stage summary using wall time between first input and last output per stage
         stage_summary: list[dict[str, Any]] = []
         for sid in range(self.num_stages):
@@ -673,7 +673,7 @@ class OrchestratorMetrics:
             "e2e_avg_time_per_request_ms": e2e_avg_req,
             "e2e_avg_tokens_per_s": e2e_avg_tok,
             "wall_time_ms": wall_time_ms,
-            "final_stage_id": final_stage_id_for_e2e,
+            "final_stage_id": final_stage_id_to_prompt,
             "stages": stage_summary,
             "transfers": transfer_summary,
         }

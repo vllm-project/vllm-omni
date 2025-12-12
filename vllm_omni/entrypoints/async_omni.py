@@ -357,6 +357,7 @@ class AsyncOmni(EngineClient):
             for stage_id, stage in enumerate(self.stage_list):
                 result = stage.try_collect()
                 if result is None:
+                    await asyncio.sleep(0)
                     continue
 
                 made_progress = True
