@@ -9,7 +9,9 @@ For unit tests and system tests, we strongly recommend placing test files in the
 
 ### End-to-End (E2E) Tests for Models
 End-to-end tests verify the complete functionality of a system or component. For our project, the E2E tests for different omni models are organized into two subdirectories:
+
 - **`tests/e2e/offline_inference/`**: Tests for offline inference modes (e.g., Qwen3Omni offline inference)
+
 - **`tests/e2e/online_serving/`**: Tests for online serving scenarios (e.g., API server tests)
 
 **Example:** The test file for `vllm_omni/entrypoints/omni_llm.py` should be located at `tests/entrypoints/test_omni_llm.py`.
@@ -96,16 +98,16 @@ vllm_omni/                          tests/
     └── npu/                         │   └── npu/                       # Maps to worker/npu/
         └── ...                      │       └── test_*.py
 │
-└── e2e/                →    ├── e2e/                # End-to-end scenarios (no 1:1 source mirror)
-                                  ├── online_serving/       # Full-stack online serving flows
-                                  │   └── (empty for now)
-                                  └── offline_inference/    # Full offline inference flows
-                                      ├── test_qwen2_5_omni.py     # Moved from multi_stages/
-                                      ├── test_qwen3_omni.py       # Moved from multi_stages_h100/
-                                      ├── test_diffusion_model.py  # Moved from single_stage/
-                                      └── stage_configs/           # Shared stage configs
-                                          ├── qwen2_5_omni_ci.yaml
-                                          └── qwen3_omni_ci.yaml
+└── e2e/                       →    ├── e2e/                # End-to-end scenarios (no 1:1 source mirror)
+                                    ├── online_serving/       # Full-stack online serving flows
+                                    │   └── (empty for now)
+                                    └── offline_inference/    # Full offline inference flows
+                                        ├── test_qwen2_5_omni.py     # Moved from multi_stages/
+                                        ├── test_qwen3_omni.py       # Moved from multi_stages_h100/
+                                        ├── test_diffusion_model.py  # Moved from single_stage/
+                                        └── stage_configs/           # Shared stage configs
+                                            ├── qwen2_5_omni_ci.yaml
+                                            └── qwen3_omni_ci.yaml
 ```
 
 
@@ -133,8 +135,10 @@ vllm_omni/                          tests/
 1. **File header**: Add SPDX license header to all test files
 2. **Imports**: Pls don't use manual `sys.path` modifications, use standard imports instead.
 3. **Test type differentiation**:
-   - Unit tests: Maintain mock style
-   - Model tests: Consider using OmniRunner uniformly, avoid decorators
+
+      - Unit tests: Maintain mock style
+      - E2E tests for models: Consider using OmniRunner uniformly, avoid decorators
+
 4. **Documentation**: Add docstrings to all test functions
 5. **Environment variables**: Set uniformly in `conftest.py` or at the top of files
 6. **Type annotations**: Add type annotations to all test function parameters
@@ -142,10 +146,13 @@ vllm_omni/                          tests/
 
 ### Template
 #### E2E - Online serving
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Online E2E smoke test for an omni model (video,text,audio → audio).
 """
-```python
 from pathlib import Path
 
 import pytest
@@ -179,7 +186,7 @@ def base64_encoded_video() -> str:
 @pytest.fixture(scope="session")
 def dummy_messages_from_video_data(video_data_url: str, content_text: str) -> str:
     xxx
-    
+
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_audio(
     client: openai.OpenAI,
@@ -189,24 +196,23 @@ def test_video_to_audio(
     #set message
     video_data_url = f"data:video/mp4;base64, {base64_encoded_video}"
     messages = dummy_messages_from_video_data(video_data_url)
-    
+
     #send request
     chat_completion = client.chat.completions.create(
         model=omni_server.model,
         messages=messages,
     )
-    
+
     #verify text output
     text_choice = chat_completion.choices[0]
     assert text_choice.finish_reason == "length"
-    
+
     #verify audio output
     audio_choice = chat_completion.choices[1]
     audio_message = audio_choice.message
     if hasattr(audio_message, "audio") and audio_message.audio:
         assert audio_message.audio.data is not None
         assert len(audio_message.audio.data) > 0
-    
 ```
 
 #### E2E - Offline inference
