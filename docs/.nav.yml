@@ -25,7 +25,6 @@ nav:
     - contributing/README.md
     - glob: contributing/*
       flatten_single_child_sections: true
-  - Dockerfile: contributing/dockerfile/dockerfile.md
   - Model Implementation:
     - contributing/model/README.md
   - CI: contributing/ci
