@@ -1,8 +1,15 @@
 # Summary
 
-## Entry Points
 
-Main entry points for vLLM-Omni inference and serving.
+## Configuration
+
+Configuration classes.
+
+- [vllm_omni.config.model.OmniModelConfig][]
+
+## EntryPoints
+
+Main entrypoints for vLLM-Omni inference and serving.
 
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
@@ -48,7 +55,6 @@ Engine classes for offline and online inference.
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.dit_cache_manager.DiTCacheManager][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
@@ -91,28 +97,14 @@ Model execution components.
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchEmbed][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchMerger][]
 
-## Configuration
-
-Configuration classes.
-
-- [vllm_omni.config.model.OmniModelConfig][]
-- [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
-
 ## Workers
 
 Worker classes and model runners for distributed inference.
 
 - [vllm_omni.diffusion.worker.gpu_worker.GPUWorker][]
 - [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
-- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
-- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
-- [vllm_omni.worker.npu.npu_ar_model_runner.NPUARModelRunner][]
-- [vllm_omni.worker.npu.npu_ar_worker.NPUARWorker][]
-- [vllm_omni.worker.npu.npu_generation_model_runner.NPUGenerationModelRunner][]
-- [vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker][]
-- [vllm_omni.worker.npu.npu_model_runner.OmniNPUModelRunner][]
