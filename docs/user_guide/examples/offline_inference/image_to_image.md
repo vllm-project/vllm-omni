@@ -1,4 +1,4 @@
-# Image-To-Image Offline Inference
+# Image-To-Image
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_image>. Added in PR [#196](https://github.com/vllm-project/vllm-omni/pull/196).
 

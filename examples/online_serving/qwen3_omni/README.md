@@ -1,4 +1,4 @@
-# Qwen3-Omni Online Serving
+# Qwen3-Omni
 
 ## 🛠️ Installation
 

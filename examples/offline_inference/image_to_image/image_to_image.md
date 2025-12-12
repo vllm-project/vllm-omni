@@ -1,4 +1,4 @@
-# Image-To-Image Offline Inference
+# Image-To-Image
 
 This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
 

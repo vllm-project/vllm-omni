@@ -1,4 +1,4 @@
-# Text-To-Image Offline Inference
+# Text-To-Image
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 

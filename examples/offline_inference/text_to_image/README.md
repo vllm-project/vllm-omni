@@ -1,4 +1,4 @@
-# Text-To-Image Offline Inference
+# Text-To-Image
 
 This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
 

@@ -1,4 +1,4 @@
-# Qwen2.5-Omni Offline Inference
+# Qwen2.5-Omni
 
 ## 🛠️ Installation
 

@@ -1,4 +1,4 @@
-# Text-To-Video Offline Inference
+# Text-To-Video
 
 The `Wan-AI/Wan2.2-T2V-A14B-Diffusers` pipeline generates short videos from text prompts.
 

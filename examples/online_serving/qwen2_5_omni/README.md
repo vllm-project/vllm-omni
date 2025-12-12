@@ -1,4 +1,4 @@
-# Qwen2.5-Omni Online Serving
+# Qwen2.5-Omni
 
 ## 🛠️ Installation
 

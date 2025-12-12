@@ -1,4 +1,4 @@
-# Qwen3-Omni Offline Inference
+# Qwen3-Omni
 
 ## 🛠️ Installation
 
