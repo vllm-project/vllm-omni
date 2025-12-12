@@ -141,8 +141,5 @@ docker run \
     "${image_name}" \
     bash -c '
     set -e
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    source /usr/local/Ascend/nnal/atb/set_env.sh && \
-    export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib
     VLLM_USE_MODELSCOPE=True pytest -s -v tests/multi_stages/test_qwen2_5_omni.py
 '
