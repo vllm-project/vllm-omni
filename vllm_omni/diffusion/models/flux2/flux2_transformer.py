@@ -139,8 +139,7 @@ class Flux2Attention(nn.Module):
         image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        hidden_states.shape[0]
-        hidden_states.shape[1]
+        img_seq_len = hidden_states.shape[1]
         txt_seq_len = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
 
         # Image QKV
@@ -171,10 +170,24 @@ class Flux2Attention(nn.Module):
 
             # Apply RoPE
             if image_rotary_emb is not None:
-                img_q = apply_rotary_emb(img_q, image_rotary_emb, sequence_dim=1)
-                img_k = apply_rotary_emb(img_k, image_rotary_emb, sequence_dim=1)
-                txt_q = apply_rotary_emb(txt_q, image_rotary_emb, sequence_dim=1)
-                txt_k = apply_rotary_emb(txt_k, image_rotary_emb, sequence_dim=1)
+                # In dual-stream blocks, we receive a concatenated (text+image) rotary embedding
+                # but apply it to two separate streams. Slice it to the right sequence lengths.
+                cos, sin = image_rotary_emb
+                if cos.shape[0] == txt_seq_len + img_seq_len:
+                    txt_rotary_emb = (cos[:txt_seq_len], sin[:txt_seq_len])
+                    img_rotary_emb = (
+                        cos[txt_seq_len : txt_seq_len + img_seq_len],
+                        sin[txt_seq_len : txt_seq_len + img_seq_len],
+                    )
+                else:
+                    # Fallback: assume caller already provided stream-aligned embeddings
+                    txt_rotary_emb = image_rotary_emb
+                    img_rotary_emb = image_rotary_emb
+
+                img_q = apply_rotary_emb(img_q, img_rotary_emb, sequence_dim=1)
+                img_k = apply_rotary_emb(img_k, img_rotary_emb, sequence_dim=1)
+                txt_q = apply_rotary_emb(txt_q, txt_rotary_emb, sequence_dim=1)
+                txt_k = apply_rotary_emb(txt_k, txt_rotary_emb, sequence_dim=1)
 
             # Joint attention: concatenate [text, image]
             joint_q = torch.cat([txt_q, img_q], dim=1)
@@ -882,4 +895,3 @@ class Flux2Transformer2DModel(nn.Module):
                     param.copy_(loaded_weight)
             else:
                 logger.warning(f"Weight {name} (mapped to {mapped_name}) not found in model params.")
-

@@ -3,6 +3,7 @@
 
 import json
 import os
+from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -19,9 +20,11 @@ from torch import nn
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2Transformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -115,6 +118,15 @@ class Flux2Pipeline(nn.Module):
     ):
         super().__init__()
         self.od_config = od_config
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
         self.device = get_local_device()
         model = od_config.model
 
@@ -152,9 +164,7 @@ class Flux2Pipeline(nn.Module):
 
         self.stage = None
 
-        self.vae_scale_factor = (
-            2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
-        )
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         # Flux2 latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible by the patch size.
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
@@ -190,8 +200,7 @@ class Flux2Pipeline(nn.Module):
             )
         elif prompt is None and prompt_embeds is None:
             raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. "
-                "Cannot leave both `prompt` and `prompt_embeds` undefined."
+                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
@@ -595,9 +604,9 @@ class Flux2Pipeline(nn.Module):
 
             # Apply BatchNorm handling
             latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-            latents_bn_std = torch.sqrt(
-                self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
-            ).to(latents.device, latents.dtype)
+            latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+                latents.device, latents.dtype
+            )
             latents = latents * latents_bn_std + latents_bn_mean
 
             # Unpatchify
@@ -607,61 +616,12 @@ class Flux2Pipeline(nn.Module):
             with torch.no_grad():
                 image = self.vae.decode(latents, return_dict=False)[0]
 
-            # Post-process
-            image = self.image_processor.postprocess(image, output_type=output_type)
-
         return DiffusionOutput(output=image)
 
-    def load_weights(self):
-        """Load transformer weights."""
-        self.load_transformer()
-
-    def load_transformer(self):
-        """Load transformer weights from checkpoint."""
-        import glob
-
-        # Define the weight iterator
-        def weight_iterator(transformer_path):
-            if not os.path.exists(transformer_path):
-                logger.warning(f"Path {transformer_path} does not exist.")
-                return
-
-            # Look for safetensors first
-            safetensors_files = glob.glob(os.path.join(transformer_path, "*.safetensors"))
-            if safetensors_files:
-                try:
-                    from safetensors.torch import load_file
-                except ImportError:
-                    logger.warning("safetensors not installed, cannot load .safetensors files.")
-                    return
-
-                for file_path in safetensors_files:
-                    state_dict = load_file(file_path)
-                    for name, tensor in state_dict.items():
-                        yield name, tensor
-            else:
-                # Fallback to bin
-                bin_files = glob.glob(os.path.join(transformer_path, "*.bin"))
-                for file_path in bin_files:
-                    state_dict = torch.load(file_path)
-                    for name, tensor in state_dict.items():
-                        yield name, tensor
-
-        try:
-            # Get model path from config or download from HF
-            model_name = self.od_config.model if hasattr(self, "od_config") else "black-forest-labs/FLUX.2-dev"
-            if os.path.exists(model_name):
-                model_path = model_name
-            else:
-                model_path = download_weights_from_hf_specific(model_name, None, ["*"])
-
-            transformer_path = os.path.join(model_path, "transformer")
-            self.transformer.load_weights(weight_iterator(transformer_path))
-            logger.info("Loaded Flux2 transformer weights successfully")
-
-        except Exception as e:
-            logger.error(f"An error occurred loading transformer weights: {e}")
-            raise e
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights using AutoWeightsLoader for vLLM integration."""
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
 
     @property
     def guidance_scale(self):
@@ -682,4 +642,3 @@ class Flux2Pipeline(nn.Module):
     @property
     def interrupt(self):
         return self._interrupt
-
