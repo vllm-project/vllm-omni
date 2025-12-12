@@ -16,7 +16,7 @@ from torch import nn
 
 from diffusers.models import AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from transformers import AutoTokenizer, AutoModel, AutoProcessor
+from transformers import AutoTokenizer, Qwen2VLProcessor, Qwen2_5_VLForConditionalGeneration
 from diffusers.utils.torch_utils import randn_tensor
 
 from vllm.logger import init_logger
@@ -311,9 +311,10 @@ class LongCatImagePipeline(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        self.text_encoder = AutoModel.from_pretrained(
+        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
+        self.text_processor = Qwen2VLProcessor.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
@@ -412,6 +413,34 @@ class LongCatImagePipeline(
 
         return prompt_embeds, text_ids
     
+    @staticmethod
+    def _pack_latents(latents, batch_size, num_channels_latents, height, width):
+        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+
+        return latents
+
+    @staticmethod
+    def _unpack_latents(latents, height, width, vae_scale_factor):
+        batch_size, num_patches, channels = latents.shape
+
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+        height = 2 * (int(height) // (vae_scale_factor * 2))
+        width = 2 * (int(width) // (vae_scale_factor * 2))
+
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+
+        latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
+
+        return latents
+    
+    @property
+    def do_classifier_free_guidance(self):
+        return self._guidance_scale > 1
+    
     def prepare_latents(
         self,
         batch_size,
@@ -507,7 +536,7 @@ class LongCatImagePipeline(
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = self._execution_device
+        device = self.device
         if enable_prompt_rewrite:
             prompt = self.rewire_prompt(prompt, device )
 
@@ -554,7 +583,7 @@ class LongCatImagePipeline(
         # handle guidance
         guidance = None
 
-        if self.joint_attention_kwargs is None:
+        if self._joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
 
         if self.do_classifier_free_guidance:
@@ -584,7 +613,7 @@ class LongCatImagePipeline(
 
             if self.do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
-                noise_pred = noise_pred_uncond + self.guidance_scale * \
+                noise_pred = noise_pred_uncond + self._guidance_scale * \
                         (noise_pred_text - noise_pred_uncond)
 
                 if enable_cfg_renorm:
@@ -615,7 +644,6 @@ class LongCatImagePipeline(
                 latents = latents.to(dtype=self.vae.dtype)
 
             image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
 
 
         return DiffusionOutput(output=image)
