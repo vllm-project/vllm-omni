@@ -593,7 +593,7 @@ class LongCatImagePipeline(
 
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
-            if self.interrupt:
+            if self._interrupt:
                 continue
 
             self._current_timestep = t
