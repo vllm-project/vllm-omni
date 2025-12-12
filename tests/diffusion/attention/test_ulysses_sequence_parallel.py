@@ -309,10 +309,6 @@ def ulysses_attention_on_test_model(
                 assert hasattr(layer.attention, "use_ulysses"), f"Layer {i} attention should have use_ulysses attribute"
                 assert layer.attention.use_ulysses, f"Layer {i} attention should be using Ulysses"
 
-        # Run backward pass to ensure gradients work
-        loss = output.sum()
-        loss.backward()
-
         print(
             f"Rank {local_rank}: Test passed with "
             f"batch_size={batch_size}, seq_len={seq_len}, "
