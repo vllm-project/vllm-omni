@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-from sageattention import sageattn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
