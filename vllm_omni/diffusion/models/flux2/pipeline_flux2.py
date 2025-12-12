@@ -170,7 +170,7 @@ class Flux2Pipeline(nn.Module):
             # Load text encoder
             self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
                 model, subfolder="text_encoder", local_files_only=local_files_only, torch_dtype=torch.bfloat16
-            ).to(self.device)
+            )
             logger.info("Loaded Flux2 text encoder successfully")
 
             # Load VAE
@@ -180,7 +180,7 @@ class Flux2Pipeline(nn.Module):
             logger.info("Loaded Flux2 VAE successfully")
 
             # Initialize transformer (with config support for CI testing)
-            self.transformer = Flux2Transformer2DModel(od_config=od_config).to(self.device)
+            self.transformer = Flux2Transformer2DModel(od_config=od_config)
             logger.info("Initialized Flux2 transformer successfully.")
 
             # Load tokenizer
