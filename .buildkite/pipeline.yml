@@ -40,7 +40,7 @@ steps:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
     agents:
-      queue: "gpu_4_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
