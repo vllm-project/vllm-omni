@@ -579,9 +579,6 @@ class QwenImageTransformer2DModel(nn.Module):
         # else:
         #     lora_scale = 1.0
 
-        ############################################################
-        # parallel inputs
-        ############################################################
         if self.parallel_config.sequence_parallel_size > 1:
             hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
                 get_sequence_parallel_rank()
@@ -628,9 +625,6 @@ class QwenImageTransformer2DModel(nn.Module):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
-        ############################################################
-        # parallel outputs
-        ############################################################
         if self.parallel_config.sequence_parallel_size > 1:
             output = get_sp_group().all_gather(output, dim=-2)
         return Transformer2DModelOutput(sample=output)
