@@ -104,7 +104,7 @@ vllm_omni/                          tests/
                                     └── offline_inference/    # Full offline inference flows
                                         ├── test_qwen2_5_omni.py     # Moved from multi_stages/
                                         ├── test_qwen3_omni.py       # Moved from multi_stages_h100/
-                                        ├── test_diffusion_model.py  # Moved from single_stage/
+                                        ├── test_t2i_model.py  # Moved from single_stage/
                                         └── stage_configs/           # Shared stage configs
                                             ├── qwen2_5_omni_ci.yaml
                                             └── qwen3_omni_ci.yaml
@@ -256,8 +256,6 @@ def test_video_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
         has_audio = any(o.final_output_type == "audio" for o in outputs)
         assert has_audio
 ```
-
-
 
 ## Checklist before submit your test files:
 

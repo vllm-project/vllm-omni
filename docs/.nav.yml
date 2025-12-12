@@ -32,6 +32,7 @@ nav:
   - Model Implementation:
     - contributing/model/README.md
   - CI: contributing/ci
+  - Tests: contributing/tests
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md
