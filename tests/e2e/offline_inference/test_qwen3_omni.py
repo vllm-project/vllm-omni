@@ -1,43 +1,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E tests for Qwen2.5-Omni model with mixed modality inputs and audio output.
+E2E offline tests for Omni model with video input and audio output.
 """
 
+import os
 from pathlib import Path
 
 import pytest
-from vllm.assets.audio import AudioAsset
-from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
-from vllm.multimodal.image import convert_image_mode
 
 from .conftest import OmniRunner
-from .utils import create_new_process_for_each_test
 
-models = ["Qwen/Qwen2.5-Omni-3B"]
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-# CI stage config optimized for 24GB GPU (L4/RTX3090)
-CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+
+# CI stage config for 2xH100-80G GPUs
+stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+
+# Create parameter combinations for model and stage config
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
-@pytest.mark.core_model
-@pytest.mark.parametrize("model", models)
-@create_new_process_for_each_test()
-def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
-    """Test processing audio, image, and video together, generating audio output."""
-    with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
-        # Prepare multimodal inputs
-        question = "What is recited in the audio? What is in this image? Describe the video briefly."
-        audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
-        audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
-        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
+@pytest.mark.parametrize("test_config", test_params)
+def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
+    """Test processing video, generating audio output."""
+    model, stage_config_path = test_config
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
+        # Prepare inputs
+        question = "Describe the video briefly."
         video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
 
         outputs = runner.generate_multimodal(
             prompts=question,
-            audios=audio,
-            images=image,
             videos=video,
         )
 
