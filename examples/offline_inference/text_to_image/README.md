@@ -1,4 +1,4 @@
-# Qwen-Image Offline Inference
+# Text-To-Image Offline Inference
 
 This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` using vLLM-Omni:
 

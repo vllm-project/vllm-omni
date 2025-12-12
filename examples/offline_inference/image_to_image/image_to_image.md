@@ -1,7 +1,4 @@
-# Qwen-Image-Edit Offline Inference
-
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_image>. Added in PR [#196](https://github.com/vllm-project/vllm-omni/pull/196).
-
+# Image-To-Image Offline Inference
 
 This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_edit.py` CLI.
 
@@ -23,10 +20,3 @@ Key arguments:
 - `--cfg_scale`: true CFG scale for Qwen-Image-Edit (quality vs. fidelity).
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--output`: path to save the generated PNG.
-
-## Example materials
-
-??? abstract "image_edit.py"
-    ``````py
-    --8<-- "examples/offline_inference/image_to_image/image_edit.py"
-    ``````
