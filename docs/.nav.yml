@@ -10,6 +10,7 @@ nav:
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
+      - FLUX 2: user_guide/examples/offline_inference/flux2.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
     - Online Serving:
