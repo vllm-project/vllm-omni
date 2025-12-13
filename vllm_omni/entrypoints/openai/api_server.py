@@ -1,6 +1,9 @@
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
+
+# Image generation API imports
+import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -38,20 +41,98 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
+from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.image_api_utils import (
+    build_generation_params,
+    encode_image_base64,
+    parse_size,
+)
+from vllm_omni.entrypoints.openai.image_model_profiles import (
+    get_model_profile,
+)
+from vllm_omni.entrypoints.openai.protocol.images import (
+    ImageData,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
+)
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 logger = init_logger(__name__)
 
 
+# Server entry points
+
+
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
-    """Run a single-worker API server."""
+    """Run a single-worker API server.
+
+    Automatically detects if the model is a diffusion model and routes
+    to the appropriate server implementation.
+    """
 
     # Add process-specific prefix to stdout and stderr.
     decorate_logs("APIServer")
 
     listen_address, sock = setup_server(args)
-    await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+
+    # Check if model is a diffusion model
+    if is_diffusion_model(args.model):
+        logger.info("Detected diffusion model, starting diffusion API server")
+        await omni_run_diffusion_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+    else:
+        await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+
+
+async def omni_run_diffusion_server(args, **uvicorn_kwargs) -> None:
+    """Run a diffusion model API server."""
+
+    # Add process-specific prefix to stdout and stderr.
+    decorate_logs("DiffusionAPIServer")
+
+    listen_address, sock = setup_server(args)
+    await omni_run_diffusion_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+
+
+async def omni_run_diffusion_server_worker(listen_address, sock, args, **uvicorn_kwargs) -> None:
+    """Run a diffusion model API server worker."""
+
+    # Load logging config for uvicorn if specified
+    log_config = load_log_config(args.log_config_file)
+    if log_config is not None:
+        uvicorn_kwargs["log_config"] = log_config
+
+    async with build_async_diffusion(args) as diffusion_engine:
+        app = build_app(args)
+
+        await omni_diffusion_init_app_state(diffusion_engine, app.state, args)
+
+        logger.info("Starting vLLM Diffusion API server on %s", listen_address)
+
+        shutdown_task = await serve_http(
+            app,
+            sock=sock,
+            enable_ssl_refresh=getattr(args, "enable_ssl_refresh", False),
+            host=args.host,
+            port=args.port,
+            log_level=args.uvicorn_log_level,
+            access_log=not getattr(args, "disable_uvicorn_access_log", False),
+            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+            ssl_keyfile=getattr(args, "ssl_keyfile", None),
+            ssl_certfile=getattr(args, "ssl_certfile", None),
+            ssl_ca_certs=getattr(args, "ssl_ca_certs", None),
+            ssl_cert_reqs=getattr(args, "ssl_cert_reqs", 0),
+            h11_max_incomplete_event_size=getattr(args, "h11_max_incomplete_event_size", None),
+            h11_max_header_count=getattr(args, "h11_max_header_count", None),
+            **uvicorn_kwargs,
+        )
+
+    # NB: Await server shutdown only after the backend context is exited
+    try:
+        await shutdown_task
+    finally:
+        sock.close()
 
 
 async def omni_run_server_worker(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
@@ -145,6 +226,54 @@ async def build_async_omni(
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
     ) as async_omni:
         yield async_omni
+
+
+@asynccontextmanager
+async def build_async_diffusion(
+    args: Namespace,
+    **kwargs: Any,
+) -> AsyncIterator[AsyncOmniDiffusion]:
+    """Build an AsyncOmniDiffusion instance from command-line arguments.
+
+    Creates an async context manager that yields an AsyncOmniDiffusion
+    instance configured from the provided arguments.
+
+    Args:
+        args: Parsed command-line arguments containing model and configuration
+        **kwargs: Additional keyword arguments passed to AsyncOmniDiffusion
+
+    Yields:
+        AsyncOmniDiffusion instance ready for use
+    """
+    diffusion_engine: Optional[AsyncOmniDiffusion] = None
+
+    try:
+        # Build diffusion config from args
+        diffusion_kwargs = {
+            "model": args.model,
+        }
+
+        # Add optional configuration from args
+        if hasattr(args, "num_gpus"):
+            diffusion_kwargs["num_gpus"] = args.num_gpus
+
+        if hasattr(args, "trust_remote_code"):
+            diffusion_kwargs["trust_remote_code"] = args.trust_remote_code
+
+        diffusion_kwargs.update(kwargs)
+
+        logger.info(
+            "Building AsyncOmniDiffusion with model=%s, num_gpus=%s",
+            args.model,
+            diffusion_kwargs.get("num_gpus", 1),
+        )
+
+        diffusion_engine = AsyncOmniDiffusion(**diffusion_kwargs)
+
+        yield diffusion_engine
+    finally:
+        if diffusion_engine:
+            diffusion_engine.shutdown()
 
 
 @asynccontextmanager
@@ -314,6 +443,62 @@ async def omni_init_app_state(
     state.server_load_metrics = 0
 
 
+async def omni_diffusion_init_app_state(
+    diffusion_engine: AsyncOmniDiffusion,
+    state: State,
+    args: Namespace,
+) -> None:
+    """Initialize the FastAPI application state for diffusion model API server.
+
+    Sets up the application state with diffusion model information and
+    chat completion handler for image generation via /v1/chat/completions.
+
+    Args:
+        diffusion_engine: AsyncOmniDiffusion engine instance
+        state: FastAPI application state object to initialize
+        args: Parsed command-line arguments
+    """
+    if args.served_model_name is not None:
+        served_model_names = args.served_model_name
+    else:
+        served_model_names = [args.model]
+
+    model_name = served_model_names[0] if served_model_names else args.model
+
+    state.diffusion_engine = diffusion_engine
+    state.diffusion_model_name = model_name  # Store for image endpoints
+    state.log_stats = not getattr(args, "disable_log_stats", False)
+
+    # Get default parameters from CLI args
+    default_seed = getattr(args, "diffusion_seed", None)
+    default_num_inference_steps = getattr(args, "num_inference_steps", 50)
+    default_guidance_scale = getattr(args, "guidance_scale", 4.0)
+
+    # Initialize chat handler with diffusion engine (uses /v1/chat/completions endpoint)
+    state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
+        diffusion_engine=diffusion_engine,
+        model_name=model_name,
+        default_seed=default_seed,
+        default_num_inference_steps=default_num_inference_steps,
+        default_guidance_scale=default_guidance_scale,
+    )
+
+    # Set other handlers to None for diffusion-only mode
+    state.engine_client = None
+    state.vllm_config = None
+
+    state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
+    state.server_load_metrics = 0
+
+    logger.info(
+        "Diffusion API server initialized for model: %s (seed=%s, steps=%d, guidance=%.2f)",
+        model_name,
+        default_seed,
+        default_num_inference_steps,
+        default_guidance_scale,
+    )
+
+
 def Omnichat(request: Request) -> Optional[OmniOpenAIServingChat]:
     return request.app.state.openai_serving_chat
 
@@ -337,11 +522,119 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except Exception as e:
+        logger.exception("Chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(), status_code=generator.error.code)
+        return JSONResponse(
+            content=generator.model_dump(), status_code=generator.code if hasattr(generator, "code") else 400
+        )
 
     elif isinstance(generator, ChatCompletionResponse):
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+# Image generation API endpoints
+
+
+@router.post(
+    "/v1/images/generations",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": ImageGenerationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+    """Generate images from text prompts using diffusion models.
+
+    OpenAI DALL-E compatible endpoint for text-to-image generation.
+
+    Args:
+        request: Image generation request with prompt and parameters
+        raw_request: Raw FastAPI request for accessing app state
+
+    Returns:
+        ImageGenerationResponse with generated images as base64 PNG
+
+    Raises:
+        HTTPException: For validation errors, missing engine, or generation failures
+    """
+    # Get diffusion engine from app state
+    diffusion_engine: Optional[AsyncOmniDiffusion] = getattr(raw_request.app.state, "diffusion_engine", None)
+    if diffusion_engine is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Diffusion engine not initialized. Start server with a diffusion model.",
+        )
+
+    # Get model profile
+    model_name = getattr(raw_request.app.state, "diffusion_model_name", request.model)
+
+    # Validate model matches server if specified in request
+    if request.model is not None and request.model != model_name:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{request.model}' but "
+            f"server is running '{model_name}'. Either omit the 'model' "
+            f"field or use '{model_name}'.",
+        )
+
+    try:
+        profile = get_model_profile(model_name)
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+
+    try:
+        # Parse and validate size
+        if request.size:
+            width, height = parse_size(request.size)
+        else:
+            width = profile.default_width
+            height = profile.default_height
+
+        # Build generation parameters
+        gen_params = build_generation_params(
+            request=request,
+            profile=profile,
+            width=width,
+            height=height,
+        )
+
+        logger.info(
+            f"[{model_name}] Generating {request.n} image(s) - "
+            f"size: {width}x{height}, steps: {gen_params['num_inference_steps']}, seed: {request.seed}"
+        )
+        logger.debug(f"Generation prompt: '{request.prompt[:100]}...'")  # Prompt details at debug level
+
+        # Generate images using AsyncOmniDiffusion
+        result = await diffusion_engine.generate(**gen_params)
+
+        # Extract images from result
+        images = result.images if hasattr(result, "images") else []
+
+        logger.info(f"Successfully generated {len(images)} image(s)")
+
+        # Encode images to base64
+        image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
+
+        return ImageGenerationResponse(
+            created=int(time.time()),
+            data=image_data,
+        )
+
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Image generation failed: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image generation failed: {str(e)}"
+        )
