@@ -39,7 +39,9 @@ from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.protocol import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 logger = init_logger(__name__)
 
@@ -310,12 +312,20 @@ async def omni_init_app_state(
         log_error_stack=args.log_error_stack,
     )
 
+    state.openai_serving_speech = OmniOpenAIServingSpeech(
+        engine_client, model_config, state.openai_serving_models, request_logger=request_logger
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
 
 
 def Omnichat(request: Request) -> Optional[OmniOpenAIServingChat]:
     return request.app.state.openai_serving_chat
+
+
+def Omnispeech(request: Request) -> Optional[OmniOpenAIServingSpeech]:
+    return request.app.state.openai_serving_speech
 
 
 @router.post(
@@ -345,3 +355,25 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post(
+    "/v1/audio/speech",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+    try:
+        return await handler.create_speech(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
