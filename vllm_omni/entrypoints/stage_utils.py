@@ -73,6 +73,17 @@ def set_stage_devices(
         mem_get_info_fn = torch.cuda.mem_get_info
         get_device_name_fn = torch.cuda.get_device_name
         device_type_label = "CUDA"
+    elif device_type == "xpu":
+        import intel_extension_for_pytorch  # noqa: F401
+        import torch
+
+        is_available_fn = torch.xpu.is_available
+        set_device_fn = torch.xpu.set_device
+        device_count_fn = torch.xpu.device_count
+        get_device_properties_fn = torch.xpu.get_device_properties
+        mem_get_info_fn = torch.xpu.mem_get_info
+        get_device_name_fn = torch.xpu.get_device_name
+        device_type_label = "XPU"
     else:
         logger.debug("[Stage-%s] Unsupported device type: %s", stage_id, device_type)
         return
