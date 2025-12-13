@@ -8,10 +8,6 @@ import torch
 import zmq
 from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm.distributed.parallel_state import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 from vllm.logger import init_logger
 from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
@@ -19,7 +15,9 @@ from vllm_omni.diffusion.data import (
     SHUTDOWN_MESSAGE,
     DiffusionOutput,
     OmniDiffusionConfig,
+    set_current_omni_diffusion_config,
 )
+from vllm_omni.diffusion.distributed.parallel_state import init_distributed_environment, initialize_model_parallel
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -60,12 +58,23 @@ class GPUWorker:
 
         # hack
         vllm_config = VllmConfig()
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
+        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         set_current_vllm_config(vllm_config)
+        set_current_omni_diffusion_config(self.od_config)
 
         init_distributed_environment(world_size=world_size, rank=rank)
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
         logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+        parallel_config = self.od_config.parallel_config
+        initialize_model_parallel(
+            data_parallel_degree=parallel_config.data_parallel_size,
+            classifier_free_guidance_degree=parallel_config.cfg_parallel_size,
+            sequence_parallel_degree=parallel_config.sequence_parallel_size,
+            ulysses_degree=parallel_config.ulysses_degree,
+            ring_degree=parallel_config.ring_degree,
+            tensor_parallel_degree=parallel_config.tensor_parallel_size,
+            pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
+        )
 
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config)
