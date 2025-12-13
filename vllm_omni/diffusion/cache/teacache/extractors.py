@@ -261,6 +261,7 @@ def extract_qwen_context(
 # to ensure consistent lookup without substring matching.
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImagePipeline": extract_qwen_context,
+    "QwenImageEditPipeline": extract_qwen_context,
     # Future models:
     # "FluxPipeline": extract_flux_context,
     # "CogVideoXPipeline": extract_cogvideox_context,
