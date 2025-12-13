@@ -17,6 +17,7 @@ nav:
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
   - General:
     - usage/*
+    - Cache-DiT Acceleration: user_guide/cache_dit_acceleration.md
   - Configuration:
     - configuration/README.md
     - configuration/*
