@@ -13,35 +13,34 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 logger = init_logger(__name__)
 
 try:
-    # only tested with flash_attn v3
-    # from flash_attn_interface import flash_attn_func as flash_attn_3_func  # not available in flash-attn 2.8.1
-    from flash_attn import flash_attn_func  # can be FA2 or FA3
+    from sageattention import sageattn
 except ImportError:
     logger.warning(
-        "FlashAttentionBackend is not available. You may install flash-attn "
-        "by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
-        " or install pre-built flash-attn from https://github.com/Dao-AILab/flash-attention/releases"
+        "SageAttentionBackend is not available. You may install sage-attention"
+        " by pip install git+https://github.com/thu-ml/SageAttention.git"
     )
     raise ImportError
 
+# TODO add sage3 attention backend
 
-class FlashAttentionBackend(AttentionBackend):
+
+class SageAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [64, 96, 128, 192, 256]
+        return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
     def get_name() -> str:
-        return "FLASH_ATTN"
+        return "SAGE_ATTN"
 
     @staticmethod
-    def get_impl_cls() -> type["FlashAttentionImpl"]:
-        return FlashAttentionImpl
+    def get_impl_cls() -> type["SageAttentionImpl"]:
+        return SageAttentionImpl
 
 
-class FlashAttentionImpl(AttentionImpl):
+class SageAttentionImpl(AttentionImpl):
     def __init__(
         self,
         num_heads: int,
@@ -52,7 +51,6 @@ class FlashAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
 
@@ -63,12 +61,12 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        # TODO: flash_attn_func does not support attn_mask.
-        out: torch.Tensor = flash_attn_func(
+        output = sageattn(
             query,
             key,
             value,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
+            tensor_layout="NHD",
+            is_causal=self.causal,
+            sm_scale=self.softmax_scale,
         )
-        return out
+        return output
