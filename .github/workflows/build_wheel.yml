@@ -29,6 +29,8 @@ jobs:
           pip install uv
 
       - name: Build Wheel
+        env:
+          UV_SYSTEM_PYTHON: 1
         run: |
           bash scripts/build_wheel.sh --python python
 
