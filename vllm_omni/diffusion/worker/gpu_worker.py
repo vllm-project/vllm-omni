@@ -88,12 +88,23 @@ class GPUWorker:
         from vllm_omni.diffusion.cache.apply import setup_cache
 
         self.od_config.cache_config["model_type"] = self.od_config.model_class_name
-
-        self.pipeline._cache_adapter = setup_cache(
-            self.pipeline.transformer,
-            cache_type=self.od_config.cache_adapter,
-            cache_config=self.od_config.cache_config,
-        )
+        # Not all diffusion pipelines expose a `transformer` attribute (e.g. BagelPipeline
+        # currently wraps an LLM + VAE directly). Only apply cache adapter when supported.
+        transformer = getattr(self.pipeline, "transformer", None)
+        if transformer is None:
+            self.pipeline._cache_adapter = None
+            logger.info(
+                "Worker %s: pipeline %s has no `transformer`; skipping cache adapter (%s).",
+                self.rank,
+                type(self.pipeline).__name__,
+                self.od_config.cache_adapter,
+            )
+        else:
+            self.pipeline._cache_adapter = setup_cache(
+                transformer,
+                cache_type=self.od_config.cache_adapter,
+                cache_config=self.od_config.cache_config,
+            )
 
     def maybe_reset_cache(self) -> None:
         """Reset cache state before each generation if applicable."""

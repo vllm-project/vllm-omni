@@ -48,16 +48,29 @@ class OmniDiffusion:
 
         self.od_config = od_config
 
-        config_dict = get_hf_file_to_dict(
-            "model_index.json",
-            od_config.model,
-        )
-        od_config.model_class_name = config_dict.get("_class_name", None)
-        tf_config_dict = get_hf_file_to_dict(
-            "transformer/config.json",
-            od_config.model,
-        )
-        od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        # Diffusers-style models expose `model_index.json` with `_class_name`.
+        # Bagel models (and other non-diffusers) typically expose `config.json`.
+        try:
+            config_dict = get_hf_file_to_dict(
+                "model_index.json",
+                od_config.model,
+            )
+            od_config.model_class_name = config_dict.get("_class_name", None)
+
+            tf_config_dict = get_hf_file_to_dict(
+                "transformer/config.json",
+                od_config.model,
+            )
+            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        except Exception:
+            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                od_config.model_class_name = "BagelPipeline"
+                od_config.tf_model_config = TransformerConfig()
+            else:
+                raise
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
