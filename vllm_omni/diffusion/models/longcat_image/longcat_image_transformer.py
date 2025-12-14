@@ -3,7 +3,7 @@
 
 import functools
 from collections.abc import Iterable
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -239,7 +239,7 @@ class LongCatImageTransformerBlock(nn.Module):
 
 
 class LongCatImagePosEmbed(nn.Module):
-    def __init__(self, theta: int, axes_dim: List[int]):
+    def __init__(self, theta: int, axes_dim: list[int]):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
@@ -307,9 +307,9 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[dict[str, Any]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
@@ -350,7 +350,7 @@ class LongCatImageTransformer2DModel(nn.Module):
         num_attention_heads: int = 24,
         joint_attention_dim: int = 3584,
         pooled_projection_dim: int = 3584,
-        axes_dims_rope: List[int] = [16, 56, 56],
+        axes_dims_rope: list[int] = [16, 56, 56],
     ):
         super().__init__()
         self.out_channels = in_channels

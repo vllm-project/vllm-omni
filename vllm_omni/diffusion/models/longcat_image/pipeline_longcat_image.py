@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import inspect
 from collections.abc import Iterable
-from typing import Any, Optional, Union, List, Dict
+from typing import Any, Optional, Union
 
 
 import json, re
@@ -149,8 +149,8 @@ def retrieve_timesteps(
     scheduler,
     num_inference_steps: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
+    timesteps: Optional[list[int]] = None,
+    sigmas: Optional[list[float]] = None,
     **kwargs,
 ):
     r"""
@@ -165,15 +165,15 @@ def retrieve_timesteps(
             must be `None`.
         device (`str` or `torch.device`, *optional*):
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
+        timesteps (`list[int]`, *optional*):
             Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
             `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
+        sigmas (`list[float]`, *optional*):
             Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
             `num_inference_steps` and `timesteps` must be `None`.
 
     Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        `tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
@@ -295,7 +295,7 @@ class LongCatImagePipeline(
         )
         return output_text
     
-    def _encode_prompt(self, prompt: List[str]):
+    def _encode_prompt(self, prompt: list[str]):
         batch_all_tokens = []
 
         for each_prompt in prompt:
@@ -358,7 +358,7 @@ class LongCatImagePipeline(
 
     def encode_prompt(
         self,
-        prompt: Union[str, List[str]] = None,
+        prompt: Union[str, list[str]] = None,
         num_images_per_prompt: Optional[int] = 1,
         prompt_embeds: Optional[torch.Tensor] = None,
     ):
@@ -478,22 +478,22 @@ class LongCatImagePipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: Union[str, List[str]] = None,
-        negative_prompt: Union[str, List[str]] = None,
+        prompt: Union[str, list[str]] = None,
+        negative_prompt: Union[str, list[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
-        sigmas: Optional[List[float]] = None,
+        sigmas: Optional[list[float]] = None,
         guidance_scale: float = 4.5,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator,
-                                List[torch.Generator]]] = None,
+                                list[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: Optional[dict[str, Any]] = None,
         enable_cfg_renorm: Optional[bool] = True,
         cfg_renorm_min: Optional[float] = 0.0,
         enable_prompt_rewrite: Optional[bool] = True,
