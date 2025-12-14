@@ -14,6 +14,8 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.request import OmniRequest
 
+from . import logger  # noqa: F401
+
 for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
