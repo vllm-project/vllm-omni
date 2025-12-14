@@ -76,7 +76,8 @@ def calculate_shift(
 
 def split_quotation(prompt, quote_pairs=None):
     """
-    Implement a regex-based string splitting algorithm that identifies delimiters defined by single or double quote pairs. 
+    Implement a regex-based string splitting algorithm that identifies delimiters 
+    defined by single or double quote pairs. 
 
     Examples::
         >>> prompt_en = "Please write 'Hello' on the blackboard for me."
@@ -116,11 +117,11 @@ def prepare_pos_ids(
         start=(0, 0),
         num_token=None,
         height=None,
-        width=None):
+        width=None) -> torch.Tensor:
     if type == 'text':
         assert num_token
         if height or width:
-            print(
+            logger.warning(
                 'Warning: The parameters of height and width will be ignored in "text" type.')
         pos_ids = torch.zeros(num_token, 3)
         pos_ids[..., 0] = modality_id
@@ -129,7 +130,7 @@ def prepare_pos_ids(
     elif type == 'image':
         assert height and width
         if num_token:
-            print('Warning: The parameter of num_token will be ignored in "image" type.')
+            logger.warning('Warning: The parameter of num_token will be ignored in "image" type.')
         pos_ids = torch.zeros(height, width, 3)
         pos_ids[..., 0] = modality_id
         pos_ids[..., 1] = (
@@ -152,7 +153,7 @@ def retrieve_timesteps(
     timesteps: Optional[list[int]] = None,
     sigmas: Optional[list[float]] = None,
     **kwargs,
-):
+) -> tuple[torch.Tensor, int]:
     r"""
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
@@ -246,12 +247,17 @@ class LongCatImagePipeline(
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
-        self.text_processor = Qwen2VLProcessor.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
+        self.text_processor = Qwen2VLProcessor.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
+        self.vae = AutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
         self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
-        self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model, subfolder="tokenizer", local_files_only=local_files_only
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
 
@@ -295,7 +301,7 @@ class LongCatImagePipeline(
         )
         return output_text
     
-    def _encode_prompt(self, prompt: list[str]):
+    def _encode_prompt(self, prompt: list[str]) -> torch.Tensor:
         batch_all_tokens = []
 
         for each_prompt in prompt:
@@ -361,7 +367,7 @@ class LongCatImagePipeline(
         prompt: Union[str, list[str]] = None,
         num_images_per_prompt: Optional[int] = 1,
         prompt_embeds: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if prompt_embeds is None and prompt is None:
             raise ValueError("Provide either `prompt` or `prompt_embeds`.")
 
