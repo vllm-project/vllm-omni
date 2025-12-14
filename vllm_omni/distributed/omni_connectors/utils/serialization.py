@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import io
 from typing import Any
 
-try:
-    import torch
-
-    _has_torch = True
-except ImportError:
-    _has_torch = False
+from vllm import envs
 
 try:
     import cloudpickle
@@ -23,57 +17,68 @@ from .logging import get_connector_logger
 logger = get_connector_logger(__name__)
 
 
+def _log_insecure_serialization_warning():
+    logger.warning_once("Allowing insecure serialization using pickle due to "
+                        "VLLM_ALLOW_INSECURE_SERIALIZATION=1")
+
+
 class OmniSerializer:
     """
     Centralized serialization handler for OmniConnectors.
-    Supports multiple backends (torch, cloudpickle) to ensure consistency across connectors.
     """
 
     @staticmethod
-    def serialize(obj: Any, method: str = "cloudpickle") -> bytes:
+    def serialize(obj: Any) -> bytes:
         """
-        Serialize an object to bytes.
+        Serialize an object to bytes using cloudpickle.
 
         Args:
             obj: The object to serialize.
-            method: Serialization method ("cloudpickle" or "torch").
-                    Defaults to "cloudpickle" (consistent with legacy stage_utils).
+
+        Returns:
+            Serialized bytes.
+
+        Raises:
+            TypeError: If cloudpickle is not available and insecure serialization
+                       is not explicitly allowed.
         """
-        if method == "torch" and _has_torch:
-            buf = io.BytesIO()
-            torch.save(obj, buf)
-            return buf.getvalue()
-        elif method == "cloudpickle" or (method == "torch" and not _has_torch):
-            if not _has_cloudpickle:
-                # Fallback to standard pickle if cloudpickle is missing
-                import pickle
-
-                return pickle.dumps(obj)
+        if _has_cloudpickle:
             return cloudpickle.dumps(obj)
-        else:
-            # Default fallback
-            import pickle
 
-            return pickle.dumps(obj)
+        if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+            raise TypeError(
+                f"Object of type {type(obj)} is not serializable. "
+                "Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow "
+                "fallback to pickle-based serialization."
+            )
+        _log_insecure_serialization_warning()
+        import pickle
+        return pickle.dumps(obj)
 
     @staticmethod
-    def deserialize(data: bytes, method: str = "cloudpickle") -> Any:
+    def deserialize(data: bytes) -> Any:
         """
-        Deserialize bytes to an object.
+        Deserialize bytes to an object using cloudpickle.
 
         Args:
             data: The bytes to deserialize.
-            method: Serialization method used ("cloudpickle" or "torch").
+
+        Returns:
+            Deserialized object.
+
+        Raises:
+            TypeError: If cloudpickle is not available and insecure serialization
+                       is not explicitly allowed.
         """
-        if method == "torch" and _has_torch:
-            return torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
-        elif method == "cloudpickle" or (method == "torch" and not _has_torch):
-            if not _has_cloudpickle:
-                import pickle
-
-                return pickle.loads(data)
+        if _has_cloudpickle:
             return cloudpickle.loads(data)
-        else:
-            import pickle
 
-            return pickle.loads(data)
+        if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
+            raise TypeError(
+                "Data is not deserializable. "
+                "Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow "
+                "fallback to pickle-based deserialization."
+            )
+        _log_insecure_serialization_warning()
+        import pickle
+        return pickle.loads(data)

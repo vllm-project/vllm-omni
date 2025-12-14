@@ -13,10 +13,10 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerial
 def test_pickle_serialization():
     """Test basic pickle serialization."""
     data = {"key": "value", "list": [1, 2, 3]}
-    serialized = OmniSerializer.serialize(data, method="cloudpickle")
+    serialized = OmniSerializer.serialize(data)
     assert isinstance(serialized, bytes)
 
-    deserialized = OmniSerializer.deserialize(serialized, method="cloudpickle")
+    deserialized = OmniSerializer.deserialize(serialized)
     assert data == deserialized
 
 
