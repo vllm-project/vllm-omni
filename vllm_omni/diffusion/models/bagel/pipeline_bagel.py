@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-
+"""
+BagelPipeline implementation for vLLM Omni.
+"""
 from __future__ import annotations
 
 import copy
@@ -10,8 +12,8 @@ from dataclasses import dataclass
 from math import isqrt
 
 import torch
-from PIL import Image
 from torch import nn
+from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -22,7 +24,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-from .autoencoder import AutoEncoder, AutoEncoderParams, default_ae_params
+from .autoencoder import AutoEncoder, AutoEncoderParams
 from .bagel_core import Bagel, BagelConfig
 from .qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
 from .utils import BagelGenParams, add_special_tokens
@@ -44,10 +46,25 @@ class _VaeCfg:
     downsample: int = 8
 
 
+def default_ae_params() -> AutoEncoderParams:
+    return AutoEncoderParams(
+        resolution=256,
+        in_channels=3,
+        downsample=8,
+        ch=128,
+        out_ch=3,
+        ch_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        z_channels=16,
+        scale_factor=0.3611,
+        shift_factor=0.1159,
+    )
+
+
 class BagelPipeline(nn.Module):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
-    This pipeline is self-contained and does NOT import the external Bagel repo.
+    This pipeline is self-contained and uses the ported Bagel core files.
     """
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
@@ -117,6 +134,7 @@ class BagelPipeline(nn.Module):
             language_model=self.language_model,
             config=BagelConfig(
                 visual_gen=True,
+                visual_und=False,  # Explicitly disabled
                 llm_config=llm_config,
                 vae_config=vae_cfg,
                 latent_patch_size=int(bagel_cfg.get("latent_patch_size", 2)),
@@ -149,6 +167,11 @@ class BagelPipeline(nn.Module):
         latent = latent.reshape(1, h, w, p, p, c)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, c, h * p, w * p)
+        
+        # Cast to VAE dtype (e.g. bfloat16) as latents might remain float32 from generation loop
+        vae_dtype = next(vae.parameters()).dtype
+        latent = latent.to(vae_dtype)
+        
         image = vae.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         return Image.fromarray(image.to(torch.uint8).cpu().numpy())
@@ -205,6 +228,9 @@ class BagelPipeline(nn.Module):
             _ = req.pil_image  # reserved
             # In practice you would encode the image into context here.
             gen_params.cfg_img_scale = 1.0
+        
+        # Initialize cfg_text_context BEFORE text update (unconditional on text).
+        cfg_text_context = copy.deepcopy(gen_context)
 
         # Add text prompt (prefill) on gen context.
         generation_input, newlens, new_rope = self.bagel.prepare_prompts(
@@ -234,14 +260,12 @@ class BagelPipeline(nn.Module):
         gen_context["kv_lens"] = newlens
         gen_context["ropes"] = new_rope
 
-        # Initialize cfg contexts from the (now-prefilled) gen context.
-        # This keeps KV/lens/rope consistent and avoids None-KV merge crashes.
-        # TODO: proper unconditional/negative-prompt text CFG should build a separate cfg_text_context.
-        cfg_text_context = copy.deepcopy(gen_context)
+        # Initialize cfg_img_context AFTER text update (conditional on text, but maybe unconditional on image later).
+        # Typically cfg_img_context mirrors gen_context for text-to-image.
         cfg_img_context = copy.deepcopy(gen_context)
 
         # Prepare latent query and run flow
-        generation_input, newlens, new_rope = self.bagel.prepare_vae_latent(
+        generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
             image_sizes=[image_shape],
