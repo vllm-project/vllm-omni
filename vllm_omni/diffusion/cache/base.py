@@ -2,66 +2,99 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Base cache adapter interface for diffusion models.
+Base cache backend interface for diffusion models.
 
-This module defines the abstract base class that all cache adapters must implement.
-Cache adapters provide a unified interface for applying different caching strategies
-(TeaCache, DeepCache, etc.) to transformer models using hooks.
+This module defines the abstract base class that all cache backends must implement.
+Cache backends provide a unified interface for applying different caching strategies
+to transformer models.
+
+Main cache backend implementations:
+1. CacheDiTBackend: Implements cache-dit acceleration (DBCache, SCM, TaylorSeer) using
+   the cache-dit library. Inherits from CacheBackend. Used via cache_backend="cache_dit".
+2. TeaCacheBackend: Hook-based backend for TeaCache acceleration. Inherits from
+   CacheBackend. Used via cache_backend="tea_cache".
+
+All backends implement the same interface:
+- enable(pipeline): Enable cache on the pipeline
+- refresh(pipeline, num_inference_steps, verbose): Refresh cache state
+- is_enabled(): Check if cache is enabled
 """
 
 from abc import ABC, abstractmethod
 from typing import Any
 
-import torch
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 
-class CacheAdapter(ABC):
+class CacheBackend(ABC):
     """
-    Abstract base class for cache adapters.
+    Abstract base class for cache backends.
 
-    Cache adapters apply caching strategies to transformer models to accelerate
-    inference. Each adapter type (TeaCache, DeepCache, etc.) implements the
-    apply() and reset() methods to manage cache lifecycle.
+    All cache backend implementations (CacheDiTBackend, TeaCacheBackend, etc.) inherit
+    from this base class and implement the enable() and refresh() methods to manage
+    cache lifecycle.
+
+    Cache backends apply caching strategies to transformer models to accelerate
+    inference. Different backends use different underlying mechanisms (e.g., cache-dit
+    library for CacheDiTBackend, hooks for TeaCacheBackend), but all share the same
+    unified interface.
 
     Attributes:
-        config: Dictionary containing cache-specific configuration parameters
+        config: DiffusionCacheConfig instance containing cache-specific configuration parameters
+        enabled: Boolean flag indicating whether cache is enabled (set to True after enable() is called)
     """
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: DiffusionCacheConfig):
         """
-        Initialize cache adapter with configuration.
+        Initialize cache backend with configuration.
 
         Args:
-            config: Cache-specific configuration dictionary
+            config: DiffusionCacheConfig instance with cache-specific parameters
         """
         self.config = config
+        self.enabled = False
 
     @abstractmethod
-    def apply(self, transformer: torch.nn.Module) -> None:
+    def enable(self, pipeline: Any) -> None:
         """
-        Apply cache to transformer using hooks.
+        Enable cache on the pipeline.
 
-        This method should register the appropriate hooks on the transformer
-        to enable caching during inference. Called once during pipeline
-        initialization.
+        This method applies the caching strategy to the transformer(s) in the pipeline.
+        The specific implementation depends on the backend (e.g., hooks for TeaCacheBackend,
+        cache-dit library for CacheDiTBackend). Called once during pipeline initialization.
 
         Args:
-            transformer: Transformer module to apply cache to
+            pipeline: Diffusion pipeline instance. The backend can extract:
+                     - transformer: via pipeline.transformer
+                     - model_type: via pipeline.__class__.__name__
         """
-        raise NotImplementedError("Subclasses must implement apply()")
+        raise NotImplementedError("Subclasses must implement enable()")
 
     @abstractmethod
-    def reset(self, transformer: torch.nn.Module) -> None:
+    def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """
-        Reset cache state for new generation.
+        Refresh cache state for new generation.
 
         This method should clear any cached values and reset counters/accumulators.
         Called at the start of each generation to ensure clean state.
 
         Args:
-            transformer: Transformer module to reset cache on
+            pipeline: Diffusion pipeline instance. The backend can extract:
+                     - transformer: via pipeline.transformer
+            num_inference_steps: Number of inference steps for the current generation.
+                                May be used for cache context updates.
+            verbose: Whether to log refresh operations (default: True)
         """
-        raise NotImplementedError("Subclasses must implement reset()")
+        raise NotImplementedError("Subclasses must implement refresh()")
+
+    def is_enabled(self) -> bool:
+        """
+        Check if cache is enabled on this backend.
+
+        Returns:
+            True if cache is enabled, False otherwise.
+        """
+        return self.enabled
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(config={self.config})"

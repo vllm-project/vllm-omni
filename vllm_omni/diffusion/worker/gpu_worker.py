@@ -15,6 +15,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import (
     SHUTDOWN_MESSAGE,
     DiffusionOutput,
@@ -84,21 +85,11 @@ class GPUWorker:
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
-        # Apply cache adapter (model_type is auto-injected in OmniDiffusionConfig.__post_init__)
-        from vllm_omni.diffusion.cache.apply import setup_cache
+        # Setup cache backend based on type (both backends use enable()/reset() interface)
+        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
-        self.od_config.cache_config["model_type"] = self.od_config.model_class_name
-
-        self.pipeline._cache_adapter = setup_cache(
-            self.pipeline.transformer,
-            cache_type=self.od_config.cache_adapter,
-            cache_config=self.od_config.cache_config,
-        )
-
-    def maybe_reset_cache(self) -> None:
-        """Reset cache state before each generation if applicable."""
-        if self.pipeline._cache_adapter is not None:
-            self.pipeline._cache_adapter.reset(self.pipeline.transformer)
+        if self.cache_backend is not None:
+            self.cache_backend.enable(self.pipeline)
 
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
@@ -106,9 +97,13 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
-        self.maybe_reset_cache()
         # TODO: dealing with first req for now
         req = reqs[0]
+
+        # Refresh cache context if needed
+        if self.cache_backend is not None and self.cache_backend.is_enabled():
+            self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
+
         output = self.pipeline.forward(req)
         return output
 

@@ -4,7 +4,7 @@
 import enum
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable
 
 import torch
@@ -42,6 +42,122 @@ class TransformerConfig:
 
 
 @dataclass
+class DiffusionCacheConfig:
+    """
+    Configuration for cache adapters (TeaCache, cache-dit, etc.).
+
+    This dataclass provides a unified interface for cache configuration parameters.
+    It can be initialized from a dictionary and accessed via attributes.
+
+    Common parameters:
+        - TeaCache: rel_l1_thresh, coefficients (optional)
+        - cache-dit: Fn_compute_blocks, Bn_compute_blocks, max_warmup_steps,
+                    residual_diff_threshold, enable_taylorseer, taylorseer_order,
+                    scm_steps_mask_policy, scm_steps_policy
+
+    Example:
+        >>> # From dict (user-facing API) - partial config uses defaults for missing keys
+        >>> config = DiffusionCacheConfig.from_dict({"rel_l1_thresh": 0.3})
+        >>> # Access via attribute
+        >>> print(config.rel_l1_thresh)  # 0.3 (from dict)
+        >>> print(config.Fn_compute_blocks)  # 8 (default)
+        >>> # Empty dict uses all defaults
+        >>> default_config = DiffusionCacheConfig.from_dict({})
+        >>> print(default_config.rel_l1_thresh)  # 0.2 (default)
+    """
+
+    # TeaCache parameters [tea_cache only]
+    # Default: 0.2 provides ~1.5x speedup with minimal quality loss (optimal balance)
+    rel_l1_thresh: float = 0.2
+    coefficients: list[float] | None = None  # Uses model-specific defaults if None
+
+    # cache-dit parameters [cache-dit only]
+    # Default: 1 forward compute block (optimized for single-transformer models)
+    # Use 1 as default instead of cache-dit's 8, optimized for single-transformer models
+    # This provides better performance while maintaining quality for most use cases
+    Fn_compute_blocks: int = 1
+    # Default: 0 backward compute blocks (no fusion by default)
+    Bn_compute_blocks: int = 0
+    # Default: 4 warmup steps (optimized for few-step distilled models like Z-Image with 8 steps)
+    # Use 4 as default warmup steps instead of 8 in cache-dit, making DBCache work
+    # for few-step distilled models (e.g., Z-Image with 8 steps)
+    max_warmup_steps: int = 4
+    # Default: -1 (unlimited cached steps) - DBCache disables caching when previous cached steps exceed this value
+    # to prevent precision degradation. Set to -1 for unlimited caching (cache-dit default).
+    max_cached_steps: int = -1
+    # Default: 0.24 residual difference threshold (higher for more aggressive caching)
+    # Use a relatively higher residual diff threshold (0.24) as default to allow more
+    # aggressive caching. This is safe because we have max_continuous_cached_steps limit.
+    # Without this limit, a lower threshold like 0.12 would be needed.
+    residual_diff_threshold: float = 0.24
+    # Default: Limit consecutive cached steps to 3 to prevent precision degradation
+    # This allows us to use a higher residual_diff_threshold for more aggressive caching
+    max_continuous_cached_steps: int = 3
+    # Default: Disable TaylorSeer (not suitable for few-step distilled models)
+    # TaylorSeer is not suitable for few-step distilled models, so we disable it by default.
+    # References:
+    # - From Reusing to Forecasting: Accelerating Diffusion Models with TaylorSeers
+    # - Forecast then Calibrate: Feature Caching as ODE for Efficient Diffusion Transformers
+    enable_taylorseer: bool = False
+    # Default: 1st order TaylorSeer polynomial
+    taylorseer_order: int = 1
+    # Default: "fast" SCM mask policy for good speed/quality balance
+    scm_steps_mask_policy: str = "fast"
+    # Default: "dynamic" steps policy for adaptive caching
+    scm_steps_policy: str = "dynamic"
+    # Used by cache-dit for scm mask generation. If this value changes during inference,
+    # we will re-generate the scm mask and refresh the cache context.
+    num_inference_steps: int | None = None
+
+    # Additional parameters that may be passed but not explicitly defined
+    _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DiffusionCacheConfig":
+        """
+        Create DiffusionCacheConfig from a dictionary.
+
+        Args:
+            data: Dictionary containing cache configuration parameters
+
+        Returns:
+            DiffusionCacheConfig instance with parameters set from dict
+        """
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected cache config dict, got {type(data)!r}")
+
+        # Get all dataclass field names automatically
+        field_names = {f.name for f in fields(cls)}
+
+        # Extract parameters that match dataclass fields (excluding private fields)
+        known_params = {k: v for k, v in data.items() if k in field_names and not k.startswith("_")}
+
+        # Store extra parameters
+        extra_params = {k: v for k, v in data.items() if k not in field_names}
+
+        # Create instance with known params (missing ones will use defaults)
+        # Then update _extra_params after creation since it's a private field
+        instance = cls(**known_params, _extra_params=extra_params)
+        return instance
+
+    def __getattr__(self, item: str) -> Any:
+        """
+        Allow access to extra parameters via attribute access.
+
+        This enables accessing parameters that weren't explicitly defined
+        in the dataclass fields but were passed in the dict.
+        """
+        if item == "_extra_params" or item.startswith("_"):
+            return object.__getattribute__(self, item)
+
+        extra = object.__getattribute__(self, "_extra_params")
+        if item in extra:
+            return extra[item]
+
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     model: str
@@ -64,9 +180,9 @@ class OmniDiffusionConfig:
     # Cache strategy (legacy)
     cache_strategy: str = "none"
 
-    # Cache adapter configuration (NEW)
-    cache_adapter: str = "none"  # "tea_cache", "deep_cache", etc.
-    cache_config: dict[str, Any] = field(default_factory=dict)
+    # Cache backend configuration (NEW)
+    cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
+    cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -213,17 +329,20 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
-        # Automatically inject model_class_name into cache_config if not present
-        if self.cache_adapter != "none" and self.model_class_name:
-            if "model_type" not in self.cache_config:
-                self.cache_config["model_type"] = self.model_class_name
-                logger.debug(f"Auto-injected model_type='{self.model_class_name}' into cache_config")
+        # Convert cache_config dict to DiffusionCacheConfig if needed
+        if isinstance(self.cache_config, dict):
+            self.cache_config = DiffusionCacheConfig.from_dict(self.cache_config)
+        elif not isinstance(self.cache_config, DiffusionCacheConfig):
+            # If it's neither dict nor DiffusionCacheConfig, convert to empty config
+            self.cache_config = DiffusionCacheConfig()
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        # Check environment variable as fallback for cache_adapter
-        if "cache_adapter" not in kwargs:
-            kwargs["cache_adapter"] = os.environ.get("DIFFUSION_CACHE_ADAPTER", "none").lower()
+        # Check environment variable as fallback for cache_backend
+        # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
+        if "cache_backend" not in kwargs:
+            cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
+            kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
         return cls(**kwargs)
 
 

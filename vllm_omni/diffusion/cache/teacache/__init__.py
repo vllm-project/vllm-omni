@@ -16,16 +16,16 @@ Usage:
 
     omni = Omni(
         model="Qwen/Qwen-Image",
-        cache_adapter="tea_cache",
+        cache_backend="tea_cache",
         cache_config={"rel_l1_thresh": 0.2}
     )
     images = omni.generate("a cat")
 
     # Alternative: Using environment variable
-    # export DIFFUSION_CACHE_ADAPTER=tea_cache
+    # export DIFFUSION_CACHE_BACKEND=tea_cache
 """
 
-from vllm_omni.diffusion.cache.teacache.adapter import TeaCacheAdapter
+from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import (
     CacheContext,
@@ -35,7 +35,7 @@ from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache
 from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
 
 __all__ = [
-    "TeaCacheAdapter",
+    "TeaCacheBackend",
     "TeaCacheConfig",
     "TeaCacheState",
     "TeaCacheHook",
