@@ -1,26 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
-
-from vllm.logger import init_logger
 from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import Timesteps, TimestepEmbedding, apply_rotary_emb, get_1d_rotary_pos_embed
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-
-from vllm_omni.utils.platform_utils import is_npu
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm_omni.diffusion.attention.layer import Attention
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.utils.platform_utils import is_npu
 
 logger = init_logger(__name__)
 
@@ -386,10 +383,8 @@ class LongCatImageTransformer2DModel(nn.Module):
             ]
         )
 
-        self.norm_out = AdaLayerNormContinuous(
-            self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(
-            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
+        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
 
@@ -430,7 +425,7 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         timestep = timestep.to(hidden_states.dtype) * 1000
 
-        temb = self.time_embed( timestep, hidden_states.dtype )
+        temb = self.time_embed(timestep, hidden_states.dtype)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
@@ -460,7 +455,7 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         for index_block, block in enumerate(self.single_transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_single_checkpoint[index_block]:
-                encoder_hidden_states,hidden_states = self._gradient_checkpointing_func(
+                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                     block,
                     hidden_states,
                     encoder_hidden_states,
