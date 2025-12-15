@@ -5,7 +5,12 @@ import os
 import time
 from typing import Any
 
+from vllm.logger import init_logger
 from vllm_omni.entrypoints.stage_utils import append_jsonl as _append_jsonl
+
+
+_orchestrator_logger = init_logger("vllm_omni.orchestrator")
+_diffusion_logger = init_logger("vllm_omni.diffusion")
 
 
 def remove_old_logs(log_file: str | None, num_stages: int) -> None:
@@ -49,6 +54,11 @@ def remove_old_logs(log_file: str | None, num_stages: int) -> None:
 
 
 def configure_orchestrator_logger(logger: logging.Logger, log_file: str | None) -> None:
+    """
+    Attach a FileHandler to the given logger, and also to the
+    module-level orchestrator & diffusion loggers so they share
+    the same log file.
+    """
     try:
         if not log_file:
             return
@@ -56,9 +66,21 @@ def configure_orchestrator_logger(logger: logging.Logger, log_file: str | None) 
         if not has_file_handler:
             fh = logging.FileHandler(log_file)
             fh.setLevel(logging.DEBUG)
-            fh.setFormatter(logging.Formatter("%(asctime)s [PID:%(process)d] %(levelname)s: %(message)s"))
+            fh.setFormatter(
+                logging.Formatter("%(asctime)s [PID:%(process)d] %(levelname)s: %(message)s")
+            )
+            # Attach to caller logger (usually __name__)
             logger.addHandler(fh)
             logger.setLevel(logging.DEBUG)
+
+            # Also attach to module-level orchestrator & diffusion loggers
+            for lg in (_orchestrator_logger, _diffusion_logger):
+                try:
+                    lg.addHandler(fh)
+                    if lg.level > logging.DEBUG:
+                        lg.setLevel(logging.DEBUG)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -296,8 +318,6 @@ def compute_and_log_stage_request_stats(
         float(rx_mbps),
     )
 
-
-# ----------------- Aggregation helpers for orchestrator -----------------
 
 
 def record_stage_metrics(
@@ -581,6 +601,18 @@ class OrchestratorMetrics:
                     float(total_ms_c),
                 )
 
+        if self.enable_stats:
+            try:
+                _diffusion_logger.info(
+                    "[StageMetrics] stage=%s req=%s metrics=%s",
+                    stage_id,
+                    req_id,
+                    metrics,
+                )
+            except Exception:
+                # best-effort logging; don't break orchestrator
+                pass
+
     def on_forward(
         self,
         from_stage: int,
@@ -639,6 +671,7 @@ class OrchestratorMetrics:
             "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
             "transfers_total_bytes": int(pr.get("transfers_bytes", 0)),
             "stages": pr.get("stages", {}),
+            "audio_metrics": pr.get("audio_metrics", {}),
         }
         self.sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
         if self.enable_stats and self.overall_stats_file:
@@ -674,6 +707,7 @@ class OrchestratorMetrics:
         e2e_avg_req = (self.e2e_total_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
         e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / self.e2e_total_ms) if self.e2e_total_ms > 0 else 0.0
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
+
         summary: dict[str, Any] = {
             "e2e_requests": int(self.e2e_count),
             "e2e_total_time_ms": float(wall_time_ms),
@@ -686,6 +720,7 @@ class OrchestratorMetrics:
             "stages": stage_summary,
             "transfers": transfer_summary,
         }
+
         if self.enable_stats and self.stats_file:
             log_orchestrator_summary(self.stats_file, summary)
         if self.enable_stats and self.overall_stats_file:

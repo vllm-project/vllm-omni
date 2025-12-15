@@ -7,7 +7,7 @@ with the correct prompt format on Qwen2.5-Omni
 
 import os
 from typing import NamedTuple, Optional
-
+import time
 import librosa
 import numpy as np
 import soundfile as sf
@@ -18,7 +18,7 @@ from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
 from vllm.utils import FlexibleArgumentParser
-
+from datetime import datetime
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -320,10 +320,17 @@ def main(args):
     else:
         query_result = query_func()
 
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(base_dir, "logs", "omni", ts)
+    os.makedirs(log_dir, exist_ok=True)
+
+    print("Omni logs will be saved to:", log_dir)
+
     omni_llm = Omni(
         model=model_name,
         log_stats=args.enable_stats,
-        log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
+        log_file=(os.path.join(log_dir, "omni_llm_pipeline.log") if args.enable_stats else None),
         init_sleep_seconds=args.init_sleep_seconds,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
@@ -419,7 +426,7 @@ def parse_args():
     parser.add_argument(
         "--enable-stats",
         action="store_true",
-        default=False,
+        default=True,
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(

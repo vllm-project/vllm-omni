@@ -18,7 +18,7 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils import FlexibleArgumentParser
-
+from datetime import datetime
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -169,10 +169,18 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
     else:
         query_result = query_func()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(base_dir, "logs", "omni", ts)
+    os.makedirs(log_dir, exist_ok=True)
+
+    print("Omni logs will be saved to:", log_dir)
 
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
+        log_stats=True,
+        log_file=os.path.join(log_dir, "omni_llm_pipeline.log")
     )
 
     thinker_sampling_params = SamplingParams(
