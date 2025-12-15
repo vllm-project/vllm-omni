@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from vllm.outputs import RequestOutput
@@ -17,7 +16,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
             output tensors (e.g., {"image": tensor, "audio": tensor})
     """
 
-    multimodal_outputs: Optional[dict[str, torch.Tensor]] = None
+    multimodal_outputs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass
