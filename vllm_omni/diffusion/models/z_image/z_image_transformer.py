@@ -227,7 +227,16 @@ class ZImageTransformerBlock(nn.Module):
                 nn.Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True),
             )
 
-    def forward(
+    def forward(self, x, attn_mask, freqs_cis, adaln_input=None):
+        dynamic_dims = [0, 1]
+        for dim in dynamic_dims:
+            torch._dynamo.mark_dynamic(x, dim)
+            torch._dynamo.mark_dynamic(attn_mask, dim)
+            torch._dynamo.mark_dynamic(freqs_cis, dim)
+        return self.old_forward(x, attn_mask, freqs_cis, adaln_input)
+
+    @torch.compile()
+    def old_forward(
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,
