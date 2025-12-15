@@ -34,7 +34,6 @@ from typing import Optional
 import torch
 import torch.distributed
 import vllm.distributed.parallel_state as vllm_parallel_state
-from torch.cuda import device_count, set_device
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
@@ -46,15 +45,12 @@ from .group_coordinator import (
     SequenceParallelGroupCoordinator,
 )
 
-try:
-    from torch_musa.core.device import device_count, set_device
-except ModuleNotFoundError:
-    pass
-
-try:
+if envs._is_npu():
     from torch.npu import device_count, set_device
-except ModuleNotFoundError:
-    pass
+elif envs._is_musa():
+    from torch_musa.core.device import device_count, set_device
+else:
+    from torch.cuda import device_count, set_device
 
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
