@@ -1,85 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import struct
 from typing import Any
 
-from vllm import envs
-
-try:
-    import cloudpickle
-
-    _has_cloudpickle = True
-except ImportError:
-    _has_cloudpickle = False
-
-from .logging import get_connector_logger
-
-logger = get_connector_logger(__name__)
-
-
-def _log_insecure_serialization_warning():
-    logger.warning_once("Allowing insecure serialization using pickle due to VLLM_ALLOW_INSECURE_SERIALIZATION=1")
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 class OmniSerializer:
     """
     Centralized serialization handler for OmniConnectors.
+
+    Wraps vLLM's MsgpackEncoder/MsgpackDecoder for safe serialization.
+
+    Wire format:
+        [num_bufs: u32][len_0: u32][len_1: u32]...[buf_0][buf_1]...
     """
+
+    _encoder = MsgpackEncoder()
+    _decoder = MsgpackDecoder()
 
     @staticmethod
     def serialize(obj: Any) -> bytes:
-        """
-        Serialize an object to bytes using cloudpickle.
+        """Serialize an object to bytes."""
+        bufs = OmniSerializer._encoder.encode(obj)
 
-        Args:
-            obj: The object to serialize.
+        # Header: num_bufs + length of each buffer
+        header = struct.pack("<I", len(bufs))
+        for buf in bufs:
+            header += struct.pack("<I", len(buf))
 
-        Returns:
-            Serialized bytes.
-
-        Raises:
-            TypeError: If cloudpickle is not available and insecure serialization
-                       is not explicitly allowed.
-        """
-        if _has_cloudpickle:
-            return cloudpickle.dumps(obj)
-
-        if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
-            raise TypeError(
-                f"Object of type {type(obj)} is not serializable. "
-                "Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow "
-                "fallback to pickle-based serialization."
-            )
-        _log_insecure_serialization_warning()
-        import pickle
-
-        return pickle.dumps(obj)
+        data = b"".join(
+            buf if isinstance(buf, bytes) else bytes(memoryview(buf))  # type: ignore[arg-type]
+            for buf in bufs
+        )
+        return header + data
 
     @staticmethod
     def deserialize(data: bytes) -> Any:
-        """
-        Deserialize bytes to an object using cloudpickle.
+        """Deserialize bytes to an object."""
+        # Parse header
+        (num_bufs,) = struct.unpack("<I", data[:4])
+        header_size = 4 + num_bufs * 4
+        len_arr = struct.unpack(f"<{num_bufs}I", data[4:header_size])
 
-        Args:
-            data: The bytes to deserialize.
+        if num_bufs == 1:
+            return OmniSerializer._decoder.decode(data[header_size:])
 
-        Returns:
-            Deserialized object.
-
-        Raises:
-            TypeError: If cloudpickle is not available and insecure serialization
-                       is not explicitly allowed.
-        """
-        if _has_cloudpickle:
-            return cloudpickle.loads(data)
-
-        if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
-            raise TypeError(
-                "Data is not deserializable. "
-                "Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow "
-                "fallback to pickle-based deserialization."
-            )
-        _log_insecure_serialization_warning()
-        import pickle
-
-        return pickle.loads(data)
+        # Multi-buffer: split by lengths
+        bufs = []
+        offset = header_size
+        for length in len_arr:
+            bufs.append(data[offset : offset + length])
+            offset += length
+        return OmniSerializer._decoder.decode(bufs)
