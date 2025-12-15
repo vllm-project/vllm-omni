@@ -275,8 +275,7 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
-            if stopped_running_reqs:
-                self.running = remove_all(self.running, stopped_running_reqs)
+            self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
