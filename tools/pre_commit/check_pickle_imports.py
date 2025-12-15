@@ -15,20 +15,23 @@ import regex as re
 #  Before adding new uses of pickle/cloudpickle, please consider safer
 #  alternatives like msgpack or pydantic that are already in use in vLLM. Only
 #  add to this list if absolutely necessary and after careful security review.
-ALLOWED_FILES = {
-}
+ALLOWED_FILES = {"vllm_omni/entrypoints/omni_llm.py", "tests/e2e/offline_inference/utils.py"}
 
-PICKLE_RE = re.compile(r"^\s*(import\s+(pickle|cloudpickle)(\s|$|\sas)"
-                       r"|from\s+(pickle|cloudpickle)\s+import\b)")
+PICKLE_RE = re.compile(
+    r"^\s*(import\s+(pickle|cloudpickle)(\s|$|\sas)"
+    r"|from\s+(pickle|cloudpickle)\s+import\b)"
+)
 
 
 def scan_file(path: str) -> int:
-    with open(path, encoding='utf-8') as f:
+    with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f, 1):
             if PICKLE_RE.match(line):
-                print(f"{path}:{i}: "
-                      "\033[91merror:\033[0m "  # red color
-                      "Found pickle/cloudpickle import")
+                print(
+                    f"{path}:{i}: "
+                    "\033[91merror:\033[0m "  # red color
+                    "Found pickle/cloudpickle import"
+                )
                 return 1
     return 0
 
@@ -65,14 +68,12 @@ def test_regex():
     ]
     for i, (line, should_match) in enumerate(test_cases):
         result = bool(PICKLE_RE.match(line))
-        assert result == should_match, (
-            f"Test case {i} failed: '{line}' "
-            f"(expected {should_match}, got {result})")
+        assert result == should_match, f"Test case {i} failed: '{line}' (expected {should_match}, got {result})"
     print("All regex tests passed.")
 
 
-if __name__ == '__main__':
-    if '--test-regex' in sys.argv:
+if __name__ == "__main__":
+    if "--test-regex" in sys.argv:
         test_regex()
     else:
         sys.exit(main())
