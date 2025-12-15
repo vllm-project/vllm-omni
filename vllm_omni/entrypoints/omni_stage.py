@@ -859,152 +859,165 @@ async def _stage_worker_async(
         _logging.getLogger(__name__).warning("[Stage-%s] Failed to send stage ready signal: %s", stage_id, e)
 
     # Batch processing loop
-    while True:
-        task = in_q.get()
-        _recv_dequeue_ts = _time.time()
-        if task is None:
-            _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
-            break
+    try:
+        while True:
+            task = in_q.get()
+            _recv_dequeue_ts = _time.time()
+            if task is None:
+                _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
+                break
 
-        _rx_bytes_by_rid: dict[Any, int] = {}
-        _rx_decode_ms_by_rid: dict[Any, float] = {}
-        _in_flight_ms_by_rid: dict[Any, float] = {}
+            _rx_bytes_by_rid: dict[Any, int] = {}
+            _rx_decode_ms_by_rid: dict[Any, float] = {}
+            _in_flight_ms_by_rid: dict[Any, float] = {}
 
-        rid = task["request_id"]
-        try:
-            sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
-            if sent_ts is not None:
-                _in_flight_ms_by_rid[rid] = (_recv_dequeue_ts - sent_ts) * 1000.0
-            else:
-                _in_flight_ms_by_rid[rid] = 0.0
-        except Exception:
-            _in_flight_ms_by_rid[rid] = 0.0
-        ein, _rx_metrics = try_recv_via_connector(
-            task=task,
-            connectors=connectors,
-            stage_id=stage_id,
-        )
-        if ein is None or _rx_metrics is None:
-            raise RuntimeError(
-                f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                "Ensure connectors are configured for all incoming edges."
-            )
-        _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-        _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
-
-        sampling_params = task["sampling_params"]
-        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%s", stage_id, rid)
-        print("--------------------------------", flush=True)
-        print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
-        print("--------------------------------", flush=True)
-        try:
-            _batch_seq += 1
-            _gen_t0 = _time.time()
-            if isinstance(ein, list):
-                ein = ein[0]
-
-            async for res in stage_engine.generate(ein, sampling_params, rid):
-                gen_output = res
-            _gen_t1 = _time.time()
-            _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-
-            r_outputs = [gen_output]
-            _num_tokens = count_tokens_from_outputs(r_outputs)
-            _agg_total_tokens += _num_tokens
-            _agg_total_gen_time_ms += _gen_ms
-
-            if _stats_file:
-                _avg_tokens_per_s = (
-                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
-                )
-                log_stage_running_avg(
-                    _stats_file,
-                    stage_id,
-                    int(_agg_total_tokens),
-                    float(_agg_total_gen_time_ms),
-                    float(_avg_tokens_per_s),
-                )
-                log_stage_batch_stats(_stats_file, stage_id, 1, float(_gen_ms), [rid])
-
+            rid = task["request_id"]
             try:
-                use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
-                _metrics = {
-                    "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                    "stage_gen_time_ms": _gen_ms,
-                    "batch_id": int(_batch_seq),
-                    "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                    "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                    "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                }
+                sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
+                if sent_ts is not None:
+                    _in_flight_ms_by_rid[rid] = (_recv_dequeue_ts - sent_ts) * 1000.0
+                else:
+                    _in_flight_ms_by_rid[rid] = 0.0
+            except Exception:
+                _in_flight_ms_by_rid[rid] = 0.0
+            ein, _rx_metrics = try_recv_via_connector(
+                task=task,
+                connectors=connectors,
+                stage_id=stage_id,
+            )
+            if ein is None or _rx_metrics is None:
+                raise RuntimeError(
+                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                    "Ensure connectors are configured for all incoming edges."
+                )
+            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
+            sampling_params = task["sampling_params"]
+            _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%s", stage_id, rid)
+            print("--------------------------------", flush=True)
+            print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
+            print("--------------------------------", flush=True)
+            try:
+                _batch_seq += 1
+                _gen_t0 = _time.time()
+                if isinstance(ein, list):
+                    ein = ein[0]
+
+                async for res in stage_engine.generate(ein, sampling_params, rid):
+                    gen_output = res
+                _gen_t1 = _time.time()
+                _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+
+                r_outputs = [gen_output]
+                _num_tokens = count_tokens_from_outputs(r_outputs)
+                _agg_total_tokens += _num_tokens
+                _agg_total_gen_time_ms += _gen_ms
+
                 if _stats_file:
-                    compute_and_log_stage_request_stats(
+                    _avg_tokens_per_s = (
+                        (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
+                    )
+                    log_stage_running_avg(
                         _stats_file,
                         stage_id,
-                        rid,
-                        1,
-                        r_outputs,
-                        float(_gen_ms),
-                        int(_metrics["rx_transfer_bytes"]),  # type: ignore[index]
-                        float(_metrics["rx_decode_time_ms"]),  # type: ignore[index]
+                        int(_agg_total_tokens),
+                        float(_agg_total_gen_time_ms),
+                        float(_avg_tokens_per_s),
                     )
-                if use_shm:
-                    out_q.put(
-                        {
-                            "request_id": rid,
-                            "stage_id": stage_id,
-                            "engine_outputs_shm": payload,
-                            "metrics": _metrics,
-                        }
-                    )
-                else:
-                    out_q.put(
-                        {
-                            "request_id": rid,
-                            "stage_id": stage_id,
-                            "engine_outputs": payload,
-                            "metrics": _metrics,
-                        }
-                    )
-                    try:
-                        print(
-                            f"[Stage-{stage_id}] Enqueued req={rid}, use_shm={use_shm}, "
-                            f"tokens_out={_metrics['num_tokens_out']}",
-                            flush=True,
+                    log_stage_batch_stats(_stats_file, stage_id, 1, float(_gen_ms), [rid])
+
+                try:
+                    use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
+                    _metrics = {
+                        "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
+                        "stage_gen_time_ms": _gen_ms,
+                        "batch_id": int(_batch_seq),
+                        "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                        "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
+                        "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                    }
+                    if _stats_file:
+                        compute_and_log_stage_request_stats(
+                            _stats_file,
+                            stage_id,
+                            rid,
+                            1,
+                            r_outputs,
+                            float(_gen_ms),
+                            int(_metrics["rx_transfer_bytes"]),  # type: ignore[index]
+                            float(_metrics["rx_decode_time_ms"]),  # type: ignore[index]
                         )
-                    except Exception:
-                        pass
-            except Exception as e:
-                _logging.getLogger(__name__).exception(
-                    "[Stage-%s] Failed to enqueue result for request %s: %s",
-                    stage_id,
-                    rid,
-                    e,
+                    if use_shm:
+                        out_q.put(
+                            {
+                                "request_id": rid,
+                                "stage_id": stage_id,
+                                "engine_outputs_shm": payload,
+                                "metrics": _metrics,
+                            }
+                        )
+                    else:
+                        out_q.put(
+                            {
+                                "request_id": rid,
+                                "stage_id": stage_id,
+                                "engine_outputs": payload,
+                                "metrics": _metrics,
+                            }
+                        )
+                        try:
+                            print(
+                                f"[Stage-{stage_id}] Enqueued req={rid}, use_shm={use_shm}, "
+                                f"tokens_out={_metrics['num_tokens_out']}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    _logging.getLogger(__name__).exception(
+                        "[Stage-%s] Failed to enqueue result for request %s: %s",
+                        stage_id,
+                        rid,
+                        e,
+                    )
+                    out_q.put(
+                        {
+                            "request_id": rid,
+                            "stage_id": stage_id,
+                            "engine_outputs": r_outputs,
+                            "metrics": {
+                                "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
+                                "stage_gen_time_ms": _gen_ms,
+                                "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                                "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
+                                "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                            },
+                        }
+                    )
+                _logging.getLogger(__name__).debug(
+                    "[Stage-%s] Enqueued result for request %s to downstream", stage_id, rid
                 )
+
+            except Exception as e:
+                _logging.getLogger(__name__).exception("[Stage-%s] Failed on request %s: %s", stage_id, rid, e)
                 out_q.put(
                     {
                         "request_id": rid,
                         "stage_id": stage_id,
-                        "engine_outputs": r_outputs,
-                        "metrics": {
-                            "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                            "stage_gen_time_ms": _gen_ms,
-                            "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                            "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                            "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                        },
+                        "error": str(e),
                     }
                 )
-            _logging.getLogger(__name__).debug("[Stage-%s] Enqueued result for request %s to downstream", stage_id, rid)
-
+                # exit from the loop to avoid being stuck
+                break
+        print("--------------------------------", flush=True)
+        print(f"[Stage-{stage_id}] Stage worker exiting", flush=True)
+        print("--------------------------------", flush=True)
+    finally:
+        # Always shutdown the engine to release GPU memory and terminate child processes
+        try:
+            _logging.getLogger(__name__).info("[Stage-%s] Shutting down engine...", stage_id)
+            stage_engine.shutdown()
+            _logging.getLogger(__name__).info("[Stage-%s] Engine shutdown complete", stage_id)
         except Exception as e:
-            _logging.getLogger(__name__).exception("[Stage-%s] Failed on request %s: %s", stage_id, rid, e)
-            out_q.put(
-                {
-                    "request_id": rid,
-                    "stage_id": stage_id,
-                    "error": str(e),
-                }
-            )
-    print("--------------------------------", flush=True)
-    print(f"[Stage-{stage_id}] Stage worker exiting", flush=True)
-    print("--------------------------------", flush=True)
+            _logging.getLogger(__name__).warning("[Stage-%s] Error during engine shutdown: %s", stage_id, e)

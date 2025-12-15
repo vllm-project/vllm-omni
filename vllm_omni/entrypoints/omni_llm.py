@@ -359,7 +359,8 @@ class OmniLLM:
                         req_id,
                         result["error"],
                     )
-                    continue
+                    # close all stages on error in any stage
+                    self.close()
 
                 if result.get("type") == "stage_ready":
                     # Only happens when stage is initialized slower than expected,
@@ -501,6 +502,14 @@ class OmniLLM:
                 if result.get("type") == "stage_ready":
                     self._stages_ready.add(stage_id)
                     logger.info("[Orchestrator] Stage-%s reported ready", stage_id)
+                elif result.get("type") == "stage_error":
+                    error_msg = result.get("error", "Unknown error")
+                    logger.error(
+                        "[Orchestrator] Stage-%s failed to initialize: %s",
+                        stage_id,
+                        error_msg,
+                    )
+                    self.close()
                 else:
                     # No user data should arrive before seeding; ignore other messages
                     pass
@@ -533,6 +542,7 @@ class OmniLLM:
                 logger.error(
                     "[Orchestrator] Stage initialization failed and an error occurred while logging suggestions",
                 )
+            self.close()
         elif len(self._stages_ready) == num_stages:
             logger.info("[Orchestrator] All stages initialized successfully")
 

@@ -370,7 +370,8 @@ class AsyncOmni(EngineClient):
                         req_id,
                         result["error"],
                     )
-                    continue
+                    # Shutdown entire orchestrator and all stages on error in any stage
+                    self.shutdown()
 
                 if result.get("type") == "stage_ready":
                     # Only happens when stage is initialized slower than expected,
@@ -493,8 +494,9 @@ class AsyncOmni(EngineClient):
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
+        deadline = time.time() + max(0, int(timeout))
         num_stages = len(self.stage_list)
-        while len(self._stages_ready) < num_stages:
+        while len(self._stages_ready) < num_stages and time.time() < deadline:
             progressed = False
             for stage_id, stage in enumerate(self.stage_list):
                 if stage_id in self._stages_ready:
@@ -519,6 +521,14 @@ class AsyncOmni(EngineClient):
                     if is_tracing_enabled is not None:
                         stage.set_is_tracing_enabled(is_tracing_enabled)
                     logger.debug("[Orchestrator] Stage-%s reported ready", stage_id)
+                elif result.get("type") == "stage_error":
+                    error_msg = result.get("error", "Unknown error")
+                    logger.error(
+                        "[Orchestrator] Stage-%s failed to initialize: %s",
+                        stage_id,
+                        error_msg,
+                    )
+                    self.close()
                 else:
                     # No user data should arrive before seeding; ignore other messages
                     pass
@@ -559,6 +569,7 @@ class AsyncOmni(EngineClient):
                     "[Orchestrator] Stage initialization failed and an error \
                         occurred while logging suggestions",
                 )
+            self.close()
 
     @property
     def is_running(self) -> bool:
