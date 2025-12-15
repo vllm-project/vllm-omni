@@ -1,56 +1,50 @@
 #!/bin/bash
 
-# This script aims to tune the best server parameter combinations to maximize throughput for given requirement. 
-# The current server parameter combination is  max_num_seqs and max_num_batched_tokens
-# It also supports additional requirement: e2e latency and prefix cache. 
-
-# Pre-requisite:
-# 1. Checkout to your branch, install/ update the correct running env. For TPU, activate conda env and install the corresponding torch, xla version. 
-# 2. If the model is customized, replace the MODEL's config with the customized config.
-# 3. Set variables (ALL REQUIRED)
-#   BASE: your directory for vllm repo
-#   MODEL: the model served by vllm
-#   TP: ways of tensor parallelism
-#   DOWNLOAD_DIR: directory to download and load model weights.
-#   INPUT_LEN: request input len
-#   OUTPUT_LEN: request output len
-#   MIN_CACHE_HIT_PCT: prefix cache rate
-#   MAX_LATENCY_ALLOWED_MS: (e2e) latency requirement. If there's no latency requirement, set it to a large number like 1000000000
-#   NUM_SEQS_LIST: a list of `max-num-seqs` you want to loop with.
-#   NUM_BATCHED_TOKENS_LIST: a list of `max-num-batched-tokens` you want to loop with.
-#   Note that the default NUM_SEQS_LIST and NUM_BATCHED_TOKENS_LIST are set for medium size input/output len, for extra short context (such as 20:20), you might need to include larger numbers in NUM_SEQS_LIST.
-# 4. Run the script, it might take a long time, you can use tmux to avoid the script stop if disconnection happens.
-# 5. The final result will be saved in RESULT file. 
-
-
-# Example use cases 
-# 1. Given input_len=1800, output_len=20, what's the best max_num_seqs and max_num_batched_tokens to get highest throughput?
-# Use INPUT_LEN=1800,  OUTPUT_LEN=20, MIN_CACHE_HIT_PCT=0, MAX_LATENCY_ALLOWED_MS=100000000000
-# 2. If we have latency requirement to be lower than 500ms, what's the best server parameter?
-# Use INPUT_LEN=1800,  OUTPUT_LEN=20, MIN_CACHE_HIT_PCT=0, MAX_LATENCY_ALLOWED_MS=500
-# 3. If we want to reach 60% prefix cache, what's the best server parameter? 
-# Use INPUT_LEN=1800,  OUTPUT_LEN=20, MIN_CACHE_HIT_PCT=60, MAX_LATENCY_ALLOWED_MS=500
+# This script aims to tune the best server parameter combinations to maximize throughput for given requirement.
+# See details in README (benchmarks/auto_tune/README.md).
 
 TAG=$(date +"%Y_%m_%d_%H_%M")
-BASE=""
-MODEL="meta-llama/Llama-3.1-8B-Instruct"
-TP=1
-DOWNLOAD_DIR=""
-INPUT_LEN=4000
-OUTPUT_LEN=16
-MIN_CACHE_HIT_PCT=0
-MAX_LATENCY_ALLOWED_MS=100000000000
-NUM_SEQS_LIST="128 256"
-NUM_BATCHED_TOKENS_LIST="512 1024 2048 4096"
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
+BASE=${BASE:-"$SCRIPT_DIR/../../.."}
+MODEL=${MODEL:-"meta-llama/Llama-3.1-8B-Instruct"}
+SYSTEM=${SYSTEM:-"TPU"}
+TP=${TP:-1}
+DOWNLOAD_DIR=${DOWNLOAD_DIR:-""}
+INPUT_LEN=${INPUT_LEN:-4000}
+OUTPUT_LEN=${OUTPUT_LEN:-16}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+MIN_CACHE_HIT_PCT=${MIN_CACHE_HIT_PCT:-0}
+MAX_LATENCY_ALLOWED_MS=${MAX_LATENCY_ALLOWED_MS:-100000000000}
+NUM_SEQS_LIST=${NUM_SEQS_LIST:-"128 256"}
+NUM_BATCHED_TOKENS_LIST=${NUM_BATCHED_TOKENS_LIST:-"512 1024 2048 4096"}
 
 LOG_FOLDER="$BASE/auto-benchmark/$TAG"
 RESULT="$LOG_FOLDER/result.txt"
+PROFILE_PATH="$LOG_FOLDER/profile"
 
-echo "result file: $RESULT"
-echo "model: $MODEL"
+echo "====================== AUTO TUNE PARAMETERS ===================="
+echo "SCRIPT_DIR=$SCRIPT_DIR"
+echo "BASE=$BASE"
+echo "MODEL=$MODEL"
+echo "SYSTEM=$SYSTEM"
+echo "TP=$TP"
+echo "DOWNLOAD_DIR=$DOWNLOAD_DIR"
+echo "INPUT_LEN=$INPUT_LEN"
+echo "OUTPUT_LEN=$OUTPUT_LEN"
+echo "MAX_MODEL_LEN=$MAX_MODEL_LEN"
+echo "MIN_CACHE_HIT_PCT=$MIN_CACHE_HIT_PCT"
+echo "MAX_LATENCY_ALLOWED_MS=$MAX_LATENCY_ALLOWED_MS"
+echo "NUM_SEQS_LIST=$NUM_SEQS_LIST"
+echo "NUM_BATCHED_TOKENS_LIST=$NUM_BATCHED_TOKENS_LIST"
+echo "VLLM_LOGGING_LEVEL=$VLLM_LOGGING_LEVEL"
+echo "RESULT_FILE=$RESULT"
+echo "====================== AUTO TUNEPARAMETERS ===================="
 
 rm -rf $LOG_FOLDER
+rm -rf $PROFILE_PATH
 mkdir -p $LOG_FOLDER
+mkdir -p $PROFILE_PATH
 
 cd "$BASE/vllm"
 
@@ -60,36 +54,66 @@ current_hash=$(git rev-parse HEAD)
 echo "hash:$current_hash" >> "$RESULT"
 echo "current_hash: $current_hash"
 
+TOTAL_LEN=$((INPUT_LEN + OUTPUT_LEN))
+RED='\033[0;31m'
+if (( TOTAL_LEN > MAX_MODEL_LEN )); then
+    echo -e "${RED}FAILED: INPUT_LEN($INPUT_LEN) + OUTPUT_LEN($OUTPUT_LEN) = $TOTAL_LEN, which is > MAX_MODEL_LEN = $MAX_MODEL_LEN.\033[0m" >&2
+    exit 1
+fi
+
 best_throughput=0
 best_max_num_seqs=0
 best_num_batched_tokens=0
 best_goodput=0
+best_request_rate=0
 
 start_server() {
     local gpu_memory_utilization=$1
     local max_num_seqs=$2
     local max_num_batched_tokens=$3
     local vllm_log=$4
-    
-    pkill -f vllm
+    local profile_dir=$5
 
-    VLLM_USE_V1=1 VLLM_SERVER_DEV_MODE=1 vllm serve $MODEL \
-        --disable-log-requests \
-        --port 8004 \
-        --gpu-memory-utilization $gpu_memory_utilization \
-        --max-num-seqs $max_num_seqs \
-        --max-num-batched-tokens $max_num_batched_tokens \
-        --tensor-parallel-size $TP \
-        --enable-prefix-caching \
-        --load-format dummy \
-        --download-dir "$DOWNLOAD_DIR" \
-        --max-model-len $(( INPUT_LEN+OUTPUT_LEN )) > "$vllm_log" 2>&1 &
+    pkill -if vllm
+
+    # Define the common arguments as a bash array.
+    # Each argument and its value are separate elements.
+    local common_args_array=(
+        "$MODEL"
+        "--disable-log-requests"
+        "--port" "8004"
+        "--gpu-memory-utilization" "$gpu_memory_utilization"
+        "--max-num-seqs" "$max_num_seqs"
+        "--max-num-batched-tokens" "$max_num_batched_tokens"
+        "--tensor-parallel-size" "$TP"
+        "--enable-prefix-caching"
+        "--load-format" "dummy"
+        "--download-dir" "$DOWNLOAD_DIR"
+        "--max-model-len" "$MAX_MODEL_LEN"
+    )
+
+    # Use the array expansion "${common_args_array[@]}"
+    # This correctly passes each element as a separate argument.
+    if [[ -n "$profile_dir" ]]; then
+        # Start server with profiling enabled
+        VLLM_USE_V1=1 VLLM_SERVER_DEV_MODE=1 VLLM_TORCH_PROFILER_DIR=$profile_dir \
+            vllm serve "${common_args_array[@]}" > "$vllm_log" 2>&1 &
+    else
+        # Start server without profiling
+        VLLM_USE_V1=1 VLLM_SERVER_DEV_MODE=1 \
+            vllm serve "${common_args_array[@]}" > "$vllm_log" 2>&1 &
+    fi
+    local server_pid=$!
 
     # wait for 10 minutes...
     server_started=0
-    for i in {1..60}; do  
+    for i in {1..60}; do
+        # This line checks whether the server is still alive or not,
+        # since that we should always have permission to send signal to the server process.
+        kill -0 $server_pid 2> /dev/null || break
+
         RESPONSE=$(curl -s -X GET "http://0.0.0.0:8004/health" -w "%{http_code}" -o /dev/stdout)
-        STATUS_CODE=$(echo "$RESPONSE" | tail -n 1) 
+        STATUS_CODE=$(echo "$RESPONSE" | tail -n 1)
         if [[ "$STATUS_CODE" -eq 200 ]]; then
             server_started=1
             break
@@ -97,8 +121,9 @@ start_server() {
             sleep 10
         fi
     done
+
     if (( ! server_started )); then
-        echo "server did not start within 10 minutes. Please check server log at $vllm_log".
+        echo "server did not start within 10 minutes or crashed. Please check server log at $vllm_log".
         return 1
     else
         return 0
@@ -114,10 +139,11 @@ run_benchmark() {
     echo "vllm_log: $vllm_log"
     echo
     rm -f $vllm_log
-    pkill -f vllm
+    pkill -if vllm
 
     echo "starting server..."
-    start_server $gpu_memory_utilization $max_num_seqs $max_num_batched_tokens $vllm_log
+    # Call start_server without a profile_dir to avoid profiling overhead
+    start_server $gpu_memory_utilization $max_num_seqs $max_num_batched_tokens $vllm_log ""
     result=$?
     if [[ "$result" -eq 1 ]]; then
         echo "server failed to start. gpu_memory_utilization:$gpu_memory_utilization, max_num_seqs:$max_num_seqs, max_num_batched_tokens: $max_num_batched_tokens"
@@ -125,17 +151,19 @@ run_benchmark() {
         echo "server started."
     fi
     echo
-    
+
     echo "run benchmark test..."
     meet_latency_requirement=0
     # get a basic qps by using request-rate inf
     bm_log="$LOG_FOLDER/bm_log_${max_num_seqs}_${max_num_batched_tokens}_requestrate_inf.txt"
     prefix_len=$(( INPUT_LEN * MIN_CACHE_HIT_PCT / 100 ))
-    python benchmarks/benchmark_serving.py \
+    adjusted_input_len=$(( INPUT_LEN - prefix_len ))
+    # --profile flag is removed from this call
+    vllm bench serve \
         --backend vllm \
         --model $MODEL  \
         --dataset-name random \
-        --random-input-len $INPUT_LEN \
+        --random-input-len $adjusted_input_len \
         --random-output-len $OUTPUT_LEN \
         --ignore-eos \
         --disable-tqdm \
@@ -162,11 +190,11 @@ run_benchmark() {
             curl -X POST http://0.0.0.0:8004/reset_prefix_cache
             sleep 5
             bm_log="$LOG_FOLDER/bm_log_${max_num_seqs}_${max_num_batched_tokens}_requestrate_${request_rate}.txt"
-            python benchmarks/benchmark_serving.py \
+            vllm bench serve \
                 --backend vllm \
                 --model $MODEL  \
                 --dataset-name random \
-                --random-input-len $INPUT_LEN \
+                --random-input-len $adjusted_input_len \
                 --random-output-len $OUTPUT_LEN \
                 --ignore-eos \
                 --disable-tqdm \
@@ -195,6 +223,7 @@ run_benchmark() {
             best_max_num_seqs=$max_num_seqs
             best_num_batched_tokens=$max_num_batched_tokens
             best_goodput=$goodput
+            best_request_rate=$request_rate
         fi
     else
         echo "max_num_seqs: $max_num_seqs, max_num_batched_tokens: $max_num_batched_tokens does not meet latency requirement ${MAX_LATENCY_ALLOWED_MS}"
@@ -203,9 +232,9 @@ run_benchmark() {
 
     echo "best_max_num_seqs: $best_max_num_seqs, best_num_batched_tokens: $best_num_batched_tokens, best_throughput: $best_throughput"
 
-    pkill vllm
+    pkill -if vllm
     sleep 10
-    printf '=%.0s' $(seq 1 20)
+    echo "===================="
     return 0
 }
 
@@ -216,7 +245,8 @@ read -r -a num_batched_tokens_list <<< "$NUM_BATCHED_TOKENS_LIST"
 gpu_memory_utilization=0.98
 find_gpu_memory_utilization=0
 while (( $(echo "$gpu_memory_utilization >= 0.9" | bc -l) )); do
-    start_server $gpu_memory_utilization "${num_seqs_list[-1]}" "${num_batched_tokens_list[-1]}" "$LOG_FOLDER/vllm_log_gpu_memory_utilization_$gpu_memory_utilization.log"
+    # Pass empty string for profile_dir argument
+    start_server $gpu_memory_utilization "${num_seqs_list[-1]}" "${num_batched_tokens_list[-1]}" "$LOG_FOLDER/vllm_log_gpu_memory_utilization_$gpu_memory_utilization.log" ""
     result=$?
     if [[ "$result" -eq 0 ]]; then
         find_gpu_memory_utilization=1
@@ -239,6 +269,45 @@ for num_seqs in "${num_seqs_list[@]}"; do
     done
 done
 echo "finish permutations"
-echo "best_max_num_seqs: $best_max_num_seqs, best_num_batched_tokens: $best_num_batched_tokens, best_throughput: $best_throughput"
-echo "best_max_num_seqs: $best_max_num_seqs, best_num_batched_tokens: $best_num_batched_tokens, best_throughput: $best_throughput" >> "$RESULT"
 
+# =================================================================================
+# FINAL PROFILING RUN FOR THE BEST CONFIGURATION
+# =================================================================================
+if (( $(echo "$best_throughput > 0" | bc -l) )); then
+    echo
+    echo "Benchmark tuning finished. Now running profiling on the best configuration found..."
+    echo "Best config: max_num_seqs: $best_max_num_seqs, max_num_batched_tokens: $best_num_batched_tokens, throughput: $best_throughput"
+    echo
+
+    vllm_log="$LOG_FOLDER/vllm_log_BEST_PROFILE.txt"
+    bm_log="$LOG_FOLDER/bm_log_BEST_PROFILE.txt"
+
+    # Start server with the best params and profiling ENABLED
+    echo "Starting server for profiling..."
+    start_server $gpu_memory_utilization $best_max_num_seqs $best_num_batched_tokens "$vllm_log" "$PROFILE_PATH"
+
+    # Run benchmark with the best params and the --profile flag
+    echo "Running benchmark with profiling..."
+    prefix_len=$(( INPUT_LEN * MIN_CACHE_HIT_PCT / 100 ))
+    adjusted_input_len=$(( INPUT_LEN - prefix_len ))
+    vllm bench serve \
+        --backend vllm \
+        --model $MODEL \
+        --dataset-name random \
+        --random-input-len $adjusted_input_len \
+        --random-output-len $OUTPUT_LEN \
+        --ignore-eos \
+        --disable-tqdm \
+        --request-rate $best_request_rate \
+        --percentile-metrics ttft,tpot,itl,e2el \
+        --goodput e2el:$MAX_LATENCY_ALLOWED_MS \
+        --num-prompts 100 \
+        --random-prefix-len $prefix_len \
+        --port 8004 \
+        --profile &> "$bm_log"
+else
+    echo "No configuration met the latency requirements. Skipping final profiling run."
+fi
+pkill -if vllm
+echo "best_max_num_seqs: $best_max_num_seqs, best_num_batched_tokens: $best_num_batched_tokens, best_throughput: $best_throughput, profile saved in: $PROFILE_PATH"
+echo "best_max_num_seqs: $best_max_num_seqs, best_num_batched_tokens: $best_num_batched_tokens, best_throughput: $best_throughput, profile saved in: $PROFILE_PATH" >> "$RESULT"
