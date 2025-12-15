@@ -495,6 +495,8 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            if ".to_out.0" in name:
+                name = name.replace(".to_out.0", ".to_out")
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
