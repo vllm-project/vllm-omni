@@ -66,8 +66,6 @@ def parse_args() -> argparse.Namespace:
         default=4.0,
         help="True classifier-free guidance scale specific to Qwen-Image-Edit.",
     )
-    parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
-    parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
     parser.add_argument(
         "--output",
         type=str,
@@ -123,6 +121,7 @@ def main():
     parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     omni = Omni(
         model=args.model,
+        model_class_name="QwenImageEditPipeline",
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         parallel_config=parallel_config,
@@ -135,7 +134,6 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
-    print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
@@ -146,8 +144,6 @@ def main():
         negative_prompt=args.negative_prompt,
         generator=generator,
         true_cfg_scale=args.cfg_scale,
-        height=args.height,
-        width=args.width,
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_outputs_per_prompt,
     )
