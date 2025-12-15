@@ -893,7 +893,7 @@ async def _stage_worker_async(
         _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
         sampling_params = task["sampling_params"]
-        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%d", stage_id, rid)
+        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%s", stage_id, rid)
         print("--------------------------------", flush=True)
         print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
         print("--------------------------------", flush=True)
