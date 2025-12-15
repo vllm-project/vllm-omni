@@ -32,13 +32,9 @@ class OmniRequestOutput:
     Attributes:
         request_id: Unique identifier for this request
         finished: Whether generation is complete
-
-        # Pipeline stage fields
         stage_id: Identifier of the stage that produced this output (pipeline mode)
         final_output_type: Type of output ("text", "image", "audio", "latents")
         request_output: The underlying RequestOutput from the stage (pipeline mode)
-
-        # Diffusion model fields
         images: List of generated PIL images (diffusion mode)
         prompt: The prompt used for generation (diffusion mode)
         latents: Optional tensor of latent representations (diffusion mode)
