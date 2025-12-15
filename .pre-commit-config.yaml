@@ -64,3 +64,4 @@ repos:
       entry: python tools/pre_commit/check_pickle_imports.py
       language: python
       types: [python]
+      additional_dependencies: [regex]
