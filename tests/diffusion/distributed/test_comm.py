@@ -96,9 +96,8 @@ def _test_4d_identity_worker(
 
     # Initialize distributed environment
     init_distributed_environment()
-    initialize_model_parallel(sequence_parallel_size=world_size)
-
-    sp_group = get_sp_group()
+    initialize_model_parallel(ulysses_degree=world_size)  # test ulysses sp by default
+    sp_group = get_sp_group().ulysses_group  # get ulysses sp group not ring sp group
 
     # Create input tensor: (bs, seqlen/P, hc, hs)
     torch.manual_seed(42 + local_rank)
@@ -118,9 +117,9 @@ def _test_4d_identity_worker(
     intermediate = SeqAllToAll4D.apply(
         sp_group,
         input_tensor,
-        scatter_idx=2,  # scatter head dimension
-        gather_idx=1,  # gather sequence dimension
-        use_sync=use_sync,
+        2,  # scatter head dimension
+        1,  # gather sequence dimension
+        use_sync,
     )
 
     # Verify intermediate shape
@@ -138,9 +137,9 @@ def _test_4d_identity_worker(
     output = SeqAllToAll4D.apply(
         sp_group,
         intermediate,
-        scatter_idx=1,  # scatter sequence dimension
-        gather_idx=2,  # gather head dimension
-        use_sync=use_sync,
+        1,  # scatter sequence dimension
+        2,  # gather head dimension
+        use_sync,
     )
 
     # Verify output shape matches input
@@ -226,9 +225,8 @@ def _test_5d_identity_worker(
 
     # Initialize distributed environment
     init_distributed_environment()
-    initialize_model_parallel(sequence_parallel_size=world_size)
-
-    sp_group = get_sp_group()
+    initialize_model_parallel(ulysses_degree=world_size)  # test ulysses sp by default
+    sp_group = get_sp_group().ulysses_group  # get ulysses sp group not ring sp group
 
     # Create input tensor: (bs, seqlen/P, 3, hc, hs)
     # The '3' dimension is for Q, K, V
@@ -250,9 +248,9 @@ def _test_5d_identity_worker(
     intermediate = SeqAllToAll5D.apply(
         sp_group,
         input_tensor,
-        scatter_idx=3,  # scatter head dimension
-        gather_idx=1,  # gather sequence dimension
-        use_sync=use_sync,
+        3,  # scatter head dimension
+        1,  # gather sequence dimension
+        use_sync,
     )
 
     # Verify intermediate shape
@@ -271,9 +269,9 @@ def _test_5d_identity_worker(
     output = SeqAllToAll5D.apply(
         sp_group,
         intermediate,
-        scatter_idx=1,  # scatter sequence dimension
-        gather_idx=3,  # gather head dimension
-        use_sync=use_sync,
+        1,  # scatter sequence dimension
+        3,  # gather head dimension
+        use_sync,
     )
 
     # Verify output shape matches input
