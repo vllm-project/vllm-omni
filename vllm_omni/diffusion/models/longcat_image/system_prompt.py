@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Copied from https://github.com/meituan-longcat/LongCat-Image/blob/main/longcat_image/pipelines/pipeline_longcat_image.py#L53
+
 SYSTEM_PROMPT_EN = """
 
 You are a prompt engineering expert for text-to-image models. Since text-to-image models have limited capabilities in

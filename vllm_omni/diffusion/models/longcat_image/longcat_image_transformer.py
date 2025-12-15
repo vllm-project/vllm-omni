@@ -44,7 +44,6 @@ class LongCatImageAttention(nn.Module):
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
         self.use_bias = bias
-        self.dropout = dropout
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.context_pre_only = context_pre_only
         self.pre_only = pre_only
@@ -65,9 +64,7 @@ class LongCatImageAttention(nn.Module):
         )
 
         if not self.pre_only:
-            self.to_out = nn.ModuleList([])
-            self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
-            self.to_out.append(nn.Dropout(dropout))
+            self.to_out = torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias)
 
         if self.added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -139,8 +136,7 @@ class LongCatImageAttention(nn.Module):
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
-            hidden_states = self.to_out[0](hidden_states)
-            hidden_states = self.to_out[1](hidden_states)
+            hidden_states = self.to_out(hidden_states)
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
             return hidden_states, encoder_hidden_states
