@@ -14,7 +14,15 @@ curl -s "$SERVER/v1/chat/completions" \
   -d "{
     \"messages\": [
       {\"role\": \"user\", \"content\": \"$PROMPT\"}
-    ]
+    ],
+    \"extra_body\": {
+      \"height\": 1024,
+      \"width\": 1024,
+      \"num_inference_steps\": 50,
+      \"true_cfg_scale\": 4.0,
+      \"seed\": 42,
+      \"num_outputs_per_prompt\": 1
+    }
   }" | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > "$OUTPUT"
 
 if [ -f "$OUTPUT" ]; then

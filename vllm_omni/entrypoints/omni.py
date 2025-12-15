@@ -6,7 +6,6 @@ from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
-
 def _dummy_snapshot_download(model_id):
     return model_id
 

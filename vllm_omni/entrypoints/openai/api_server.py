@@ -241,14 +241,36 @@ async def build_async_diffusion(
         if hasattr(args, "trust_remote_code"):
             diffusion_kwargs["trust_remote_code"] = args.trust_remote_code
 
-        diffusion_kwargs.update(kwargs)
+        # VAE memory optimization parameters
+        if hasattr(args, "vae_use_slicing"):
+            diffusion_kwargs["vae_use_slicing"] = args.vae_use_slicing
+        if hasattr(args, "vae_use_tiling"):
+            diffusion_kwargs["vae_use_tiling"] = args.vae_use_tiling
 
+        # Cache optimization parameters
+        if hasattr(args, "cache_adapter") and args.cache_adapter:
+            diffusion_kwargs["cache_adapter"] = args.cache_adapter
+        if hasattr(args, "cache_config") and args.cache_config:
+            import json
+
+            try:
+                diffusion_kwargs["cache_config"] = json.loads(args.cache_config)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse cache_config JSON: {e}")
+
+        # Video model engine-level parameters (e.g., Wan2.2)
+        if hasattr(args, "boundary_ratio") and args.boundary_ratio is not None:
+            diffusion_kwargs["boundary_ratio"] = args.boundary_ratio
+        if hasattr(args, "flow_shift") and args.flow_shift is not None:
+            diffusion_kwargs["flow_shift"] = args.flow_shift
+
+        diffusion_kwargs.update(kwargs)
+        logger.info(f"diffusion_kwargs: {diffusion_kwargs}")
         logger.info(
             "Building AsyncOmniDiffusion with model=%s, num_gpus=%s",
             args.model,
             diffusion_kwargs.get("num_gpus", 1),
         )
-
         diffusion_engine = AsyncOmniDiffusion(**diffusion_kwargs)
 
         yield diffusion_engine
@@ -452,18 +474,12 @@ async def omni_diffusion_init_app_state(
     state.diffusion_engine = diffusion_engine
     state.log_stats = not getattr(args, "disable_log_stats", False)
 
-    # Get default parameters from CLI args
-    default_seed = getattr(args, "diffusion_seed", None)
-    default_num_inference_steps = getattr(args, "num_inference_steps", 50)
-    default_guidance_scale = getattr(args, "guidance_scale", 4.0)
-
     # Initialize chat handler with diffusion engine (uses /v1/chat/completions endpoint)
+    # Note: Request-level parameters (num_inference_steps, guidance_scale, seed, height, width, etc.)
+    # are passed per-request via the API, not as server defaults
     state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
         diffusion_engine=diffusion_engine,
         model_name=model_name,
-        default_seed=default_seed,
-        default_num_inference_steps=default_num_inference_steps,
-        default_guidance_scale=default_guidance_scale,
     )
 
     # Set other handlers to None for diffusion-only mode
@@ -473,13 +489,7 @@ async def omni_diffusion_init_app_state(
     state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
     state.server_load_metrics = 0
 
-    logger.info(
-        "Diffusion API server initialized for model: %s (seed=%s, steps=%d, guidance=%.2f)",
-        model_name,
-        default_seed,
-        default_num_inference_steps,
-        default_guidance_scale,
-    )
+    logger.info("Diffusion API server initialized for model: %s", model_name)
 
 @router.post(
     "/v1/chat/completions",

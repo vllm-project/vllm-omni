@@ -128,6 +128,7 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="The address of the Ray cluster to connect to.",
+        )
 
         # Diffusion model specific arguments
         serve_parser.add_argument(
@@ -136,30 +137,45 @@ class OmniServeCommand(CLISubcommand):
             default=1,
             help="Number of GPUs to use for diffusion model inference.",
         )
+
+        # Cache optimization parameters
         serve_parser.add_argument(
-            "--diffusion-dtype",
+            "--cache-adapter",
             type=str,
-            default="bfloat16",
-            choices=["float16", "bfloat16", "float32"],
-            help="Data type for diffusion model inference.",
+            default="none",
+            help="Cache adapter for diffusion models (e.g., 'tea_cache', 'deep_cache').",
         )
         serve_parser.add_argument(
-            "--num-inference-steps",
-            type=int,
-            default=50,
-            help="Default number of inference steps for diffusion models.",
-        )
-        serve_parser.add_argument(
-            "--guidance-scale",
-            type=float,
-            default=7.5,
-            help="Default guidance scale for diffusion models.",
-        )
-        serve_parser.add_argument(
-            "--diffusion-seed",
-            type=int,
+            "--cache-config",
+            type=str,
             default=None,
-            help="Random seed for reproducible image generation. If not set, uses random seed.",
+            help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
+        )
+
+        # VAE memory optimization parameters
+        serve_parser.add_argument(
+            "--vae-use-slicing",
+            action="store_true",
+            help="Enable VAE slicing for memory optimization (useful for NPU).",
+        )
+        serve_parser.add_argument(
+            "--vae-use-tiling",
+            action="store_true",
+            help="Enable VAE tiling for memory optimization (useful for NPU).",
+        )
+
+        # Video model parameters (e.g., Wan2.2) - engine-level
+        serve_parser.add_argument(
+            "--boundary-ratio",
+            type=float,
+            default=None,
+            help="Boundary split ratio for low/high DiT in video models (e.g., 0.875 for Wan2.2).",
+        )
+        serve_parser.add_argument(
+            "--flow-shift",
+            type=float,
+            default=None,
+            help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
         return serve_parser
 

@@ -15,10 +15,7 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 ```bash
 vllm serve Qwen/Qwen-Image-Edit --omni \
     --port 8092 \
-    --num-gpus 1 \
-    --diffusion-dtype bfloat16 \
-    --num-inference-steps 50 \
-    --guidance-scale 7.5
+    --num-gpus 2
 ```
 
 Or use the startup script:
@@ -44,9 +41,16 @@ curl -s http://localhost:8092/v1/chat/completions \
       \"role\": \"user\",
       \"content\": [
         {\"type\": \"text\", \"text\": \"Convert this image to watercolor style\"},
-        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$IMG_B64\"}}
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,\$IMG_B64\"}}
       ]
-    }]
+    }],
+    \"extra_body\": {
+      \"height\": 1024,
+      \"width\": 1024,
+      \"num_inference_steps\": 50,
+      \"guidance_scale\": 7.5,
+      \"seed\": 42
+    }
   }" | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
 ```
 
@@ -99,13 +103,11 @@ python gradio_demo.py
 
 ### Image Editing with Parameters
 
+Use `extra_body` to pass generation parameters:
+
 ```json
 {
   "messages": [
-    {
-      "role": "system",
-      "content": "size=1024x1024 steps=50 guidance=7.5 seed=42"
-    },
     {
       "role": "user",
       "content": [
@@ -113,19 +115,29 @@ python gradio_demo.py
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
       ]
     }
-  ]
+  ],
+  "extra_body": {
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 50,
+    "guidance_scale": 7.5,
+    "seed": 42
+  }
 }
 ```
 
-## System Message Parameters
+## Generation Parameters (extra_body)
 
-| Parameter | Format | Description |
-|-----------|--------|-------------|
-| `size` | `1024x1024` | Output image size (width x height) |
-| `steps` | `50` | Number of inference steps |
-| `guidance` | `7.5` | CFG guidance scale |
-| `seed` | `42` | Random seed (reproducible) |
-| `negative` | `text` | Negative prompt |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `height` | int | None | Output image height in pixels |
+| `width` | int | None | Output image width in pixels |
+| `size` | str | None | Output image size (e.g., "1024x1024") |
+| `num_inference_steps` | int | 50 | Number of denoising steps |
+| `guidance_scale` | float | 7.5 | CFG guidance scale |
+| `seed` | int | None | Random seed (reproducible) |
+| `negative_prompt` | str | None | Negative prompt |
+| `num_outputs_per_prompt` | int | 1 | Number of images to generate |
 
 ## Response Format
 

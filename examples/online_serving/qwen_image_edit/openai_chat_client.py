@@ -4,7 +4,7 @@ Qwen-Image-Edit OpenAI-compatible chat client for image editing.
 
 Usage:
     python openai_chat_client.py --input qwen_image_output.png --prompt "Convert to watercolor style" --output output.png
-    python openai_chat_client.py --input input.png --prompt "Convert to oil painting" --size 1024x1024 --seed 42
+    python openai_chat_client.py --input input.png --prompt "Convert to oil painting" --height 1024 --width 1024 --seed 42
 """
 
 import argparse
@@ -20,9 +20,10 @@ def edit_image(
     input_image: str | Path,
     prompt: str,
     server_url: str = "http://localhost:8092",
-    size: str | None = None,
+    height: int | None = None,
+    width: int | None = None,
     steps: int | None = None,
-    guidance: float | None = None,
+    guidance_scale: float | None = None,
     seed: int | None = None,
     negative_prompt: str | None = None,
 ) -> bytes | None:
@@ -32,9 +33,10 @@ def edit_image(
         input_image: Path to input image
         prompt: Text description of the edit
         server_url: Server URL
-        size: Output image size (e.g., "1024x1024")
+        height: Output image height in pixels
+        width: Output image width in pixels
         steps: Number of inference steps
-        guidance: Guidance scale
+        guidance_scale: CFG guidance scale
         seed: Random seed
         negative_prompt: Negative prompt
 
@@ -55,26 +57,8 @@ def edit_image(
     img = Image.open(BytesIO(image_bytes))
     mime_type = f"image/{img.format.lower()}" if img.format else "image/png"
 
-    messages = []
-
-    # Build system message with parameters
-    params = []
-    if size:
-        params.append(f"size={size}")
-    if steps:
-        params.append(f"steps={steps}")
-    if guidance:
-        params.append(f"guidance={guidance}")
-    if seed is not None:
-        params.append(f"seed={seed}")
-    if negative_prompt:
-        params.append(f"negative={negative_prompt}")
-
-    if params:
-        messages.append({"role": "system", "content": " ".join(params)})
-
-    # Add user message with text and image
-    messages.append(
+    # Build user message with text and image
+    messages = [
         {
             "role": "user",
             "content": [
@@ -82,14 +66,34 @@ def edit_image(
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
             ],
         }
-    )
+    ]
+
+    # Build extra_body with generation parameters
+    extra_body = {}
+    if height is not None:
+        extra_body["height"] = height
+    if width is not None:
+        extra_body["width"] = width
+    if steps is not None:
+        extra_body["num_inference_steps"] = steps
+    if guidance_scale is not None:
+        extra_body["guidance_scale"] = guidance_scale
+    if seed is not None:
+        extra_body["seed"] = seed
+    if negative_prompt:
+        extra_body["negative_prompt"] = negative_prompt
+
+    # Build request payload
+    payload = {"messages": messages}
+    if extra_body:
+        payload["extra_body"] = extra_body
 
     # Send request
     try:
         response = requests.post(
             f"{server_url}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
-            json={"messages": messages},
+            json=payload,
             timeout=300,
         )
         response.raise_for_status()
@@ -117,9 +121,10 @@ def main():
     parser.add_argument("--prompt", "-p", required=True, help="Edit prompt")
     parser.add_argument("--output", "-o", default="output.png", help="Output file")
     parser.add_argument("--server", "-s", default="http://localhost:8092", help="Server URL")
-    parser.add_argument("--size", help="Output image size (e.g., 1024x1024)")
-    parser.add_argument("--steps", type=int, help="Inference steps")
-    parser.add_argument("--guidance", type=float, help="Guidance scale")
+    parser.add_argument("--height", type=int, default=1024, help="Output image height")
+    parser.add_argument("--width", type=int, default=1024, help="Output image width")
+    parser.add_argument("--steps", type=int, default=50, help="Inference steps")
+    parser.add_argument("--guidance", type=float, default=7.5, help="Guidance scale")
     parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
@@ -132,9 +137,10 @@ def main():
         input_image=args.input,
         prompt=args.prompt,
         server_url=args.server,
-        size=args.size,
+        height=args.height,
+        width=args.width,
         steps=args.steps,
-        guidance=args.guidance,
+        guidance_scale=args.guidance,
         seed=args.seed,
         negative_prompt=args.negative,
     )

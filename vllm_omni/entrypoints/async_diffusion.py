@@ -17,36 +17,12 @@ from typing import Any, Optional
 
 from PIL import Image
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.outputs import OmniRequestOutput
-
-try:
-    from vllm.transformers_utils.config import get_hf_file_to_dict
-except ImportError:
-
-    def get_hf_file_to_dict(filename: str, model: str) -> dict:
-        """Fallback implementation for getting HF config files."""
-        import json
-        from pathlib import Path
-
-        from huggingface_hub import hf_hub_download
-
-        try:
-            # Try local path first
-            local_path = Path(model) / filename
-            if local_path.exists():
-                with open(local_path) as f:
-                    return json.load(f)
-            # Download from hub
-            file_path = hf_hub_download(repo_id=model, filename=filename)
-            with open(file_path) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
 
 logger = init_logger(__name__)
 

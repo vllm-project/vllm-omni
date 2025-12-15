@@ -18,9 +18,10 @@ from PIL import Image
 def edit_image(
     input_image: Image.Image,
     prompt: str,
-    size: str,
+    height: int,
+    width: int,
     steps: int,
-    guidance: float,
+    guidance_scale: float,
     seed: int | None,
     negative_prompt: str,
     server_url: str,
@@ -34,25 +35,8 @@ def edit_image(
     input_image.save(buffer, format="PNG")
     image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    messages = []
-
-    # Build system message with parameters
-    params = []
-    if size:
-        params.append(f"size={size}")
-    if steps:
-        params.append(f"steps={steps}")
-    if guidance:
-        params.append(f"guidance={guidance}")
-    if seed is not None and seed >= 0:
-        params.append(f"seed={seed}")
-    if negative_prompt:
-        params.append(f"negative={negative_prompt}")
-
-    if params:
-        messages.append({"role": "system", "content": " ".join(params)})
-
-    messages.append(
+    # Build user message with text and image
+    messages = [
         {
             "role": "user",
             "content": [
@@ -60,13 +44,28 @@ def edit_image(
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
             ],
         }
-    )
+    ]
+
+    # Build extra_body with generation parameters
+    extra_body = {
+        "height": height,
+        "width": width,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance_scale,
+    }
+    if seed is not None and seed >= 0:
+        extra_body["seed"] = seed
+    if negative_prompt:
+        extra_body["negative_prompt"] = negative_prompt
+
+    # Build request payload
+    payload = {"messages": messages, "extra_body": extra_body}
 
     try:
         response = requests.post(
             f"{server_url}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
-            json={"messages": messages},
+            json=payload,
             timeout=300,
         )
         response.raise_for_status()
@@ -112,11 +111,22 @@ def create_demo(server_url: str):
                 )
 
                 with gr.Row():
-                    size = gr.Dropdown(
-                        label="Output Size",
-                        choices=["Keep original", "512x512", "768x768", "1024x1024"],
-                        value="Keep original",
+                    height = gr.Slider(
+                        label="Height",
+                        minimum=256,
+                        maximum=2048,
+                        value=1024,
+                        step=64,
                     )
+                    width = gr.Slider(
+                        label="Width",
+                        minimum=256,
+                        maximum=2048,
+                        value=1024,
+                        step=64,
+                    )
+
+                with gr.Row():
                     steps = gr.Slider(
                         label="Inference Steps",
                         minimum=10,
@@ -124,15 +134,15 @@ def create_demo(server_url: str):
                         value=50,
                         step=5,
                     )
-
-                with gr.Row():
-                    guidance = gr.Slider(
+                    guidance_scale = gr.Slider(
                         label="Guidance Scale (CFG)",
                         minimum=1.0,
                         maximum=20.0,
                         value=7.5,
                         step=0.5,
                     )
+
+                with gr.Row():
                     seed = gr.Number(
                         label="Random Seed (-1 for random)",
                         value=-1,
@@ -162,15 +172,13 @@ def create_demo(server_url: str):
             inputs=[prompt],
         )
 
-        def process_edit(img, p, s, st, g, se, n):
-            # Handle size
-            actual_size = None if s == "Keep original" else s
+        def process_edit(img, p, h, w, st, g, se, n):
             actual_seed = se if se >= 0 else None
-            return edit_image(img, p, actual_size, st, g, actual_seed, n, server_url)
+            return edit_image(img, p, h, w, st, g, actual_seed, n, server_url)
 
         edit_btn.click(
             fn=process_edit,
-            inputs=[input_image, prompt, size, steps, guidance, seed, negative_prompt],
+            inputs=[input_image, prompt, height, width, steps, guidance_scale, seed, negative_prompt],
             outputs=[output_image],
         )
 

@@ -29,7 +29,14 @@ curl -s "$SERVER/v1/chat/completions" \
         {\"type\": \"text\", \"text\": \"$PROMPT\"},
         {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$IMG_B64\"}}
       ]
-    }]
+    }],
+    \"extra_body\": {
+      \"height\": 1024,
+      \"width\": 1024,
+      \"num_inference_steps\": 50,
+      \"guidance_scale\": 7.5,
+      \"seed\": 42
+    }
   }" | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > "$OUTPUT"
 
 if [ -f "$OUTPUT" ]; then

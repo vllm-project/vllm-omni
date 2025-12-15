@@ -4,7 +4,7 @@ Qwen-Image OpenAI-compatible chat client for image generation.
 
 Usage:
     python openai_chat_client.py --prompt "A beautiful landscape" --output output.png
-    python openai_chat_client.py --prompt "A sunset" --size 1024x1024 --steps 50 --seed 42
+    python openai_chat_client.py --prompt "A sunset" --height 1024 --width 1024 --steps 50 --seed 42
 """
 
 import argparse
@@ -17,53 +17,60 @@ import requests
 def generate_image(
     prompt: str,
     server_url: str = "http://localhost:8091",
-    size: str | None = None,
+    height: int | None = None,
+    width: int | None = None,
     steps: int | None = None,
-    guidance: float | None = None,
+    true_cfg_scale: float | None = None,
     seed: int | None = None,
     negative_prompt: str | None = None,
+    num_outputs_per_prompt: int = 1,
 ) -> bytes | None:
     """Generate an image using the chat completions API.
 
     Args:
         prompt: Text description of the image
         server_url: Server URL
-        size: Image size (e.g., "1024x1024")
+        height: Image height in pixels
+        width: Image width in pixels
         steps: Number of inference steps
-        guidance: Guidance scale
+        true_cfg_scale: Qwen-Image CFG scale
         seed: Random seed
         negative_prompt: Negative prompt
+        num_outputs_per_prompt: Number of images to generate
 
     Returns:
         Image bytes or None if failed
     """
-    messages = []
+    messages = [{"role": "user", "content": prompt}]
 
-    # Build system message with parameters
-    params = []
-    if size:
-        params.append(f"size={size}")
-    if steps:
-        params.append(f"steps={steps}")
-    if guidance:
-        params.append(f"guidance={guidance}")
+    # Build extra_body with generation parameters
+    extra_body = {}
+    if height is not None:
+        extra_body["height"] = height
+    if width is not None:
+        extra_body["width"] = width
+    if steps is not None:
+        extra_body["num_inference_steps"] = steps
+    if true_cfg_scale is not None:
+        extra_body["true_cfg_scale"] = true_cfg_scale
     if seed is not None:
-        params.append(f"seed={seed}")
+        extra_body["seed"] = seed
     if negative_prompt:
-        params.append(f"negative={negative_prompt}")
+        extra_body["negative_prompt"] = negative_prompt
+    if num_outputs_per_prompt > 1:
+        extra_body["num_outputs_per_prompt"] = num_outputs_per_prompt
 
-    if params:
-        messages.append({"role": "system", "content": " ".join(params)})
-
-    # Add user message
-    messages.append({"role": "user", "content": prompt})
+    # Build request payload
+    payload = {"messages": messages}
+    if extra_body:
+        payload["extra_body"] = extra_body
 
     # Send request
     try:
         response = requests.post(
             f"{server_url}/v1/chat/completions",
             headers={"Content-Type": "application/json"},
-            json={"messages": messages},
+            json=payload,
             timeout=300,
         )
         response.raise_for_status()
@@ -90,9 +97,10 @@ def main():
     parser.add_argument("--prompt", "-p", default="a cup of coffee on the table", help="Text prompt")
     parser.add_argument("--output", "-o", default="qwen_image_output.png", help="Output file")
     parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
-    parser.add_argument("--size", default="1024x1024", help="Image size (e.g., 1024x1024)")
+    parser.add_argument("--height", type=int, default=1024, help="Image height")
+    parser.add_argument("--width", type=int, default=1024, help="Image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")
-    parser.add_argument("--guidance", type=float, default=4.0, help="Guidance scale")
+    parser.add_argument("--cfg-scale", type=float, default=4.0, help="True CFG scale")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
@@ -103,9 +111,10 @@ def main():
     image_bytes = generate_image(
         prompt=args.prompt,
         server_url=args.server,
-        size=args.size,
+        height=args.height,
+        width=args.width,
         steps=args.steps,
-        guidance=args.guidance,
+        true_cfg_scale=args.cfg_scale,
         seed=args.seed,
         negative_prompt=args.negative,
     )

@@ -15,10 +15,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
     --port 8091 \
-    --num-gpus 1 \
-    --num-inference-steps 50 \
-    --guidance-scale 7.5 \
-    --diffusion-seed 42
+    --num-gpus 2
 ```
 
 Or use the startup script:
@@ -41,7 +38,14 @@ curl -s http://localhost:8091/v1/chat/completions \
   -d '{
     "messages": [
       {"role": "user", "content": "A beautiful landscape painting"}
-    ]
+    ],
+    "extra_body": {
+      "height": 1024,
+      "width": 1024,
+      "num_inference_steps": 50,
+      "true_cfg_scale": 4.0,
+      "seed": 42
+    }
   }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
 ```
 
@@ -72,12 +76,20 @@ python gradio_demo.py
 
 ### Generation with Parameters
 
+Use `extra_body` to pass generation parameters:
+
 ```json
 {
   "messages": [
-    {"role": "system", "content": "size=1024x1024 steps=50 guidance=7.5 seed=42"},
     {"role": "user", "content": "A beautiful landscape painting"}
-  ]
+  ],
+  "extra_body": {
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 50,
+    "true_cfg_scale": 4.0,
+    "seed": 42
+  }
 }
 ```
 
@@ -96,15 +108,18 @@ python gradio_demo.py
 }
 ```
 
-## System Message Parameters
+## Generation Parameters (extra_body)
 
-| Parameter | Format | Description |
-|-----------|--------|-------------|
-| `size` | `1024x1024` | Image size (width x height) |
-| `steps` | `50` | Number of inference steps |
-| `guidance` | `7.5` | CFG guidance scale |
-| `seed` | `42` | Random seed (reproducible) |
-| `negative` | `text` | Negative prompt |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `height` | int | None | Image height in pixels |
+| `width` | int | None | Image width in pixels |
+| `size` | str | None | Image size (e.g., "1024x1024") |
+| `num_inference_steps` | int | 50 | Number of denoising steps |
+| `true_cfg_scale` | float | 4.0 | Qwen-Image CFG scale |
+| `seed` | int | None | Random seed (reproducible) |
+| `negative_prompt` | str | None | Negative prompt |
+| `num_outputs_per_prompt` | int | 1 | Number of images to generate |
 
 ## Response Format
 

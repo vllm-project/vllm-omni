@@ -92,38 +92,30 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     _diffusion_mode: bool = False
     _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
     _diffusion_model_name: str = ""
-    _diffusion_default_seed: Optional[int] = None
-    _diffusion_default_steps: int = 50
-    _diffusion_default_guidance: float = 7.5
 
     @classmethod
     def for_diffusion(
         cls,
         diffusion_engine: "AsyncOmniDiffusion",
         model_name: str,
-        default_seed: Optional[int] = None,
-        default_num_inference_steps: int = 50,
-        default_guidance_scale: float = 7.5,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
         Args:
             diffusion_engine: The async diffusion engine
             model_name: Name of the model being served
-            default_seed: Optional default seed for reproducible generation
-            default_num_inference_steps: Default number of inference steps
-            default_guidance_scale: Default guidance scale
 
         Returns:
             OmniOpenAIServingChat instance configured for diffusion mode
+
+        Note:
+            Request-level parameters (num_inference_steps, guidance_scale, seed,
+            height, width, num_frames, fps, etc.) are passed per-request via the API.
         """
         instance = cls.__new__(cls)
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
-        instance._diffusion_default_seed = default_seed
-        instance._diffusion_default_steps = default_num_inference_steps
-        instance._diffusion_default_guidance = default_guidance_scale
         return instance
 
     async def create_chat_completion(
@@ -960,30 +952,42 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             if not prompt:
                 return self._create_error_response("No text prompt found in messages")
 
-            # Extract generation parameters from system messages
-            gen_params = self._extract_diffusion_params(messages)
+            # Extract generation parameters from extra_body (preferred)
+            # Reference: text_to_image.py and text_to_video.py for supported parameters
+            extra_body = getattr(request, "extra_body", None) or {}
+
+            # Parse size if provided (supports "1024x1024" format)
+            height = extra_body.get("height")
+            width = extra_body.get("width")
+            if "size" in extra_body:
+                try:
+                    size_str = extra_body["size"]
+                    if isinstance(size_str, str) and "x" in size_str.lower():
+                        w, h = size_str.lower().split("x")
+                        width, height = int(w), int(h)
+                except ValueError:
+                    logger.warning("Invalid size format: %s", extra_body.get("size"))
+
+            # Get request parameters from extra_body
+            # Text-to-image parameters (ref: text_to_image.py)
+            num_inference_steps = extra_body.get("num_inference_steps", 50)
+            guidance_scale = extra_body.get("guidance_scale", 7.5)
+            true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
+            seed = extra_body.get("seed")
+            negative_prompt = extra_body.get("negative_prompt")
+            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+
+            # Text-to-video parameters (ref: text_to_video.py)
+            num_frames = extra_body.get("num_frames")
+            guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
 
             logger.info(
-                "Diffusion chat request %s: prompt=%r, ref_images=%d",
+                "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
                 request_id,
                 prompt[:50] + "..." if len(prompt) > 50 else prompt,
                 len(reference_images),
+                {k: v for k, v in extra_body.items() if v is not None},
             )
-
-            # Parse size if provided
-            height, width = None, None
-            if "size" in gen_params:
-                try:
-                    w, h = gen_params["size"].lower().split("x")
-                    width, height = int(w), int(h)
-                except ValueError:
-                    logger.warning("Invalid size format: %s", gen_params["size"])
-
-            # Use request values or fall back to defaults
-            num_inference_steps = gen_params.get("num_inference_steps") or self._diffusion_default_steps
-            guidance_scale = gen_params.get("guidance_scale") or self._diffusion_default_guidance
-            seed = gen_params.get("seed") if gen_params.get("seed") is not None else self._diffusion_default_seed
-            negative_prompt = gen_params.get("negative_prompt")
 
             # Decode reference images if provided
             pil_images: list[Image.Image] = []
@@ -1003,9 +1007,19 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 "height": height,
                 "width": width,
                 "negative_prompt": negative_prompt,
-                "num_outputs_per_prompt": 1,
+                "num_outputs_per_prompt": num_outputs_per_prompt,
                 "seed": seed,
             }
+
+            # Add Qwen-Image specific parameter
+            if true_cfg_scale is not None:
+                gen_kwargs["true_cfg_scale"] = true_cfg_scale
+
+            # Add video generation parameters if set
+            if num_frames is not None:
+                gen_kwargs["num_frames"] = num_frames
+            if guidance_scale_2 is not None:
+                gen_kwargs["guidance_scale_2"] = guidance_scale_2
 
             # Add reference image if provided
             if pil_images:
@@ -1128,58 +1142,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         prompt = " ".join(prompt_parts).strip()
         return prompt, images
-
-    def _extract_diffusion_params(
-        self,
-        messages: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Extract generation parameters from system messages.
-
-        Looks for parameters like size, num_inference_steps, guidance_scale, seed.
-
-        Args:
-            messages: List of chat messages
-
-        Returns:
-            Dictionary of generation parameters
-        """
-        params: dict[str, Any] = {}
-
-        for message in messages:
-            role = message.get("role", "")
-            if role != "system":
-                continue
-
-            content = message.get("content", "")
-            if isinstance(content, str):
-                # Parse simple key=value pairs from system message
-                for part in content.split():
-                    if "=" in part:
-                        key, value = part.split("=", 1)
-                        key = key.strip().lower()
-                        value = value.strip()
-
-                        if key in ("size", "resolution"):
-                            params["size"] = value
-                        elif key in ("steps", "num_inference_steps"):
-                            try:
-                                params["num_inference_steps"] = int(value)
-                            except ValueError:
-                                pass
-                        elif key in ("guidance", "guidance_scale", "cfg"):
-                            try:
-                                params["guidance_scale"] = float(value)
-                            except ValueError:
-                                pass
-                        elif key == "seed":
-                            try:
-                                params["seed"] = int(value)
-                            except ValueError:
-                                pass
-                        elif key in ("negative", "negative_prompt"):
-                            params["negative_prompt"] = value
-
-        return params
 
     def _create_error_response(
         self,
