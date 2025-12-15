@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import pickle
+import tempfile
 
 import pytest
 import torch
@@ -155,17 +157,53 @@ def test_ulysses_attention(
     num_heads: int,
     head_size: int,
 ):
-    """Test Ulysses attention with various parameter combinations."""
+    """Test Ulysses attention by comparing with and without SP enabled."""
     sequence_parallel_size = ulysses_degree * ring_degree
-    num_processes = sequence_parallel_size
 
-    def run_torch_spawn(fn, nprocs):
-        # need to use torch.mp.spawn otherwise will have problems with
-        # torch.distributed and cuda
+    # Create temporary files to share results between processes
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        baseline_output_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        sp_output_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        model_state_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        input_data_file = f.name
+
+    try:
+        # Step 1: Run without SP (baseline with ulysses_degree=1, ring_degree=1)
+        print("\n[Baseline] Running without SP (ulysses_degree=1, ring_degree=1)...")
         torch.multiprocessing.spawn(
-            fn,
+            ulysses_attention_on_test_model,
             args=(
-                num_processes,
+                1,  # num_processes = 1 for baseline
+                test_model_cls,
+                batch_size,
+                seq_len,
+                num_heads,
+                head_size,
+                dtype,
+                causal,
+                use_sync,
+                dynamic,
+                use_compile,
+                1,  # ulysses_degree = 1
+                1,  # ring_degree = 1
+                1,  # sequence_parallel_size = 1
+                baseline_output_file,
+                model_state_file,
+                input_data_file,
+                True,  # is_baseline
+            ),
+            nprocs=1,
+        )
+
+        # Step 2: Run with SP enabled
+        print(f"\n[SP Test] Running with SP (ulysses_degree={ulysses_degree}, ring_degree={ring_degree})...")
+        torch.multiprocessing.spawn(
+            ulysses_attention_on_test_model,
+            args=(
+                sequence_parallel_size,  # num_processes
                 test_model_cls,
                 batch_size,
                 seq_len,
@@ -179,11 +217,82 @@ def test_ulysses_attention(
                 ulysses_degree,
                 ring_degree,
                 sequence_parallel_size,
+                sp_output_file,
+                model_state_file,
+                input_data_file,
+                False,  # is_baseline
             ),
-            nprocs=nprocs,
+            nprocs=sequence_parallel_size,
         )
 
-    run_torch_spawn(ulysses_attention_on_test_model, num_processes)
+        # Step 3: Verify input consistency and compare outputs
+        print(f"\n{'=' * 80}")
+        print("Verifying input data consistency...")
+        with open(input_data_file, "rb") as f:
+            input_data = pickle.load(f)
+        input_checksum = hash(input_data.tobytes())
+        print(f"  Input data shape: {input_data.shape}")
+        print(f"  Input data checksum: {input_checksum}")
+        print("  ✓ Both baseline and SP used the same input data")
+
+        print(f"\n{'=' * 80}")
+        print("Comparing outputs between baseline and SP...")
+        with open(baseline_output_file, "rb") as f:
+            baseline_output = pickle.load(f)
+        with open(sp_output_file, "rb") as f:
+            sp_output = pickle.load(f)
+
+        # Convert to tensors for comparison
+        baseline_tensor = torch.tensor(baseline_output)
+        sp_tensor = torch.tensor(sp_output)
+
+        print(f"  Baseline output shape: {baseline_tensor.shape}")
+        print(f"  SP output shape: {sp_tensor.shape}")
+        assert baseline_tensor.shape == sp_tensor.shape, "Output shapes must match!"
+
+        # Calculate differences
+        abs_diff = torch.abs(baseline_tensor - sp_tensor)
+        max_abs_diff = abs_diff.max().item()
+        mean_abs_diff = abs_diff.mean().item()
+
+        # Calculate relative difference (avoid division by zero)
+        baseline_abs = torch.abs(baseline_tensor)
+        relative_diff = abs_diff / (baseline_abs + 1e-8)
+        max_relative_diff = relative_diff.max().item()
+        mean_relative_diff = relative_diff.mean().item()
+
+        print(f"\n{'=' * 80}")
+        print("Output Difference Analysis:")
+        print(f"  - Max absolute difference: {max_abs_diff:.6e}")
+        print(f"  - Mean absolute difference: {mean_abs_diff:.6e}")
+        print(f"  - Max relative difference: {max_relative_diff:.6e}")
+        print(f"  - Mean relative difference: {mean_relative_diff:.6e}")
+        print(f"  - Baseline output range: [{baseline_tensor.min().item():.6e}, {baseline_tensor.max().item():.6e}]")
+        print(f"  - SP output range: [{sp_tensor.min().item():.6e}, {sp_tensor.max().item():.6e}]")
+        print(f"{'=' * 80}\n")
+
+        # Assert that differences are within acceptable tolerance
+        # For FP16/BF16, we expect some numerical differences due to different computation order
+        if dtype == torch.float16:
+            atol, rtol = 1e-4, 1e-2
+        elif dtype == torch.bfloat16:
+            atol, rtol = 1e-4, 1e-2
+        else:
+            atol, rtol = 1e-5, 1e-3
+
+        assert max_abs_diff < atol or max_relative_diff < rtol, (
+            f"Output difference too large: max_abs_diff={max_abs_diff:.6e}, "
+            f"max_relative_diff={max_relative_diff:.6e}, "
+            f"tolerance: atol={atol}, rtol={rtol}"
+        )
+
+        print("✓ Test passed: SP output matches baseline within tolerance")
+
+    finally:
+        # Clean up temporary files
+        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
+            if os.path.exists(f):
+                os.remove(f)
 
 
 def ulysses_attention_on_test_model(
@@ -202,9 +311,18 @@ def ulysses_attention_on_test_model(
     ulysses_degree: int,
     ring_degree: int,
     sequence_parallel_size: int,
+    output_file: str,
+    model_state_file: str,
+    input_data_file: str,
+    is_baseline: bool,
 ):
-    """Run Ulysses attention test on a test model."""
-    current_platform.seed_everything(42)
+    """Run Ulysses attention test on a test model and save results for comparison."""
+    # Use fixed seed for reproducibility across baseline and SP runs
+    RANDOM_SEED = 42
+    current_platform.seed_everything(RANDOM_SEED)
+
+    mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+    print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -223,7 +341,7 @@ def ulysses_attention_on_test_model(
     # Initialize distributed environment
     init_distributed_environment()
 
-    # Set up OmniDiffusionConfig with Ulysses parallel config
+    # Set up OmniDiffusionConfig with parallel config
     parallel_config = DiffusionParallelConfig(
         pipeline_parallel_size=1,
         data_parallel_size=1,
@@ -240,7 +358,7 @@ def ulysses_attention_on_test_model(
         parallel_config=parallel_config,
     )
 
-    # Initialize model parallel with Ulysses
+    # Initialize model parallel
     initialize_model_parallel(
         data_parallel_degree=1,
         classifier_free_guidance_degree=1,
@@ -272,16 +390,56 @@ def ulysses_attention_on_test_model(
             model_kwargs["num_layers"] = 2
 
         model = test_model_cls(**model_kwargs)
-
         model = model.to(device).to(dtype)
 
-        # Create input
-        # In sequence parallel, each rank gets seq_len / sequence_parallel_size
+        # For baseline: Generate and save model state and input data
+        # This ensures both baseline and SP use exactly the same initialization
+        if is_baseline and local_rank == 0:
+            # Save model state for reuse (before any computation)
+            model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            with open(model_state_file, "wb") as f:
+                pickle.dump(model_state, f)
+
+            # Generate and save full input data with fixed seed
+            # Reinitialize RNG to ensure reproducibility
+            torch.manual_seed(42)
+            torch.cuda.manual_seed_all(42)
+            full_hidden_states = torch.randn(
+                (batch_size, seq_len, hidden_size),
+                dtype=dtype,
+                device="cpu",
+            )
+            with open(input_data_file, "wb") as f:
+                pickle.dump(full_hidden_states.numpy(), f)
+
+            print("[Baseline] Saved model state and input data")
+
+        # Synchronize to ensure baseline has saved data before SP loads it
+        if world_size > 1:
+            torch.distributed.barrier()
+
+        # IMPORTANT: Both baseline and SP load the same model state and input data
+        # This ensures exact same initialization and input for fair comparison
+        with open(model_state_file, "rb") as f:
+            model_state = pickle.load(f)
+        model.load_state_dict({k: v.to(device).to(dtype) for k, v in model_state.items()})
+
+        with open(input_data_file, "rb") as f:
+            full_hidden_states_np = pickle.load(f)
+        full_hidden_states = torch.from_numpy(full_hidden_states_np).to(device).to(dtype)
+
+        print(f"[Rank {local_rank}] Loaded model state and full input data with shape {full_hidden_states.shape}")
+
+        # Split input sequence according to sequence parallel BEFORE model forward
+        # Each rank gets a contiguous chunk of the sequence dimension
         local_seq_len = seq_len // sequence_parallel_size
-        hidden_states = torch.randn(
-            (batch_size, local_seq_len, hidden_size),
-            dtype=dtype,
-            device=device,
+        start_idx = local_rank * local_seq_len
+        end_idx = start_idx + local_seq_len
+        hidden_states = full_hidden_states[:, start_idx:end_idx, :].contiguous()
+
+        print(
+            f"[Rank {local_rank}] Split input: local_seq_len={local_seq_len}, "
+            f"indices=[{start_idx}:{end_idx}], local_shape={hidden_states.shape}"
         )
 
         if dynamic:
@@ -292,28 +450,62 @@ def ulysses_attention_on_test_model(
         if use_compile:
             model = torch.compile(model)
 
-        # Run forward pass
+        # Run forward pass with local sequence chunk
+        print(f"[Rank {local_rank}] Running forward pass...")
         output = model(hidden_states)
+        print(f"[Rank {local_rank}] Forward pass completed, output shape: {output.shape}")
 
         # Verify output shape
         assert output.shape == (batch_size, local_seq_len, hidden_size), (
             f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
         )
 
-        # Verify that Attention is using Ulysses
-        if hasattr(model, "attention"):
-            assert hasattr(model.attention, "use_ulysses"), "Attention should have use_ulysses attribute"
-            assert model.attention.use_ulysses, "Attention should be using Ulysses"
-        elif hasattr(model, "layers"):
-            for i, layer in enumerate(model.layers):
-                assert hasattr(layer.attention, "use_ulysses"), f"Layer {i} attention should have use_ulysses attribute"
-                assert layer.attention.use_ulysses, f"Layer {i} attention should be using Ulysses"
+        # Verify SP usage for non-baseline runs
+        if not is_baseline:
+            if hasattr(model, "attention"):
+                assert hasattr(model.attention, "use_ulysses"), "Attention should have use_ulysses attribute"
+                assert model.attention.use_ulysses, "Attention should be using Ulysses"
+            elif hasattr(model, "layers"):
+                for i, layer in enumerate(model.layers):
+                    assert hasattr(layer.attention, "use_ulysses"), (
+                        f"Layer {i} attention should have use_ulysses attribute"
+                    )
+                    assert layer.attention.use_ulysses, f"Layer {i} attention should be using Ulysses"
 
-        print(
-            f"Rank {local_rank}: Test passed with "
-            f"batch_size={batch_size}, seq_len={seq_len}, "
-            f"num_heads={num_heads}, head_size={head_size}, "
-            f"dtype={dtype}, causal={causal}, use_sync={use_sync}, "
-            f"dynamic={dynamic}, use_compile={use_compile}"
-        )
+        # Gather outputs from all ranks AFTER computation
+        if world_size > 1:
+            print(f"[Rank {local_rank}] Gathering outputs from all {world_size} ranks...")
+            # Gather all outputs to rank 0
+            gathered_outputs = [torch.zeros_like(output) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_outputs, output)
+            if local_rank == 0:
+                # Concatenate along sequence dimension to reconstruct full sequence
+                full_output = torch.cat(gathered_outputs, dim=1)
+                print(f"[Rank 0] Gathered and concatenated outputs: {full_output.shape}")
+                # Verify the full output shape matches expected
+                assert full_output.shape == (batch_size, seq_len, hidden_size), (
+                    f"Gathered output shape mismatch: expected {(batch_size, seq_len, hidden_size)}, "
+                    f"got {full_output.shape}"
+                )
+            else:
+                full_output = None
+        else:
+            # For baseline (world_size=1), output is already complete
+            full_output = output
+            print(f"[Rank 0] No gather needed (world_size=1), output shape: {full_output.shape}")
+
+        # Save output from rank 0 for comparison
+        if local_rank == 0:
+            output_np = full_output.cpu().numpy()
+            with open(output_file, "wb") as f:
+                pickle.dump(output_np, f)
+
+            mode_str = "baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
+            print(
+                f"\n[{mode_str}] ✓ Saved output with shape {full_output.shape}:\n"
+                f"  - batch_size={batch_size}, seq_len={seq_len}\n"
+                f"  - num_heads={num_heads}, head_size={head_size}\n"
+                f"  - dtype={dtype}, causal={causal}, use_sync={use_sync}\n"
+            )
+
         destroy_distributed_env()
