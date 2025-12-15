@@ -850,35 +850,41 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Handle different image output formats
         images = []
-        if hasattr(final_res, "multimodal_output") and final_res.multimodal_output:
-            image_data = final_res.multimodal_output.get("image")
-            if image_data is not None:
-                if isinstance(image_data, Image.Image):
-                    images.append(image_data)
-                elif hasattr(image_data, "cpu"):  # Tensor
-                    import numpy as np
 
-                    # Convert tensor to PIL Image
-                    img_array = image_data.float().detach().cpu().numpy()
-                    # Handle different tensor formats (CHW -> HWC)
-                    if img_array.ndim == 3 and img_array.shape[0] in [1, 3, 4]:
-                        img_array = np.transpose(img_array, (1, 2, 0))
-                    # Normalize to 0-255
-                    if img_array.max() <= 1.0:
-                        img_array = (img_array * 255).astype(np.uint8)
-                    else:
-                        img_array = img_array.astype(np.uint8)
-                    # Handle grayscale
-                    if img_array.ndim == 2:
-                        images.append(Image.fromarray(img_array, mode="L"))
-                    elif img_array.shape[-1] == 1:
-                        images.append(Image.fromarray(img_array.squeeze(-1), mode="L"))
-                    elif img_array.shape[-1] == 3:
-                        images.append(Image.fromarray(img_array, mode="RGB"))
-                    elif img_array.shape[-1] == 4:
-                        images.append(Image.fromarray(img_array, mode="RGBA"))
-        elif hasattr(final_res, "images") and final_res.images:
-            images = final_res.images
+        # First check omni_outputs.images directly (for diffusion mode via from_diffusion)
+        if omni_outputs.images:
+            images = omni_outputs.images
+        # Fall back to request_output for pipeline mode
+        elif final_res is not None:
+            if hasattr(final_res, "multimodal_output") and final_res.multimodal_output:
+                image_data = final_res.multimodal_output.get("image")
+                if image_data is not None:
+                    if isinstance(image_data, Image.Image):
+                        images.append(image_data)
+                    elif hasattr(image_data, "cpu"):  # Tensor
+                        import numpy as np
+
+                        # Convert tensor to PIL Image
+                        img_array = image_data.float().detach().cpu().numpy()
+                        # Handle different tensor formats (CHW -> HWC)
+                        if img_array.ndim == 3 and img_array.shape[0] in [1, 3, 4]:
+                            img_array = np.transpose(img_array, (1, 2, 0))
+                        # Normalize to 0-255
+                        if img_array.max() <= 1.0:
+                            img_array = (img_array * 255).astype(np.uint8)
+                        else:
+                            img_array = img_array.astype(np.uint8)
+                        # Handle grayscale
+                        if img_array.ndim == 2:
+                            images.append(Image.fromarray(img_array, mode="L"))
+                        elif img_array.shape[-1] == 1:
+                            images.append(Image.fromarray(img_array.squeeze(-1), mode="L"))
+                        elif img_array.shape[-1] == 3:
+                            images.append(Image.fromarray(img_array, mode="RGB"))
+                        elif img_array.shape[-1] == 4:
+                            images.append(Image.fromarray(img_array, mode="RGBA"))
+            elif hasattr(final_res, "images") and final_res.images:
+                images = final_res.images
 
         # Convert images to base64
         image_contents = []
