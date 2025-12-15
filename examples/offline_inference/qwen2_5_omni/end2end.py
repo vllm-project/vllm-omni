@@ -108,7 +108,6 @@ def get_mixed_modalities_query(
                 "image": image_data,
                 "video": video_frames,
             },
-            "modalities": ["text"],
         },
         limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
     )
