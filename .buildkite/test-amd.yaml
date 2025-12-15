@@ -1,16 +1,12 @@
 steps:
-  - label: ":docker: Build image"
-    key: image-build
-    commands:
-      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm-ci ."
-      - "docker tag vllm-omni-rocm-ci public.ecr.aws/q9t5s3a7/vllm-rocm-ci-test-repo:$BUILDKITE_COMMIT"
-      - "docker push public.ecr.aws/q9t5s3a7/vllm-rocm-ci-test-repo:$BUILDKITE_COMMIT"
-    agents:
-      queue: "cpu_queue_premerge_us_east_1"
 
-  - label: "Simple Unit Test"
-    commands:
-      - ".buildkite/scripts/simple_test.sh"
-    agents:
-      queue: "cpu_queue_premerge"
+- label: "Diffusion Model Test"
+  timeout_in_minutes: 15
+  agent_pool: mi325_2
+  depends_on: image-build
+  mirror_hardwares: [amdexperimental, amdproduction, amdtentative]
+  grade: Blocking
+  source_file_dependencies:
+  - ./
+  commands:
+    - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
