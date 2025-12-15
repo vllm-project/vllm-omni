@@ -170,10 +170,6 @@ cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -
     ``````py
     --8<-- "examples/online_serving/qwen_image/gradio_demo.py"
     ``````
-??? abstract "online_serving.log"
-    ``````log
-    --8<-- "examples/online_serving/qwen_image/online_serving.log"
-    ``````
 ??? abstract "openai_chat_client.py"
     ``````py
     --8<-- "examples/online_serving/qwen_image/openai_chat_client.py"

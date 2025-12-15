@@ -192,10 +192,6 @@ Use `extra_body` to pass generation parameters:
     ``````py
     --8<-- "examples/online_serving/qwen_image_edit/gradio_demo.py"
     ``````
-??? abstract "online_serving.log"
-    ``````log
-    --8<-- "examples/online_serving/qwen_image_edit/online_serving.log"
-    ``````
 ??? abstract "openai_chat_client.py"
     ``````py
     --8<-- "examples/online_serving/qwen_image_edit/openai_chat_client.py"
