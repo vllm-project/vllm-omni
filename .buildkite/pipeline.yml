@@ -53,7 +53,7 @@ steps:
     timeout_in_minutes: 15
     depends_on: image-build
     commands:
-      - pytest -s -v tests/diffusion/attention/test_ulysses_sequence_parallel.py tests/diffusion/distributed/test_comm.py
+      - pytest -s -v tests/diffusion/attention/test_ulysses_sequence_parallel.py tests/diffusion/distributed/test_comm.py tests/e2e/offline_inference/test_sequence_parallel.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
