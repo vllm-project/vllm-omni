@@ -24,6 +24,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -65,6 +66,8 @@ def parse_args() -> argparse.Namespace:
         default=4.0,
         help="True classifier-free guidance scale specific to Qwen-Image-Edit.",
     )
+    parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
+    parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
     parser.add_argument(
         "--output",
         type=str,
@@ -94,6 +97,18 @@ def parse_args() -> argparse.Namespace:
             "Default: None (no cache acceleration)."
         ),
     )
+    parser.add_argument(
+        "--ulysses_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ring_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
     return parser.parse_args()
 
 
@@ -114,7 +129,6 @@ def main():
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
-
     # Configure cache based on backend type
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -131,30 +145,39 @@ def main():
             "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
             "taylorseer_order": 1,  # TaylorSeer polynomial order
             # SCM (Step Computation Masking) parameters [cache-dit only]
-            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
+            "scm_steps_mask_policy": "fast",  # SCM mask policy: "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
     elif args.cache_backend == "tea_cache":
-        raise ValueError("TeaCache is not supported for image-to-image generation.")
+        # TeaCache configuration
+        # All parameters marked with [tea_cache only] in DiffusionCacheConfig
+        cache_config = {
+            # TeaCache parameters [tea_cache only]
+            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
+            # Note: coefficients will use model-specific defaults based on model_type
+            #       (e.g., QwenImagePipeline or FluxPipeline)
+        }
 
-    # Initialize Omni with QwenImageEditPipeline
+    assert args.ring_degree == 1, "Ring attention is not supported yet"
+    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     omni = Omni(
         model=args.model,
-        model_class_name="QwenImageEditPipeline",
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        parallel_config=parallel_config,
     )
-    print("Pipeline loaded")
 
+    print("Pipeline loaded")
     # Time profiling for generation
     print(f"\n{'=' * 60}")
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
-    print(f"  Input image size: {input_image.size}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
+    print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
@@ -165,6 +188,8 @@ def main():
         negative_prompt=args.negative_prompt,
         generator=generator,
         true_cfg_scale=args.cfg_scale,
+        height=args.height,
+        width=args.width,
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_outputs_per_prompt,
     )
