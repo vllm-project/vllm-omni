@@ -17,11 +17,7 @@ _TYPE_NDARRAY = 2
 class OmniSerializer:
     """
     Centralized serialization handler for OmniConnectors.
-
     Wraps vLLM's MsgpackEncoder/MsgpackDecoder for safe serialization.
-
-    Wire format:
-        [type: u8][num_bufs: u32][len_0: u32][len_1: u32]...[buf_0][buf_1]...
     """
 
     _encoder = MsgpackEncoder()
