@@ -50,6 +50,42 @@ omni = Omni(
 )
 ```
 
+### Example Script
+
+See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example with cache-dit acceleration.
+
+```bash
+# Enable cache-dit with default parameters
+cd examples/offline_inference/text_to_image
+python text_to_image.py \
+    --prompt "a cup of coffee on the table" \
+    --enable_cache_dit \
+    --num_inference_steps 50
+```
+
+The `--enable_cache_dit` flag enables cache-dit acceleration with these customized parameters:
+
+```python
+omni = Omni(
+    ...
+    cache_backend="cache_dit" if args.enable_cache_dit else None,
+    cache_config={
+        # Scheme: Hybrid DBCache + SCM + TaylorSeer
+        # DBCache
+        "Fn_compute_blocks": 8,
+        "Bn_compute_blocks": 0,
+        "max_warmup_steps": 4,
+        "residual_diff_threshold": 0.12,
+        # TaylorSeer
+        "enable_taylorseer": True,
+        "taylorseer_order": 1,
+        # SCM
+        "scm_steps_mask_policy": "fast",
+        "scm_steps_policy": "dynamic",
+    },
+)
+
+```
 
 ## Acceleration Methods
 
