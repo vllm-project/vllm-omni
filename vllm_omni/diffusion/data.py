@@ -101,8 +101,8 @@ class DiffusionCacheConfig:
     enable_taylorseer: bool = False
     # Default: 1st order TaylorSeer polynomial
     taylorseer_order: int = 1
-    # Default: "fast" SCM mask policy for good speed/quality balance
-    scm_steps_mask_policy: str = "fast"
+    # Default: None SCM mask policy (disabled by default)
+    scm_steps_mask_policy: str | None = None
     # Default: "dynamic" steps policy for adaptive caching
     scm_steps_policy: str = "dynamic"
     # Used by cache-dit for scm mask generation. If this value changes during inference,

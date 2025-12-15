@@ -21,9 +21,9 @@ nav:
     - configuration/README.md
     - configuration/*
   - Diffusion Acceleration:
-     - Overview: user_guide/diffusion_acceleration.md
-     - TeaCache: user_guide/teacache.md
-     - Cache-DiT: user_guide/cache_dit_acceleration.md
+    - Overview: user_guide/diffusion_acceleration.md
+    - TeaCache: user_guide/teacache.md
+    - Cache-DiT: user_guide/cache_dit_acceleration.md
   - Models:
     - models/supported_models.md
 - Developer Guide:

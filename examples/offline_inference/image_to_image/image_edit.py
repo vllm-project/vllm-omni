@@ -18,6 +18,7 @@ For more options, run:
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -82,6 +83,17 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
     )
+    parser.add_argument(
+        "--cache_backend",
+        type=str,
+        default=None,
+        choices=["cache_dit", "tea_cache"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Default: None (no cache acceleration)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -103,15 +115,49 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
+    # Configure cache based on backend type
+    cache_config = None
+    if args.cache_backend == "cache_dit":
+        # cache-dit configuration: Hybrid DBCache + SCM + TaylorSeer
+        # All parameters marked with [cache-dit only] in DiffusionCacheConfig
+        cache_config = {
+            # DBCache parameters [cache-dit only]
+            "Fn_compute_blocks": 1,  # Optimized for single-transformer models
+            "Bn_compute_blocks": 0,  # Number of backward compute blocks
+            "max_warmup_steps": 4,  # Maximum warmup steps (works for few-step models)
+            "residual_diff_threshold": 0.24,  # Higher threshold for more aggressive caching
+            "max_continuous_cached_steps": 3,  # Limit to prevent precision degradation
+            # TaylorSeer parameters [cache-dit only]
+            "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
+            "taylorseer_order": 1,  # TaylorSeer polynomial order
+            # SCM (Step Computation Masking) parameters [cache-dit only]
+            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
+            "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
+        }
+    elif args.cache_backend == "tea_cache":
+        raise ValueError("TeaCache is not supported for image-to-image generation.")
+
     # Initialize Omni with QwenImageEditPipeline
     omni = Omni(
         model=args.model,
         model_class_name="QwenImageEditPipeline",
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
     )
     print("Pipeline loaded")
 
+    # Time profiling for generation
+    print(f"\n{'=' * 60}")
+    print("Generation Configuration:")
+    print(f"  Model: {args.model}")
+    print(f"  Inference steps: {args.num_inference_steps}")
+    print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Input image size: {input_image.size}")
+    print(f"{'=' * 60}\n")
+
+    generation_start = time.perf_counter()
     # Generate edited image
     images = omni.generate(
         prompt=args.prompt,
@@ -122,6 +168,11 @@ def main():
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_outputs_per_prompt,
     )
+    generation_end = time.perf_counter()
+    generation_time = generation_end - generation_start
+
+    # Print profiling results
+    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     # Save output image(s)
     output_path = Path(args.output)
