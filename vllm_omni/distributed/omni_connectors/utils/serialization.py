@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 # Type codes for serialization
