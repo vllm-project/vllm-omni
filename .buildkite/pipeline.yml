@@ -49,6 +49,23 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "Ulysses Sequence Parallelism Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/diffusion/attention/test_ulysses_sequence_parallel.py tests/diffusion/distributed/test_comm.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Omni Model Test"
     timeout_in_minutes: 15
     depends_on: image-build
