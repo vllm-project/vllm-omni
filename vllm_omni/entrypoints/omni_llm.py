@@ -361,6 +361,7 @@ class OmniLLM:
                     )
                     # close all stages on error in any stage
                     self.close()
+                    raise RuntimeError(result["error"])
 
                 if result.get("type") == "stage_ready":
                     # Only happens when stage is initialized slower than expected,

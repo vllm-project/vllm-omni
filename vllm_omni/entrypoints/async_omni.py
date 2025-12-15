@@ -372,6 +372,7 @@ class AsyncOmni(EngineClient):
                     )
                     # Shutdown entire orchestrator and all stages on error in any stage
                     self.shutdown()
+                    raise RuntimeError(result["error"])
 
                 if result.get("type") == "stage_ready":
                     # Only happens when stage is initialized slower than expected,
