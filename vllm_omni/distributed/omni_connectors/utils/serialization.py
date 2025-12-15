@@ -14,20 +14,34 @@ _TYPE_TENSOR = 1
 _TYPE_NDARRAY = 2
 
 
-class OmniSerializer:
+class OmniSerde:
     """
-    Centralized serialization handler for OmniConnectors.
+    Serialization/deserialization handler for OmniConnectors.
     Wraps vLLM's MsgpackEncoder/MsgpackDecoder for safe serialization.
+
+    Similar to vLLM's MsgpackSerde but uses struct instead of pickle for metadata.
     """
 
-    _encoder = MsgpackEncoder()
-    _decoder = MsgpackDecoder()
-    _tensor_decoder = MsgpackDecoder(torch.Tensor)
-    _ndarray_decoder = MsgpackDecoder(np.ndarray)
+    def __init__(self):
+        self.encoder = MsgpackEncoder()
+        self.decoder = MsgpackDecoder()
+        self.tensor_decoder = MsgpackDecoder(torch.Tensor)
+        self.ndarray_decoder = MsgpackDecoder(np.ndarray)
 
-    @staticmethod
-    def serialize(obj: Any) -> bytes:
-        """Serialize an object to bytes."""
+    def serialize(self, obj: Any) -> tuple[bytes | list[bytes], int, bytes, int]:
+        """
+        Serialize an object to bytes.
+
+        Args:
+            obj: The object to serialize.
+
+        Returns:
+            tuple: (data, nbytes, metadata, metadata_len)
+                - data: Serialized data (bytes or list of bytes for multi-buffer)
+                - nbytes: Total size of serialized data
+                - metadata: Header containing type and length info
+                - metadata_len: Size of metadata
+        """
         # Determine type code
         if isinstance(obj, torch.Tensor):
             type_code = _TYPE_TENSOR
@@ -36,22 +50,38 @@ class OmniSerializer:
         else:
             type_code = _TYPE_GENERIC
 
-        bufs = OmniSerializer._encoder.encode(obj)
+        bufs = self.encoder.encode(obj)
+        len_arr = [len(buf) for buf in bufs]
+        nbytes = sum(len_arr)
 
-        # Header: type_code + num_bufs + length of each buffer
-        header = struct.pack("<BI", type_code, len(bufs))
-        for buf in bufs:
-            header += struct.pack("<I", len(buf))
+        # Convert bufs to bytes
+        data: bytes | list[bytes]
+        if len(bufs) == 1:
+            buf = bufs[0]
+            data = buf if isinstance(buf, bytes) else bytes(memoryview(buf))  # type: ignore[arg-type]
+        else:
+            data = [
+                buf if isinstance(buf, bytes) else bytes(memoryview(buf))  # type: ignore[arg-type]
+                for buf in bufs
+            ]
 
-        data = b"".join(
-            buf if isinstance(buf, bytes) else bytes(memoryview(buf))  # type: ignore[arg-type]
-            for buf in bufs
-        )
-        return header + data
+        # Metadata: type_code + num_bufs + length of each buffer
+        metadata = struct.pack("<BI", type_code, len(bufs))
+        for length in len_arr:
+            metadata += struct.pack("<I", length)
 
-    @staticmethod
-    def deserialize(data: bytes) -> Any:
-        """Deserialize bytes to an object."""
+        return data, nbytes, metadata, len(metadata)
+
+    def deserialize(self, data: bytes | memoryview) -> Any:
+        """
+        Deserialize bytes to an object.
+
+        Args:
+            data: The bytes to deserialize (can be memoryview for zero-copy).
+
+        Returns:
+            Deserialized object.
+        """
         # Parse header
         type_code, num_bufs = struct.unpack("<BI", data[:5])
         header_size = 5 + num_bufs * 4
@@ -59,11 +89,11 @@ class OmniSerializer:
 
         # Select decoder based on type
         if type_code == _TYPE_TENSOR:
-            decoder = OmniSerializer._tensor_decoder
+            decoder = self.tensor_decoder
         elif type_code == _TYPE_NDARRAY:
-            decoder = OmniSerializer._ndarray_decoder
+            decoder = self.ndarray_decoder
         else:
-            decoder = OmniSerializer._decoder
+            decoder = self.decoder
 
         if num_bufs == 1:
             return decoder.decode(data[header_size:])
@@ -75,3 +105,28 @@ class OmniSerializer:
             bufs.append(data[offset : offset + length])
             offset += length
         return decoder.decode(bufs)
+
+
+class OmniSerializer:
+    """
+    Simple serialization interface for OmniConnectors.
+    Wraps OmniSerde with a simpler bytes-in/bytes-out interface.
+    """
+
+    _serde = OmniSerde()
+
+    @staticmethod
+    def serialize(obj: Any) -> bytes:
+        """Serialize an object to bytes."""
+        data, nbytes, metadata, _ = OmniSerializer._serde.serialize(obj)
+
+        if isinstance(data, bytes):
+            return metadata + data
+
+        # Multi-buffer: concatenate all buffers
+        return metadata + b"".join(data)
+
+    @staticmethod
+    def deserialize(data: bytes | memoryview) -> Any:
+        """Deserialize bytes to an object."""
+        return OmniSerializer._serde.deserialize(data)
