@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ulysses_degree",
         type=int,
-        default=2,
+        default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
@@ -111,7 +111,6 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-
     assert args.ring_degree == 1, "Ring attention is not supported yet"
     parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     omni = Omni(
@@ -129,6 +128,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
