@@ -19,6 +19,15 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.utils.platform_utils import detect_device_type
+
+device_type = detect_device_type()
+if device_type == "cuda":
+    torch_device = torch.cuda
+elif device_type == "npu":
+    torch_device = torch.npu
+else:
+    raise ValueError(f"Unsupported device type: {device_type} for this test script! Expected GPU or NPU.")
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -324,8 +333,8 @@ def ulysses_attention_on_test_model(
     mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
 
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
+    device = torch.device(f"{device_type}:{local_rank}")
+    torch_device.set_device(device)
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
 
@@ -403,14 +412,14 @@ def ulysses_attention_on_test_model(
             # Generate and save full input data with fixed seed
             # Reinitialize RNG to ensure reproducibility
             torch.manual_seed(42)
-            torch.cuda.manual_seed_all(42)
+            torch_device.manual_seed_all(42)
             full_hidden_states = torch.randn(
                 (batch_size, seq_len, hidden_size),
                 dtype=dtype,
                 device="cpu",
             )
             with open(input_data_file, "wb") as f:
-                pickle.dump(full_hidden_states.numpy(), f)
+                pickle.dump(full_hidden_states.detach().cpu().float().numpy(), f)
 
             print("[Baseline] Saved model state and input data")
 
@@ -496,7 +505,7 @@ def ulysses_attention_on_test_model(
 
         # Save output from rank 0 for comparison
         if local_rank == 0:
-            output_np = full_output.cpu().numpy()
+            output_np = full_output.detach().cpu().float().numpy()
             with open(output_file, "wb") as f:
                 pickle.dump(output_np, f)
 
