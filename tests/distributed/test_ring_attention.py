@@ -86,7 +86,7 @@ class MockAttentionModel(torch.nn.Module):
         return output
 
 
-@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("batch_size", [1,2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [32])
@@ -94,7 +94,7 @@ class MockAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_sync", [True, False])
 @pytest.mark.parametrize("ring_degree", [2])
-@pytest.mark.parametrize("ulysses_degree", [1])
+@pytest.mark.parametrize("ulysses_degree", [1,2])
 def test_ring_attention(
     dtype: torch.dtype,
     causal: bool,
