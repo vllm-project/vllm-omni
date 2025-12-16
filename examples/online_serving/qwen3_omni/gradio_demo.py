@@ -129,6 +129,19 @@ def parse_args():
         default=ASYNC_INIT_TIMEOUT,
         help="Timeout (seconds) for initializing all stages.",
     )
+    parser.add_argument(
+        "--worker-backend",
+        type=int,
+        default="multi_process",
+        choices=["multi_process", "ray"],
+        help="The backend to use for stage workers.",
+    )
+    parser.add_argument(
+        "--ray-address",
+        type=str,
+        default="",
+        help="(Optional) Specify if you use Ray backend.",
+    )
     return parser.parse_args()
 
 
@@ -143,6 +156,8 @@ def build_async_omni_cli_args(base_args: argparse.Namespace) -> argparse.Namespa
         shm_threshold_bytes=int(getattr(base_args, "shm_threshold_bytes", 65536)),
         batch_timeout=int(getattr(base_args, "batch_timeout", 10)),
         init_timeout=int(getattr(base_args, "init_timeout", ASYNC_INIT_TIMEOUT)),
+        worker_backend=getattr(base_args, "worker_backend", "multi_process"),
+        ray_address=getattr(base_args, "ray_address", ""),
     )
 
 
