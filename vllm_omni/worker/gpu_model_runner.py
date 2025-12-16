@@ -204,7 +204,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                                     dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
                                     arr = np.frombuffer(entry.tensor_data, dtype=dt)
                                     arr = arr.reshape(entry.tensor_shape)
-                                    info_dict[k] = torch.from_numpy(arr)
+                                    info_dict[k] = torch.from_numpy(arr.copy())
                                 else:
                                     info_dict[k] = entry.list_data
                     if info_dict:
@@ -736,7 +736,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                             dt = np.dtype(getattr(payload_pe, "dtype", "float32"))
                             arr = np.frombuffer(data, dtype=dt)
                             arr = arr.reshape(shape)
-                            pe_cpu = torch.from_numpy(arr)
+                            pe_cpu = torch.from_numpy(arr.copy())
                 if pe_cpu is not None and req_id in self.requests:
                     setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
                 # additional_information
@@ -756,7 +756,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                                     dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
                                     arr = np.frombuffer(tensor_data, dtype=dt)
                                     arr = arr.reshape(getattr(entry, "tensor_shape", ()))
-                                    info_dict[k] = torch.from_numpy(arr)
+                                    info_dict[k] = torch.from_numpy(arr.copy())
                                 else:
                                     info_dict[k] = getattr(entry, "list_data", None)
                     if info_dict and req_id in self.requests:
