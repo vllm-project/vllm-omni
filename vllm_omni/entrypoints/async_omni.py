@@ -46,6 +46,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
     configure_orchestrator_logger,
@@ -122,6 +123,8 @@ class AsyncOmni(EngineClient):
             self.stage_configs = load_stage_configs_from_yaml(cli_args.stage_configs_path, base_engine_args)
 
         shm_threshold_bytes = cli_args.shm_threshold_bytes
+        self.output_handler: asyncio.Task | None = None
+        self.request_states: dict[str, ClientRequestState] = {}  # request_id -> state
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -238,6 +241,10 @@ class AsyncOmni(EngineClient):
             except Exception as e:
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
+        if self.output_handler is not None:
+            self.output_handler.cancel()
+            self.output_handler = None
+
         try_close_ray(self._ray_pg)
 
     def __del__(self) -> None:  # best-effort
@@ -295,6 +302,10 @@ class AsyncOmni(EngineClient):
             ValueError: If sampling_params_list has incorrect length.
         """
         logger.debug("[Orchestrator] generate() called")
+
+        # Start output handler on the first call to generate()
+        self._run_output_handler()
+
         if sampling_params_list is None:
             sampling_params_list = self.default_sampling_params_list
         if len(sampling_params_list) != len(self.stage_list):
@@ -339,6 +350,9 @@ class AsyncOmni(EngineClient):
         )
         # Seed stage-0 queue with all requests
         logger.debug("[Orchestrator] Seeding request into stage-0")
+        req_state = ClientRequestState(request_id)
+        self.request_states[request_id] = req_state
+
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
@@ -353,135 +367,120 @@ class AsyncOmni(EngineClient):
         logger.debug("[Orchestrator] Enqueued request %s to stage-0", request_id)
 
         logger.debug("[Orchestrator] Entering scheduling loop: stages=%d", num_stages)
-        finished = False
-        while not finished:
-            made_progress = False
-            for stage_id, stage in enumerate(self.stage_list):
-                result = stage.try_collect()
-                if result is None:
-                    continue
+        for stage_id, stage in enumerate(self.stage_list):
+            result = await req_state.queue.get()
+            assert stage_id == req_state.stage_id
 
-                made_progress = True
-                req_id = result.get("request_id")
-                if "error" in result:
-                    logger.error(
-                        "Stage %s error on request %s: %s",
-                        stage_id,
-                        req_id,
-                        result["error"],
-                    )
-                    continue
-
-                if result.get("type") == "stage_ready":
-                    # Only happens when stage is initialized slower than expected,
-                    # so we wait for a short time and try again
-                    time.sleep(0.05)
-                    continue
-
-                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-                # Mark last output time for this stage whenever we receive outputs
-                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-                try:
-                    _m = result.get("metrics")
-                    if _m is not None:
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
-                except Exception as e:
-                    logger.exception(
-                        "[Orchestrator] Failed to process metrics for stage %s, \
-                            req %s: %s",
-                        stage_id,
-                        req_id,
-                        e,
-                    )
-                logger.debug(
-                    "[Orchestrator] Stage-%s completed request %s; \
-                        forwarding or finalizing",
+            req_id = result.get("request_id")
+            if "error" in result:
+                logger.error(
+                    "Stage %s error on request %s: %s",
                     stage_id,
                     req_id,
+                    result["error"],
                 )
-                stage.set_engine_outputs(engine_outputs)
+                raise RuntimeError(result)  # Request Finished due to error
 
-                if getattr(stage, "final_output", False):
-                    logger.debug(
-                        "[Orchestrator] Request %s finalized at stage-%s",
+            engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+            # Mark last output time for this stage whenever we receive outputs
+            metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+            try:
+                _m = result.get("metrics")
+                if _m is not None:
+                    metrics.on_stage_metrics(stage_id, req_id, _m)
+            except Exception as e:
+                logger.exception(
+                    "[Orchestrator] Failed to process metrics for stage %s, \
+                        req %s: %s",
+                    stage_id,
+                    req_id,
+                    e,
+                )
+            logger.debug(
+                "[Orchestrator] Stage-%s completed request %s; \
+                    forwarding or finalizing",
+                stage_id,
+                req_id,
+            )
+            stage.set_engine_outputs(engine_outputs)
+
+            if getattr(stage, "final_output", False):
+                logger.debug(
+                    "[Orchestrator] Request %s finalized at stage-%s",
+                    req_id,
+                    stage_id,
+                )
+
+                # End-to-end timing and time-per-token for final output
+                # (only once per request at the designated final stage)
+                try:
+                    rid_key = str(req_id)
+                    if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
+                        metrics.on_finalize_request(
+                            stage_id,
+                            req_id,
+                            engine_outputs,
+                            _req_start_ts.get(req_id, _wall_start_ts),
+                        )
+                except Exception as e:
+                    logger.exception(
+                        "[Orchestrator] Finalize request handling error for \
+                            req %s at stage %s: %s",
                         req_id,
                         stage_id,
+                        e,
                     )
 
-                    # End-to-end timing and time-per-token for final output
-                    # (only once per request at the designated final stage)
-                    try:
-                        rid_key = str(req_id)
-                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
-                            metrics.on_finalize_request(
-                                stage_id,
-                                req_id,
-                                engine_outputs,
-                                _req_start_ts.get(req_id, _wall_start_ts),
-                            )
-                    except Exception as e:
-                        logger.exception(
-                            "[Orchestrator] Finalize request handling error for \
-                                req %s at stage %s: %s",
-                            req_id,
-                            stage_id,
-                            e,
-                        )
+                if isinstance(engine_outputs, list):
+                    engine_outputs = engine_outputs[0]
+                yield OmniRequestOutput(
+                    stage_id=stage_id,
+                    final_output_type=stage.final_output_type,
+                    request_output=engine_outputs,
+                )
 
-                    if isinstance(engine_outputs, list):
-                        engine_outputs = engine_outputs[0]
-                    yield OmniRequestOutput(
+            next_stage_id = stage_id + 1
+            if next_stage_id < num_stages:
+                next_stage: OmniStage = self.stage_list[next_stage_id]
+                next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                sp_next: SamplingParams = sampling_params_list[next_stage_id]
+
+                # Check if we have a connector for this edge
+                connector_key = (str(stage_id), str(next_stage_id))
+                connector = self.connectors.get(connector_key)
+
+                sent_via_connector = False
+                if connector:
+                    sent_via_connector = try_send_via_connector(
+                        connector=connector,
                         stage_id=stage_id,
-                        final_output_type=stage.final_output_type,
-                        request_output=engine_outputs,
+                        next_stage_id=next_stage_id,
+                        req_id=req_id,
+                        next_inputs=next_inputs,
+                        sampling_params=sp_next,
+                        original_prompt=prompt,
+                        next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                        metrics=metrics,
                     )
 
-                next_stage_id = stage_id + 1
-                if next_stage_id < num_stages:
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                    sp_next: SamplingParams = sampling_params_list[next_stage_id]
-
-                    # Check if we have a connector for this edge
-                    connector_key = (str(stage_id), str(next_stage_id))
-                    connector = self.connectors.get(connector_key)
-
-                    sent_via_connector = False
-                    if connector:
-                        sent_via_connector = try_send_via_connector(
-                            connector=connector,
-                            stage_id=stage_id,
-                            next_stage_id=next_stage_id,
-                            req_id=req_id,
-                            next_inputs=next_inputs,
-                            sampling_params=sp_next,
-                            original_prompt=prompt,
-                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                            metrics=metrics,
-                        )
-
-                    if not sent_via_connector:
-                        # Fallback logic removed as we now enforce connector usage.
-                        # If no connector is found or send fails, we log an error and raise,
-                        # because continuing would cause the request to be silently dropped
-                        # and the orchestrator to hang waiting for completion.
-                        error_msg = (
-                            f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
-                            "Configure a connector for this edge or inspect connector logs for details."
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
-                    logger.debug(
-                        "[Orchestrator] Forwarded request %s to stage-%s",
-                        req_id,
-                        next_stage_id,
+                if not sent_via_connector:
+                    # Fallback logic removed as we now enforce connector usage.
+                    # If no connector is found or send fails, we log an error and raise,
+                    # because continuing would cause the request to be silently dropped
+                    # and the orchestrator to hang waiting for completion.
+                    error_msg = (
+                        f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                        "Configure a connector for this edge or inspect connector logs for details."
                     )
-                else:
-                    finished = True
-                    logger.debug("[Orchestrator] Request %s fully completed", req_id)
-
-            if not made_progress:
-                time.sleep(0.005)
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                logger.debug(
+                    "[Orchestrator] Forwarded request %s to stage-%s",
+                    req_id,
+                    next_stage_id,
+                )
+            else:
+                logger.debug("[Orchestrator] Request %s fully completed", req_id)
 
         logger.debug("[Orchestrator] All requests completed")
 
@@ -491,6 +490,8 @@ class AsyncOmni(EngineClient):
             logger.info("[Summary] %s", summary)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
+        finally:
+            self.request_states.pop(request_id, None)
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
         num_stages = len(self.stage_list)
@@ -559,6 +560,51 @@ class AsyncOmni(EngineClient):
                     "[Orchestrator] Stage initialization failed and an error \
                         occurred while logging suggestions",
                 )
+
+    def _run_output_handler(self) -> None:
+        if self.output_handler is not None:
+            return
+
+        stage_list = self.stage_list
+        request_states = self.request_states
+
+        async def output_handler():
+            try:
+                while True:
+                    idle = True
+                    for stage_id, stage in enumerate(stage_list):
+                        result = stage.try_collect()
+                        if result is None:
+                            continue
+                        idle = False
+                        if result.get("type") == "stage_ready":
+                            # Only happens when stage is initialized slower than expected,
+                            # so we wait for a short time and try again
+                            await asyncio.sleep(0.05)
+                            continue
+                        req_id = result.get("request_id")
+                        req_state = request_states.get(req_id)
+                        if req_state is None:
+                            logger.debug(
+                                "[Orchestrator] Request may have been aborted; \
+                                    dropping output for req %s at stage-%s  ",
+                                req_id,
+                                stage_id,
+                            )
+                            continue
+                        await req_state.queue.put(result)
+                        req_state.stage_id = stage_id
+                    if idle:
+                        await asyncio.sleep(0.001)  # Avoid CPU overload when idle
+                    else:
+                        await asyncio.sleep(0)
+            except Exception as e:
+                logger.exception("AsyncOmni output_handler failed.")
+                for req_state in request_states.values():
+                    await req_state.queue.put({"request_id": req_id, "error": str(e)})
+                self.output_handler = None  # Make possible for restart
+
+        self.output_handler = asyncio.create_task(output_handler())
 
     @property
     def is_running(self) -> bool:
