@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Optional
 
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.request import Request
@@ -21,9 +20,9 @@ class OmniNewRequestData(NewRequestData):
     """
 
     # Optional serialized prompt embeddings
-    prompt_embeds: Optional[PromptEmbedsPayload] = None
+    prompt_embeds: PromptEmbedsPayload | None = None
     # Optional serialized additional information
-    additional_information: Optional[AdditionalInformationPayload] = None
+    additional_information: AdditionalInformationPayload | None = None
 
     @classmethod
     def from_request(
