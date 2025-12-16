@@ -29,13 +29,12 @@ The following table shows which models are currently supported by each cache bac
 |-------|-----------------|----------|-----------|
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ❌ | ✅* |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ❌ | ✅ |
 
-\* Qwen-Image-Edit support is not fully verified
 
 ## Performance Benchmarks
 
-The following benchmarks were measured on **Qwen/Qwen-Image** model generating images with 50 inference steps:
+The following benchmarks were measured on **Qwen/Qwen-Image** and **Qwen/Qwen-Image-Edit** models with 50 inference steps:
 
 !!! note "Benchmark Disclaimer"
     These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
@@ -47,12 +46,14 @@ The following benchmarks were measured on **Qwen/Qwen-Image** model generating i
 
     For optimal performance in your specific scenario, we recommend experimenting with different parameter configurations as described in the detailed guides below.
 
-| Configuration | Generation Time | Speedup | Notes |
-|---------------|----------------|---------|-------|
-| **Baseline (diffusers)** | 20.0s | 1.0x | No acceleration |
-| **TeaCache** (`rel_l1_thresh=0.2`) | 10.47s | **1.91x** | Recommended default setting |
-| **Cache-DiT (DBCache + TaylorSeer)** | 10.8s | **1.85x** | Fn=1, Bn=0, W=8, TaylorSeer order=1 |
-| **Cache-DiT (DBCache + TaylorSeer + SCM)** | 14.0s | **1.43x** | Fn=8, Bn=0, W=4, TaylorSeer order=1, SCM fast |
+| Model | Cache Backend | Cache Config | Generation Time | Speedup | Notes |
+|-------|---------------|--------------|----------------|---------|-------|
+| **Qwen/Qwen-Image** | None  | None | 20.0s | 1.0x | Baseline (diffusers) |
+| **Qwen/Qwen-Image** | TeaCache | `rel_l1_thresh=0.2` | 10.47s | **1.91x** | Recommended default setting |
+| **Qwen/Qwen-Image** | Cache-DiT | DBCache + TaylorSeer (Fn=1, Bn=0, W=8, TaylorSeer order=1) | 10.8s | **1.85x** | - |
+| **Qwen/Qwen-Image** | Cache-DiT | DBCache + TaylorSeer + SCM (Fn=8, Bn=0, W=4, TaylorSeer order=1, SCM fast) | 14.0s | **1.43x** | - |
+| **Qwen/Qwen-Image-Edit** | None | No acceleration | 51.5s | 1.0x | Baseline (diffusers) |
+| **Qwen/Qwen-Image-Edit** | Cache-DiT | Default (Fn=1, Bn=0, W=4, TaylorSeer disabled, SCM disabled) | 21.6s | **2.38x** | - |
 
 
 ## Quick Start

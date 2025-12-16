@@ -85,7 +85,7 @@ def main():
             "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
             "taylorseer_order": 1,  # TaylorSeer polynomial order
             # SCM (Step Computation Masking) parameters [cache-dit only]
-            "scm_steps_mask_policy": "fast",  # SCM mask policy: "slow", "medium", "fast", "ultra"
+            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
     elif args.cache_backend == "tea_cache":

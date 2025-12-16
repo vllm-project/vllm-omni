@@ -31,12 +31,7 @@ images = omni.generate(
 )
 ```
 
-**Default Parameters**: When `cache_config` is not provided, cache-dit uses:
-- `Fn_compute_blocks=8` (aligned with cache-dit's recommended default)
-- `Bn_compute_blocks=0`
-- `max_warmup_steps=8`
-- `residual_diff_threshold=0.08`
-- No TaylorSeer or SCM enabled
+**Default Parameters**: When `cache_config` is not provided, cache-dit uses optimized default values. See the [Configuration Reference](#configuration-reference) section for a complete list of all parameters and their default values.
 
 ### Custom Configuration
 
@@ -55,42 +50,6 @@ omni = Omni(
 )
 ```
 
-### Example Script
-
-See `examples/offline_inference/qwen_image/text_to_image.py` for a complete working example with cache-dit acceleration.
-
-```bash
-# Enable cache-dit with default parameters
-cd examples/offline_inference/qwen_image
-python text_to_image.py \
-    --prompt "a cup of coffee on the table" \
-    --enable_cache_dit \
-    --num_inference_steps 50
-```
-
-The `--enable_cache_dit` flag enables cache-dit acceleration with these customized parameters:
-
-```python
-omni = Omni(
-    ...
-    cache_backend="cache_dit" if args.enable_cache_dit else None,
-    cache_config={
-        # Scheme: Hybrid DBCache + SCM + TaylorSeer
-        # DBCache
-        "Fn_compute_blocks": 8,
-        "Bn_compute_blocks": 0,
-        "max_warmup_steps": 4,
-        "residual_diff_threshold": 0.12,
-        # TaylorSeer
-        "enable_taylorseer": True,
-        "taylorseer_order": 1,
-        # SCM
-        "scm_steps_mask_policy": "fast",
-        "scm_steps_policy": "dynamic",
-    },
-)
-
-```
 
 ## Acceleration Methods
 
@@ -104,10 +63,10 @@ DBCache intelligently caches intermediate transformer block outputs when the res
 
 - `Fn_compute_blocks` (int, default: 1): Number of **first n** transformer blocks used to compute stable feature differences. Higher values provide more accurate caching decisions but increase computation.
 - `Bn_compute_blocks` (int, default: 0): Number of **last n** transformer blocks used for additional fusion. These blocks act as an auto-scaler for approximate hidden states.
-- `max_warmup_steps` (int, default: 8): Number of initial steps where caching is disabled to ensure the model learns sufficient features before caching begins.
-- `residual_diff_threshold` (float, default: 0.08): Threshold for residual difference. Higher values lead to faster performance but may reduce precision.
+- `max_warmup_steps` (int, default: 4): Number of initial steps where caching is disabled to ensure the model learns sufficient features before caching begins. Optimized for few-step distilled models.
+- `residual_diff_threshold` (float, default: 0.24): Threshold for residual difference. Higher values lead to faster performance but may reduce precision. Default uses a relatively higher threshold for more aggressive caching.
 - `max_cached_steps` (int, default: -1): Maximum number of cached steps. Set to -1 for unlimited caching.
-- `max_continuous_cached_steps` (int, default: -1): Maximum number of consecutive cached steps. Set to -1 for unlimited consecutive caching.
+- `max_continuous_cached_steps` (int, default: 3): Maximum number of consecutive cached steps. Limits consecutive caching to prevent precision degradation.
 
 **Example Configuration**:
 
@@ -122,9 +81,10 @@ cache_config={
 ```
 
 **Performance Tips**:
-- Start with `Fn_compute_blocks=8` and adjust based on your model size
-- Increase `residual_diff_threshold` (e.g., 0.12-0.15) for faster inference with slight quality trade-off
-- Reduce `max_warmup_steps` (e.g., 4-6) for faster startup, but ensure sufficient warmup
+
+- Default `Fn_compute_blocks=1` works well for most cases. Increase to 8-12 for larger models or when more accuracy is needed
+- Increase `residual_diff_threshold` (e.g., 0.12-0.15) for faster inference with slight quality trade-off, or decrease from default 0.24 for higher quality
+- Default `max_warmup_steps=4` is optimized for few-step models. Increase to 6-8 for more steps if needed
 
 ### 2. TaylorSeer
 
@@ -145,6 +105,7 @@ cache_config={
 ```
 
 **Performance Tips**:
+
 - Use `taylorseer_order=1` for most cases (good balance of speed and quality)
 - Combine with DBCache for maximum acceleration
 - Higher orders (2-3) may improve quality but reduce speed gains
@@ -156,6 +117,7 @@ SCM allows you to specify which steps must be computed and which can use cached 
 **Key Parameters**:
 
 - `scm_steps_mask_policy` (str | None, default: None): Predefined mask policy. Options:
+  - `None`: SCM disabled (default)
   - `"slow"`: More compute steps, higher quality (18 compute steps out of 28)
   - `"medium"`: Balanced (15 compute steps out of 28)
   - `"fast"`: More cache steps, faster inference (11 compute steps out of 28)
@@ -174,107 +136,12 @@ cache_config={
 ```
 
 **Performance Tips**:
+
+- SCM is disabled by default (`scm_steps_mask_policy=None`). Enable it by setting a policy value if you need additional acceleration
 - Start with `"medium"` policy and adjust based on quality requirements
 - Use `"fast"` or `"ultra"` for maximum speed when quality can be slightly compromised
 - `"dynamic"` policy generally provides better quality than `"static"`
 - SCM mask is automatically regenerated when `num_inference_steps` changes during inference
-
-## Complete Configuration Examples
-
-### Example 1: DBCache Only (Recommended Starting Point)
-
-```python
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    cache_backend="cache_dit",
-    cache_config={
-        "Fn_compute_blocks": 8,
-        "Bn_compute_blocks": 0,
-        "max_warmup_steps": 8,
-        "residual_diff_threshold": 0.08,
-    },
-)
-```
-
-### Example 2: DBCache + TaylorSeer (Balanced Speed/Quality)
-
-```python
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    cache_backend="cache_dit",
-    cache_config={
-        # DBCache
-        "Fn_compute_blocks": 8,
-        "Bn_compute_blocks": 0,
-        "max_warmup_steps": 8,
-        "residual_diff_threshold": 0.12,
-        # TaylorSeer
-        "enable_taylorseer": True,
-        "taylorseer_order": 1,
-    },
-)
-```
-
-### Example 3: DBCache + SCM
-
-```python
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    cache_backend="cache_dit",
-    cache_config={
-        # DBCache
-        "Fn_compute_blocks": 8,
-        "Bn_compute_blocks": 0,
-        "max_warmup_steps": 4,
-        "residual_diff_threshold": 0.12,
-        # SCM
-        "scm_steps_mask_policy": "fast",
-        "scm_steps_policy": "dynamic",
-    },
-)
-```
-
-### Example 4: All Methods Combined
-
-```python
-omni = Omni(
-    model="Qwen/Qwen-Image",
-    cache_backend="cache_dit",
-    cache_config={
-        # DBCache
-        "Fn_compute_blocks": 8,
-        "Bn_compute_blocks": 0,
-        "max_warmup_steps": 4,
-        "residual_diff_threshold": 0.12,
-        # TaylorSeer
-        "enable_taylorseer": True,
-        "taylorseer_order": 1,
-        # SCM
-        "scm_steps_mask_policy": "fast",
-        "scm_steps_policy": "dynamic",
-    },
-)
-```
-
-## Dynamic num_inference_steps
-
-Cache-dit automatically handles changes in `num_inference_steps` during inference. When you call `generate()` with a different `num_inference_steps` than the previous request, cache-dit will:
-
-1. Automatically refresh the cache context
-2. Regenerate SCM masks if SCM is enabled
-3. Update internal configurations to match the new step count
-
-**Example**:
-
-```python
-# First request with 50 steps
-images1 = omni.generate("prompt 1", num_inference_steps=50)
-
-# Second request with 28 steps - cache context automatically refreshes
-images2 = omni.generate("prompt 2", num_inference_steps=28)
-```
-
-No manual intervention is required - the refresh happens automatically and efficiently.
 
 ## Configuration Reference
 
@@ -282,43 +149,60 @@ No manual intervention is required - the refresh happens automatically and effic
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `Fn_compute_blocks` | int | 8 | First n blocks for difference computation (aligned with cache-dit's default) |
+| `Fn_compute_blocks` | int | 1 | First n blocks for difference computation (optimized for single-transformer models) |
 | `Bn_compute_blocks` | int | 0 | Last n blocks for fusion |
-| `max_warmup_steps` | int | 8 | Steps before caching starts |
+| `max_warmup_steps` | int | 4 | Steps before caching starts (optimized for few-step distilled models) |
 | `max_cached_steps` | int | -1 | Max cached steps (-1 = unlimited) |
-| `max_continuous_cached_steps` | int | -1 | Max consecutive cached steps (-1 = unlimited) |
-| `residual_diff_threshold` | float | 0.08 | Residual difference threshold |
+| `max_continuous_cached_steps` | int | 3 | Max consecutive cached steps (prevents precision degradation) |
+| `residual_diff_threshold` | float | 0.24 | Residual difference threshold (higher for more aggressive caching) |
 | `num_inference_steps` | int \| None | None | Initial inference steps for SCM mask generation (optional, auto-refreshed during inference) |
-| `enable_taylorseer` | bool | False | Enable TaylorSeer acceleration |
+| `enable_taylorseer` | bool | False | Enable TaylorSeer acceleration (not suitable for few-step distilled models) |
 | `taylorseer_order` | int | 1 | Taylor expansion order |
-| `scm_steps_mask_policy` | str \| None | None | SCM mask policy ("slow", "medium", "fast", "ultra") |
+| `scm_steps_mask_policy` | str \| None | None | SCM mask policy (None, "slow", "medium", "fast", "ultra") |
 | `scm_steps_policy` | str | "dynamic" | SCM computation policy ("dynamic" or "static") |
 
-## Tips and Best Practices
+## Example: Accelerate Text-to-Image Generation with CacheDiT
 
-### 1. Start Simple
-The easiest way to get started is to enable cache-dit without any configuration:
+See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example with cache-dit acceleration.
 
-```python
-omni = Omni(model="Qwen/Qwen-Image", cache_backend="cache_dit")
+```bash
+# Enable cache-dit with hybrid acceleration
+cd examples/offline_inference/text_to_image
+python text_to_image.py \
+    --model Qwen/Qwen-Image \
+    --prompt "a cup of coffee on the table" \
+    --cache_backend cache_dit \
+    --num_inference_steps 50
 ```
 
-This uses cache-dit's recommended defaults (`Fn_compute_blocks=8`). Once you understand the baseline performance, you can customize the configuration to add other acceleration methods or fine-tune parameters.
 
-### 2. Quality vs Speed Trade-offs
-- **Higher quality**: Lower `residual_diff_threshold` (0.08), more `Fn_compute_blocks` (8-12), SCM `"slow"` or `"medium"`
-- **Faster inference**: Higher `residual_diff_threshold` (0.12-0.15), fewer `max_warmup_steps` (4-6), SCM `"fast"` or `"ultra"`
+The script uses cache-dit acceleration with a hybrid configuration combining DBCache, SCM, and TaylorSeer:
 
-### 3. Model-Specific Tuning
-Different models may benefit from different configurations:
-- **Smaller models**: May work well with `Fn_compute_blocks=4-6`
-- **Larger models**: Often benefit from `Fn_compute_blocks=8-12`
-- **High-resolution images**: May need lower `residual_diff_threshold` for quality
+```python
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    cache_backend="cache_dit",
+    cache_config={
+        # Scheme: Hybrid DBCache + SCM + TaylorSeer
+        # DBCache
+        "Fn_compute_blocks": 8,
+        "Bn_compute_blocks": 0,
+        "max_warmup_steps": 4,
+        "residual_diff_threshold": 0.12,
+        # TaylorSeer
+        "enable_taylorseer": True,
+        "taylorseer_order": 1,
+        # SCM
+        "scm_steps_mask_policy": "fast",  # Set to None to disable SCM
+        "scm_steps_policy": "dynamic",
+    },
+)
+```
 
-### 4. Combining Methods
-- **DBCache + TaylorSeer**: Good balance, works well for most cases
-- **DBCache + SCM**: Can try when quality can be slightly compromised
-- **All three**: Maximum acceleration if the parameters are carefully tuned
+You can customize the configuration by modifying the `cache_config` dictionary to use only specific methods (e.g., DBCache only, DBCache + SCM, etc.) based on your quality and speed requirements.
+
+To test another model, you can modify `--model` with the target model identifier like `Tongyi-MAI/Z-Image-Turbo` and update `cache_confg` according the model architecture (e.g., number of transformer blocks).
+
 
 ## Additional Resources
 
