@@ -20,7 +20,6 @@ from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
-from vllm_omni.utils.platform_utils import is_npu
 
 
 class Attention(nn.Module):
@@ -104,25 +103,12 @@ class Attention(nn.Module):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
 
-        if is_npu():
-            context_layer = self.attention(
-                q,
-                k,
-                v,
-                num_heads=q.shape[-2],
-                input_layout="BSND",
-                scale=softmax_scale,
-                softmax_lse_flag=True,
-                pre_tokens=65535,
-                next_tokens=65535,
-            )
-        else:
-            context_layer = self.attention.forward(
-                q,
-                k,
-                v,
-                attn_metadata=attn_metadata,
-            )
+        context_layer = self.attention.forward(
+            q,
+            k,
+            v,
+            attn_metadata=attn_metadata,
+        )
 
         if isinstance(context_layer, tuple):
             context_layer = context_layer[0]
