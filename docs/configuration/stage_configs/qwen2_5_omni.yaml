@@ -60,8 +60,8 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker
-      scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.15
       enforce_eager: true
       trust_remote_code: true
