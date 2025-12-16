@@ -944,13 +944,10 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
         }
     )
 
-    # Generate should handle error gracefully (log but continue)
+    # Generate should handle error by raising RuntimeError
     sampling_params_list = [object()]
-    outputs = llm.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
-    # Should return final output (error was logged but didn't stop processing)
-    assert isinstance(outputs, list)
-    # Since final_output=True, should have one output
-    assert len(outputs) == 1
+    with pytest.raises(RuntimeError, match="test error"):
+        llm.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
 
 
 def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
