@@ -13,7 +13,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
-from typing import Any, Optional
+from typing import Any
 
 from PIL import Image
 from vllm.logger import init_logger
@@ -52,7 +52,7 @@ class AsyncOmniDiffusion:
     def __init__(
         self,
         model: str,
-        od_config: Optional[OmniDiffusionConfig] = None,
+        od_config: OmniDiffusionConfig | None = None,
         **kwargs: Any,
     ):
         self.model = model
@@ -84,7 +84,7 @@ class AsyncOmniDiffusion:
     def _prepare_request(
         self,
         prompt: str,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
         **kwargs: Any,
     ) -> OmniDiffusionRequest:
         """Prepare a diffusion request from prompt and parameters.
@@ -116,14 +116,14 @@ class AsyncOmniDiffusion:
     async def generate(
         self,
         prompt: str,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        negative_prompt: Optional[str] = None,
+        height: int | None = None,
+        width: int | None = None,
+        negative_prompt: str | None = None,
         num_outputs_per_prompt: int = 1,
-        seed: Optional[int] = None,
+        seed: int | None = None,
         **kwargs: Any,
     ) -> OmniRequestOutput:
         """Generate images asynchronously from a text prompt.
@@ -206,7 +206,7 @@ class AsyncOmniDiffusion:
     async def generate_stream(
         self,
         prompt: str,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate images with streaming progress updates.

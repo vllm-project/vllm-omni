@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional
 
 import jinja2
 from fastapi import Request
@@ -927,8 +927,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
-        raw_request: Optional[Request] = None,
-    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+        raw_request: Request | None = None,
+    ) -> ChatCompletionResponse | ErrorResponse:
         """Generate images via chat completion interface for diffusion models.
 
         Args:

@@ -229,7 +229,7 @@ async def build_async_diffusion(
     Yields:
         AsyncOmniDiffusion instance ready for use
     """
-    diffusion_engine: Optional[AsyncOmniDiffusion] = None
+    diffusion_engine: AsyncOmniDiffusion | None = None
 
     try:
         # Build diffusion kwargs by extracting matching OmniDiffusionConfig fields from args
@@ -436,6 +436,7 @@ async def omni_init_app_state(
 def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
     return request.app.state.openai_serving_chat
 
+
 async def omni_diffusion_init_app_state(
     diffusion_engine: AsyncOmniDiffusion,
     state: State,
@@ -477,6 +478,7 @@ async def omni_diffusion_init_app_state(
     state.server_load_metrics = 0
 
     logger.info("Diffusion API server initialized for model: %s", model_name)
+
 
 @router.post(
     "/v1/chat/completions",
