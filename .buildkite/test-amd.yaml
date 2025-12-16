@@ -3,10 +3,22 @@ steps:
 - label: "Diffusion Model Test"
   timeout_in_minutes: 15
   agent_pool: mi325_2
-  depends_on: image-build
-  mirror_hardwares: [amdexperimental, amdtentative]
+  depends_on: amd-build
+  mirror_hardwares: [amdexperimental, amdproduction, amdtentative]
   grade: Blocking
   source_file_dependencies:
   - ./
   commands:
     - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
+
+- label: "Omni Model Test"
+  timeout_in_minutes: 15
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdexperimental, amdproduction, amdtentative]
+  source_file_dependencies:
+  - ./
+  commands:
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py

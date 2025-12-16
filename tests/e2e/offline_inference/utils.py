@@ -20,6 +20,7 @@ from vllm.platforms import current_platform
 VLLM_PATH = Path(__file__).parent.parent.parent
 """Path to root of the vLLM repository."""
 
+print(f"VLLM_PATH: {VLLM_PATH}")
 
 _P = ParamSpec("_P")
 
