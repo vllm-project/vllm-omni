@@ -514,20 +514,20 @@ def init_vae_group(
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
 def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use_ulysses_low=True):
     """
-    sp_ulysses_degree x sp_ring_degree = seq_parallel_degree
-    (ulysses_degree, dp_degree)
+    sp_ulysses_degree x sp_ring_degree = seq_parallel_size
+    (ulysses_degree, dp_size)
     """
-    sp_degree = sp_ring_degree * sp_ulysses_degree
-    dp_degree = world_size // sp_degree
+    sp_size = sp_ring_degree * sp_ulysses_degree
+    dp_size = world_size // sp_size
 
-    assert world_size % sp_degree == 0, f"world_size {world_size} % sp_degree {sp_ulysses_degree} == 0"
+    assert world_size % sp_size == 0, f"world_size {world_size} % sp_size {sp_ulysses_degree} == 0"
 
     num_ulysses_pgs = sp_ring_degree  # world_size // sp_ulysses_degree
     num_ring_pgs = sp_ulysses_degree  # world_size // sp_ring_degree
 
     if use_ulysses_low:
-        for dp_rank in range(dp_degree):
-            offset = dp_rank * sp_degree
+        for dp_rank in range(dp_size):
+            offset = dp_rank * sp_size
             for i in range(num_ulysses_pgs):
                 ulysses_ranks = list(
                     range(
@@ -540,14 +540,14 @@ def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use
                     ulyssess_pg = group
 
             for i in range(num_ring_pgs):
-                ring_ranks = list(range(i + offset, sp_degree + offset, num_ring_pgs))
+                ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
                 group = torch.distributed.new_group(ring_ranks)
                 if rank in ring_ranks:
                     ring_pg = group
 
     else:
-        for dp_rank in range(dp_degree):
-            offset = dp_rank * sp_degree
+        for dp_rank in range(dp_size):
+            offset = dp_rank * sp_size
             for i in range(num_ring_pgs):
                 ring_ranks = list(range(i * sp_ring_degree + offset, (i + 1) * sp_ring_degree + offset))
                 group = torch.distributed.new_group(ring_ranks)
@@ -555,7 +555,7 @@ def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use
                     ring_pg = group
 
             for i in range(num_ulysses_pgs):
-                ulysses_ranks = list(range(i + offset, sp_degree + offset, num_ulysses_pgs))
+                ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
                 group = torch.distributed.new_group(ulysses_ranks)
                 if rank in ulysses_ranks:
                     ulyssess_pg = group
@@ -564,13 +564,13 @@ def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use
 
 
 def initialize_model_parallel(
-    data_parallel_degree: int = 1,
-    classifier_free_guidance_degree: int = 1,
-    sequence_parallel_degree: Optional[int] = None,
+    data_parallel_size: int = 1,
+    cfg_parallel_size: int = 1,
+    sequence_parallel_size: Optional[int] = None,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
-    tensor_parallel_degree: int = 1,
-    pipeline_parallel_degree: int = 1,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
 ) -> None:
@@ -580,21 +580,21 @@ def initialize_model_parallel(
     Initialize model parallel groups.
 
     Arguments:
-        data_parallel_degree: number of data parallelism groups.
-        classifier_free_guidance_degree: number of GPUs used for Classifier Free Guidance (CFG)
-        sequence_parallel_degree: number of GPUs used for sequence parallelism.
-            sequence_parallel_degree = ulysses_degree * ring_degree
+        data_parallel_size: number of data parallelism groups.
+        cfg_parallel_size: number of GPUs used for Classifier Free Guidance (CFG) parallelism.
+        sequence_parallel_size: number of GPUs used for sequence parallelism.
+            sequence_parallel_size = ulysses_degree * ring_degree
         ulysses_degree: number of GPUs used for ulysses sequence parallelism.
         ring_degree: number of GPUs used for ring sequence parallelism.
-        tensor_parallel_degree: number of GPUs used for tensor parallelism.
-        pipeline_parallel_degree: number of GPUs used for pipeline parallelism.
+        tensor_parallel_size: number of GPUs used for tensor parallelism.
+        pipeline_parallel_size: number of GPUs used for pipeline parallelism.
         backend: distributed backend of pytorch collective comm.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 groups to parallelize the batch dim(dp), 2 groups to parallelize
     split batch caused by CFG, and 2 GPUs to parallelize sequence.
 
-    dp_degree (2) * cfg_degree (2) * sp_degree (2) * pp_degree (2) = 16.
+    dp_size (2) * cfg_size (2) * sp_size (2) * pp_size (2) = 16.
 
     The present function will create 8 data-parallel groups,
     8 CFG group, 8 pipeline-parallel group, and
@@ -621,48 +621,44 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    if sequence_parallel_degree is None:
-        sequence_parallel_degree = ring_degree * ulysses_degree
+    if sequence_parallel_size is None:
+        sequence_parallel_size = ring_degree * ulysses_degree
         logger.info(
-            f"sequence_parallel_degree is not provided, using ring_degree * ulysses_degree = {sequence_parallel_degree}"
+            f"sequence_parallel_size is not provided, using ring_degree * ulysses_degree = {sequence_parallel_size}"
         )
 
-    if sequence_parallel_degree != ring_degree * ulysses_degree:
+    if sequence_parallel_size != ring_degree * ulysses_degree:
         raise ValueError(
-            "sequence_parallel_degree is not equal to ring_degree * ulysses_degree,"
-            f" but got {sequence_parallel_degree} != {ring_degree} * {ulysses_degree}"
+            "sequence_parallel_size is not equal to ring_degree * ulysses_degree,"
+            f" but got {sequence_parallel_size} != {ring_degree} * {ulysses_degree}"
         )
 
     # FIXME: Since the async p2p communication operation of NPU is not same as cuda in torch,
     # the pipefusion is not ready for npu yet
     if envs._is_npu():
-        assert pipeline_parallel_degree == 1, "Current pipefusion is not ready for NPU"
+        assert pipeline_parallel_size == 1, "Current pipefusion is not ready for NPU"
 
     dit_parallel_size = (
-        data_parallel_degree
-        * classifier_free_guidance_degree
-        * sequence_parallel_degree
-        * pipeline_parallel_degree
-        * tensor_parallel_degree
+        data_parallel_size * cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     )
 
     if world_size < dit_parallel_size:
         raise RuntimeError(
             f"world_size ({world_size}) is less than "
-            f"tensor_parallel_degree ({tensor_parallel_degree}) x "
-            f"pipeline_parallel_degree ({pipeline_parallel_degree}) x"
-            f"sequence_parallel_degree ({sequence_parallel_degree}) x"
-            f"classifier_free_guidance_degree "
-            f"({classifier_free_guidance_degree}) x"
-            f"data_parallel_degree ({data_parallel_degree})"
+            f"tensor_parallel_size ({tensor_parallel_size}) x "
+            f"pipeline_parallel_size ({pipeline_parallel_size}) x"
+            f"sequence_parallel_size ({sequence_parallel_size}) x"
+            f"cfg_parallel_size "
+            f"({cfg_parallel_size}) x"
+            f"data_parallel_size ({data_parallel_size})"
         )
 
     rank_generator: RankGenerator = RankGenerator(
-        tensor_parallel_degree,
-        sequence_parallel_degree,
-        pipeline_parallel_degree,
-        classifier_free_guidance_degree,
-        data_parallel_degree,
+        tensor_parallel_size,
+        sequence_parallel_size,
+        pipeline_parallel_size,
+        cfg_parallel_size,
+        data_parallel_size,
         "tp-sp-pp-cfg-dp",
     )
     global _DP

@@ -72,13 +72,13 @@ class GPUWorker:
                 logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
                 parallel_config = self.od_config.parallel_config
                 initialize_model_parallel(
-                    data_parallel_degree=parallel_config.data_parallel_size,
-                    classifier_free_guidance_degree=parallel_config.cfg_parallel_size,
-                    sequence_parallel_degree=parallel_config.sequence_parallel_size,
+                    data_parallel_size=parallel_config.data_parallel_size,
+                    cfg_parallel_size=parallel_config.cfg_parallel_size,
+                    sequence_parallel_size=parallel_config.sequence_parallel_size,
                     ulysses_degree=parallel_config.ulysses_degree,
                     ring_degree=parallel_config.ring_degree,
-                    tensor_parallel_degree=parallel_config.tensor_parallel_size,
-                    pipeline_parallel_degree=parallel_config.pipeline_parallel_size,
+                    tensor_parallel_size=parallel_config.tensor_parallel_size,
+                    pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 )
 
                 load_config = LoadConfig()

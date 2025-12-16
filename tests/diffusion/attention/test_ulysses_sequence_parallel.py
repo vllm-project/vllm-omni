@@ -369,13 +369,13 @@ def ulysses_attention_on_test_model(
 
     # Initialize model parallel
     initialize_model_parallel(
-        data_parallel_degree=1,
-        classifier_free_guidance_degree=1,
-        sequence_parallel_degree=sequence_parallel_size,
+        data_parallel_size=1,
+        cfg_parallel_size=1,
+        sequence_parallel_size=sequence_parallel_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
-        tensor_parallel_degree=1,
-        pipeline_parallel_degree=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
     )
 
     # Set the config so Attention can access it
