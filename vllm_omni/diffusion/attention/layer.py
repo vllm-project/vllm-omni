@@ -167,7 +167,7 @@ class Attention(nn.Module):
             # 
             # So yes, call Ring Attention here.
             
-            context_layer, _ = ring_flash_attn_func(
+            context_layer = ring_flash_attn_func(
                 q,
                 k,
                 v,
