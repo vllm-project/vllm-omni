@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Optional
+from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
@@ -31,7 +31,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def put(
         self, from_stage: str, to_stage: str, request_id: str, data: Any
-    ) -> tuple[bool, int, Optional[dict[str, Any]]]:
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             # Always serialize first to check size (and for SHM writing)
             # Note: For extremely large objects in "inline" mode (e.g. Ray),
@@ -63,8 +63,8 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, request_id: str, metadata: Optional[dict[str, Any]] = None
-    ) -> Optional[tuple[Any, int]]:
+        self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Any, int] | None:
         if not metadata:
             logger.error(f"SharedMemoryConnector get called without metadata for req {request_id}")
             return None

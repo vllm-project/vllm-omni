@@ -6,7 +6,7 @@ import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 
@@ -261,11 +261,11 @@ class AsyncOmni(EngineClient):
         self,
         prompt: PromptType,
         request_id: str,
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
-        data_parallel_rank: Optional[int] = None,
+        data_parallel_rank: int | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
@@ -577,7 +577,7 @@ class AsyncOmni(EngineClient):
     def dead_error(self) -> BaseException:
         return EngineDeadError()
 
-    async def abort(self, request_id: Union[str, Iterable[str]]) -> None:
+    async def abort(self, request_id: str | Iterable[str]) -> None:
         pass
 
     async def get_vllm_config(self) -> VllmConfig:
@@ -620,13 +620,13 @@ class AsyncOmni(EngineClient):
     async def reset_mm_cache(self) -> None:
         pass
 
-    async def reset_prefix_cache(self, device: Optional[Device] = None) -> None:
+    async def reset_prefix_cache(self, device: Device | None = None) -> None:
         pass
 
     async def sleep(self, level: int = 1) -> None:
         pass
 
-    async def wake_up(self, tags: Optional[list[str]] = None) -> None:
+    async def wake_up(self, tags: list[str] | None = None) -> None:
         pass
 
     async def is_sleeping(self) -> bool:
@@ -689,8 +689,8 @@ class AsyncOmniStageLLM(AsyncLLM):
         use_cached_outputs: bool = False,
         log_requests: bool = True,
         start_engine_loop: bool = True,
-        stat_loggers: Optional[list[StatLoggerFactory]] = None,
-        client_addresses: Optional[dict[str, str]] = None,
+        stat_loggers: list[StatLoggerFactory] | None = None,
+        client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
     ) -> None:
@@ -771,7 +771,7 @@ class AsyncOmniStageLLM(AsyncLLM):
         )
 
         # Loggers.
-        self.logger_manager: Optional[StatLoggerManager] = None
+        self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
                 vllm_config=vllm_config,
@@ -782,7 +782,7 @@ class AsyncOmniStageLLM(AsyncLLM):
             )
             self.logger_manager.log_engine_initialized()
 
-        self.output_handler: Optional[asyncio.Task] = None
+        self.output_handler: asyncio.Task | None = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -819,10 +819,10 @@ class AsyncOmniStageLLM(AsyncLLM):
         engine_args: AsyncOmniEngineArgs,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        stat_loggers: Optional[list[StatLoggerFactory]] = None,
+        stat_loggers: list[StatLoggerFactory] | None = None,
         enable_log_requests: bool = False,
         disable_log_stats: bool = False,
-        client_addresses: Optional[dict[str, str]] = None,
+        client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
         disable_log_requests: bool = True,  # Deprecated, will be removed

@@ -1,5 +1,3 @@
-from typing import Union
-
 import torch
 from vllm.inputs import TextPrompt
 
@@ -13,7 +11,7 @@ TALKER_CODEC_END_TOKEN_ID = 8294
 def thinker2talker(
     stage_list,
     engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
     if not engine_input_source:

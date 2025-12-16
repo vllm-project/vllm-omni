@@ -4,8 +4,9 @@
 import enum
 import os
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger

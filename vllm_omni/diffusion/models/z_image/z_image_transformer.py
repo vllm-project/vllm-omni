@@ -17,7 +17,6 @@
 
 import math
 from collections.abc import Iterable
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -232,7 +231,7 @@ class ZImageTransformerBlock(nn.Module):
         x: torch.Tensor,
         attn_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
-        adaln_input: Optional[torch.Tensor] = None,
+        adaln_input: torch.Tensor | None = None,
     ):
         if self.modulation:
             assert adaln_input is not None

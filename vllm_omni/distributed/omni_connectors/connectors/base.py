@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 from ..utils.logging import get_connector_logger
 
@@ -15,7 +15,7 @@ class OmniConnectorBase(ABC):
     @abstractmethod
     def put(
         self, from_stage: str, to_stage: str, request_id: str, data: Any
-    ) -> tuple[bool, int, Optional[dict[str, Any]]]:
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
 
         Args:
@@ -32,8 +32,8 @@ class OmniConnectorBase(ABC):
 
     @abstractmethod
     def get(
-        self, from_stage: str, to_stage: str, request_id: str, metadata: Optional[dict[str, Any]] = None
-    ) -> Optional[tuple[Any, int]]:
+        self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Any, int] | None:
         """Retrieve Python object and payload size (bytes).
 
         Args:

@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 try:
     from typing import NotRequired
@@ -73,10 +73,10 @@ class OmniEmbedsPrompt(EmbedsPrompt):
 
 def token_inputs_omni(
     prompt_token_ids: list[int],
-    prompt: Optional[str] = None,
-    cache_salt: Optional[str] = None,
-    prompt_embeds: Optional[torch.Tensor] = None,
-    additional_information: Optional[dict[str, Any]] = None,
+    prompt: str | None = None,
+    cache_salt: str | None = None,
+    prompt_embeds: torch.Tensor | None = None,
+    additional_information: dict[str, Any] | None = None,
 ) -> OmniTokenInputs:
     """Construct token inputs with optional embeddings and metadata.
 

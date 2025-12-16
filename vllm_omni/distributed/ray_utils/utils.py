@@ -4,7 +4,7 @@
 import logging
 import os
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -96,7 +96,7 @@ def get_ray_queue_class():
     return lambda: RayQueue(maxsize=0)
 
 
-def initialize_ray_cluster(address: Optional[str] = None):
+def initialize_ray_cluster(address: str | None = None):
     if not RAY_AVAILABLE:
         logger.warning("Ray is not available, skipping initialization.")
         return
@@ -107,9 +107,7 @@ def initialize_ray_cluster(address: Optional[str] = None):
         ray.init(address=address, ignore_reinit_error=True, runtime_env=runtime_env)
 
 
-def create_placement_group(
-    number_of_stages: int, address: Optional[str] = None, strategy: str = "PACK"
-) -> PlacementGroup:
+def create_placement_group(number_of_stages: int, address: str | None = None, strategy: str = "PACK") -> PlacementGroup:
     """Create a placement group for the given number of stages.
     Args:
         number_of_stages: The number of stages to create the placement group for.

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -307,7 +307,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.input_batch.refresh_metadata()
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: Union[torch.Tensor, list[torch.Tensor]]) -> dict:
+    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor]) -> dict:
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
@@ -326,7 +326,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _dummy_run(
         self,
         num_tokens: int,
-        cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
         allow_microbatching: bool = True,
@@ -444,7 +444,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             num_tokens_across_dp = num_tokens_after_padding
             num_tokens_after_padding = int(num_tokens_after_padding[0].item())
 
-        attn_metadata: Optional[PerLayerAttnMetadata] = None
+        attn_metadata: PerLayerAttnMetadata | None = None
 
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
@@ -612,19 +612,19 @@ class OmniGPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens_np: np.ndarray,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        ubatch_slices: Optional[UBatchSlices] = None,
-        num_tokens_after_padding: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        ubatch_slices: UBatchSlices | None = None,
+        num_tokens_after_padding: torch.Tensor | None = None,
     ) -> tuple[
         int,
         int,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor,
-        Optional[IntermediateTensors],
+        IntermediateTensors | None,
         dict[str, Any],
-        Optional[dict[str, dict]],
+        dict[str, dict] | None,
     ]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if ubatch_slices:
@@ -638,7 +638,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
-        per_req_additional_information: Optional[dict[str, dict]] = None
+        per_req_additional_information: dict[str, dict] | None = None
         if self.supports_mm_inputs and get_pp_group().is_first_rank and not self.model_config.is_encoder_decoder:
             # Build multimodal inputs and overlay prompt embeds; collect per-request info
             per_req_additional_information = self._build_mm_inputs_and_overlays(
@@ -784,7 +784,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def _build_model_kwargs_extra(
         self,
-        per_req_additional_information: Optional[dict[str, dict]],
+        per_req_additional_information: dict[str, dict] | None,
         num_scheduled_tokens_np,
     ) -> dict:
         """Build extra keyword arguments passed to the model for this step, including:

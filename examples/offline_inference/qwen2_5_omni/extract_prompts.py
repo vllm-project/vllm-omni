@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-from typing import Optional
 
 
-def extract_prompt(line: str) -> Optional[str]:
+def extract_prompt(line: str) -> str | None:
     # Extract the content between the first '|' and the second '|'
     i = line.find("|")
     if i == -1:

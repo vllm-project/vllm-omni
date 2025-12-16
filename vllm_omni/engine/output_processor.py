@@ -1,5 +1,6 @@
 from ast import Dict
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -33,18 +34,18 @@ class OmniRequestState(RequestState):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.mm_type: Optional[str] = None
-        self.mm_accumulated: Optional[Dict[str, Any]] = None
+        self.mm_type: str | None = None
+        self.mm_accumulated: Dict[str, Any] | None = None
 
     @classmethod
     def from_new_request(
         cls,
         tokenizer: AnyTokenizer,
         request: EngineCoreRequest,
-        prompt: Optional[str],
-        parent_req: Optional[ParentRequest],
+        prompt: str | None,
+        parent_req: ParentRequest | None,
         request_index: int,
-        queue: Optional[Any],
+        queue: Any | None,
         log_stats: bool,
     ) -> "OmniRequestState":
         if sampling_params := request.sampling_params:
@@ -93,7 +94,7 @@ class OmniRequestState(RequestState):
             log_stats=log_stats,
         )
 
-    def add_multimodal_tensor(self, payload: Optional[Any], mm_type: Optional[str]) -> None:
+    def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
             return
         try:
@@ -167,11 +168,11 @@ class OmniRequestState(RequestState):
     def make_request_output(
         self,
         new_token_ids: list[int],
-        pooling_output: Optional[torch.Tensor],
-        finish_reason: Optional[FinishReason],
-        stop_reason: Optional[Union[int, str]],
-        kv_transfer_params: Optional[dict[str, Any]] = None,
-    ) -> Optional[Union[OmniRequestOutput, PoolingRequestOutput]]:
+        pooling_output: torch.Tensor | None,
+        finish_reason: FinishReason | None,
+        stop_reason: int | str | None,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
         Creates a RequestOutput or PoolingRequestOutput from the generated
@@ -210,8 +211,8 @@ class OmniRequestState(RequestState):
     def _new_completion_output(
         self,
         token_ids: list[int],
-        finish_reason: Optional[FinishReason],
-        stop_reason: Optional[Union[int, str]],
+        finish_reason: FinishReason | None,
+        stop_reason: int | str | None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
@@ -248,7 +249,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         self,
         tokenizer: AnyTokenizer,
         log_stats: bool,
-        engine_core_output_type: Optional[str] = None,
+        engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
 
@@ -281,10 +282,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def add_request(
         self,
         request: EngineCoreRequest,
-        prompt: Optional[str],
-        parent_req: Optional[ParentRequest] = None,
+        prompt: str | None,
+        parent_req: ParentRequest | None = None,
         request_index: int = 0,
-        queue: Optional[RequestOutputCollector] = None,
+        queue: RequestOutputCollector | None = None,
     ) -> None:
         """Add a new request to be processed.
 
@@ -322,8 +323,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
-        engine_core_timestamp: Optional[float] = None,
-        iteration_stats: Optional[IterationStats] = None,
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
         """Process engine core outputs into request outputs.
 
@@ -524,7 +525,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             except Exception:
                 pass
 
-    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> Optional[torch.Tensor]:
+    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> torch.Tensor | None:
         mm = getattr(eco, "multimodal_outputs", None)
         if not isinstance(mm, dict):
             return None

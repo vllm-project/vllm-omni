@@ -1,6 +1,5 @@
 import time
 from pathlib import Path
-from typing import Optional, Union
 
 import huggingface_hub
 import vllm.envs as envs
@@ -17,10 +16,10 @@ logger = init_logger(__name__)
 
 def download_weights_from_hf_specific(
     model_name_or_path: str,
-    cache_dir: Optional[str],
+    cache_dir: str | None,
     allow_patterns: list[str],
-    revision: Optional[str] = None,
-    ignore_patterns: Optional[Union[str, list[str]]] = None,
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
 ) -> str:
     """Download model weights from Hugging Face Hub. Users can specify the
     allow_patterns to download only the necessary weights.

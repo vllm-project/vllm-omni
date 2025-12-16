@@ -7,7 +7,7 @@ autoregressively, predicting layers 1 to N based on layer-0 codes from the talke
 """
 
 from collections import namedtuple
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -136,10 +136,10 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
         causal_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         use_cache: bool = False,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
 
@@ -253,8 +253,8 @@ class Qwen3OmniCodePredictorMTPLayer(nn.Module):
         prefix: str,
         model_config: ModelConfig,
         layer_idx: int,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -284,10 +284,10 @@ class Qwen3OmniCodePredictorMTPLayer(nn.Module):
         causal_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         use_cache: bool = False,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         # Self-attention with residual
         residual = hidden_states
@@ -310,7 +310,7 @@ class Qwen3OmniCodePredictorMTPLayer(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None, "inputs_embeds required for MTP"
@@ -396,11 +396,11 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Any] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> Any:
         """

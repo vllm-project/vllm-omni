@@ -1,7 +1,7 @@
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
-from typing import Annotated, Any, Callable, Literal, Optional, Union
+from typing import Annotated, Any, Literal
 
 import torch
 import torch.nn as nn
@@ -86,7 +86,7 @@ class Qwen2_5OmniAudioFeatureInputs(TensorSchema):
 
     type: Literal["audio_features"]
     input_features: Annotated[
-        Union[torch.Tensor, list[torch.Tensor]],
+        torch.Tensor | list[torch.Tensor],
         TensorShape("nmb", "tsl"),
     ]
 
@@ -155,7 +155,7 @@ def create_qwen2_5_omni_thinker_field_factory(
 class Qwen2_5OmniThinkerMultiModalDataParser(Qwen2VLMultiModalDataParser):
     def _parse_audio_data(
         self,
-        data: Union[dict[str, torch.Tensor], ModalityData[ImageItem]],
+        data: dict[str, torch.Tensor] | ModalityData[ImageItem],
     ) -> ModalityDataItems[Any, Any]:
         if isinstance(data, dict):
             return DictEmbeddingItems(
@@ -185,7 +185,7 @@ class Qwen2_5OmniThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProce
         assert isinstance(feature_extractor, WhisperFeatureExtractor)
         return feature_extractor
 
-    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None, "image": None, "video": None}
 
 
@@ -608,7 +608,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(BaseMultiModalProcessor[Qwen2_5OmniT
 
     def _apply_hf_processor_main(
         self,
-        prompt: Union[str, list[int]],
+        prompt: str | list[int],
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Mapping[str, object],
@@ -676,7 +676,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
         else:
             return torch.concat(mm_input, dim=dim)
 
-    def _parse_and_validate_audio_input(self, **kwargs: object) -> Optional[Qwen2_5OmniAudioFeatureInputs]:
+    def _parse_and_validate_audio_input(self, **kwargs: object) -> Qwen2_5OmniAudioFeatureInputs | None:
         input_audio_features = kwargs.pop("input_audio_features", None)
         audio_feature_lengths = kwargs.pop("audio_feature_lengths", None)
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
@@ -699,7 +699,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
     def _parse_and_validate_image_input(
         self,
         **kwargs: dict[str, Any],
-    ) -> Optional[Qwen2_5_VLImageInputs]:
+    ) -> Qwen2_5_VLImageInputs | None:
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -731,7 +731,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
     def _parse_and_validate_video_input(
         self,
         **kwargs: dict[str, Any],
-    ) -> Optional[Qwen2_5_VLVideoInputs]:
+    ) -> Qwen2_5_VLVideoInputs | None:
         pixel_values_videos = kwargs.pop("pixel_values_videos", None)
         video_embeds = kwargs.pop("video_embeds", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
@@ -841,7 +841,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     )
 
     @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
             return "<|vision_start|><|IMAGE|><|vision_end|>"
         if modality.startswith("video"):
@@ -940,7 +940,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
@@ -958,7 +958,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             )
         return inputs_embeds
 
-    def get_multimodal_embeddings_v0(self, **kwargs: object) -> Optional[NestedTensors]:
+    def get_multimodal_embeddings_v0(self, **kwargs: object) -> NestedTensors | None:
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
@@ -982,7 +982,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     def get_input_embeddings_v0(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[NestedTensors] = None,
+        multimodal_embeddings: NestedTensors | None = None,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
@@ -1002,10 +1002,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -1031,7 +1031,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         )
         return text_inputs_embeds, hidden_states.unsqueeze(0)  # (1, S, D)
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -5,7 +5,7 @@ import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 
 import gradio as gr
 import numpy as np
@@ -175,16 +175,16 @@ def create_prompt_args(base_args: argparse.Namespace) -> SimpleNamespace:
 
 
 def process_audio_file(
-    audio_file: Optional[Any],
-) -> Optional[tuple[np.ndarray, int]]:
+    audio_file: Any | None,
+) -> tuple[np.ndarray, int] | None:
     """Normalize Gradio audio input to (np.ndarray, sample_rate)."""
     if audio_file is None:
         return None
 
-    sample_rate: Optional[int] = None
-    audio_np: Optional[np.ndarray] = None
+    sample_rate: int | None = None
+    audio_np: np.ndarray | None = None
 
-    def _load_from_path(path_str: str) -> Optional[tuple[np.ndarray, int]]:
+    def _load_from_path(path_str: str) -> tuple[np.ndarray, int] | None:
         if not path_str:
             return None
         path = Path(path_str)
@@ -237,7 +237,7 @@ def process_audio_file(
     return audio_np.astype(np.float32), sample_rate
 
 
-def process_image_file(image_file: Optional[Image.Image]) -> Optional[Image.Image]:
+def process_image_file(image_file: Image.Image | None) -> Image.Image | None:
     """Process image file from Gradio input.
 
     Returns:
@@ -252,10 +252,10 @@ def process_image_file(image_file: Optional[Image.Image]) -> Optional[Image.Imag
 
 
 def process_video_file(
-    video_file: Optional[str],
+    video_file: str | None,
     enable_audio_in_video: bool = False,
     max_frames: int = 32,
-) -> Optional[tuple[np.ndarray, dict[str, Any], Optional[tuple[np.ndarray, int]]]]:
+) -> tuple[np.ndarray, dict[str, Any], tuple[np.ndarray, int] | None] | None:
     """Process video file and optionally extract audio track."""
     if video_file is None:
         return None
@@ -272,7 +272,7 @@ def process_video_file(
         print(f"Failed to decode video {video_path}: {exc}")
         return None
 
-    audio_tuple: Optional[tuple[np.ndarray, int]] = None
+    audio_tuple: tuple[np.ndarray, int] | None = None
     if enable_audio_in_video:
         try:
             import librosa  # type: ignore import
@@ -290,9 +290,9 @@ async def run_inference_async_omni(
     sampling_params: list[SamplingParams],
     prompt_args_template: SimpleNamespace,
     user_prompt: str,
-    audio_file: Optional[tuple[str, tuple[int, np.ndarray]]] = None,
-    image_file: Optional[Image.Image] = None,
-    video_file: Optional[str] = None,
+    audio_file: tuple[str, tuple[int, np.ndarray]] | None = None,
+    image_file: Image.Image | None = None,
+    video_file: str | None = None,
     use_audio_in_video: bool = False,
 ):
     """Run inference using AsyncOmni directly with multimodal support."""
@@ -420,9 +420,9 @@ def build_interface(
 
     async def run_inference(
         user_prompt: str,
-        audio_file: Optional[tuple[str, tuple[int, np.ndarray]]],
-        image_file: Optional[Image.Image],
-        video_file: Optional[str],
+        audio_file: tuple[str, tuple[int, np.ndarray]] | None,
+        image_file: Image.Image | None,
+        video_file: str | None,
         use_audio_in_video: bool,
     ):
         return await run_inference_async_omni(

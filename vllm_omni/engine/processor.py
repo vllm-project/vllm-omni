@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from vllm.config import VllmConfig
@@ -90,14 +90,14 @@ class OmniProcessor(Processor):
         self,
         request_id: str,
         prompt: PromptType,
-        params: Union[SamplingParams, PoolingParams],
-        arrival_time: Optional[float] = None,
-        lora_request: Optional[LoRARequest] = None,
-        tokenization_kwargs: Optional[dict[str, Any]] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
+        params: SamplingParams | PoolingParams,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
-        data_parallel_rank: Optional[int] = None,
-    ) -> tuple[Optional[str], OmniEngineCoreRequest]:
+        data_parallel_rank: int | None = None,
+    ) -> tuple[str | None, OmniEngineCoreRequest]:
         """Process input prompt into an engine core request.
 
         Converts a prompt (text, tokens, or multimodal) into an
@@ -185,7 +185,7 @@ class OmniProcessor(Processor):
         # discriminated unions of TypedDicts, because of how it handles
         # inheritance of TypedDict. If we explicitly extract the items we want
         # we can avoid type errors from using `dict.get` later in the method.
-        prompt_str: Optional[str] = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
+        prompt_str: str | None = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
         prompt_token_ids = decoder_inputs["prompt_token_ids"] if decoder_inputs["type"] != "embeds" else None
         prompt_embeds = decoder_inputs["prompt_embeds"] if decoder_inputs["type"] == "embeds" else None
 
@@ -205,7 +205,7 @@ class OmniProcessor(Processor):
             pooling_params = params.clone()
 
         # Multimodal related.
-        mm_features: Optional[list[MultiModalFeatureSpec]] = None
+        mm_features: list[MultiModalFeatureSpec] | None = None
 
         if decoder_inputs["type"] == "multimodal":
             decoder_mm_inputs = decoder_inputs["mm_kwargs"]
@@ -230,8 +230,8 @@ class OmniProcessor(Processor):
 
         # Serialize prompt_embeds and additional_information if provided
         # (direct-transfer path)
-        prompt_embeds_payload: Optional[PromptEmbedsPayload] = None
-        additional_information_payload: Optional[AdditionalInformationPayload] = None
+        prompt_embeds_payload: PromptEmbedsPayload | None = None
+        additional_information_payload: AdditionalInformationPayload | None = None
         if "prompt_embeds" in decoder_inputs:  # type: ignore[operator]
             pe: torch.Tensor = decoder_inputs["prompt_embeds"]  # type: ignore[index]
             if pe.ndim != 2:

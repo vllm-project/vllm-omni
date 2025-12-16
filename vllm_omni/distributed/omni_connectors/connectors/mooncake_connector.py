@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
-from typing import Any, Optional
+from typing import Any
 
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
@@ -36,8 +36,8 @@ class MooncakeConnector(OmniConnectorBase):
         self.proto = config.get("proto", "tcp")
         self.rdma = config.get("rdma", "")
 
-        self.store: Optional[MooncakeDistributedStore] = None
-        self.pin: Optional[ReplicateConfig] = None
+        self.store: MooncakeDistributedStore | None = None
+        self.pin: ReplicateConfig | None = None
 
         self._metrics = {
             "puts": 0,
@@ -74,7 +74,7 @@ class MooncakeConnector(OmniConnectorBase):
 
     def put(
         self, from_stage: str, to_stage: str, request_id: str, data: Any
-    ) -> tuple[bool, int, Optional[dict[str, Any]]]:
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         if not self.store:
             logger.error("Store not initialized")
             return False, 0, None
@@ -102,8 +102,8 @@ class MooncakeConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, request_id: str, metadata: Optional[dict[str, Any]] = None
-    ) -> Optional[tuple[Any, int]]:
+        self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Any, int] | None:
         if not self.store:
             logger.error("Store not initialized")
             return None
