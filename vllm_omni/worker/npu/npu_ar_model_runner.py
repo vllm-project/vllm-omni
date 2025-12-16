@@ -838,7 +838,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         pooler_output: list[torch.Tensor | None] = []
         prev_logits_index = 0
-        for rid, logits_index in zip(req_ids_output_copy, logits_indices):
+        logits_indices_cpu = logits_indices.cpu()
+        for rid, logits_index in zip(req_ids_output_copy, logits_indices_cpu):
             # Base payload: hidden slice for this request in this iteration
             hidden_slice = hidden_states_cpu[prev_logits_index : logits_index + 1]
             payload: dict[str, object] = {"hidden": hidden_slice}
@@ -863,6 +864,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         elif isinstance(v, list):
                             element: torch.Tensor = v[0]
                             multimodal_outputs[k] = v[1:] if len(v) > 1 else v
+                            if isinstance(element, torch.Tensor) and not element.is_cpu:
+                                element = element.detach().cpu().contiguous()
                             mm_payload[k] = element
                     except Exception as e:
                         # Best-effort; skip malformed entries
@@ -871,7 +874,19 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     payload.update(mm_payload)
             pooler_output.append(payload)  # type: ignore[arg-type]
             prev_logits_index = logits_index + 1
+        def check_device(obj, path=""):
+            if isinstance(obj, torch.Tensor):
+                if not obj.is_cpu:
+                    print(f"NPU tensor at {path}: device={obj.device}, shape={obj.shape}")
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    check_device(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    check_device(v, f"{path}[{i}]")
 
+        check_device(pooler_output, "pooler_output")
+        check_device(prompt_logprobs_dict, "prompt_logprobs_dict")
         # Omni-new
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
