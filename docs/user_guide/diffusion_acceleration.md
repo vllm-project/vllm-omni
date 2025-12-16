@@ -1,0 +1,100 @@
+# Diffusion Acceleration Overview
+
+vLLM-Omni supports various cache acceleration methods to speed up diffusion model inference with minimal quality degradation. These methods intelligently cache intermediate computations to avoid redundant work across diffusion timesteps.
+
+## Supported Acceleration Methods
+
+vLLM-Omni currently supports two main cache acceleration backends:
+
+1. **[TeaCache](teacache.md)** - Hook-based adaptive caching that caches transformer computations when consecutive timesteps are similar
+2. **[Cache-DiT](cache_dit_acceleration.md)** - Library-based acceleration using multiple techniques:
+   - **DBCache** (Dual Block Cache): Caches intermediate transformer block outputs based on residual differences
+   - **TaylorSeer**: Uses Taylor expansion-based forecasting for faster inference
+   - **SCM** (Step Computation Masking): Selectively computes steps based on adaptive masking
+
+Both methods can provide significant speedups (typically **1.5x-2.0x**) while maintaining high output quality.
+
+## Quick Comparison
+
+| Method | Configuration | Description | Best For |
+|--------|--------------|-------------|----------|
+| **TeaCache** | `cache_backend="tea_cache"` | Simple, adaptive caching with minimal configuration | Quick setup, balanced speed/quality |
+| **Cache-DiT** | `cache_backend="cache_dit"` | Advanced caching with multiple techniques (DBCache, TaylorSeer, SCM) | Maximum acceleration, fine-grained control |
+
+## Supported Models
+
+The following table shows which models are currently supported by each cache backend:
+
+| Model | Model Identifier | TeaCache | Cache-DiT |
+|-------|-----------------|----------|-----------|
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ❌ | ✅ |
+
+
+## Performance Benchmarks
+
+The following benchmarks were measured on **Qwen/Qwen-Image** and **Qwen/Qwen-Image-Edit** models with 50 inference steps:
+
+!!! note "Benchmark Disclaimer"
+    These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
+
+    - Specific model and use case
+    - Hardware configuration
+    - Careful parameter tuning
+    - Different inference settings (e.g., number of steps, image resolution)
+
+    For optimal performance in your specific scenario, we recommend experimenting with different parameter configurations as described in the detailed guides below.
+
+| Model | Cache Backend | Cache Config | Generation Time | Speedup | Notes |
+|-------|---------------|--------------|----------------|---------|-------|
+| **Qwen/Qwen-Image** | None  | None | 20.0s | 1.0x | Baseline (diffusers) |
+| **Qwen/Qwen-Image** | TeaCache | `rel_l1_thresh=0.2` | 10.47s | **1.91x** | Recommended default setting |
+| **Qwen/Qwen-Image** | Cache-DiT | DBCache + TaylorSeer (Fn=1, Bn=0, W=8, TaylorSeer order=1) | 10.8s | **1.85x** | - |
+| **Qwen/Qwen-Image** | Cache-DiT | DBCache + TaylorSeer + SCM (Fn=8, Bn=0, W=4, TaylorSeer order=1, SCM fast) | 14.0s | **1.43x** | - |
+| **Qwen/Qwen-Image-Edit** | None | No acceleration | 51.5s | 1.0x | Baseline (diffusers) |
+| **Qwen/Qwen-Image-Edit** | Cache-DiT | Default (Fn=1, Bn=0, W=4, TaylorSeer disabled, SCM disabled) | 21.6s | **2.38x** | - |
+
+
+## Quick Start
+
+### Using TeaCache
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    cache_backend="tea_cache",
+    cache_config={"rel_l1_thresh": 0.2}  # Optional, defaults to 0.2
+)
+
+outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
+```
+
+### Using Cache-DiT
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    cache_backend="cache_dit",
+    cache_config={
+        "Fn_compute_blocks": 1,
+        "Bn_compute_blocks": 0,
+        "max_warmup_steps": 8,
+        "enable_taylorseer": True,
+        "taylorseer_order": 1,
+    }
+)
+
+outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
+```
+
+## Documentation
+
+For detailed information on each acceleration method:
+
+- **[TeaCache Guide](teacache.md)** - Complete TeaCache documentation, configuration options, and best practices
+- **[Cache-DiT Acceleration Guide](cache_dit_acceleration.md)** - Comprehensive Cache-DiT guide covering DBCache, TaylorSeer, SCM, and configuration parameters
