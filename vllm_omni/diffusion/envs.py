@@ -2,7 +2,8 @@
 # Adapted from
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
 import os
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 from packaging import version
@@ -12,10 +13,10 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     MASTER_ADDR: str = ""
-    MASTER_PORT: Optional[int] = None
-    CUDA_HOME: Optional[str] = None
+    MASTER_PORT: int | None = None
+    CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
-    CUDA_VISIBLE_DEVICES: Optional[str] = None
+    CUDA_VISIBLE_DEVICES: str | None = None
     CUDA_VERSION: version.Version
     TORCH_VERSION: version.Version
 

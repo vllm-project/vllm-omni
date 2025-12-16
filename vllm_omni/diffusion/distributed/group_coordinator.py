@@ -5,7 +5,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 import torch.distributed
@@ -21,13 +21,14 @@ if envs._is_npu():
     logger.info("torch.npu synchronize")
     from torch.npu import synchronize
 
+
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 
 
 def _split_tensor_dict(
-    tensor_dict: dict[str, Union[torch.Tensor, Any]], prefix: str = ""
+    tensor_dict: dict[str, torch.Tensor | Any], prefix: str = ""
 ) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -101,7 +102,7 @@ class GroupCoordinator:
         self,
         group_ranks: list[list[int]],
         local_rank: int,
-        torch_distributed_backend: Union[str, Backend],
+        torch_distributed_backend: str | Backend,
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -202,7 +203,7 @@ class GroupCoordinator:
 
     def all_gather(
         self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
-    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor | list[torch.Tensor]:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -280,7 +281,7 @@ class GroupCoordinator:
         torch.distributed.broadcast(input_, src=self.ranks[src], group=self.device_group)
         return input_
 
-    def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
+    def broadcast_object(self, obj: Any | None = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -300,7 +301,7 @@ class GroupCoordinator:
             torch.distributed.broadcast_object_list(recv, src=self.ranks[src], group=self.cpu_group)
             return recv[0]
 
-    def broadcast_object_list(self, obj_list: list[Any], src: int = 0, group: Optional[ProcessGroup] = None):
+    def broadcast_object_list(self, obj_list: list[Any], src: int = 0, group: ProcessGroup | None = None):
         """Broadcast the input object list.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -365,11 +366,11 @@ class GroupCoordinator:
 
     def broadcast_tensor_dict(
         self,
-        tensor_dict: Optional[dict[str, Union[torch.Tensor, Any]]] = None,
+        tensor_dict: dict[str, torch.Tensor | Any] | None = None,
         src: int = 0,
-        group: Optional[ProcessGroup] = None,
-        metadata_group: Optional[ProcessGroup] = None,
-    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        group: ProcessGroup | None = None,
+        metadata_group: ProcessGroup | None = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Broadcast the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -433,9 +434,9 @@ class GroupCoordinator:
 
     def send_tensor_dict(
         self,
-        tensor_dict: dict[str, Union[torch.Tensor, Any]],
-        dst: Optional[int] = None,
-    ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
         """
@@ -469,7 +470,7 @@ class GroupCoordinator:
                 torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
         return None
 
-    def recv_tensor_dict(self, src: Optional[int] = None) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+    def recv_tensor_dict(self, src: int | None = None) -> dict[str, torch.Tensor | Any] | None:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -513,7 +514,7 @@ class GroupCoordinator:
         """
         torch.distributed.barrier(group=self.cpu_group)
 
-    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a non-blocking way"""
         """NOTE: `dst` is the rank_in_group of the destination rank."""
         if dst is None:
@@ -525,7 +526,7 @@ class GroupCoordinator:
             group=(self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group),
         )
 
-    def recv(self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None) -> torch.Tensor:
+    def recv(self, size: torch.Size, dtype: torch.dtype, src: int | None = None) -> torch.Tensor:
         """Receives a tensor from the src rank."""
         """NOTE: `src` is the rank_in_group of the source rank."""
         if src is None:
@@ -571,7 +572,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self,
         group_ranks: list[list[int]],
         local_rank: int,
-        torch_distributed_backend: Union[str, Backend],
+        torch_distributed_backend: str | Backend,
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -622,17 +623,17 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: list[tuple[str, int]] = []
         self.receiving_tasks: list[tuple[torch.distributed.Work, str, int]] = []
-        self.dtype: Optional[torch.dtype] = None
-        self.num_pipefusion_patches: Optional[int] = None
+        self.dtype: torch.dtype | None = None
+        self.num_pipefusion_patches: int | None = None
 
         self.recv_shape: dict[str, dict[int, torch.Size]] = {}
         self.send_shape: dict[str, dict[int, torch.Size]] = {}
         self.recv_buffer: dict[str, dict[int, torch.Size]] = {}
 
         self.skip_tensor_recv_buffer_set: bool = False
-        self.recv_skip_tasks_queue: list[Union[int, tuple[str, int]]] = []
+        self.recv_skip_tasks_queue: list[int | tuple[str, int]] = []
         self.receiving_skip_tasks: list[tuple[torch.distributed.Work, str, int]] = []
-        self.skip_tensor_recv_buffer: Optional[Union[list[torch.Tensor], torch.Tensor]] = None
+        self.skip_tensor_recv_buffer: list[torch.Tensor] | torch.Tensor | None = None
         self.skip_device_group = None
         for ranks in group_ranks:
             skip_device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
@@ -686,7 +687,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self,
         tensor_send_to_next=None,
         recv_prev=False,
-        name: Optional[str] = None,
+        name: str | None = None,
         segment_idx: int = 0,
     ):
         send_flag = False
@@ -913,7 +914,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self,
         group_ranks: list[list[int]],
         local_rank: int,
-        torch_distributed_backend: Union[str, Backend],
+        torch_distributed_backend: str | Backend,
         **kwargs,
     ):
         super().__init__(
