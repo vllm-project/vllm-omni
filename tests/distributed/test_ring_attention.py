@@ -86,7 +86,7 @@ class MockAttentionModel(torch.nn.Module):
         return output
 
 
-@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [32])
