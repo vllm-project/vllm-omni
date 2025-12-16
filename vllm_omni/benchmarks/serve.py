@@ -4,10 +4,10 @@ r"""Benchmark online serving throughput.
 
 On the server side, run one of the following commands
 to launch the vLLM OpenAI API server:
-    vllm serve <your_model> <engine arguments>
+    vllm-omni serve <your_model> <engine arguments>
 
 On the client side, run:
-    vllm bench serve \
+    vllm-omni bench serve \
         --backend <backend or endpoint type. Default 'openai'> \
         --label <benchmark result label. Default using backend> \
         --model <your_model> \
