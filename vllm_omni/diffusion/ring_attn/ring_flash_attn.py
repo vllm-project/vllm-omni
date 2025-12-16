@@ -50,6 +50,7 @@ def ring_flash_attn_forward(
                 alibi_slopes=alibi_slopes,
                 return_softmax=True and dropout_p > 0,
             )
+            print(f"DEBUG: Rank {comm.rank} Step {step} | q shape: {q.shape} | block_out shape: {block_out.shape} | block_lse shape: {block_lse.shape}")
             if attn_type == AttnType.SPARSE_SAGE:
                 out, lse = block_out, block_lse
             else:
