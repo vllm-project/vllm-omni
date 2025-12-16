@@ -53,6 +53,16 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "MammothModa2ForConditionalGeneration",
     ),
+    "MammothModa2ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2_ar",
+        "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2DiTForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2_dit",
+        "MammothModa2DiTForConditionalGeneration",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {
