@@ -174,19 +174,6 @@ class Qwen3OmniMoeForConditionalGenerationWithLogging(Qwen3OmniMoeForConditional
             dtype=input_ids.dtype,
         )
         tts_bos_embed, tts_eos_embed, tts_pad_embed = (
-            self.thinker.get_input_embeddings()(talker_special_tokens).to(self.talker.device).chunk(3, dim=1)
-        )  # 3 * [1 1 d]
-        info_to_save = {
-            "tts_bos_embed": tts_bos_embed,
-            "tts_eos_embed": tts_eos_embed,
-            "tts_pad_embed": tts_pad_embed,
-            "thinker_embeddings": thinker_embed,
-            "thinker_hidden_states": thinker_hidden,
-            "thinker_sequences": thinker_result.sequences,
-            "thinker_input_ids": input_ids,
-        }
-        torch.save(info_to_save, "/mnt/ztc_vllm/transformer_info_with_system_prompt.pt")
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = (
             self.talker.text_projection(self.thinker.get_input_embeddings()(talker_special_tokens))
             .to(self.talker.device)
             .chunk(3, dim=1)
