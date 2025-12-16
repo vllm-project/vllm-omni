@@ -6,12 +6,29 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 # Type codes for serialization
 _TYPE_GENERIC = 0
 _TYPE_TENSOR = 1
 _TYPE_NDARRAY = 2
+
+
+def _preprocess_obj(obj: Any) -> Any:
+    """
+    Recursively preprocess object to convert unsupported types.
+    Converts PIL.Image to numpy array for serialization.
+    """
+    if isinstance(obj, Image.Image):
+        return np.array(obj)
+    if isinstance(obj, dict):
+        return {k: _preprocess_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_preprocess_obj(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_preprocess_obj(v) for v in obj)
+    return obj
 
 
 class OmniSerde:
@@ -42,6 +59,9 @@ class OmniSerde:
                 - metadata: Header containing type and length info
                 - metadata_len: Size of metadata
         """
+        # Preprocess to convert unsupported types (e.g., PIL.Image -> np.array)
+        obj = _preprocess_obj(obj)
+
         # Determine type code
         if isinstance(obj, torch.Tensor):
             type_code = _TYPE_TENSOR
