@@ -19,7 +19,7 @@ def all_to_all_4D(
         input (torch.tensor): a tensor sharded along dim scatter dim
         scatter_idx (int): default 1
         gather_idx (int): default 2
-        group : torch process group
+        group (torch.distributed.ProcessGroup): torch process group
         use_sync (bool): whether to synchronize after all-to-all
 
     Returns:
@@ -124,8 +124,8 @@ def all_to_all_5D(
         input (torch.tensor): a tensor sharded along dim scatter dim
         scatter_idx (int): default 1
         gather_idx (int): default 2
-        group : torch process group
-        use_sync: whether to synchronize after all-to-all
+        group (torch.distributed.ProcessGroup): torch process group
+        use_sync (bool): whether to synchronize after all-to-all
 
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, 3, hc, hs)

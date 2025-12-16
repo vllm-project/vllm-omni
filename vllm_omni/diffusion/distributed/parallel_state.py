@@ -238,13 +238,6 @@ class RankGenerator:
                 to obtain multiple parallel types, we can use a hyphen
                 '-' to separate them. For example, if we want to obtain
                 the TP_DP group, the token should be 'tp-dp'.
-
-            independent_ep (bool: True):
-                This flag controls whether we treat EP and DP independently.
-                EP shares ranks with DP, if we want to get ranks related to
-                EP, we should set the flag. For example, get_ranks('dp', True)
-                will get DP modulo EP group, and get_ranks('dp', False) will
-                get full DP group.
         """
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
