@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from PIL import Image
@@ -45,14 +45,14 @@ class OmniRequestOutput:
     finished: bool = True
 
     # Pipeline stage fields
-    stage_id: Optional[int] = None
+    stage_id: int | None = None
     final_output_type: str = "text"
-    request_output: Optional[RequestOutput] = None
+    request_output: RequestOutput | None = None
 
     # Diffusion model fields
     images: list[Image.Image] = field(default_factory=list)
-    prompt: Optional[str] = None
-    latents: Optional[torch.Tensor] = None
+    prompt: str | None = None
+    latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -85,9 +85,9 @@ class OmniRequestOutput:
         cls,
         request_id: str,
         images: list[Image.Image],
-        prompt: Optional[str] = None,
-        metrics: Optional[dict[str, Any]] = None,
-        latents: Optional[torch.Tensor] = None,
+        prompt: str | None = None,
+        metrics: dict[str, Any] | None = None,
+        latents: torch.Tensor | None = None,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 

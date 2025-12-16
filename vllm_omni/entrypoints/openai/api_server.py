@@ -1,9 +1,11 @@
+import json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import fields
 from http import HTTPStatus
 from typing import Any
 
@@ -38,6 +40,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -229,40 +232,24 @@ async def build_async_diffusion(
     diffusion_engine: Optional[AsyncOmniDiffusion] = None
 
     try:
-        # Build diffusion config from args
-        diffusion_kwargs = {
-            "model": args.model,
-        }
+        # Build diffusion kwargs by extracting matching OmniDiffusionConfig fields from args
+        config_field_names = {f.name for f in fields(OmniDiffusionConfig)}
+        diffusion_kwargs: dict[str, Any] = {"model": args.model}
 
-        # Add optional configuration from args
-        if hasattr(args, "num_gpus"):
-            diffusion_kwargs["num_gpus"] = args.num_gpus
-
-        if hasattr(args, "trust_remote_code"):
-            diffusion_kwargs["trust_remote_code"] = args.trust_remote_code
-
-        # VAE memory optimization parameters
-        if hasattr(args, "vae_use_slicing"):
-            diffusion_kwargs["vae_use_slicing"] = args.vae_use_slicing
-        if hasattr(args, "vae_use_tiling"):
-            diffusion_kwargs["vae_use_tiling"] = args.vae_use_tiling
-
-        # Cache optimization parameters
-        if hasattr(args, "cache_adapter") and args.cache_adapter:
-            diffusion_kwargs["cache_adapter"] = args.cache_adapter
-        if hasattr(args, "cache_config") and args.cache_config:
-            import json
-
-            try:
-                diffusion_kwargs["cache_config"] = json.loads(args.cache_config)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse cache_config JSON: {e}")
-
-        # Video model engine-level parameters (e.g., Wan2.2)
-        if hasattr(args, "boundary_ratio") and args.boundary_ratio is not None:
-            diffusion_kwargs["boundary_ratio"] = args.boundary_ratio
-        if hasattr(args, "flow_shift") and args.flow_shift is not None:
-            diffusion_kwargs["flow_shift"] = args.flow_shift
+        for field_name in config_field_names:
+            if not hasattr(args, field_name):
+                continue
+            value = getattr(args, field_name)
+            if value is None:
+                continue
+            # Special handling for cache_config JSON string
+            if field_name == "cache_config" and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse cache_config JSON: {e}")
+                    continue
+            diffusion_kwargs[field_name] = value
 
         diffusion_kwargs.update(kwargs)
         logger.info(f"diffusion_kwargs: {diffusion_kwargs}")
