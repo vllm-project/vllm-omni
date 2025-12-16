@@ -9,6 +9,11 @@ steps:
   source_file_dependencies:
   - ./
   commands:
+    - export MIOPEN_FIND_MODE=FAST
+    - export VLLM_ROCM_USE_AITER=1
+    - export VLLM_ROCM_USE_AITER_MHA=1
+    - export VLLM_ROCM_USE_AITER_LINEAR=0
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
     - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
 
 - label: "Omni Model Test"
@@ -21,4 +26,9 @@ steps:
   commands:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export MIOPEN_FIND_MODE=FAST
+    - export VLLM_ROCM_USE_AITER=1
+    - export VLLM_ROCM_USE_AITER_MHA=1
+    - export VLLM_ROCM_USE_AITER_LINEAR=0
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
     - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
