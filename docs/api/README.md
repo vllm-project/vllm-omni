@@ -12,6 +12,7 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
 - [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
 - [vllm_omni.entrypoints.omni.Omni][]
+- [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_llm.OmniStageLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
@@ -48,7 +49,6 @@ Engine classes for offline and online inference.
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.dit_cache_manager.DiTCacheManager][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
@@ -96,6 +96,9 @@ Model execution components.
 Configuration classes.
 
 - [vllm_omni.config.model.OmniModelConfig][]
+- [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
+- [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
+- [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
 
 ## Workers
 

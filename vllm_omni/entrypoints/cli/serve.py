@@ -95,6 +95,19 @@ class OmniServeCommand(CLISubcommand):
             default=10,
             help="The timeout for the batch.",
         )
+        serve_parser.add_argument(
+            "--worker-backend",
+            type=str,
+            default="multi_process",
+            choices=["multi_process", "ray"],
+            help="The backend to use for stage workers.",
+        )
+        serve_parser.add_argument(
+            "--ray-address",
+            type=str,
+            default=None,
+            help="The address of the Ray cluster to connect to.",
+        )
         return serve_parser
 
 

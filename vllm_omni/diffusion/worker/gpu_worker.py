@@ -15,6 +15,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import (
     SHUTDOWN_MESSAGE,
     DiffusionOutput,
@@ -84,6 +85,12 @@ class GPUWorker:
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
+        # Setup cache backend based on type (both backends use enable()/reset() interface)
+        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+
+        if self.cache_backend is not None:
+            self.cache_backend.enable(self.pipeline)
+
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
@@ -92,6 +99,11 @@ class GPUWorker:
         assert self.pipeline is not None
         # TODO: dealing with first req for now
         req = reqs[0]
+
+        # Refresh cache context if needed
+        if self.cache_backend is not None and self.cache_backend.is_enabled():
+            self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
+
         output = self.pipeline.forward(req)
         return output
 

@@ -1,6 +1,6 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
 
-# The following config has been verified on 1x H100-80G GPU.
+# The following config has been verified on 2x H100-80G GPU.
 stage_args:
   - stage_id: 0
     runtime:
@@ -29,6 +29,7 @@ stage_args:
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
+
   - stage_id: 1
     runtime:
       process: true
@@ -56,10 +57,11 @@ stage_args:
       detokenize: True
       repetition_penalty: 1.05
       stop_token_ids: [8294]
+
   - stage_id: 2
     runtime:
       process: true
-      devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
+      devices: "2"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
@@ -90,6 +92,7 @@ runtime:
   defaults:
     window_size: -1             # Simplified: trigger downstream only after full upstream completion
     max_inflight: 1             # Simplified: process serially within each stage
+
   edges:
     - from: 0                   # thinker → talker: trigger only after receiving full input (-1)
       to: 1
