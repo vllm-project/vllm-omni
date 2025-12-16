@@ -532,18 +532,14 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings: MultiModalEmbeddings | None = None,
-<<<<<<< HEAD
         *,
         is_multimodal: torch.Tensor | None = None,
         handle_oov_mm_token: bool = False,
-=======
->>>>>>> main
     ) -> torch.Tensor:
         # This is to satisfy the type checker for each overload
         if multimodal_embeddings is None or is_multimodal is None:
             return super().embed_input_ids(input_ids)
 
-<<<<<<< HEAD
         return super().embed_input_ids(
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
@@ -552,9 +548,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         )
 
     def embed_multimodal_v0(self, **kwargs: object) -> NestedTensors | None:
-=======
-    def get_multimodal_embeddings_v0(self, **kwargs: object) -> NestedTensors | None:
->>>>>>> main
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         image_input = self._parse_and_validate_image_input(**kwargs)
         video_input = self._parse_and_validate_video_input(**kwargs)
@@ -575,28 +568,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             multimodal_embeddings.append((video_embeds, "video"))
         return multimodal_embeddings
 
-<<<<<<< HEAD
-=======
-    def get_input_embeddings_v0(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: NestedTensors | None = None,
-    ) -> torch.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-
-        for embeddings, modality in multimodal_embeddings:
-            if modality == "audio":
-                placeholder_token_id = self.config.audio_token_index
-            if modality == "image":
-                placeholder_token_id = self.config.image_token_index
-            if modality == "video":
-                placeholder_token_id = self.config.video_token_index
-            inputs_embeds = merge_multimodal_embeddings(input_ids, inputs_embeds, embeddings, placeholder_token_id)
-        return inputs_embeds
-
->>>>>>> main
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -613,14 +584,10 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         )
         return hidden_states
 
-<<<<<<< HEAD
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-=======
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
->>>>>>> main
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

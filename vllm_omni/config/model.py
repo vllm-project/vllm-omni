@@ -1,7 +1,7 @@
 import json
 import warnings
 from importlib.util import find_spec
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 import vllm.envs as envs
@@ -72,8 +72,8 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
-    engine_output_type: str | None = None
-    hf_config_name: str | None = None
+    engine_output_type: Optional[str] = None
+    hf_config_name: Optional[str] = None
 
     @property
     def registry(self):
@@ -94,13 +94,15 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self,
         # Multimodal config init vars
-        limit_mm_per_prompt: dict[str, int] | None,
+        limit_mm_per_prompt: dict[str, int | dict[str, int]] | None,
+        enable_mm_embeds: bool | None,
         media_io_kwargs: dict[str, dict[str, Any]] | None,
         mm_processor_kwargs: dict[str, Any] | None,
         mm_processor_cache_gb: float | None,
         mm_processor_cache_type: MMCacheType | None,
         mm_shm_cache_max_object_size_mb: int | None,
         mm_encoder_tp_mode: MMEncoderTPMode | None,
+        mm_encoder_attn_backend: AttentionBackendEnum | str | None,
         interleave_mm_strings: bool | None,
         skip_mm_profiling: bool | None,
         video_pruning_rate: float | None,
