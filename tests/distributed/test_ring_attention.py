@@ -25,7 +25,7 @@ def update_environment_variables(envs_dict: dict[str, str]):
         os.environ[k] = v
 
 
-class TestAttentionModel(torch.nn.Module):
+class MockAttentionModel(torch.nn.Module):
     """Test model using Attention layer."""
 
     def __init__(
@@ -74,10 +74,13 @@ class TestAttentionModel(torch.nn.Module):
         v = v.view(batch_size, seq_len, v.shape[-1] // self.head_size, self.head_size)
 
         # Apply attention
+        print(f"Rank {torch.distributed.get_rank()}: q shape before attention: {q.shape}")
         attn_output = self.attention(q, k, v)
-
+        print(f"Rank {torch.distributed.get_rank()}: attn_output shape: {attn_output.shape}")
         # Reshape back and project
-        attn_output = attn_output.view(batch_size, seq_len, -1)
+        # attn_output = attn_output.view(batch_size, seq_len, -1)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_size)
+        print(f"Rank {torch.distributed.get_rank()}: attn_output reshaped: {attn_output.shape}")
         output = self.o_proj(attn_output)
 
         return output
@@ -197,7 +200,7 @@ def ring_attention_on_test_model(
     # Set the config so Attention can access it
     with set_current_omni_diffusion_config(od_config):
         hidden_size = num_heads * head_size
-        model = TestAttentionModel(
+        model = MockAttentionModel(
             num_heads=num_heads,
             head_size=head_size,
             hidden_size=hidden_size,
@@ -244,4 +247,5 @@ def ring_attention_on_test_model(
             f"ring_degree={ring_degree}, ulysses_degree={ulysses_degree}"
         )
         destroy_distributed_env()
+
 

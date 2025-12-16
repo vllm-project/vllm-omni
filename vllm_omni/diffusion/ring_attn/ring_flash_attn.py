@@ -54,7 +54,6 @@ def ring_flash_attn_forward(
                 out, lse = block_out, block_lse
             else:
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
-
         if step + 1 != comm.world_size:
             comm.wait()
             k = next_k
@@ -321,4 +320,5 @@ def ring_flash_attn_func(
         attn_type,
         attn_processor,
     )
+
 
