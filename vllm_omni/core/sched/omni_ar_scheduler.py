@@ -14,7 +14,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 class OmniARScheduler(VLLMScheduler):
     """
-    OmniScheduler: Scheduler for vLLM-Omni multimodal processing.
+    OmniARScheduler: Scheduler for vLLM-Omni multimodal processing.
 
     This scheduler extends vLLM's scheduler to support multimodal and
     non-autoregressive processing with additional fields and methods
