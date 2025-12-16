@@ -10,7 +10,6 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
 """vLLM-Omni distributed state.
 
 It takes over the control of the distributed environment from PyTorch.
@@ -28,8 +27,6 @@ The typical workflow is:
 If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
-
-from typing import Optional
 
 import torch
 import torch.distributed
@@ -60,14 +57,14 @@ HAS_FLASH_ATTN = env_info["has_flash_attn"]
 logger = init_logger(__name__)
 
 
-_WORLD: Optional[GroupCoordinator] = None
+_WORLD: GroupCoordinator | None = None
 # get _TP from vllm.distributed.parallel_state
-_SP: Optional[SequenceParallelGroupCoordinator] = None
-_PP: Optional[PipelineGroupCoordinator] = None
-_CFG: Optional[GroupCoordinator] = None
-_DP: Optional[GroupCoordinator] = None
-_DIT: Optional[GroupCoordinator] = None
-_VAE: Optional[GroupCoordinator] = None
+_SP: SequenceParallelGroupCoordinator | None = None
+_PP: PipelineGroupCoordinator | None = None
+_CFG: GroupCoordinator | None = None
+_DP: GroupCoordinator | None = None
+_DIT: GroupCoordinator | None = None
+_VAE: GroupCoordinator | None = None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -396,7 +393,7 @@ def init_distributed_environment(
     rank: int = -1,
     distributed_init_method: str = "env://",
     local_rank: int = -1,
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     if backend is None:
         backend = envs.get_torch_distributed_backend()
@@ -566,13 +563,13 @@ def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use
 def initialize_model_parallel(
     data_parallel_size: int = 1,
     cfg_parallel_size: int = 1,
-    sequence_parallel_size: Optional[int] = None,
+    sequence_parallel_size: int | None = None,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     vae_parallel_size: int = 0,
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ) -> None:
     if backend is None:
         backend = envs.get_torch_distributed_backend()

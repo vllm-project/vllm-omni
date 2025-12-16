@@ -6,7 +6,6 @@
 # Adapted from
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -51,8 +50,8 @@ class Attention(nn.Module):
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.use_sync = use_sync
-        self.ring_pg: Optional[dist.ProcessGroup] = None
-        self.ulysses_pg: Optional[dist.ProcessGroup] = None
+        self.ring_pg: dist.ProcessGroup | None = None
+        self.ulysses_pg: dist.ProcessGroup | None = None
         self.use_ulysses = False
 
         try:
