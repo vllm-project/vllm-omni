@@ -4,7 +4,7 @@ Qwen-Image-Edit OpenAI-compatible chat client for image editing.
 
 Usage:
     python openai_chat_client.py --input qwen_image_output.png --prompt "Convert to watercolor style" --output output.png
-    python openai_chat_client.py --input input.png --prompt "Convert to oil painting" --height 1024 --width 1024 --seed 42
+    python openai_chat_client.py --input input.png --prompt "Convert to oil painting" --seed 42
 """
 
 import argparse
@@ -70,10 +70,6 @@ def edit_image(
 
     # Build extra_body with generation parameters
     extra_body = {}
-    if height is not None:
-        extra_body["height"] = height
-    if width is not None:
-        extra_body["width"] = width
     if steps is not None:
         extra_body["num_inference_steps"] = steps
     if guidance_scale is not None:

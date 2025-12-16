@@ -330,6 +330,26 @@ class OmniDiffusionConfig:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
+        # Convert string dtype to torch.dtype if needed
+        if isinstance(self.dtype, str):
+            dtype_map = {
+                "auto": torch.bfloat16,
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+                "half": torch.float16,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+                "float": torch.float32,
+            }
+            dtype_lower = self.dtype.lower()
+            if dtype_lower in dtype_map:
+                self.dtype = dtype_map[dtype_lower]
+            else:
+                logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
+                self.dtype = torch.bfloat16
+
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
             self.cache_config = DiffusionCacheConfig.from_dict(self.cache_config)

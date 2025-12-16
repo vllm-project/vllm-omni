@@ -18,8 +18,6 @@ from PIL import Image
 def edit_image(
     input_image: Image.Image,
     prompt: str,
-    height: int,
-    width: int,
     steps: int,
     guidance_scale: float,
     seed: int | None,
@@ -48,8 +46,6 @@ def edit_image(
 
     # Build extra_body with generation parameters
     extra_body = {
-        "height": height,
-        "width": width,
         "num_inference_steps": steps,
         "guidance_scale": guidance_scale,
     }
@@ -111,22 +107,6 @@ def create_demo(server_url: str):
                 )
 
                 with gr.Row():
-                    height = gr.Slider(
-                        label="Height",
-                        minimum=256,
-                        maximum=2048,
-                        value=1024,
-                        step=64,
-                    )
-                    width = gr.Slider(
-                        label="Width",
-                        minimum=256,
-                        maximum=2048,
-                        value=1024,
-                        step=64,
-                    )
-
-                with gr.Row():
                     steps = gr.Slider(
                         label="Inference Steps",
                         minimum=10,
@@ -172,13 +152,13 @@ def create_demo(server_url: str):
             inputs=[prompt],
         )
 
-        def process_edit(img, p, h, w, st, g, se, n):
+        def process_edit(img, p, st, g, se, n):
             actual_seed = se if se >= 0 else None
-            return edit_image(img, p, h, w, st, g, actual_seed, n, server_url)
+            return edit_image(img, p, st, g, actual_seed, n, server_url)
 
         edit_btn.click(
             fn=process_edit,
-            inputs=[input_image, prompt, height, width, steps, guidance_scale, seed, negative_prompt],
+            inputs=[input_image, prompt, steps, guidance_scale, seed, negative_prompt],
             outputs=[output_image],
         )
 
