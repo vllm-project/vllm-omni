@@ -66,11 +66,19 @@ Key checks:
 - Orchestrator stats: per-stage latency should be stable; investigate long tails.
 - Stage logs: ensure no errors and no unusually slow stages.
 
+
 ## Performance snapshot
 
 The chart below summarizes our measured Qwen3-Omni MoE end-to-end benchmark, comparing vLLM-Omni against HF Transformers. It shows the overall throughput advantage for vLLM-Omni. These are actual experiment results—please refer to this performance when evaluating or reproducing the benchmark.
 
 ![vLLM-Omni vs HF](./vllm-omni-vs-hf.png)
+
+## Directory layout
+- `benchmarks/build_dataset/` — dataset prep utilities (e.g., SeedTTS top100).
+- `benchmarks/<model>/vllm_omni/` — vLLM-Omni pipeline benchmarks, logs, outputs.
+- Add new tasks under `benchmarks/<model>/...` with the same pattern: `transformers/`, `vllm_omni/`, task-specific README, and (optionally) dataset prep notes.
+- `benchmarks/<model>/vllm-omni-vs-hf.png` — current performance snapshot (overall throughput comparison).
+- `benchmarks/<model>/transformers/` — HF Transformers benchmarks (offline reference).
 
 ## Troubleshooting
 - Make sure GPU/driver/FlashAttention2 requirements are met for the chosen model.
