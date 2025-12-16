@@ -475,6 +475,7 @@ def _stage_worker(
     _batch_seq = 0
 
     # Device mapping
+    device_type = None
     try:
         from vllm_omni.utils import detect_device_type
 
@@ -483,11 +484,75 @@ def _stage_worker(
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
+    # Sequential initialization on the same device to avoid memory calculation errors
+    # when multiple instances start simultaneously
+    device_id = None
+    lock_file = None
+    if device_type == "cuda":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                # Get the current device ID (logical device 0 after set_stage_devices)
+                device_id = torch.cuda.current_device()
+                lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+
+                # Wait for other instances to finish initialization
+                max_wait_time = 300  # 5 minutes max wait
+                wait_start = _time.time()
+                while _os.path.exists(lock_file):
+                    try:
+                        # Check if the lock file is stale (older than 5 minutes)
+                        if _time.time() - _os.path.getmtime(lock_file) > max_wait_time:
+                            _os.remove(lock_file)
+                            break
+                    except (OSError, FileNotFoundError):
+                        break
+
+                    # Check if we've been waiting too long
+                    if _time.time() - wait_start > max_wait_time:
+                        _logging.getLogger(__name__).warning(
+                            "[Stage-%s] Timeout waiting for device %s initialization lock, proceeding anyway",
+                            stage_id,
+                            device_id,
+                        )
+                        break
+
+                    _time.sleep(0.1)
+
+                # Create our lock file
+                try:
+                    with open(lock_file, "w") as f:
+                        f.write(f"{_os.getpid()}\n")
+                    _logging.getLogger(__name__).debug(
+                        "[Stage-%s] Acquired initialization lock for device %s", stage_id, device_id
+                    )
+                except OSError:
+                    # If we can't create the lock file, continue anyway
+                    _logging.getLogger(__name__).debug(
+                        "[Stage-%s] Failed to create lock file for device %s, continuing anyway", stage_id, device_id
+                    )
+        except Exception as e:
+            _logging.getLogger(__name__).debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
+            )
+
     # Init LLM
     _logging.getLogger(__name__).debug(
         "[Stage-%s] Initializing engine with args keys=%s", stage_id, list(engine_args.keys())
     )
-    stage_engine = OmniStageLLM(model=model, **engine_args)
+    try:
+        stage_engine = OmniStageLLM(model=model, **engine_args)
+    finally:
+        # Clean up lock file after engine initialization
+        if lock_file and _os.path.exists(lock_file):
+            try:
+                _os.remove(lock_file)
+                _logging.getLogger(__name__).debug(
+                    "[Stage-%s] Released initialization lock for device %s", stage_id, device_id
+                )
+            except (OSError, FileNotFoundError):
+                pass
     _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
 
     # Initialize OmniConnectors if configured
@@ -747,6 +812,7 @@ async def _stage_worker_async(
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
+    import os as _os
     import time as _time
 
     from vllm_omni.distributed.omni_connectors import build_stage_connectors
@@ -802,6 +868,7 @@ async def _stage_worker_async(
     _batch_seq = 0
 
     # Device mapping
+    device_type = None
     try:
         from vllm_omni.utils import detect_device_type
 
@@ -821,20 +888,84 @@ async def _stage_worker_async(
             return
         connectors = built_connectors
 
+    # Sequential initialization on the same device to avoid memory calculation errors
+    # when multiple instances start simultaneously
+    device_id = None
+    lock_file = None
+    if device_type == "cuda":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                # Get the current device ID (logical device 0 after set_stage_devices)
+                device_id = torch.cuda.current_device()
+                lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+
+                # Wait for other instances to finish initialization
+                max_wait_time = 300  # 5 minutes max wait
+                wait_start = _time.time()
+                while _os.path.exists(lock_file):
+                    try:
+                        # Check if the lock file is stale (older than 5 minutes)
+                        if _time.time() - _os.path.getmtime(lock_file) > max_wait_time:
+                            _os.remove(lock_file)
+                            break
+                    except (OSError, FileNotFoundError):
+                        break
+
+                    # Check if we've been waiting too long
+                    if _time.time() - wait_start > max_wait_time:
+                        _logging.getLogger(__name__).warning(
+                            "[Stage-%s] Timeout waiting for device %s initialization lock, proceeding anyway",
+                            stage_id,
+                            device_id,
+                        )
+                        break
+
+                    _time.sleep(0.1)
+
+                # Create our lock file
+                try:
+                    with open(lock_file, "w") as f:
+                        f.write(f"{_os.getpid()}\n")
+                    _logging.getLogger(__name__).debug(
+                        "[Stage-%s] Acquired initialization lock for device %s", stage_id, device_id
+                    )
+                except OSError:
+                    # If we can't create the lock file, continue anyway
+                    _logging.getLogger(__name__).debug(
+                        "[Stage-%s] Failed to create lock file for device %s, continuing anyway", stage_id, device_id
+                    )
+        except Exception as e:
+            _logging.getLogger(__name__).debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
+            )
+
     # Init LLM
     _logging.getLogger(__name__).debug(
         "[Stage-%s] Initializing engine with args keys=%s",
         stage_id,
         list(engine_args.keys()),
     )
-    omni_engine_args = AsyncOmniEngineArgs(**engine_args)
-    usage_context = UsageContext.OPENAI_API_SERVER
-    vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
-    stage_engine = AsyncOmniStageLLM.from_vllm_config(
-        vllm_config=vllm_config,
-        usage_context=usage_context,
-        engine_args=omni_engine_args,
-    )
+    try:
+        omni_engine_args = AsyncOmniEngineArgs(**engine_args)
+        usage_context = UsageContext.OPENAI_API_SERVER
+        vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
+        stage_engine = AsyncOmniStageLLM.from_vllm_config(
+            vllm_config=vllm_config,
+            usage_context=usage_context,
+            engine_args=omni_engine_args,
+        )
+    finally:
+        # Clean up lock file after engine initialization
+        if lock_file and _os.path.exists(lock_file):
+            try:
+                _os.remove(lock_file)
+                _logging.getLogger(__name__).debug(
+                    "[Stage-%s] Released initialization lock for device %s", stage_id, device_id
+                )
+            except (OSError, FileNotFoundError):
+                pass
     omni_stage.set_async_engine(stage_engine)
     # Don't keep the dummy data in memory
     await stage_engine.reset_mm_cache()
