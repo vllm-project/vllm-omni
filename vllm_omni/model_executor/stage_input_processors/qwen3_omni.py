@@ -3,7 +3,7 @@
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
-from typing import Any, Union
+from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
@@ -49,7 +49,7 @@ def _compute_talker_prompt_ids_length(info):
 def thinker2talker(
     stage_list: list[Any],
     engine_input_source: list[int],
-    prompt: Union[OmniTokensPrompt, TextPrompt, None] = None,
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """
@@ -114,7 +114,7 @@ def thinker2talker(
 def talker2code2wav(
     stage_list: list[Any],
     engine_input_source: list[int],
-    prompt: Union[OmniTokensPrompt, TextPrompt, None] = None,
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """

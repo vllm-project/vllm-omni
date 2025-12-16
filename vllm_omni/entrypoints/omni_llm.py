@@ -4,7 +4,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Union
+from typing import Any
 
 import cloudpickle
 from pydantic import ValidationError
@@ -89,9 +89,9 @@ class OmniLLM:
     def __init__(
         self,
         model: str,
-        stage_configs_path: Optional[str] = None,
+        stage_configs_path: str | None = None,
         log_stats: bool = False,
-        log_file: Optional[str] = None,
+        log_file: str | None = None,
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
@@ -228,8 +228,8 @@ class OmniLLM:
 
     def generate(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
+        prompts: PromptType | Sequence[PromptType],
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
     ) -> list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
@@ -262,8 +262,8 @@ class OmniLLM:
 
     def _run_generation(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
+        prompts: PromptType | Sequence[PromptType],
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
     ) -> list[OmniRequestOutput]:
         logger.debug("[Orchestrator] generate() called")
         if sampling_params_list is None:
@@ -559,9 +559,9 @@ class OmniStageLLM(LLM):
     def __init__(
         self,
         model: str,
-        compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
-        hf_overrides: Optional[dict[str, Any]] = None,
-        structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
+        compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
+        hf_overrides: dict[str, Any] | None = None,
+        structured_outputs_config: dict[str, Any] | StructuredOutputsConfig | None = None,
         **kwargs: Any,
     ):
         """LLM constructor."""
@@ -633,7 +633,7 @@ class OmniStageLLM(LLM):
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
-        self.default_sampling_params: Union[dict[str, Any], None] = None
+        self.default_sampling_params: dict[str, Any] | None = None
 
         supported_tasks = self.llm_engine.get_supported_tasks()  # type: ignore
 

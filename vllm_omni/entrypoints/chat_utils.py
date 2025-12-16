@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Iterable
-from typing import Any, Optional, Union, cast
+from typing import Any, cast
 
 import numpy as np
 from openai.types.chat import ChatCompletionContentPartTextParam
@@ -33,13 +33,13 @@ class OmniAsyncMultiModalItemTracker(AsyncMultiModalItemTracker):
 class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
     def __init__(self, tracker: AsyncMultiModalItemTracker) -> None:
         super().__init__(tracker=tracker)
-        self._mm_processor_kwargs: Optional[dict[str, Any]] = None
+        self._mm_processor_kwargs: dict[str, Any] | None = None
 
-    def set_mm_processor_kwargs(self, mm_processor_kwargs: Optional[dict[str, Any]]) -> None:
+    def set_mm_processor_kwargs(self, mm_processor_kwargs: dict[str, Any] | None) -> None:
         """Set mm_processor_kwargs for use in parsing."""
         self._mm_processor_kwargs = mm_processor_kwargs
 
-    def parse_video(self, video_url: Optional[str], uuid: Optional[str] = None) -> None:
+    def parse_video(self, video_url: str | None, uuid: str | None = None) -> None:
         video = self._connector.fetch_video_async(video_url=video_url) if video_url else None
 
         placeholder = self._tracker.add("video", video, uuid)
@@ -51,7 +51,7 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
             audio_placeholder = self._tracker.add("audio", audio_coro, uuid)
             self._add_placeholder("audio", audio_placeholder)
 
-    async def _extract_audio_from_video_async(self, video_url: str) -> tuple[np.ndarray, Union[int, float]]:
+    async def _extract_audio_from_video_async(self, video_url: str) -> tuple[np.ndarray, int | float]:
         """
         Extract audio from video URL using librosa.
         Returns tuple of (audio_array, sample_rate) compatible with audio format.
@@ -79,7 +79,7 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
                 temp_file.write(data)
                 return temp_file.name
 
-        def _load_audio_sync(file_path: str) -> tuple[np.ndarray, Union[int, float]]:
+        def _load_audio_sync(file_path: str) -> tuple[np.ndarray, int | float]:
             """Synchronous audio loading with librosa - runs in thread pool."""
             import librosa
 
@@ -131,11 +131,11 @@ def parse_chat_messages_futures(
     model_config: ModelConfig,
     tokenizer: AnyTokenizer,
     content_format: _ChatTemplateContentFormat,
-    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
-    Awaitable[Optional[MultiModalDataDict]],
-    Optional[MultiModalUUIDDict],
+    Awaitable[MultiModalDataDict | None],
+    MultiModalUUIDDict | None,
 ]:
     conversation: list[ConversationMessage] = []
     mm_tracker = OmniAsyncMultiModalItemTracker(model_config, tokenizer)
@@ -165,7 +165,7 @@ def _parse_chat_message_content(
     mm_tracker: BaseMultiModalItemTracker,
     content_format: _ChatTemplateContentFormat,
     interleave_strings: bool,
-    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> list[ConversationMessage]:
     role = message["role"]
     content = message.get("content")
@@ -210,7 +210,7 @@ def _parse_chat_message_content_parts(
     *,
     wrap_dicts: bool,
     interleave_strings: bool,
-    mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> list[ConversationMessage]:
     content = list[_ContentPart]()
 

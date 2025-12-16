@@ -1,7 +1,7 @@
 import json
 import warnings
 from importlib.util import find_spec
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import torch
 import vllm.envs as envs
@@ -65,8 +65,8 @@ class OmniModelConfig(ModelConfig):
     stage_id: int = 0
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
-    engine_output_type: Optional[str] = None
-    hf_config_name: Optional[str] = None
+    engine_output_type: str | None = None
+    hf_config_name: str | None = None
 
     @property
     def registry(self):
@@ -87,16 +87,16 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self,
         # Multimodal config init vars
-        limit_mm_per_prompt: Optional[dict[str, int]],
-        media_io_kwargs: Optional[dict[str, dict[str, Any]]],
-        mm_processor_kwargs: Optional[dict[str, Any]],
-        mm_processor_cache_gb: Optional[float],
-        mm_processor_cache_type: Optional[MMCacheType],
-        mm_shm_cache_max_object_size_mb: Optional[int],
-        mm_encoder_tp_mode: Optional[MMEncoderTPMode],
-        interleave_mm_strings: Optional[bool],
-        skip_mm_profiling: Optional[bool],
-        video_pruning_rate: Optional[float],
+        limit_mm_per_prompt: dict[str, int] | None,
+        media_io_kwargs: dict[str, dict[str, Any]] | None,
+        mm_processor_kwargs: dict[str, Any] | None,
+        mm_processor_cache_gb: float | None,
+        mm_processor_cache_type: MMCacheType | None,
+        mm_shm_cache_max_object_size_mb: int | None,
+        mm_encoder_tp_mode: MMEncoderTPMode | None,
+        interleave_mm_strings: bool | None,
+        skip_mm_profiling: bool | None,
+        video_pruning_rate: float | None,
     ) -> None:
         # Set the default seed to 0 in V1.
         if envs.VLLM_USE_V1 and self.seed is None:

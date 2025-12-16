@@ -2,7 +2,7 @@ import os
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from omegaconf import OmegaConf
 from vllm.transformers_utils.config import get_config
@@ -97,7 +97,7 @@ def resolve_model_config_path(model: str) -> str:
     return str(stage_config_path)
 
 
-def load_stage_configs_from_model(model: str, base_engine_args: Optional[dict] = None) -> list:
+def load_stage_configs_from_model(model: str, base_engine_args: dict | None = None) -> list:
     """Load stage configurations from model's default config file.
 
     Loads stage configurations based on the model type and device type.
@@ -120,7 +120,7 @@ def load_stage_configs_from_model(model: str, base_engine_args: Optional[dict] =
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: Optional[dict] = None) -> list:
+def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
     """Load stage configurations from a YAML file.
 
     Args:
