@@ -20,15 +20,14 @@ from .utils import create_new_process_for_each_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
-# CI stage config optimized for 24GB GPU (L4/RTX3090)
 # CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
 if is_npu():
-    stage_configs = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
 else:
-    stage_configs = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
 
 # Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [(model, stage_config) for model in models]
 
 
 @pytest.mark.core_model
