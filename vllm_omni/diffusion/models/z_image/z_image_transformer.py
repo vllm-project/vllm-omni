@@ -32,6 +32,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.compile import dit_support_compile
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -190,6 +191,7 @@ class FeedForward(nn.Module):
         return self.w2(self.act(self.w13(x)))
 
 
+@dit_support_compile(dynamic_arg_dims={"x": [0, 1], "attn_mask": [0, 1], "freqs_cis": [0, 1]})
 class ZImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -227,16 +229,7 @@ class ZImageTransformerBlock(nn.Module):
                 nn.Linear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True),
             )
 
-    def forward(self, x, attn_mask, freqs_cis, adaln_input=None):
-        dynamic_dims = [0, 1]
-        for dim in dynamic_dims:
-            torch._dynamo.mark_dynamic(x, dim)
-            torch._dynamo.mark_dynamic(attn_mask, dim)
-            torch._dynamo.mark_dynamic(freqs_cis, dim)
-        return self.old_forward(x, attn_mask, freqs_cis, adaln_input)
-
-    @torch.compile()
-    def old_forward(
+    def forward(
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,

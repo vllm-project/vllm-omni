@@ -32,6 +32,7 @@ class DiffusionEngine:
         self._processes: list[mp.Process] = []
         self._closed = False
         self._make_client()
+        self._dummy_run()
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
@@ -150,6 +151,22 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
+
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        prompt = "dummy"
+        num_inference_steps = 1
+        height = 512
+        width = 512
+        req = OmniDiffusionRequest(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            num_outputs_per_prompt=1,
+        )
+        logger.info("dummy run to warm up the model")
+        self.add_req_and_wait_for_response([req])
 
     def close(self, *, timeout_s: float = 30.0) -> None:
         if self._closed:
