@@ -1013,6 +1013,9 @@ async def _stage_worker_async(
         print("--------------------------------", flush=True)
         print(f"[Stage-{stage_id}] Stage worker exiting", flush=True)
         print("--------------------------------", flush=True)
+    except Exception as e:
+        _logging.getLogger(__name__).exception("[Stage-%s] Stage worker crashed: %s", stage_id, e)
+        raise e
     finally:
         # Always shutdown the engine to release GPU memory and terminate child processes
         try:
