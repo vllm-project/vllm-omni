@@ -53,6 +53,13 @@ _OMNI_MODELS = {
         "index_tts",
         "IndexTTSForConditionalGeneration",
     ),
+    "IndexTTSGPTForConditionalGeneration": ("index_tts", "index_tts_gpt", "IndexTTSGPTForConditionalGeneration"),
+    "IndexTTSS2MelForConditionalGeneration": ("index_tts", "index_tts_s2mel", "IndexTTSS2MelForConditionalGeneration"),
+    "IndexTTSVocoderForConditionalGeneration": (
+        "index_tts",
+        "index_tts_vocoder",
+        "IndexTTSVocoderForConditionalGeneration",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {

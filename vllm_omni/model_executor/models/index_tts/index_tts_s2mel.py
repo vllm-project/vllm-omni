@@ -41,7 +41,8 @@ class IndexTTSS2MelForConditionalGeneration(nn.Module):
         codes,  # [B, T_codes]
         latent,  # [B, T_codes, D]
         code_lens,  # [B]
-        prompt_condition: torch.Tensor,  # [B, D, T_prompt]
+        spk_cond_emb,
+        ref_target_lengths,
         ref_mel: torch.Tensor,  # [B, D, T_ref]
         style: torch.Tensor,  # [B, D_style]
         **generation_kwargs,
@@ -59,9 +60,17 @@ class IndexTTSS2MelForConditionalGeneration(nn.Module):
         S_infer = S_infer + latent
         target_lengths = (code_lens * 1.72).long()
 
+        #   3. Quantize spk_cond_emb
+        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+
+        #   6. Generate prompt_condition using s2mel length_regulator:
+        prompt_condition = self.s2mel.models["length_regulator"](
+            S_ref, ylens=ref_target_lengths, n_quantizers=3, f0=None
+        )[0]
+
         cond = self.s2mel.models["length_regulator"](S_infer, ylens=target_lengths, n_quantizers=3, f0=None)[0]
         cat_condition = torch.cat([prompt_condition, cond], dim=1)
-        s2mel_mel_spectrogram = self.s2mel.models["cfm"].inference(
+        s2mel_spectrogram = self.s2mel.models["cfm"].inference(
             cat_condition,
             torch.LongTensor([cat_condition.size(1)]).to(cond.device),
             ref_mel,
@@ -71,9 +80,9 @@ class IndexTTSS2MelForConditionalGeneration(nn.Module):
             inference_cfg_rate=inference_cfg_rate,
         )
 
-        s2mel_mel_spectrogram = s2mel_mel_spectrogram[:, :, ref_mel.size(-1) :]
+        s2mel_spectrogram = s2mel_spectrogram[:, :, ref_mel.size(-1) :]
 
-        return s2mel_mel_spectrogram
+        return s2mel_spectrogram
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         s2mel_ckpt = getattr(self.config, "s2mel_checkpoint", None)
@@ -88,11 +97,31 @@ class IndexTTSS2MelForConditionalGeneration(nn.Module):
             ignore_modules=[],
             is_distributed=False,
         )
+        self.s2mel.models["cfm"].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        sc_rel = self.config.semantic_codec.get("safetensors_path", "semantic_codec/model.safetensors")
+
+        if not isinstance(sc_rel, str) or not sc_rel:
+            raise RuntimeError("IndexTTS: Missing semantic_codec.safetensors_path")
+        sc_repo = self.config.semantic_codec.get("repo_id", repo_id)
+        sc_path = hf_hub_download(sc_repo, filename=sc_rel)
+        print(sc_path)
+
         mapper = WeightsMapper(
             orig_to_new_prefix={
-                "gpt.": "",
-                "s2mel.": "s2mel.",
+                "s2mel.": "",
             }
         )
+        device = next(self.parameters()).device
+        self.s2mel.to(device)
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+
+        # Verify coverage for required prefixes
+        def _loaded_prefix(prefix: str) -> bool:
+            return any(n.startswith(prefix) for n in loaded)
+
+        for required_prefix in ("semantic_codec.",):
+            if not _loaded_prefix(required_prefix):
+                raise RuntimeError(f"IndexTTS: Missing loaded weights for prefix: {required_prefix}")
+        return loaded

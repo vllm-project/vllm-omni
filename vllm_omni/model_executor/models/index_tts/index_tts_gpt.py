@@ -42,8 +42,10 @@ class IndexTTSGPTForConditionalGeneration(nn.Module):
         text_tokens: torch.Tensor,  # [B, T_text]
         spk_cond_emb: torch.Tensor,  # [B, T_spk, D]
         emo_cond_emb: torch.Tensor,  # [B, T_emo, D]
+        emovec_mat: torch.Tensor,
+        weight_vector: torch.Tensor,
+        emo_vector: torch.Tensor,
         emo_alpha: float = 1.0,
-        emo_vector=None,
         **generation_kwargs,
     ) -> dict:
         """
@@ -63,6 +65,8 @@ class IndexTTSGPTForConditionalGeneration(nn.Module):
             torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
             alpha=emo_alpha,
         )
+        if emo_vector is not None:
+            emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
 
         top_p = generation_kwargs.pop("top_p", 0.8)
         top_k = generation_kwargs.pop("top_k", 30)

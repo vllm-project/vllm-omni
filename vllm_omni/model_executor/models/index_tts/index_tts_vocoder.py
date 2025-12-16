@@ -20,7 +20,7 @@ logger = init_logger(__name__)
 class IndexTTSVocoderForConditionalGeneration(nn.Module):
     """
     Stage 2: Vocoder model for generating waveforms from mel-spectrograms.
-    Input: s2mel_mel_spectrogram
+    Input: s2mel_spectrogram
     Output: waveforms
     """
 
@@ -34,13 +34,13 @@ class IndexTTSVocoderForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        s2mel_mel_spectrogram: torch.Tensor,  # [B, D, T_mel]
+        s2mel_spectrogram: torch.Tensor,  # [B, D, T_mel]
         **generation_kwargs,
     ):
         """
         Forward pass for vocoder-based waveform generation.
         """
-        wav = self.bigvgan(s2mel_mel_spectrogram.float()).squeeze().unsqueeze(0)
+        wav = self.bigvgan(s2mel_spectrogram.float()).squeeze().unsqueeze(0)
         wav = wav.squeeze(1)
         wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
         return wav  # [B, T_audio]
@@ -56,6 +56,8 @@ class IndexTTSVocoderForConditionalGeneration(nn.Module):
         )
         self.bigvgan = bigvgan.BigVGAN.from_pretrained(self.vocoder_name)
         self.bigvgan.remove_weight_norm()
+        device = next(self.parameters()).device
+        self.bigvgan.to(device)
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=mapper)
