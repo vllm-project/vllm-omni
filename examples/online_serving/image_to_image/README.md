@@ -12,11 +12,6 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 
 ### Start with Parameters
 
-```bash
-vllm serve Qwen/Qwen-Image-Edit --omni \
-    --port 8092 \
-    --num-gpus 2
-```
 
 Or use the startup script:
 
