@@ -1,6 +1,6 @@
 # Diffusion Acceleration Overview
 
-vLLM-Omni supports various acceleration methods to speed up diffusion model inference with minimal quality degradation. These methods include **cache methods** that intelligently cache intermediate computations to avoid redundant work across diffusion timesteps, and **parallelism methods** that distribute the computation across multiple devices.
+vLLM-Omni supports various cache acceleration methods to speed up diffusion model inference with minimal quality degradation. These methods include **cache methods** that intelligently cache intermediate computations to avoid redundant work across diffusion timesteps, and **parallelism methods** that distribute the computation across multiple devices.
 
 ## Supported Acceleration Methods
 
@@ -35,12 +35,12 @@ The following table shows which models are currently supported by each accelerat
 |-------|-----------------|----------|-----------|-----------|
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ❌ | ✅* | ✅ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ❌ | ✅ |✅ |
 
 
 ## Performance Benchmarks
 
-The following benchmarks were measured on **Qwen/Qwen-Image** model generating images (**1024x1024**) with 50 inference steps:
+The following benchmarks were measured on **Qwen/Qwen-Image** and **Qwen/Qwen-Image-Edit** models generating 1024x1024 images with 50 inference steps:
 
 !!! note "Benchmark Disclaimer"
     These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
@@ -60,7 +60,6 @@ The following benchmarks were measured on **Qwen/Qwen-Image** model generating i
 | **Qwen/Qwen-Image** | Cache-DiT | DBCache + TaylorSeer + SCM (Fn=8, Bn=0, W=4, TaylorSeer order=1, SCM fast) | 14.0s | **1.43x** | - |
 | **Qwen/Qwen-Image-Edit** | None | No acceleration | 51.5s | 1.0x | Baseline (diffusers) |
 | **Qwen/Qwen-Image-Edit** | Cache-DiT | Default (Fn=1, Bn=0, W=4, TaylorSeer disabled, SCM disabled) | 21.6s | **2.38x** | - |
-
 
 To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** model generating images (**2048x2048** as long sequence input) with 50 inference steps. The hardware devices are NVIDIA H800 GPUs. `sdpa` is the attention backends.
 
@@ -145,3 +144,4 @@ For detailed information on each acceleration method:
 
 - **[TeaCache Guide](teacache.md)** - Complete TeaCache documentation, configuration options, and best practices
 - **[Cache-DiT Acceleration Guide](cache_dit_acceleration.md)** - Comprehensive Cache-DiT guide covering DBCache, TaylorSeer, SCM, and configuration parameters
+- **[Sequence Parallelism](parallelism_acceleration.md#sequence-parallelism) ** - Guidance on how to set sequence parallelism with configuration.
