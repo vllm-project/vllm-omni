@@ -14,9 +14,7 @@ This document explains the benchmark architecture across all benchmark assets in
 
 ## Directory layout
 - `benchmarks/build_dataset/` — dataset prep utilities (e.g., SeedTTS top100).
-- `benchmarks/<model>/transformers/` — HF Transformers benchmarks (offline reference).
 - `benchmarks/<model>/vllm_omni/` — vLLM-Omni pipeline benchmarks, logs, outputs.
-- `benchmarks/<model>/vllm-omni-vs-hf.png` — current performance snapshot (overall throughput comparison).
 - Add new tasks under `benchmarks/<model>/...` with the same pattern: `transformers/`, `vllm_omni/`, task-specific README, and (optionally) dataset prep notes.
 
 ## Reference workflows
