@@ -23,7 +23,7 @@ stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.ya
 
 if is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")]
+    stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
