@@ -156,12 +156,12 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--vae-use-slicing",
             action="store_true",
-            help="Enable VAE slicing for memory optimization (useful for NPU).",
+            help="Enable VAE slicing for memory optimization (useful for mitigating OOM issues).",
         )
         serve_parser.add_argument(
             "--vae-use-tiling",
             action="store_true",
-            help="Enable VAE tiling for memory optimization (useful for NPU).",
+            help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
 
         # Video model parameters (e.g., Wan2.2) - engine-level
