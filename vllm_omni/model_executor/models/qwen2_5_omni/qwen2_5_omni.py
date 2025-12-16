@@ -75,9 +75,9 @@ class Qwen2_5OmniForConditionalGeneration(
             self.thinker = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "thinker"),
-                hf_config=config,
+                hf_config=thinker_config,
                 # Use registry architecture key
-                architectures=["Qwen2_5OmniModel"],
+                architectures=["Qwen2_5OmniThinkerModel"],
             )
             self.model = self.thinker
             self.talker = None

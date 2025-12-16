@@ -6,6 +6,11 @@ _OMNI_MODELS = {
         "qwen2_5_omni",
         "Qwen2_5OmniForConditionalGeneration",
     ),
+    "Qwen2_5OmniThinkerModel": (
+        "qwen2_5_omni",
+        "qwen2_5_omni_thinker",
+        "Qwen2_5OmniThinkerForConditionalGeneration",
+    ),
     "Qwen2_5OmniTalkerModel": (
         "qwen2_5_omni",
         "qwen2_5_omni_talker",

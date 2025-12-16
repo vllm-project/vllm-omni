@@ -13,7 +13,7 @@ from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
@@ -75,7 +75,7 @@ class OmniInputProcessor(InputProcessor):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
         super().__init__(vllm_config, tokenizer, mm_registry)

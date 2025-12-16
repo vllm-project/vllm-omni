@@ -60,13 +60,14 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.transformers_utils.tokenizers import (
+from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.mistral import (
+    MistralTokenizer,
     maybe_serialize_tool_calls,
     truncate_tool_call_ids,
     validate_request_params,
 )
-from vllm.utils import as_list
+from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
@@ -237,7 +238,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     async def _preprocess_chat(
         self,
         request: Union[ChatLikeRequest, ResponsesRequest],
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         messages: list[ChatCompletionMessageParam],
         chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
@@ -246,7 +247,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         tool_dicts: Optional[list[dict[str, Any]]] = None,
         documents: Optional[list[dict[str, str]]] = None,
         chat_template_kwargs: Optional[dict[str, Any]] = None,
-        tool_parser: Optional[Callable[[AnyTokenizer], ToolParser]] = None,
+        tool_parser: Optional[Callable[[TokenizerLike], ToolParser]] = None,
         add_special_tokens: bool = False,
     ) -> tuple[
         list[ConversationMessage],
@@ -397,7 +398,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
     ) -> Union[ErrorResponse, ChatCompletionResponse]:
         created_time = int(time.time())
@@ -487,7 +488,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         self,
         request: ChatCompletionRequest,
         omni_outputs: OmniRequestOutput,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         conversation: list[ConversationMessage],
         role: str,
     ):

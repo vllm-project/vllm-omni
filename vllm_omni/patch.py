@@ -18,10 +18,10 @@ for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
         continue
-    # if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
-    #     module.EngineCoreOutput = OmniEngineCoreOutput
-    # if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
-    #     module.EngineCoreOutputs = OmniEngineCoreOutputs
+    if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
+        module.EngineCoreOutput = OmniEngineCoreOutput
+    if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
+        module.EngineCoreOutputs = OmniEngineCoreOutputs
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
         module.TokensPrompt = OmniTokensPrompt
     if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:

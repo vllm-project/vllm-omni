@@ -35,8 +35,9 @@ from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
-from vllm.transformers_utils.tokenizer import MistralTokenizer
-from vllm.utils import decorate_logs
+from vllm.tokenizers import MistralTokenizer
+from vllm.utils.system_utils import decorate_logs
+
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -174,7 +175,7 @@ async def build_async_omni_from_stage_config(
     """
 
     # V1 AsyncLLM.
-    assert envs.VLLM_USE_V1
+    # assert envs.VLLM_USE_V1
 
     if disable_frontend_multiprocessing:
         logger.warning(
@@ -285,14 +286,12 @@ async def omni_init_app_state(
 
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
-        model_config=model_config,
         base_model_paths=base_model_paths,
         lora_modules=lora_modules,
     )
     await state.openai_serving_models.init_static_loras()
     state.openai_serving_chat = OmniOpenAIServingChat(
         engine_client,
-        model_config,
         state.openai_serving_models,
         args.response_role,
         request_logger=request_logger,

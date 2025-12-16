@@ -78,7 +78,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
-    Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
 )
@@ -110,7 +109,7 @@ try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
-
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import Qwen2_5OmniConditionalGenerationMixin
 
 logger = init_logger(__name__)
 

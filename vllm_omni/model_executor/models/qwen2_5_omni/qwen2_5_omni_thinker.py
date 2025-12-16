@@ -50,12 +50,13 @@ from vllm.multimodal.inputs import (
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from collections.abc import Iterable
+from vllm.model_executor.models.qwen2_5_omni_thinker import Qwen2_5OmniConditionalGenerationMixin as Qwen2_5OmniConditionalGenerationMixinBase
 try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 logger = init_logger(__name__)
-class Qwen2_5OmniConditionalGenerationMixin:
+class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixinBase):
     def _parse_and_validate_audio_input(
         self, **kwargs: object
     ) -> Qwen2_5OmniAudioFeatureInputs | None:
@@ -64,12 +65,18 @@ class Qwen2_5OmniConditionalGenerationMixin:
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
         if input_audio_features is None:
             return None
-        if input_audio_features is not None and input_audio_features.ndim == 3:
+        if input_audio_features is not None and isinstance(input_audio_features, torch.Tensor) and input_audio_features.ndim == 3:
             input_audio_features = input_audio_features.reshape(-1, input_audio_features.shape[-1])
-        if audio_feature_lengths is not None and audio_feature_lengths.ndim == 2:
+        elif input_audio_features is not None and isinstance(input_audio_features, list):
+            input_audio_features = torch.cat(input_audio_features, dim=-1)
+        if audio_feature_lengths is not None and  isinstance(audio_feature_lengths, torch.Tensor) and audio_feature_lengths.ndim == 2:
             audio_feature_lengths = audio_feature_lengths.reshape(-1)
-        if feature_attention_mask is not None and feature_attention_mask.ndim == 3:
+        elif audio_feature_lengths is not None and isinstance(audio_feature_lengths, list):
+            audio_feature_lengths = torch.cat(audio_feature_lengths, dim=-1)
+        if feature_attention_mask is not None and isinstance(feature_attention_mask, torch.Tensor) and feature_attention_mask.ndim == 3:
             feature_attention_mask = feature_attention_mask.reshape(-1, feature_attention_mask.shape[-1])
+        elif feature_attention_mask is not None and isinstance(feature_attention_mask, list):
+            feature_attention_mask = torch.cat(feature_attention_mask, dim=-1)
         return Qwen2_5OmniAudioFeatureInputs(
             type="audio_features",
             input_features=input_audio_features,
@@ -87,11 +94,11 @@ class Qwen2_5OmniConditionalGenerationMixin:
 
         if pixel_values is None and image_embeds is None:
             return None
-        if pixel_values is not None and pixel_values.ndim == 3:
+        if pixel_values is not None and isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 3:
             pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
-        if image_embeds is not None and image_embeds.ndim == 3:
+        if image_embeds is not None and isinstance(image_embeds, torch.Tensor) and image_embeds.ndim == 3:
             image_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
-        if image_grid_thw is not None and image_grid_thw.ndim == 3:
+        if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor) and image_grid_thw.ndim == 3:
             image_grid_thw = image_grid_thw.reshape(-1, image_grid_thw.shape[-1])
         if pixel_values is not None:
             return Qwen2_5_VLImagePixelInputs(
@@ -119,11 +126,11 @@ class Qwen2_5OmniConditionalGenerationMixin:
             return None
 
 
-        if pixel_values_videos is not None and pixel_values_videos.ndim == 3:
+        if pixel_values_videos is not None and isinstance(pixel_values_videos, torch.Tensor) and pixel_values_videos.ndim == 3:
             pixel_values_videos = pixel_values_videos.reshape(-1, pixel_values_videos.shape[-1])
-        if video_grid_thw is not None and video_grid_thw.ndim == 3:
+        if video_grid_thw is not None and isinstance(video_grid_thw, torch.Tensor) and video_grid_thw.ndim == 3:
             video_grid_thw = video_grid_thw.reshape(-1, video_grid_thw.shape[-1])
-        if video_embeds is not None and video_embeds.ndim == 3:
+        if video_embeds is not None and isinstance(video_embeds, torch.Tensor) and video_embeds.ndim == 3:
             video_embeds = video_embeds.reshape(-1, video_embeds.shape[-1])
         if pixel_values_videos is not None:
             return Qwen2_5_VLVideoPixelInputs(
@@ -198,7 +205,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         super().__init__()
         self.vllm_config = vllm_config
         thinker_config: Qwen2_5OmniThinkerConfig = (
-            vllm_config.model_config.hf_config.thinker_config
+            vllm_config.model_config.hf_config
         )
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config

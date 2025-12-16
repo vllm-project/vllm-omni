@@ -144,26 +144,23 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             )
 
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
-        pooler_output: list[torch.Tensor | None] = []
+        pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
+            assert multimodal_outputs.shape[0] == 1, "model should return a single tensor, to return multiple tensors, use a dict"
             assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
             for i in range(self.input_batch.num_reqs):
-                pooler_output.append(
+                pooler_output.append({"model_outputs": 
                     multimodal_outputs[i].detach().to("cpu").contiguous()
-                )
+                })
         elif isinstance(multimodal_outputs, list):
+            assert len(multimodal_outputs) == 1, "model should return a single list, to return multiple lists, use a dict"
             for out in multimodal_outputs:
-                pooler_output.append(
-                    out.detach().to("cpu").contiguous() if out is not None else None
-                )
+                pooler_output.append({"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None})
         elif isinstance(multimodal_outputs, dict):
-            for out in multimodal_outputs.values():
-                pooler_output.append(
-                    out.detach().to("cpu").contiguous() if out is not None else None
-                )
+            for key, out in multimodal_outputs.items():
+                pooler_output.append({key: out.detach().to("cpu").contiguous() if out is not None else None})
         else:
             raise RuntimeError("Unsupported diffusion output type")
-
         output = OmniModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
