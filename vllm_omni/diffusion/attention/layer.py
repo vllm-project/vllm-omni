@@ -113,7 +113,7 @@ class Attention(nn.Module):
         if softmax_scale is None:
             softmax_scale = query.shape[-1] ** -0.5
             
-        out = ring_flash_attn_func(
+        out, _ = ring_flash_attn_func(
             query,
             key,
             value,
