@@ -874,19 +874,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     payload.update(mm_payload)
             pooler_output.append(payload)  # type: ignore[arg-type]
             prev_logits_index = logits_index + 1
-        def check_device(obj, path=""):
-            if isinstance(obj, torch.Tensor):
-                if not obj.is_cpu:
-                    print(f"NPU tensor at {path}: device={obj.device}, shape={obj.shape}")
-            elif isinstance(obj, dict):
-                for k, v in obj.items():
-                    check_device(v, f"{path}.{k}")
-            elif isinstance(obj, list):
-                for i, v in enumerate(obj):
-                    check_device(v, f"{path}[{i}]")
-
-        check_device(pooler_output, "pooler_output")
-        check_device(prompt_logprobs_dict, "prompt_logprobs_dict")
         # Omni-new
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
