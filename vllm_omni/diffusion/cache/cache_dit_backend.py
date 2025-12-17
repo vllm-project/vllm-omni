@@ -23,12 +23,6 @@ try:
     CACHE_DIT_AVAILABLE = True
 except ImportError:
     CACHE_DIT_AVAILABLE = False
-    cache_dit = None  # type: ignore
-    DBCacheConfig = None  # type: ignore
-    BlockAdapter = None  # type: ignore
-    ForwardPattern = None  # type: ignore
-    ParamsModifier = None  # type: ignore
-    TaylorSeerCalibratorConfig = None  # type: ignore
     logger.warning("cache-dit is not installed. Cache-dit acceleration will not be available.")
 
 
@@ -39,7 +33,7 @@ except ImportError:
 CUSTOM_DIT_ENABLERS: dict[str, Callable] = {}
 
 
-def _build_db_cache_config(cache_config: Any) -> Any:
+def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
     """Build DBCacheConfig with optional SCM (Step Computation Masking) support.
 
     Args:

@@ -1,6 +1,8 @@
 from typing import Any
 
 from vllm_omni.diffusion.cache.base import CacheBackend
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
+from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 
@@ -29,12 +31,8 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         cache_config = DiffusionCacheConfig.from_dict(cache_config)
 
     if cache_backend == "cache_dit":
-        from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
-
         return CacheDiTBackend(cache_config)
     elif cache_backend == "tea_cache":
-        from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
-
         return TeaCacheBackend(cache_config)
     else:
         raise ValueError(f"Unsupported cache backend: {cache_backend}. Supported: 'cache_dit', 'tea_cache'")
