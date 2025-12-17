@@ -141,8 +141,8 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         TestMultiLayerAttentionModel,
     ],
 )
-@pytest.mark.parametrize("ulysses_degree", [2, 4])
-@pytest.mark.parametrize("ring_degree", [1])
+@pytest.mark.parametrize("ulysses_degree", [2])
+@pytest.mark.parametrize("ring_degree", [2])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])

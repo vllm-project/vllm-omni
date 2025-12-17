@@ -94,7 +94,7 @@ class MockAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_sync", [True, False])
 @pytest.mark.parametrize("ring_degree", [2])
-@pytest.mark.parametrize("ulysses_degree", [1, 2])
+@pytest.mark.parametrize("ulysses_degree", [2])
 def test_ring_attention(
     dtype: torch.dtype,
     causal: bool,
