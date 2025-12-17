@@ -305,7 +305,7 @@ async def run_inference_async_omni(
     image_file: Image.Image | None = None,
     video_file: str | None = None,
     use_audio_in_video: bool = False,
-    output_modalities: Optional[str] = None,
+    output_modalities: str | None = None,
 ):
     """Run inference using AsyncOmni directly with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
@@ -440,7 +440,7 @@ def build_interface(
         image_file: Image.Image | None,
         video_file: str | None,
         use_audio_in_video: bool,
-        output_modalities: Optional[str] = None,
+        output_modalities: str | None = None,
     ):
         return await run_inference_async_omni(
             omni,

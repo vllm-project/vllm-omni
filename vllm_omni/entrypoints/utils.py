@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
-from vllm.transformers_utils.config import get_config
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_config
 
 from vllm_omni.utils import detect_device_type
 
@@ -171,7 +171,10 @@ def get_final_stage_id_for_e2e(output_modalities: list[str], default_modalities:
 
     try:
         for _sid in range(last_stage_id, -1, -1):
-            if getattr(stage_list[_sid], "final_output", False) and stage_list[_sid].final_output_type in output_modalities:
+            if (
+                getattr(stage_list[_sid], "final_output", False)
+                and stage_list[_sid].final_output_type in output_modalities
+            ):
                 final_stage_id_for_e2e = _sid
                 break
         if final_stage_id_for_e2e < 0:

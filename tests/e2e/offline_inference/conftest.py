@@ -4,7 +4,7 @@
 Pytest configuration and fixtures for vllm-omni tests.
 """
 
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
@@ -79,7 +79,7 @@ class OmniRunner:
         images: PromptImageInput = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-        modalities: Optional[list[str]] = None,
+        modalities: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Construct Omni input format from prompts and multimodal data.
@@ -216,7 +216,7 @@ class OmniRunner:
         images: PromptImageInput = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-        modalities: Optional[list[str]] = None,
+        modalities: list[str] | None = None,
     ) -> list[Any]:
         """
         Convenience method to generate with multimodal inputs.

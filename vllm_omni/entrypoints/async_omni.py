@@ -6,7 +6,7 @@ import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 
@@ -56,10 +56,10 @@ from vllm_omni.entrypoints.log_utils import (
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
+    get_final_stage_id_for_e2e,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
-    get_final_stage_id_for_e2e,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -270,10 +270,10 @@ class AsyncOmni(EngineClient):
         self,
         prompt: PromptType,
         request_id: str,
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
-        output_modalities: Optional[list[str]] = None,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
+        output_modalities: list[str] | None = None,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
@@ -327,7 +327,7 @@ class AsyncOmni(EngineClient):
         # Determine the final stage for E2E stats (highest stage_id with
         # final_output=True; fallback to last stage)
         final_stage_id_for_e2e = get_final_stage_id_for_e2e(output_modalities, self.output_modalities, self.stage_list)
-        
+
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
             num_stages,
@@ -355,7 +355,7 @@ class AsyncOmni(EngineClient):
         logger.debug("[Orchestrator] Enqueued request %s to stage-0", request_id)
 
         logger.debug("[Orchestrator] Entering scheduling loop: stages=%d", num_stages)
-        for stage_id, stage in enumerate(self.stage_list[:final_stage_id_for_e2e + 1]):
+        for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
             result = await req_state.queue.get()
             assert stage_id == req_state.stage_id
 

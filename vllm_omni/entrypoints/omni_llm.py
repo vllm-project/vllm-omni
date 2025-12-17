@@ -44,10 +44,10 @@ from vllm_omni.entrypoints.log_utils import (
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
+    get_final_stage_id_for_e2e,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
-    get_final_stage_id_for_e2e,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -296,7 +296,9 @@ class OmniLLM:
         final_stage_id_to_prompt = {}
         try:
             for rid, prompt in request_id_to_prompt.items():
-                final_stage_id_for_e2e = get_final_stage_id_for_e2e(prompt.get("modalities", None), self.output_modalities, self.stage_list)
+                final_stage_id_for_e2e = get_final_stage_id_for_e2e(
+                    prompt.get("modalities", None), self.output_modalities, self.stage_list
+                )
                 final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
         except Exception as e:
