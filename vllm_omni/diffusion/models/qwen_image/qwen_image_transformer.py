@@ -21,7 +21,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.compile import dit_support_compile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.layers.rope import apply_rotary_embedding
+from vllm_omni.diffusion.layers.rope import apply_rotary_emb
+
+# from vllm.vllm_flash_attn.layers.rotary import (
+#     apply_rotary_emb as apply_rotary_embedding,
+# ) This is faster than apply_rotary_emb above
 
 logger = init_logger(__name__)
 
@@ -260,15 +264,14 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = self.norm_added_k(txt_key)
 
         # Apply RoPE
-        if vid_freqs is not None and txt_freqs is not None:
-            img_cos = vid_freqs.real
-            img_sin = vid_freqs.imag
-            txt_cos = txt_freqs.real
-            txt_sin = txt_freqs.imag
-            img_query = apply_rotary_embedding(img_query, img_cos, img_sin, interleaved=True)
-            img_key = apply_rotary_embedding(img_key, img_cos, img_sin, interleaved=True)
-            txt_query = apply_rotary_embedding(txt_query, txt_cos, txt_sin, interleaved=True)
-            txt_key = apply_rotary_embedding(txt_key, txt_cos, txt_sin, interleaved=True)
+        img_cos = vid_freqs.real.to(img_query.dtype)
+        img_sin = vid_freqs.imag.to(img_query.dtype)
+        txt_cos = txt_freqs.real.to(txt_query.dtype)
+        txt_sin = txt_freqs.imag.to(txt_query.dtype)
+        img_query = apply_rotary_emb(img_query, img_cos, img_sin, interleaved=True)
+        img_key = apply_rotary_emb(img_key, img_cos, img_sin, interleaved=True)
+        txt_query = apply_rotary_emb(txt_query, txt_cos, txt_sin, interleaved=True)
+        txt_key = apply_rotary_emb(txt_key, txt_cos, txt_sin, interleaved=True)
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -299,16 +302,6 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-# @dit_support_compile(
-#     dynamic_arg_dims={
-#         "hidden_states": [0, 1],
-#         "encoder_hidden_states": [0, 1],
-#         "encoder_hidden_states_mask": [0, 1],
-#         "temb": 0,
-#         "vid_freqs": 0,
-#         "txt_freqs": 0,
-#     }
-# )
 @dit_support_compile()
 class QwenImageTransformerBlock(nn.Module):
     def __init__(

@@ -32,7 +32,12 @@ class DiffusionEngine:
         self._processes: list[mp.Process] = []
         self._closed = False
         self._make_client()
-        self._dummy_run()
+        try:
+            self._dummy_run()
+        except Exception as e:
+            logger.error(f"Dummy run failed: {e}")
+            self.close()
+            raise e
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
@@ -154,10 +159,10 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        prompt = "dummy"
+        prompt = "dummy run"
         num_inference_steps = 1
-        height = 512
-        width = 512
+        height = 1024
+        width = 1024
         req = OmniDiffusionRequest(
             prompt=prompt,
             height=height,

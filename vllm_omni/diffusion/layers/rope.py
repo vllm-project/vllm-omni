@@ -63,7 +63,7 @@ def _rotary_embedding_kernel(
         tl.store(output_row_ptr + offsets_x2, o2_vals.to(x2_vals.dtype), mask=mask)
 
 
-def apply_rotary_embedding(
+def _apply_rotary_embedding(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
     output = torch.empty_like(x)
@@ -104,3 +104,33 @@ def apply_rotary_embedding(
     )
 
     return output
+
+
+def apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+    interleaved: bool = False,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [num_tokens, num_heads, head_size] or [num_tokens, head_size]
+        cos: [num_tokens, head_size // 2]
+        sin: [num_tokens, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    if is_neox_style:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        if is_neox_style:
+            x1, x2 = torch.chunk(x, 2, dim=-1)
+        else:
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+        o1 = (x1.float() * cos - x2.float() * sin).type_as(x)
+        o2 = (x2.float() * cos + x1.float() * sin).type_as(x)
+        return torch.cat((o1, o2), dim=-1)
+    else:
+        return _apply_rotary_embedding(x, cos, sin, interleaved)
