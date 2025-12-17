@@ -1,5 +1,4 @@
 import time
-from typing import Optional
 
 import torch
 from transformers import Qwen3OmniMoeForConditionalGeneration
@@ -9,10 +8,10 @@ class Qwen3OmniMoeForConditionalGenerationWithLogging(Qwen3OmniMoeForConditional
     @torch.no_grad()
     def generate(
         self,
-        input_ids: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
         speaker: str = "Ethan",
         use_audio_in_video: bool = False,
-        return_audio: Optional[bool] = None,
+        return_audio: bool | None = None,
         thinker_max_new_tokens: int = 1024,
         thinker_eos_token_id: int = 151645,
         talker_max_new_tokens: int = 4096,
@@ -61,7 +60,7 @@ class Qwen3OmniMoeForConditionalGenerationWithLogging(Qwen3OmniMoeForConditional
                 raise NotImplementedError(f"Speaker {speaker} not implemented")
             if input_ids.shape[0] != 1:
                 raise NotImplementedError("Qwen3-Omni currently does not support batched inference with audio output")
-            talker_supppressed_tokens = [
+            talker_suppressed_tokens = [
                 i
                 for i in range(
                     self.config.talker_config.text_config.vocab_size - 1024,
@@ -77,7 +76,7 @@ class Qwen3OmniMoeForConditionalGenerationWithLogging(Qwen3OmniMoeForConditional
                 "temperature": talker_temperature,
                 "eos_token_id": self.config.talker_config.codec_eos_token_id,
                 "repetition_penalty": talker_repetition_penalty,
-                "suppress_tokens": talker_supppressed_tokens,
+                "suppress_tokens": talker_suppressed_tokens,
                 "output_hidden_states": True,
                 "return_dict_in_generate": True,
             }
