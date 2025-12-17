@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     CUDA_VERSION: version.Version
     TORCH_VERSION: version.Version
 
-
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
     # used in distributed environment to determine the master address
