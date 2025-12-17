@@ -66,17 +66,11 @@ class MammothModa2ARForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> OmniOutput:
-        # 单条也自动补 batch 维；其余情况保持原状
         if input_ids is not None and input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
         if positions is not None and positions.ndim == 1:
             positions = positions.unsqueeze(0)
 
-        # 确保返回 hidden_states，供后续 DiT 条件使用
-        kwargs.setdefault("output_hidden_states", True)
-        kwargs.setdefault("use_cache", False)
-
-        # 直接透传给 vLLM 模型；如果已是 OmniOutput 则直接返回
         outputs = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -85,29 +79,7 @@ class MammothModa2ARForConditionalGeneration(nn.Module):
             **kwargs,
         )
 
-        if isinstance(outputs, OmniOutput):
-            return outputs
-
-        # 兼容兜底：提取 text_hidden_states
-        if hasattr(outputs, "text_hidden_states"):
-            hidden = outputs.text_hidden_states
-            mm_out = getattr(outputs, "multimodal_outputs", None)
-            # 额外携带 hidden_states 便于 DiT 阶段做条件抽取
-            if mm_out is None:
-                mm_out = {}
-            if hasattr(outputs, "hidden_states"):
-                mm_out = dict(mm_out)
-                mm_out["hidden_states"] = outputs.hidden_states
-        elif isinstance(outputs, torch.Tensor):
-            hidden = outputs
-            mm_out = None
-        elif isinstance(outputs, (list, tuple)) and outputs and isinstance(outputs[0], torch.Tensor):
-            hidden = outputs[0]
-            mm_out = None
-        else:
-            raise RuntimeError(f"Unsupported output type from AR model: {type(outputs)}")
-
-        return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm_out)
+        return OmniOutput(text_hidden_states=outputs)
 
     @torch.inference_mode()
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
