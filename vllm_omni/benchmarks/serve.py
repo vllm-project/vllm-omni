@@ -36,15 +36,17 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from vllm_omni.benchmarks.datasets import (SampleRequest, add_dataset_parser,
-                                      get_samples)
+from vllm_omni.benchmarks.datasets import get_samples,add_dataset_parser
+
 from vllm_omni.benchmarks.lib.endpoint_request_func import (
-    ASYNC_REQUEST_FUNCS, OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
-    RequestFuncOutput)
-from vllm_omni.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm_omni.benchmarks.lib.utils import (convert_to_pytorch_benchmark_format,
+    ASYNC_REQUEST_FUNCS, OPENAI_COMPATIBLE_BACKENDS)
+
+from vllm.benchmarks.datasets import SampleRequest
+from vllm.lib.endpoint_request_func import RequestFuncInput,RequestFuncOutput
+from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
+from vllm.benchmarks.lib.utils import (convert_to_pytorch_benchmark_format,
                                        write_to_json)
-from vllm_omni.transformers_utils.tokenizer import get_tokenizer
+from vllm.transformers_utils.tokenizer import get_tokenizer
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
