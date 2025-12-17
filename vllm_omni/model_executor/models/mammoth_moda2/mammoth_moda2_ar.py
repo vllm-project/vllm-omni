@@ -46,9 +46,6 @@ class MammothModa2ARForConditionalGeneration(nn.Module):
         if llm_config is None:
             raise ValueError("MammothModa2 config must contain llm_config for AR stage.")
 
-        # 记录需要捕获的层索引（用于 DiT 条件）
-        self.gen_condition_layers = tuple(getattr(hf_combined, "gen_condition_layers", ())) or None
-
         llm_vllm_config = vllm_config.with_hf_config(
             llm_config, architectures=["Qwen2_5_VLForConditionalGeneration"]
         )
@@ -79,24 +76,6 @@ class MammothModa2ARForConditionalGeneration(nn.Module):
         kwargs.setdefault("output_hidden_states", True)
         kwargs.setdefault("use_cache", False)
 
-        # 安装 hook 捕获指定层 hidden
-        captured: list[torch.Tensor] = []
-        hooks: list[torch.utils.hooks.RemovableHandle] = []
-        layers = getattr(getattr(self.model, "language_model", None), "model", None)
-        layers = getattr(layers, "layers", None)
-        if layers is not None and self.gen_condition_layers:
-            num_layers = len(layers)
-
-            def _capture_hidden(module, _inp, output):
-                out = output[0] if isinstance(output, tuple) else output
-                if isinstance(out, torch.Tensor):
-                    captured.append(out)
-
-            for idx in self.gen_condition_layers:
-                real_idx = idx if idx >= 0 else num_layers + idx
-                if 0 <= real_idx < num_layers:
-                    hooks.append(layers[real_idx].register_forward_hook(_capture_hidden))
-
         # 直接透传给 vLLM 模型；如果已是 OmniOutput 则直接返回
         outputs = self.model(
             input_ids=input_ids,
@@ -105,8 +84,6 @@ class MammothModa2ARForConditionalGeneration(nn.Module):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        for h in hooks:
-            h.remove()
 
         if isinstance(outputs, OmniOutput):
             return outputs
@@ -121,15 +98,12 @@ class MammothModa2ARForConditionalGeneration(nn.Module):
             if hasattr(outputs, "hidden_states"):
                 mm_out = dict(mm_out)
                 mm_out["hidden_states"] = outputs.hidden_states
-            if captured:
-                mm_out = dict(mm_out)
-                mm_out["captured_hidden_states"] = captured
         elif isinstance(outputs, torch.Tensor):
             hidden = outputs
-            mm_out = {"captured_hidden_states": captured} if captured else None
+            mm_out = None
         elif isinstance(outputs, (list, tuple)) and outputs and isinstance(outputs[0], torch.Tensor):
             hidden = outputs[0]
-            mm_out = {"captured_hidden_states": captured} if captured else None
+            mm_out = None
         else:
             raise RuntimeError(f"Unsupported output type from AR model: {type(outputs)}")
 

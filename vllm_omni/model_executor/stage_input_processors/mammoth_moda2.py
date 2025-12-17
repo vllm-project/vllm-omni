@@ -32,14 +32,33 @@ def ar2dit(
     for ar_output in ar_outputs:
         output = ar_output.outputs[0]
         mm_out = getattr(output, "multimodal_outputs", {}) or {}
-        captured = mm_out.get("captured_hidden_states")
-        hidden_states = mm_out.get("hidden_states")
+        hidden = getattr(output, "text_hidden_states", None)
+        if hidden is None:
+            hidden = mm_out.get("hidden_states")
+        captured = hidden
 
-        additional_information = {}
-        if captured is not None:
-            additional_information["captured_hidden_states"] = [h.detach().cpu() for h in captured]
-        if hidden_states is not None:
-            additional_information["hidden_states"] = [h.detach().cpu() for h in hidden_states]
+        additional_information: dict[str, object] = {}
+        if captured:
+            # 将隐藏态转换为 [B, L, H]
+            if isinstance(captured, torch.Tensor):
+                if captured.ndim == 2:
+                    captured = captured.unsqueeze(0)
+                text_condition_tokens = captured
+            elif isinstance(captured, (list, tuple)) and captured and isinstance(captured[0], torch.Tensor):
+                stacked = torch.stack(list(captured), dim=0)  # [K, ...]
+                text_condition_tokens = stacked[-1] if stacked.ndim >= 3 else stacked  # 取最后一层
+                if text_condition_tokens.ndim == 2:
+                    text_condition_tokens = text_condition_tokens.unsqueeze(0)
+            else:
+                text_condition_tokens = None
+
+            if text_condition_tokens is not None:
+                text_condition_attention_mask = torch.ones(
+                    text_condition_tokens.shape[:2],
+                    dtype=torch.bool,
+                )
+            additional_information["text_condition_tokens"] = text_condition_tokens.detach().cpu()
+            additional_information["text_condition_attention_mask"] = text_condition_attention_mask
 
         prompt_ids = getattr(ar_output, "prompt_token_ids", None)
         if prompt_ids is None and hasattr(output, "token_ids"):
