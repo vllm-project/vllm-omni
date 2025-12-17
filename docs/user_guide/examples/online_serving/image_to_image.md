@@ -127,9 +127,6 @@ Use `extra_body` to pass generation parameters:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `height` | int | None | Output image height in pixels |
-| `width` | int | None | Output image width in pixels |
-| `size` | str | None | Output image size (e.g., "1024x1024") |
 | `num_inference_steps` | int | 50 | Number of denoising steps |
 | `guidance_scale` | float | 7.5 | CFG guidance scale |
 | `seed` | int | None | Random seed (reproducible) |

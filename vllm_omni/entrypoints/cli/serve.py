@@ -140,10 +140,10 @@ class OmniServeCommand(CLISubcommand):
 
         # Cache optimization parameters
         serve_parser.add_argument(
-            "--cache-adapter",
+            "--cache-backend",
             type=str,
             default="none",
-            help="Cache adapter for diffusion models (e.g., 'tea_cache', 'deep_cache').",
+            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit'",
         )
         serve_parser.add_argument(
             "--cache-config",

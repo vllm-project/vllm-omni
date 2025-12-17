@@ -1,4 +1,4 @@
-# Qwen-Image Online Serving
+# Qwen-Image/Z-Image Online Serving
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen_image>.
 
@@ -62,7 +62,7 @@ python gradio_demo.py
 
 ## Request Format
 
-### Simple Text Generation
+### Simple Text-to-Image Generation
 
 ```json
 {
@@ -112,7 +112,6 @@ Use `extra_body` to pass generation parameters:
 |-----------|------|---------|-------------|
 | `height` | int | None | Image height in pixels |
 | `width` | int | None | Image width in pixels |
-| `size` | str | None | Image size (e.g., "1024x1024") |
 | `num_inference_steps` | int | 50 | Number of denoising steps |
 | `true_cfg_scale` | float | 4.0 | Qwen-Image CFG scale |
 | `seed` | int | None | Random seed (reproducible) |
