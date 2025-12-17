@@ -19,57 +19,11 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinea
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.compile import dit_support_compile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.rope import apply_rotary_embedding
 
 logger = init_logger(__name__)
-
-
-def apply_rotary_emb_qwen(
-    x: torch.Tensor,
-    freqs_cis: Union[torch.Tensor, tuple[torch.Tensor]],
-    use_real: bool = True,
-    use_real_unbind_dim: int = -1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor. This function applies rotary embeddings
-    to the given query or key 'x' tensors using the provided frequency tensor 'freqs_cis'. The input tensors are
-    reshaped as complex numbers, and the frequency tensor is reshaped for broadcasting compatibility. The resulting
-    tensors contain rotary embeddings and are returned as real tensors.
-
-    Args:
-        x (`torch.Tensor`):
-            Query or key tensor to apply rotary embeddings. [B, S, H, D] xk (torch.Tensor): Key tensor to apply
-        freqs_cis (`tuple[torch.Tensor]`): Precomputed frequency tensor for complex exponentials. ([S, D], [S, D],)
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: tuple of modified query tensor and key tensor with rotary embeddings.
-    """
-    if use_real:
-        cos, sin = freqs_cis  # [S, D]
-        cos = cos[None, None]
-        sin = sin[None, None]
-        cos, sin = cos.to(x.device), sin.to(x.device)
-
-        if use_real_unbind_dim == -1:
-            # Used for flux, cogvideox, hunyuan-dit
-            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
-            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
-        elif use_real_unbind_dim == -2:
-            # Used for Stable Audio, OmniGen, CogView4 and Cosmos
-            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)  # [B, S, H, D//2]
-            x_rotated = torch.cat([-x_imag, x_real], dim=-1)
-        else:
-            raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
-
-        out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-
-        return out
-    else:
-        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
-        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
-
-        return x_out.type_as(x)
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -276,8 +230,9 @@ class QwenImageCrossAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        **cross_attention_kwargs,
+        encoder_hidden_states_mask: torch.Tensor,
+        vid_freqs: torch.Tensor,
+        txt_freqs: torch.Tensor,
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
 
@@ -305,12 +260,15 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = self.norm_added_k(txt_key)
 
         # Apply RoPE
-        if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb
-            img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
-            img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-            txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-            txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+        if vid_freqs is not None and txt_freqs is not None:
+            img_cos = vid_freqs.real
+            img_sin = vid_freqs.imag
+            txt_cos = txt_freqs.real
+            txt_sin = txt_freqs.imag
+            img_query = apply_rotary_embedding(img_query, img_cos, img_sin, interleaved=True)
+            img_key = apply_rotary_embedding(img_key, img_cos, img_sin, interleaved=True)
+            txt_query = apply_rotary_embedding(txt_query, txt_cos, txt_sin, interleaved=True)
+            txt_key = apply_rotary_embedding(txt_key, txt_cos, txt_sin, interleaved=True)
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -341,6 +299,17 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
+# @dit_support_compile(
+#     dynamic_arg_dims={
+#         "hidden_states": [0, 1],
+#         "encoder_hidden_states": [0, 1],
+#         "encoder_hidden_states_mask": [0, 1],
+#         "temb": 0,
+#         "vid_freqs": 0,
+#         "txt_freqs": 0,
+#     }
+# )
+@dit_support_compile()
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -393,8 +362,8 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_mask: torch.Tensor,
         temb: torch.Tensor,
-        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        joint_attention_kwargs: Optional[dict[str, Any]] = None,
+        vid_freqs: torch.Tensor,
+        txt_freqs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
@@ -418,13 +387,12 @@ class QwenImageTransformerBlock(nn.Module):
         # 2. Applies QK normalization and RoPE
         # 3. Concatenates and runs joint attention
         # 4. Splits results back to separate streams
-        joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
             encoder_hidden_states_mask=encoder_hidden_states_mask,
-            image_rotary_emb=image_rotary_emb,
-            **joint_attention_kwargs,
+            vid_freqs=vid_freqs,
+            txt_freqs=txt_freqs,
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
@@ -481,10 +449,6 @@ class QwenImageTransformer2DModel(nn.Module):
             The dimensions to use for the rotary positional embeddings.
     """
 
-    # _supports_gradient_checkpointing = True
-    # _no_split_modules = ["QwenImageTransformerBlock"]
-    # _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
-    # _repeated_blocks = ["QwenImageTransformerBlock"]
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -528,8 +492,6 @@ class QwenImageTransformer2DModel(nn.Module):
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
-
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -591,14 +553,19 @@ class QwenImageTransformer2DModel(nn.Module):
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
+        # print("hidden_states shape:", hidden_states.shape)
+        # print("encoder_hidden_states shape:", encoder_hidden_states.shape)
+        # print("encoder_hidden_states_mask shape:", encoder_hidden_states_mask.shape)
+        # print("temb shape:", temb.shape)
+        # print("image_rotary_emb shapes:", [x.shape for x in image_rotary_emb])
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=attention_kwargs,
+                vid_freqs=image_rotary_emb[0],
+                txt_freqs=image_rotary_emb[1],
             )
 
         # Use only the image part (hidden_states) from the dual-stream blocks

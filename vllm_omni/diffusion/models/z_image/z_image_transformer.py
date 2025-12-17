@@ -191,7 +191,14 @@ class FeedForward(nn.Module):
         return self.w2(self.act(self.w13(x)))
 
 
-@dit_support_compile(dynamic_arg_dims={"x": [0, 1], "attn_mask": [0, 1], "freqs_cis": [0, 1]})
+@dit_support_compile(
+    dynamic_arg_dims={
+        "x": [0, 1],
+        "attn_mask": [0, 1],
+        "freqs_cis": [0, 1],
+        "adaln_input": 0,
+    }
+)
 class ZImageTransformerBlock(nn.Module):
     def __init__(
         self,

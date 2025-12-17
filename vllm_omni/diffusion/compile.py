@@ -18,7 +18,7 @@ def dit_support_compile(
     Usage 1: use directly as a decorator without arguments:
 
     ```python
-    @support_torch_compile
+    @dit_support_compile
     class MyModel(nn.Module):
         def forward(self, x: torch.Tensor, y: Optional[torch.Tensor]): ...
     ```
@@ -26,7 +26,7 @@ def dit_support_compile(
     Usage 2: use as a decorator with arguments:
 
     ```python
-    @support_torch_compile(dynamic_arg_dims={"x": 0, "y": 0})
+    @dit_support_compile(dynamic_arg_dims={"x": 0, "y": 0})
     class MyModel(nn.Module):
         def forward(self, x: torch.Tensor, y: Optional[torch.Tensor]): ...
     ```
@@ -35,12 +35,14 @@ def dit_support_compile(
     def wrap(cls: _T) -> _T:
         original_forward = cls.forward
         sig = inspect.signature(original_forward)
-
-        compiled_forward = torch.compile(
-            original_forward,
-            fullgraph=True,
-            mode="max-autotune-no-cudagraphs",
-        )
+        if dynamic_arg_dims is not None:
+            compiled_forward = torch.compile(original_forward, fullgraph=True)
+        else:
+            compiled_forward = torch.compile(
+                original_forward,
+                fullgraph=True,
+                dynamic=True,
+            )
 
         dims_map: dict[str, list[int]] | None = None
         if dynamic_arg_dims is not None:
@@ -73,9 +75,10 @@ def dit_support_compile(
             setattr(instance, "_dit_dynamic_marked", True)
 
         def wrapped_forward(self, *args, **kwargs):
-            bound_args = sig.bind(self, *args, **kwargs)
-            bound_args.apply_defaults()
-            _mark_dynamic_once(self, bound_args)
+            if dynamic_arg_dims is not None:
+                bound_args = sig.bind(self, *args, **kwargs)
+                bound_args.apply_defaults()
+                _mark_dynamic_once(self, bound_args)
             return compiled_forward(self, *args, **kwargs)
 
         cls.forward = wrapped_forward
