@@ -6,7 +6,6 @@
 # Adapted from
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
-
 import torch
 import torch.distributed as dist
 import torch.nn as nn
