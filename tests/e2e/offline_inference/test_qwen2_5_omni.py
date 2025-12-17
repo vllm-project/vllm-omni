@@ -10,18 +10,24 @@ import pytest
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
+from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.multimodal.image import convert_image_mode
+
+from vllm_omni.utils import is_npu
 
 from .conftest import OmniRunner
 from .utils import create_new_process_for_each_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
-# CI stage config optimized for 24GB GPU (L4/RTX3090)
-stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")]
+# CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
+if is_npu():
+    stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
+else:
+    stage_config = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
 
 # Create parameter combinations for model and stage config
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+test_params = [(model, stage_config) for model in models]
 
 
 @pytest.mark.core_model
@@ -36,7 +42,11 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
         audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
         audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
         image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
-        video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
+        if not VLLM_USE_MODELSCOPE:
+            video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
+        else:
+            # modelscope can't access raushan-testing-hf/videos-test, skip video input temporarily
+            video = None
 
         outputs = runner.generate_multimodal(
             prompts=question,
