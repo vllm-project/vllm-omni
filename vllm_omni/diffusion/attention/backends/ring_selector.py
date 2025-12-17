@@ -5,7 +5,7 @@
 from functools import partial
 
 import torch
-from .attention import (
+from .ring_kernels import (
     flash_attn_forward_aiter,
     flash_attn_forward,
     flash_attn_backward,
@@ -15,13 +15,13 @@ from .attention import (
     pytorch_attn_backward,
     flashinfer_attn_forward,
     flashinfer_attn_backbward,
-    HAS_FLASH_ATTN_HOPPER,
 )
 from enum import Enum, auto
 
-from ..globals import (
+from .ring_globals import (
     HAS_AITER,
     HAS_FLASH_ATTN,
+    HAS_FLASH_ATTN_HOPPER,
     HAS_SAGE_ATTENTION,
     HAS_SPARSE_SAGE_ATTENTION,
     HAS_NPU,
@@ -108,7 +108,7 @@ def select_flash_attn_impl(
                 ), "FlashAttention3 is not available! install it from https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#flashattention-3-beta-release"
                 # (q, k, v, softmax_scale=None, causal=False, window_size=(-1, -1),
                 # deterministic=False, descale_q=None, descale_k=None, descale_v=None, gqa_parallel=False)
-                from .attention import flash3_attn_func
+                from .ring_kernels import flash3_attn_func
 
                 assert softmax_scale is not None, f"softmax_scale is required for FA3"
                 assert (
@@ -260,13 +260,3 @@ def select_flash_attn_impl(
     else:
         raise ValueError(f"Unknown flash attention implementation: {impl_type}")
 
-
-__all__ = [
-    "flash_attn_forward",
-    "flash_attn_backward",
-    "flash_attn3_func_forward",
-    "flash_attn3_func_forward",
-    "flashinfer_attn_forward",
-    "flashinfer_attn_backbward",
-    "AttnType",
-]

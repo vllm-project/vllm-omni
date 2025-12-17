@@ -21,8 +21,8 @@ from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
 from vllm_omni.utils.platform_utils import is_npu
-from vllm_omni.diffusion.ring_attn.ring_flash_attn import ring_flash_attn_func
-from vllm_omni.diffusion.ring_attn.kernels import AttnType
+from vllm_omni.diffusion.attention.ring_flash_attn import ring_flash_attn_func
+from vllm_omni.diffusion.attention.backends.ring_selector import AttnType
 
 
 class Attention(nn.Module):

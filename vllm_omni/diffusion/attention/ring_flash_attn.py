@@ -5,8 +5,9 @@
 import torch
 import torch.distributed as dist
 # from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from .utils import RingComm, update_out_and_lse
-from .kernels import select_flash_attn_impl, AttnType
+from vllm_omni.diffusion.distributed.ring import RingComm
+from vllm_omni.diffusion.attention.utils import update_out_and_lse
+from vllm_omni.diffusion.attention.backends.ring_selector import select_flash_attn_impl, AttnType
 
 def ring_flash_attn_forward(
     process_group,
@@ -50,11 +51,12 @@ def ring_flash_attn_forward(
                 alibi_slopes=alibi_slopes,
                 return_softmax=True and dropout_p > 0,
             )
-            print(f"DEBUG: Rank {comm.rank} Step {step} | q shape: {q.shape} | block_out shape: {block_out.shape} | block_lse shape: {block_lse.shape}")
+            # print(f"Rank {comm.rank} Step {step}: q={q.shape} block_out={block_out.shape}")
             if attn_type == AttnType.SPARSE_SAGE:
                 out, lse = block_out, block_lse
             else:
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
         if step + 1 != comm.world_size:
             comm.wait()
             k = next_k
@@ -174,9 +176,11 @@ class RingFlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         assert alibi_slopes is None
+        # 添加 contiguous 确保内存连续
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
+        
         out, softmax_lse = ring_flash_attn_forward(
             group,
             q,
@@ -322,5 +326,4 @@ def ring_flash_attn_func(
         attn_type,
         attn_processor,
     )
-
 

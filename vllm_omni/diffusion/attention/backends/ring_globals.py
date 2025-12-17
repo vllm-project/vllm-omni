@@ -58,3 +58,4 @@ try:
     HAS_NPU = True
 except ImportError:
     HAS_NPU = False
+

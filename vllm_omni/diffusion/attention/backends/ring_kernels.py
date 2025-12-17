@@ -19,7 +19,7 @@ try:
 except ModuleNotFoundError:
     pass
 
-from ..globals import HAS_FLASH_ATTN, HAS_FLASH_ATTN_HOPPER, HAS_FLASHINFER, HAS_AITER, HAS_NPU
+from .ring_globals import HAS_FLASH_ATTN, HAS_FLASH_ATTN_HOPPER, HAS_FLASHINFER, HAS_AITER, HAS_NPU
 
 if HAS_AITER:
     import aiter
@@ -382,3 +382,4 @@ def npu_attn_forward(q, k, v,
                                                 pre_tokens=65535, 
                                                 next_tokens=65535)
     return block_out, block_lse.squeeze(dim=-1)
+
