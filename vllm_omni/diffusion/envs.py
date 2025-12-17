@@ -3,6 +3,7 @@
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections.abc import Callable
 
 import torch
 from packaging import version
@@ -12,13 +13,12 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     MASTER_ADDR: str = ""
-    MASTER_PORT: Optional[int] = None
-    CUDA_HOME: Optional[str] = None
+    MASTER_PORT: int | None = None
+    CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
-    CUDA_VISIBLE_DEVICES: Optional[str] = None
+    CUDA_VISIBLE_DEVICES: str | None = None
     CUDA_VERSION: version.Version
     TORCH_VERSION: version.Version
-
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -157,7 +157,7 @@ class PackagesEnvChecker:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(PackagesEnvChecker, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             cls._instance.initialize()
         return cls._instance
 
@@ -184,7 +184,7 @@ class PackagesEnvChecker:
             if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
                 return False
             else:
-                from flash_attn import __version__, flash_attn_func
+                from flash_attn import __version__
 
                 if __version__ < "2.6.0":
                     raise ImportError("install flash_attn >= 2.6.0")

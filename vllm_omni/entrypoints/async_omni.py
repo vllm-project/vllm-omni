@@ -6,7 +6,7 @@ import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 
@@ -33,6 +33,16 @@ from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 
 # Internal imports (our code)
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.distributed.omni_connectors import (
+    get_stage_connector_config,
+    initialize_orchestrator_connectors,
+)
+from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.ray_utils.utils import (
+    create_placement_group,
+    get_ray_queue_class,
+    try_close_ray,
+)
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
@@ -43,10 +53,12 @@ from vllm_omni.entrypoints.log_utils import (
     remove_old_logs,
 )
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
-from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
-from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
+from vllm_omni.entrypoints.utils import (
+    load_stage_configs_from_model,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -93,15 +105,28 @@ class AsyncOmni(EngineClient):
         cli_args: Namespace,
         **kwargs: Any,
     ):
+        self.worker_backend = cli_args.worker_backend
+        self.ray_address = cli_args.ray_address
+        self._ray_pg = None
+
         self.batch_timeout = cli_args.batch_timeout
         self._enable_stats: bool = bool(cli_args.log_stats)
 
         base_engine_args = AsyncOmniEngineArgs.from_cli_args(cli_args).__dict__.copy()
 
         if cli_args.stage_configs_path is None:
+            self.config_path = resolve_model_config_path(model)
             self.stage_configs = load_stage_configs_from_model(model, base_engine_args)
         else:
+            self.config_path = cli_args.stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(cli_args.stage_configs_path, base_engine_args)
+
+        shm_threshold_bytes = cli_args.shm_threshold_bytes
+
+        # Initialize connectors
+        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
+            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
+        )
 
         self.stage_list: list[OmniStage] = []
         self.default_sampling_params_list: list[SamplingParams] = []
@@ -138,34 +163,56 @@ class AsyncOmni(EngineClient):
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
-        self._ctx = mp.get_context("spawn")
+        if self.worker_backend == "ray":
+            self._queue_cls = get_ray_queue_class()
+        else:
+            self._ctx = mp.get_context("spawn")
+            self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
+
         self._stage_in_queues: list[mp.Queue] = []
         self._stage_out_queues: list[mp.Queue] = []
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
-        self._start_stage_processes(model)
+        self._start_stages(model)
         # Wait for all stages to report readiness before seeding
         self._stages_ready: set[int] = set()
         self._wait_for_stages_ready(timeout=init_timeout)
 
-    def _start_stage_processes(self, model: str) -> None:
+    def _start_stages(self, model: str) -> None:
+        if self.worker_backend == "ray":
+            # Initialize Ray Cluster
+            self._ray_pg = create_placement_group(
+                number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
+            )
+
         for stage_id, stage in enumerate(self.stage_list):
             # Use unbounded queues to avoid deadlock when seeding many requests
-            in_q: mp.Queue = self._ctx.Queue(maxsize=0)
-            out_q: mp.Queue = self._ctx.Queue(maxsize=0)
+            in_q = self._queue_cls()
+            out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
 
             # Attach queues and start Stage-owned worker process
             stage.attach_queues(in_q, out_q)
+
+            # Build connectors config for this stage
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
             stage.init_stage_worker(
                 model,
                 is_async=True,
                 log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
-                ctx=self._ctx,
+                ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
+                connectors_config=stage_connectors_config,
+                worker_backend=self.worker_backend,
+                ray_placement_group=self._ray_pg,
             )
+
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
             time.sleep(self._init_sleep_seconds)
 
@@ -191,6 +238,8 @@ class AsyncOmni(EngineClient):
             except Exception as e:
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
+        try_close_ray(self._ray_pg)
+
     def __del__(self) -> None:  # best-effort
         try:
             self.close()
@@ -212,11 +261,11 @@ class AsyncOmni(EngineClient):
         self,
         prompt: PromptType,
         request_id: str,
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
-        data_parallel_rank: Optional[int] = None,
+        data_parallel_rank: int | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
@@ -264,12 +313,14 @@ class AsyncOmni(EngineClient):
         # Determine the final stage for E2E stats (highest stage_id with
         # final_output=True; fallback to last stage)
         final_stage_id_for_e2e = -1
+        last_stage_id = len(self.stage_list) - 1
         try:
-            for _sid, _st in enumerate(self.stage_list):
-                if getattr(_st, "final_output", False):
-                    final_stage_id_for_e2e = max(final_stage_id_for_e2e, _sid)
+            for _sid in range(last_stage_id, -1, -1):
+                if getattr(self.stage_list[_sid], "final_output", False):
+                    final_stage_id_for_e2e = _sid
+                    break
             if final_stage_id_for_e2e < 0:
-                final_stage_id_for_e2e = len(self.stage_list) - 1
+                final_stage_id_for_e2e = last_stage_id
         except Exception as e:
             logger.debug(
                 "[Orchestrator] Failed to determine final stage for E2E; \
@@ -277,7 +328,7 @@ class AsyncOmni(EngineClient):
                 e,
                 exc_info=True,
             )
-            final_stage_id_for_e2e = len(self.stage_list) - 1
+            final_stage_id_for_e2e = last_stage_id
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
             num_stages,
@@ -360,8 +411,8 @@ class AsyncOmni(EngineClient):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_int = int(req_id) if isinstance(req_id, (int, str)) and str(req_id).isdigit() else req_id
-                        if stage_id == final_stage_id_for_e2e and rid_int not in metrics.e2e_done:
+                        rid_key = str(req_id)
+                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -390,52 +441,36 @@ class AsyncOmni(EngineClient):
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]
-                    try:
-                        # Measure transfer size and time (encode + enqueue)
-                        size_bytes = 0
-                        try:
-                            size_bytes = len(_set(next_inputs))
-                        except Exception:
-                            size_bytes = 0
-                        t0 = time.time()
-                        ipc_payload = _encode(
-                            next_inputs,
-                            getattr(self, "_shm_threshold_bytes", 65536),
-                            obj_key="engine_inputs",
-                            shm_key="engine_inputs_shm",
+
+                    # Check if we have a connector for this edge
+                    connector_key = (str(stage_id), str(next_stage_id))
+                    connector = self.connectors.get(connector_key)
+
+                    sent_via_connector = False
+                    if connector:
+                        sent_via_connector = try_send_via_connector(
+                            connector=connector,
+                            stage_id=stage_id,
+                            next_stage_id=next_stage_id,
+                            req_id=req_id,
+                            next_inputs=next_inputs,
+                            sampling_params=sp_next,
+                            original_prompt=prompt,
+                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                            metrics=metrics,
                         )
-                        ipc_payload.update(
-                            {
-                                "request_id": req_id,
-                                "sampling_params": sp_next,
-                                "sent_ts": time.time(),
-                            }
+
+                    if not sent_via_connector:
+                        # Fallback logic removed as we now enforce connector usage.
+                        # If no connector is found or send fails, we log an error and raise,
+                        # because continuing would cause the request to be silently dropped
+                        # and the orchestrator to hang waiting for completion.
+                        error_msg = (
+                            f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                            "Configure a connector for this edge or inspect connector logs for details."
                         )
-                        self.stage_list[next_stage_id].submit(ipc_payload)
-                        t1 = time.time()
-                        tx_ms = (t1 - t0) * 1000.0
-                        metrics.on_forward(
-                            stage_id,
-                            next_stage_id,
-                            req_id,
-                            int(size_bytes),
-                            float(tx_ms),
-                            bool("engine_inputs_shm" in ipc_payload),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[Orchestrator] IPC encode failed for req %s: %s; \
-                                falling back to inline payload",
-                            req_id,
-                            e,
-                        )
-                        self.stage_list[next_stage_id].submit(
-                            {
-                                "request_id": req_id,
-                                "engine_inputs": next_inputs,
-                                "sampling_params": sp_next,
-                            }
-                        )
+                        logger.error(error_msg)
+                        raise RuntimeError(error_msg)
                     logger.debug(
                         "[Orchestrator] Forwarded request %s to stage-%s",
                         req_id,
@@ -542,7 +577,7 @@ class AsyncOmni(EngineClient):
     def dead_error(self) -> BaseException:
         return EngineDeadError()
 
-    async def abort(self, request_id: Union[str, Iterable[str]]) -> None:
+    async def abort(self, request_id: str | Iterable[str]) -> None:
         pass
 
     async def get_vllm_config(self) -> VllmConfig:
@@ -585,13 +620,13 @@ class AsyncOmni(EngineClient):
     async def reset_mm_cache(self) -> None:
         pass
 
-    async def reset_prefix_cache(self, device: Optional[Device] = None) -> None:
+    async def reset_prefix_cache(self, device: Device | None = None) -> None:
         pass
 
     async def sleep(self, level: int = 1) -> None:
         pass
 
-    async def wake_up(self, tags: Optional[list[str]] = None) -> None:
+    async def wake_up(self, tags: list[str] | None = None) -> None:
         pass
 
     async def is_sleeping(self) -> bool:
@@ -654,8 +689,8 @@ class AsyncOmniStageLLM(AsyncLLM):
         use_cached_outputs: bool = False,
         log_requests: bool = True,
         start_engine_loop: bool = True,
-        stat_loggers: Optional[list[StatLoggerFactory]] = None,
-        client_addresses: Optional[dict[str, str]] = None,
+        stat_loggers: list[StatLoggerFactory] | None = None,
+        client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
     ) -> None:
@@ -736,7 +771,7 @@ class AsyncOmniStageLLM(AsyncLLM):
         )
 
         # Loggers.
-        self.logger_manager: Optional[StatLoggerManager] = None
+        self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
                 vllm_config=vllm_config,
@@ -747,7 +782,7 @@ class AsyncOmniStageLLM(AsyncLLM):
             )
             self.logger_manager.log_engine_initialized()
 
-        self.output_handler: Optional[asyncio.Task] = None
+        self.output_handler: asyncio.Task | None = None
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -784,10 +819,10 @@ class AsyncOmniStageLLM(AsyncLLM):
         engine_args: AsyncOmniEngineArgs,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        stat_loggers: Optional[list[StatLoggerFactory]] = None,
+        stat_loggers: list[StatLoggerFactory] | None = None,
         enable_log_requests: bool = False,
         disable_log_stats: bool = False,
-        client_addresses: Optional[dict[str, str]] = None,
+        client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
         disable_log_requests: bool = True,  # Deprecated, will be removed

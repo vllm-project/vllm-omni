@@ -15,7 +15,8 @@ import importlib
 import logging
 import multiprocessing as mp
 import os
-from typing import Any, Optional, Union
+import sys
+from typing import Any
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -27,11 +28,11 @@ from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 
+from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     maybe_dump_to_shm,
-    maybe_load_from_ipc_with_metrics,
     set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -80,10 +81,10 @@ class OmniStage:
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
         self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
         # Runtime orchestration state (added)
-        self._in_q: Optional[mp.Queue] = None
-        self._out_q: Optional[mp.Queue] = None
-        self._proc: Optional[mp.Process] = None
-        self._log_file: Optional[str] = None
+        self._in_q: mp.Queue | None = None
+        self._out_q: mp.Queue | None = None
+        self._proc: mp.Process | None = None
+        self._log_file: str | None = None
         self._shm_threshold_bytes: int = 65536
         self._logger = logging.getLogger(__name__)
 
@@ -159,10 +160,13 @@ class OmniStage:
         model: str,
         *,
         is_async: bool = False,
-        log_file: Optional[str] = None,
+        log_file: str | None = None,
         shm_threshold_bytes: int = 65536,
-        ctx: Optional[mp.context.BaseContext] = None,
+        ctx: mp.context.BaseContext | None = None,
         batch_timeout: int = 10,
+        connectors_config: dict | None = None,
+        worker_backend: str = "multi_process",
+        **kwargs: Any,
     ) -> None:
         """Initialize and start the stage worker process.
 
@@ -176,13 +180,23 @@ class OmniStage:
             shm_threshold_bytes: Threshold for using shared memory for IPC
             ctx: Optional multiprocessing context (default: spawn)
             batch_timeout: Timeout in seconds for batching requests
+            connectors_config: Configuration for stage connectors
+            worker_backend: Backend type ("multi_process" or "ray")
+            **kwargs: Additional arguments (e.g. ray_placement_group)
 
         Raises:
             AssertionError: If queues are not attached before calling this method
         """
         assert self._in_q is not None and self._out_q is not None, "Queues must be attached before start_process"
         self._log_file = log_file
-        self._shm_threshold_bytes = shm_threshold_bytes
+
+        if worker_backend == "ray":
+            ray_placement_group = kwargs.get("ray_placement_group", None)
+            assert ray_placement_group is not None, "Ray placement group must be provided"
+            self._shm_threshold_bytes = sys.maxsize
+        else:
+            self._shm_threshold_bytes = shm_threshold_bytes
+
         ctx = ctx or mp.get_context("spawn")
         # Prepare lightweight dict config for worker
         engine_args = _to_dict(self.engine_args)
@@ -192,43 +206,74 @@ class OmniStage:
             "engine_args": engine_args,
             "runtime": runtime_cfg,
             "shm_threshold_bytes": self._shm_threshold_bytes,
+            "connectors_config": connectors_config or {},
         }
-        if is_async:
-            self._proc = ctx.Process(
-                target=_stage_worker_async_entry,
-                args=(
+
+        if worker_backend == "ray":
+            if is_async:
+                self._ray_actor = start_ray_actor(
+                    _stage_worker_async_entry,
+                    ray_placement_group,
+                    self.stage_id,
                     self,
-                    model,
-                    stage_payload,
-                    batch_timeout,
-                ),
-            )
+                    model=model,
+                    stage_payload=stage_payload,
+                    batch_timeout=batch_timeout,
+                )
+            else:
+                self._ray_actor = start_ray_actor(
+                    _stage_worker,
+                    ray_placement_group,
+                    self.stage_id,
+                    model=model,
+                    stage_payload=stage_payload,
+                    in_q=self._in_q,
+                    out_q=self._out_q,
+                    log_file=self._log_file,
+                    batch_timeout=batch_timeout,
+                )
         else:
-            self._proc = ctx.Process(
-                target=_stage_worker,
-                args=(
-                    model,
-                    stage_payload,
-                    self._in_q,
-                    self._out_q,
-                    self._log_file,
-                    batch_timeout,
-                ),
-            )
-        self._proc.start()
+            if is_async:
+                self._proc = ctx.Process(
+                    target=_stage_worker_async_entry,
+                    args=(
+                        self,
+                        model,
+                        stage_payload,
+                        batch_timeout,
+                    ),
+                )
+            else:
+                self._proc = ctx.Process(
+                    target=_stage_worker,
+                    args=(
+                        model,
+                        stage_payload,
+                        self._in_q,
+                        self._out_q,
+                        self._log_file,
+                        batch_timeout,
+                    ),
+                )
+            self._proc.start()
 
     def stop_stage_worker(self) -> None:
         """Stop the stage worker process gracefully.
 
         Sends shutdown signal to the worker and waits for it to terminate.
         If graceful shutdown fails, forcefully terminates the process.
+        Handles both multiprocessing Process and Ray Actor.
         """
         if self._in_q is not None:
             try:
                 self._in_q.put_nowait(None)
             except Exception as e:
                 self._logger.warning("[Stage-%s] Failed to send shutdown to in_q: %s", self.stage_id, e)
-        if self._proc is not None:
+
+        if hasattr(self, "_ray_actor") and self._ray_actor:
+            kill_ray_actor(self._ray_actor)
+            self._ray_actor = None
+        elif self._proc is not None:
             try:
                 self._proc.join(timeout=5)
             except Exception as e:
@@ -238,6 +283,7 @@ class OmniStage:
                     self._proc.terminate()
                 except Exception as e:
                     self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
+
         # Cleanup temporary stage log if we created one (only when no log_file provided)
         try:
             if not self._log_file:
@@ -257,7 +303,7 @@ class OmniStage:
         assert self._in_q is not None
         self._in_q.put(payload)
 
-    def try_collect(self) -> Optional[dict[str, Any]]:
+    def try_collect(self) -> dict[str, Any] | None:
         """Try to collect a result from the stage worker without blocking.
 
         Returns:
@@ -271,8 +317,8 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: Union[OmniTokensPrompt, TextPrompt] = None
-    ) -> list[Union[OmniTokensPrompt, TextPrompt]]:
+        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+    ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
         Derives inputs for this stage from outputs of upstream stages.
@@ -326,7 +372,7 @@ def _stage_worker(
     stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
@@ -334,6 +380,8 @@ def _stage_worker(
     import os as _os
     import time as _time
 
+    from vllm_omni.distributed.omni_connectors import build_stage_connectors
+    from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
@@ -347,6 +395,7 @@ def _stage_worker(
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
+    connectors_config = stage_payload.get("connectors_config", {})
 
     # Per-stage logger: clear inherited handlers to avoid broken parent streams
     try:
@@ -440,6 +489,18 @@ def _stage_worker(
     )
     stage_engine = OmniStageLLM(model=model, **engine_args)
     _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
+
+    # Initialize OmniConnectors if configured
+    connectors = {}
+    if connectors_config:
+        built_connectors = build_stage_connectors(
+            stage_id=stage_id,
+            connectors_config=connectors_config,
+        )
+        if built_connectors is None:
+            return
+        connectors = built_connectors
+
     # Signal readiness to orchestrator
     try:
         out_q.put({"type": "stage_ready", "stage_id": stage_id})
@@ -496,9 +557,25 @@ def _stage_worker(
                     _in_flight_ms_by_rid[rid] = 0.0
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
-            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(t, obj_key="engine_inputs", shm_key="engine_inputs_shm")
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
+            # Resolve input data strictly via connectors if payload
+            # is larger than shm_threshold_bytes or using other connectors
+            ein, _rx_metrics = try_recv_via_connector(
+                task=t,
+                connectors=connectors,
+                stage_id=stage_id,
+            )
+
+            if ein is None or _rx_metrics is None:
+                raise RuntimeError(
+                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                    "Ensure connectors are configured for all incoming edges."
+                )
+
+            if _rx_metrics:
+                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
             batch_request_ids.append(rid)
             if isinstance(ein, list):
                 batch_engine_inputs.extend(ein)
@@ -671,6 +748,8 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
+    from vllm_omni.distributed.omni_connectors import build_stage_connectors
+    from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
     from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
@@ -685,6 +764,7 @@ async def _stage_worker_async(
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
+    connectors_config = stage_payload.get("connectors_config", {})
 
     log_file = omni_stage._log_file
     in_q = omni_stage._in_q
@@ -728,6 +808,17 @@ async def _stage_worker_async(
         set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
+
+    # Initialize OmniConnectors if configured to match sync worker behavior
+    connectors: dict[Any, Any] = {}
+    if connectors_config:
+        built_connectors = build_stage_connectors(
+            stage_id=stage_id,
+            connectors_config=connectors_config,
+        )
+        if built_connectors is None:
+            return
+        connectors = built_connectors
 
     # Init LLM
     _logging.getLogger(__name__).debug(
@@ -788,12 +879,21 @@ async def _stage_worker_async(
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
-        ein, _rx_metrics = maybe_load_from_ipc_with_metrics(task, obj_key="engine_inputs", shm_key="engine_inputs_shm")
+        ein, _rx_metrics = try_recv_via_connector(
+            task=task,
+            connectors=connectors,
+            stage_id=stage_id,
+        )
+        if ein is None or _rx_metrics is None:
+            raise RuntimeError(
+                f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                "Ensure connectors are configured for all incoming edges."
+            )
         _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
         _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
         sampling_params = task["sampling_params"]
-        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%d", stage_id, rid)
+        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%s", stage_id, rid)
         print("--------------------------------", flush=True)
         print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
         print("--------------------------------", flush=True)

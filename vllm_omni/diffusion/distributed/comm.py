@@ -19,7 +19,11 @@ def all_to_all_4D(
         input (torch.tensor): a tensor sharded along dim scatter dim
         scatter_idx (int): default 1
         gather_idx (int): default 2
+<<<<<<< HEAD
         group : torch process group
+=======
+        group (torch.distributed.ProcessGroup): torch process group
+>>>>>>> wtomin/usp
         use_sync (bool): whether to synchronize after all-to-all
 
     Returns:
@@ -65,7 +69,8 @@ def all_to_all_4D(
         seq_world_size = dist.get_world_size(group)
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
-        # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)-> (hc/P, P, seqlen/P, bs, hs) -transpose(0, 1) -> (P, hc/P, seqlen/P, bs, hs)
+        # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)->
+        #  (hc/P, P, seqlen/P, bs, hs) -transpose(0, 1) -> (P, hc/P, seqlen/P, bs, hs)
         input_t = (
             input.reshape(bs, seq_world_size, shard_seqlen, shard_hc, hs)
             .transpose(0, 3)
@@ -133,8 +138,13 @@ def all_to_all_5D(
         input (torch.tensor): a tensor sharded along dim scatter dim
         scatter_idx (int): default 1
         gather_idx (int): default 2
+<<<<<<< HEAD
         group : torch process group
         use_sync: whether to synchronize after all-to-all
+=======
+        group (torch.distributed.ProcessGroup): torch process group
+        use_sync (bool): whether to synchronize after all-to-all
+>>>>>>> wtomin/usp
 
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, 3, hc, hs)
@@ -152,7 +162,8 @@ def all_to_all_5D(
         shard_hc = hc // seq_world_size
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
-        # (bs, seqlen/P, 3, hc, hs) -reshape-> (bs, seq_len/P, 3, P, hc/P, hs) -transpose(0,3)-> (P, seq_len/P, 3, bs, hc/P, hs)
+        # (bs, seqlen/P, 3, hc, hs) -reshape-> (bs, seq_len/P, 3, P, hc/P, hs) -transpose(0,3)->
+        #  (P, seq_len/P, 3, bs, hc/P, hs)
         input_t = input.reshape(bs, shard_seqlen, 3, seq_world_size, shard_hc, hs).transpose(0, 3).contiguous()
 
         output = torch.empty_like(input_t)
@@ -180,7 +191,8 @@ def all_to_all_5D(
         seq_world_size = dist.get_world_size(group)
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
-        # (bs, seqlen, 3, hc/P, hs) -reshape-> (bs, P, seq_len/P, 3, hc/P, hs) -transpose(0, 4)-> (hc/P, P, seqlen/P, 3, bs, hs) -transpose(0, 1) -> (P, hc/P, seqlen/P, 3, bs, hs)
+        # (bs, seqlen, 3, hc/P, hs) -reshape-> (bs, P, seq_len/P, 3, hc/P, hs) -transpose(0, 4)->
+        # (hc/P, P, seqlen/P, 3, bs, hs) -transpose(0, 1) -> (P, hc/P, seqlen/P, 3, bs, hs)
         input_t = (
             input.reshape(bs, seq_world_size, shard_seqlen, 3, shard_hc, hs)
             .transpose(0, 4)

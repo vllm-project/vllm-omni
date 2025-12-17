@@ -6,7 +6,7 @@ with the correct prompt format on Qwen3-Omni (thinker only).
 """
 
 import os
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import librosa
 import numpy as np
@@ -57,7 +57,7 @@ def get_text_query(question: str = None) -> QueryResult:
     )
 
 
-def get_video_query(question: str = None, video_path: Optional[str] = None, num_frames: int = 16) -> QueryResult:
+def get_video_query(question: str = None, video_path: str | None = None, num_frames: int = 16) -> QueryResult:
     if question is None:
         question = "Why is this video funny?"
     prompt = (
@@ -85,7 +85,7 @@ def get_video_query(question: str = None, video_path: Optional[str] = None, num_
     )
 
 
-def get_image_query(question: str = None, image_path: Optional[str] = None) -> QueryResult:
+def get_image_query(question: str = None, image_path: str | None = None) -> QueryResult:
     if question is None:
         question = "What is the content of this image?"
     prompt = (
@@ -114,7 +114,7 @@ def get_image_query(question: str = None, image_path: Optional[str] = None) -> Q
     )
 
 
-def get_audio_query(question: str = None, audio_path: Optional[str] = None, sampling_rate: int = 16000) -> QueryResult:
+def get_audio_query(question: str = None, audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
     if question is None:
         question = "What is the content of this audio?"
     prompt = (

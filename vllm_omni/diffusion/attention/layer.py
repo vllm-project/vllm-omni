@@ -10,7 +10,9 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.distributed as dist
 import torch.nn as nn
+from torch import Tensor
 from torch import Tensor
 
 from vllm_omni.diffusion.attention.backends.abstract import (
