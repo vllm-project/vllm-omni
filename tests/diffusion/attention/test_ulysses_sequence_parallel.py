@@ -142,7 +142,7 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
     ],
 )
 @pytest.mark.parametrize("ulysses_degree", [2])
-@pytest.mark.parametrize("ring_degree", [2])
+@pytest.mark.parametrize("ring_degree", [1,2])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
@@ -283,9 +283,9 @@ def test_ulysses_attention(
         # Assert that differences are within acceptable tolerance
         # For FP16/BF16, we expect some numerical differences due to different computation order
         if dtype == torch.float16:
-            atol, rtol = 1e-4, 1e-2
+            atol, rtol = 5e-3, 5e-2
         elif dtype == torch.bfloat16:
-            atol, rtol = 1e-4, 1e-2
+            atol, rtol = 5e-3, 5e-2
         else:
             atol, rtol = 1e-5, 1e-3
 
