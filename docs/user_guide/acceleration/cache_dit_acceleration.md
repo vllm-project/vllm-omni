@@ -201,7 +201,7 @@ omni = Omni(
 
 You can customize the configuration by modifying the `cache_config` dictionary to use only specific methods (e.g., DBCache only, DBCache + SCM, etc.) based on your quality and speed requirements.
 
-To test another model, you can modify `--model` with the target model identifier like `Tongyi-MAI/Z-Image-Turbo` and update `cache_confg` according the model architecture (e.g., number of transformer blocks).
+To test another model, you can modify `--model` with the target model identifier like `Tongyi-MAI/Z-Image-Turbo` and update `cache_config` according the model architecture (e.g., number of transformer blocks).
 
 
 ## Additional Resources

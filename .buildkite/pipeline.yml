@@ -9,6 +9,14 @@ steps:
     agents:
       queue: "cpu_queue_premerge_us_east_1"
 
+  - label: "Test on NPU"
+    depends_on: ~
+    key: npu-test
+    commands:
+      - ".buildkite/scripts/hardware_ci/run_npu_test.sh"
+    agents:
+      queue: "ascend"
+
   - label: "Simple Unit Test"
     commands:
       - ".buildkite/scripts/simple_test.sh"
@@ -16,7 +24,7 @@ steps:
       queue: "cpu_queue_premerge"
 
   - label: "Diffusion Model Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
@@ -39,6 +47,23 @@ steps:
       - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Parallelism Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
