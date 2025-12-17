@@ -8,9 +8,9 @@ vLLM-Omni currently supports two main cache acceleration backends:
 
 1. **[TeaCache](acceleration/teacache.md)** - Hook-based adaptive caching that caches transformer computations when consecutive timesteps are similar
 2. **[Cache-DiT](acceleration/cache_dit_acceleration.md)** - Library-based acceleration using multiple techniques:
-   - **DBCache** (Dual Block Cache): Caches intermediate transformer block outputs based on residual differences
-   - **TaylorSeer**: Uses Taylor expansion-based forecasting for faster inference
-   - **SCM** (Step Computation Masking): Selectively computes steps based on adaptive masking
+    - **DBCache** (Dual Block Cache): Caches intermediate transformer block outputs based on residual differences
+    - **TaylorSeer**: Uses Taylor expansion-based forecasting for faster inference
+    - **SCM** (Step Computation Masking): Selectively computes steps based on adaptive masking
 
 Both methods can provide significant speedups (typically **1.5x-2.0x**) while maintaining high output quality.
 

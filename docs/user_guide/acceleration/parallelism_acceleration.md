@@ -5,6 +5,7 @@ This guide includes how to use parallelism methods in vLLM-Omni to speed up diff
 ## Overview
 
 The following parallelism methods are currently supported in vLLM-Omni:
+
 1. DeepSpeed Ulysses Sequence Parallel (Ulysses-SP) ([paper](https://arxiv.org/pdf/2309.14509)): Ulysses-SP splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
 
 
