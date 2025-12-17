@@ -11,7 +11,7 @@ steps:
 
   - label: "Test on NPU"
     depends_on: ~
-    soft_tail: true
+    soft_fail: true
     key: npu-test
     commands:
       - ".buildkite/scripts/hardware_ci/run_npu_test.sh"
