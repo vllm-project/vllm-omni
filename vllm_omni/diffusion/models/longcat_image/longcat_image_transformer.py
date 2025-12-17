@@ -494,6 +494,23 @@ class LongCatImageTransformer2DModel(nn.Module):
         for name, loaded_weight in weights:
             if ".to_out.0" in name:
                 name = name.replace(".to_out.0", ".to_out")
+            # Handle FeedForward parameter mapping
+            if ".ff.net." in name:
+                # Map .ff.net.0.proj -> .ff.w_in
+                if ".net.0.proj" in name:
+                    name = name.replace(".net.0.proj", ".w_in")
+                # Map .ff.net.2 -> .ff.w_out
+                elif ".net.2" in name:
+                    name = name.replace(".net.2", ".w_out")
+            # Handle FeedForward context parameters
+            if ".ff_context.net." in name:
+                # Map .ff_context.net.0.proj -> .ff_context.w_in
+                if ".net.0.proj" in name:
+                    name = name.replace(".net.0.proj", ".w_in")
+                # Map .ff_context.net.2 -> .ff_context.w_out
+                elif ".net.2" in name:
+                    name = name.replace(".net.2", ".w_out")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
