@@ -240,7 +240,6 @@ class QwenImageCrossAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        encoder_hidden_states_mask: torch.Tensor,
         vid_freqs: torch.Tensor,
         txt_freqs: torch.Tensor,
     ):
@@ -428,7 +427,6 @@ class QwenImageTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
             vid_freqs=image_rotary_emb[0],
             txt_freqs=image_rotary_emb[1],
         )
