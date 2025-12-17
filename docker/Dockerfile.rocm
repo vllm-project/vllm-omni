@@ -31,7 +31,7 @@ COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && python3 -m pip install --no-cache-dir ".[dev]"
 
 # Create python symlink
-RUN export GPU_ARCHS="gfx942;gfx950"
+ENV GPU_ARCHS="gfx942;gfx950"
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
