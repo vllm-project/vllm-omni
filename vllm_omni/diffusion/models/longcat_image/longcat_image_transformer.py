@@ -6,11 +6,11 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -20,6 +20,23 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.utils.platform_utils import is_npu
 
 logger = init_logger(__name__)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, dim_out: Optional[int] = None, mult: int = 4, bias: bool = True):
+        super().__init__()
+        inner_dim = int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        self.w_in = ReplicatedLinear(dim, inner_dim, bias=bias, return_bias=False)
+        self.act = get_act_fn("gelu_pytorch_tanh")
+        self.w_out = ReplicatedLinear(inner_dim, dim_out, bias=bias, return_bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.w_in(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.w_out(hidden_states)
+        return hidden_states
 
 
 class LongCatImageAttention(nn.Module):
@@ -170,10 +187,10 @@ class LongCatImageTransformerBlock(nn.Module):
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff = FeedForward(dim=dim, dim_out=dim)
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.ff_context = FeedForward(dim=dim, dim_out=dim)
 
     def forward(
         self,
