@@ -414,26 +414,6 @@ class LongCatImageTransformer2DModel(nn.Module):
         guidance: torch.Tensor = None,
         return_dict: bool = True,
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
-        """
-        The  forward method.
-
-        Args:
-            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
-                Input `hidden_states`.
-            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
-                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            timestep ( `torch.LongTensor`):
-                Used to indicate denoising step.
-            block_controlnet_hidden_states: (`list` of `torch.Tensor`):
-                A list of tensors that if specified are added to the residuals of transformer blocks.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-                tuple.
-
-        Returns:
-            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-            `tuple` where the first element is the sample tensor.
-        """
         hidden_states = self.x_embedder(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
