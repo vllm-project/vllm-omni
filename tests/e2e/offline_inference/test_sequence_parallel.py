@@ -34,7 +34,7 @@ models = ["riverclouds/qwen_image_random"]
 
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("ulysses_degree", [1, 2])
-@pytest.mark.parametrize("ring_degree", [1])
+@pytest.mark.parametrize("ring_degree", [1, 2])
 def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: int):
     """Test SP (Ulysses-SP + Ring-SP) backend with diffusion model."""
     # Skip if not enough GPUs available
