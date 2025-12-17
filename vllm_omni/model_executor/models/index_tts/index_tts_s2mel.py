@@ -12,6 +12,7 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.model_executor.models.index_tts.index_tts_config import IndexTTSConfig
@@ -21,23 +22,32 @@ from vllm_omni.model_executor.models.index_tts.utils.maskgct_utils import JsonHP
 logger = init_logger(__name__)
 
 
-class IndexTTSS2MelForConditionalGeneration(nn.Module):
+class IndexTTSS2MelForConditionalGeneration(nn.Module, VllmModelForTextGeneration):
     """
     Stage 1: S2Mel model for generating mel-spectrograms from semantic codes.
     Input: semantic_codes, spk_cond_emb, emo_cond_emb
     Output: mel_spectrograms
     """
 
+    @classmethod
+    def is_generative(cls) -> bool:
+        return True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.config: IndexTTSConfig = VllmConfig.model_config.hf_config
+        self.config: IndexTTSConfig = vllm_config.model_config.hf_config
         self.prefix = prefix
         self.semantic_codec = build_semantic_codec(self.config.semantic_codec)
-        self.s2mel = MyModel(self.s2mel_cfg, use_gpt_latent=True)
         self.s2mel_cfg = JsonHParams(**self.config.s2mel)
+        self.s2mel = MyModel(self.s2mel_cfg, use_gpt_latent=True)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return hidden_states
 
     def forward(
         self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
         codes,  # [B, T_codes]
         latent,  # [B, T_codes, D]
         code_lens,  # [B]

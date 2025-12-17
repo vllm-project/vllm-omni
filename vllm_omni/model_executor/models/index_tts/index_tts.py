@@ -13,7 +13,8 @@ DESCRIPTION:
 """
 
 import random
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 import librosa
 import torch
@@ -23,7 +24,16 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoFeatureExtractor, Wav2Vec2BertModel
 from vllm.config import VllmConfig  # type: ignore
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFieldConfig
+from vllm.multimodal.parse import (
+    ModalityDataItems,
+    MultiModalDataParser,
+)
+from vllm.multimodal.processing import BaseMultiModalProcessor, BaseProcessingInfo
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
 
 from vllm_omni.model_executor.models.index_tts.index_tts_config import IndexTTSConfig
 from vllm_omni.model_executor.models.index_tts.index_tts_vocoder import IndexTTSVocoderForConditionalGeneration
@@ -45,9 +55,112 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 
-class IndexTTSForConditionalGeneration(torch.nn.Module):
+def index_tts_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+    return dict(
+        spk_cond_emb=MultiModalFieldConfig.batched("spk_cond_emb"),
+        emo_cond_emb=MultiModalFieldConfig.batched("emo_cond_emb"),
+        emovec_mat=MultiModalFieldConfig.batched("emovec_mat"),
+        weight_vector=MultiModalFieldConfig.batched("weight_vector"),
+        emo_vector=MultiModalFieldConfig.batched("emo_vector"),
+    )
+
+
+class IndexTTSEmbeddingItems(ModalityDataItems):
+    pass
+
+
+class IndexTTSDataParser(MultiModalDataParser):
+    def _parse_index_tts_embedding(self, data) -> IndexTTSEmbeddingItems:
+        if isinstance(data, torch.Tensor):
+            return IndexTTSEmbeddingItems([data])
+        if isinstance(data, list):
+            return IndexTTSEmbeddingItems(data)
+        return IndexTTSEmbeddingItems([data])
+
+    def _get_subparsers(self):
+        parsers = super()._get_subparsers()
+        for key in [
+            "spk_cond_emb",
+            "emo_cond_emb",
+            "emovec_mat",
+            "weight_vector",
+            "emo_vector",
+            # S2Mel inputs that might be passed as mm_data in dummy builder
+            "codes",
+            "latent",
+            "code_lens",
+            "ref_target_lengths",
+            "ref_mel",
+            "style",
+        ]:
+            parsers[key] = self._parse_index_tts_embedding
+        return parsers
+
+
+class IndexTTSProcessingInfo(BaseProcessingInfo):
+    def get_hf_config(self):
+        return self.ctx.get_hf_config(IndexTTSConfig)
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"spk_cond_emb": None, "emo_cond_emb": None}
+
+
+class IndexTTSDummyInputsBuilder(BaseDummyInputsBuilder[IndexTTSProcessingInfo]):
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        return "Hello world"
+
+    def get_dummy_mm_data(self, seq_len: int, mm_counts: Mapping[str, int]) -> dict[str, Any]:
+        hidden_size = 1024
+        return {
+            "spk_cond_emb": torch.randn(1, 10, hidden_size),
+            "emo_cond_emb": torch.randn(1, 10, hidden_size),
+            "emovec_mat": torch.randn(1, 8, hidden_size),
+            "weight_vector": torch.randn(1, 8),
+            "emo_vector": torch.randn(1, 8),
+        }
+
+    def get_dummy_inputs(self, *args, **kwargs):
+        # Default hidden size
+        hidden_size = 1024
+        return {
+            "input_ids": torch.tensor([[101, 102]], dtype=torch.long),
+            "spk_cond_emb": torch.randn(1, 10, hidden_size),
+            "emo_cond_emb": torch.randn(1, 10, hidden_size),
+            "emovec_mat": torch.randn(1, 8, hidden_size),
+            "weight_vector": torch.randn(1, 8),
+            "emo_vector": torch.randn(1, 8),
+            "text": "Hello world",
+        }
+
+
+class IndexTTSMultiModalProcessor(BaseMultiModalProcessor[IndexTTSProcessingInfo]):
+    def _call_support(self, prompt, mm_data, mm_kwargs):
+        return mm_data
+
+    def _get_data_parser(self) -> MultiModalDataParser:
+        return IndexTTSDataParser()
+
+    def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
+        return index_tts_field_config(hf_inputs)
+
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        """No prompt updates needed for IndexTTS."""
+        return []
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    IndexTTSMultiModalProcessor,
+    info=IndexTTSProcessingInfo,
+    dummy_inputs=IndexTTSDummyInputsBuilder,
+)
+class IndexTTSForConditionalGeneration(torch.nn.Module, SupportsMultiModal):
+    # Class attributes required by vLLM registry
+    is_text_generation_model = True  # Supports text/audio generation
+    is_pooling_model = False  # Not a pooling/embedding model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self.have_multimodal_outputs = True  # Required for GPUGenerationWorker
         self.config: IndexTTSConfig = vllm_config.model_config.hf_config
         self.prefix = prefix
         self.model_stage = vllm_config.model_config.model_stage
@@ -309,10 +422,11 @@ class IndexTTSForConditionalGeneration(torch.nn.Module):
         device = next(self.parameters()).device
 
         if self.model_stage == "gpt":
+            logger.info("IndexTTS: Running GPT stage for mel code generation...")
             ### Prepare speaker conditioning
             spk_cond_emb, style, _, _ = self._prepare_speaker_conditioning(spk_audio_prompt, device)
 
-            emo_vector, emo_audio_prompt, emo_alpha, emovec_mat = self._get_emo_vector(
+            emo_vector, emo_audio_prompt, emo_alpha, emovec_mat, weight_vector = self._get_emo_vector(
                 use_emo_text,
                 emo_vector,
                 emo_audio_prompt,
@@ -328,16 +442,23 @@ class IndexTTSForConditionalGeneration(torch.nn.Module):
             emo_cond_emb = self._prepare_emotion_conditioning(emo_audio_prompt, device)
             ### Tokenize and segment text
             text_tokens_list = self.tokenizer.tokenize(text)
+            text_tokens = self.tokenizer.convert_tokens_to_ids(text_tokens_list)
+            logger.info(f"IndexTTS: Text tokenized into {len(text_tokens)} tokens.")
+            text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=device).unsqueeze(0)
+            logger.info(f"IndexTTS: Text tokenized into {text_tokens.shape} tokens.")
+
             # segments = self.tokenizer.split_segments(
             #     text_tokens_list, max_text_tokens_per_segment, quick_streaming_tokens=quick_streaming_tokens
             # )
+            logger.info(f"IndexTTS: Text tokenized into {len(text_tokens_list)} tokens.")
             output = self.model(
-                text_tokens=text_tokens_list,
-                spk_audio_prompt=spk_audio_prompt,
+                text_tokens=text_tokens,
+                # spk_audio_prompt=spk_audio_prompt,
                 spk_cond_emb=spk_cond_emb,
                 emo_cond_emb=emo_cond_emb,
                 emovec_mat=emovec_mat,
                 emo_vector=emo_vector,
+                weight_vector=weight_vector,
                 emo_alpha=emo_alpha,
                 max_mel_tokens=max_mel_tokens,
                 **generation_kwargs,
