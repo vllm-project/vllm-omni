@@ -255,30 +255,19 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     start_offset = int(self.query_start_loc_cpu[req_index])
                     self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
                 # Build per-request additional information (no cross-request concat)
+                # NOTE: Pass full tensors without slicing, consistent with GPU version.
+                # Tensors like thinker_embeddings need to be passed in full to the model.
                 if addi_cpu is not None and isinstance(addi_cpu, dict):
                     req_info: dict[str, object] = {}
                     for k, v in addi_cpu.items():
                         if isinstance(v, torch.Tensor):
-                            # For prefill tokens, pass only the scheduled slice;
-                            # for decode or no scheduled tokens, pass whole tensor
-                            if overlay_len > 0:
-                                try:
-                                    seg = (
-                                        v[num_computed_tokens : num_computed_tokens + overlay_len]
-                                        .detach()
-                                        .to("cpu")
-                                        .contiguous()
-                                    )
-                                except Exception:
-                                    seg = v.detach().to("cpu").contiguous()
-                                req_info[k] = seg
-                            else:
-                                req_info[k] = v.detach().to("cpu").contiguous()
+                            req_info[k] = v.detach().to("cpu").contiguous()
                         elif isinstance(v, list):
                             req_info[k] = v
                         else:
                             req_info[k] = v
-                    per_req_additional_information[req_id] = req_info
+                    if req_info:
+                        per_req_additional_information[req_id] = req_info
             #  ------------------------------------------------------------------------------------------------
 
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
