@@ -1,5 +1,4 @@
 import asyncio
-from typing import Optional
 
 from fastapi import Request
 from fastapi.responses import Response
@@ -18,7 +17,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
-        raw_request: Optional[Request] = None,
+        raw_request: Request | None = None,
     ):
         """
         Create Speech API similar to OpenAI's API.
@@ -49,7 +48,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt=prompt, request_id=request_id, sampling_params_list=sampling_params_list
             )
 
-            final_output: Optional[OmniRequestOutput] = None
+            final_output: OmniRequestOutput | None = None
             async for res in generator:
                 final_output = res
 

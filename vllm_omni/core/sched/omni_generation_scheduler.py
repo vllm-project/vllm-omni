@@ -1,6 +1,5 @@
 import time
 from collections import defaultdict
-from typing import Optional
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -170,7 +169,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         kv_connector_output = model_runner_output.kv_connector_output
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        spec_decoding_stats: Optional[SpecDecodingStats] = None
+        spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
@@ -275,8 +274,7 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
-            if stopped_running_reqs:
-                self.running = remove_all(self.running, stopped_running_reqs)
+            self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)

@@ -1,3 +1,4 @@
+import uuid
 import warnings
 from queue import Empty, Queue
 from typing import Any
@@ -639,9 +640,17 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
 
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_llm_module, "uuid", uuid)
+
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     llm = OmniLLM(model="any", init_timeout=1)
+
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
 
     # Simulate worker behavior: manually put results into output queues
     # Note: We put results before calling generate, which simulates worker processes
@@ -649,7 +658,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     # Stage 0 output (will be collected first)
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
@@ -661,7 +670,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     # then stage 1 result will be collected.
     llm.stage_list[1]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1, "text": "s1"}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
@@ -734,21 +743,29 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
 
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_llm_module, "uuid", uuid)
+
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     llm = OmniLLM(model="any", init_timeout=1)
 
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
+
     # Simulate worker behavior: put results into output queues
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
     )
     llm.stage_list[1]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
@@ -923,14 +940,22 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
 
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_llm_module, "uuid", uuid)
+
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     llm = OmniLLM(model="any", init_timeout=1)
 
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
+
     # Put error message in output queue
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "error": "test error",
         }
     )
@@ -938,7 +963,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     # (error handling continues the loop, so we need a valid result to finish)
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "result"}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
