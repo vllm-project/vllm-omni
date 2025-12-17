@@ -6,7 +6,7 @@ import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Optional, Union
 
 import torch
 
