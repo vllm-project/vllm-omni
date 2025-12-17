@@ -106,8 +106,8 @@ class AsyncOmni(EngineClient):
         cli_args: Namespace,
         **kwargs: Any,
     ):
-        self.worker_backend = cli_args.worker_backend
-        self.ray_address = cli_args.ray_address
+        self.worker_backend = getattr(cli_args, "worker_backend", "multi_process")
+        self.ray_address = getattr(cli_args, "ray_address", "")
         self._ray_pg = None
 
         self.batch_timeout = cli_args.batch_timeout
