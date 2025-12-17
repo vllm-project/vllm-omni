@@ -1,11 +1,13 @@
+import json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import fields
 from http import HTTPStatus
-from typing import Any, Optional
+from typing import Any
 
 import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
@@ -38,6 +40,9 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
@@ -45,13 +50,73 @@ logger = init_logger(__name__)
 
 
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
-    """Run a single-worker API server."""
+    """Run a single-worker API server.
+
+    Automatically detects if the model is a diffusion model and routes
+    to the appropriate server implementation.
+    """
 
     # Add process-specific prefix to stdout and stderr.
     decorate_logs("APIServer")
 
     listen_address, sock = setup_server(args)
-    await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+
+    # Check if model is a diffusion model
+    if is_diffusion_model(args.model):
+        logger.info("Detected diffusion model, starting diffusion API server")
+        await omni_run_diffusion_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+    else:
+        await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+
+
+async def omni_run_diffusion_server(args, **uvicorn_kwargs) -> None:
+    """Run a diffusion model API server."""
+
+    # Add process-specific prefix to stdout and stderr.
+    decorate_logs("DiffusionAPIServer")
+
+    listen_address, sock = setup_server(args)
+    await omni_run_diffusion_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+
+
+async def omni_run_diffusion_server_worker(listen_address, sock, args, **uvicorn_kwargs) -> None:
+    """Run a diffusion model API server worker."""
+
+    # Load logging config for uvicorn if specified
+    log_config = load_log_config(args.log_config_file)
+    if log_config is not None:
+        uvicorn_kwargs["log_config"] = log_config
+
+    async with build_async_diffusion(args) as diffusion_engine:
+        app = build_app(args)
+
+        await omni_diffusion_init_app_state(diffusion_engine, app.state, args)
+
+        logger.info("Starting vLLM Diffusion API server on %s", listen_address)
+
+        shutdown_task = await serve_http(
+            app,
+            sock=sock,
+            enable_ssl_refresh=getattr(args, "enable_ssl_refresh", False),
+            host=args.host,
+            port=args.port,
+            log_level=args.uvicorn_log_level,
+            access_log=not getattr(args, "disable_uvicorn_access_log", False),
+            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+            ssl_keyfile=getattr(args, "ssl_keyfile", None),
+            ssl_certfile=getattr(args, "ssl_certfile", None),
+            ssl_ca_certs=getattr(args, "ssl_ca_certs", None),
+            ssl_cert_reqs=getattr(args, "ssl_cert_reqs", 0),
+            h11_max_incomplete_event_size=getattr(args, "h11_max_incomplete_event_size", None),
+            h11_max_header_count=getattr(args, "h11_max_header_count", None),
+            **uvicorn_kwargs,
+        )
+
+    # NB: Await server shutdown only after the backend context is exited
+    try:
+        await shutdown_task
+    finally:
+        sock.close()
 
 
 async def omni_run_server_worker(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
@@ -111,8 +176,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 async def build_async_omni(
     args: Namespace,
     *,
-    disable_frontend_multiprocessing: Optional[bool] = None,
-    client_config: Optional[dict[str, Any]] = None,
+    disable_frontend_multiprocessing: bool | None = None,
+    client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Build an AsyncOmni instance from command-line arguments.
 
@@ -148,11 +213,65 @@ async def build_async_omni(
 
 
 @asynccontextmanager
+async def build_async_diffusion(
+    args: Namespace,
+    **kwargs: Any,
+) -> AsyncIterator[AsyncOmniDiffusion]:
+    """Build an AsyncOmniDiffusion instance from command-line arguments.
+
+    Creates an async context manager that yields an AsyncOmniDiffusion
+    instance configured from the provided arguments.
+
+    Args:
+        args: Parsed command-line arguments containing model and configuration
+        **kwargs: Additional keyword arguments passed to AsyncOmniDiffusion
+
+    Yields:
+        AsyncOmniDiffusion instance ready for use
+    """
+    diffusion_engine: AsyncOmniDiffusion | None = None
+
+    try:
+        # Build diffusion kwargs by extracting matching OmniDiffusionConfig fields from args
+        config_field_names = {f.name for f in fields(OmniDiffusionConfig)}
+        diffusion_kwargs: dict[str, Any] = {"model": args.model}
+
+        for field_name in config_field_names:
+            if not hasattr(args, field_name):
+                continue
+            value = getattr(args, field_name)
+            if value is None:
+                continue
+            # Special handling for cache_config JSON string
+            if field_name == "cache_config" and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse cache_config JSON: {e}")
+                    continue
+            diffusion_kwargs[field_name] = value
+
+        diffusion_kwargs.update(kwargs)
+        logger.info(f"diffusion_kwargs: {diffusion_kwargs}")
+        logger.info(
+            "Building AsyncOmniDiffusion with model=%s, num_gpus=%s",
+            args.model,
+            diffusion_kwargs.get("num_gpus", 1),
+        )
+        diffusion_engine = AsyncOmniDiffusion(**diffusion_kwargs)
+
+        yield diffusion_engine
+    finally:
+        if diffusion_engine:
+            diffusion_engine.shutdown()
+
+
+@asynccontextmanager
 async def build_async_omni_from_stage_config(
     args: Namespace,
     *,
     disable_frontend_multiprocessing: bool = False,
-    client_config: Optional[dict[str, Any]] = None,
+    client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Create AsyncOmni from stage configuration.
 
@@ -182,7 +301,7 @@ async def build_async_omni_from_stage_config(
             "To disable frontend multiprocessing, set VLLM_USE_V1=0."
         )
 
-    async_omni: Optional[EngineClient] = None
+    async_omni: EngineClient | None = None
 
     try:
         async_omni = AsyncOmni(model=args.model, cli_args=args)
@@ -257,7 +376,7 @@ async def omni_init_app_state(
                 )
 
     if args.tool_server == "demo":
-        tool_server: Optional[ToolServer] = DemoToolServer()
+        tool_server: ToolServer | None = DemoToolServer()
         assert isinstance(tool_server, DemoToolServer)
         await tool_server.init_and_validate()
     elif args.tool_server:
@@ -314,8 +433,51 @@ async def omni_init_app_state(
     state.server_load_metrics = 0
 
 
-def Omnichat(request: Request) -> Optional[OmniOpenAIServingChat]:
+def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
     return request.app.state.openai_serving_chat
+
+
+async def omni_diffusion_init_app_state(
+    diffusion_engine: AsyncOmniDiffusion,
+    state: State,
+    args: Namespace,
+) -> None:
+    """Initialize the FastAPI application state for diffusion model API server.
+
+    Sets up the application state with diffusion model information and
+    chat completion handler for image generation via /v1/chat/completions.
+
+    Args:
+        diffusion_engine: AsyncOmniDiffusion engine instance
+        state: FastAPI application state object to initialize
+        args: Parsed command-line arguments
+    """
+    if args.served_model_name is not None:
+        served_model_names = args.served_model_name
+    else:
+        served_model_names = [args.model]
+
+    model_name = served_model_names[0] if served_model_names else args.model
+
+    state.diffusion_engine = diffusion_engine
+    state.log_stats = not getattr(args, "disable_log_stats", False)
+
+    # Initialize chat handler with diffusion engine (uses /v1/chat/completions endpoint)
+    # Note: Request-level parameters (num_inference_steps, guidance_scale, seed, height, width, etc.)
+    # are passed per-request via the API, not as server defaults
+    state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
+        diffusion_engine=diffusion_engine,
+        model_name=model_name,
+    )
+
+    # Set other handlers to None for diffusion-only mode
+    state.engine_client = None
+    state.vllm_config = None
+
+    state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
+    state.server_load_metrics = 0
+
+    logger.info("Diffusion API server initialized for model: %s", model_name)
 
 
 @router.post(
@@ -337,9 +499,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except Exception as e:
+        logger.exception("Chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(), status_code=generator.error.code)
+        return JSONResponse(
+            content=generator.model_dump(), status_code=generator.code if hasattr(generator, "code") else 400
+        )
 
     elif isinstance(generator, ChatCompletionResponse):
         return JSONResponse(content=generator.model_dump())

@@ -7,7 +7,8 @@ This module provides a CacheDiTBackend class to enable cache-dit acceleration on
 pipelines in vllm-omni, supporting both single and dual-transformer architectures.
 """
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Optional
 
 from vllm.logger import init_logger
 
@@ -311,8 +312,8 @@ class CacheDiTBackend(CacheBackend):
         super().__init__(config)
 
         # Cache-dit specific attributes
-        self._refresh_func: Optional[Callable[[Any, int, bool], None]] = None
-        self._last_num_inference_steps: Optional[int] = None
+        self._refresh_func: Callable[[Any, int, bool], None] | None = None
+        self._last_num_inference_steps: int | None = None
 
     def enable(self, pipeline: Any) -> None:
         """Enable cache-dit on the pipeline if configured.
