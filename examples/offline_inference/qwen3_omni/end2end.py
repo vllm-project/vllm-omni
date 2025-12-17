@@ -6,7 +6,7 @@ with the correct prompt format on Qwen3-Omni (thinker only).
 """
 
 import os
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import librosa
 import numpy as np
@@ -18,7 +18,7 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.utils import FlexibleArgumentParser
-
+from datetime import datetime
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -57,7 +57,7 @@ def get_text_query(question: str = None) -> QueryResult:
     )
 
 
-def get_video_query(question: str = None, video_path: str | None = None, num_frames: int = 16) -> QueryResult:
+def get_video_query(question: str = None, video_path: Optional[str] = None, num_frames: int = 16) -> QueryResult:
     if question is None:
         question = "Why is this video funny?"
     prompt = (
@@ -85,7 +85,7 @@ def get_video_query(question: str = None, video_path: str | None = None, num_fra
     )
 
 
-def get_image_query(question: str = None, image_path: str | None = None) -> QueryResult:
+def get_image_query(question: str = None, image_path: Optional[str] = None) -> QueryResult:
     if question is None:
         question = "What is the content of this image?"
     prompt = (
@@ -114,7 +114,7 @@ def get_image_query(question: str = None, image_path: str | None = None) -> Quer
     )
 
 
-def get_audio_query(question: str = None, audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
+def get_audio_query(question: str = None, audio_path: Optional[str] = None, sampling_rate: int = 16000) -> QueryResult:
     if question is None:
         question = "What is the content of this audio?"
     prompt = (
@@ -169,10 +169,18 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
     else:
         query_result = query_func()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(base_dir, "logs", "omni", ts)
+    os.makedirs(log_dir, exist_ok=True)
+
+    print("Omni logs will be saved to:", log_dir)
 
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
+        log_stats=True,
+        log_file=os.path.join(log_dir, "omni_llm_pipeline.log")
     )
 
     thinker_sampling_params = SamplingParams(
