@@ -30,6 +30,14 @@ If you have not enough memory, you can set thinker with tensor parallel. Just ru
 bash run_single_prompt_tp.sh
 ```
 
+### Modality control
+If you want to control output modalities, e.g. only output text, you can run the command below:
+```bash
+python end2end.py --output-wav output_audio \
+                  --query-type use_audio \
+                  --modalities text
+```
+
 #### Using Local Media Files
 The `end2end.py` script supports local media files (audio, video, image) via command-line arguments:
 

@@ -172,6 +172,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
+        output_modalities = getattr(request, "modalities", self.engine_client.output_modalities)
+
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
@@ -194,6 +196,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     prompt=engine_prompt,
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
+                    output_modalities=output_modalities,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
                     priority=request.priority,

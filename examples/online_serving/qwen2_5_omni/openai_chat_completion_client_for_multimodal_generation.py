@@ -341,12 +341,18 @@ def run_multimodal_generation(args) -> None:
     if args.query_type == "use_audio_in_video":
         extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
 
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+    else:
+        output_modalities = None
+
     chat_completion = client.chat.completions.create(
         messages=[
             get_system_prompt(),
             prompt,
         ],
         model=model_name,
+        modalities=output_modalities,
         extra_body=extra_body,
     )
 
@@ -400,6 +406,12 @@ def parse_args():
         type=str,
         default=None,
         help="Custom text prompt/question to use instead of the default prompt for the selected query type.",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Output modalities to use for the prompts.",
     )
 
     return parser.parse_args()

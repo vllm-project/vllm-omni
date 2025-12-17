@@ -61,7 +61,7 @@ stage_args:
   - stage_id: 2
     runtime:
       process: true
-      devices: "2"            # Example: use a different GPU than the previous stage; use "0" if single GPU
+      devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav

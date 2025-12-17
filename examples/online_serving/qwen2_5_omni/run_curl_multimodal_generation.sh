@@ -4,14 +4,18 @@ set -euo pipefail
 # Default query type
 QUERY_TYPE="${1:-mixed_modalities}"
 
+# Default modalities argument
+MODALITIES="${2:-null}"
+
 # Validate query type
 if [[ ! "$QUERY_TYPE" =~ ^(mixed_modalities|use_audio_in_video|multi_audios|text)$ ]]; then
     echo "Error: Invalid query type '$QUERY_TYPE'"
-    echo "Usage: $0 [mixed_modalities|use_audio_in_video|multi_audios|text]"
+    echo "Usage: $0 [mixed_modalities|use_audio_in_video|multi_audios|text] [modalities]"
     echo "  mixed_modalities: Audio + Image + Video + Text query"
     echo "  use_audio_in_video: Video + Text query (with audio extraction from video)"
     echo "  multi_audios: Two audio clips + Text query"
     echo "  text: Text query"
+    echo "  modalities: Modalities parameter (default: null)"
     exit 1
 fi
 
@@ -164,6 +168,7 @@ output=$(curl -sS -X POST http://localhost:8091/v1/chat/completions \
   "model": "Qwen/Qwen2.5-Omni-7B",
   "sampling_params_list": $sampling_params_list,
   "mm_processor_kwargs": $mm_processor_kwargs,
+  "modalities": $MODALITIES,
   "messages": [
     {
       "role": "system",

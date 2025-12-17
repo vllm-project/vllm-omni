@@ -85,3 +85,46 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
         audio_tensor = audio_output.request_output[0].multimodal_output["audio"]
         assert audio_tensor is not None
         assert audio_tensor.numel() > 0
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("test_config", test_params)
+@create_new_process_for_each_test()
+def test_mixed_modalities_to_text_only(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
+    """Test processing audio, image, and video together, generating audio output."""
+    model, stage_config_path = test_config
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
+        # Prepare multimodal inputs
+        question = "What is recited in the audio? What is in this image? Describe the video briefly."
+        audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
+        audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
+        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
+        video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
+        modalities = ["text"]
+
+        outputs = runner.generate_multimodal(
+            prompts=question,
+            audios=audio,
+            images=image,
+            videos=video,
+            modalities=modalities,
+        )
+
+        # Verify we got outputs from multiple stages
+        assert len(outputs) > 0
+
+        for stage_output in outputs:
+            assert stage_output.final_output_type != "audio"
+
+        # Find and verify text output (thinker stage)
+        text_output = None
+        for stage_output in outputs:
+            if stage_output.final_output_type == "text":
+                text_output = stage_output
+                break
+
+        assert text_output is not None
+        assert len(text_output.request_output) > 0
+        text_content = text_output.request_output[0].outputs[0].text
+        assert text_content is not None
+        assert len(text_content.strip()) > 0

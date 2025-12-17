@@ -626,6 +626,7 @@ def _stage_worker(
                 idx = 0
                 for ro in unmapped:
                     target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                    ro.request_id = target_rid
                     req_to_outputs[target_rid].append(ro)
                     idx += 1
 

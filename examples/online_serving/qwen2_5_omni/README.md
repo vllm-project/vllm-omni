@@ -24,7 +24,7 @@ Get into the example folder
 cd examples/online_serving/qwen2_5_omni
 ```
 
-####  Send request via python
+#### Send request via python
 
 ```bash
 python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities
@@ -68,6 +68,14 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 
 ```bash
 bash run_curl_multimodal_generation.sh mixed_modalities
+```
+
+## Modality control
+If you want to control output modalities, e.g. only output text, you can run the command below:
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type mixed_modalities \
+    --modalities text
 ```
 
 ## Run Local Web UI Demo

@@ -373,6 +373,11 @@ def main(args):
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+        for i, prompt in enumerate(prompts):
+            prompt["modalities"] = output_modalities
+
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
@@ -381,11 +386,11 @@ def main(args):
     for stage_outputs in omni_outputs:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 text_output = output.outputs[0].text
                 # Save aligned text file per request
-                prompt_text = prompts[request_id]["prompt"]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
                 lines = []
                 lines.append("Prompt:\n")
                 lines.append(str(prompt_text) + "\n")
@@ -399,9 +404,9 @@ def main(args):
                 print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
@@ -504,6 +509,12 @@ def parse_args():
         type=str,
         default=None,
         help="Address of the Ray cluster.",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Modalities to use for the prompts.",
     )
     return parser.parse_args()
 
