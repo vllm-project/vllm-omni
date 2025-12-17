@@ -21,6 +21,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
 
 logger = init_logger(__name__)
 
@@ -542,6 +547,7 @@ class QwenImageTransformer2DModel(nn.Module):
         super().__init__()
         model_config = od_config.tf_model_config
         num_layers = model_config.num_layers
+        self.parallel_config = od_config.parallel_config
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
@@ -616,6 +622,11 @@ class QwenImageTransformer2DModel(nn.Module):
         # else:
         #     lora_scale = 1.0
 
+        if self.parallel_config.sequence_parallel_size > 1:
+            hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
+                get_sequence_parallel_rank()
+            ]
+
         hidden_states = self.img_in(hidden_states)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
@@ -645,6 +656,15 @@ class QwenImageTransformer2DModel(nn.Module):
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
+        def get_rotary_emb_chunk(freqs):
+            freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[get_sequence_parallel_rank()]
+            return freqs
+
+        if self.parallel_config.sequence_parallel_size > 1:
+            img_freqs, txt_freqs = image_rotary_emb
+            img_freqs = get_rotary_emb_chunk(img_freqs)
+            image_rotary_emb = (img_freqs, txt_freqs)
+
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -662,6 +682,8 @@ class QwenImageTransformer2DModel(nn.Module):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
+        if self.parallel_config.sequence_parallel_size > 1:
+            output = get_sp_group().all_gather(output, dim=-2)
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

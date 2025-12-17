@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -57,6 +58,13 @@ def parse_args() -> argparse.Namespace:
             "Default: None (no cache acceleration)."
         ),
     )
+    parser.add_argument(
+        "--ulysses_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+
     return parser.parse_args()
 
 
@@ -98,12 +106,14 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
+    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        parallel_config=parallel_config,
     )
 
     # Time profiling for generation
@@ -112,6 +122,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
