@@ -10,9 +10,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-import torch.distributed as dist
 import torch.nn as nn
-from torch import Tensor
 from torch import Tensor
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -56,6 +54,7 @@ class Attention(nn.Module):
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.use_sync = use_sync
+        self.causal = causal
         self.ring_pg: Optional[dist.ProcessGroup] = None
         self.ulysses_pg: Optional[dist.ProcessGroup] = None
         self.use_ulysses = False
@@ -121,7 +120,7 @@ class Attention(nn.Module):
             value,
             dropout_p=0.0, # TODO: get from config if needed
             softmax_scale=softmax_scale,
-            causal=False, # TODO: verify causal logic
+            causal=self.causal,
             window_size=(-1, -1),
             softcap=0.0,
             alibi_slopes=None,
@@ -175,7 +174,7 @@ class Attention(nn.Module):
                 v,
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
-                causal=False,
+                causal=self.causal,
                 window_size=(-1, -1),
                 softcap=0.0,
                 alibi_slopes=None,
