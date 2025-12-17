@@ -5,7 +5,12 @@ import os
 import time
 from typing import Any
 
+from vllm.logger import init_logger
 from vllm_omni.entrypoints.stage_utils import append_jsonl as _append_jsonl
+
+
+_orchestrator_logger = init_logger("vllm_omni.orchestrator")
+_diffusion_logger = init_logger("vllm_omni.diffusion")
 
 
 def remove_old_logs(log_file: str | None, num_stages: int) -> None:
@@ -49,6 +54,11 @@ def remove_old_logs(log_file: str | None, num_stages: int) -> None:
 
 
 def configure_orchestrator_logger(logger: logging.Logger, log_file: str | None) -> None:
+    """
+    Attach a FileHandler to the given logger, and also to the
+    module-level orchestrator & diffusion loggers so they share
+    the same log file.
+    """
     try:
         if not log_file:
             return
@@ -56,9 +66,21 @@ def configure_orchestrator_logger(logger: logging.Logger, log_file: str | None) 
         if not has_file_handler:
             fh = logging.FileHandler(log_file)
             fh.setLevel(logging.DEBUG)
-            fh.setFormatter(logging.Formatter("%(asctime)s [PID:%(process)d] %(levelname)s: %(message)s"))
+            fh.setFormatter(
+                logging.Formatter("%(asctime)s [PID:%(process)d] %(levelname)s: %(message)s")
+            )
+            # Attach to caller logger (usually __name__)
             logger.addHandler(fh)
             logger.setLevel(logging.DEBUG)
+
+            # Also attach to module-level orchestrator & diffusion loggers
+            for lg in (_orchestrator_logger, _diffusion_logger):
+                try:
+                    lg.addHandler(fh)
+                    if lg.level > logging.DEBUG:
+                        lg.setLevel(logging.DEBUG)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -297,11 +319,11 @@ def compute_and_log_stage_request_stats(
     )
 
 
-# ----------------- Aggregation helpers for orchestrator -----------------
+
 
 
 def record_stage_metrics(
-    per_request: dict[str, dict[str, Any]],
+    per_request: dict[int, dict[str, Any]],
     stage_req_counts: list[int],
     stage_total_time_ms: list[float],
     stage_total_tokens: list[int],
@@ -312,8 +334,8 @@ def record_stage_metrics(
     try:
         stage_req_counts[stage_id] += 1
         stage_total_tokens[stage_id] += int(metrics.get("num_tokens_out", 0))
-        rid_key = str(req_id)
-        pr = per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+        rid_int = int(req_id)
+        pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         pr_stages = pr["stages"]  # type: ignore[index]
         pr_stages[stage_id] = {
             "stage_gen_time_ms": float(metrics.get("stage_gen_time_ms", 0.0)),
@@ -324,9 +346,9 @@ def record_stage_metrics(
 
 
 def aggregate_rx_and_maybe_total(
-    transfer_edge_req: dict[tuple[int, int, str], dict[str, float]],
+    transfer_edge_req: dict[tuple[int, int, int], dict[str, float]],
     transfer_agg: dict[tuple[int, int], dict[str, float]],
-    per_request: dict[str, dict[str, Any]],
+    per_request: dict[int, dict[str, Any]],
     stage_id: int,
     req_id: Any,
     rx_bytes: float,
@@ -355,8 +377,11 @@ def aggregate_rx_and_maybe_total(
             agg["rx_count"] += 1.0
 
             # Try combine with sender-side timing if present
-            rid_key = str(req_id)
-            s = transfer_edge_req.get((stage_id - 1, stage_id, rid_key))
+            try:
+                rid_int = int(req_id)
+            except Exception:
+                rid_int = req_id  # best effort
+            s = transfer_edge_req.get((stage_id - 1, stage_id, rid_int))
             if s is None:
                 return None
             tx_ms = float(s.get("tx_ms", 0.0))
@@ -366,7 +391,7 @@ def aggregate_rx_and_maybe_total(
             agg["total_count"] += 1.0
             # accumulate per-request transfer totals
             try:
-                pr = per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+                pr = per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
                 pr["transfers_ms"] = float(pr.get("transfers_ms", 0.0)) + total_ms  # type: ignore[index]
                 pr["transfers_bytes"] = int(pr.get("transfers_bytes", 0)) + int(rx_bytes)  # type: ignore[index]
             except Exception:
@@ -379,7 +404,7 @@ def aggregate_rx_and_maybe_total(
 
 def record_sender_transfer_agg(
     transfer_agg: dict[tuple[int, int], dict[str, float]],
-    transfer_edge_req: dict[tuple[int, int, str], dict[str, float]],
+    transfer_edge_req: dict[tuple[int, int, int], dict[str, float]],
     from_stage: int,
     to_stage: int,
     req_id: Any,
@@ -405,8 +430,11 @@ def record_sender_transfer_agg(
         agg["sum_ms"] += float(tx_ms)
         agg["count"] += 1.0
         # Store sender-side timing for per-request combination
-        rid_key = str(req_id)
-        transfer_edge_req[(from_stage, to_stage, rid_key)] = {
+        try:
+            rid_int = int(req_id)
+        except Exception:
+            rid_int = req_id
+        transfer_edge_req[(from_stage, to_stage, rid_int)] = {
             "tx_ms": float(tx_ms),
             "size_bytes": float(size_bytes),
         }
@@ -506,12 +534,12 @@ class OrchestratorMetrics:
         self.stage_total_tokens: list[int] = [0 for _ in range(self.num_stages)]
         self.stage_req_counts: list[int] = [0 for _ in range(self.num_stages)]
         self.transfer_agg: dict[tuple[int, int], dict[str, float]] = {}
-        self.transfer_edge_req: dict[tuple[int, int, str], dict[str, float]] = {}
+        self.transfer_edge_req: dict[tuple[int, int, int], dict[str, float]] = {}
         self.e2e_total_ms: float = 0.0
         self.e2e_total_tokens: int = 0
         self.e2e_count: int = 0
-        self.e2e_done: set[str] = set()
-        self.per_request: dict[str, dict[str, Any]] = {}
+        self.e2e_done: set[int] = set()
+        self.per_request: dict[int, dict[str, Any]] = {}
         self.sum_per_request_transfer_ms: float = 0.0
         self.wall_start_ts: float = float(wall_start_ts)
         self.last_finish_ts: float = float(wall_start_ts)
@@ -575,6 +603,18 @@ class OrchestratorMetrics:
                     float(total_ms_c),
                 )
 
+        if self.enable_stats:
+            try:
+                _diffusion_logger.info(
+                    "[StageMetrics] stage=%s req=%s metrics=%s",
+                    stage_id,
+                    req_id,
+                    metrics,
+                )
+            except Exception:
+                # best-effort logging; don't break orchestrator
+                pass
+
     def on_forward(
         self,
         from_stage: int,
@@ -608,7 +648,10 @@ class OrchestratorMetrics:
         )
 
     def on_finalize_request(self, stage_id: int, req_id: Any, engine_outputs: list[Any], req_start_ts: float) -> None:
-        rid_key = str(req_id)
+        try:
+            rid_int = int(req_id)
+        except Exception:
+            rid_int = req_id
         _t0 = float(req_start_ts)
         _t1 = time.time()
         # Update last output time for this stage
@@ -620,16 +663,17 @@ class OrchestratorMetrics:
         self.e2e_total_ms += e2e_ms
         self.e2e_total_tokens += int(num_tokens)
         self.e2e_count += 1
-        self.e2e_done.add(rid_key)
-        pr = self.per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+        self.e2e_done.add(rid_int)
+        pr = self.per_request.setdefault(rid_int, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         per_req_record = {
             "type": "overall_request",
-            "request_id": rid_key,
+            "request_id": rid_int,
             "e2e_time_ms": e2e_ms,
             "num_tokens_out": int(num_tokens),
             "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
             "transfers_total_bytes": int(pr.get("transfers_bytes", 0)),
             "stages": pr.get("stages", {}),
+            "audio_metrics": pr.get("audio_metrics", {}),
         }
         self.sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
         if self.enable_stats and self.overall_stats_file:
@@ -665,6 +709,7 @@ class OrchestratorMetrics:
         e2e_avg_req = (self.e2e_total_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
         e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / self.e2e_total_ms) if self.e2e_total_ms > 0 else 0.0
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
+
         summary: dict[str, Any] = {
             "e2e_requests": int(self.e2e_count),
             "e2e_total_time_ms": float(wall_time_ms),
@@ -677,6 +722,7 @@ class OrchestratorMetrics:
             "stages": stage_summary,
             "transfers": transfer_summary,
         }
+
         if self.enable_stats and self.stats_file:
             log_orchestrator_summary(self.stats_file, summary)
         if self.enable_stats and self.overall_stats_file:
