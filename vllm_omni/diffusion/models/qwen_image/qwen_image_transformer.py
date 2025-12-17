@@ -546,11 +546,6 @@ class QwenImageTransformer2DModel(nn.Module):
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
-        # print("hidden_states shape:", hidden_states.shape)
-        # print("encoder_hidden_states shape:", encoder_hidden_states.shape)
-        # print("encoder_hidden_states_mask shape:", encoder_hidden_states_mask.shape)
-        # print("temb shape:", temb.shape)
-        # print("image_rotary_emb shapes:", [x.shape for x in image_rotary_emb])
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
