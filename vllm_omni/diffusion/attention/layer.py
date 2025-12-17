@@ -23,6 +23,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel
 from vllm_omni.utils.platform_utils import is_npu
 from vllm_omni.diffusion.attention.ring_flash_attn import ring_flash_attn_func
 from vllm_omni.diffusion.attention.backends.ring_selector import AttnType
+from vllm_omni.diffusion.attention.backends.ring_globals import HAS_FLASH_ATTN
 
 
 class Attention(nn.Module):
@@ -95,6 +96,28 @@ class Attention(nn.Module):
         elif self.use_ring:
             return self._forward_ring(query, key, value, attn_metadata)
         else:
+            # If FlashAttention is available and not on NPU, use it to ensure consistency with Ring Attention
+            if HAS_FLASH_ATTN and not is_npu():
+                softmax_scale = self.softmax_scale
+                if softmax_scale is None:
+                    softmax_scale = query.shape[-1] ** -0.5
+                
+                return ring_flash_attn_func(
+                    query,
+                    key,
+                    value,
+                    dropout_p=0.0,
+                    softmax_scale=softmax_scale,
+                    causal=self.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=False,
+                    group=None,
+                    attn_type=AttnType.FA,
+                )
+
             # shape: (batch_size, seq_len, num_heads, head_size)
             attn_output = self.attention.forward(query, key, value, attn_metadata)
             return attn_output
