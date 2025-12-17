@@ -295,8 +295,12 @@ class OmniLLM:
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt = {}
         for rid, prompt in request_id_to_prompt.items():
+            if isinstance(prompt, dict):
+                prompt_modalities = prompt.get("modalities", None)
+            else:
+                prompt_modalities = None
             final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                prompt.get("modalities", None), self.output_modalities, self.stage_list
+                prompt_modalities, self.output_modalities, self.stage_list
             )
             final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
