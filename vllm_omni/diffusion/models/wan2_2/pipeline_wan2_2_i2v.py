@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterable
 
@@ -19,72 +18,13 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    create_transformer_from_config,
+    load_transformer_config,
+    retrieve_latents,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-
-
-def load_transformer_config(model_path: str, subfolder: str = "transformer") -> dict:
-    """Load transformer config from model directory."""
-    config_path = os.path.join(model_path, subfolder, "config.json")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            return json.load(f)
-    return {}
-
-
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
-    # Map config keys to constructor parameters
-    kwargs = {}
-
-    if "patch_size" in config:
-        kwargs["patch_size"] = tuple(config["patch_size"])
-    if "num_attention_heads" in config:
-        kwargs["num_attention_heads"] = config["num_attention_heads"]
-    if "attention_head_dim" in config:
-        kwargs["attention_head_dim"] = config["attention_head_dim"]
-    if "in_channels" in config:
-        kwargs["in_channels"] = config["in_channels"]
-    if "out_channels" in config:
-        kwargs["out_channels"] = config["out_channels"]
-    if "text_dim" in config:
-        kwargs["text_dim"] = config["text_dim"]
-    if "freq_dim" in config:
-        kwargs["freq_dim"] = config["freq_dim"]
-    if "ffn_dim" in config:
-        kwargs["ffn_dim"] = config["ffn_dim"]
-    if "num_layers" in config:
-        kwargs["num_layers"] = config["num_layers"]
-    if "cross_attn_norm" in config:
-        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
-    if "eps" in config:
-        kwargs["eps"] = config["eps"]
-    if "image_dim" in config:
-        kwargs["image_dim"] = config["image_dim"]
-    if "added_kv_proj_dim" in config:
-        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
-    if "rope_max_seq_len" in config:
-        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
-    if "pos_embed_seq_len" in config:
-        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
-
-    return WanTransformer3DModel(**kwargs)
-
-
-def retrieve_latents(
-    encoder_output: torch.Tensor,
-    generator: torch.Generator | None = None,
-    sample_mode: str = "sample",
-):
-    """Retrieve latents from VAE encoder output."""
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
 
 
 def get_wan22_i2v_post_process_func(
