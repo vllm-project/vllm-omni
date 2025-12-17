@@ -148,7 +148,9 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
-def get_final_stage_id_for_e2e(output_modalities: list[str], default_modalities: list[str], stage_list: list) -> int:
+def get_final_stage_id_for_e2e(
+    output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
+) -> int:
     """Get the final stage id for e2e.
 
     Args:
@@ -163,6 +165,7 @@ def get_final_stage_id_for_e2e(output_modalities: list[str], default_modalities:
         for modality in output_modalities:
             if modality not in default_modalities:
                 logger.warning(f"Invalid output modality: {modality}, ignoring it")
+                # TODO: if user specifies unsupported modalities, invalid it and raise an error
                 continue
             prompt_modalities.append(modality)
         output_modalities = prompt_modalities
