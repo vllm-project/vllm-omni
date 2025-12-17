@@ -148,7 +148,9 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
-def get_final_stage_id_for_e2e(output_modalities: list[str] | None, default_modalities: list[str], stage_list: list) -> int:
+def get_final_stage_id_for_e2e(
+    output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
+) -> int:
     """Get the final stage id for e2e.
 
     Args:
