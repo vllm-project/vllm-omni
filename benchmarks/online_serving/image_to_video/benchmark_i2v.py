@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import mimetypes
+import os
 import platform
 import subprocess
 import sys
@@ -19,13 +22,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-DEFAULT_T2I_PROMPTS: list[str] = [
-    "A cat",
-    "A futuristic city with flying cars and neon lights, cyberpunk style, high resolution, 8k",
-    "An astronaut riding a horse on mars, realistic photography",
-    "A landscape painting of mountains and river, oil painting style",
-    "一只橘猫在窗台上晒太阳，温暖的午后，写实风格",
-    "赛博朋克街道，雨夜霓虹，路面反光，细节丰富",
+DEFAULT_I2V_PROMPTS: list[str] = [
+    "Animate this image with a slow cinematic camera move.",
+    "Turn this into a short video with subtle motion and realistic lighting.",
+    "Create a smooth parallax effect and gentle wind movement.",
+    "Generate a short loop with slight camera zoom and ambient motion.",
 ]
 
 
@@ -62,7 +63,7 @@ def _read_prompts(prompt_file: Optional[Path], prompt: Optional[str], num_prompt
         source = str(prompt_file)
         version = _sha256_bytes(raw.encode("utf-8"))
     else:
-        prompts = list(DEFAULT_T2I_PROMPTS)
+        prompts = list(DEFAULT_I2V_PROMPTS)
         source = "builtin"
         version = _sha256_bytes(("\n".join(prompts)).encode("utf-8"))
 
@@ -205,30 +206,36 @@ class GPUMonitor(threading.Thread):
         self.join(timeout=5.0)
 
 
-def _extract_b64_json_count(body: bytes) -> Optional[int]:
+def _guess_mime_type(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime or "application/octet-stream"
+
+
+def _encode_image_as_data_url(path: Path) -> str:
+    mime = _guess_mime_type(path)
+    b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def _extract_data_count(body: bytes) -> Optional[int]:
     parsed = _try_parse_json(body)
     if not isinstance(parsed, dict):
         return None
     data = parsed.get("data")
     if not isinstance(data, list):
         return None
-    cnt = 0
-    for item in data:
-        if isinstance(item, dict) and isinstance(item.get("b64_json"), str) and item["b64_json"]:
-            cnt += 1
-    return int(cnt)
+    return int(len(data))
 
 
-def _send_images_generations_request(
+def _send_i2v_request(
     *,
     api_base: str,
     endpoint_path: str,
     api_key: str,
     model: Optional[str],
     prompt: str,
+    image_data_url: str,
     n: int,
-    size: str,
-    response_format: str,
     timeout_s: float,
     extra_fields: dict[str, Any],
 ) -> tuple[float, bool, Optional[str], Optional[int]]:
@@ -236,9 +243,8 @@ def _send_images_generations_request(
 
     payload: dict[str, Any] = {
         "prompt": prompt,
+        "image": image_data_url,
         "n": n,
-        "size": size,
-        "response_format": response_format,
     }
     if model:
         payload["model"] = model
@@ -255,12 +261,12 @@ def _send_images_generations_request(
         parsed = _try_parse_json(body)
         if isinstance(parsed, dict) and "error" in parsed:
             return latency_s, False, _extract_error_message(body), None
-        out_n = _extract_b64_json_count(body)
+        out_n = _extract_data_count(body)
         return latency_s, True, None, out_n
     except urllib.error.HTTPError as e:
         latency_s = time.perf_counter() - t0
-        body = e.read() if hasattr(e, "read") else b""
-        return latency_s, False, _extract_error_message(body) or str(e), None
+        resp_body = e.read() if hasattr(e, "read") else b""
+        return latency_s, False, _extract_error_message(resp_body) or str(e), None
     except Exception as e:
         latency_s = time.perf_counter() - t0
         return latency_s, False, str(e), None
@@ -268,37 +274,32 @@ def _send_images_generations_request(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/images/generations."
+        description="Online serving benchmark for Image-to-Video via OpenAI-style API (endpoint is configurable)."
     )
 
     parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
     parser.add_argument("--api-key", type=str, default="EMPTY", help="OpenAI API key (use 'EMPTY' for local).")
-    parser.add_argument("--endpoint-path", type=str, default="/images/generations", help="Endpoint path.")
+    parser.add_argument(
+        "--endpoint-path",
+        type=str,
+        default="/videos/generations",
+        help="Endpoint path (default assumes an OpenAI-style videos generations API).",
+    )
     parser.add_argument("--model", type=str, default=None, help="Optional served model name (server default if omitted).")
+
+    parser.add_argument("--image", type=str, required=True, help="Input image path.")
 
     parser.add_argument("--prompt", type=str, default=None, help="Single prompt (overrides prompt set).")
     parser.add_argument("--prompt-file", type=str, default=None, help="Text file with one prompt per line.")
     parser.add_argument("--num-prompts", type=int, default=None, help="Use only the first N prompts from the set.")
 
-    parser.add_argument("--concurrency", type=int, default=8, help="Concurrent clients (threads).")
-    parser.add_argument("--num-requests", type=int, default=40, help="Total measured requests.")
+    parser.add_argument("--concurrency", type=int, default=2, help="Concurrent clients (threads).")
+    parser.add_argument("--num-requests", type=int, default=10, help="Total measured requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
-    parser.add_argument("--n", type=int, default=1, help="OpenAI 'n': images per request.")
-    parser.add_argument("--size", type=str, default="1024x1024", help="OpenAI 'size' (e.g., 1024x1024).")
-    parser.add_argument(
-        "--response-format",
-        type=str,
-        default="b64_json",
-        help="OpenAI response_format (only b64_json supported by vLLM-Omni images API).",
-    )
-    parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
-
-    parser.add_argument("--seed", type=int, default=None, help="(ext) Random seed.")
-    parser.add_argument("--num-inference-steps", type=int, default=None, help="(ext) num_inference_steps.")
-    parser.add_argument("--guidance-scale", type=float, default=None, help="(ext) guidance_scale.")
-    parser.add_argument("--true-cfg-scale", type=float, default=None, help="(ext) true_cfg_scale.")
-    parser.add_argument("--negative-prompt", type=str, default=None, help="(ext) negative_prompt.")
+    parser.add_argument("--n", type=int, default=1, help="Number of videos per request (OpenAI-style).")
+    parser.add_argument("--num-frames", type=int, default=None, help="Optional num_frames for throughput in frames/s.")
+    parser.add_argument("--timeout-s", type=float, default=900.0, help="HTTP timeout per request.")
     parser.add_argument("--extra-json", type=str, default=None, help="Extra JSON fields to merge into request.")
 
     parser.add_argument("--gpu-monitor", action="store_true", help="Enable GPU peak VRAM monitor (NVML).")
@@ -320,6 +321,11 @@ def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[3]
 
+    image_path = Path(args.image).resolve()
+    if not image_path.exists():
+        raise FileNotFoundError(f"--image not found: {image_path}")
+    image_data_url = _encode_image_as_data_url(image_path)
+
     prompt_file = Path(args.prompt_file).resolve() if args.prompt_file else None
     prompt_data = _read_prompts(prompt_file, args.prompt, args.num_prompts)
     prompts: list[str] = prompt_data["prompts"]
@@ -332,20 +338,8 @@ def main() -> None:
         raise ValueError("--warmup-requests must be >= 0")
     if args.n <= 0:
         raise ValueError("--n must be >= 1")
-    if args.response_format != "b64_json":
-        raise ValueError("--response-format must be 'b64_json'.")
 
     extra_fields: dict[str, Any] = {}
-    if args.seed is not None:
-        extra_fields["seed"] = args.seed
-    if args.num_inference_steps is not None:
-        extra_fields["num_inference_steps"] = args.num_inference_steps
-    if args.guidance_scale is not None:
-        extra_fields["guidance_scale"] = args.guidance_scale
-    if args.true_cfg_scale is not None:
-        extra_fields["true_cfg_scale"] = args.true_cfg_scale
-    if args.negative_prompt is not None:
-        extra_fields["negative_prompt"] = args.negative_prompt
     if args.extra_json:
         extra_fields.update(json.loads(args.extra_json))
 
@@ -360,15 +354,14 @@ def main() -> None:
 
     def _task(i: int) -> dict[str, Any]:
         prompt = prompts[i % len(prompts)]
-        latency_s, ok, err, out_n = _send_images_generations_request(
+        latency_s, ok, err, out_n = _send_i2v_request(
             api_base=args.api_base,
             endpoint_path=args.endpoint_path,
             api_key=args.api_key,
             model=args.model,
             prompt=prompt,
+            image_data_url=image_data_url,
             n=args.n,
-            size=args.size,
-            response_format=args.response_format,
             timeout_s=args.timeout_s,
             extra_fields=extra_fields,
         )
@@ -384,12 +377,13 @@ def main() -> None:
     print(f"api_base:        {args.api_base}")
     print(f"endpoint_path:   {args.endpoint_path}")
     print(f"model:           {args.model or '(server default)'}")
+    print(f"image:           {image_path}")
     print(f"concurrency:     {args.concurrency}")
     print(f"warmup_requests: {args.warmup_requests}")
     print(f"num_requests:    {args.num_requests}")
     print(f"n:               {args.n}")
-    print(f"size:            {args.size}")
-    print(f"response_format: {args.response_format}")
+    if args.num_frames is not None:
+        print(f"num_frames:      {args.num_frames}")
     if extra_fields:
         print(f"extra_fields:    {extra_fields}")
 
@@ -426,20 +420,25 @@ def main() -> None:
         else:
             outputs_ok += args.n
 
-    throughput_img_s = float(outputs_ok / total_time_s) if total_time_s > 0 else 0.0
+    throughput_vid_s = float(outputs_ok / total_time_s) if total_time_s > 0 else 0.0
+    throughput_frames_s = None
+    if args.num_frames is not None and total_time_s > 0:
+        throughput_frames_s = float(outputs_ok * args.num_frames / total_time_s)
 
     print("\n" + "=" * 40)
     print("       BENCHMARK REPORT       ")
     print("=" * 40)
     print(f"Total Time Taken:       {total_time_s:.2f} s")
-    print(f"Total Images Gen:       {outputs_ok}")
+    print(f"Total Videos Gen:       {outputs_ok}")
     print(f"Success Rate:           {len(success) / len(results) * 100:.1f}%")
     print("-" * 40)
-    print(f"1. Throughput:          {throughput_img_s:.2f} images/s")
+    print(f"1. Throughput:          {throughput_vid_s:.2f} videos/s")
+    if throughput_frames_s is not None:
+        print(f"2. Throughput:          {throughput_frames_s:.2f} frames/s")
     if monitor is not None and monitor.error is None:
-        print(f"2. Memory Peak (Total): {monitor.max_memory_used_mb:.2f} MB")
+        print(f"3. Memory Peak (Total): {monitor.max_memory_used_mb:.2f} MB")
     else:
-        print("2. Memory Peak (Total): N/A")
+        print("3. Memory Peak (Total): N/A")
     print("-" * 40)
     if lat_ms_ok:
         stats = _summary_stats(lat_ms_ok)
@@ -458,7 +457,7 @@ def main() -> None:
         out_path = Path(args.output_json).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         summary = {
-            "task": "t2i",
+            "task": "i2v",
             "timestamp_utc": _utc_timestamp(),
             "git_commit": _git_commit(repo_root),
             "system": {
@@ -470,18 +469,19 @@ def main() -> None:
                 "api_base": args.api_base,
                 "endpoint_path": args.endpoint_path,
                 "model": args.model,
+                "image": str(image_path),
                 "concurrency": args.concurrency,
                 "warmup_requests": args.warmup_requests,
                 "num_requests": args.num_requests,
                 "n": args.n,
-                "size": args.size,
-                "response_format": args.response_format,
+                "num_frames": args.num_frames,
                 "timeout_s": args.timeout_s,
                 "extra_fields": extra_fields,
             },
             "metrics_summary": {
                 "e2e_latency_ms": (_summary_stats(lat_ms_ok) if lat_ms_ok else None),
-                "throughput_images_per_s": throughput_img_s,
+                "throughput_videos_per_s": throughput_vid_s,
+                "throughput_frames_per_s": throughput_frames_s,
                 "success_rate": float(len(success) / len(results)) if results else None,
                 "failure_rate": float(len(failures) / len(results)) if results else None,
                 "peak_vram_mb": (monitor.max_memory_used_mb if monitor is not None and monitor.error is None else None),

@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
+import mimetypes
+import os
 import platform
 import subprocess
 import sys
@@ -19,13 +22,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-DEFAULT_T2I_PROMPTS: list[str] = [
-    "A cat",
-    "A futuristic city with flying cars and neon lights, cyberpunk style, high resolution, 8k",
-    "An astronaut riding a horse on mars, realistic photography",
-    "A landscape painting of mountains and river, oil painting style",
-    "一只橘猫在窗台上晒太阳，温暖的午后，写实风格",
-    "赛博朋克街道，雨夜霓虹，路面反光，细节丰富",
+DEFAULT_I2I_PROMPTS: list[str] = [
+    "Convert this image to watercolor style.",
+    "Convert to oil painting style.",
+    "Make it look like a cinematic photo, high contrast.",
+    "Turn this into a cartoon illustration.",
+    "Enhance details and sharpen slightly.",
 ]
 
 
@@ -62,7 +64,7 @@ def _read_prompts(prompt_file: Optional[Path], prompt: Optional[str], num_prompt
         source = str(prompt_file)
         version = _sha256_bytes(raw.encode("utf-8"))
     else:
-        prompts = list(DEFAULT_T2I_PROMPTS)
+        prompts = list(DEFAULT_I2I_PROMPTS)
         source = "builtin"
         version = _sha256_bytes(("\n".join(prompts)).encode("utf-8"))
 
@@ -117,16 +119,6 @@ def _join_url(base_url: str, path: str) -> str:
     base = base_url.rstrip("/")
     rel = path.lstrip("/")
     return f"{base}/{rel}"
-
-
-def _http_post_json(url: str, api_key: str, payload: dict[str, Any], timeout_s: float) -> tuple[int, bytes]:
-    data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return int(getattr(resp, "status", 200)), resp.read()
 
 
 def _try_parse_json(body: bytes) -> Any:
@@ -205,6 +197,41 @@ class GPUMonitor(threading.Thread):
         self.join(timeout=5.0)
 
 
+def _guess_mime_type(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime or "application/octet-stream"
+
+
+def _encode_multipart_formdata(
+    *,
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+) -> tuple[bytes, str]:
+    boundary = f"----vllm-omni-bench-{os.urandom(8).hex()}"
+    crlf = "\r\n"
+    body_parts: list[bytes] = []
+
+    for name, value in fields.items():
+        body_parts.append(f"--{boundary}{crlf}".encode("utf-8"))
+        body_parts.append(f'Content-Disposition: form-data; name="{name}"{crlf}{crlf}'.encode("utf-8"))
+        body_parts.append(value.encode("utf-8"))
+        body_parts.append(crlf.encode("utf-8"))
+
+    for name, (filename, content, content_type) in files.items():
+        body_parts.append(f"--{boundary}{crlf}".encode("utf-8"))
+        body_parts.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"{crlf}'.encode("utf-8")
+        )
+        body_parts.append(f"Content-Type: {content_type}{crlf}{crlf}".encode("utf-8"))
+        body_parts.append(content)
+        body_parts.append(crlf.encode("utf-8"))
+
+    body_parts.append(f"--{boundary}--{crlf}".encode("utf-8"))
+    body = b"".join(body_parts)
+    content_type_header = f"multipart/form-data; boundary={boundary}"
+    return body, content_type_header
+
+
 def _extract_b64_json_count(body: bytes) -> Optional[int]:
     parsed = _try_parse_json(body)
     if not isinstance(parsed, dict):
@@ -219,13 +246,15 @@ def _extract_b64_json_count(body: bytes) -> Optional[int]:
     return int(cnt)
 
 
-def _send_images_generations_request(
+def _send_images_edits_request(
     *,
     api_base: str,
     endpoint_path: str,
     api_key: str,
     model: Optional[str],
     prompt: str,
+    image_path: Path,
+    mask_path: Optional[Path],
     n: int,
     size: str,
     response_format: str,
@@ -234,33 +263,54 @@ def _send_images_generations_request(
 ) -> tuple[float, bool, Optional[str], Optional[int]]:
     url = _join_url(api_base, endpoint_path)
 
-    payload: dict[str, Any] = {
+    image_bytes = image_path.read_bytes()
+    files: dict[str, tuple[str, bytes, str]] = {
+        "image": (image_path.name, image_bytes, _guess_mime_type(image_path)),
+    }
+    if mask_path is not None:
+        mask_bytes = mask_path.read_bytes()
+        files["mask"] = (mask_path.name, mask_bytes, _guess_mime_type(mask_path))
+
+    fields: dict[str, str] = {
         "prompt": prompt,
-        "n": n,
+        "n": str(n),
         "size": size,
         "response_format": response_format,
     }
     if model:
-        payload["model"] = model
+        fields["model"] = model
     for k, v in extra_fields.items():
-        if v is not None:
-            payload[k] = v
+        if v is None:
+            continue
+        fields[k] = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+
+    body, content_type = _encode_multipart_formdata(fields=fields, files=files)
+
+    headers = {
+        "Content-Type": content_type,
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     t0 = time.perf_counter()
     try:
-        status, body = _http_post_json(url, api_key, payload, timeout_s)
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = int(getattr(resp, "status", 200))
+            resp_body = resp.read()
         latency_s = time.perf_counter() - t0
         if status < 200 or status >= 300:
-            return latency_s, False, _extract_error_message(body), None
-        parsed = _try_parse_json(body)
+            return latency_s, False, _extract_error_message(resp_body), None
+        parsed = _try_parse_json(resp_body)
         if isinstance(parsed, dict) and "error" in parsed:
-            return latency_s, False, _extract_error_message(body), None
-        out_n = _extract_b64_json_count(body)
+            return latency_s, False, _extract_error_message(resp_body), None
+        out_n = _extract_b64_json_count(resp_body)
         return latency_s, True, None, out_n
     except urllib.error.HTTPError as e:
         latency_s = time.perf_counter() - t0
-        body = e.read() if hasattr(e, "read") else b""
-        return latency_s, False, _extract_error_message(body) or str(e), None
+        resp_body = e.read() if hasattr(e, "read") else b""
+        return latency_s, False, _extract_error_message(resp_body) or str(e), None
     except Exception as e:
         latency_s = time.perf_counter() - t0
         return latency_s, False, str(e), None
@@ -268,20 +318,23 @@ def _send_images_generations_request(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/images/generations."
+        description="Online serving benchmark for Image-to-Image via OpenAI-compatible /v1/images/edits."
     )
 
     parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
     parser.add_argument("--api-key", type=str, default="EMPTY", help="OpenAI API key (use 'EMPTY' for local).")
-    parser.add_argument("--endpoint-path", type=str, default="/images/generations", help="Endpoint path.")
+    parser.add_argument("--endpoint-path", type=str, default="/images/edits", help="Endpoint path.")
     parser.add_argument("--model", type=str, default=None, help="Optional served model name (server default if omitted).")
+
+    parser.add_argument("--image", type=str, required=True, help="Input image path.")
+    parser.add_argument("--mask", type=str, default=None, help="Optional mask image path (OpenAI edits API).")
 
     parser.add_argument("--prompt", type=str, default=None, help="Single prompt (overrides prompt set).")
     parser.add_argument("--prompt-file", type=str, default=None, help="Text file with one prompt per line.")
     parser.add_argument("--num-prompts", type=int, default=None, help="Use only the first N prompts from the set.")
 
-    parser.add_argument("--concurrency", type=int, default=8, help="Concurrent clients (threads).")
-    parser.add_argument("--num-requests", type=int, default=40, help="Total measured requests.")
+    parser.add_argument("--concurrency", type=int, default=4, help="Concurrent clients (threads).")
+    parser.add_argument("--num-requests", type=int, default=20, help="Total measured requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
     parser.add_argument("--n", type=int, default=1, help="OpenAI 'n': images per request.")
@@ -290,15 +343,9 @@ def parse_args() -> argparse.Namespace:
         "--response-format",
         type=str,
         default="b64_json",
-        help="OpenAI response_format (only b64_json supported by vLLM-Omni images API).",
+        help="OpenAI response_format (only b64_json is commonly supported).",
     )
     parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
-
-    parser.add_argument("--seed", type=int, default=None, help="(ext) Random seed.")
-    parser.add_argument("--num-inference-steps", type=int, default=None, help="(ext) num_inference_steps.")
-    parser.add_argument("--guidance-scale", type=float, default=None, help="(ext) guidance_scale.")
-    parser.add_argument("--true-cfg-scale", type=float, default=None, help="(ext) true_cfg_scale.")
-    parser.add_argument("--negative-prompt", type=str, default=None, help="(ext) negative_prompt.")
     parser.add_argument("--extra-json", type=str, default=None, help="Extra JSON fields to merge into request.")
 
     parser.add_argument("--gpu-monitor", action="store_true", help="Enable GPU peak VRAM monitor (NVML).")
@@ -320,6 +367,13 @@ def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[3]
 
+    image_path = Path(args.image).resolve()
+    if not image_path.exists():
+        raise FileNotFoundError(f"--image not found: {image_path}")
+    mask_path = Path(args.mask).resolve() if args.mask else None
+    if mask_path is not None and not mask_path.exists():
+        raise FileNotFoundError(f"--mask not found: {mask_path}")
+
     prompt_file = Path(args.prompt_file).resolve() if args.prompt_file else None
     prompt_data = _read_prompts(prompt_file, args.prompt, args.num_prompts)
     prompts: list[str] = prompt_data["prompts"]
@@ -332,20 +386,8 @@ def main() -> None:
         raise ValueError("--warmup-requests must be >= 0")
     if args.n <= 0:
         raise ValueError("--n must be >= 1")
-    if args.response_format != "b64_json":
-        raise ValueError("--response-format must be 'b64_json'.")
 
     extra_fields: dict[str, Any] = {}
-    if args.seed is not None:
-        extra_fields["seed"] = args.seed
-    if args.num_inference_steps is not None:
-        extra_fields["num_inference_steps"] = args.num_inference_steps
-    if args.guidance_scale is not None:
-        extra_fields["guidance_scale"] = args.guidance_scale
-    if args.true_cfg_scale is not None:
-        extra_fields["true_cfg_scale"] = args.true_cfg_scale
-    if args.negative_prompt is not None:
-        extra_fields["negative_prompt"] = args.negative_prompt
     if args.extra_json:
         extra_fields.update(json.loads(args.extra_json))
 
@@ -360,12 +402,14 @@ def main() -> None:
 
     def _task(i: int) -> dict[str, Any]:
         prompt = prompts[i % len(prompts)]
-        latency_s, ok, err, out_n = _send_images_generations_request(
+        latency_s, ok, err, out_n = _send_images_edits_request(
             api_base=args.api_base,
             endpoint_path=args.endpoint_path,
             api_key=args.api_key,
             model=args.model,
             prompt=prompt,
+            image_path=image_path,
+            mask_path=mask_path,
             n=args.n,
             size=args.size,
             response_format=args.response_format,
@@ -384,6 +428,8 @@ def main() -> None:
     print(f"api_base:        {args.api_base}")
     print(f"endpoint_path:   {args.endpoint_path}")
     print(f"model:           {args.model or '(server default)'}")
+    print(f"image:           {image_path}")
+    print(f"mask:            {mask_path or '(none)'}")
     print(f"concurrency:     {args.concurrency}")
     print(f"warmup_requests: {args.warmup_requests}")
     print(f"num_requests:    {args.num_requests}")
@@ -458,7 +504,7 @@ def main() -> None:
         out_path = Path(args.output_json).resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         summary = {
-            "task": "t2i",
+            "task": "i2i",
             "timestamp_utc": _utc_timestamp(),
             "git_commit": _git_commit(repo_root),
             "system": {
@@ -470,6 +516,8 @@ def main() -> None:
                 "api_base": args.api_base,
                 "endpoint_path": args.endpoint_path,
                 "model": args.model,
+                "image": str(image_path),
+                "mask": (str(mask_path) if mask_path is not None else None),
                 "concurrency": args.concurrency,
                 "warmup_requests": args.warmup_requests,
                 "num_requests": args.num_requests,
