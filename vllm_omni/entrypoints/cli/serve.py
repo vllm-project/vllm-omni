@@ -134,8 +134,17 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--num-gpus",
             type=int,
-            default=1,
+            default=None,
             help="Number of GPUs to use for diffusion model inference.",
+        )
+        serve_parser.add_argument(
+            "--usp",
+            "--ulysses-degree",
+            dest="ulysses_degree",
+            type=int,
+            default=None,
+            help="Ulysses Sequence Parallelism degree for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
         )
 
         # Cache optimization parameters

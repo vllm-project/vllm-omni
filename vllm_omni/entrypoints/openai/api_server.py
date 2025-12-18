@@ -40,7 +40,7 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.utils import decorate_logs
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -235,6 +235,18 @@ async def build_async_diffusion(
         # Build diffusion kwargs by extracting matching OmniDiffusionConfig fields from args
         config_field_names = {f.name for f in fields(OmniDiffusionConfig)}
         diffusion_kwargs: dict[str, Any] = {"model": args.model}
+
+        # Diffusion parallelism configuration (e.g. `--usp 2`).
+        parallel_config_kwargs: dict[str, Any] = {}
+        for field in fields(DiffusionParallelConfig):
+            if not hasattr(args, field.name):
+                continue
+            value = getattr(args, field.name)
+            if value is None:
+                continue
+            parallel_config_kwargs[field.name] = value
+        if parallel_config_kwargs:
+            diffusion_kwargs["parallel_config"] = DiffusionParallelConfig(**parallel_config_kwargs)
 
         for field_name in config_field_names:
             if not hasattr(args, field_name):
