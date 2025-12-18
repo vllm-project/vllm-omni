@@ -1,4 +1,4 @@
-# Image-To-Image Online Serving
+# Image-To-Image
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/image_to_image>.
 

@@ -1,4 +1,4 @@
-# Text-To-Image Online Serving
+# Text-To-Image
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_image>.
 

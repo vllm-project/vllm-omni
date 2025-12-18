@@ -16,7 +16,7 @@ nav:
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
-      - Text-To-Image Online Serving: user_guide/examples/online_serving/text_to_image.md
+      - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
   - General:
     - usage/*
   - Configuration:

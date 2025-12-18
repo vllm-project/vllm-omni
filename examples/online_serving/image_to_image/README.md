@@ -1,4 +1,4 @@
-# Image-To-Image Online Serving
+# Image-To-Image
 
 This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
 

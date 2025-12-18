@@ -1,4 +1,4 @@
-# Text-To-Image Online Serving
+# Text-To-Image
 
 This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
