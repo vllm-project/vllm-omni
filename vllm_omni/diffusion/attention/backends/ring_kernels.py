@@ -56,7 +56,7 @@ def pytorch_attn_forward(
     softcap=None,
     alibi_slopes=None,
     return_softmax=False,
-    op_type="efficient",
+    op_type="flash",
 ):
     assert op_type in ["flash", "efficient"], f"Invalid op_type: {op_type}"
     """
@@ -64,6 +64,14 @@ def pytorch_attn_forward(
     k shape (bs, seqlen, nhead, hs)
     v shape (bs, seqlen, nhead, hs)
     """
+    # print(f"DEBUG pytorch_attn_forward INPUT: q={q.shape}, op_type={op_type}, dtype={q.dtype}")
+    
+    # Fallback logic: Flash Attention does not support float32.
+    # If op_type is 'flash' but dtype is float32, force 'efficient'.
+    if op_type == "flash" and q.dtype == torch.float32:
+        # print("DEBUG: Downgrading op_type to 'efficient' because dtype is float32")
+        op_type = "efficient"
+
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
@@ -91,8 +99,12 @@ def pytorch_attn_forward(
     else:
         raise ValueError(f"Invalid op_type: {op_type}")
     
+    # print(f"DEBUG pytorch_attn_forward RAW OUTPUT: out={out.shape}, lse={lse.shape}")
+
     out = out.transpose(1, 2)
     lse = lse.to(q.dtype)
+    
+    # print(f"DEBUG pytorch_attn_forward FINAL OUTPUT: out={out.shape}, lse={lse.shape}")
     return out, lse
 
 def pytorch_attn_backward(
@@ -382,4 +394,3 @@ def npu_attn_forward(q, k, v,
                                                 pre_tokens=65535, 
                                                 next_tokens=65535)
     return block_out, block_lse.squeeze(dim=-1)
-
