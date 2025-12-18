@@ -74,14 +74,78 @@ class OmniMsgpackDecoder(MsgpackDecoder):
         return super().dec_hook(t, obj)
 
 
-def _post_process_pil_images(obj: Any) -> Any:
-    """Recursively convert PIL Image marker dicts back to PIL.Image objects.
+def _is_encoded_tensor(obj: Any) -> bool:
+    """Check if obj looks like an encoded tensor: (dtype_str, shape_tuple, data)."""
+    if not isinstance(obj, (list, tuple)) or len(obj) != 3:
+        return False
+    dtype_str, shape, data = obj
+    if not isinstance(dtype_str, str):
+        return False
+    if not isinstance(shape, (list, tuple)):
+        return False
+    # Check shape contains only integers
+    if not all(isinstance(s, int) for s in shape):
+        return False
+    # dtype_str should be a valid torch dtype name (without 'torch.' prefix)
+    # Common dtypes: float32, float16, bfloat16, int64, int32, etc.
+    valid_dtypes = {
+        "float32", "float16", "bfloat16", "float64",
+        "int64", "int32", "int16", "int8", "uint8", "bool",
+    }
+    if dtype_str not in valid_dtypes:
+        return False
+    # data should be bytes-like or memoryview or buffer index (int)
+    if isinstance(data, (bytes, memoryview, bytearray, int)):
+        return True
+    return False
+
+
+def _decode_tensor_from_encoded(obj: Any, aux_buffers: Any = None) -> torch.Tensor:
+    """Decode an encoded tensor (dtype_str, shape_tuple, data) back to torch.Tensor.
+
+    Args:
+        obj: Encoded tensor as (dtype_str, shape_tuple, data)
+        aux_buffers: Optional list of auxiliary buffers for multi-buffer decoding
+    """
+    dtype_str, shape, data = obj
+
+    # Get the raw bytes
+    if isinstance(data, int):
+        # Buffer index - need aux_buffers
+        if aux_buffers is None:
+            raise ValueError("Buffer index requires aux_buffers")
+        buffer = aux_buffers[data]
+        if isinstance(buffer, memoryview):
+            buffer = bytearray(buffer)
+    elif isinstance(data, (bytes, memoryview, bytearray)):
+        buffer = bytearray(data) if isinstance(data, memoryview) else data
+    else:
+        buffer = bytearray(data)
+
+    torch_dtype = getattr(torch, dtype_str)
+    if not buffer:
+        return torch.empty(shape, dtype=torch_dtype)
+    arr = torch.frombuffer(buffer, dtype=torch.uint8)
+    return arr.view(torch_dtype).reshape(shape)
+
+
+def _post_process_decoded(obj: Any, aux_buffers: Any = None) -> Any:
+    """Recursively post-process decoded objects to restore PIL Images and tensors.
 
     msgspec's dec_hook is only called when a specific type is expected.
-    When deserializing generic objects (dicts, lists), PIL Image markers
+    When deserializing generic objects (dicts, lists), special encoded formats
     need to be manually converted after decoding.
+
+    This handles:
+    1. PIL Image marker dicts -> PIL.Image objects
+    2. Encoded tensors (dtype, shape, data) -> torch.Tensor objects
+
+    Args:
+        obj: The decoded object to post-process
+        aux_buffers: Optional list of auxiliary buffers for multi-buffer tensor decoding
     """
     if isinstance(obj, dict):
+        # Check for PIL Image marker
         if obj.get(_PIL_IMAGE_MARKER):
             data = obj["data"]
             shape = obj.get("shape")
@@ -104,9 +168,21 @@ def _post_process_pil_images(obj: Any) -> Any:
                 return Image.fromarray(arr, mode=mode)
             except Exception:
                 return Image.fromarray(arr)
-        return {k: _post_process_pil_images(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_post_process_pil_images(item) for item in obj]
+        # Recursively process dict values
+        return {k: _post_process_decoded(v, aux_buffers) for k, v in obj.items()}
+
+    elif isinstance(obj, (list, tuple)):
+        # Check if this looks like an encoded tensor
+        if _is_encoded_tensor(obj):
+            try:
+                return _decode_tensor_from_encoded(obj, aux_buffers)
+            except Exception:
+                # If decoding fails, it might not be a tensor after all
+                pass
+        # Recursively process list/tuple elements
+        processed = [_post_process_decoded(item, aux_buffers) for item in obj]
+        return type(obj)(processed) if isinstance(obj, tuple) else processed
+
     return obj
 
 
@@ -192,21 +268,24 @@ class OmniSerde:
         else:
             decoder = self.decoder
 
+        # Split data into buffers
+        bufs: list[Any] = []
+        offset = header_size
+        for length in len_arr:
+            bufs.append(data[offset : offset + length])
+            offset += length
+
         if num_bufs == 1:
-            result = decoder.decode(data[header_size:])
+            result = decoder.decode(bufs[0])
         else:
-            # Multi-buffer: split by lengths
-            bufs = []
-            offset = header_size
-            for length in len_arr:
-                bufs.append(data[offset : offset + length])
-                offset += length
             result = decoder.decode(bufs)
 
-        # Post-process to convert PIL Image marker dicts back to PIL.Image
-        # This is needed because dec_hook is only called for typed decoding
+        # Post-process to restore PIL Images and tensors from their encoded forms
+        # This is needed because dec_hook is only called for typed decoding,
+        # but generic decoding returns raw dicts/lists
         if type_code == _TYPE_GENERIC:
-            result = _post_process_pil_images(result)
+            # Pass aux_buffers for multi-buffer tensor decoding
+            result = _post_process_decoded(result, bufs if num_bufs > 1 else None)
 
         return result
 
