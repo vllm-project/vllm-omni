@@ -294,21 +294,15 @@ class OmniLLM:
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt = {}
-        try:
-            for rid, prompt in request_id_to_prompt.items():
-                final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                    prompt.get("modalities", None), self.output_modalities, self.stage_list
-                )
-                final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
-
-        except Exception as e:
-            logger.debug(
-                "[Orchestrator] Failed to determine final stage for E2E; falling back to last: %s",
-                e,
-                exc_info=True,
+        for rid, prompt in request_id_to_prompt.items():
+            if isinstance(prompt, dict):
+                prompt_modalities = prompt.get("modalities", None)
+            else:
+                prompt_modalities = None
+            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
+                prompt_modalities, self.output_modalities, self.stage_list
             )
-            for rid, prompt in request_id_to_prompt.items():
-                final_stage_id_to_prompt[rid] = len(self.stage_list) - 1
+            final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
