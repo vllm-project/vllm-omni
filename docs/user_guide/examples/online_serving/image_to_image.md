@@ -1,6 +1,6 @@
 # Qwen-Image-Edit Online Serving
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen_image_edit>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/image_to_image>.
 
 
 This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
@@ -14,6 +14,7 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 ```
 
 ### Start with Parameters
+
 
 Or use the startup script:
 
@@ -127,6 +128,9 @@ Use `extra_body` to pass generation parameters:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `height` | int | None | Output image height in pixels |
+| `width` | int | None | Output image width in pixels |
+| `size` | str | None | Output image size (e.g., "1024x1024") |
 | `num_inference_steps` | int | 50 | Number of denoising steps |
 | `guidance_scale` | float | 7.5 | CFG guidance scale |
 | `seed` | int | None | Random seed (reproducible) |
@@ -181,17 +185,13 @@ Use `extra_body` to pass generation parameters:
 
 ??? abstract "gradio_demo.py"
     ``````py
-    --8<-- "examples/online_serving/qwen_image_edit/gradio_demo.py"
+    --8<-- "examples/online_serving/image_to_image/gradio_demo.py"
     ``````
 ??? abstract "openai_chat_client.py"
     ``````py
-    --8<-- "examples/online_serving/qwen_image_edit/openai_chat_client.py"
-    ``````
-??? abstract "run_curl_image_edit.sh"
-    ``````sh
-    --8<-- "examples/online_serving/qwen_image_edit/run_curl_image_edit.sh"
+    --8<-- "examples/online_serving/image_to_image/openai_chat_client.py"
     ``````
 ??? abstract "run_server.sh"
     ``````sh
-    --8<-- "examples/online_serving/qwen_image_edit/run_server.sh"
+    --8<-- "examples/online_serving/image_to_image/run_server.sh"
     ``````
