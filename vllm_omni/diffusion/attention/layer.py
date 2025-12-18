@@ -120,7 +120,27 @@ class Attention(nn.Module):
                     f"joint_strategy: {joint_strategy} not supported. "
                     f"Supported joint strategy: {supported_joint_strategy}"
                 )
-            elif joint_strategy == "rear":
+
+            # get the current attn heads according to the current rank
+            ulysses_world_size = torch.distributed.get_world_size(self.ulysses_pg)
+            ulysses_rank = torch.distributed.get_rank(self.ulysses_pg)
+            attn_heads_per_ulysses_rank = joint_tensor_key.shape[-2] // ulysses_world_size
+            joint_tensor_query = joint_tensor_query[
+                ...,
+                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
+                :,
+            ]
+            joint_tensor_key = joint_tensor_key[
+                ...,
+                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
+                :,
+            ]
+            joint_tensor_value = joint_tensor_value[
+                ...,
+                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
+                :,
+            ]
+            if joint_strategy == "rear":
                 query = torch.cat([query, joint_tensor_query], dim=1)
                 key = torch.cat([key, joint_tensor_key], dim=1)
                 value = torch.cat([value, joint_tensor_value], dim=1)
@@ -134,8 +154,6 @@ class Attention(nn.Module):
             raise ValueError(
                 "joint_tensor_query, joint_tensor_key, and joint_tensor_value should be None or not None simultaneously."
             )
-
-        # TODO: joint key and value (part of attn heads) according to the current rank are needed for ring attention
 
         context_layer = self.attention.forward(
             query,
