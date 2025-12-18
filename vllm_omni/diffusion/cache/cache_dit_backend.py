@@ -10,21 +10,14 @@ pipelines in vllm-omni, supporting both single and dual-transformer architecture
 from collections.abc import Callable
 from typing import Any, Optional
 
+import cache_dit
+from cache_dit import BlockAdapter, DBCacheConfig, ForwardPattern, ParamsModifier, TaylorSeerCalibratorConfig
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
 
 logger = init_logger(__name__)
-
-try:
-    import cache_dit
-    from cache_dit import BlockAdapter, DBCacheConfig, ForwardPattern, ParamsModifier, TaylorSeerCalibratorConfig
-
-    CACHE_DIT_AVAILABLE = True
-except ImportError:
-    CACHE_DIT_AVAILABLE = False
-    logger.warning("cache-dit is not installed. Cache-dit acceleration will not be available.")
 
 
 # Registry of custom cache-dit enablers for specific models
@@ -325,9 +318,6 @@ class CacheDiTBackend(CacheBackend):
         Args:
             pipeline: The diffusion pipeline instance.
         """
-        if not CACHE_DIT_AVAILABLE:
-            logger.warning("cache-dit is not available, skipping cache-dit setup.")
-            return
 
         # Extract pipeline name from pipeline
         pipeline_name = pipeline.__class__.__name__

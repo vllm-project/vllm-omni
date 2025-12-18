@@ -30,7 +30,6 @@ classifiers = [
 dependencies = [
     # Core runtime dependencies (required for actual usage)
     "omegaconf>=2.3.0",
-    # "decord>=0.6.0", # install manually
     "librosa>=0.11.0",
     "resampy>=0.4.3",
     "diffusers>=0.36.0",

@@ -41,7 +41,6 @@ class TestCacheDiTBackend:
         assert backend.config.Fn_compute_blocks == 4
         assert backend.enabled is False
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.CACHE_DIT_AVAILABLE", True)
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
     def test_enable_single_transformer(self, mock_cache_dit):
         """Test enabling cache-dit on single-transformer pipeline."""
@@ -63,7 +62,6 @@ class TestCacheDiTBackend:
         assert backend._refresh_func is not None
         mock_cache_dit.enable_cache.assert_called_once()
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.CACHE_DIT_AVAILABLE", True)
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
     def test_refresh(self, mock_cache_dit):
         """Test refreshing cache context with SCM mask policy updates when num_inference_steps changes."""
