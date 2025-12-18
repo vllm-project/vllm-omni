@@ -29,13 +29,14 @@ def ring_pytorch_attn_func(
     group=None,
     attn_type: AttnType = AttnType.FA,
     attn_processor=None,
+    op_type="flash",
 ):
-    return RingAttentionFunc.apply(group, q, k, v, softmax_scale, causal)
+    return RingAttentionFunc.apply(group, q, k, v, softmax_scale, causal, op_type)
 
 class RingAttentionFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, group, q, k, v, sm_scale, is_causal):
+    def forward(ctx, group, q, k, v, sm_scale, is_causal, op_type):
 
         comm = RingComm(group)
         #TODO(fmom): add flex attention
@@ -57,7 +58,7 @@ class RingAttentionFunc(torch.autograd.Function):
 
             if not is_causal or step <= comm.rank:
                 block_out, block_lse  = pytorch_attn_forward(
-                    q, k, v, softmax_scale = sm_scale, causal = is_causal and step == 0
+                    q, k, v, softmax_scale = sm_scale, causal = is_causal and step == 0, op_type=op_type
                 )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
                 
@@ -72,6 +73,7 @@ class RingAttentionFunc(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.is_causal = is_causal
         ctx.group = group
+        ctx.op_type = op_type
 
         return out
 
@@ -82,6 +84,7 @@ class RingAttentionFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         sm_scale = ctx.sm_scale
         is_causal = ctx.is_causal
+        op_type = ctx.op_type
 
         kv_comm = RingComm(ctx.group)
         d_kv_comm = RingComm(ctx.group)
@@ -106,7 +109,7 @@ class RingAttentionFunc(torch.autograd.Function):
                 bwd_causal = is_causal and step == 0
 
                 block_dq_buffer, block_dk_buffer, block_dv_buffer = pytorch_attn_backward(
-                    dout, q, k, v, out, softmax_lse = softmax_lse, softmax_scale = sm_scale, causal = bwd_causal
+                    dout, q, k, v, out, softmax_lse = softmax_lse, softmax_scale = sm_scale, causal = bwd_causal, op_type=op_type
                 )
 
                 if dq is None:
