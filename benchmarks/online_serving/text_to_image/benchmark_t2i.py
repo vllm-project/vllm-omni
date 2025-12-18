@@ -11,33 +11,22 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import torch
-
-from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.entrypoints.omni_diffusion import prepare_requests
-from vllm_omni.utils.platform_utils import detect_device_type, is_npu
-
 
 DEFAULT_T2I_PROMPTS: list[str] = [
-    "a cup of coffee on the table",
-    "a photo of a corgi wearing sunglasses, studio lighting",
-    "a cinematic landscape with mountains and fog, ultra wide angle",
-    "a watercolor painting of cherry blossoms in spring, soft pastel",
-    "a futuristic city at night with neon signs, rain, reflections",
-    "a macro shot of a ladybug on a leaf, shallow depth of field",
-    "a cozy reading nook with warm lamp light, detailed interior",
-    "an astronaut riding a horse on the moon, surreal",
-    "a robot chef preparing sushi, 3d render, high detail",
-    "a vintage poster of a seaside town, art deco style",
+    "A cat",
+    "A futuristic city with flying cars and neon lights, cyberpunk style, high resolution, 8k",
+    "An astronaut riding a horse on mars, realistic photography",
+    "A landscape painting of mountains and river, oil painting style",
     "一只橘猫在窗台上晒太阳，温暖的午后，写实风格",
-    "未来感机甲站在沙漠中，夕阳逆光，电影质感",
     "赛博朋克街道，雨夜霓虹，路面反光，细节丰富",
-    "传统水墨画风格的山水，云雾缭绕，意境悠远",
 ]
 
 
@@ -125,191 +114,190 @@ def _summary_stats(values: list[float]) -> dict[str, float]:
     }
 
 
-class _CudaMemorySampler:
-    def __init__(self, backend: str, interval_s: float, gpu_indices: Optional[list[int]]):
-        self.backend = backend
-        self.interval_s = interval_s
-        self.gpu_indices = gpu_indices
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._peak_total_mib: Optional[float] = None
-        self._nvml = None
-        self._nvml_handles = None
-
-    def _get_used_mib_total(self) -> Optional[float]:
-        if self.backend == "nvml":
-            try:
-                if self._nvml is None or self._nvml_handles is None:
-                    return None
-                total = 0.0
-                for handle in self._nvml_handles:
-                    info = self._nvml.nvmlDeviceGetMemoryInfo(handle)
-                    total += info.used / (1024 * 1024)
-                return total
-            except Exception:
-                return None
-
-        if self.backend == "nvidia-smi":
-            try:
-                args = [
-                    "nvidia-smi",
-                    "--query-gpu=memory.used",
-                    "--format=csv,noheader,nounits",
-                ]
-                res = subprocess.run(args, check=True, capture_output=True, text=True)
-                lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
-                used_mib = [float(x) for x in lines]
-                if self.gpu_indices is not None:
-                    used_mib = [used_mib[i] for i in self.gpu_indices if i < len(used_mib)]
-                return float(sum(used_mib)) if used_mib else None
-            except Exception:
-                return None
-
-        return None
-
-    def start(self) -> None:
-        self._stop.clear()
-        self._peak_total_mib = None
-        if self.backend == "nvml":
-            try:
-                import pynvml  # type: ignore[import-not-found]
-
-                pynvml.nvmlInit()
-                count = pynvml.nvmlDeviceGetCount()
-                indices = self.gpu_indices if self.gpu_indices is not None else list(range(count))
-                self._nvml = pynvml
-                self._nvml_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in indices]
-            except Exception:
-                self._nvml = None
-                self._nvml_handles = None
-
-        def _run() -> None:
-            while not self._stop.is_set():
-                used = self._get_used_mib_total()
-                if used is not None:
-                    if self._peak_total_mib is None or used > self._peak_total_mib:
-                        self._peak_total_mib = used
-                time.sleep(self.interval_s)
-
-        self._thread = threading.Thread(target=_run, name="gpu-mem-sampler", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> Optional[float]:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-        if self.backend == "nvml" and self._nvml is not None:
-            try:
-                self._nvml.nvmlShutdown()
-            except Exception:
-                pass
-            self._nvml = None
-            self._nvml_handles = None
-        return self._peak_total_mib
+def _join_url(base_url: str, path: str) -> str:
+    base = base_url.rstrip("/")
+    rel = path.lstrip("/")
+    return f"{base}/{rel}"
 
 
-def _detect_cuda_mem_backend(requested: str) -> str:
-    if requested != "auto":
-        return requested
+def _http_post_json(url: str, api_key: str, payload: dict[str, Any], timeout_s: float) -> tuple[int, bytes]:
+    data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return int(getattr(resp, "status", 200)), resp.read()
+
+
+def _extract_error_message(body: bytes) -> str:
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            if isinstance(err, dict) and "message" in err:
+                return str(err["message"])
+            return str(err)
+        return str(data)
+    except Exception:
+        return body.decode("utf-8", errors="replace")[:1000]
+
+
+def _try_parse_json(body: bytes) -> Any:
+    try:
+        return json.loads(body.decode("utf-8", errors="replace"))
+    except Exception:
+        pass
+    return None
+
+
+def _try_import_pynvml():
     try:
         import pynvml  # type: ignore[import-not-found]
 
-        _ = pynvml
-        return "nvml"
+        return pynvml
     except Exception:
+        return None
+
+
+class GPUMonitor(threading.Thread):
+    def __init__(self, interval_s: float, gpu_indices: Optional[list[int]]):
+        super().__init__(daemon=True)
+        self.interval_s = interval_s
+        self.gpu_indices = gpu_indices
+        self._running = True
+        self.max_memory_used_mb: float = 0.0
+        self.device_count: int = 0
+        self.error: Optional[str] = None
+        self._pynvml = None
+
+    def run(self) -> None:
+        self._pynvml = _try_import_pynvml()
+        if self._pynvml is None:
+            self.error = "pynvml not available"
+            return
+
         try:
-            subprocess.run(["nvidia-smi", "-L"], check=True, capture_output=True, text=True)
-            return "nvidia-smi"
-        except Exception:
-            return "none"
+            self._pynvml.nvmlInit()
+            self.device_count = int(self._pynvml.nvmlDeviceGetCount())
+            indices = self.gpu_indices if self.gpu_indices is not None else list(range(self.device_count))
+
+            handles = []
+            for idx in indices:
+                if idx < 0 or idx >= self.device_count:
+                    continue
+                handles.append(self._pynvml.nvmlDeviceGetHandleByIndex(idx))
+
+            while self._running:
+                total_used = 0
+                for h in handles:
+                    info = self._pynvml.nvmlDeviceGetMemoryInfo(h)
+                    total_used += int(info.used)
+                total_mb = total_used / 1024 / 1024
+                if total_mb > self.max_memory_used_mb:
+                    self.max_memory_used_mb = float(total_mb)
+                time.sleep(self.interval_s)
+        except Exception as e:
+            self.error = str(e)
+        finally:
+            try:
+                self._pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._running = False
+        self.join(timeout=5.0)
 
 
-def _device_sync(device_type: str) -> None:
-    if device_type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elif device_type == "npu" and hasattr(torch, "npu"):
-        try:
-            torch.npu.synchronize()  # type: ignore[attr-defined]
-        except Exception:
-            pass
+def _send_image_request(
+    api_base: str,
+    endpoint_path: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    *,
+    n: int,
+    size: str,
+    response_format: str,
+    timeout_s: float,
+    extra_body: dict[str, Any],
+) -> tuple[float, bool, Optional[str], Optional[int]]:
+    url = _join_url(api_base, endpoint_path)
 
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "n": n,
+        "size": size,
+        "response_format": response_format,
+    }
+    for k, v in extra_body.items():
+        if v is not None:
+            payload[k] = v
 
-def _is_oom_error(msg: str) -> bool:
-    s = msg.lower()
-    return ("out of memory" in s) or ("cuda oom" in s) or (("cublas" in s) and ("alloc" in s))
-
-
-@dataclass
-class _RequestResult:
-    request_idx: int
-    batch_size: int
-    images_generated: int
-    success: bool
-    error: Optional[str]
-    timings_ms: dict[str, float]
-    peak_vram_mib: Optional[float]
+    t0 = time.perf_counter()
+    try:
+        status, body = _http_post_json(url, api_key, payload, timeout_s)
+        latency_s = time.perf_counter() - t0
+        if status < 200 or status >= 300:
+            return latency_s, False, _extract_error_message(body), None
+        parsed = _try_parse_json(body)
+        if isinstance(parsed, dict) and "error" in parsed:
+            return latency_s, False, _extract_error_message(body), None
+        out_n = int(len(parsed.get("data", []))) if isinstance(parsed, dict) and isinstance(parsed.get("data"), list) else None
+        return latency_s, True, None, out_n
+    except urllib.error.HTTPError as e:
+        latency_s = time.perf_counter() - t0
+        body = e.read() if hasattr(e, "read") else b""
+        return latency_s, False, _extract_error_message(body) or str(e), None
+    except Exception as e:
+        latency_s = time.perf_counter() - t0
+        return latency_s, False, str(e), None
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark DiT Text-to-Image generation via vLLM-Omni (in-process).")
+    parser = argparse.ArgumentParser(
+        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/images/generations."
+    )
 
-    parser.add_argument("--model", default="Qwen/Qwen-Image", help="Diffusion model name or local path.")
-    parser.add_argument("--prompt", default=None, help="Single prompt (overrides prompt set).")
+    parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
+    parser.add_argument("--api-key", type=str, default="EMPTY", help="OpenAI API key (use 'EMPTY' for local).")
+    parser.add_argument("--endpoint-path", type=str, default="/images/generations", help="Endpoint path.")
+    parser.add_argument("--model", type=str, required=True, help="Served model name.")
+
+    parser.add_argument("--prompt", type=str, default=None, help="Single prompt (overrides prompt set).")
     parser.add_argument("--prompt-file", type=str, default=None, help="Text file with one prompt per line.")
     parser.add_argument("--num-prompts", type=int, default=None, help="Use only the first N prompts from the set.")
 
-    parser.add_argument("--height", type=int, default=1024, help="Output image height.")
-    parser.add_argument("--width", type=int, default=1024, help="Output image width.")
-    parser.add_argument("--num-inference-steps", type=int, default=50, help="Denoising steps.")
-    parser.add_argument("--true-cfg-scale", type=float, default=4.0, help="Qwen-Image true CFG scale.")
-    parser.add_argument("--negative-prompt", type=str, default=None, help="Negative prompt (optional).")
-    parser.add_argument("--num-outputs-per-prompt", type=int, default=1, help="Images per prompt.")
+    parser.add_argument("--concurrency", type=int, default=8, help="Concurrent clients (threads).")
+    parser.add_argument("--num-requests", type=int, default=40, help="Total measured requests.")
+    parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
-    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs for diffusion engine.")
+    parser.add_argument("--images-per-request", type=int, default=1, help="OpenAI 'n': images per request.")
+    parser.add_argument("--size", type=str, default="1024x1024", help="OpenAI 'size' (e.g., 1024x1024).")
+    parser.add_argument("--response-format", type=str, default="b64_json", help="OpenAI response_format.")
+    parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
+
+    parser.add_argument("--num-inference-steps", type=int, default=None, help="(vLLM-Omni ext) num_inference_steps.")
+    parser.add_argument("--true-cfg-scale", type=float, default=None, help="(vLLM-Omni ext) true_cfg_scale.")
+    parser.add_argument("--negative-prompt", type=str, default=None, help="(vLLM-Omni ext) negative_prompt.")
+
+    parser.add_argument("--extra-body-json", type=str, default=None, help="Extra JSON fields to merge into request.")
+
+    parser.add_argument("--gpu-monitor", action="store_true", help="Enable GPU peak VRAM monitor (NVML).")
+    parser.add_argument("--gpu-monitor-interval-s", type=float, default=0.1, help="GPU monitor sampling interval.")
     parser.add_argument(
-        "--cache-backend",
+        "--gpu-indices",
         type=str,
         default=None,
-        choices=["cache_dit", "tea_cache"],
-        help="Optional cache backend for acceleration.",
-    )
-    parser.add_argument(
-        "--cache-config-json",
-        type=str,
-        default=None,
-        help="Optional JSON string for cache_config (passed to Omni).",
+        help="Comma-separated GPU indices for monitoring (default: all).",
     )
 
-    parser.add_argument("--warmup-requests", type=int, default=5, help="Warmup requests (not measured).")
-    parser.add_argument("--requests", type=int, default=30, help="Measured requests.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Prompts per request.")
-    parser.add_argument("--base-seed", type=int, default=42, help="Base seed; increments per prompt.")
-
-    parser.add_argument("--output-json", type=str, default="t2i_benchmark_summary.json", help="Summary JSON path.")
-    parser.add_argument("--output-jsonl", type=str, default=None, help="Optional per-request JSONL path.")
-
-    parser.add_argument("--save-outputs-dir", type=str, default=None, help="Optional directory to save sample outputs.")
-    parser.add_argument("--save-outputs-max", type=int, default=0, help="Max measured requests to save outputs for.")
-
-    parser.add_argument(
-        "--cuda-mem-monitor",
-        type=str,
-        default="auto",
-        choices=["auto", "none", "nvml", "nvidia-smi"],
-        help="Best-effort CUDA peak VRAM monitor backend.",
-    )
-    parser.add_argument(
-        "--cuda-mem-sample-ms",
-        type=int,
-        default=0,
-        help="Memory sampling interval in ms (0 disables sampling).",
-    )
-    parser.add_argument(
-        "--cuda-gpu-indices",
-        type=str,
-        default=None,
-        help="Comma-separated physical GPU indices for memory monitoring (default: all).",
-    )
+    parser.add_argument("--output-json", type=str, default=None, help="Optional summary JSON output path.")
+    parser.add_argument("--output-jsonl", type=str, default=None, help="Optional per-request JSONL output path.")
 
     return parser.parse_args()
 
@@ -322,177 +310,135 @@ def main() -> None:
     prompt_data = _read_prompts(prompt_file, args.prompt, args.num_prompts)
     prompts: list[str] = prompt_data["prompts"]
 
-    if args.batch_size <= 0:
-        raise ValueError("--batch-size must be >= 1")
-    if args.requests <= 0:
-        raise ValueError("--requests must be >= 1")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be >= 1")
+    if args.num_requests <= 0:
+        raise ValueError("--num-requests must be >= 1")
     if args.warmup_requests < 0:
         raise ValueError("--warmup-requests must be >= 0")
+    if args.images_per_request <= 0:
+        raise ValueError("--images-per-request must be >= 1")
 
-    device_type = detect_device_type()
-    generator_device = device_type if device_type in ("cuda", "npu") else "cpu"
+    extra_body: dict[str, Any] = {}
+    if args.num_inference_steps is not None:
+        extra_body["num_inference_steps"] = args.num_inference_steps
+    if args.true_cfg_scale is not None:
+        extra_body["true_cfg_scale"] = args.true_cfg_scale
+    if args.negative_prompt is not None:
+        extra_body["negative_prompt"] = args.negative_prompt
+    if args.extra_body_json:
+        extra_body.update(json.loads(args.extra_body_json))
 
-    vae_use_slicing = is_npu()
-    vae_use_tiling = is_npu()
+    gpu_indices = None
+    if args.gpu_indices:
+        gpu_indices = [int(x.strip()) for x in args.gpu_indices.split(",") if x.strip()]
 
-    cache_config = None
-    if args.cache_config_json:
-        cache_config = json.loads(args.cache_config_json)
+    monitor = None
+    if args.gpu_monitor:
+        monitor = GPUMonitor(interval_s=args.gpu_monitor_interval_s, gpu_indices=gpu_indices)
+        monitor.start()
 
-    omni = Omni(
-        model=args.model,
-        vae_use_slicing=vae_use_slicing,
-        vae_use_tiling=vae_use_tiling,
-        cache_backend=args.cache_backend,
-        cache_config=cache_config,
-        num_gpus=args.num_gpus,
-    )
+    def _task(i: int) -> dict[str, Any]:
+        prompt = prompts[i % len(prompts)]
+        latency_s, ok, err, out_n = _send_image_request(
+            args.api_base,
+            args.endpoint_path,
+            args.api_key,
+            args.model,
+            prompt,
+            n=args.images_per_request,
+            size=args.size,
+            response_format=args.response_format,
+            timeout_s=args.timeout_s,
+            extra_body=extra_body,
+        )
+        return {
+            "request_idx": i,
+            "latency_ms": latency_s * 1000.0,
+            "success": ok,
+            "error": err,
+            "outputs": out_n,
+        }
 
-    try:
-        engine = getattr(omni.instance, "engine", None)
-        if engine is None:
-            raise RuntimeError("Loaded model does not expose diffusion engine (is this a diffusion model?).")
+    print("---- Benchmark Config ----")
+    print(f"api_base:            {args.api_base}")
+    print(f"endpoint_path:       {args.endpoint_path}")
+    print(f"model:               {args.model}")
+    print(f"concurrency:         {args.concurrency}")
+    print(f"warmup_requests:     {args.warmup_requests}")
+    print(f"num_requests:        {args.num_requests}")
+    print(f"images_per_request:  {args.images_per_request}")
+    print(f"size:                {args.size}")
+    print(f"response_format:     {args.response_format}")
+    if extra_body:
+        print(f"extra_body:          {extra_body}")
 
-        cuda_mem_backend = _detect_cuda_mem_backend(args.cuda_mem_monitor)
-        gpu_indices = None
-        if args.cuda_gpu_indices:
-            gpu_indices = [int(x.strip()) for x in args.cuda_gpu_indices.split(",") if x.strip()]
+    for i in range(args.warmup_requests):
+        _ = _task(-1 - i)
 
-        sample_interval_s = (args.cuda_mem_sample_ms / 1000.0) if args.cuda_mem_sample_ms > 0 else 0.0
+    results: list[dict[str, Any]] = []
+    start_benchmark = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = [executor.submit(_task, i) for i in range(args.num_requests)]
+        for fut in futures:
+            results.append(fut.result())
+    total_time_s = time.perf_counter() - start_benchmark
 
-        jsonl_path = Path(args.output_jsonl).resolve() if args.output_jsonl else None
-        jsonl_f = jsonl_path.open("w", encoding="utf-8") if jsonl_path else None
+    if monitor is not None:
+        monitor.stop()
 
-        save_dir = Path(args.save_outputs_dir).resolve() if args.save_outputs_dir else None
-        if save_dir is not None:
-            save_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_jsonl:
+        jsonl_path = Path(args.output_jsonl).resolve()
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with jsonl_path.open("w", encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-        results: list[_RequestResult] = []
+    success = [r for r in results if r["success"]]
+    failures = [r for r in results if not r["success"]]
 
-        total_requests = args.warmup_requests + args.requests
-        prompt_idx = 0
-        prompt_seed = args.base_seed
+    lat_ms = [float(r["latency_ms"]) for r in results]
+    lat_ms_ok = [float(r["latency_ms"]) for r in success]
 
-        for req_idx in range(total_requests):
-            batch_prompts = []
-            batch_generators: list[torch.Generator] = []
-            for _ in range(args.batch_size):
-                batch_prompts.append(prompts[prompt_idx % len(prompts)])
-                prompt_idx += 1
-                g = torch.Generator(device=generator_device).manual_seed(prompt_seed)
-                prompt_seed += 1
-                batch_generators.append(g)
+    outputs_ok = 0
+    for r in success:
+        out_n = r.get("outputs")
+        if isinstance(out_n, int) and out_n > 0:
+            outputs_ok += out_n
+        else:
+            outputs_ok += args.images_per_request
 
-            req = prepare_requests(
-                batch_prompts,
-                generator=batch_generators,
-                negative_prompt=args.negative_prompt,
-                height=args.height,
-                width=args.width,
-                true_cfg_scale=args.true_cfg_scale,
-                num_inference_steps=args.num_inference_steps,
-                num_outputs_per_prompt=args.num_outputs_per_prompt,
-            )
+    throughput_img_s = float(outputs_ok / total_time_s) if total_time_s > 0 else 0.0
 
-            timings_ms: dict[str, float] = {}
+    print("\n" + "=" * 40)
+    print("       BENCHMARK REPORT       ")
+    print("=" * 40)
+    print(f"Total Time Taken:       {total_time_s:.2f} s")
+    print(f"Total Images Gen:       {outputs_ok}")
+    print(f"Success Rate:           {len(success) / len(results) * 100:.1f}%")
+    print("-" * 40)
+    print(f"1. Throughput:          {throughput_img_s:.2f} images/s")
+    if monitor is not None and monitor.error is None:
+        print(f"2. Memory Peak (Total): {monitor.max_memory_used_mb:.2f} MB")
+    else:
+        print("2. Memory Peak (Total): N/A")
+    print("-" * 40)
+    if lat_ms_ok:
+        stats = _summary_stats(lat_ms_ok)
+        print(f"Avg Latency (ok):       {stats['mean'] / 1000.0:.2f} s")
+        print(f"P99 Latency (ok):       {stats['p99'] / 1000.0:.2f} s")
+    else:
+        print("Avg Latency:            N/A")
+        print("P99 Latency:            N/A")
+    print("=" * 40)
+    if failures:
+        print(f"Failures: {len(failures)} (showing up to 3)")
+        for r in failures[:3]:
+            print(f"- idx={r['request_idx']}: {r.get('error')}")
 
-            peak_vram_mib = None
-            mem_sampler: Optional[_CudaMemorySampler] = None
-            if device_type == "cuda" and sample_interval_s > 0 and cuda_mem_backend != "none":
-                mem_sampler = _CudaMemorySampler(cuda_mem_backend, sample_interval_s, gpu_indices)
-
-            success = False
-            err: Optional[str] = None
-            images = None
-
-            try:
-                _device_sync(device_type)
-                if mem_sampler is not None:
-                    mem_sampler.start()
-
-                t0 = time.perf_counter()
-
-                pre_t0 = time.perf_counter()
-                reqs = [req]
-                if engine.pre_process_func is not None:
-                    reqs = engine.pre_process_func(reqs)
-                timings_ms["preprocess_ms"] = (time.perf_counter() - pre_t0) * 1000.0
-
-                eng_t0 = time.perf_counter()
-                out = engine.add_req_and_wait_for_response(reqs)
-                timings_ms["engine_ms"] = (time.perf_counter() - eng_t0) * 1000.0
-
-                if out.error:
-                    raise RuntimeError(out.error)
-
-                post_t0 = time.perf_counter()
-                images = engine.post_process_func(out.output)
-                timings_ms["postprocess_ms"] = (time.perf_counter() - post_t0) * 1000.0
-
-                _device_sync(device_type)
-                timings_ms["e2e_ms"] = (time.perf_counter() - t0) * 1000.0
-
-                success = images is not None
-            except Exception as e:
-                err = str(e)
-                success = False
-            finally:
-                if mem_sampler is not None:
-                    peak_vram_mib = mem_sampler.stop()
-
-            is_measured = req_idx >= args.warmup_requests
-            if not is_measured:
-                continue
-
-            save_ms = 0.0
-            if (
-                success
-                and images is not None
-                and save_dir is not None
-                and args.save_outputs_max > 0
-                and (req_idx - args.warmup_requests) < args.save_outputs_max
-            ):
-                save_t0 = time.perf_counter()
-                # Images are expected to be a list of PIL images.
-                for img_i, img in enumerate(images):
-                    out_path = save_dir / f"req{req_idx:04d}_img{img_i:02d}.png"
-                    img.save(out_path)
-                save_ms = (time.perf_counter() - save_t0) * 1000.0
-
-            if save_ms > 0:
-                timings_ms["save_ms"] = save_ms
-
-            images_generated = args.batch_size * args.num_outputs_per_prompt if success else 0
-            result = _RequestResult(
-                request_idx=req_idx - args.warmup_requests,
-                batch_size=args.batch_size,
-                images_generated=images_generated,
-                success=success,
-                error=err,
-                timings_ms=timings_ms,
-                peak_vram_mib=peak_vram_mib,
-            )
-            results.append(result)
-
-            if jsonl_f is not None:
-                jsonl_f.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
-                jsonl_f.flush()
-
-        if jsonl_f is not None:
-            jsonl_f.close()
-
-        latencies_ms = [r.timings_ms["e2e_ms"] for r in results if r.success and "e2e_ms" in r.timings_ms]
-        engine_ms = [r.timings_ms["engine_ms"] for r in results if r.success and "engine_ms" in r.timings_ms]
-        pre_ms = [r.timings_ms["preprocess_ms"] for r in results if r.success and "preprocess_ms" in r.timings_ms]
-        post_ms = [r.timings_ms["postprocess_ms"] for r in results if r.success and "postprocess_ms" in r.timings_ms]
-        vram_samples = [r.peak_vram_mib for r in results if r.success and r.peak_vram_mib is not None]
-
-        failures = [r for r in results if not r.success]
-        oom_failures = [r for r in failures if r.error and _is_oom_error(r.error)]
-
-        total_images = sum(r.images_generated for r in results)
-        total_time_s = sum((r.timings_ms.get("e2e_ms", 0.0) / 1000.0) for r in results if r.success)
-
+    if args.output_json:
+        out_path = Path(args.output_json).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         summary = {
             "task": "t2i",
             "timestamp_utc": _utc_timestamp(),
@@ -500,53 +446,31 @@ def main() -> None:
             "system": {
                 "platform": platform.platform(),
                 "python": sys.version.replace("\n", " "),
-                "device_type": device_type,
             },
             "prompt_set": prompt_data["prompt_set"],
             "config": {
+                "api_base": args.api_base,
+                "endpoint_path": args.endpoint_path,
                 "model": args.model,
-                "height": args.height,
-                "width": args.width,
-                "num_inference_steps": args.num_inference_steps,
-                "true_cfg_scale": args.true_cfg_scale,
-                "negative_prompt": args.negative_prompt,
-                "num_outputs_per_prompt": args.num_outputs_per_prompt,
-                "num_gpus": args.num_gpus,
-                "cache_backend": args.cache_backend,
-                "cache_config_json": args.cache_config_json,
-            },
-            "run": {
+                "concurrency": args.concurrency,
                 "warmup_requests": args.warmup_requests,
-                "measured_requests": args.requests,
-                "batch_size": args.batch_size,
-                "base_seed": args.base_seed,
+                "num_requests": args.num_requests,
+                "images_per_request": args.images_per_request,
+                "size": args.size,
+                "response_format": args.response_format,
+                "timeout_s": args.timeout_s,
+                "extra_body": extra_body,
             },
             "metrics_summary": {
-                "e2e_latency_ms": (_summary_stats(latencies_ms) if latencies_ms else None),
-                "engine_ms": (_summary_stats(engine_ms) if engine_ms else None),
-                "preprocess_ms": (_summary_stats(pre_ms) if pre_ms else None),
-                "postprocess_ms": (_summary_stats(post_ms) if post_ms else None),
-                "throughput_images_per_s": (float(total_images / total_time_s) if total_time_s > 0 else None),
-                "peak_vram_mib": (_summary_stats(vram_samples) if vram_samples else None),
+                "e2e_latency_ms": (_summary_stats(lat_ms_ok) if lat_ms_ok else None),
+                "throughput_images_per_s": throughput_img_s,
+                "success_rate": float(len(success) / len(results)) if results else None,
                 "failure_rate": float(len(failures) / len(results)) if results else None,
-                "oom_rate": float(len(oom_failures) / len(results)) if results else None,
+                "peak_vram_mb": (monitor.max_memory_used_mb if monitor is not None and monitor.error is None else None),
             },
         }
-
-        out_json_path = Path(args.output_json).resolve()
-        out_json_path.parent.mkdir(parents=True, exist_ok=True)
-        out_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-        print(f"Wrote summary JSON to {out_json_path}")
-        if jsonl_path is not None:
-            print(f"Wrote per-request JSONL to {jsonl_path}")
-        if save_dir is not None:
-            print(f"Saved sample outputs to {save_dir}")
-    finally:
-        try:
-            omni.close()
-        except Exception:
-            pass
+        out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"\nWrote summary JSON to {out_path}")
 
 
 if __name__ == "__main__":
