@@ -13,14 +13,17 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from .mammoth_moda2_ar import (
     MammothModa2ARMultiModalProcessor,
     MammothModa2ARProcessingInfo,
     MammothModa2ARDummyInputsBuilder,
 )
+from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -28,11 +31,13 @@ from .mammoth_moda2_ar import (
     info=MammothModa2ARProcessingInfo,
     dummy_inputs=MammothModa2ARDummyInputsBuilder,
 )
-class MammothModa2ForConditionalGeneration(nn.Module):
+class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
+                                           SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         cfg = vllm_config.model_config.hf_config
         self.model_stage = vllm_config.model_config.model_stage
+        self.multimodal_config = vllm_config.model_config.multimodal_config
 
         if self.model_stage == "ar":
             # AR 阶段：多模态 + MoE 文本
@@ -60,6 +65,30 @@ class MammothModa2ForConditionalGeneration(nn.Module):
             self.model, "make_empty_intermediate_tensors", lambda: None
         )
 
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int):  # noqa: ARG003
+        return Qwen2_5_VLForConditionalGeneration.get_placeholder_str(modality,
+                                                                      i)
+
+    def get_language_model(self) -> nn.Module:
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
+    def get_multimodal_embeddings(self, **kwargs: object):
+        if hasattr(self.model, "get_multimodal_embeddings"):
+            return self.model.get_multimodal_embeddings(**kwargs)
+        return []
+
+    def get_input_embeddings(self,
+                             input_ids: torch.Tensor,
+                             multimodal_embeddings=None) -> torch.Tensor:
+        if hasattr(self.model, "get_input_embeddings"):
+            return self.model.get_input_embeddings(
+                input_ids, multimodal_embeddings=multimodal_embeddings)
+        raise NotImplementedError(
+            "Underlying model does not implement get_input_embeddings")
+
     def forward(self, *args, **kwargs) -> OmniOutput | torch.Tensor:
         out = self.model(*args, **kwargs)
         # 子模块可能直接返回 OmniOutput / tensor；保持向后兼容
@@ -76,5 +105,8 @@ class MammothModa2ForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights):
         if hasattr(self.model, "load_weights"):
-            return self.model.load_weights(weights)
+            loaded = self.model.load_weights(weights)
+            # 本 wrapper 仅把子模型挂在 `self.model` 下，因此需要把返回的已加载参数名补上 "model." 前缀，
+            # 才能与 DefaultModelLoader 的 strict check（基于本对象 named_parameters）对齐。
+            return add_prefix_to_loaded_weights(loaded, "model")
         return set()

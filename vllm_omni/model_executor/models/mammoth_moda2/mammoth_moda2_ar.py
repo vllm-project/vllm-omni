@@ -18,6 +18,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2MLP
 from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalDataParser
 from vllm.sequence import IntermediateTensors
@@ -28,6 +32,7 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -50,7 +55,7 @@ from vllm_omni.model_executor.models.mammoth_moda2.processing_mammothmoda2 impor
 def moe_forward(
     hidden_states: torch.Tensor,
     und_expert: Callable[[torch.Tensor], torch.Tensor],
-    gen_expert: Callable[[torch.Tensor], torch.Tensor],
+    gen_expert: Callable[[torch.Tensor], torch.Tensor] | None,
     gen_token_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -67,6 +72,9 @@ def moe_forward(
     -------
     merged : Tensor                  # (B, L, D) 与输入顺序一致
     """
+    # 若该层不启用 MoE（gen_expert=None），直接全量走 und_expert
+    if gen_expert is None:
+        return und_expert(hidden_states)
     # 若没有提供 mask，直接全量走 und_expert
     if gen_token_mask is None or not gen_token_mask.any():
         return und_expert(hidden_states)
@@ -186,13 +194,16 @@ class Mammoth2DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
-        self.gen_mlp = Qwen2MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
+        if 14 <= layer_idx < 28:
+            self.gen_mlp = Qwen2MLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gen_mlp",
+            )
+        else:
+            self.gen_mlp = None
         
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -279,6 +290,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
+                config.hidden_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.lm_head",
             )
@@ -287,12 +299,25 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Mammoth2DecoderLayer
+
+        def _make_decoder_layer(*, prefix: str) -> nn.Module:
+            # vLLM make_layers 只会传 prefix，形如 "{prefix}.layers.{idx}"。
+            # 这里从 prefix 提取 idx，确保 layer_idx 能用于按层启用 MoE。
+            try:
+                layer_idx = int(prefix.rsplit(".", 1)[-1])
+            except Exception:
+                layer_idx = 0
+            return decoder_layer_type(
+                config=config,
+                layer_idx=layer_idx,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: decoder_layer_type(config=config,
-                                              cache_config=cache_config,
-                                              quant_config=quant_config,
-                                              prefix=prefix),
+            _make_decoder_layer,
             prefix=f"{prefix}.layers",
         )
 
@@ -303,6 +328,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+
+    @property
+    def model(self) -> "MammothModa2Qwen2ForCausalLM":
+        # vLLM 的 Qwen2.5-VL 路径会调用 `language_model.model(...)` 来拿到 hidden states。
+        # 这里用 property 避免把 self 注册成子模块从而形成 named_modules 的递归环。
+        return self
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -351,8 +382,67 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         return self.lm_head(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            if (self.quant_config is not None and
+                (scale_name := self.quant_config.get_cache_scale(name))):
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                name = name.replace(weight_name, param_name)
+
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name.endswith("scale"):
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+            loaded_params.add(name)
+
+        return loaded_params
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -366,9 +456,19 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
     # 复用原有权重映射，再加一层 model. -> language_model.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
-            "model.": "language_model.",
-            "language_model.": "language_model.",
-            "visual.": "visual.",
+            # 生成侧（DiT/VAE）权重不属于 AR stage，跳过
+            "gen_image_condition_refiner.": None,
+            "gen_transformer.": None,
+            "gen_vae.": None,
+
+            # LLM 主体：checkpoint 使用 llm_model.* 前缀
+            # 注意：先匹配更具体的 gen_embed/gen_head，否则会被通用映射吞掉
+            "llm_model.model.language_model.gen_embed_tokens.": None,
+            "llm_model.gen_head.": None,
+
+            "llm_model.model.language_model.": "language_model.",
+            "llm_model.model.visual.": "visual.",
+            "llm_model.lm_head.": "language_model.lm_head.",
         }
     )
 
