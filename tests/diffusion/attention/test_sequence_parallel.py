@@ -147,11 +147,11 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [8])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("dtype", [torch.float32]) #[torch.float16, torch.bfloat16]
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32]) #[torch.float16, torch.bfloat16]
 @pytest.mark.parametrize("use_sync", [False])
 @pytest.mark.parametrize("dynamic", [False])
 @pytest.mark.parametrize("use_compile", [False])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
+@pytest.mark.parametrize("attn_backend", ["sdpa", "flash_attn"])
 def test_sequence_parallel(
     ulysses_degree: int,
     ring_degree: int,
