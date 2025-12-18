@@ -380,6 +380,23 @@ def _stage_worker(
     import os as _os
     import time as _time
 
+    # NOTE: 子进程以 spawn 方式启动，不会继承主进程对 transformers 的注册。
+    # 这里提前导入 vllm_omni.model_executor.models，触发 AutoConfig/AutoTokenizer 等注册，
+    # 避免 tokenizer/processor 回落到 transformers 内置的 Qwen2Tokenizer 逻辑。
+    try:
+        tmpdir = _os.environ.get("TMPDIR")
+        if not tmpdir or not _os.path.isdir(tmpdir) or not _os.access(tmpdir, _os.W_OK):
+            tmpdir = _os.path.join(_os.path.expanduser("~"), ".cache", "vllm_omni", "tmp")
+            _os.makedirs(tmpdir, exist_ok=True)
+            _os.environ["TMPDIR"] = tmpdir
+    except Exception:
+        pass
+
+    try:
+        import vllm_omni.model_executor.models  # noqa: F401
+    except Exception:
+        pass
+
     from vllm_omni.distributed.omni_connectors import build_stage_connectors
     from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
     from vllm_omni.entrypoints.log_utils import (
@@ -746,17 +763,33 @@ async def _stage_worker_async(
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
+    import os as _os
     import time as _time
+
+    # NOTE: spawn 子进程需要在初始化前完成自定义模型/Tokenizer/Processor 注册。
+    try:
+        tmpdir = _os.environ.get("TMPDIR")
+        if not tmpdir or not _os.path.isdir(tmpdir) or not _os.access(tmpdir, _os.W_OK):
+            tmpdir = _os.path.join(_os.path.expanduser("~"), ".cache", "vllm_omni", "tmp")
+            _os.makedirs(tmpdir, exist_ok=True)
+            _os.environ["TMPDIR"] = tmpdir
+    except Exception:
+        pass
+
+    try:
+        import vllm_omni.model_executor.models  # noqa: F401
+    except Exception:
+        pass
 
     from vllm_omni.distributed.omni_connectors import build_stage_connectors
     from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
-    from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
         count_tokens_from_outputs,
         log_stage_batch_stats,
         log_stage_running_avg,
     )
+    from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
 
     # no inline JSONL/serialization imports; logging handled by utilities
 

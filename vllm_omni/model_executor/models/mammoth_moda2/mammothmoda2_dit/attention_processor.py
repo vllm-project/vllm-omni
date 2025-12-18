@@ -38,7 +38,7 @@ from transformers.modeling_flash_attention_utils import (
 )
 from transformers.utils.import_utils import is_torch_npu_available
 
-from mammothmoda2.model.mammothmoda2_dit.rope_real import apply_real_rotary_emb
+from .rope_real import apply_real_rotary_emb
 
 if is_flash_attn_available():
     if is_torch_npu_available():
