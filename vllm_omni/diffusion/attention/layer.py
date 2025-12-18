@@ -147,7 +147,8 @@ class Attention(nn.Module):
                      query, key, value, 
                      softmax_scale=softmax_scale, 
                      causal=self.causal,
-                     group=None
+                     group=None,
+                     op_type="flash" # Default to flash implementation of SDPA
                  )
 
             # shape: (batch_size, seq_len, num_heads, head_size)
@@ -181,7 +182,8 @@ class Attention(nn.Module):
                  query, key, value, 
                  softmax_scale=softmax_scale, 
                  causal=self.causal,
-                 group=self.ring_pg
+                 group=self.ring_pg,
+                 op_type="efficient" # Default to flash implementation of SDPA
              )
             
         out = ring_flash_attn_func(
@@ -234,7 +236,8 @@ class Attention(nn.Module):
                      q, k, v, 
                      softmax_scale=softmax_scale, 
                      causal=self.causal,
-                     group=self.ring_pg
+                     group=self.ring_pg,
+                     op_type="efficient" 
                  )
             else:
                 context_layer = ring_flash_attn_func(

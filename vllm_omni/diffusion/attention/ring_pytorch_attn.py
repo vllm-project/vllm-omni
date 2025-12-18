@@ -9,7 +9,6 @@ import math
 import torch
 import torch.nn.functional as F
 from typing import Any, Optional, Tuple
-from vllm_omni.diffusion.attention.backends.ring_selector import select_flash_attn_impl, AttnType
 from vllm_omni.diffusion.distributed.ring import RingComm
 from vllm_omni.diffusion.attention.utils import update_out_and_lse
 from vllm_omni.diffusion.attention.backends.ring_kernels import pytorch_attn_forward, pytorch_attn_backward
@@ -27,9 +26,7 @@ def ring_pytorch_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
-    attn_type: AttnType = AttnType.FA,
-    attn_processor=None,
-    op_type="flash",
+    op_type="efficient",
 ):
     return RingAttentionFunc.apply(group, q, k, v, softmax_scale, causal, op_type)
 
@@ -138,4 +135,3 @@ class RingAttentionFunc(torch.autograd.Function):
         d_kv_comm.wait()
 
         return dq, next_dk, next_dv, None, None
-

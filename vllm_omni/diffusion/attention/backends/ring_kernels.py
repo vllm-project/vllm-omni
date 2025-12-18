@@ -56,7 +56,7 @@ def pytorch_attn_forward(
     softcap=None,
     alibi_slopes=None,
     return_softmax=False,
-    op_type="flash",
+    op_type="efficient",
 ):
     assert op_type in ["flash", "efficient"], f"Invalid op_type: {op_type}"
     """
