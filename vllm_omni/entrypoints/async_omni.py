@@ -382,80 +382,83 @@ class AsyncOmni(EngineClient):
 
         logger.debug("[Orchestrator] Entering scheduling loop: stages=%d", num_stages)
         for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
-            result = await req_state.queue.get()
-            assert stage_id == req_state.stage_id
+            finished = False
+            while not finished:
+                result = await req_state.queue.get()
+                assert stage_id == req_state.stage_id
 
-            req_id = result.get("request_id")
-            if "error" in result:
-                logger.error(
-                    "Stage %s error on request %s: %s",
-                    stage_id,
-                    req_id,
-                    result["error"],
-                )
-                raise RuntimeError(result)  # Request Finished due to error
+                req_id = result.get("request_id")
+                if "error" in result:
+                    logger.error(
+                        "Stage %s error on request %s: %s",
+                        stage_id,
+                        req_id,
+                        result["error"],
+                    )
+                    raise RuntimeError(result)  # Request Finished due to error
 
-            engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-            # Mark last output time for this stage whenever we receive outputs
-            metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-            try:
-                _m = result.get("metrics")
-                if _m is not None:
-                    metrics.on_stage_metrics(stage_id, req_id, _m)
-            except Exception as e:
-                logger.exception(
-                    "[Orchestrator] Failed to process metrics for stage %s, \
-                        req %s: %s",
-                    stage_id,
-                    req_id,
-                    e,
-                )
-            logger.debug(
-                "[Orchestrator] Stage-%s completed request %s; \
-                    forwarding or finalizing",
-                stage_id,
-                req_id,
-            )
-            stage.set_engine_outputs(engine_outputs)
-
-            if getattr(stage, "final_output", False):
-                logger.debug(
-                    "[Orchestrator] Request %s finalized at stage-%s",
-                    req_id,
-                    stage_id,
-                )
-
-                # End-to-end timing and time-per-token for final output
-                # (only once per request at the designated final stage)
+                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+                # Mark last output time for this stage whenever we receive outputs
+                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    rid_key = str(req_id)
-                    if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
-                        metrics.on_finalize_request(
-                            stage_id,
-                            req_id,
-                            engine_outputs,
-                            _req_start_ts.get(req_id, _wall_start_ts),
-                        )
+                    _m = result.get("metrics")
+                    if _m is not None:
+                        metrics.on_stage_metrics(stage_id, req_id, _m)
                 except Exception as e:
                     logger.exception(
-                        "[Orchestrator] Finalize request handling error for \
-                            req %s at stage %s: %s",
-                        req_id,
+                        "[Orchestrator] Failed to process metrics for stage %s, \
+                            req %s: %s",
                         stage_id,
+                        req_id,
                         e,
                     )
+                logger.debug(
+                    "[Orchestrator] Stage-%s completed request %s; \
+                        forwarding or finalizing",
+                    stage_id,
+                    req_id,
+                )
+                stage.set_engine_outputs(engine_outputs)
 
                 if isinstance(engine_outputs, list):
                     engine_outputs = engine_outputs[0]
-                yield OmniRequestOutput(
-                    stage_id=stage_id,
-                    final_output_type=stage.final_output_type,
-                    request_output=engine_outputs,
-                )
+                finished = engine_outputs.finished
+
+                if getattr(stage, "final_output", False):
+                    logger.debug(
+                        "[Orchestrator] Request %s finalized at stage-%s",
+                        req_id,
+                        stage_id,
+                    )
+
+                    # End-to-end timing and time-per-token for final output
+                    # (only once per request at the designated final stage)
+                    try:
+                        rid_key = str(req_id)
+                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
+                            metrics.on_finalize_request(
+                                stage_id,
+                                req_id,
+                                engine_outputs,
+                                _req_start_ts.get(req_id, _wall_start_ts),
+                            )
+                    except Exception as e:
+                        logger.exception(
+                            "[Orchestrator] Finalize request handling error for \
+                                req %s at stage %s: %s",
+                            req_id,
+                            stage_id,
+                            e,
+                        )
+                    yield OmniRequestOutput(
+                        stage_id=stage_id,
+                        final_output_type=stage.final_output_type,
+                        request_output=engine_outputs,
+                    )
 
             # Forward to next stage if there is one
             next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e:
+            if next_stage_id <= final_stage_id_for_e2e and finished:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
                 next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]

@@ -885,6 +885,8 @@ async def _stage_worker_async(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
+    stage_chunk_size: int = 4,
+    engine_output_type: str = "latent",
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
@@ -1175,7 +1177,12 @@ async def _stage_worker_async(
             _gen_t0 = _time.time()
             if isinstance(ein, list):
                 ein = ein[0]
+
+            loop_num = 0
+            prev_token_count = [0]  # Track previous cumulative token count
+            prev_multimodal_len = [0]
             async for res in stage_engine.generate(ein, sampling_params, rid):
+                print(f"************************* loop_num: {loop_num} *************************", flush=True)
                 gen_output = res
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
