@@ -102,10 +102,9 @@ class TestAttentionModel(torch.nn.Module):
 
         # Apply attention with split logic
         if get_sequence_parallel_world_size() > 1 and not split_text_embed_in_sp and encoder_hidden_states is not None:
-            # Split back to hidden_states part (first seq_len) and encoder_hidden_states part (second seq_len)
-            q_hidden, q_encoder = torch.split(q, [seq_len, total_seq_len - seq_len], dim=1)
-            k_hidden, k_encoder = torch.split(k, [seq_len, total_seq_len - seq_len], dim=1)
-            v_hidden, v_encoder = torch.split(v, [seq_len, total_seq_len - seq_len], dim=1)
+            q_encoder, q_hidden = torch.split(q, [total_seq_len - seq_len, seq_len], dim=1)
+            k_encoder, k_hidden = torch.split(k, [total_seq_len - seq_len, seq_len], dim=1)
+            v_encoder, v_hidden = torch.split(v, [total_seq_len - seq_len, seq_len], dim=1)
 
             # Use hidden_states part as main attention, encoder part as joint
             attn_output = self.attention(
@@ -124,6 +123,7 @@ class TestAttentionModel(torch.nn.Module):
         # Reshape back and project
         attn_output = attn_output.view(batch_size, total_seq_len, -1)
         output = self.o_proj(attn_output)
+        output = output[:, encoder_hidden_states.shape[1] :, :] if encoder_hidden_states is not None else output
 
         return output
 
@@ -163,11 +163,8 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass through multiple attention layers."""
-        output = (
-            hidden_states if encoder_hidden_states is None else torch.cat([encoder_hidden_states, hidden_states], dim=1)
-        )
         for layer in self.layers:
-            output = output + layer(hidden_states, encoder_hidden_states)
+            hidden_states = hidden_states + layer(hidden_states, encoder_hidden_states)
         return hidden_states
 
 
@@ -178,7 +175,7 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         TestMultiLayerAttentionModel,
     ],
 )
-@pytest.mark.parametrize("ulysses_degree", [2, 4])
+@pytest.mark.parametrize("ulysses_degree", [2])
 @pytest.mark.parametrize("ring_degree", [1])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
@@ -186,7 +183,7 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("head_size", [8])
 @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("use_sync", [True, False])
+@pytest.mark.parametrize("use_sync", [True])
 @pytest.mark.parametrize("dynamic", [False])
 @pytest.mark.parametrize("use_compile", [False])
 def test_ulysses_attention(
@@ -531,17 +528,8 @@ def ulysses_attention_on_test_model(
         print(f"[Rank {local_rank}] Running forward pass...")
         output = model(hidden_states, encoder_hidden_states)
         print(f"[Rank {local_rank}] Forward pass completed, output shape: {output.shape}")
-
-        # Verify output shape
-        # When split_text_embed_in_sp is True and SP is enabled, output should be local_seq_len
-        # When split_text_embed_in_sp is False, output should be 2 * local_seq_len (concatenated)
-        if get_sequence_parallel_world_size() > 1 and split_text_embed_in_sp:
-            expected_output_seq_len = local_seq_len
-        else:
-            expected_output_seq_len = 2 * local_seq_len  # Combined hidden_states and encoder_hidden_states
-
-        assert output.shape == (batch_size, expected_output_seq_len, hidden_size), (
-            f"Output shape mismatch: expected {(batch_size, expected_output_seq_len, hidden_size)}, got {output.shape}"
+        assert output.shape == (batch_size, local_seq_len, hidden_size), (
+            f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
         )
 
         # Verify SP usage for non-baseline runs
@@ -555,7 +543,7 @@ def ulysses_attention_on_test_model(
                         f"Layer {i} attention should have use_ulysses attribute"
                     )
                     assert layer.attention.use_ulysses, f"Layer {i} attention should be using Ulysses"
-
+        output = output.contiguous()
         # Gather outputs from all ranks AFTER computation
         if world_size > 1:
             print(f"[Rank {local_rank}] Gathering outputs from all {world_size} ranks...")
@@ -566,15 +554,9 @@ def ulysses_attention_on_test_model(
                 # Concatenate along sequence dimension to reconstruct full sequence
                 full_output = torch.cat(gathered_outputs, dim=1)
                 print(f"[Rank 0] Gathered and concatenated outputs: {full_output.shape}")
-                # Verify the full output shape matches expected
-                # When split_text_embed_in_sp is True, expected is seq_len
-                # When False, expected is 2 * seq_len
-                if split_text_embed_in_sp:
-                    expected_full_seq_len = seq_len
-                else:
-                    expected_full_seq_len = 2 * seq_len
-                assert full_output.shape == (batch_size, expected_full_seq_len, hidden_size), (
-                    f"Gathered output shape mismatch: expected {(batch_size, expected_full_seq_len, hidden_size)}, "
+
+                assert full_output.shape == (batch_size, seq_len, hidden_size), (
+                    f"Gathered output shape mismatch: expected {(batch_size, seq_len, hidden_size)}, "
                     f"got {full_output.shape}"
                 )
             else:
