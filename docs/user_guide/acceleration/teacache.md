@@ -87,13 +87,28 @@ cache_config={"rel_l1_thresh": 0.1}  # More conservative caching
 
 ## Supported Models
 
-Currently supported models:
+<style>
+th {
+  white-space: nowrap;
+  min-width: 0 !important;
+}
+</style>
 
-- **QwenImagePipeline**
-  - Model identifier: `"Qwen/Qwen-Image"`
-  - Example: `model="Qwen/Qwen-Image"`
+| Architecture | Models | Example HF Models |
+|--------------|--------|-------------------|
+| `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
+| `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 
-Future support (extractors in development):
+### Coming Soon
 
-- **FluxPipeline** - Coming soon
-- **CogVideoXPipeline** - Coming soon
+<style>
+th {
+  white-space: nowrap;
+  min-width: 0 !important;
+}
+</style>
+
+| Architecture | Models | Example HF Models |
+|--------------|--------|-------------------|
+| `FluxPipeline` | Flux | - |
+| `CogVideoXPipeline` | CogVideoX | - |
