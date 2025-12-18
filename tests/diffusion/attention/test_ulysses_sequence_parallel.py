@@ -85,7 +85,7 @@ class TestAttentionModel(torch.nn.Module):
         # Combine hidden_states and encoder_hidden_states if provided
         if encoder_hidden_states is not None:
             # Concatenate along sequence dimension
-            combined_hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+            combined_hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
         else:
             combined_hidden_states = hidden_states
 
@@ -165,8 +165,11 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass through multiple attention layers."""
+        output = (
+            hidden_states if encoder_hidden_states is None else torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        )
         for layer in self.layers:
-            hidden_states = hidden_states + layer(hidden_states, encoder_hidden_states)
+            output = output + layer(hidden_states, encoder_hidden_states)
         return hidden_states
 
 

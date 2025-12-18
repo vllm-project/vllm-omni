@@ -17,7 +17,7 @@ class ForwardContext:
 
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
-    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
+    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
