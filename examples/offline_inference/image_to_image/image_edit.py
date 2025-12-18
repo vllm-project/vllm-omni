@@ -144,7 +144,14 @@ def main():
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
     elif args.cache_backend == "tea_cache":
-        raise ValueError("TeaCache is not supported for image-to-image generation.")
+        # TeaCache configuration
+        # All parameters marked with [tea_cache only] in DiffusionCacheConfig
+        cache_config = {
+            # TeaCache parameters [tea_cache only]
+            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
+            # Note: coefficients will use model-specific defaults based on model_type
+            #       (e.g., QwenImagePipeline or FluxPipeline)
+        }
 
     # Initialize Omni with QwenImageEditPipeline
     omni = Omni(
