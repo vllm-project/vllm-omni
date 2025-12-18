@@ -52,12 +52,6 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8092 --usp 2
 ```
 
-If you prefer to set GPU count explicitly:
-
-```bash
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --num-gpus 2
-```
-
 ##### Benchmarks
 !!! note "Benchmark Disclaimer"
     These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
