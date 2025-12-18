@@ -1,4 +1,4 @@
-# Test File Structure and Style Guide
+# vLLM-Omni Test File Structure and Style Guide
 
 To ensure project maintainability and sustainable development, we encourage contributors to submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes. This document outlines the guidelines for organizing and naming test files.
 
@@ -9,7 +9,9 @@ For unit tests and system tests, we strongly recommend placing test files in the
 
 ### End-to-End (E2E) Tests for Models
 End-to-end tests verify the complete functionality of a system or component. For our project, the E2E tests for different omni models are organized into two subdirectories:
+
 - **`tests/e2e/offline_inference/`**: Tests for offline inference modes (e.g., Qwen3Omni offline inference)
+
 - **`tests/e2e/online_serving/`**: Tests for online serving scenarios (e.g., API server tests)
 
 **Example:** The test file for `vllm_omni/entrypoints/omni_llm.py` should be located at `tests/entrypoints/test_omni_llm.py`.
@@ -24,10 +26,9 @@ vllm_omni/                          tests/
 │   └── model.py                    │   └── test_model.py
 │
 ├── core/                      →    ├── core/
-│   ├── dit_cache_manager.py       │   ├── test_dit_cache_manager.py
 │   └── sched/                      │   └── sched/                    # Maps to core/sched/
-│       ├── omni_ar_scheduler.py   │       ├── test_omni_ar_scheduler.py
-│       ├── omni_generation_scheduler.py │ ├── test_omni_generation_scheduler.py
+│       ├── omni_ar_scheduler.py    │       ├── test_omni_ar_scheduler.py
+│       ├── omni_generation_scheduler.py │  ├── test_omni_generation_scheduler.py
 │       └── output.py               │       └── test_output.py
 │
 ├── diffusion/                 →    ├── diffusion/
@@ -37,14 +38,14 @@ vllm_omni/                          tests/
 │   │   └── backends/               │   │   └── test_*.py
 │   ├── models/                     │   ├── models/                   # Maps to diffusion/models/
 │   │   ├── qwen_image/             │   │   ├── qwen_image/
-│   │   │   └── ...                  │   │   │   └── test_*.py
-│   │   └── z_image/                 │   │   └── z_image/
-│   │       └── ...                  │   │       └── test_*.py
-│   └── worker/                      │   └── worker/                   # Maps to diffusion/worker/
-│       └── ...                      │       └── test_*.py
+│   │   │   └── ...                 │   │   │   └── test_*.py
+│   │   └── z_image/                │   │   └── z_image/
+│   │       └── ...                 │   │       └── test_*.py
+│   └── worker/                     │   └── worker/                   # Maps to diffusion/worker/
+│       └── ...                     │       └── test_*.py
 │
 ├── distributed/               →    ├── distributed/
-│   └── ...                          │   └── test_*.py
+│   └── ...                         │   └── test_*.py
 │
 ├── engine/                    →    ├── engine/
 │   ├── processor.py                │   ├── test_processor.py
@@ -80,7 +81,7 @@ vllm_omni/                          tests/
 │   │       └── ...                 │   │       └── test_*.py
 │   ├── stage_configs/              │   └── stage_configs/             # Configuration tests (if needed)
 │   │   └── ...                     │       └── test_*.py
-│   └── stage_input_processors/      │   └── stage_input_processors/
+│   └── stage_input_processors/     │   └── stage_input_processors/
 │       └── ...                     │       └── test_*.py
 │
 ├── sample/                    →    ├── sample/
@@ -90,22 +91,22 @@ vllm_omni/                          tests/
 │   └── platform_utils.py           │   └── test_platform_utils.py
 │
 ├── worker/                    →    ├── worker/
-    ├── gpu_ar_worker.py             │   ├── test_gpu_ar_worker.py
-    ├── gpu_generation_worker.py     │   ├── test_gpu_generation_worker.py
-    ├── gpu_model_runner.py          │   ├── test_gpu_model_runner.py
-    └── npu/                         │   └── npu/                       # Maps to worker/npu/
-        └── ...                      │       └── test_*.py
+    ├── gpu_ar_worker.py            │   ├── test_gpu_ar_worker.py
+    ├── gpu_generation_worker.py    │   ├── test_gpu_generation_worker.py
+    ├── gpu_model_runner.py         │   ├── test_gpu_model_runner.py
+    └── npu/                        │   └── npu/                       # Maps to worker/npu/
+        └── ...                     │       └── test_*.py
 │
-└── e2e/                →    ├── e2e/                # End-to-end scenarios (no 1:1 source mirror)
-                                  ├── online_serving/       # Full-stack online serving flows
-                                  │   └── (empty for now)
-                                  └── offline_inference/    # Full offline inference flows
-                                      ├── test_qwen2_5_omni.py     # Moved from multi_stages/
-                                      ├── test_qwen3_omni.py       # Moved from multi_stages_h100/
-                                      ├── test_diffusion_model.py  # Moved from single_stage/
-                                      └── stage_configs/           # Shared stage configs
-                                          ├── qwen2_5_omni_ci.yaml
-                                          └── qwen3_omni_ci.yaml
+└── e2e/                       →    ├── e2e/                # End-to-end scenarios (no 1:1 source mirror)
+                                    ├── online_serving/       # Full-stack online serving flows
+                                    │   └── (empty for now)
+                                    └── offline_inference/    # Full offline inference flows
+                                        ├── test_qwen2_5_omni.py     # Moved from multi_stages/
+                                        ├── test_qwen3_omni.py       # Moved from multi_stages_h100/
+                                        ├── test_t2i_model.py  # Moved from single_stage/
+                                        └── stage_configs/           # Shared stage configs
+                                            ├── qwen2_5_omni_ci.yaml
+                                            └── qwen3_omni_ci.yaml
 ```
 
 
@@ -133,8 +134,10 @@ vllm_omni/                          tests/
 1. **File header**: Add SPDX license header to all test files
 2. **Imports**: Pls don't use manual `sys.path` modifications, use standard imports instead.
 3. **Test type differentiation**:
-   - Unit tests: Maintain mock style
-   - Model tests: Consider using OmniRunner uniformly, avoid decorators
+
+      - Unit tests: Maintain mock style
+      - E2E tests for models: Consider using OmniRunner uniformly, avoid decorators
+
 4. **Documentation**: Add docstrings to all test functions
 5. **Environment variables**: Set uniformly in `conftest.py` or at the top of files
 6. **Type annotations**: Add type annotations to all test function parameters
@@ -142,10 +145,13 @@ vllm_omni/                          tests/
 
 ### Template
 #### E2E - Online serving
+
+```python
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Online E2E smoke test for an omni model (video,text,audio → audio).
 """
-```python
 from pathlib import Path
 
 import pytest
@@ -179,7 +185,7 @@ def base64_encoded_video() -> str:
 @pytest.fixture(scope="session")
 def dummy_messages_from_video_data(video_data_url: str, content_text: str) -> str:
     xxx
-    
+
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_audio(
     client: openai.OpenAI,
@@ -189,24 +195,23 @@ def test_video_to_audio(
     #set message
     video_data_url = f"data:video/mp4;base64, {base64_encoded_video}"
     messages = dummy_messages_from_video_data(video_data_url)
-    
+
     #send request
     chat_completion = client.chat.completions.create(
         model=omni_server.model,
         messages=messages,
     )
-    
+
     #verify text output
     text_choice = chat_completion.choices[0]
     assert text_choice.finish_reason == "length"
-    
+
     #verify audio output
     audio_choice = chat_completion.choices[1]
     audio_message = audio_choice.message
     if hasattr(audio_message, "audio") and audio_message.audio:
         assert audio_message.audio.data is not None
         assert len(audio_message.audio.data) > 0
-    
 ```
 
 #### E2E - Offline inference
@@ -228,16 +233,21 @@ from ..multi_stages.conftest import OmniRunner
 # Optional: set process start method for workers
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-CI_STAGE_CONFIG_PATH = str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml") # Edit here to load your model
+models = ["{your model name}"] #Edit here to load your model
+stage_configs = [str(Path(__file__).parent / "stage_configs" / {your model yaml})] #Edit here to load your model yaml
 
+# Create parameter combinations for model and stage config
+test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 # function name: test_{input_modality}_to_{output_modality}
 # modality candidate: text, image, audio, video, mixed_modalities
 @pytest.mark.gpu_mem_high  # requires high-memory GPU node
-@pytest.mark.parametrize("model", ["Qwen/Qwen3-Omni-30B-A3B-Instruct"])
+@pytest.mark.parametrize("test_config", test_params)
 def test_video_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
     """Offline inference: video input, audio output."""
-    with omni_runner(model, seed=42, stage_configs_path=CI_STAGE_CONFIG_PATH) as runner:
+    model, stage_config_path = test_config
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
+        # Prepare inputs
         video = VideoAsset(name="sample", num_frames=4).np_ndarrays
 
         outputs = runner.generate_multimodal(
@@ -250,8 +260,6 @@ def test_video_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
         has_audio = any(o.final_output_type == "audio" for o in outputs)
         assert has_audio
 ```
-
-
 
 ## Checklist before submit your test files:
 

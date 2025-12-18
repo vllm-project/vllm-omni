@@ -1,12 +1,7 @@
 import os
-import socket
-import subprocess
-import sys
-import time
 import pytest
 import torch
 from vllm.logger import init_logger
-from vllm.utils import get_open_port
 
 logger = init_logger(__name__)
 
@@ -38,79 +33,3 @@ def clean_gpu_memory_between_tests():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
-
-
-
-class OmniServer:
-    """Omniserver for vLLM-Omni tests."""
-
-    def __init__(
-        self,
-        model: str,
-        serve_args: list[str],
-        *,
-        env_dict: dict[str, str] | None = None,
-    ) -> None:
-        self.model = model
-        self.serve_args = serve_args
-        self.env_dict = env_dict
-        self.proc: subprocess.Popen | None = None
-        self.host = "127.0.0.1"
-        self.port = get_open_port()
-
-    def _start_server(self) -> None:
-        """Start the vLLM-Omni server subprocess."""
-        env = os.environ.copy()
-        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        if self.env_dict is not None:
-            env.update(self.env_dict)
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "vllm_omni.entrypoints.cli.main",
-            "serve",
-            self.model,
-            "--omni",
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
-        ] + self.serve_args
-
-        print(f"Launching OmniServer with: {' '.join(cmd)}")
-        self.proc = subprocess.Popen(
-            cmd,
-            env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
-        )
-
-        # Wait for server to be ready
-        max_wait = 600  # 10 minutes
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex((self.host, self.port))
-                    if result == 0:
-                        print(f"Server ready on {self.host}:{self.port}")
-                        return
-            except Exception:
-                pass
-            time.sleep(2)
-
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
-
-    def __enter__(self):
-        self._start_server()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
