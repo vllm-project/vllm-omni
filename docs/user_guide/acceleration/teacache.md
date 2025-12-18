@@ -39,6 +39,21 @@ omni = Omni(
 )
 ```
 
+## Online Serving (OpenAI-Compatible)
+
+Enable TeaCache for online serving by passing `--cache-backend tea_cache` when starting the server:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh": 0.2}'
+```
+
+For complete, runnable scripts (including base64 image extraction), see:
+
+- `docs/user_guide/examples/online_serving/text_to_image.md`
+- `docs/user_guide/examples/online_serving/image_to_image.md`
+
 ## Configuration Parameters
 
 ### `rel_l1_thresh` (float, default: `0.2`)
