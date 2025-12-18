@@ -4,7 +4,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, Union
+from typing import Any
 
 import cloudpickle
 from pydantic import ValidationError
@@ -44,6 +44,7 @@ from vllm_omni.entrypoints.log_utils import (
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
+    get_final_stage_id_for_e2e,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -89,9 +90,9 @@ class OmniLLM:
     def __init__(
         self,
         model: str,
-        stage_configs_path: Optional[str] = None,
+        stage_configs_path: str | None = None,
         log_stats: bool = False,
-        log_file: Optional[str] = None,
+        log_file: str | None = None,
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
@@ -147,6 +148,7 @@ class OmniLLM:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
         if self.worker_backend == "ray":
@@ -228,8 +230,8 @@ class OmniLLM:
 
     def generate(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
+        prompts: PromptType | Sequence[PromptType],
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
     ) -> list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
@@ -262,8 +264,8 @@ class OmniLLM:
 
     def _run_generation(
         self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
+        prompts: PromptType | Sequence[PromptType],
+        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
     ) -> list[OmniRequestOutput]:
         logger.debug("[Orchestrator] generate() called")
         if sampling_params_list is None:
@@ -291,22 +293,17 @@ class OmniLLM:
         _wall_start_ts: float = time.time()
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
-        final_stage_id_for_e2e = -1
-        last_stage_id = len(self.stage_list) - 1
-        try:
-            for _sid in range(last_stage_id, -1, -1):
-                if getattr(self.stage_list[_sid], "final_output", False):
-                    final_stage_id_for_e2e = _sid
-                    break
-            if final_stage_id_for_e2e < 0:
-                final_stage_id_for_e2e = last_stage_id
-        except Exception as e:
-            logger.debug(
-                "[Orchestrator] Failed to determine final stage for E2E; falling back to last: %s",
-                e,
-                exc_info=True,
+        final_stage_id_to_prompt = {}
+        for rid, prompt in request_id_to_prompt.items():
+            if isinstance(prompt, dict):
+                prompt_modalities = prompt.get("modalities", None)
+            else:
+                prompt_modalities = None
+            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
+                prompt_modalities, self.output_modalities, self.stage_list
             )
-            final_stage_id_for_e2e = last_stage_id
+            final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
+
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
             num_stages,
@@ -406,7 +403,7 @@ class OmniLLM:
                     # (only once per request at the designated final stage)
                     try:
                         rid_key = str(req_id)
-                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
+                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -422,7 +419,7 @@ class OmniLLM:
                         )
 
                 next_stage_id = stage_id + 1
-                if next_stage_id < num_stages:
+                if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     try:
                         next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
@@ -479,7 +476,7 @@ class OmniLLM:
 
         # Summarize and print stats
         try:
-            summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
+            summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
             logger.info("[Summary] %s", summary)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
@@ -559,9 +556,9 @@ class OmniStageLLM(LLM):
     def __init__(
         self,
         model: str,
-        compilation_config: Optional[Union[int, dict[str, Any], CompilationConfig]] = None,
-        hf_overrides: Optional[dict[str, Any]] = None,
-        structured_outputs_config: Optional[Union[dict[str, Any], StructuredOutputsConfig]] = None,
+        compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
+        hf_overrides: dict[str, Any] | None = None,
+        structured_outputs_config: dict[str, Any] | StructuredOutputsConfig | None = None,
         **kwargs: Any,
     ):
         """LLM constructor."""
@@ -633,7 +630,7 @@ class OmniStageLLM(LLM):
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()
-        self.default_sampling_params: Union[dict[str, Any], None] = None
+        self.default_sampling_params: dict[str, Any] | None = None
 
         supported_tasks = self.llm_engine.get_supported_tasks()  # type: ignore
 

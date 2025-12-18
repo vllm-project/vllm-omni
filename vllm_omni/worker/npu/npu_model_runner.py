@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -293,8 +293,8 @@ class OmniNPUModelRunner(NPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(
-        self, hidden_states: Union[torch.Tensor, list[torch.Tensor]]
-    ) -> tuple[torch.Tensor, Union[torch.Tensor, list[torch.Tensor], dict]]:
+        self, hidden_states: torch.Tensor | list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | list[torch.Tensor] | dict]:
         """Extract multimodal outputs from hidden states."""
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
@@ -373,7 +373,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         num_tokens: int,
         with_prefill: bool = False,
         is_torchair_compile: bool = False,
-        aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
+        aclgraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
     ) -> torch.Tensor:

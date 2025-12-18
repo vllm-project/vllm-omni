@@ -35,6 +35,14 @@ Then run the command below.
 bash run_single_prompt.sh
 ```
 
+### Modality control
+If you want to control output modalities, e.g. only output text, you can run the command below:
+```bash
+python end2end.py --output-wav output_audio \
+                  --query-type mixed_modalities \
+                  --modalities text
+```
+
 #### Using Local Media Files
 The `end2end.py` script supports local media files (audio, video, image) via CLI arguments:
 
