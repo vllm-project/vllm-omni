@@ -17,8 +17,31 @@ def _update_out_and_lse(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     
     block_out = block_out.to(torch.float32)
-    block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
-
+    # block_lse shape: (batch_size, num_heads, seq_len)
+    # lse shape: (batch_size, seq_len, num_heads, 1)
+    
+    # Check if block_lse needs transposition
+    # If block_lse is (B, H, S), we need to transpose to (B, S, H) then unsqueeze to (B, S, H, 1)
+    # If block_lse is already (B, S, H), we just unsqueeze
+    
+    if block_lse.dim() == 3:
+        # Assuming (B, H, S) from Flash Attention / SDPA
+        # But we need to be careful if it is already (B, S, H)
+        # Check against out shape. out is (B, S, H, D)
+        # So lse should be (B, S, H, 1)
+        
+        B, S, H, D = out.shape
+        
+        # If block_lse is (B, H, S)
+        if block_lse.shape[-1] == S and block_lse.shape[-2] == H:
+             block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+        # If block_lse is (B, S, H)
+        elif block_lse.shape[-2] == S and block_lse.shape[-1] == H:
+             block_lse = block_lse.unsqueeze(dim=-1)
+        else:
+            # Fallback to original behavior but adding a check might be good
+             block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+    
     # new_lse = lse + torch.log(1 + torch.exp(block_lse - lse))
     # torch.exp(lse - new_lse) * out + torch.exp(block_lse - new_lse) * block_out
     # For additional context and discussion, please refer to:
@@ -40,7 +63,25 @@ def update_out_and_lse(
         if slice_ is not None:
             raise RuntimeError("first update_out_and_lse should not pass slice_ args")
         out = block_out.to(torch.float32)
-        lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+        
+        # Initialize LSE
+        # block_lse from FA/SDPA is usually (B, H, S)
+        # We want internal LSE state to be (B, S, H, 1) to match out (B, S, H, D) broadcasting
+        
+        if block_lse.dim() == 3:
+             B, S, H, D = out.shape
+             # If block_lse is (B, H, S)
+             if block_lse.shape[-1] == S and block_lse.shape[-2] == H:
+                  lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+             # If block_lse is (B, S, H)
+             elif block_lse.shape[-2] == S and block_lse.shape[-1] == H:
+                  lse = block_lse.unsqueeze(dim=-1)
+             else:
+                  # Original behavior fallback
+                  lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+        else:
+             lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+             
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
         slice_out, slice_lse = _update_out_and_lse(
@@ -72,4 +113,3 @@ def unflatten_varlen_lse(lse, cu_seqlens, max_seqlen: int):
         start, end = cu_seqlens[i], cu_seqlens[i + 1]
         new_lse[i, : end - start] = lse[start:end]
     return new_lse.squeeze(dim=-1).transpose(1, 2).contiguous()
-
