@@ -1,4 +1,9 @@
-from vllm.model_executor.models.registry import _VLLM_MODELS, _LazyRegisteredModel, _ModelRegistry
+from vllm.model_executor.models.registry import (
+    _VLLM_MODELS,
+    _LazyRegisteredModel,
+    _ModelRegistry,
+    ModelRegistry as VLLMModelRegistry,
+)
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
@@ -58,6 +63,18 @@ _OMNI_MODELS = {
         "mammoth_moda2_dit",
         "MammothModa2DiTForConditionalGeneration",
     ),
+    # 顶层入口，匹配 HF 配置里的 architectures= ["Mammothmoda2Model"]
+    "Mammothmoda2Model": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
+    # 文本骨干架构别名，便于按名称显式加载。
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2_ar",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {
@@ -65,6 +82,12 @@ _VLLM_OMNI_MODELS = {
     **_OMNI_MODELS,
 }
 
+# 兼容基础 vLLM 的全局 ModelRegistry，确保 architectures=["Mammothmoda2Model"] 可被识别。
+if hasattr(VLLMModelRegistry, "register_model"):
+    VLLMModelRegistry.register_model(
+        "Mammothmoda2Model",
+        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2:MammothModa2ForConditionalGeneration",
+    )
 
 OmniModelRegistry = _ModelRegistry(
     {
