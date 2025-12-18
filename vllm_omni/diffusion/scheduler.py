@@ -36,7 +36,15 @@ class Scheduler:
             local_reader_ranks=list(range(od_config.num_gpus)),
         )
 
+        # Initialize RPC MessageQueue for broadcasting RPC requests
+        self.rpc_mq = MessageQueue(
+            n_reader=od_config.num_gpus,
+            n_local_reader=od_config.num_gpus,
+            local_reader_ranks=list(range(od_config.num_gpus)),
+        )
+
         self.result_mq = None
+        self.rpc_result_mq = None
 
     def initialize_result_queue(self, handle):
         # Initialize MessageQueue for receiving results
@@ -44,8 +52,17 @@ class Scheduler:
         self.result_mq = MessageQueue.create_from_handle(handle, rank=0)
         logger.info("SyncScheduler initialized result MessageQueue")
 
+    def initialize_rpc_result_queue(self, handle):
+        # Initialize MessageQueue for receiving RPC results
+        # We act as rank 0 reader for this queue
+        self.rpc_result_mq = MessageQueue.create_from_handle(handle, rank=0)
+        logger.info("SyncScheduler initialized RPC result MessageQueue")
+
     def get_broadcast_handle(self):
         return self.mq.export_handle()
+
+    def get_rpc_broadcast_handle(self):
+        return self.rpc_mq.export_handle()
 
     def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
@@ -68,7 +85,9 @@ class Scheduler:
             self.context.term()
         self.context = None
         self.mq = None
+        self.rpc_mq = None
         self.result_mq = None
+        self.rpc_result_mq = None
 
 
 # Singleton instance for easy access
