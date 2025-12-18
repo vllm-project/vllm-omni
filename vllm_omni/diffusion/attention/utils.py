@@ -8,7 +8,8 @@ import torch.nn.functional as F
 
 __all__ = ["update_out_and_lse", "flatten_varlen_lse", "unflatten_varlen_lse"]
 
-@torch.jit.script
+# Remove torch.jit.script for debugging and flexible shape handling
+# @torch.jit.script
 def _update_out_and_lse(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -17,37 +18,50 @@ def _update_out_and_lse(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     
     block_out = block_out.to(torch.float32)
-    # block_lse shape: (batch_size, num_heads, seq_len)
-    # lse shape: (batch_size, seq_len, num_heads, 1)
     
-    # Check if block_lse needs transposition
-    # If block_lse is (B, H, S), we need to transpose to (B, S, H) then unsqueeze to (B, S, H, 1)
-    # If block_lse is already (B, S, H), we just unsqueeze
+    # Debug prints (will be visible in stdout/stderr of the test output)
+    # print(f"DEBUG: out.shape={out.shape}, lse.shape={lse.shape}, block_out.shape={block_out.shape}, block_lse.shape={block_lse.shape}")
+
+    # Check and adjust block_lse shape to match lse
+    # lse expected to be (B, S, H, 1) or broadcastable to out
     
-    if block_lse.dim() == 3:
-        # Assuming (B, H, S) from Flash Attention / SDPA
-        # But we need to be careful if it is already (B, S, H)
-        # Check against out shape. out is (B, S, H, D)
-        # So lse should be (B, S, H, 1)
+    # Case 1: block_lse is (B, H, S) - Typical from SDPA/FlashAttn
+    if block_lse.dim() == 3 and block_lse.shape[-2] == out.shape[-2]: 
+        # CAUTION: Heuristic assuming H is dim -2 for block_lse? No, SDPA returns (B, H, S)
+        # But out is (B, S, H, D). So block_lse (B, H, S) needs transpose to (B, S, H)
         
+        # Let's rely on matching S and H dimensions with out
         B, S, H, D = out.shape
-        
-        # If block_lse is (B, H, S)
         if block_lse.shape[-1] == S and block_lse.shape[-2] == H:
-             block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
-        # If block_lse is (B, S, H)
+            block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
         elif block_lse.shape[-2] == S and block_lse.shape[-1] == H:
              block_lse = block_lse.unsqueeze(dim=-1)
-        else:
-            # Fallback to original behavior but adding a check might be good
-             block_lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+             
+    # Case 2: block_lse is flattened? or mismatch
+    
+    # Ensure block_lse is broadcastable to lse
+    # If lse is (B, S, H, 1) and block_lse ended up (B, H, S, 1) due to wrong transpose, it would fail
+    
+    # Safe guard: if shapes are just permuted (B, H, S) vs (B, S, H), force match to out
+    if lse.shape != block_lse.shape:
+        # Try to align block_lse to lse if possible
+        if block_lse.dim() == 4 and lse.dim() == 4:
+             if block_lse.shape[1] == lse.shape[2] and block_lse.shape[2] == lse.shape[1]:
+                  block_lse = block_lse.transpose(1, 2)
     
     # new_lse = lse + torch.log(1 + torch.exp(block_lse - lse))
     # torch.exp(lse - new_lse) * out + torch.exp(block_lse - new_lse) * block_out
     # For additional context and discussion, please refer to:
     # https://github.com/zhuzilin/ring-flash-attention/pull/34#issuecomment-2076126795
-    out = out - F.sigmoid(block_lse - lse) * (out - block_out)
-    lse = lse - F.logsigmoid(lse - block_lse)
+    
+    try:
+        out = out - F.sigmoid(block_lse - lse) * (out - block_out)
+        lse = lse - F.logsigmoid(lse - block_lse)
+    except RuntimeError as e:
+        print(f"ERROR in _update_out_and_lse: {e}")
+        print(f"out: {out.shape}, lse: {lse.shape}")
+        print(f"block_out: {block_out.shape}, block_lse: {block_lse.shape}")
+        raise e
 
     return out, lse
 
@@ -65,22 +79,23 @@ def update_out_and_lse(
         out = block_out.to(torch.float32)
         
         # Initialize LSE
-        # block_lse from FA/SDPA is usually (B, H, S)
-        # We want internal LSE state to be (B, S, H, 1) to match out (B, S, H, D) broadcasting
+        # Goal: lse shape should match out's spatial dims (B, S, H, 1)
+        B, S, H, D = out.shape
+        
+        # block_lse from SDPA/FA is typically (B, H, S)
+        # We need (B, S, H, 1)
         
         if block_lse.dim() == 3:
-             B, S, H, D = out.shape
-             # If block_lse is (B, H, S)
              if block_lse.shape[-1] == S and block_lse.shape[-2] == H:
                   lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
-             # If block_lse is (B, S, H)
              elif block_lse.shape[-2] == S and block_lse.shape[-1] == H:
                   lse = block_lse.unsqueeze(dim=-1)
              else:
-                  # Original behavior fallback
+                  # Fallback or weird shape
                   lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
         else:
-             lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
+             # Already 4D?
+             lse = block_lse
              
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]
@@ -93,7 +108,7 @@ def update_out_and_lse(
     return out, lse
 
 
-@torch.jit.script
+# @torch.jit.script
 def flatten_varlen_lse(lse, cu_seqlens):
     new_lse = []
     for i in range(len(cu_seqlens) - 1):
@@ -102,7 +117,7 @@ def flatten_varlen_lse(lse, cu_seqlens):
     return torch.cat(new_lse, dim=1)
 
 
-@torch.jit.script
+# @torch.jit.script
 def unflatten_varlen_lse(lse, cu_seqlens, max_seqlen: int):
     num_seq = len(cu_seqlens) - 1
     num_head = lse.shape[-2]
