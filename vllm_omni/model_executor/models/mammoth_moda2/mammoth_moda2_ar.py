@@ -340,7 +340,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -349,9 +349,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
+                assert input_ids is not None
                 hidden_states = self.get_input_embeddings(input_ids)
             # gen token mask: True 表示生成图像 token，走 gen_mlp
-            if self.gen_vocab_start_index is None:
+            # vLLM v1 路径下可能只提供 inputs_embeds，并将 input_ids 置为 None；
+            # 此时无法按 token id 区分 gen token，退化为全量走 und_expert。
+            if self.gen_vocab_start_index is None or input_ids is None:
                 gen_token_mask = None
             else:
                 gen_token_mask = input_ids >= self.gen_vocab_start_index
