@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -121,7 +122,9 @@ def _join_url(base_url: str, path: str) -> str:
 
 def _http_post_json(url: str, api_key: str, payload: dict[str, Any], timeout_s: float) -> tuple[int, bytes]:
     data = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -129,23 +132,25 @@ def _http_post_json(url: str, api_key: str, payload: dict[str, Any], timeout_s: 
         return int(getattr(resp, "status", 200)), resp.read()
 
 
+def _extract_error_message(body: bytes) -> str:
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            if isinstance(err, dict) and "message" in err:
+                return str(err["message"])
+            return str(err)
+        return str(data)
+    except Exception:
+        return body.decode("utf-8", errors="replace")[:1000]
+
+
 def _try_parse_json(body: bytes) -> Any:
     try:
         return json.loads(body.decode("utf-8", errors="replace"))
     except Exception:
-        return None
-
-
-def _extract_error_message(body: bytes) -> str:
-    parsed = _try_parse_json(body)
-    if isinstance(parsed, dict) and "error" in parsed:
-        err = parsed["error"]
-        if isinstance(err, dict) and "message" in err:
-            return str(err["message"])
-        return str(err)
-    if isinstance(parsed, dict) and "detail" in parsed:
-        return str(parsed["detail"])
-    return body.decode("utf-8", errors="replace")[:1000]
+        pass
+    return None
 
 
 def _try_import_pynvml():
@@ -173,10 +178,12 @@ class GPUMonitor(threading.Thread):
         if self._pynvml is None:
             self.error = "pynvml not available"
             return
+
         try:
             self._pynvml.nvmlInit()
             self.device_count = int(self._pynvml.nvmlDeviceGetCount())
             indices = self.gpu_indices if self.gpu_indices is not None else list(range(self.device_count))
+
             handles = []
             for idx in indices:
                 if idx < 0 or idx >= self.device_count:
@@ -205,46 +212,50 @@ class GPUMonitor(threading.Thread):
         self.join(timeout=5.0)
 
 
-def _extract_b64_json_count(body: bytes) -> Optional[int]:
+def _parse_size(size: str) -> tuple[int, int]:
+    s = size.strip().lower()
+    if "x" not in s:
+        raise ValueError(f"Invalid --size format: {size!r} (expected like 1024x1024)")
+    w_str, h_str = s.split("x", 1)
+    return int(w_str), int(h_str)
+
+
+def _extract_image_count_from_chat_completions(body: bytes) -> Optional[int]:
     parsed = _try_parse_json(body)
     if not isinstance(parsed, dict):
         return None
-    data = parsed.get("data")
-    if not isinstance(data, list):
+    try:
+        content = parsed["choices"][0]["message"]["content"]
+        if not isinstance(content, list):
+            return None
+        cnt = 0
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                cnt += 1
+        return int(cnt)
+    except Exception:
         return None
-    cnt = 0
-    for item in data:
-        if isinstance(item, dict) and isinstance(item.get("b64_json"), str) and item["b64_json"]:
-            cnt += 1
-    return int(cnt)
 
 
-def _send_images_generations_request(
-    *,
+def _send_t2i_chat_request(
     api_base: str,
     endpoint_path: str,
     api_key: str,
     model: Optional[str],
     prompt: str,
-    n: int,
-    size: str,
-    response_format: str,
+    *,
     timeout_s: float,
-    extra_fields: dict[str, Any],
+    extra_body: dict[str, Any],
 ) -> tuple[float, bool, Optional[str], Optional[int]]:
     url = _join_url(api_base, endpoint_path)
 
     payload: dict[str, Any] = {
-        "prompt": prompt,
-        "n": n,
-        "size": size,
-        "response_format": response_format,
+        "messages": [{"role": "user", "content": prompt}],
     }
     if model:
         payload["model"] = model
-    for k, v in extra_fields.items():
-        if v is not None:
-            payload[k] = v
+    if extra_body:
+        payload["extra_body"] = extra_body
 
     t0 = time.perf_counter()
     try:
@@ -255,7 +266,7 @@ def _send_images_generations_request(
         parsed = _try_parse_json(body)
         if isinstance(parsed, dict) and "error" in parsed:
             return latency_s, False, _extract_error_message(body), None
-        out_n = _extract_b64_json_count(body)
+        out_n = _extract_image_count_from_chat_completions(body)
         return latency_s, True, None, out_n
     except urllib.error.HTTPError as e:
         latency_s = time.perf_counter() - t0
@@ -268,12 +279,12 @@ def _send_images_generations_request(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/images/generations."
+        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/chat/completions."
     )
 
-    parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
+    parser.add_argument("--api-base", type=str, default="http://localhost:8091", help="Server base URL.")
     parser.add_argument("--api-key", type=str, default="EMPTY", help="OpenAI API key (use 'EMPTY' for local).")
-    parser.add_argument("--endpoint-path", type=str, default="/images/generations", help="Endpoint path.")
+    parser.add_argument("--endpoint-path", type=str, default="/v1/chat/completions", help="Endpoint path.")
     parser.add_argument("--model", type=str, default=None, help="Optional served model name (server default if omitted).")
 
     parser.add_argument("--prompt", type=str, default=None, help="Single prompt (overrides prompt set).")
@@ -284,22 +295,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-requests", type=int, default=40, help="Total measured requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
-    parser.add_argument("--n", type=int, default=1, help="OpenAI 'n': images per request.")
-    parser.add_argument("--size", type=str, default="1024x1024", help="OpenAI 'size' (e.g., 1024x1024).")
-    parser.add_argument(
-        "--response-format",
-        type=str,
-        default="b64_json",
-        help="OpenAI response_format (only b64_json supported by vLLM-Omni images API).",
-    )
+    parser.add_argument("--images-per-request", type=int, default=1, help="Images per request (maps to num_outputs_per_prompt).")
+    parser.add_argument("--size", type=str, default="1024x1024", help="Output size as WIDTHxHEIGHT (e.g., 1024x1024).")
+    parser.add_argument("--seed", type=int, default=None, help="Optional fixed seed for all requests.")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
 
-    parser.add_argument("--seed", type=int, default=None, help="(ext) Random seed.")
-    parser.add_argument("--num-inference-steps", type=int, default=None, help="(ext) num_inference_steps.")
-    parser.add_argument("--guidance-scale", type=float, default=None, help="(ext) guidance_scale.")
-    parser.add_argument("--true-cfg-scale", type=float, default=None, help="(ext) true_cfg_scale.")
-    parser.add_argument("--negative-prompt", type=str, default=None, help="(ext) negative_prompt.")
-    parser.add_argument("--extra-json", type=str, default=None, help="Extra JSON fields to merge into request.")
+    parser.add_argument("--num-inference-steps", type=int, default=None, help="(vLLM-Omni ext) num_inference_steps.")
+    parser.add_argument("--true-cfg-scale", type=float, default=None, help="(vLLM-Omni ext) true_cfg_scale.")
+    parser.add_argument("--negative-prompt", type=str, default=None, help="(vLLM-Omni ext) negative_prompt.")
+
+    parser.add_argument("--extra-body-json", type=str, default=None, help="Extra JSON fields to merge into request.")
 
     parser.add_argument("--gpu-monitor", action="store_true", help="Enable GPU peak VRAM monitor (NVML).")
     parser.add_argument("--gpu-monitor-interval-s", type=float, default=0.1, help="GPU monitor sampling interval.")
@@ -330,24 +335,25 @@ def main() -> None:
         raise ValueError("--num-requests must be >= 1")
     if args.warmup_requests < 0:
         raise ValueError("--warmup-requests must be >= 0")
-    if args.n <= 0:
-        raise ValueError("--n must be >= 1")
-    if args.response_format != "b64_json":
-        raise ValueError("--response-format must be 'b64_json'.")
+    if args.images_per_request <= 0:
+        raise ValueError("--images-per-request must be >= 1")
 
-    extra_fields: dict[str, Any] = {}
-    if args.seed is not None:
-        extra_fields["seed"] = args.seed
+    extra_body: dict[str, Any] = {}
+    width, height = _parse_size(args.size)
+    extra_body["height"] = height
+    extra_body["width"] = width
     if args.num_inference_steps is not None:
-        extra_fields["num_inference_steps"] = args.num_inference_steps
-    if args.guidance_scale is not None:
-        extra_fields["guidance_scale"] = args.guidance_scale
+        extra_body["num_inference_steps"] = args.num_inference_steps
     if args.true_cfg_scale is not None:
-        extra_fields["true_cfg_scale"] = args.true_cfg_scale
+        extra_body["true_cfg_scale"] = args.true_cfg_scale
     if args.negative_prompt is not None:
-        extra_fields["negative_prompt"] = args.negative_prompt
-    if args.extra_json:
-        extra_fields.update(json.loads(args.extra_json))
+        extra_body["negative_prompt"] = args.negative_prompt
+    if args.seed is not None:
+        extra_body["seed"] = args.seed
+    if args.images_per_request != 1:
+        extra_body["num_outputs_per_prompt"] = args.images_per_request
+    if args.extra_body_json:
+        extra_body.update(json.loads(args.extra_body_json))
 
     gpu_indices = None
     if args.gpu_indices:
@@ -360,17 +366,14 @@ def main() -> None:
 
     def _task(i: int) -> dict[str, Any]:
         prompt = prompts[i % len(prompts)]
-        latency_s, ok, err, out_n = _send_images_generations_request(
-            api_base=args.api_base,
-            endpoint_path=args.endpoint_path,
-            api_key=args.api_key,
-            model=args.model,
-            prompt=prompt,
-            n=args.n,
-            size=args.size,
-            response_format=args.response_format,
+        latency_s, ok, err, out_n = _send_t2i_chat_request(
+            args.api_base,
+            args.endpoint_path,
+            args.api_key,
+            args.model,
+            prompt,
             timeout_s=args.timeout_s,
-            extra_fields=extra_fields,
+            extra_body=extra_body,
         )
         return {
             "request_idx": i,
@@ -381,17 +384,16 @@ def main() -> None:
         }
 
     print("---- Benchmark Config ----")
-    print(f"api_base:        {args.api_base}")
-    print(f"endpoint_path:   {args.endpoint_path}")
-    print(f"model:           {args.model or '(server default)'}")
-    print(f"concurrency:     {args.concurrency}")
-    print(f"warmup_requests: {args.warmup_requests}")
-    print(f"num_requests:    {args.num_requests}")
-    print(f"n:               {args.n}")
-    print(f"size:            {args.size}")
-    print(f"response_format: {args.response_format}")
-    if extra_fields:
-        print(f"extra_fields:    {extra_fields}")
+    print(f"api_base:            {args.api_base}")
+    print(f"endpoint_path:       {args.endpoint_path}")
+    print(f"model:               {args.model or '(server default)'}")
+    print(f"concurrency:         {args.concurrency}")
+    print(f"warmup_requests:     {args.warmup_requests}")
+    print(f"num_requests:        {args.num_requests}")
+    print(f"images_per_request:  {args.images_per_request}")
+    print(f"size:                {args.size}")
+    if extra_body:
+        print(f"extra_body:          {extra_body}")
 
     for i in range(args.warmup_requests):
         _ = _task(-1 - i)
@@ -416,6 +418,8 @@ def main() -> None:
 
     success = [r for r in results if r["success"]]
     failures = [r for r in results if not r["success"]]
+
+    lat_ms = [float(r["latency_ms"]) for r in results]
     lat_ms_ok = [float(r["latency_ms"]) for r in success]
 
     outputs_ok = 0
@@ -424,7 +428,7 @@ def main() -> None:
         if isinstance(out_n, int) and out_n > 0:
             outputs_ok += out_n
         else:
-            outputs_ok += args.n
+            outputs_ok += args.images_per_request
 
     throughput_img_s = float(outputs_ok / total_time_s) if total_time_s > 0 else 0.0
 
@@ -473,11 +477,10 @@ def main() -> None:
                 "concurrency": args.concurrency,
                 "warmup_requests": args.warmup_requests,
                 "num_requests": args.num_requests,
-                "n": args.n,
+                "images_per_request": args.images_per_request,
                 "size": args.size,
-                "response_format": args.response_format,
                 "timeout_s": args.timeout_s,
-                "extra_fields": extra_fields,
+                "extra_body": extra_body,
             },
             "metrics_summary": {
                 "e2e_latency_ms": (_summary_stats(lat_ms_ok) if lat_ms_ok else None),
@@ -493,4 +496,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

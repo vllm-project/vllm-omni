@@ -149,6 +149,32 @@ def _try_parse_json(body: bytes) -> Any:
     return None
 
 
+def _extract_video_count_from_chat_completions(body: bytes) -> Optional[int]:
+    parsed = _try_parse_json(body)
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        content = parsed["choices"][0]["message"]["content"]
+        if not isinstance(content, list):
+            return None
+        video_cnt = 0
+        image_cnt = 0
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "video_url":
+                video_cnt += 1
+            elif item.get("type") == "image_url":
+                image_cnt += 1
+        if video_cnt > 0:
+            return int(video_cnt)
+        if image_cnt > 0:
+            return int(image_cnt)
+        return None
+    except Exception:
+        return None
+
+
 def _try_import_pynvml():
     try:
         import pynvml  # type: ignore[import-not-found]
@@ -223,32 +249,34 @@ def _send_video_request(
     guidance_scale: Optional[float],
     guidance_scale_2: Optional[float],
     negative_prompt: Optional[str],
-    response_format: str,
     timeout_s: float,
     extra_body: dict[str, Any],
 ) -> tuple[float, bool, Optional[str], Optional[int]]:
     url = _join_url(api_base, endpoint_path)
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "n": n,
+    req_extra: dict[str, Any] = {
         "height": height,
         "width": width,
         "num_frames": num_frames,
-        "response_format": response_format,
+        "num_outputs_per_prompt": n,
     }
     if num_inference_steps is not None:
-        payload["num_inference_steps"] = num_inference_steps
+        req_extra["num_inference_steps"] = num_inference_steps
     if guidance_scale is not None:
-        payload["guidance_scale"] = guidance_scale
+        req_extra["guidance_scale"] = guidance_scale
     if guidance_scale_2 is not None:
-        payload["guidance_scale_2"] = guidance_scale_2
+        req_extra["guidance_scale_2"] = guidance_scale_2
     if negative_prompt is not None:
-        payload["negative_prompt"] = negative_prompt
+        req_extra["negative_prompt"] = negative_prompt
     for k, v in extra_body.items():
         if v is not None:
-            payload[k] = v
+            req_extra[k] = v
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "extra_body": req_extra,
+    }
 
     t0 = time.perf_counter()
     try:
@@ -259,7 +287,7 @@ def _send_video_request(
         parsed = _try_parse_json(body)
         if isinstance(parsed, dict) and "error" in parsed:
             return latency_s, False, _extract_error_message(body), None
-        out_n = int(len(parsed.get("data", []))) if isinstance(parsed, dict) and isinstance(parsed.get("data"), list) else None
+        out_n = _extract_video_count_from_chat_completions(body)
         return latency_s, True, None, out_n
     except urllib.error.HTTPError as e:
         latency_s = time.perf_counter() - t0
@@ -272,12 +300,12 @@ def _send_video_request(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online serving benchmark for Text-to-Video via OpenAI-compatible API (defaults to /v1/images/generations)."
+        description="Online serving benchmark for Text-to-Video via OpenAI-compatible /v1/chat/completions."
     )
 
     parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
     parser.add_argument("--api-key", type=str, default="EMPTY", help="OpenAI API key (use 'EMPTY' for local).")
-    parser.add_argument("--endpoint-path", type=str, default="/images/generations", help="Endpoint path.")
+    parser.add_argument("--endpoint-path", type=str, default="/chat/completions", help="Endpoint path (under api-base).")
     parser.add_argument("--model", type=str, required=True, help="Served model name.")
 
     parser.add_argument("--prompt", type=str, default=None, help="Single prompt (overrides prompt set).")
@@ -292,14 +320,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=720, help="Video height.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
-    parser.add_argument("--response-format", type=str, default="b64_json", help="Response format.")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
 
     parser.add_argument("--num-inference-steps", type=int, default=None, help="(vLLM-Omni ext) num_inference_steps.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="(vLLM-Omni ext) guidance_scale.")
     parser.add_argument("--guidance-scale-2", type=float, default=None, help="(vLLM-Omni ext) guidance_scale_2.")
     parser.add_argument("--negative-prompt", type=str, default=None, help="(vLLM-Omni ext) negative_prompt.")
-    parser.add_argument("--extra-body-json", type=str, default=None, help="Extra JSON fields to merge into request.")
+    parser.add_argument("--extra-body-json", type=str, default=None, help="Extra JSON fields to merge into extra_body.")
 
     parser.add_argument("--gpu-monitor", action="store_true", help="Enable GPU peak VRAM monitor (NVML).")
     parser.add_argument("--gpu-monitor-interval-s", type=float, default=0.1, help="GPU monitor sampling interval.")
@@ -364,7 +391,6 @@ def main() -> None:
             guidance_scale=args.guidance_scale,
             guidance_scale_2=args.guidance_scale_2,
             negative_prompt=args.negative_prompt,
-            response_format=args.response_format,
             timeout_s=args.timeout_s,
             extra_body=extra_body,
         )
@@ -394,7 +420,6 @@ def main() -> None:
         print(f"guidance_scale_2:    {args.guidance_scale_2}")
     if args.negative_prompt is not None:
         print("negative_prompt:     (set)")
-    print(f"response_format:     {args.response_format}")
     if extra_body:
         print(f"extra_body:          {extra_body}")
 
@@ -489,7 +514,6 @@ def main() -> None:
                 "guidance_scale": args.guidance_scale,
                 "guidance_scale_2": args.guidance_scale_2,
                 "negative_prompt": bool(args.negative_prompt),
-                "response_format": args.response_format,
                 "timeout_s": args.timeout_s,
                 "extra_body": extra_body,
             },

@@ -227,6 +227,32 @@ def _extract_data_count(body: bytes) -> Optional[int]:
     return int(len(data))
 
 
+def _extract_video_count_from_chat_completions(body: bytes) -> Optional[int]:
+    parsed = _try_parse_json(body)
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        content = parsed["choices"][0]["message"]["content"]
+        if not isinstance(content, list):
+            return None
+        video_cnt = 0
+        image_cnt = 0
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "video_url":
+                video_cnt += 1
+            elif item.get("type") == "image_url":
+                image_cnt += 1
+        if video_cnt > 0:
+            return int(video_cnt)
+        if image_cnt > 0:
+            return int(image_cnt)
+        return None
+    except Exception:
+        return None
+
+
 def _send_i2v_request(
     *,
     api_base: str,
@@ -236,21 +262,56 @@ def _send_i2v_request(
     prompt: str,
     image_data_url: str,
     n: int,
+    height: Optional[int],
+    width: Optional[int],
+    num_frames: Optional[int],
+    num_inference_steps: Optional[int],
+    guidance_scale: Optional[float],
+    guidance_scale_2: Optional[float],
+    negative_prompt: Optional[str],
+    seed: Optional[int],
     timeout_s: float,
     extra_fields: dict[str, Any],
 ) -> tuple[float, bool, Optional[str], Optional[int]]:
     url = _join_url(api_base, endpoint_path)
 
+    req_extra: dict[str, Any] = {
+        "num_outputs_per_prompt": n,
+    }
+    if height is not None:
+        req_extra["height"] = height
+    if width is not None:
+        req_extra["width"] = width
+    if num_frames is not None:
+        req_extra["num_frames"] = num_frames
+    if num_inference_steps is not None:
+        req_extra["num_inference_steps"] = num_inference_steps
+    if guidance_scale is not None:
+        req_extra["guidance_scale"] = guidance_scale
+    if guidance_scale_2 is not None:
+        req_extra["guidance_scale_2"] = guidance_scale_2
+    if negative_prompt is not None:
+        req_extra["negative_prompt"] = negative_prompt
+    if seed is not None:
+        req_extra["seed"] = seed
+    for k, v in extra_fields.items():
+        if v is not None:
+            req_extra[k] = v
+
     payload: dict[str, Any] = {
-        "prompt": prompt,
-        "image": image_data_url,
-        "n": n,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        ],
+        "extra_body": req_extra,
     }
     if model:
         payload["model"] = model
-    for k, v in extra_fields.items():
-        if v is not None:
-            payload[k] = v
 
     t0 = time.perf_counter()
     try:
@@ -261,7 +322,7 @@ def _send_i2v_request(
         parsed = _try_parse_json(body)
         if isinstance(parsed, dict) and "error" in parsed:
             return latency_s, False, _extract_error_message(body), None
-        out_n = _extract_data_count(body)
+        out_n = _extract_video_count_from_chat_completions(body)
         return latency_s, True, None, out_n
     except urllib.error.HTTPError as e:
         latency_s = time.perf_counter() - t0
@@ -274,7 +335,7 @@ def _send_i2v_request(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online serving benchmark for Image-to-Video via OpenAI-style API (endpoint is configurable)."
+        description="Online serving benchmark for Image-to-Video via OpenAI-compatible /v1/chat/completions."
     )
 
     parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
@@ -282,8 +343,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--endpoint-path",
         type=str,
-        default="/videos/generations",
-        help="Endpoint path (default assumes an OpenAI-style videos generations API).",
+        default="/chat/completions",
+        help="Endpoint path (under api-base).",
     )
     parser.add_argument("--model", type=str, default=None, help="Optional served model name (server default if omitted).")
 
@@ -297,10 +358,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-requests", type=int, default=10, help="Total measured requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
-    parser.add_argument("--n", type=int, default=1, help="Number of videos per request (OpenAI-style).")
-    parser.add_argument("--num-frames", type=int, default=None, help="Optional num_frames for throughput in frames/s.")
+    parser.add_argument("--n", type=int, default=1, help="Videos per request (maps to num_outputs_per_prompt).")
+    parser.add_argument("--height", type=int, default=None, help="Optional video height.")
+    parser.add_argument("--width", type=int, default=None, help="Optional video width.")
+    parser.add_argument("--num-frames", type=int, default=None, help="Optional num_frames (also used for frames/s).")
+    parser.add_argument("--num-inference-steps", type=int, default=None, help="Optional num_inference_steps.")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="Optional guidance_scale.")
+    parser.add_argument("--guidance-scale-2", type=float, default=None, help="Optional guidance_scale_2.")
+    parser.add_argument("--negative-prompt", type=str, default=None, help="Optional negative_prompt.")
+    parser.add_argument("--seed", type=int, default=None, help="Optional seed.")
     parser.add_argument("--timeout-s", type=float, default=900.0, help="HTTP timeout per request.")
-    parser.add_argument("--extra-json", type=str, default=None, help="Extra JSON fields to merge into request.")
+    parser.add_argument("--extra-body-json", type=str, default=None, help="Extra JSON fields to merge into extra_body.")
 
     parser.add_argument("--gpu-monitor", action="store_true", help="Enable GPU peak VRAM monitor (NVML).")
     parser.add_argument("--gpu-monitor-interval-s", type=float, default=0.1, help="GPU monitor sampling interval.")
@@ -340,8 +408,8 @@ def main() -> None:
         raise ValueError("--n must be >= 1")
 
     extra_fields: dict[str, Any] = {}
-    if args.extra_json:
-        extra_fields.update(json.loads(args.extra_json))
+    if args.extra_body_json:
+        extra_fields.update(json.loads(args.extra_body_json))
 
     gpu_indices = None
     if args.gpu_indices:
@@ -362,6 +430,14 @@ def main() -> None:
             prompt=prompt,
             image_data_url=image_data_url,
             n=args.n,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
+            negative_prompt=args.negative_prompt,
+            seed=args.seed,
             timeout_s=args.timeout_s,
             extra_fields=extra_fields,
         )
@@ -493,4 +569,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
