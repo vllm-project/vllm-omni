@@ -47,9 +47,6 @@ You can enable Ulysses-SP in online serving for diffusion models via `--usp`:
 ```bash
 # Text-to-image (requires >= 2 GPUs)
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
-
-# Image-to-image (requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image-Edit --omni --port 8092 --usp 2
 ```
 
 ##### Benchmarks
