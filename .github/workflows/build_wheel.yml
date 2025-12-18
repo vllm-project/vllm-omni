@@ -1,0 +1,41 @@
+name: Build Wheel
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - name: Build Wheel
+        env:
+          UV_SYSTEM_PYTHON: 1
+        run: |
+          bash scripts/build_wheel.sh --python python
+
+      - name: Upload Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-omni-wheel-py${{ matrix.python-version }}
+          path: dist/*.whl
