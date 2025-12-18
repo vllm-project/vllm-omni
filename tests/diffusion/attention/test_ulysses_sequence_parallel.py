@@ -19,6 +19,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.utils.platform_utils import detect_device_type
 
 device_type = detect_device_type()
@@ -379,7 +380,7 @@ def ulysses_attention_on_test_model(
     )
 
     # Set the config so Attention can access it
-    with set_current_omni_diffusion_config(od_config):
+    with set_forward_context(omni_diffusion_config=od_config), set_current_omni_diffusion_config(od_config):
         # Create model
         hidden_size = num_heads * head_size
 
