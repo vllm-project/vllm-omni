@@ -101,11 +101,11 @@ class TestAttentionModel(torch.nn.Module):
         v = v.view(batch_size, total_seq_len, v.shape[-1] // self.head_size, self.head_size)
 
         # Apply attention with split logic
-        if get_sequence_parallel_world_size() > 1 and split_text_embed_in_sp and encoder_hidden_states is not None:
+        if get_sequence_parallel_world_size() > 1 and not split_text_embed_in_sp and encoder_hidden_states is not None:
             # Split back to hidden_states part (first seq_len) and encoder_hidden_states part (second seq_len)
-            q_hidden, q_encoder = torch.split(q, [seq_len, seq_len], dim=1)
-            k_hidden, k_encoder = torch.split(k, [seq_len, seq_len], dim=1)
-            v_hidden, v_encoder = torch.split(v, [seq_len, seq_len], dim=1)
+            q_hidden, q_encoder = torch.split(q, [seq_len, total_seq_len - seq_len], dim=1)
+            k_hidden, k_encoder = torch.split(k, [seq_len, total_seq_len - seq_len], dim=1)
+            v_hidden, v_encoder = torch.split(v, [seq_len, total_seq_len - seq_len], dim=1)
 
             # Use hidden_states part as main attention, encoder part as joint
             attn_output = self.attention(
