@@ -29,11 +29,14 @@ class OmniMsgpackEncoder(MsgpackEncoder):
             if not arr.flags["C_CONTIGUOUS"]:
                 arr = np.ascontiguousarray(arr)
 
+            # Store raw bytes instead of ndarray to avoid deserialization issues
+            # msgspec doesn't know to convert list back to ndarray without type hint
             return {
                 _PIL_IMAGE_MARKER: True,
                 "mode": obj.mode,
                 "size": obj.size,   # (W, H)
-                "data": arr,
+                "shape": list(arr.shape),  # Store shape separately
+                "data": arr.tobytes(),  # Store as raw bytes
             }
 
         # ---- fallback to vLLM default ----
@@ -47,21 +50,64 @@ class OmniMsgpackDecoder(MsgpackDecoder):
         # ---- PIL.Image reconstruction ----
         if isinstance(obj, dict) and obj.get(_PIL_IMAGE_MARKER):
             data = obj["data"]
+            shape = obj.get("shape")
+            mode = obj["mode"]
 
-            # Safety: force uint8 ndarray
-            if not isinstance(data, np.ndarray):
-                data = np.array(data, dtype=np.uint8)
-            elif data.dtype != np.uint8:
-                data = data.astype(np.uint8, copy=False)
+            # Reconstruct ndarray from raw bytes
+            if isinstance(data, (bytes, memoryview)):
+                arr = np.frombuffer(data, dtype=np.uint8)
+                if shape:
+                    arr = arr.reshape(shape)
+            elif isinstance(data, np.ndarray):
+                arr = data if data.dtype == np.uint8 else data.astype(np.uint8, copy=False)
+            else:
+                arr = np.array(data, dtype=np.uint8)
+                if shape:
+                    arr = arr.reshape(shape)
 
             try:
-                return Image.fromarray(data, mode=obj["mode"])
+                return Image.fromarray(arr, mode=mode)
             except Exception:
-                # Fallback: let PIL infer mode
-                return Image.fromarray(data)
+                return Image.fromarray(arr)
 
         # ---- fallback ----
         return super().dec_hook(t, obj)
+
+
+def _post_process_pil_images(obj: Any) -> Any:
+    """Recursively convert PIL Image marker dicts back to PIL.Image objects.
+
+    msgspec's dec_hook is only called when a specific type is expected.
+    When deserializing generic objects (dicts, lists), PIL Image markers
+    need to be manually converted after decoding.
+    """
+    if isinstance(obj, dict):
+        if obj.get(_PIL_IMAGE_MARKER):
+            data = obj["data"]
+            shape = obj.get("shape")
+            mode = obj["mode"]
+
+            # Reconstruct ndarray from raw bytes
+            if isinstance(data, (bytes, memoryview)):
+                arr = np.frombuffer(data, dtype=np.uint8)
+                if shape:
+                    arr = arr.reshape(shape)
+            elif isinstance(data, np.ndarray):
+                arr = data if data.dtype == np.uint8 else data.astype(np.uint8, copy=False)
+            else:
+                # Fallback for list (shouldn't happen with new format)
+                arr = np.array(data, dtype=np.uint8)
+                if shape:
+                    arr = arr.reshape(shape)
+
+            try:
+                return Image.fromarray(arr, mode=mode)
+            except Exception:
+                return Image.fromarray(arr)
+        return {k: _post_process_pil_images(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_post_process_pil_images(item) for item in obj]
+    return obj
 
 
 class OmniSerde:
@@ -147,15 +193,22 @@ class OmniSerde:
             decoder = self.decoder
 
         if num_bufs == 1:
-            return decoder.decode(data[header_size:])
+            result = decoder.decode(data[header_size:])
+        else:
+            # Multi-buffer: split by lengths
+            bufs = []
+            offset = header_size
+            for length in len_arr:
+                bufs.append(data[offset : offset + length])
+                offset += length
+            result = decoder.decode(bufs)
 
-        # Multi-buffer: split by lengths
-        bufs = []
-        offset = header_size
-        for length in len_arr:
-            bufs.append(data[offset : offset + length])
-            offset += length
-        return decoder.decode(bufs)
+        # Post-process to convert PIL Image marker dicts back to PIL.Image
+        # This is needed because dec_hook is only called for typed decoding
+        if type_code == _TYPE_GENERIC:
+            result = _post_process_pil_images(result)
+
+        return result
 
 
 class OmniSerializer:
