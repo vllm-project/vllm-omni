@@ -11,6 +11,7 @@ the original input processing utilities for cross-stage data wiring.
 """
 
 import asyncio
+import fcntl
 import importlib
 import logging
 import multiprocessing as mp
@@ -531,6 +532,9 @@ def _stage_worker(
                 num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
                 devices_to_lock = physical_devices[:num_devices_to_lock]
 
+                # Sort devices_to_lock to prevent deadlock (all processes acquire locks in same order)
+                devices_to_lock = sorted(devices_to_lock)
+
                 _logging.getLogger(__name__).debug(
                     "[Stage-%s] Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
                     stage_id,
@@ -542,10 +546,11 @@ def _stage_worker(
                     devices_to_lock,
                 )
 
-                # Atomically acquire lock files for all devices using O_EXCL
+                # Acquire exclusive locks for all devices using fcntl.flock
+                # Locks are automatically released when process dies
                 max_wait_time = 300  # 5 minutes max wait
                 wait_start = _time.time()
-                acquired_locks = []
+                acquired_lock_fds = []  # Store file descriptors to keep locks alive
 
                 for device_id in devices_to_lock:
                     lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
@@ -553,51 +558,52 @@ def _stage_worker(
 
                     while not lock_acquired:
                         try:
-                            # Try to atomically create the lock file (fails if it exists)
-                            lock_fd = _os.open(lock_file, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
-                            # Successfully created the lock file - write PID
-                            with _os.fdopen(lock_fd, "w") as f:
-                                f.write(f"{_os.getpid()}\n")
-                            lock_acquired = True
-                            acquired_locks.append(lock_file)
-                            _logging.getLogger(__name__).debug(
-                                "[Stage-%s] Acquired initialization lock for device %s", stage_id, device_id
-                            )
-                        except FileExistsError:
-                            # Lock file exists - another process is initializing
-                            # Check if the lock is stale (older than max_wait_time)
+                            # Open or create the lock file
+                            lock_fd = _os.open(lock_file, _os.O_CREAT | _os.O_RDWR, 0o644)
+
+                            # Try to acquire exclusive lock (non-blocking first)
                             try:
-                                if _time.time() - _os.path.getmtime(lock_file) > max_wait_time:
-                                    # Stale lock - remove it and retry
-                                    try:
-                                        _os.remove(lock_file)
-                                    except (OSError, FileNotFoundError):
-                                        pass
-                            except (OSError, FileNotFoundError):
-                                pass
-
-                            # Check if we've been waiting too long
-                            if _time.time() - wait_start > max_wait_time:
-                                _logging.getLogger(__name__).warning(
-                                    "[Stage-%s] Timeout waiting for device %s initialization lock, proceeding anyway",
-                                    stage_id,
-                                    device_id,
+                                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                # Successfully acquired lock - write PID
+                                _os.ftruncate(lock_fd, 0)  # Clear file
+                                _os.write(lock_fd, f"{_os.getpid()}\n".encode())
+                                _os.fsync(lock_fd)  # Ensure written to disk
+                                lock_acquired = True
+                                acquired_lock_fds.append(lock_fd)
+                                _logging.getLogger(__name__).debug(
+                                    "[Stage-%s] Acquired exclusive lock for device %s", stage_id, device_id
                                 )
-                                break
+                            except BlockingIOError:
+                                # Lock is held by another process
+                                _os.close(lock_fd)
 
-                            # Wait a bit before retrying
-                            _time.sleep(0.1)
+                                # Check if we've been waiting too long
+                                if _time.time() - wait_start > max_wait_time:
+                                    _logging.getLogger(__name__).warning(
+                                        "[Stage-%s] Timeout waiting for device %s "
+                                        "initialization lock, proceeding anyway",
+                                        stage_id,
+                                        device_id,
+                                    )
+                                    break
+
+                                # Wait a bit before retrying
+                                _time.sleep(0.1)
                         except OSError as e:
-                            # Other error creating lock file - log and continue without lock
+                            # Other error - log and continue without lock
                             _logging.getLogger(__name__).debug(
-                                "[Stage-%s] Failed to create lock file for device %s: %s, continuing anyway",
+                                "[Stage-%s] Failed to acquire lock for device %s: %s, continuing anyway",
                                 stage_id,
                                 device_id,
                                 e,
                             )
+                            try:
+                                _os.close(lock_fd)
+                            except (OSError, NameError):
+                                pass
                             break
 
-                lock_files = acquired_locks
+                lock_files = acquired_lock_fds
         except Exception as e:
             _logging.getLogger(__name__).debug(
                 "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
@@ -610,16 +616,15 @@ def _stage_worker(
     try:
         stage_engine = OmniStageLLM(model=model, **engine_args)
     finally:
-        # Clean up all lock files after engine initialization
-        for lock_file in lock_files:
-            if _os.path.exists(lock_file):
-                try:
-                    _os.remove(lock_file)
-                    _logging.getLogger(__name__).debug(
-                        "[Stage-%s] Released initialization lock: %s", stage_id, lock_file
-                    )
-                except (OSError, FileNotFoundError):
-                    pass
+        # Release all locks by closing file descriptors
+        # Locks are automatically released when file descriptors are closed
+        # or when process dies
+        for lock_fd in lock_files:
+            try:
+                _os.close(lock_fd)
+                _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
+            except (OSError, ValueError):
+                pass
     _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
 
     # Initialize OmniConnectors if configured
@@ -1002,6 +1007,9 @@ async def _stage_worker_async(
                 num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
                 devices_to_lock = physical_devices[:num_devices_to_lock]
 
+                # Sort devices_to_lock to prevent deadlock (all processes acquire locks in same order)
+                devices_to_lock = sorted(devices_to_lock)
+
                 _logging.getLogger(__name__).debug(
                     "[Stage-%s] Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
                     stage_id,
@@ -1013,10 +1021,11 @@ async def _stage_worker_async(
                     devices_to_lock,
                 )
 
-                # Atomically acquire lock files for all devices using O_EXCL
+                # Acquire exclusive locks for all devices using fcntl.flock
+                # Locks are automatically released when process dies
                 max_wait_time = 300  # 5 minutes max wait
                 wait_start = _time.time()
-                acquired_locks = []
+                acquired_lock_fds = []  # Store file descriptors to keep locks alive
 
                 for device_id in devices_to_lock:
                     lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
@@ -1024,51 +1033,52 @@ async def _stage_worker_async(
 
                     while not lock_acquired:
                         try:
-                            # Try to atomically create the lock file (fails if it exists)
-                            lock_fd = _os.open(lock_file, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
-                            # Successfully created the lock file - write PID
-                            with _os.fdopen(lock_fd, "w") as f:
-                                f.write(f"{_os.getpid()}\n")
-                            lock_acquired = True
-                            acquired_locks.append(lock_file)
-                            _logging.getLogger(__name__).debug(
-                                "[Stage-%s] Acquired initialization lock for device %s", stage_id, device_id
-                            )
-                        except FileExistsError:
-                            # Lock file exists - another process is initializing
-                            # Check if the lock is stale (older than max_wait_time)
+                            # Open or create the lock file
+                            lock_fd = _os.open(lock_file, _os.O_CREAT | _os.O_RDWR, 0o644)
+
+                            # Try to acquire exclusive lock (non-blocking first)
                             try:
-                                if _time.time() - _os.path.getmtime(lock_file) > max_wait_time:
-                                    # Stale lock - remove it and retry
-                                    try:
-                                        _os.remove(lock_file)
-                                    except (OSError, FileNotFoundError):
-                                        pass
-                            except (OSError, FileNotFoundError):
-                                pass
-
-                            # Check if we've been waiting too long
-                            if _time.time() - wait_start > max_wait_time:
-                                _logging.getLogger(__name__).warning(
-                                    "[Stage-%s] Timeout waiting for device %s initialization lock, proceeding anyway",
-                                    stage_id,
-                                    device_id,
+                                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                # Successfully acquired lock - write PID
+                                _os.ftruncate(lock_fd, 0)  # Clear file
+                                _os.write(lock_fd, f"{_os.getpid()}\n".encode())
+                                _os.fsync(lock_fd)  # Ensure written to disk
+                                lock_acquired = True
+                                acquired_lock_fds.append(lock_fd)
+                                _logging.getLogger(__name__).debug(
+                                    "[Stage-%s] Acquired exclusive lock for device %s", stage_id, device_id
                                 )
-                                break
+                            except BlockingIOError:
+                                # Lock is held by another process
+                                _os.close(lock_fd)
 
-                            # Wait a bit before retrying
-                            _time.sleep(0.1)
+                                # Check if we've been waiting too long
+                                if _time.time() - wait_start > max_wait_time:
+                                    _logging.getLogger(__name__).warning(
+                                        "[Stage-%s] Timeout waiting for device %s "
+                                        "initialization lock, proceeding anyway",
+                                        stage_id,
+                                        device_id,
+                                    )
+                                    break
+
+                                # Wait a bit before retrying
+                                _time.sleep(0.1)
                         except OSError as e:
-                            # Other error creating lock file - log and continue without lock
+                            # Other error - log and continue without lock
                             _logging.getLogger(__name__).debug(
-                                "[Stage-%s] Failed to create lock file for device %s: %s, continuing anyway",
+                                "[Stage-%s] Failed to acquire lock for device %s: %s, continuing anyway",
                                 stage_id,
                                 device_id,
                                 e,
                             )
+                            try:
+                                _os.close(lock_fd)
+                            except (OSError, NameError):
+                                pass
                             break
 
-                lock_files = acquired_locks
+                lock_files = acquired_lock_fds
         except Exception as e:
             _logging.getLogger(__name__).debug(
                 "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
@@ -1090,16 +1100,15 @@ async def _stage_worker_async(
             engine_args=omni_engine_args,
         )
     finally:
-        # Clean up all lock files after engine initialization
-        for lock_file in lock_files:
-            if _os.path.exists(lock_file):
-                try:
-                    _os.remove(lock_file)
-                    _logging.getLogger(__name__).debug(
-                        "[Stage-%s] Released initialization lock: %s", stage_id, lock_file
-                    )
-                except (OSError, FileNotFoundError):
-                    pass
+        # Release all locks by closing file descriptors
+        # Locks are automatically released when file descriptors are closed
+        # or when process dies
+        for lock_fd in lock_files:
+            try:
+                _os.close(lock_fd)
+                _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
+            except (OSError, ValueError):
+                pass
     omni_stage.set_async_engine(stage_engine)
     # Don't keep the dummy data in memory
     await stage_engine.reset_mm_cache()
