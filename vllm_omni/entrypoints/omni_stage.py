@@ -15,6 +15,7 @@ import importlib
 import logging
 import multiprocessing as mp
 import os
+import uuid
 from typing import Any, Callable, Optional, TypeVar, Union
 
 from vllm.inputs import TextPrompt
@@ -353,7 +354,6 @@ class OmniStage:
         assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
         
         # Submit collective_rpc task to worker
-        import uuid
         rpc_id = str(uuid.uuid4())
         self._in_q.put({
             "type": "collective_rpc",
@@ -372,11 +372,13 @@ class OmniStage:
                 raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
             
             result = self.try_collect()
-            if result is not None and result.get("type") == "collective_rpc_result" and result.get("rpc_id") == rpc_id:
-                if "error" in result:
-                    raise RuntimeError(f"collective_rpc failed: {result['error']}")
-                return result["result"]
-            
+            if result is not None:
+                if result.get("type") == "collective_rpc_result":
+                    if result.get("rpc_id") == rpc_id:
+                        if "error" in result:
+                            raise RuntimeError(f"collective_rpc failed: {result['error']}")
+                        return result["result"]
+
             time.sleep(0.001)  # Small sleep to avoid busy waiting
 
 
@@ -519,12 +521,9 @@ def _stage_worker(
             rpc_id = task.get("rpc_id")
             method = task.get("method")
             timeout = task.get("timeout")
-            args = task.get("args", ())
+            args = task.get("args")
             kwargs = task.get("kwargs")
             try:
-                _logging.getLogger(__name__).debug(
-                    "[Stage-%s] Executing collective_rpc: method=%s", stage_id, method
-                )
                 result = stage_engine.collective_rpc(method, timeout, args, kwargs)
                 out_q.put({
                     "type": "collective_rpc_result",
@@ -532,9 +531,6 @@ def _stage_worker(
                     "result": result,
                 })
             except Exception as e:
-                _logging.getLogger(__name__).exception(
-                    "[Stage-%s] collective_rpc failed: %s", stage_id, e
-                )
                 out_q.put({
                     "type": "collective_rpc_result",
                     "rpc_id": rpc_id,
