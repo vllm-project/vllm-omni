@@ -32,7 +32,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.compile import dit_support_compile
-from vllm_omni.diffusion.layers.rope import apply_rotary_emb
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -116,6 +116,7 @@ class ZImageAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
         )
+        self.rope = RotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
@@ -135,8 +136,8 @@ class ZImageAttention(nn.Module):
 
         cos = freqs_cis.real.squeeze(0).to(query.dtype)
         sin = freqs_cis.imag.squeeze(0).to(query.dtype)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        query = self.rope(query, cos, sin)
+        key = self.rope(key, cos, sin)
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)

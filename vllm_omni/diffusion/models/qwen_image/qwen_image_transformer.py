@@ -23,15 +23,13 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.compile import dit_support_compile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-# from vllm.vllm_flash_attn.layers.rotary import (
-#     apply_rotary_emb as apply_rotary_embedding,
-# ) This is faster than apply_rotary_emb above
+# This is faster than apply_rotary_emb above
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from vllm_omni.diffusion.layers.rope import apply_rotary_emb
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
@@ -235,6 +233,7 @@ class QwenImageCrossAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
         )
+        self.rope = RotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
@@ -273,10 +272,10 @@ class QwenImageCrossAttention(nn.Module):
         img_sin = vid_freqs.imag.to(img_query.dtype)
         txt_cos = txt_freqs.real.to(txt_query.dtype)
         txt_sin = txt_freqs.imag.to(txt_query.dtype)
-        img_query = apply_rotary_emb(img_query, img_cos, img_sin, interleaved=True)
-        img_key = apply_rotary_emb(img_key, img_cos, img_sin, interleaved=True)
-        txt_query = apply_rotary_emb(txt_query, txt_cos, txt_sin, interleaved=True)
-        txt_key = apply_rotary_emb(txt_key, txt_cos, txt_sin, interleaved=True)
+        img_query = self.rope(img_query, img_cos, img_sin)
+        img_key = self.rope(img_key, img_cos, img_sin)
+        txt_query = self.rope(txt_query, txt_cos, txt_sin)
+        txt_key = self.rope(txt_key, txt_cos, txt_sin)
 
         # Concatenate for joint attention
         # Order: [text, image]
