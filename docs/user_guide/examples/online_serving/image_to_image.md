@@ -1,4 +1,4 @@
-# Qwen-Image-Edit Online Serving
+# Image-To-Image Online Serving
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/image_to_image>.
 
@@ -126,16 +126,16 @@ Use `extra_body` to pass generation parameters:
 
 ## Generation Parameters (extra_body)
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `height` | int | None | Output image height in pixels |
-| `width` | int | None | Output image width in pixels |
-| `size` | str | None | Output image size (e.g., "1024x1024") |
-| `num_inference_steps` | int | 50 | Number of denoising steps |
-| `guidance_scale` | float | 7.5 | CFG guidance scale |
-| `seed` | int | None | Random seed (reproducible) |
-| `negative_prompt` | str | None | Negative prompt |
-| `num_outputs_per_prompt` | int | 1 | Number of images to generate |
+| Parameter                | Type  | Default | Description                           |
+| ------------------------ | ----- | ------- | ------------------------------------- |
+| `height`                 | int   | None    | Output image height in pixels         |
+| `width`                  | int   | None    | Output image width in pixels          |
+| `size`                   | str   | None    | Output image size (e.g., "1024x1024") |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps             |
+| `guidance_scale`         | float | 7.5     | CFG guidance scale                    |
+| `seed`                   | int   | None    | Random seed (reproducible)            |
+| `negative_prompt`        | str   | None    | Negative prompt                       |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate          |
 
 ## Response Format
 
@@ -163,23 +163,23 @@ Use `extra_body` to pass generation parameters:
 
 ## Common Editing Instructions Examples
 
-| Instruction | Description |
-|-------------|-------------|
-| `Convert this image to watercolor style` | Style transfer |
-| `Convert the image to black and white` | Desaturation |
-| `Enhance the color saturation` | Color adjustment |
-| `Convert to cartoon style` | Cartoonization |
-| `Add vintage filter effect` | Filter effect |
-| `Convert daytime scene to nighttime` | Scene conversion |
+| Instruction                              | Description      |
+| ---------------------------------------- | ---------------- |
+| `Convert this image to watercolor style` | Style transfer   |
+| `Convert the image to black and white`   | Desaturation     |
+| `Enhance the color saturation`           | Color adjustment |
+| `Convert to cartoon style`               | Cartoonization   |
+| `Add vintage filter effect`              | Filter effect    |
+| `Convert daytime scene to nighttime`     | Scene conversion |
 
 ## File Description
 
-| File | Description |
-|------|-------------|
-| `run_server.sh` | Server startup script |
-| `run_curl_image_edit.sh` | curl image editing example |
-| `openai_chat_client.py` | Python client |
-| `gradio_demo.py` | Gradio interactive interface |
+| File                     | Description                  |
+| ------------------------ | ---------------------------- |
+| `run_server.sh`          | Server startup script        |
+| `run_curl_image_edit.sh` | curl image editing example   |
+| `openai_chat_client.py`  | Python client                |
+| `gradio_demo.py`         | Gradio interactive interface |
 
 ## Example materials
 
