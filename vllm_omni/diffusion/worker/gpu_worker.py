@@ -107,6 +107,28 @@ class GPUWorker:
         logger.info(f"[Worker {self.rank}] {message}")
         return f"Worker {self.rank} printed: {message}"
 
+    def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+        """
+        Generate output for the given requests.
+        
+        Args:
+            requests: List of diffusion requests
+            
+        Returns:
+            DiffusionOutput with generated results
+        """
+        return self.execute_model(requests, self.od_config)
+
+    def do_shutdown(self) -> str:
+        """
+        Shutdown the worker gracefully.
+        
+        Returns:
+            Confirmation message
+        """
+        self.shutdown()
+        return f"Worker {self.rank} shutdown complete"
+
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
@@ -140,23 +162,17 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
-        rpc_broadcast_handle,
     ):
         self.od_config = od_config
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
 
-        # Initialize MessageQueue reader from handle
+        # Initialize MessageQueue reader from handle (unified for generation & RPC)
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
-
-        # Initialize RPC MessageQueue reader from handle
-        self.rpc_mq = MessageQueue.create_from_handle(rpc_broadcast_handle, gpu_id)
 
         self.result_mq = None
         self.result_mq_handle = None
-        self.rpc_result_mq = None
-        self.rpc_result_mq_handle = None
 
         # Setup result sender (only for rank 0 for now, or whoever needs to reply)
         # Assuming only rank 0 replies to scheduler as per original logic
@@ -166,11 +182,6 @@ class WorkerProc:
             self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
             self.result_mq_handle = self.result_mq.export_handle()
             logger.info(f"Worker {gpu_id} created result MessageQueue")
-
-            # Create MessageQueue for RPC results (1 writer -> 1 reader)
-            self.rpc_result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
-            self.rpc_result_mq_handle = self.rpc_result_mq.export_handle()
-            logger.info(f"Worker {gpu_id} created RPC result MessageQueue")
 
         assert od_config.master_port is not None
         worker = GPUWorker(
@@ -189,27 +200,12 @@ class WorkerProc:
         if self.result_mq is not None:
             self.result_mq.enqueue(output)
 
-    def return_rpc_result(self, result):
+    def recv_message(self):
         """
-        replies RPC result to client, only on rank 0
-        """
-        if self.rpc_result_mq is not None:
-            self.rpc_result_mq.enqueue(result)
-
-    def recv_reqs(self):
-        """
-        Receive requests from broadcast queue
+        Receive unified messages (RPC requests, shutdown) from broadcast queue.
+        Uses indefinite=True to block until a message arrives.
         """
         return self.mq.dequeue(indefinite=True)
-
-    def recv_rpc_reqs(self):
-        """
-        Receive RPC requests from RPC broadcast queue
-        """
-        try:
-            return self.rpc_mq.dequeue(timeout=0.001)
-        except Exception:
-            return None
 
     def execute_rpc(self, rpc_request: dict):
         """Execute an RPC request and return the result."""
@@ -248,53 +244,56 @@ class WorkerProc:
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
-            # Check for RPC requests (non-blocking)
-            rpc_req = self.recv_rpc_reqs()
-            if rpc_req is not None:
-                try:
-                    result = self.execute_rpc(rpc_req)
-                    if result is not None and self.gpu_id == 0:
-                        self.return_rpc_result(result)
-                except Exception as e:
-                    logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    if self.gpu_id == 0:
-                        self.return_rpc_result({"status": "error", "error": str(e)})
-
-            reqs = None
-            # 1: receive requests
+            # Receive unified message (generation request, RPC request, or shutdown)
+            msg = None
             try:
-                reqs = self.recv_reqs()
+                msg = self.recv_message()
             except Exception as e:
                 logger.error(
-                    f"Error receiving requests in scheduler event loop: {e}",
+                    f"Error receiving message in worker loop: {e}",
                     exc_info=True,
                 )
                 continue
 
-            if reqs == SHUTDOWN_MESSAGE:
-                logger.info("Worker %s: Received shutdown message", self.gpu_id)
-                self._running = False
-                continue
-            if reqs is None:
+            if msg is None:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
-            # 2: execute, make sure a reply is always sent
-            try:
-                output = self.worker.execute_model(reqs, self.od_config)
-            except Exception as e:
-                logger.error(
-                    f"Error executing forward in event loop: {e}",
-                    exc_info=True,
-                )
-                output = DiffusionOutput(error=str(e))
+            # Route message based on type
+            if isinstance(msg, dict) and msg.get("type") == "rpc":
+                # Handle RPC request
+                try:
+                    result = self.execute_rpc(msg)
+                    if result is not None and self.gpu_id == 0:
+                        self.return_result(result)
+                except Exception as e:
+                    logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    if self.gpu_id == 0:
+                        self.return_result({"status": "error", "error": str(e)})
 
-            try:
-                self.return_result(output)
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
+            elif isinstance(msg, dict) and msg.get("type") == "shutdown":
+                # Handle shutdown message
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
                 continue
+
+            else:
+                # Handle generation request (OmniDiffusionRequest list)
+                try:
+                    output = self.worker.execute_model(msg, self.od_config)
+                except Exception as e:
+                    logger.error(
+                        f"Error executing forward in event loop: {e}",
+                        exc_info=True,
+                    )
+                    output = DiffusionOutput(error=str(e))
+
+                try:
+                    self.return_result(output)
+                except zmq.ZMQError as e:
+                    # Reply failed; log and keep loop alive to accept future requests
+                    logger.error(f"ZMQ error sending reply: {e}")
+                    continue
 
         logger.info("event loop terminated.")
         try:
@@ -311,7 +310,6 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
-        rpc_broadcast_handle,
     ) -> None:
         """Worker initialization and execution loops."""
 
@@ -319,14 +317,12 @@ class WorkerProc:
             od_config,
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
-            rpc_broadcast_handle=rpc_broadcast_handle,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {
                 "status": "ready",
                 "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
-                "rpc_result_handle": worker_proc.rpc_result_mq_handle if rank == 0 else None,
             }
         )
         worker_proc.worker_busy_loop()

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import cloudpickle
+import pickle
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
@@ -28,7 +30,7 @@ class Scheduler:
         self.od_config = od_config
         self.context = zmq.Context()  # Standard synchronous context
 
-        # Initialize MessageQueue for broadcasting requests
+        # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
         self.mq = MessageQueue(
             n_reader=od_config.num_gpus,
@@ -36,15 +38,7 @@ class Scheduler:
             local_reader_ranks=list(range(od_config.num_gpus)),
         )
 
-        # Initialize RPC MessageQueue for broadcasting RPC requests
-        self.rpc_mq = MessageQueue(
-            n_reader=od_config.num_gpus,
-            n_local_reader=od_config.num_gpus,
-            local_reader_ranks=list(range(od_config.num_gpus)),
-        )
-
         self.result_mq = None
-        self.rpc_result_mq = None
 
     def initialize_result_queue(self, handle):
         # Initialize MessageQueue for receiving results
@@ -53,23 +47,28 @@ class Scheduler:
         logger.info("SyncScheduler initialized result MessageQueue")
 
     def initialize_rpc_result_queue(self, handle):
-        # Initialize MessageQueue for receiving RPC results
-        # We act as rank 0 reader for this queue
-        self.rpc_result_mq = MessageQueue.create_from_handle(handle, rank=0)
-        logger.info("SyncScheduler initialized RPC result MessageQueue")
+        # Deprecated: RPC results now use the same result queue
+        logger.info("RPC results use the unified result queue")
 
     def get_broadcast_handle(self):
         return self.mq.export_handle()
 
-    def get_rpc_broadcast_handle(self):
-        return self.rpc_mq.export_handle()
-
     def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-        """Sends a request to the scheduler and waits for the response."""
+        """Sends a generation request via RPC to worker rank 0 and waits for the response."""
         try:
-            # Broadcast request to all workers
-            self.mq.enqueue(requests)
-            # Wait for result from Rank 0 (or whoever sends it)
+            # Prepare RPC request for generation
+            rpc_request = {
+                "type": "rpc",
+                "method": "generate",
+                "args": (requests,),
+                "kwargs": {},
+                "output_rank": 0,  # Only rank 0 replies
+            }
+            
+            # Broadcast RPC request to all workers
+            self.mq.enqueue(rpc_request)
+            
+            # Wait for result from Rank 0
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")
 
@@ -85,9 +84,7 @@ class Scheduler:
             self.context.term()
         self.context = None
         self.mq = None
-        self.rpc_mq = None
         self.result_mq = None
-        self.rpc_result_mq = None
 
 
 # Singleton instance for easy access
