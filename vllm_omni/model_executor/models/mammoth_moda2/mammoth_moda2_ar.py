@@ -414,3 +414,8 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             multimodal_outputs=None,
             intermediate_tensors=intermediate_tensors if isinstance(hidden_states, IntermediateTensors) else None,
         )
+
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput):
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
+        return super().compute_logits(hidden_states)
