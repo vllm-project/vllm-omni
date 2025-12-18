@@ -14,21 +14,54 @@ _TYPE_GENERIC = 0
 _TYPE_TENSOR = 1
 _TYPE_NDARRAY = 2
 
+# Marker for PIL.Image serialization
+_PIL_IMAGE_MARKER = "__pil_image__"
 
-def _preprocess_obj(obj: Any) -> Any:
-    """
-    Recursively preprocess object to convert unsupported types.
-    Converts PIL.Image to numpy array for serialization.
-    """
-    if isinstance(obj, Image.Image):
-        return np.array(obj)
-    if isinstance(obj, dict):
-        return {k: _preprocess_obj(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_preprocess_obj(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_preprocess_obj(v) for v in obj)
-    return obj
+
+class OmniMsgpackEncoder(MsgpackEncoder):
+    """Extended MsgpackEncoder with PIL.Image support."""
+
+    def enc_hook(self, obj: Any) -> Any:
+        # ---- PIL.Image support ----
+        if isinstance(obj, Image.Image):
+            # Force safe, contiguous uint8 ndarray
+            arr = np.asarray(obj, dtype=np.uint8)
+            if not arr.flags["C_CONTIGUOUS"]:
+                arr = np.ascontiguousarray(arr)
+
+            return {
+                _PIL_IMAGE_MARKER: True,
+                "mode": obj.mode,
+                "size": obj.size,   # (W, H)
+                "data": arr,
+            }
+
+        # ---- fallback to vLLM default ----
+        return super().enc_hook(obj)
+
+
+class OmniMsgpackDecoder(MsgpackDecoder):
+    """Extended MsgpackDecoder with PIL.Image support."""
+
+    def dec_hook(self, t: type, obj: Any) -> Any:
+        # ---- PIL.Image reconstruction ----
+        if isinstance(obj, dict) and obj.get(_PIL_IMAGE_MARKER):
+            data = obj["data"]
+
+            # Safety: force uint8 ndarray
+            if not isinstance(data, np.ndarray):
+                data = np.array(data, dtype=np.uint8)
+            elif data.dtype != np.uint8:
+                data = data.astype(np.uint8, copy=False)
+
+            try:
+                return Image.fromarray(data, mode=obj["mode"])
+            except Exception:
+                # Fallback: let PIL infer mode
+                return Image.fromarray(data)
+
+        # ---- fallback ----
+        return super().dec_hook(t, obj)
 
 
 class OmniSerde:
@@ -40,10 +73,10 @@ class OmniSerde:
     """
 
     def __init__(self):
-        self.encoder = MsgpackEncoder()
-        self.decoder = MsgpackDecoder()
-        self.tensor_decoder = MsgpackDecoder(torch.Tensor)
-        self.ndarray_decoder = MsgpackDecoder(np.ndarray)
+        self.encoder = OmniMsgpackEncoder()
+        self.decoder = OmniMsgpackDecoder()
+        self.tensor_decoder = OmniMsgpackDecoder(torch.Tensor)
+        self.ndarray_decoder = OmniMsgpackDecoder(np.ndarray)
 
     def serialize(self, obj: Any) -> tuple[bytes | list[bytes], int, bytes, int]:
         """
@@ -59,8 +92,6 @@ class OmniSerde:
                 - metadata: Header containing type and length info
                 - metadata_len: Size of metadata
         """
-        # Preprocess to convert unsupported types (e.g., PIL.Image -> np.array)
-        obj = _preprocess_obj(obj)
 
         # Determine type code
         if isinstance(obj, torch.Tensor):
@@ -71,7 +102,7 @@ class OmniSerde:
             type_code = _TYPE_GENERIC
 
         bufs = self.encoder.encode(obj)
-        len_arr = [len(buf) for buf in bufs]
+        len_arr = [len(buf) for buf in bufs]  # type: ignore[arg-type]
         nbytes = sum(len_arr)
 
         # Convert bufs to bytes
@@ -138,13 +169,13 @@ class OmniSerializer:
     @staticmethod
     def serialize(obj: Any) -> bytes:
         """Serialize an object to bytes."""
-        data, nbytes, metadata, _ = OmniSerializer._serde.serialize(obj)
+        data, _, metadata, _ = OmniSerializer._serde.serialize(obj)
 
         if isinstance(data, bytes):
             return metadata + data
 
         # Multi-buffer: concatenate all buffers
-        return metadata + b"".join(data)
+        return metadata + b"".join(data)  # type: ignore[arg-type]
 
     @staticmethod
     def deserialize(data: bytes | memoryview) -> Any:
