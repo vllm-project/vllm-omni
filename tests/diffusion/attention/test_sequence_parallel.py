@@ -137,22 +137,21 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize(
     "test_model_cls",
     [
-        TestAttentionModel,
         TestMultiLayerAttentionModel,
     ],
 )
 @pytest.mark.parametrize("ulysses_degree", [2])
-@pytest.mark.parametrize("ring_degree", [2])
+@pytest.mark.parametrize("ring_degree", [1,2])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [8])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("use_sync", [True])
+@pytest.mark.parametrize("use_sync", [False])
 @pytest.mark.parametrize("dynamic", [False])
 @pytest.mark.parametrize("use_compile", [False])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
+@pytest.mark.parametrize("attn_backend", ["flash_attn", "sdpa"])
 def test_sequence_parallel(
     ulysses_degree: int,
     ring_degree: int,
@@ -288,11 +287,11 @@ def test_sequence_parallel(
         # For FP16/BF16, we expect some numerical differences due to different computation order
         # If we use the same backend (e.g. Flash Attention) for both baseline and SP, differences should be smaller.
         if dtype == torch.float16:
-            atol, rtol = 5e-3, 5e-2
+            atol, rtol = 5e-4, 5e-3
         elif dtype == torch.bfloat16:
-            atol, rtol = 5e-3, 5e-2
+            atol, rtol = 5e-4, 5e-3
         else:
-            atol, rtol = 1e-5, 1e-3
+            atol, rtol = 1e-5, 1e-4
 
         assert max_abs_diff < atol or max_relative_diff < rtol, (
             f"Output difference too large: max_abs_diff={max_abs_diff:.6e}, "
