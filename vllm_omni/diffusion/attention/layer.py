@@ -100,19 +100,25 @@ class Attention(nn.Module):
         softmax_scale = self.softmax_scale
         if softmax_scale is None:
             softmax_scale = query.shape[-1] ** -0.5
-
-        joint_tensor_query, joint_tensor_key, joint_tensor_value = (
-            attn_metadata.joint_query,
-            attn_metadata.joint_key,
-            attn_metadata.joint_value,
-        )
-        joint_strategy = attn_metadata.joint_strategy
+        if attn_metadata is not None:
+            joint_tensor_query, joint_tensor_key, joint_tensor_value = (
+                attn_metadata.joint_query,
+                attn_metadata.joint_key,
+                attn_metadata.joint_value,
+            )
+            joint_strategy = attn_metadata.joint_strategy
+        else:
+            joint_tensor_query = None
+            joint_tensor_key = None
+            joint_tensor_value = None
+            joint_strategy = None
 
         if joint_tensor_query is not None and joint_tensor_key is not None and joint_tensor_value is not None:
             supported_joint_strategy = ["front", "rear"]
             if joint_strategy not in supported_joint_strategy:
                 raise ValueError(
-                    f"joint_strategy: {joint_strategy} not supported. supported joint strategy: {supported_joint_strategy}"
+                    f"joint_strategy: {joint_strategy} not supported. "
+                    f"Supported joint strategy: {supported_joint_strategy}"
                 )
             elif joint_strategy == "rear":
                 query = torch.cat([query, joint_tensor_query], dim=1)
