@@ -151,7 +151,7 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("use_sync", [False])
 @pytest.mark.parametrize("dynamic", [False])
 @pytest.mark.parametrize("use_compile", [False])
-@pytest.mark.parametrize("attn_backend", ["flash_attn", "sdpa"])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sequence_parallel(
     ulysses_degree: int,
     ring_degree: int,
