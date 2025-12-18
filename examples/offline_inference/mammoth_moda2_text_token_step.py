@@ -89,6 +89,18 @@ def main() -> None:
     _ensure_tmpdir()
     args = parse_args()
 
+    # vLLM 0.11 的平台探测是硬前置：没有识别到 CUDA/ROCm/TPU/XPU/CPU 平台时会直接报错。
+    # 这个脚本的目标是跑通 token->token，因此这里提前给出明确提示。
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    if isinstance(current_platform, UnspecifiedPlatform):
+        raise RuntimeError(
+            "vLLM 未检测到可用平台（current_platform=UnspecifiedPlatform）。\n"
+            "- 如果你要用 GPU：请在有 CUDA 驱动/设备的环境运行。\n"
+            "- 如果你要用 CPU：需要安装 vLLM 的 CPU build（版本字符串通常包含 'cpu'）。"
+        )
+
     if args.prompt_token_ids:
         prompt_token_ids = _parse_token_ids(args.prompt_token_ids)
     else:
@@ -107,6 +119,7 @@ def main() -> None:
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
         max_model_len=max(256, len(prompt_token_ids) + args.max_tokens + 8),
+        enforce_eager=True,
         disable_log_stats=True,
     )
 
@@ -135,4 +148,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
