@@ -93,7 +93,8 @@ async def async_request_openai_chat_completions(
                     output.generated_text += content or ""
                     if choice["message"].get("audio"):
                         output.output_audio_num += 1
-                output.output_tokens = 0
+                usage = data.get("usage")
+                output.output_tokens = usage.get("completion_tokens")
                 output.success = True
                 output.latency = time.perf_counter() - st
             else:
