@@ -40,9 +40,13 @@ from vllm_omni.benchmarks.datasets import get_samples,add_dataset_parser
 
 from vllm_omni.benchmarks.lib.endpoint_request_func import (
     ASYNC_REQUEST_FUNCS, OPENAI_COMPATIBLE_BACKENDS)
+from vllm_omni.benchmarks.lib.endpoint_request_func import MixRequestFuncOutput
 
 from vllm.benchmarks.datasets import SampleRequest
+from vllm.benchmarks.serve import (BenchmarkMetrics,EmbedBenchmarkMetrics,DeprecatedEndpointTypeAction,
+                                   TaskType,get_request,check_goodput_args,save_to_pytorch_benchmark_format)
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput,RequestFuncOutput
+
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
 from vllm.benchmarks.lib.utils import (convert_to_pytorch_benchmark_format,
                                        write_to_json)
@@ -54,69 +58,11 @@ TERM_PLOTLIB_AVAILABLE = ((importlib.util.find_spec("termplotlib") is not None)
                           and (shutil.which("gnuplot") is not None))
 
 
-# TODO: Remove this in v0.11.0
-class DeprecatedEndpointTypeAction(argparse.Action):
-    """Argparse action for the deprecated --endpoint-type flag.
-    """
-
-    def __call__(self, _, namespace, values, option_string=None):
-        warnings.warn(
-            "'--endpoint-type' is deprecated and will be removed in v0.11.0. "
-            "Please use '--backend' instead or remove this argument if you "
-            "have already set it.",
-            stacklevel=1,
-        )
-        setattr(namespace, self.dest, values)
-
-
-class TaskType(Enum):
-    GENERATION = "generation"
-    EMBEDDING = "embedding"
-
 
 @dataclass
-class BenchmarkMetrics:
-    completed: int
-    total_input: int
-    total_output: int
-    request_throughput: float
-    request_goodput: float
-    output_throughput: float
-    total_token_throughput: float
-    mean_ttft_ms: float
-    median_ttft_ms: float
-    std_ttft_ms: float
-    percentiles_ttft_ms: list[tuple[float, float]]
-    mean_tpot_ms: float
-    median_tpot_ms: float
-    std_tpot_ms: float
-    percentiles_tpot_ms: list[tuple[float, float]]
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
-    percentiles_itl_ms: list[tuple[float, float]]
-    # E2EL stands for end-to-end latency per request.
-    # It is the time taken on the client side from sending
-    # a request to receiving a complete response.
-    mean_e2el_ms: float
-    median_e2el_ms: float
-    std_e2el_ms: float
-    percentiles_e2el_ms: list[tuple[float, float]]
-    # Max output tokens per second and concurrent requests at that peak
-    max_output_tokens_per_s: float
-    max_concurrent_requests: int
+class MixBenchmarkMetrics(BenchmarkMetrics):
+    audio_throughput: float
 
-
-@dataclass
-class EmbedBenchmarkMetrics:
-    completed: int
-    total_input: int
-    request_throughput: float
-    total_token_throughput: float
-    mean_e2el_ms: float
-    std_e2el_ms: float
-    median_e2el_ms: float
-    percentiles_e2el_ms: float
 
 
 def _get_current_request_rate(
@@ -141,96 +87,8 @@ def _get_current_request_rate(
     return request_rate
 
 
-async def get_request(
-    input_requests: list[SampleRequest],
-    request_rate: float,
-    burstiness: float = 1.0,
-    ramp_up_strategy: Optional[Literal["linear", "exponential"]] = None,
-    ramp_up_start_rps: Optional[int] = None,
-    ramp_up_end_rps: Optional[int] = None,
-) -> AsyncGenerator[tuple[SampleRequest, float], None]:
-    """
-    Asynchronously generates requests at a specified rate
-    with OPTIONAL burstiness and OPTIONAL ramp-up strategy.
-
-    Args:
-        input_requests:
-            A list of input requests, each represented as a SampleRequest.
-        request_rate:
-            The rate at which requests are generated (requests/s).
-        burstiness (optional):
-            The burstiness factor of the request generation.
-            Only takes effect when request_rate is not inf.
-            Default value is 1, which follows a Poisson process.
-            Otherwise, the request intervals follow a gamma distribution.
-            A lower burstiness value (0 < burstiness < 1) results
-            in more bursty requests, while a higher burstiness value
-            (burstiness > 1) results in a more uniform arrival of requests.
-        ramp_up_strategy (optional):
-            The ramp-up strategy. Can be "linear" or "exponential".
-            If None, uses constant request rate (specified by request_rate).
-        ramp_up_start_rps (optional):
-            The starting request rate for ramp-up.
-        ramp_up_end_rps (optional):
-            The ending request rate for ramp-up.
-    """
-    assert burstiness > 0, (
-        f"A positive burstiness factor is expected, but given {burstiness}.")
-    # Convert to list to get length for ramp-up calculations
-    if isinstance(input_requests,
-                  Iterable) and not isinstance(input_requests, list):
-        input_requests = list(input_requests)
-
-    total_requests = len(input_requests)
-    assert total_requests > 0, "No requests provided."
-
-    # Precompute delays among requests to minimize request send laggings
-    request_rates = []
-    delay_ts = []
-    for request_index, request in enumerate(input_requests):
-        current_request_rate = _get_current_request_rate(
-            ramp_up_strategy, ramp_up_start_rps, ramp_up_end_rps,
-            request_index, total_requests, request_rate)
-        request_rates.append(current_request_rate)
-        if current_request_rate == float("inf"):
-            delay_ts.append(0)
-        else:
-            theta = 1.0 / (current_request_rate * burstiness)
-
-            # Sample the request interval from the gamma distribution.
-            # If burstiness is 1, it follows exponential distribution.
-            delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
-
-    # Calculate the cumulative delay time from the first sent out requests.
-    for i in range(1, len(delay_ts)):
-        delay_ts[i] += delay_ts[i - 1]
-    if ramp_up_strategy is None and delay_ts[-1] != 0:
-        # When ramp_up_strategy is not set, we assume the request rate is fixed
-        # and all requests should be sent in target_total_delay_s, the following
-        # logic would re-scale delay time to ensure the final delay_ts
-        # align with target_total_delay_s.
-        #
-        # NOTE: If we simply accumulate the random delta values
-        # from the gamma distribution, their sum would have 1-2% gap
-        # from target_total_delay_s. The purpose of the following logic is to
-        # close the gap for stabilizing the throughput data
-        # from different random seeds.
-        target_total_delay_s = total_requests / request_rate
-        normalize_factor = target_total_delay_s / delay_ts[-1]
-        delay_ts = [delay * normalize_factor for delay in delay_ts]
-
-    start_ts = time.time()
-    for request_index, request in enumerate(input_requests):
-        if delay_ts[request_index] > 0:
-            current_ts = time.time()
-            sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
-            if sleep_interval_s > 0:
-                await asyncio.sleep(sleep_interval_s)
-        yield request, request_rates[request_index]
-
-
 def calculate_metrics_for_embeddings(
-        outputs: list[RequestFuncOutput], dur_s: float,
+        outputs: list[MixRequestFuncOutput], dur_s: float,
         selected_percentiles: list[float]) -> EmbedBenchmarkMetrics:
     """Calculate the metrics for the embedding requests.
 
@@ -277,7 +135,7 @@ def calculate_metrics(
     tokenizer: PreTrainedTokenizerBase,
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[MixBenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
     Args:
@@ -294,6 +152,7 @@ def calculate_metrics(
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
+    audio_completed = 0
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
@@ -326,6 +185,7 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             completed += 1
+            audio_completed += outputs[i].output_audio_num
         else:
             actual_output_lens.append(0)
 
@@ -417,13 +277,14 @@ def calculate_metrics(
         else:
             print("tip: install termplotlib and gnuplot to plot the metrics")
 
-    metrics = BenchmarkMetrics(
+    metrics = MixBenchmarkMetrics(
         completed=completed,
         total_input=total_input,
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
+        audio_throughput=audio_completed / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0) *
         1000,  # ttfts is empty if streaming is not supported by the endpoint
@@ -661,7 +522,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input,
                                      session=session,
                                      pbar=pbar)))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
@@ -696,15 +557,17 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
                                     benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    if isinstance(metrics, BenchmarkMetrics):
+    if isinstance(metrics, MixBenchmarkMetrics):
         print("{:<40} {:<10}".format("Total generated tokens:",
                                      metrics.total_output))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
                                     metrics.request_throughput))
+    print("{:<40} {:<10.2f}".format("Audio throughput (num/s):",
+                                    metrics.audio_throughput))
     if goodput_config_dict:
         print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
                                         metrics.request_goodput))
-    if isinstance(metrics, BenchmarkMetrics):
+    if isinstance(metrics, MixBenchmarkMetrics):
         print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
                                         metrics.output_throughput))
         print("{:<40} {:<10.2f}".format(
@@ -715,7 +578,7 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
 
-    if isinstance(metrics, BenchmarkMetrics):
+    if isinstance(metrics, MixBenchmarkMetrics):
         result = {
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -725,6 +588,7 @@ async def benchmark(
             "request_goodput":
             metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
+            "audio_throughput": metrics.audio_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "output_lens": actual_output_lens,
@@ -807,66 +671,6 @@ async def benchmark(
 
     await session.close()
     return result
-
-
-def check_goodput_args(args):
-    # Check and parse goodput arguments
-    goodput_config_dict = {}
-    VALID_NAMES = ["ttft", "tpot", "e2el"]
-    if args.goodput:
-        goodput_config_dict = parse_goodput(args.goodput)
-        for slo_name, slo_val in goodput_config_dict.items():
-            if slo_name not in VALID_NAMES:
-                raise ValueError(
-                    f"Invalid metric name found, {slo_name}: {slo_val}. "
-                    "The service level objective name should be one of "
-                    f"{str(VALID_NAMES)}. ")
-            if slo_val < 0:
-                raise ValueError(
-                    f"Invalid value found, {slo_name}: {slo_val}. "
-                    "The service level objective value should be "
-                    "non-negative.")
-    return goodput_config_dict
-
-
-def parse_goodput(slo_pairs):
-    goodput_config_dict = {}
-    try:
-        for slo_pair in slo_pairs:
-            slo_name, slo_val = slo_pair.split(":")
-            goodput_config_dict[slo_name] = float(slo_val)
-    except ValueError as err:
-        raise argparse.ArgumentTypeError(
-            "Invalid format found for service level objectives. "
-            "Specify service level objectives for goodput as \"KEY:VALUE\" "
-            "pairs, where the key is a metric name, and the value is a "
-            "number in milliseconds.") from err
-    return goodput_config_dict
-
-
-def save_to_pytorch_benchmark_format(args: argparse.Namespace,
-                                     results: dict[str, Any],
-                                     file_name: str) -> None:
-    metrics = [
-        "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
-        "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
-    ]
-    # These raw data might be useful, but they are rather big. They can be added
-    # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
-    pt_records = convert_to_pytorch_benchmark_format(
-        args=args,
-        metrics={k: [results[k]]
-                 for k in metrics if k in results},
-        extra_info={
-            k: results[k]
-            for k in results if k not in metrics and k not in ignored_metrics
-        })
-    if pt_records:
-        # Don't use json suffix here as we don't want CI to pick it up
-        pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
-        write_to_json(pt_file, pt_records)
 
 
 def add_cli_args(parser: argparse.ArgumentParser):
