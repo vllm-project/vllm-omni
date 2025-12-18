@@ -212,31 +212,50 @@ class GPUMonitor(threading.Thread):
         self.join(timeout=5.0)
 
 
-def _send_image_request(
+def _parse_size(size: str) -> tuple[int, int]:
+    s = size.strip().lower()
+    if "x" not in s:
+        raise ValueError(f"Invalid --size format: {size!r} (expected like 1024x1024)")
+    w_str, h_str = s.split("x", 1)
+    return int(w_str), int(h_str)
+
+
+def _extract_image_count_from_chat_completions(body: bytes) -> Optional[int]:
+    parsed = _try_parse_json(body)
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        content = parsed["choices"][0]["message"]["content"]
+        if not isinstance(content, list):
+            return None
+        cnt = 0
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                cnt += 1
+        return int(cnt)
+    except Exception:
+        return None
+
+
+def _send_t2i_chat_request(
     api_base: str,
     endpoint_path: str,
     api_key: str,
-    model: str,
+    model: Optional[str],
     prompt: str,
     *,
-    n: int,
-    size: str,
-    response_format: str,
     timeout_s: float,
     extra_body: dict[str, Any],
 ) -> tuple[float, bool, Optional[str], Optional[int]]:
     url = _join_url(api_base, endpoint_path)
 
     payload: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "n": n,
-        "size": size,
-        "response_format": response_format,
+        "messages": [{"role": "user", "content": prompt}],
     }
-    for k, v in extra_body.items():
-        if v is not None:
-            payload[k] = v
+    if model:
+        payload["model"] = model
+    if extra_body:
+        payload["extra_body"] = extra_body
 
     t0 = time.perf_counter()
     try:
@@ -247,7 +266,7 @@ def _send_image_request(
         parsed = _try_parse_json(body)
         if isinstance(parsed, dict) and "error" in parsed:
             return latency_s, False, _extract_error_message(body), None
-        out_n = int(len(parsed.get("data", []))) if isinstance(parsed, dict) and isinstance(parsed.get("data"), list) else None
+        out_n = _extract_image_count_from_chat_completions(body)
         return latency_s, True, None, out_n
     except urllib.error.HTTPError as e:
         latency_s = time.perf_counter() - t0
@@ -260,13 +279,13 @@ def _send_image_request(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/images/generations."
+        description="Online serving benchmark for Text-to-Image via OpenAI-compatible /v1/chat/completions."
     )
 
-    parser.add_argument("--api-base", type=str, default="http://localhost:8000/v1", help="OpenAI base URL.")
+    parser.add_argument("--api-base", type=str, default="http://localhost:8091", help="Server base URL.")
     parser.add_argument("--api-key", type=str, default="EMPTY", help="OpenAI API key (use 'EMPTY' for local).")
-    parser.add_argument("--endpoint-path", type=str, default="/images/generations", help="Endpoint path.")
-    parser.add_argument("--model", type=str, required=True, help="Served model name.")
+    parser.add_argument("--endpoint-path", type=str, default="/v1/chat/completions", help="Endpoint path.")
+    parser.add_argument("--model", type=str, default=None, help="Optional served model name (server default if omitted).")
 
     parser.add_argument("--prompt", type=str, default=None, help="Single prompt (overrides prompt set).")
     parser.add_argument("--prompt-file", type=str, default=None, help="Text file with one prompt per line.")
@@ -276,9 +295,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-requests", type=int, default=40, help="Total measured requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
-    parser.add_argument("--images-per-request", type=int, default=1, help="OpenAI 'n': images per request.")
-    parser.add_argument("--size", type=str, default="1024x1024", help="OpenAI 'size' (e.g., 1024x1024).")
-    parser.add_argument("--response-format", type=str, default="b64_json", help="OpenAI response_format.")
+    parser.add_argument("--images-per-request", type=int, default=1, help="Images per request (maps to num_outputs_per_prompt).")
+    parser.add_argument("--size", type=str, default="1024x1024", help="Output size as WIDTHxHEIGHT (e.g., 1024x1024).")
+    parser.add_argument("--seed", type=int, default=None, help="Optional fixed seed for all requests.")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
 
     parser.add_argument("--num-inference-steps", type=int, default=None, help="(vLLM-Omni ext) num_inference_steps.")
@@ -320,12 +339,19 @@ def main() -> None:
         raise ValueError("--images-per-request must be >= 1")
 
     extra_body: dict[str, Any] = {}
+    width, height = _parse_size(args.size)
+    extra_body["height"] = height
+    extra_body["width"] = width
     if args.num_inference_steps is not None:
         extra_body["num_inference_steps"] = args.num_inference_steps
     if args.true_cfg_scale is not None:
         extra_body["true_cfg_scale"] = args.true_cfg_scale
     if args.negative_prompt is not None:
         extra_body["negative_prompt"] = args.negative_prompt
+    if args.seed is not None:
+        extra_body["seed"] = args.seed
+    if args.images_per_request != 1:
+        extra_body["num_outputs_per_prompt"] = args.images_per_request
     if args.extra_body_json:
         extra_body.update(json.loads(args.extra_body_json))
 
@@ -340,15 +366,12 @@ def main() -> None:
 
     def _task(i: int) -> dict[str, Any]:
         prompt = prompts[i % len(prompts)]
-        latency_s, ok, err, out_n = _send_image_request(
+        latency_s, ok, err, out_n = _send_t2i_chat_request(
             args.api_base,
             args.endpoint_path,
             args.api_key,
             args.model,
             prompt,
-            n=args.images_per_request,
-            size=args.size,
-            response_format=args.response_format,
             timeout_s=args.timeout_s,
             extra_body=extra_body,
         )
@@ -363,13 +386,12 @@ def main() -> None:
     print("---- Benchmark Config ----")
     print(f"api_base:            {args.api_base}")
     print(f"endpoint_path:       {args.endpoint_path}")
-    print(f"model:               {args.model}")
+    print(f"model:               {args.model or '(server default)'}")
     print(f"concurrency:         {args.concurrency}")
     print(f"warmup_requests:     {args.warmup_requests}")
     print(f"num_requests:        {args.num_requests}")
     print(f"images_per_request:  {args.images_per_request}")
     print(f"size:                {args.size}")
-    print(f"response_format:     {args.response_format}")
     if extra_body:
         print(f"extra_body:          {extra_body}")
 
@@ -457,7 +479,6 @@ def main() -> None:
                 "num_requests": args.num_requests,
                 "images_per_request": args.images_per_request,
                 "size": args.size,
-                "response_format": args.response_format,
                 "timeout_s": args.timeout_s,
                 "extra_body": extra_body,
             },
