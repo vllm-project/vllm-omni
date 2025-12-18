@@ -211,14 +211,6 @@ class GPUMonitor(threading.Thread):
         self.join(timeout=5.0)
 
 
-def _parse_size(size: str) -> tuple[int, int]:
-    s = size.strip().lower()
-    if "x" not in s:
-        raise ValueError(f"Invalid --size format: {size!r} (expected like 1024x1024)")
-    w_str, h_str = s.split("x", 1)
-    return int(w_str), int(h_str)
-
-
 def _guess_mime_type(path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(path))
     return mime or "application/octet-stream"
@@ -317,7 +309,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
     parser.add_argument("--images-per-request", type=int, default=1, help="Images per request (maps to num_outputs_per_prompt).")
-    parser.add_argument("--size", type=str, default="1024x1024", help="Output size as WIDTHxHEIGHT (e.g., 1024x1024).")
     parser.add_argument("--seed", type=int, default=None, help="Optional fixed seed for all requests.")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="HTTP timeout per request.")
 
@@ -365,9 +356,6 @@ def main() -> None:
         raise ValueError("--images-per-request must be >= 1")
 
     extra_body: dict[str, Any] = {}
-    width, height = _parse_size(args.size)
-    extra_body["height"] = height
-    extra_body["width"] = width
     if args.num_inference_steps is not None:
         extra_body["num_inference_steps"] = args.num_inference_steps
     if args.guidance_scale is not None:
@@ -419,7 +407,6 @@ def main() -> None:
     print(f"warmup_requests:     {args.warmup_requests}")
     print(f"num_requests:        {args.num_requests}")
     print(f"images_per_request:  {args.images_per_request}")
-    print(f"size:                {args.size}")
     if extra_body:
         print(f"extra_body:          {extra_body}")
 
@@ -505,7 +492,6 @@ def main() -> None:
                 "warmup_requests": args.warmup_requests,
                 "num_requests": args.num_requests,
                 "images_per_request": args.images_per_request,
-                "size": args.size,
                 "timeout_s": args.timeout_s,
                 "extra_body": extra_body,
             },
