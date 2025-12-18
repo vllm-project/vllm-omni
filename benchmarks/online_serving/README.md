@@ -18,7 +18,14 @@ These scripts benchmark vLLM-Omni **online serving** via OpenAI-style HTTP APIs.
 ```bash
 python benchmarks/online_serving/text_to_image/benchmark_t2i.py \
   --api-base http://localhost:8091 \
-  --prompt "a cat wearing sunglasses"
+  --prompt "a cat wearing sunglasses" \
+  --concurrency 2 \
+  --num-requests 6 \
+  --size 1024x1024 \
+  --seed 42 \
+  --num-inference-steps 50 \
+  --true-cfg-scale 4.0 \
+  --output-json t2i.json
 ```
 
 ### 2) Text-to-Video (T2V)

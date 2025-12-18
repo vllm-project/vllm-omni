@@ -291,7 +291,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", type=str, default=None, help="Text file with one prompt per line.")
     parser.add_argument("--num-prompts", type=int, default=None, help="Use only the first N prompts from the set.")
 
-    parser.add_argument("--concurrency", type=int, default=8, help="Concurrent clients (threads).")
+    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent clients (threads).")
     parser.add_argument("--num-requests", type=int, default=40, help="Total measured requests.")
     parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests (not measured).")
 
