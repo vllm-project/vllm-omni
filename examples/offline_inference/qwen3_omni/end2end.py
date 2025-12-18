@@ -288,13 +288,13 @@ def parse_args():
     parser.add_argument(
         "--batch-timeout",
         type=int,
-        default=50,
+        default=5,
         help="Timeout for batching in seconds (default: 5)",
     )
     parser.add_argument(
         "--init-timeout",
         type=int,
-        default=600,
+        default=300,
         help="Timeout for initializing stages in seconds (default: 300)",
     )
     parser.add_argument(
