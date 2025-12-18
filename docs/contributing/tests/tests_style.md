@@ -1,4 +1,4 @@
-# vLLM-Omni Test File Structure and Style Guide
+# Test File Structure and Style Guide
 
 To ensure project maintainability and sustainable development, we encourage contributors to submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes. This document outlines the guidelines for organizing and naming test files.
 
