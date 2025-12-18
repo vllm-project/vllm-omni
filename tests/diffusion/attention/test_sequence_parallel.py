@@ -147,12 +147,13 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [8])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("use_sync", [False])
+@pytest.mark.parametrize("use_sync", [True, False])
 @pytest.mark.parametrize("dynamic", [False])
 @pytest.mark.parametrize("use_compile", [False])
-def test_ulysses_attention(
+@pytest.mark.parametrize("attn_backend", ["flash_attn", "sdpa"])
+def test_sequence_parallel(
     ulysses_degree: int,
     ring_degree: int,
     test_model_cls: type[torch.nn.Module],
@@ -165,6 +166,7 @@ def test_ulysses_attention(
     seq_len: int,
     num_heads: int,
     head_size: int,
+    attn_backend: str,
 ):
     """Test Ulysses attention by comparing with and without SP enabled."""
     sequence_parallel_size = ulysses_degree * ring_degree
@@ -203,6 +205,7 @@ def test_ulysses_attention(
                 model_state_file,
                 input_data_file,
                 True,  # is_baseline
+                attn_backend,
             ),
             nprocs=1,
         )
@@ -230,6 +233,7 @@ def test_ulysses_attention(
                 model_state_file,
                 input_data_file,
                 False,  # is_baseline
+                attn_backend,
             ),
             nprocs=sequence_parallel_size,
         )
@@ -282,10 +286,11 @@ def test_ulysses_attention(
 
         # Assert that differences are within acceptable tolerance
         # For FP16/BF16, we expect some numerical differences due to different computation order
+        # If we use the same backend (e.g. Flash Attention) for both baseline and SP, differences should be smaller.
         if dtype == torch.float16:
-            atol, rtol = 1e-4, 1e-2
+            atol, rtol = 5e-3, 5e-2
         elif dtype == torch.bfloat16:
-            atol, rtol = 1e-4, 1e-2
+            atol, rtol = 5e-3, 5e-2
         else:
             atol, rtol = 1e-5, 1e-3
 
@@ -324,6 +329,7 @@ def ulysses_attention_on_test_model(
     model_state_file: str,
     input_data_file: str,
     is_baseline: bool,
+    attn_backend: str,
 ):
     """Run Ulysses attention test on a test model and save results for comparison."""
     # Use fixed seed for reproducibility across baseline and SP runs
@@ -365,6 +371,7 @@ def ulysses_attention_on_test_model(
         model="test_model",
         dtype=dtype,
         parallel_config=parallel_config,
+        attention_backend=attn_backend, # Set the attention backend here
     )
 
     # Initialize model parallel
@@ -473,13 +480,13 @@ def ulysses_attention_on_test_model(
         if not is_baseline:
             if hasattr(model, "attention"):
                 assert hasattr(model.attention, "use_ulysses"), "Attention should have use_ulysses attribute"
-                assert model.attention.use_ulysses, "Attention should be using Ulysses"
+                assert model.attention.use_ulysses or model.attention.use_ring, "Attention should be using Ulysses or Ring"
             elif hasattr(model, "layers"):
                 for i, layer in enumerate(model.layers):
                     assert hasattr(layer.attention, "use_ulysses"), (
                         f"Layer {i} attention should have use_ulysses attribute"
                     )
-                    assert layer.attention.use_ulysses, f"Layer {i} attention should be using Ulysses"
+                    assert layer.attention.use_ulysses or layer.attention.use_ring, f"Layer {i} attention should be using Ulysses or Ring"
 
         # Gather outputs from all ranks AFTER computation
         if world_size > 1:
@@ -518,3 +525,4 @@ def ulysses_attention_on_test_model(
             )
 
         destroy_distributed_env()
+

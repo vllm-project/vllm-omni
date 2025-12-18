@@ -7,6 +7,7 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 from typing import Optional
+import os
 
 import torch
 import torch.distributed as dist
@@ -91,13 +92,30 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
+        # Check backend preference from config
+        try:
+            config = get_current_omni_diffusion_config()
+            backend_pref = config.attention_backend
+        except Exception:
+            backend_pref = None
+
         if self.use_ulysses:
             return self._forward_ulysses(query, key, value, attn_metadata)
         elif self.use_ring:
             return self._forward_ring(query, key, value, attn_metadata)
         else:
-            # If FlashAttention is available and not on NPU, use it to ensure consistency with Ring Attention
-            if HAS_FLASH_ATTN and not is_npu():
+            # Decide whether to use ring_flash_attn_func (Flash Attention)
+            use_fa = False
+            if backend_pref == "flash_attn":
+                use_fa = True
+            elif backend_pref == "sdpa":
+                use_fa = False
+            else:
+                # Default: use FA if available and not on NPU
+                if HAS_FLASH_ATTN and not is_npu():
+                    use_fa = True
+
+            if use_fa and HAS_FLASH_ATTN:
                 softmax_scale = self.softmax_scale
                 if softmax_scale is None:
                     softmax_scale = query.shape[-1] ** -0.5
@@ -117,6 +135,20 @@ class Attention(nn.Module):
                     group=None,
                     attn_type=AttnType.FA,
                 )
+            
+            # Use ring_pytorch_attn_func for SDPA/Torch backend if preferred, to ensure consistent implementation
+            # This is optional but can help align behavior with ring attention implementation
+            if backend_pref == "sdpa" or backend_pref == "torch":
+                 from vllm_omni.diffusion.attention.ring_pytorch_attn import ring_pytorch_attn_func
+                 softmax_scale = self.softmax_scale
+                 if softmax_scale is None:
+                     softmax_scale = query.shape[-1] ** -0.5
+                 return ring_pytorch_attn_func(
+                     query, key, value, 
+                     softmax_scale=softmax_scale, 
+                     causal=self.causal,
+                     group=None
+                 )
 
             # shape: (batch_size, seq_len, num_heads, head_size)
             attn_output = self.attention.forward(query, key, value, attn_metadata)
@@ -130,18 +162,33 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata = None,
     ) -> Tensor:
         """Ring attention forward pass with sequence parallelism."""
-        # query shape: (batch_size, seq_len, num_heads, head_size)
-        # Ring attention expects (batch_size, seq_len, num_heads, head_size)
         
         softmax_scale = self.softmax_scale
         if softmax_scale is None:
             softmax_scale = query.shape[-1] ** -0.5
+
+        # Check backend preference from config
+        try:
+            config = get_current_omni_diffusion_config()
+            backend_pref = config.attention_backend
+        except Exception:
+            backend_pref = None
+        
+        # Use ring_pytorch_attn_func for SDPA/Torch backend
+        if backend_pref == "sdpa" or backend_pref == "torch":
+             from vllm_omni.diffusion.attention.ring_pytorch_attn import ring_pytorch_attn_func
+             return ring_pytorch_attn_func(
+                 query, key, value, 
+                 softmax_scale=softmax_scale, 
+                 causal=self.causal,
+                 group=self.ring_pg
+             )
             
         out = ring_flash_attn_func(
             query,
             key,
             value,
-            dropout_p=0.0, # TODO: get from config if needed
+            dropout_p=0.0, 
             softmax_scale=softmax_scale,
             causal=self.causal,
             window_size=(-1, -1),
@@ -150,7 +197,7 @@ class Attention(nn.Module):
             deterministic=False,
             return_attn_probs=False,
             group=self.ring_pg,
-            attn_type=AttnType.FA, # Default to FlashAttention
+            attn_type=AttnType.FA,
         )
         return out
 
@@ -173,39 +220,38 @@ class Attention(nn.Module):
             softmax_scale = q.shape[-1] ** -0.5
 
         if self.use_ring:
-            # Hybrid: Ulysses + Ring
-            # After Ulysses AllToAll, we have (bs, seq_len, head_cnt/N, head_size)
-            # But wait, Ulysses splits heads. Ring splits sequence.
-            # If we use both, we are splitting both?
-            # Usually Hybrid means:
-            # Ulysses splits heads (seq_len is full? No, Ulysses gathers full seq_len?)
-            # 
-            # Ulysses standard:
-            # Input: (bs, seq_len/P, heads, dim)
-            # AllToAll: (bs, seq_len, heads/P, dim) -> Local Attention on full sequence, subset of heads.
-            # 
-            # If we have Ring as well (Hybrid):
-            # Input: (bs, seq_len/(P*R), heads, dim)
-            # Ulysses AllToAll (Group P): (bs, seq_len/R, heads/P, dim)
-            # Now we have seq_len/R. We need to do Ring Attention on this sequence chunk across Ring Group R.
-            # 
-            # So yes, call Ring Attention here.
+            # Check backend preference from config
+            try:
+                config = get_current_omni_diffusion_config()
+                backend_pref = config.attention_backend
+            except Exception:
+                backend_pref = None
             
-            context_layer = ring_flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=0.0,
-                softmax_scale=softmax_scale,
-                causal=self.causal,
-                window_size=(-1, -1),
-                softcap=0.0,
-                alibi_slopes=None,
-                deterministic=False,
-                return_attn_probs=False,
-                group=self.ring_pg,
-                attn_type=AttnType.FA,
-            )
+            # Use ring_pytorch_attn_func for SDPA/Torch backend
+            if backend_pref == "sdpa" or backend_pref == "torch":
+                 from vllm_omni.diffusion.attention.ring_pytorch_attn import ring_pytorch_attn_func
+                 context_layer = ring_pytorch_attn_func(
+                     q, k, v, 
+                     softmax_scale=softmax_scale, 
+                     causal=self.causal,
+                     group=self.ring_pg
+                 )
+            else:
+                context_layer = ring_flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=0.0,
+                    softmax_scale=softmax_scale,
+                    causal=self.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=False,
+                    group=self.ring_pg,
+                    attn_type=AttnType.FA,
+                )
 
         elif is_npu():
             context_layer = self.attention(
