@@ -13,8 +13,8 @@ from dataclasses import dataclass
 
 import torch
 from einops import rearrange
-from torch import Tensor, nn
 from safetensors.torch import load_file as load_sft
+from torch import Tensor, nn
 
 
 @dataclass
@@ -338,16 +338,16 @@ def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
 
 def load_ae(local_path: str) -> AutoEncoder:
     ae_params = AutoEncoderParams(
-            resolution=256,
-            in_channels=3,
-            downsample=8,
-            ch=128,
-            out_ch=3,
-            ch_mult=[1, 2, 4, 4],
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
+        resolution=256,
+        in_channels=3,
+        downsample=8,
+        ch=128,
+        out_ch=3,
+        ch_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        z_channels=16,
+        scale_factor=0.3611,
+        shift_factor=0.1159,
     )
 
     # Loading the autoencoder

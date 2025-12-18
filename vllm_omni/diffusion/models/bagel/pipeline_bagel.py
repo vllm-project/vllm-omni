@@ -2,6 +2,7 @@
 """
 BagelPipeline implementation for vLLM Omni.
 """
+
 from __future__ import annotations
 
 import copy
@@ -12,8 +13,8 @@ from dataclasses import dataclass
 from math import isqrt
 
 import torch
-from torch import nn
 from PIL import Image
+from torch import nn
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -167,11 +168,11 @@ class BagelPipeline(nn.Module):
         latent = latent.reshape(1, h, w, p, p, c)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, c, h * p, w * p)
-        
+
         # Cast to VAE dtype (e.g. bfloat16) as latents might remain float32 from generation loop
         vae_dtype = next(vae.parameters()).dtype
         latent = latent.to(vae_dtype)
-        
+
         image = vae.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         return Image.fromarray(image.to(torch.uint8).cpu().numpy())
@@ -228,7 +229,7 @@ class BagelPipeline(nn.Module):
             _ = req.pil_image  # reserved
             # In practice you would encode the image into context here.
             gen_params.cfg_img_scale = 1.0
-        
+
         # Initialize cfg_text_context BEFORE text update (unconditional on text).
         cfg_text_context = copy.deepcopy(gen_context)
 

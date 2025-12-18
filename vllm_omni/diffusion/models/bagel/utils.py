@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
 from dataclasses import dataclass
-from typing import Optional, Tuple
+
+import torch
+from torch.nn.attention.flex_attention import and_masks, or_masks
+
 
 @dataclass
 class BagelGenParams:
     cfg_text_scale: float = 1.0
     cfg_img_scale: float = 1.0
-    cfg_interval: Tuple[float, float] = (0.0, 1.0)
+    cfg_interval: tuple[float, float] = (0.0, 1.0)
     cfg_renorm_min: float = 0.0
     cfg_renorm_type: str = "global"
     num_timesteps: int = 50
     timestep_shift: float = 1.0
+
 
 def add_special_tokens(tokenizer):
     all_special_tokens = []
@@ -24,34 +27,33 @@ def add_special_tokens(tokenizer):
 
     new_tokens = []
 
-    if '<|im_start|>' not in all_special_tokens:
-        new_tokens.append('<|im_start|>')
+    if "<|im_start|>" not in all_special_tokens:
+        new_tokens.append("<|im_start|>")
 
-    if '<|im_end|>' not in all_special_tokens:
-        new_tokens.append('<|im_end|>')
+    if "<|im_end|>" not in all_special_tokens:
+        new_tokens.append("<|im_end|>")
 
-    if '<|vision_start|>' not in all_special_tokens:
-        new_tokens.append('<|vision_start|>')
+    if "<|vision_start|>" not in all_special_tokens:
+        new_tokens.append("<|vision_start|>")
 
-    if '<|vision_end|>' not in all_special_tokens:
-        new_tokens.append('<|vision_end|>')
+    if "<|vision_end|>" not in all_special_tokens:
+        new_tokens.append("<|vision_end|>")
 
     num_new_tokens = tokenizer.add_tokens(new_tokens)
-    bos_token_id = tokenizer.convert_tokens_to_ids('<|im_start|>')
-    eos_token_id = tokenizer.convert_tokens_to_ids('<|im_end|>')
-    start_of_image = tokenizer.convert_tokens_to_ids('<|vision_start|>')
-    end_of_image = tokenizer.convert_tokens_to_ids('<|vision_end|>')
+    bos_token_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    start_of_image = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    end_of_image = tokenizer.convert_tokens_to_ids("<|vision_end|>")
 
     new_token_ids = dict(
-        bos_token_id=bos_token_id, 
-        eos_token_id=eos_token_id, 
-        start_of_image=start_of_image, 
-        end_of_image=end_of_image, 
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        start_of_image=start_of_image,
+        end_of_image=end_of_image,
     )
 
     return tokenizer, new_token_ids, num_new_tokens
 
-from torch.nn.attention.flex_attention import or_masks, and_masks
 
 def create_sparse_mask(document_lens, split_lens, attn_modes, device):
     def causal_mask(b, h, q_idx, kv_idx):
@@ -61,7 +63,7 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
         return (full_and_noise_seq_id[q_idx] == full_and_noise_seq_id[kv_idx]) & (full_and_noise_seq_id[q_idx] >= 0)
 
     def remove_noise_mask(b, h, q_idx, kv_idx):
-        return (~((noise_seq_id[kv_idx] >= 0) & (noise_seq_id[q_idx] != noise_seq_id[kv_idx])))
+        return ~((noise_seq_id[kv_idx] >= 0) & (noise_seq_id[q_idx] != noise_seq_id[kv_idx]))
 
     def sample_mask(b, h, q_idx, kv_idx):
         return document_id[q_idx] == document_id[kv_idx]
@@ -70,15 +72,15 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
     noise_tmp = []
 
     for i, (length, model) in enumerate(zip(split_lens, attn_modes)):
-        value = i if model in ['full', 'noise'] else -1
+        value = i if model in ["full", "noise"] else -1
         full_and_noise_tmp.extend([value] * length)
-        value_noise = i if model == 'noise' else -1
+        value_noise = i if model == "noise" else -1
         noise_tmp.extend([value_noise] * length)
 
     full_and_noise_seq_id = torch.Tensor(full_and_noise_tmp).to(device)
     noise_seq_id = torch.Tensor(noise_tmp).to(device)
 
-    document_id = torch.cat([torch.full((l,), i) for i, l in enumerate(document_lens, start=1)]).to(device)
+    document_id = torch.cat([torch.full((length,), i) for i, length in enumerate(document_lens, start=1)]).to(device)
 
     return and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
 
