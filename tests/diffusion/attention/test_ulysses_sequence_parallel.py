@@ -118,13 +118,11 @@ class TestAttentionModel(torch.nn.Module):
                     joint_value=v_encoder,
                 ),
             )
-            output_seq_len = seq_len
         else:
             attn_output = self.attention(q, k, v)
-            output_seq_len = total_seq_len
 
         # Reshape back and project
-        attn_output = attn_output.view(batch_size, output_seq_len, -1)
+        attn_output = attn_output.view(batch_size, total_seq_len, -1)
         output = self.o_proj(attn_output)
 
         return output

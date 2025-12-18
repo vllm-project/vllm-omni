@@ -91,15 +91,7 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata = None,
     ) -> Tensor:
         """Ulysses attention forward pass with sequence parallelism."""
-        # scatter 2, gather 1
-        # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
-        query = SeqAllToAll4D.apply(self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync)
-        key = SeqAllToAll4D.apply(self.ulysses_pg, key, self.scatter_idx, self.gather_idx, self.use_sync)
-        value = SeqAllToAll4D.apply(self.ulysses_pg, value, self.scatter_idx, self.gather_idx, self.use_sync)
 
-        softmax_scale = self.softmax_scale
-        if softmax_scale is None:
-            softmax_scale = query.shape[-1] ** -0.5
         if attn_metadata is not None:
             joint_tensor_query, joint_tensor_key, joint_tensor_value = (
                 attn_metadata.joint_query,
@@ -113,23 +105,30 @@ class Attention(nn.Module):
             joint_tensor_value = None
             joint_strategy = None
 
+        is_joint = False
         if joint_tensor_query is not None and joint_tensor_key is not None and joint_tensor_value is not None:
             supported_joint_strategy = ["front", "rear"]
             if joint_strategy not in supported_joint_strategy:
                 raise ValueError(
-                    f"joint_strategy: {joint_strategy} not supported. "
-                    f"Supported joint strategy: {supported_joint_strategy}"
+                    f"joint_strategy: {joint_strategy} not supported. supported joint strategy: {supported_joint_strategy}"
                 )
+            elif joint_strategy == "rear":
+                query = torch.cat([query, joint_tensor_query], dim=1)
+                is_joint = True
+            else:
+                query = torch.cat([joint_tensor_query, query], dim=1)
+                is_joint = True
+        elif joint_tensor_query is None and joint_tensor_key is None and joint_tensor_value is None:
+            pass
+        else:
+            raise ValueError(
+                "joint_tensor_query, joint_tensor_key, and joint_tensor_value should be None or not None simultaneously."
+            )
 
-            # get the current attn heads according to the current rank
+        if is_joint:
             ulysses_world_size = torch.distributed.get_world_size(self.ulysses_pg)
             ulysses_rank = torch.distributed.get_rank(self.ulysses_pg)
             attn_heads_per_ulysses_rank = joint_tensor_key.shape[-2] // ulysses_world_size
-            joint_tensor_query = joint_tensor_query[
-                ...,
-                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
-                :,
-            ]
             joint_tensor_key = joint_tensor_key[
                 ...,
                 attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
@@ -140,20 +139,18 @@ class Attention(nn.Module):
                 attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
                 :,
             ]
-            if joint_strategy == "rear":
-                query = torch.cat([query, joint_tensor_query], dim=1)
-                key = torch.cat([key, joint_tensor_key], dim=1)
-                value = torch.cat([value, joint_tensor_value], dim=1)
-            else:
-                query = torch.cat([joint_tensor_query, query], dim=1)
-                key = torch.cat([joint_tensor_key, key], dim=1)
-                value = torch.cat([joint_tensor_value, value], dim=1)
-        elif joint_tensor_query is None and joint_tensor_key is None and joint_tensor_value is None:
-            pass
-        else:
-            raise ValueError(
-                "joint_tensor_query, joint_tensor_key, and joint_tensor_value should be None or not None simultaneously."
-            )
+        # scatter 2, gather 1
+        # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
+        query = SeqAllToAll4D.apply(self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync)
+        key = SeqAllToAll4D.apply(self.ulysses_pg, key, self.scatter_idx, self.gather_idx, self.use_sync)
+        value = SeqAllToAll4D.apply(self.ulysses_pg, value, self.scatter_idx, self.gather_idx, self.use_sync)
+        softmax_scale = self.softmax_scale
+        if softmax_scale is None:
+            softmax_scale = query.shape[-1] ** -0.5
+
+        if is_joint:
+            key = torch.cat([key, joint_tensor_key], dim=1)
+            value = torch.cat([value, joint_tensor_value], dim=1)
 
         context_layer = self.attention.forward(
             query,
