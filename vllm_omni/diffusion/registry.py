@@ -19,6 +19,11 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit",
         "QwenImageEditPipeline",
     ),
+    "QwenImageEditPlusPipeline": (
+        "qwen_image",
+        "pipeline_qwen_image_edit_plus",
+        "QwenImageEditPlusPipeline",
+    ),
     "ZImagePipeline": (
         "z_image",
         "pipeline_z_image",
@@ -65,6 +70,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImagePipeline": "get_qwen_image_post_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
+    "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
 }
@@ -74,6 +80,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
+    "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
 }
 
 

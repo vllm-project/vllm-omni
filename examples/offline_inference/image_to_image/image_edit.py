@@ -4,13 +4,23 @@
 """
 Example script for image editing with Qwen-Image-Edit.
 
-Usage:
+Usage (single image):
     python image_edit.py \
         --image input.png \
         --prompt "Let this mascot dance under the moon, surrounded by floating stars and poetic bubbles such as 'Be Kind'" \
         --output output_image_edit.png \
         --num_inference_steps 50 \
-        --cfg_scale 4.0
+        --cfg_scale 4.0 \
+        --guidance_scale 1.0
+
+Usage (multiple images):
+    python image_edit.py \
+        --image input1.png input2.png input3.png \
+        --prompt "Combine these images into a single scene" \
+        --output output_image_edit.png \
+        --num_inference_steps 50 \
+        --cfg_scale 4.0 \
+        --guidance_scale 1.0
 
 For more options, run:
     python image_edit.py --help
@@ -34,13 +44,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image-Edit",
-        help="Diffusion model name or local path.",
+        help=(
+            "Diffusion model name or local path. "
+            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or later version "
+            "which supports QwenImageEditPlusPipeline."
+        ),
     )
     parser.add_argument(
         "--image",
         type=str,
+        nargs="+",
         required=True,
-        help="Path to input image file (PNG, JPG, etc.).",
+        help="Path(s) to input image file(s) (PNG, JPG, etc.). Can specify multiple images.",
     )
     parser.add_argument(
         "--prompt",
@@ -64,7 +79,22 @@ def parse_args() -> argparse.Namespace:
         "--cfg_scale",
         type=float,
         default=4.0,
-        help="True classifier-free guidance scale specific to Qwen-Image-Edit.",
+        help=(
+            "True classifier-free guidance scale (default: 4.0). Guidance scale as defined in Classifier-Free "
+            "Diffusion Guidance. Classifier-free guidance is enabled by setting cfg_scale > 1 and providing "
+            "a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, "
+            "usually at the expense of lower image quality."
+        ),
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Guidance scale for guidance-distilled models (default: 1.0, disabled). "
+            "Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale "
+            "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -108,13 +138,19 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    # Validate input image exists
-    if not os.path.exists(args.image):
-        raise FileNotFoundError(f"Input image not found: {args.image}")
+    # Validate input images exist and load them
+    input_images = []
+    for image_path in args.image:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Input image not found: {image_path}")
+        img = Image.open(image_path).convert("RGB")
+        input_images.append(img)
 
-    # Load input image
-    input_image = Image.open(args.image).convert("RGB")
-    print(f"Loaded input image from {args.image} (size: {input_image.size})")
+    # Use single image or list based on number of inputs
+    if len(input_images) == 1:
+        input_image = input_images[0]
+    else:
+        input_image = input_images
 
     device = detect_device_type()
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -153,10 +189,9 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    # Initialize Omni with QwenImageEditPipeline
+    # Initialize Omni with appropriate pipeline
     omni = Omni(
         model=args.model,
-        model_class_name="QwenImageEditPipeline",
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
@@ -171,6 +206,12 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    if isinstance(input_image, list):
+        print(f"  Number of input images: {len(input_image)}")
+        for idx, img in enumerate(input_image):
+            print(f"    Image {idx + 1} size: {img.size}")
+    else:
+        print(f"  Input image size: {input_image.size}")
     print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
     print(f"  Input image size: {input_image.size}")
     print(f"{'=' * 60}\n")
@@ -183,6 +224,7 @@ def main():
         negative_prompt=args.negative_prompt,
         generator=generator,
         true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_outputs_per_prompt,
     )

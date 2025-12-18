@@ -31,11 +31,13 @@ vLLM-Omni also supports the sequence parallelism (SP) for the diffusion model, t
 
 The following table shows which models are currently supported by each acceleration method:
 
+
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
 |-------|-----------------|----------|-----------|-----------|
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ |
 | **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ❌ | ✅ |✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ❌ | ✅ |✅ |
 
 
 ## Performance Benchmarks
