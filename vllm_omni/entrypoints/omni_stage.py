@@ -859,6 +859,28 @@ async def _stage_worker_async(
             _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
             break
 
+        # Handle collective_rpc requests
+        if isinstance(task, dict) and task.get("type") == "collective_rpc":
+            rpc_id = task.get("rpc_id")
+            method = task.get("method")
+            timeout = task.get("timeout")
+            args = task.get("args")
+            kwargs = task.get("kwargs")
+            try:
+                result = await stage_engine.collective_rpc(method, timeout, args, kwargs)
+                out_q.put({
+                    "type": "collective_rpc_result",
+                    "rpc_id": rpc_id,
+                    "result": result,
+                })
+            except Exception as e:
+                out_q.put({
+                    "type": "collective_rpc_result",
+                    "rpc_id": rpc_id,
+                    "error": str(e),
+                })
+            continue
+
         _rx_bytes_by_rid: dict[Any, int] = {}
         _rx_decode_ms_by_rid: dict[Any, float] = {}
         _in_flight_ms_by_rid: dict[Any, float] = {}
