@@ -33,27 +33,28 @@ class OmniBenchmarkSubcommand(CLISubcommand):
         bench_parser = subparsers.add_parser(
             self.name,
             description=self.help,
-            usage=f"vllm {self.name} <bench_type> [options]")
+            usage=f"vllm {self.name} <bench_type> --omni [options]")
         bench_subparsers = bench_parser.add_subparsers(required=True,
                                                        dest="bench_type")
+        bench_subparsers.add_argument(
+            "--omni",
+            action="store_true",
+            help="Enable benchmark-Omni mode",
+        )
 
         for cmd_cls in OmniBenchmarkSubcommandBase.__subclasses__():
             cmd_subparser = bench_subparsers.add_parser(
                 cmd_cls.name,
                 help=cmd_cls.help,
                 description=cmd_cls.help,
-                usage=f"vllm {self.name} {cmd_cls.name} --omni [options]",
+                usage=f"vllm {self.name} {cmd_cls.name} [options]",
             )
             cmd_subparser.set_defaults(dispatch_function=cmd_cls.cmd)
             cmd_cls.add_cli_args(cmd_subparser)
 
             cmd_subparser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(
                 subcmd=f"{self.name} {cmd_cls.name}")
-            cmd_subparser.add_argument(
-                "--omni",
-                action="store_true",
-                help="Enable benchmark-Omni mode",
-            )
+
         return bench_parser
 
 
