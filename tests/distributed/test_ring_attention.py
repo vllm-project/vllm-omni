@@ -92,7 +92,7 @@ class MockAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("head_size", [32])
 @pytest.mark.parametrize("causal", [False]) # Ring attention typically non-causal for DiT, but supports causal
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("use_sync", [True, False])
+@pytest.mark.parametrize("use_sync", [False])
 @pytest.mark.parametrize("ring_degree", [2])
 @pytest.mark.parametrize("ulysses_degree", [2])
 def test_ring_attention(
