@@ -8,6 +8,9 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
@@ -16,6 +19,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
+    get_sequence_parallel_world_size,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -29,6 +33,9 @@ elif device_type == "npu":
     torch_device = torch.npu
 else:
     raise ValueError(f"Unsupported device type: {device_type} for this test script! Expected GPU or NPU.")
+
+global split_text_embed_in_sp
+split_text_embed_in_sp = False
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -71,25 +78,53 @@ class TestAttentionModel(torch.nn.Module):
         self.v_proj = torch.nn.Linear(hidden_size, (num_kv_heads or num_heads) * head_size)
         self.o_proj = torch.nn.Linear(num_heads * head_size, hidden_size)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass through attention layer."""
         batch_size, seq_len, _ = hidden_states.shape
 
+        # Combine hidden_states and encoder_hidden_states if provided
+        if encoder_hidden_states is not None:
+            # Concatenate along sequence dimension
+            combined_hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        else:
+            combined_hidden_states = hidden_states
+
         # Project to Q, K, V
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        q = self.q_proj(combined_hidden_states)
+        k = self.k_proj(combined_hidden_states)
+        v = self.v_proj(combined_hidden_states)
 
-        # Reshape to (batch_size, seq_len, num_heads, head_size)
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_size)
-        k = k.view(batch_size, seq_len, k.shape[-1] // self.head_size, self.head_size)
-        v = v.view(batch_size, seq_len, v.shape[-1] // self.head_size, self.head_size)
+        # Reshape to (batch_size, total_seq_len, num_heads, head_size)
+        total_seq_len = combined_hidden_states.shape[1]
+        q = q.view(batch_size, total_seq_len, self.num_heads, self.head_size)
+        k = k.view(batch_size, total_seq_len, k.shape[-1] // self.head_size, self.head_size)
+        v = v.view(batch_size, total_seq_len, v.shape[-1] // self.head_size, self.head_size)
 
-        # Apply attention
-        attn_output = self.attention(q, k, v)
+        # Apply attention with split logic
+        if get_sequence_parallel_world_size() > 1 and split_text_embed_in_sp and encoder_hidden_states is not None:
+            # Split back to hidden_states part (first seq_len) and encoder_hidden_states part (second seq_len)
+            q_hidden, q_encoder = torch.split(q, [seq_len, seq_len], dim=1)
+            k_hidden, k_encoder = torch.split(k, [seq_len, seq_len], dim=1)
+            v_hidden, v_encoder = torch.split(v, [seq_len, seq_len], dim=1)
+
+            # Use hidden_states part as main attention, encoder part as joint
+            attn_output = self.attention(
+                q_hidden,
+                k_hidden,
+                v_hidden,
+                AttentionMetadata(
+                    joint_query=q_encoder,
+                    joint_key=k_encoder,
+                    joint_value=v_encoder,
+                ),
+            )
+            output_seq_len = seq_len
+        else:
+            attn_output = self.attention(q, k, v)
+            output_seq_len = total_seq_len
 
         # Reshape back and project
-        attn_output = attn_output.view(batch_size, seq_len, -1)
+        attn_output = attn_output.view(batch_size, output_seq_len, -1)
         output = self.o_proj(attn_output)
 
         return output
@@ -128,10 +163,10 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
             ]
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass through multiple attention layers."""
         for layer in self.layers:
-            hidden_states = hidden_states + layer(hidden_states)
+            hidden_states = hidden_states + layer(hidden_states, encoder_hidden_states)
         return hidden_states
 
 
@@ -179,6 +214,8 @@ def test_ulysses_attention(
         model_state_file = f.name
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
         input_data_file = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
+        encoder_input_data_file = f.name
 
     try:
         # Step 1: Run without SP (baseline with ulysses_degree=1, ring_degree=1)
@@ -203,6 +240,7 @@ def test_ulysses_attention(
                 baseline_output_file,
                 model_state_file,
                 input_data_file,
+                encoder_input_data_file,
                 True,  # is_baseline
             ),
             nprocs=1,
@@ -230,6 +268,7 @@ def test_ulysses_attention(
                 sp_output_file,
                 model_state_file,
                 input_data_file,
+                encoder_input_data_file,
                 False,  # is_baseline
             ),
             nprocs=sequence_parallel_size,
@@ -300,7 +339,7 @@ def test_ulysses_attention(
 
     finally:
         # Clean up temporary files
-        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file]:
+        for f in [baseline_output_file, sp_output_file, model_state_file, input_data_file, encoder_input_data_file]:
             if os.path.exists(f):
                 os.remove(f)
 
@@ -324,6 +363,7 @@ def ulysses_attention_on_test_model(
     output_file: str,
     model_state_file: str,
     input_data_file: str,
+    encoder_input_data_file: str,
     is_baseline: bool,
 ):
     """Run Ulysses attention test on a test model and save results for comparison."""
@@ -419,10 +459,17 @@ def ulysses_attention_on_test_model(
                 dtype=dtype,
                 device="cpu",
             )
+            full_encoder_hidden_states = torch.randn(
+                (batch_size, seq_len, hidden_size),
+                dtype=dtype,
+                device="cpu",
+            )
             with open(input_data_file, "wb") as f:
                 pickle.dump(full_hidden_states.detach().cpu().float().numpy(), f)
+            with open(encoder_input_data_file, "wb") as f:
+                pickle.dump(full_encoder_hidden_states.detach().cpu().float().numpy(), f)
 
-            print("[Baseline] Saved model state and input data")
+            print("[Baseline] Saved model state and input data (including encoder_hidden_states)")
 
         # Synchronize to ensure baseline has saved data before SP loads it
         if world_size > 1:
@@ -438,7 +485,13 @@ def ulysses_attention_on_test_model(
             full_hidden_states_np = pickle.load(f)
         full_hidden_states = torch.from_numpy(full_hidden_states_np).to(device).to(dtype)
 
-        print(f"[Rank {local_rank}] Loaded model state and full input data with shape {full_hidden_states.shape}")
+        with open(encoder_input_data_file, "rb") as f:
+            full_encoder_hidden_states_np = pickle.load(f)
+        full_encoder_hidden_states = torch.from_numpy(full_encoder_hidden_states_np).to(device).to(dtype)
+
+        print(
+            f"[Rank {local_rank}] Loaded model state and full input data with shape {full_hidden_states.shape}, encoder shape {full_encoder_hidden_states.shape}"
+        )
 
         # Split input sequence according to sequence parallel BEFORE model forward
         # Each rank gets a contiguous chunk of the sequence dimension
@@ -447,10 +500,23 @@ def ulysses_attention_on_test_model(
         end_idx = start_idx + local_seq_len
         hidden_states = full_hidden_states[:, start_idx:end_idx, :].contiguous()
 
-        print(
-            f"[Rank {local_rank}] Split input: local_seq_len={local_seq_len}, "
-            f"indices=[{start_idx}:{end_idx}], local_shape={hidden_states.shape}"
-        )
+        # Handle encoder_hidden_states splitting based on split_text_embed_in_sp
+        if get_sequence_parallel_world_size() > 1 and split_text_embed_in_sp:
+            # Split encoder_hidden_states in the same way as hidden_states
+            encoder_hidden_states = full_encoder_hidden_states[:, start_idx:end_idx, :].contiguous()
+            print(
+                f"[Rank {local_rank}] Split input: local_seq_len={local_seq_len}, "
+                f"indices=[{start_idx}:{end_idx}], hidden_states shape={hidden_states.shape}, "
+                f"encoder_hidden_states shape={encoder_hidden_states.shape}"
+            )
+        else:
+            # No splitting for encoder_hidden_states, use full sequence
+            encoder_hidden_states = full_encoder_hidden_states
+            print(
+                f"[Rank {local_rank}] Split input: local_seq_len={local_seq_len}, "
+                f"indices=[{start_idx}:{end_idx}], hidden_states shape={hidden_states.shape}, "
+                f"encoder_hidden_states (full) shape={encoder_hidden_states.shape}"
+            )
 
         if dynamic:
             torch._dynamo.mark_dynamic(hidden_states, 0)
@@ -462,12 +528,19 @@ def ulysses_attention_on_test_model(
 
         # Run forward pass with local sequence chunk
         print(f"[Rank {local_rank}] Running forward pass...")
-        output = model(hidden_states)
+        output = model(hidden_states, encoder_hidden_states)
         print(f"[Rank {local_rank}] Forward pass completed, output shape: {output.shape}")
 
         # Verify output shape
-        assert output.shape == (batch_size, local_seq_len, hidden_size), (
-            f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
+        # When split_text_embed_in_sp is True and SP is enabled, output should be local_seq_len
+        # When split_text_embed_in_sp is False, output should be 2 * local_seq_len (concatenated)
+        if get_sequence_parallel_world_size() > 1 and split_text_embed_in_sp:
+            expected_output_seq_len = local_seq_len
+        else:
+            expected_output_seq_len = 2 * local_seq_len  # Combined hidden_states and encoder_hidden_states
+
+        assert output.shape == (batch_size, expected_output_seq_len, hidden_size), (
+            f"Output shape mismatch: expected {(batch_size, expected_output_seq_len, hidden_size)}, got {output.shape}"
         )
 
         # Verify SP usage for non-baseline runs
@@ -493,8 +566,14 @@ def ulysses_attention_on_test_model(
                 full_output = torch.cat(gathered_outputs, dim=1)
                 print(f"[Rank 0] Gathered and concatenated outputs: {full_output.shape}")
                 # Verify the full output shape matches expected
-                assert full_output.shape == (batch_size, seq_len, hidden_size), (
-                    f"Gathered output shape mismatch: expected {(batch_size, seq_len, hidden_size)}, "
+                # When split_text_embed_in_sp is True, expected is seq_len
+                # When False, expected is 2 * seq_len
+                if split_text_embed_in_sp:
+                    expected_full_seq_len = seq_len
+                else:
+                    expected_full_seq_len = 2 * seq_len
+                assert full_output.shape == (batch_size, expected_full_seq_len, hidden_size), (
+                    f"Gathered output shape mismatch: expected {(batch_size, expected_full_seq_len, hidden_size)}, "
                     f"got {full_output.shape}"
                 )
             else:
