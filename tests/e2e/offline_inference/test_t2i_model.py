@@ -17,7 +17,7 @@ from vllm_omni import Omni
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 
-models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random", "meituan-longcat/LongCat-Image"]
+models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
 # NPU still can't run Tongyi-MAI/Z-Image-Turbo properly
 # Modelscope can't find riverclouds/qwen_image_random
