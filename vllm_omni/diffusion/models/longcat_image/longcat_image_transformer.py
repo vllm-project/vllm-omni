@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, dim_out: Optional[int] = None, mult: int = 4, bias: bool = True):
+    def __init__(self, dim: int, dim_out: int | None = None, mult: int = 4, bias: bool = True):
         super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
@@ -47,12 +47,12 @@ class LongCatImageAttention(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         bias: bool = False,
-        added_kv_proj_dim: Optional[int] = None,
-        added_proj_bias: Optional[bool] = True,
+        added_kv_proj_dim: int | None = None,
+        added_proj_bias: bool | None = True,
         out_bias: bool = True,
         eps: float = 1e-5,
         out_dim: int = None,
-        context_pre_only: Optional[bool] = None,
+        context_pre_only: bool | None = None,
         pre_only: bool = False,
     ):
         super().__init__()
@@ -107,8 +107,8 @@ class LongCatImageAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
+        encoder_hidden_states: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.to_qkv(hidden_states)
@@ -197,8 +197,8 @@ class LongCatImageTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        joint_attention_kwargs: Optional[dict[str, Any]] = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
@@ -317,8 +317,8 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
-        image_rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        joint_attention_kwargs: Optional[dict[str, Any]] = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -413,7 +413,7 @@ class LongCatImageTransformer2DModel(nn.Module):
         txt_ids: torch.Tensor = None,
         guidance: torch.Tensor = None,
         return_dict: bool = True,
-    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+    ) -> torch.FloatTensor | Transformer2DModelOutput:
         hidden_states = self.x_embedder(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype) * 1000
