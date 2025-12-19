@@ -70,4 +70,5 @@ python image_edit.py \
         --output output_image_edit.png \
         --num_inference_steps 50 \
         --cfg_scale 4.0
+
 ```
