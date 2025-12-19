@@ -16,7 +16,7 @@ import logging
 import multiprocessing as mp
 import os
 import sys
-from typing import Any, Optional, Union
+from typing import Any
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -81,10 +81,10 @@ class OmniStage:
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
         self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
         # Runtime orchestration state (added)
-        self._in_q: Optional[mp.Queue] = None
-        self._out_q: Optional[mp.Queue] = None
-        self._proc: Optional[mp.Process] = None
-        self._log_file: Optional[str] = None
+        self._in_q: mp.Queue | None = None
+        self._out_q: mp.Queue | None = None
+        self._proc: mp.Process | None = None
+        self._log_file: str | None = None
         self._shm_threshold_bytes: int = 65536
         self._logger = logging.getLogger(__name__)
 
@@ -160,11 +160,11 @@ class OmniStage:
         model: str,
         *,
         is_async: bool = False,
-        log_file: Optional[str] = None,
+        log_file: str | None = None,
         shm_threshold_bytes: int = 65536,
-        ctx: Optional[mp.context.BaseContext] = None,
+        ctx: mp.context.BaseContext | None = None,
         batch_timeout: int = 10,
-        connectors_config: Optional[dict] = None,
+        connectors_config: dict | None = None,
         worker_backend: str = "multi_process",
         **kwargs: Any,
     ) -> None:
@@ -303,7 +303,7 @@ class OmniStage:
         assert self._in_q is not None
         self._in_q.put(payload)
 
-    def try_collect(self) -> Optional[dict[str, Any]]:
+    def try_collect(self) -> dict[str, Any] | None:
         """Try to collect a result from the stage worker without blocking.
 
         Returns:
@@ -317,8 +317,8 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: Union[OmniTokensPrompt, TextPrompt] = None
-    ) -> list[Union[OmniTokensPrompt, TextPrompt]]:
+        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+    ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
         Derives inputs for this stage from outputs of upstream stages.
@@ -372,7 +372,7 @@ def _stage_worker(
     stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
@@ -626,6 +626,7 @@ def _stage_worker(
                 idx = 0
                 for ro in unmapped:
                     target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                    ro.request_id = target_rid
                     req_to_outputs[target_rid].append(ro)
                     idx += 1
 
@@ -893,7 +894,7 @@ async def _stage_worker_async(
         _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
         sampling_params = task["sampling_params"]
-        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%d", stage_id, rid)
+        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%s", stage_id, rid)
         print("--------------------------------", flush=True)
         print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
         print("--------------------------------", flush=True)

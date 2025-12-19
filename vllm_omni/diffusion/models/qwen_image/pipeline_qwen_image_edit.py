@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any
 
 import numpy as np
 import PIL.Image
@@ -134,10 +134,10 @@ def calculate_dimensions(target_area: float, ratio: float):
 
 def retrieve_timesteps(
     scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[list[int]] = None,
-    sigmas: Optional[list[float]] = None,
+    num_inference_steps: int | None = None,
+    device: str | torch.device | None = None,
+    timesteps: list[int] | None = None,
+    sigmas: list[float] | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, int]:
     r"""
@@ -173,7 +173,7 @@ def retrieve_timesteps(
 
 
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "argmax"
+    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "argmax"
 ):
     """Retrieve latents from VAE encoder output."""
     if hasattr(encoder_output, "latent_dist"):
@@ -229,6 +229,9 @@ class QwenImageEditPipeline(
         self.processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="processor", local_files_only=local_files_only
         )
+
+        # Initialize cache backend to None (will be set by worker if needed)
+        self._cache_backend = None
 
         self.stage = None
 
@@ -305,9 +308,9 @@ class QwenImageEditPipeline(
 
     def _get_qwen_prompt_embeds(
         self,
-        prompt: Union[str, list[str]] = None,
-        image: Optional[torch.Tensor] = None,
-        dtype: Optional[torch.dtype] = None,
+        prompt: str | list[str] = None,
+        image: torch.Tensor | None = None,
+        dtype: torch.dtype | None = None,
     ):
         dtype = dtype or self.text_encoder.dtype
 
@@ -350,9 +353,9 @@ class QwenImageEditPipeline(
 
     def _get_qwen_prompt_embeds(
         self,
-        prompt: Union[str, list[str]] = None,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor]] = None,
-        dtype: Optional[torch.dtype] = None,
+        prompt: str | list[str] = None,
+        image: PIL.Image.Image | torch.Tensor | None = None,
+        dtype: torch.dtype | None = None,
     ):
         """Get prompt embeddings with image support for editing."""
         dtype = dtype or self.text_encoder.dtype
@@ -397,11 +400,11 @@ class QwenImageEditPipeline(
 
     def encode_prompt(
         self,
-        prompt: Union[str, list[str]],
-        image: Optional[torch.Tensor] = None,
+        prompt: str | list[str],
+        image: torch.Tensor | None = None,
         num_images_per_prompt: int = 1,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_embeds_mask: Optional[torch.Tensor] = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
     ):
         r"""
@@ -601,31 +604,43 @@ class QwenImageEditPipeline(
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
+            # Forward pass for positive prompt (or unconditional if no CFG)
+            # cache_branch is passed to hook for CFG-aware state management
+            transformer_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states_mask": prompt_embeds_mask,
+                "encoder_hidden_states": prompt_embeds,
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+                "attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
+            }
+            if self._cache_backend is not None:
+                transformer_kwargs["cache_branch"] = "positive"
+
+            noise_pred = self.transformer(**transformer_kwargs)[0]
             noise_pred = noise_pred[:, : latents.size(1)]
 
+            # Forward pass for negative prompt (CFG)
+            # cache_branch is passed to hook for CFG-aware state management
             if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
+                neg_transformer_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "img_shapes": img_shapes,
+                    "txt_seq_lens": negative_txt_seq_lens,
+                    "attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                }
+                if self._cache_backend is not None:
+                    neg_transformer_kwargs["cache_branch"] = "negative"
+
+                neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
                 neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
@@ -638,24 +653,24 @@ class QwenImageEditPipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: Union[str, list[str]] = "",
-        negative_prompt: Union[str, list[str]] = "",
-        image: Optional[Union[PIL.Image.Image, torch.Tensor]] = None,
+        prompt: str | list[str] = "",
+        negative_prompt: str | list[str] = "",
+        image: PIL.Image.Image | torch.Tensor | None = None,
         true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
         num_inference_steps: int = 50,
-        sigmas: Optional[list[float]] = None,
+        sigmas: list[float] | None = None,
         guidance_scale: float = 1.0,
         num_images_per_prompt: int = 1,
-        generator: Optional[Union[torch.Generator, list[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_embeds_mask: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "pil",
-        attention_kwargs: Optional[dict[str, Any]] = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_mask: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds_mask: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:

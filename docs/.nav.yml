@@ -7,21 +7,27 @@ nav:
   - Examples:
     - examples/README.md
     - Offline Inference:
+      - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
-      - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
     - Online Serving:
+      - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
+      - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
   - General:
     - usage/*
   - Configuration:
     - configuration/README.md
     - configuration/*
   - Diffusion Acceleration:
-     - TeaCache: user_guide/teacache.md
+    - Overview: user_guide/diffusion_acceleration.md
+    - Acceleration Methods:
+      - TeaCache: user_guide/acceleration/teacache.md
+      - Cache-DiT: user_guide/acceleration/cache_dit_acceleration.md
+      - Parallelism Acceleration: user_guide/acceleration/parallelism_acceleration.md
   - Models:
     - models/supported_models.md
 - Developer Guide:
@@ -32,6 +38,7 @@ nav:
   - Model Implementation:
     - contributing/model/README.md
   - CI: contributing/ci
+  - Tests: contributing/tests
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md

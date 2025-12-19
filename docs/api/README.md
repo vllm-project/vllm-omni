@@ -1,24 +1,20 @@
 # Summary
 
+## Entry Points
 
-## Configuration
+Main entry points for vLLM-Omni inference and serving.
 
-Configuration classes.
-
-- [vllm_omni.config.model.OmniModelConfig][]
-
-## EntryPoints
-
-Main entrypoints for vLLM-Omni inference and serving.
-
+- [vllm_omni.entrypoints.async_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
 - [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
+- [vllm_omni.entrypoints.client_request_state.ClientRequestState][]
 - [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
 - [vllm_omni.entrypoints.omni.Omni][]
+- [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_llm.OmniStageLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
@@ -97,14 +93,30 @@ Model execution components.
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchEmbed][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchMerger][]
 
+## Configuration
+
+Configuration classes.
+
+- [vllm_omni.config.model.OmniModelConfig][]
+- [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
+- [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
+- [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
+
 ## Workers
 
 Worker classes and model runners for distributed inference.
 
 - [vllm_omni.diffusion.worker.gpu_worker.GPUWorker][]
 - [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
+- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
+- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
+- [vllm_omni.worker.npu.npu_ar_model_runner.NPUARModelRunner][]
+- [vllm_omni.worker.npu.npu_ar_worker.NPUARWorker][]
+- [vllm_omni.worker.npu.npu_generation_model_runner.NPUGenerationModelRunner][]
+- [vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker][]
+- [vllm_omni.worker.npu.npu_model_runner.OmniNPUModelRunner][]

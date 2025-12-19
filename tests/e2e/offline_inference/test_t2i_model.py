@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_omni.utils.platform_utils import is_npu
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -14,7 +16,14 @@ from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
+
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
+
+# NPU still can't run Tongyi-MAI/Z-Image-Turbo properly
+# Modelscope can't find riverclouds/qwen_image_random
+# TODO: When NPU support is ready, remove this branch.
+if is_npu():
+    models = ["Qwen/Qwen-Image"]
 
 
 @pytest.mark.parametrize("model_name", models)

@@ -4,15 +4,15 @@ TeaCache speeds up diffusion model inference by caching transformer computations
 
 ## Quick Start
 
-Enable TeaCache by setting `cache_adapter` to `"tea_cache"`:
+Enable TeaCache by setting `cache_backend` to `"tea_cache"`:
 
 ```python
 from vllm_omni import Omni
 
-# Simple configuration - model_class_name and model_type are auto-detected
+# Simple configuration - model_type is automatically extracted from pipeline.__class__.__name__
 omni = Omni(
     model="Qwen/Qwen-Image",
-    cache_adapter="tea_cache",
+    cache_backend="tea_cache",
     cache_config={
         "rel_l1_thresh": 0.2  # Optional, defaults to 0.2
     }
@@ -25,10 +25,10 @@ outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_st
 You can also enable TeaCache via environment variable:
 
 ```bash
-export DIFFUSION_CACHE_ADAPTER=tea_cache
+export DIFFUSION_CACHE_BACKEND=tea_cache
 ```
 
-Then initialize without explicitly setting `cache_adapter`:
+Then initialize without explicitly setting `cache_backend`:
 
 ```python
 from vllm_omni import Omni
@@ -61,7 +61,7 @@ from vllm_omni import Omni
 
 omni = Omni(
     model="Qwen/Qwen-Image",
-    cache_adapter="tea_cache",
+    cache_backend="tea_cache",
     cache_config={"rel_l1_thresh": 0.2}
 )
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
@@ -87,13 +87,28 @@ cache_config={"rel_l1_thresh": 0.1}  # More conservative caching
 
 ## Supported Models
 
-Currently supported models:
+<style>
+th {
+  white-space: nowrap;
+  min-width: 0 !important;
+}
+</style>
 
-- **QwenImagePipeline**
-  - Model identifier: `"Qwen/Qwen-Image"`
-  - Example: `model="Qwen/Qwen-Image"`
+| Architecture | Models | Example HF Models |
+|--------------|--------|-------------------|
+| `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
+| `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 
-Future support (extractors in development):
+### Coming Soon
 
-- **FluxPipeline** - Coming soon
-- **CogVideoXPipeline** - Coming soon
+<style>
+th {
+  white-space: nowrap;
+  min-width: 0 !important;
+}
+</style>
+
+| Architecture | Models | Example HF Models |
+|--------------|--------|-------------------|
+| `FluxPipeline` | Flux | - |
+| `CogVideoXPipeline` | CogVideoX | - |
