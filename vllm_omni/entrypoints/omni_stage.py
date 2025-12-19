@@ -11,6 +11,7 @@ the original input processing utilities for cross-stage data wiring.
 """
 
 import asyncio
+import copy
 import fcntl
 import importlib
 import logging
@@ -237,6 +238,7 @@ class OmniStage:
                 )
         else:
             if is_async:
+                stage_chunk_size = 4
                 self._proc = ctx.Process(
                     target=_stage_worker_async_entry,
                     args=(
@@ -244,6 +246,8 @@ class OmniStage:
                         model,
                         stage_payload,
                         batch_timeout,
+                        stage_chunk_size,
+                        self.engine_output_type,
                     ),
                 )
             else:
@@ -876,8 +880,10 @@ def _stage_worker_async_entry(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
+    stage_chunk_size: int = 4,
+    engine_output_type: str = "latent",
 ) -> None:
-    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout))
+    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout, stage_chunk_size, engine_output_type))
 
 
 async def _stage_worker_async(
@@ -1182,7 +1188,6 @@ async def _stage_worker_async(
             prev_token_count = [0]  # Track previous cumulative token count
             prev_multimodal_len = [0]
             async for res in stage_engine.generate(ein, sampling_params, rid):
-                print(f"************************* loop_num: {loop_num} *************************", flush=True)
                 gen_output = res
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0

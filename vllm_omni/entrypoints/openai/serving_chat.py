@@ -12,6 +12,7 @@ import jinja2
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
+import numpy as np
 
 try:
     import soundfile
@@ -77,6 +78,7 @@ from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.entrypoints.openai.protocol import OmniDeltaMessage, OmniChatCompletionResponseStreamChoice, OmniChatCompletionStreamResponse
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
@@ -229,6 +231,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             raw_request.state.request_metadata = request_metadata
 
         output_modalities = getattr(request, "modalities", self.engine_client.output_modalities)
+        request.modalities = output_modalities if output_modalities is not None else self.engine_client.output_modalities
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -529,7 +532,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
         enable_force_include_usage: bool,
-    ) -> AsyncGenerator[str, None]:
+    ):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration_dict = {}
@@ -540,6 +543,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
+        previous_multimodal_lengths = [0] * num_choices
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
@@ -570,6 +574,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
+        previous_audio_tensors = [np.array([]).astype(np.float32)] * num_choices
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -618,8 +623,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             include_usage, include_continuous_usage = False, False
 
         try:
-            async for res in result_generator:
-                final_output_type = res.final_output_type
+            async for omni_res in result_generator:
+                final_output_type = omni_res.final_output_type
+                res = omni_res.request_output
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
@@ -1143,7 +1149,42 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
                         data = chunk.model_dump_json(exclude_unset=True)
                         yield f"data: {data}\n\n"
-
+                
+                elif final_output_type == "audio":
+                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    chunk = OmniChatCompletionStreamResponse(
+                            id=request_id,
+                            object=chunk_object_type,
+                            created=created_time,
+                            choices=choices_data,
+                            model=model_name,
+                            modality=final_output_type,
+                            )
+                    chunk.usage = UsageInfo(
+                                prompt_tokens=num_prompt_tokens,
+                                completion_tokens=0,
+                                total_tokens=num_prompt_tokens,
+                            )
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
+                    
+                elif final_output_type == "image":
+                    choices_data = self._create_image_choice(omni_res, role, request, stream=True)
+                    chunk = OmniChatCompletionStreamResponse(
+                            id=request_id,
+                            object=chunk_object_type,
+                            created=created_time,
+                            choices=choices_data,
+                            model=model_name,
+                            modality=final_output_type,
+                            )
+                    chunk.usage = UsageInfo(
+                                prompt_tokens=num_prompt_tokens,
+                                completion_tokens=0,
+                                total_tokens=num_prompt_tokens,
+                            )
+                    data = chunk.model_dump_json(exclude_unset=True)
+                    yield f"data: {data}\n\n"
                 
 
             # once the final token is handled, if stream_options.include_usage
@@ -1248,9 +1289,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     kv_transfer_params,
                 ) = self._create_text_choice(request, omni_outputs, tokenizer, conversation, role)
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role)
+                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
             elif omni_outputs.final_output_type == "image":
-                choices_data = self._create_image_choice(omni_outputs, role)
+                choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
@@ -1538,12 +1579,12 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)
 
         prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
-        prompt_token_ids = final_res.prompt_token_ids if request.return_token_ids else None
+        prompt_token_ids = final_res.prompt_token_ids if request.return_token_ids else- None
         kv_transfer_params = final_res.kv_transfer_params
 
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
-    def _create_audio_choice(self, omni_outputs: OmniRequestOutput, role: str):
+    def _create_audio_choice(self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
         audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
@@ -1584,17 +1625,27 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         )
 
         for output in final_res.outputs:
-            choice_data = ChatCompletionResponseChoice(
-                index=output.index,
-                message=ChatMessage(role=role, audio=audio_obj),
-                logprobs=None,
-                finish_reason="stop",
-                stop_reason=None,
-            )
+            if stream:
+                choice_data = ChatCompletionResponseStreamChoice(
+                                index=output.index,
+                                delta=DeltaMessage(role=role, content=audio_base64),
+                                logprobs=None,
+                                finish_reason="stop",
+                                stop_reason=output.stop_reason,
+                                token_ids=(as_list(output.token_ids)
+                                        if request.return_token_ids else None))
+            else:
+                choice_data = ChatCompletionResponseChoice(
+                    index=output.index,
+                    message=ChatMessage(role=role, audio=audio_obj),
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
             choices.append(choice_data)
         return choices
 
-    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str):
+    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False):
         """Create chat completion response choices for image output.
 
         Converts image tensor or PIL Image output from diffusion models
