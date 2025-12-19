@@ -149,8 +149,16 @@ class Attention(nn.Module):
             softmax_scale = query.shape[-1] ** -0.5
 
         if is_joint:
-            key = torch.cat([key, joint_tensor_key], dim=1)
-            value = torch.cat([value, joint_tensor_value], dim=1)
+            if joint_strategy == "front":
+                key = torch.cat([joint_tensor_key, key], dim=1)
+                value = torch.cat([joint_tensor_value, value], dim=1)
+            elif joint_strategy == "rear":
+                key = torch.cat([key, joint_tensor_key], dim=1)
+                value = torch.cat([value, joint_tensor_value], dim=1)
+            else:
+                raise ValueError(
+                    f"joint_strategy: {joint_strategy} not supported. supported joint strategy: {supported_joint_strategy}"
+                )
 
         context_layer = self.attention.forward(
             query,
