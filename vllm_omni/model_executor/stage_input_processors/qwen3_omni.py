@@ -11,15 +11,16 @@ from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.utils.platform_utils import detect_device_type
 
+
 def _compute_talker_prompt_ids_length(info):
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
-    
+
     device = torch.device(detect_device_type())
     thinker_sequences = torch.tensor(info["thinker_sequences"], device=device, dtype=torch.long).unsqueeze(0)  # [1, T]
-    input_ids = torch.tensor(info["thinker_input_ids"], device=device, dtype=torch.long).unsqueeze(0) # [1, T]
+    input_ids = torch.tensor(info["thinker_input_ids"], device=device, dtype=torch.long).unsqueeze(0)  # [1, T]
 
     im_start_indexes = torch.cat(
         [
