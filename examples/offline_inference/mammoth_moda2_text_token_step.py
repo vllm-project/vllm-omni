@@ -113,8 +113,11 @@ def main() -> None:
     llm = OmniStageLLM(
         model=args.model,
         trust_remote_code=args.trust_remote_code,
+        # 走 vllm-omni 的 AR worker/runner（dummy/profile 也会解包 OmniOutput）
         model_arch="Mammothmoda2Model",
         model_stage="ar",
+        worker_cls="vllm_omni.worker.gpu_ar_worker.GPUARWorker",
+        scheduler_cls="vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
         # 单卡/单进程优先，避免引入额外变量
         tensor_parallel_size=1,
         pipeline_parallel_size=1,

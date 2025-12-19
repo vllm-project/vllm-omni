@@ -297,6 +297,10 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
 
+        # vLLM 的 logits 计算不能直接调用 ParallelLMHead.forward（会抛异常），
+        # 需要通过 LogitsProcessor 使用其权重矩阵。
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Mammoth2DecoderLayer
 
@@ -382,7 +386,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if isinstance(self.lm_head, PPMissingLayer):
             return None
-        return self.lm_head(hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -456,6 +460,9 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
     """在 Qwen2_5_VLForConditionalGeneration 的多模态框架下替换语言骨干为 MoE。"""
 
+    # 兼容 gpu_model_runner 的 OmniOutput 解包逻辑。
+    have_multimodal_outputs = True
+
     # 复用原有权重映射，再加一层 model. -> language_model.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -503,7 +510,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: Any,
-    ) -> OmniOutput:
+    ):
         hidden_states = super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -511,11 +518,24 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        # 父类 forward 返回 tensor / IntermediateTensors；统一封装为 OmniOutput
+        # NOTE:
+        # `gpu_model_runner._dummy_run` 会在 forward 之后对 hidden_states 做
+        # `hidden_states[logit_indices]` 抽样，因此这里必须保证
+        # `text_hidden_states` 是 `torch.Tensor`。
+        if isinstance(hidden_states, IntermediateTensors):
+            text_hidden_states = hidden_states["hidden_states"]
+            out_intermediate_tensors = hidden_states
+        elif isinstance(hidden_states, list):
+            text_hidden_states = hidden_states[0]
+            out_intermediate_tensors = None
+        else:
+            text_hidden_states = hidden_states
+            out_intermediate_tensors = None
+
         return OmniOutput(
-            text_hidden_states=hidden_states,
-            multimodal_outputs=None,
-            intermediate_tensors=intermediate_tensors if isinstance(hidden_states, IntermediateTensors) else None,
+            text_hidden_states=text_hidden_states,
+            multimodal_outputs={},
+            intermediate_tensors=out_intermediate_tensors,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput):

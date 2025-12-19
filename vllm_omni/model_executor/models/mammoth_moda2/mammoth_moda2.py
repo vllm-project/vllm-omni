@@ -33,6 +33,11 @@ from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGenera
 )
 class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
                                            SupportsPP):
+    # 让 vllm_omni/worker/gpu_model_runner.py 的 `extract_multimodal_outputs`
+    # 走 OmniOutput 分支，从而拿到纯 torch.Tensor 的 text_hidden_states，避免后续
+    # `hidden_states[logit_indices]` 因类型不匹配（list/tuple）而报错。
+    have_multimodal_outputs = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         cfg = vllm_config.model_config.hf_config
@@ -91,10 +96,12 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def forward(self, *args, **kwargs) -> OmniOutput | torch.Tensor:
         out = self.model(*args, **kwargs)
-        # 子模块可能直接返回 OmniOutput / tensor；保持向后兼容
         if isinstance(out, OmniOutput):
             return out
-        return OmniOutput(text_hidden_states=out, multimodal_outputs=None, intermediate_tensors=None)
+        # 子模块可能直接返回 tensor / list；保持向后兼容
+        if isinstance(out, list):
+            out = out[0]
+        return OmniOutput(text_hidden_states=out, multimodal_outputs={}, intermediate_tensors=None)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput):
         if isinstance(hidden_states, OmniOutput):
