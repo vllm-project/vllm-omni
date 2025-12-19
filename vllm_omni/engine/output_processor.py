@@ -6,7 +6,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers.tokenizer_like import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -40,7 +40,7 @@ class OmniRequestState(RequestState):
     @classmethod
     def from_new_request(
         cls,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request: EngineCoreRequest,
         prompt: str | None,
         parent_req: ParentRequest | None,
@@ -269,7 +269,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         log_stats: bool,
         engine_core_output_type: str | None = None,
     ):
