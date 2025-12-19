@@ -73,7 +73,7 @@ def _is_xpu():
             return True
     except ModuleNotFoundError:
         return False
-    
+
 
 def get_device(local_rank: int) -> torch.device:
     if _is_cuda() or _is_hip():

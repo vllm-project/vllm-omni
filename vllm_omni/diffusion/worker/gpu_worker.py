@@ -69,7 +69,7 @@ class GPUWorker:
         if device_type == "cuda":
             torch.cuda.set_device(rank)
         elif device_type == "xpu":
-            torch.xpu.set_device(rank)  
+            torch.xpu.set_device(rank)
 
         # hack
         vllm_config = VllmConfig()
