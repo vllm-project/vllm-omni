@@ -179,9 +179,10 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
 @pytest.mark.parametrize("ring_degree", [1])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
+@pytest.mark.parametrize("encoder_seq_len", [16, 13])  # Test both divisible and non-divisible
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_size", [8])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_sync", [True])
 @pytest.mark.parametrize("dynamic", [False])
@@ -197,11 +198,17 @@ def test_ulysses_attention(
     use_compile: bool,
     batch_size: int,
     seq_len: int,
+    encoder_seq_len: int,
     num_heads: int,
     head_size: int,
 ):
     """Test Ulysses attention by comparing with and without SP enabled."""
     sequence_parallel_size = ulysses_degree * ring_degree
+
+    # Determine if we can split encoder_hidden_states in SP
+    can_split_encoder = (encoder_seq_len % sequence_parallel_size) == 0
+    print(f"\nEncoder sequence length: {encoder_seq_len}, SP size: {sequence_parallel_size}")
+    print(f"Can split encoder in SP: {can_split_encoder}")
 
     # Create temporary files to share results between processes
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
@@ -225,6 +232,7 @@ def test_ulysses_attention(
                 test_model_cls,
                 batch_size,
                 seq_len,
+                encoder_seq_len,
                 num_heads,
                 head_size,
                 dtype,
@@ -253,6 +261,7 @@ def test_ulysses_attention(
                 test_model_cls,
                 batch_size,
                 seq_len,
+                encoder_seq_len,
                 num_heads,
                 head_size,
                 dtype,
@@ -348,6 +357,7 @@ def ulysses_attention_on_test_model(
     test_model_cls: type[torch.nn.Module],
     batch_size: int,
     seq_len: int,
+    encoder_seq_len: int,
     num_heads: int,
     head_size: int,
     dtype: torch.dtype,
@@ -369,8 +379,15 @@ def ulysses_attention_on_test_model(
     RANDOM_SEED = 42
     current_platform.seed_everything(RANDOM_SEED)
 
+    # Determine if we can split encoder_hidden_states based on divisibility
+    global split_text_embed_in_sp
+    split_text_embed_in_sp = (encoder_seq_len % sequence_parallel_size) == 0
+
     mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
+    print(
+        f"[{mode_str}] Rank {local_rank}/{world_size} - encoder_seq_len={encoder_seq_len}, split_text_embed_in_sp={split_text_embed_in_sp}"
+    )
 
     device = torch.device(f"{device_type}:{local_rank}")
     torch_device.set_device(device)
@@ -458,7 +475,7 @@ def ulysses_attention_on_test_model(
                 device="cpu",
             )
             full_encoder_hidden_states = torch.randn(
-                (batch_size, seq_len, hidden_size),
+                (batch_size, encoder_seq_len, hidden_size),
                 dtype=dtype,
                 device="cpu",
             )
@@ -501,11 +518,15 @@ def ulysses_attention_on_test_model(
         # Handle encoder_hidden_states splitting based on split_text_embed_in_sp
         if get_sequence_parallel_world_size() > 1 and split_text_embed_in_sp:
             # Split encoder_hidden_states in the same way as hidden_states
-            encoder_hidden_states = full_encoder_hidden_states[:, start_idx:end_idx, :].contiguous()
+            local_encoder_seq_len = encoder_seq_len // sequence_parallel_size
+            encoder_start_idx = local_rank * local_encoder_seq_len
+            encoder_end_idx = encoder_start_idx + local_encoder_seq_len
+            encoder_hidden_states = full_encoder_hidden_states[:, encoder_start_idx:encoder_end_idx, :].contiguous()
             print(
                 f"[Rank {local_rank}] Split input: local_seq_len={local_seq_len}, "
                 f"indices=[{start_idx}:{end_idx}], hidden_states shape={hidden_states.shape}, "
-                f"encoder_hidden_states shape={encoder_hidden_states.shape}"
+                f"encoder_hidden_states (split) shape={encoder_hidden_states.shape}, "
+                f"encoder_indices=[{encoder_start_idx}:{encoder_end_idx}]"
             )
         else:
             # No splitting for encoder_hidden_states, use full sequence
@@ -513,7 +534,8 @@ def ulysses_attention_on_test_model(
             print(
                 f"[Rank {local_rank}] Split input: local_seq_len={local_seq_len}, "
                 f"indices=[{start_idx}:{end_idx}], hidden_states shape={hidden_states.shape}, "
-                f"encoder_hidden_states (full) shape={encoder_hidden_states.shape}"
+                f"encoder_hidden_states (full) shape={encoder_hidden_states.shape}, "
+                f"split_text_embed_in_sp={split_text_embed_in_sp}"
             )
 
         if dynamic:
@@ -575,9 +597,10 @@ def ulysses_attention_on_test_model(
             mode_str = "baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
             print(
                 f"\n[{mode_str}] ✓ Saved output with shape {full_output.shape}:\n"
-                f"  - batch_size={batch_size}, seq_len={seq_len}\n"
+                f"  - batch_size={batch_size}, seq_len={seq_len}, encoder_seq_len={encoder_seq_len}\n"
                 f"  - num_heads={num_heads}, head_size={head_size}\n"
                 f"  - dtype={dtype}, causal={causal}, use_sync={use_sync}\n"
+                f"  - split_text_embed_in_sp={split_text_embed_in_sp}\n"
             )
 
         destroy_distributed_env()
