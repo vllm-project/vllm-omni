@@ -173,8 +173,8 @@ def test_i2i_multi_image_input_qwen_image_edit_2509(
     image_data_urls = [f"data:image/png;base64,{img}" for img in base64_encoded_images]
     messages = dummy_messages_from_image_data(image_data_urls)
 
-    height = 256
-    width = 256
+    height = 832
+    width = 1248
     chat_completion = client.chat.completions.create(
         model=omni_server.model,
         messages=messages,

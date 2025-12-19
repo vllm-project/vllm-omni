@@ -1035,15 +1035,14 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 if len(pil_images) == 1:
                     gen_kwargs["pil_image"] = pil_images[0]
                 else:
-                    model_class_name = getattr(
-                        getattr(self._diffusion_engine, "od_config", None), "model_class_name", None
-                    )
-                    if model_class_name == "QwenImageEditPlusPipeline":
+                    od_config = getattr(self._diffusion_engine, "od_config", None)
+                    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
+                    if supports_multimodal_inputs:
                         gen_kwargs["pil_image"] = pil_images
                     else:
                         return self._create_error_response(
                             "Multiple input images are not supported by the current diffusion model. "
-                            "For multi-image editing, start the server with (QwenImageEditPlusPipeline) "
+                            "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
                             "and send multiple images in the user message content.",
                             status_code=400,
                         )
