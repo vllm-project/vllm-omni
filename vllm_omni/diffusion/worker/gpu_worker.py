@@ -66,9 +66,8 @@ class GPUWorker:
         vllm_config = VllmConfig()
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
-
+        self.vllm_config = vllm_config
         with (
-            set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config),
             set_current_omni_diffusion_config(self.od_config),
             set_current_vllm_config(vllm_config),
         ):
@@ -120,8 +119,8 @@ class GPUWorker:
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
             self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
-
-        output = self.pipeline.forward(req)
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+            output = self.pipeline.forward(req)
         return output
 
     def shutdown(self) -> None:
