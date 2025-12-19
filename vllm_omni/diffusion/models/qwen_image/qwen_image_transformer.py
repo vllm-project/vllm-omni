@@ -303,7 +303,6 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-@torch.compile(dynamic=True)
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,

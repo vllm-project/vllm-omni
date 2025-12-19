@@ -32,12 +32,6 @@ class DiffusionEngine:
         self._processes: list[mp.Process] = []
         self._closed = False
         self._make_client()
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
