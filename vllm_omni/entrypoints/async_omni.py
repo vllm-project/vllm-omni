@@ -21,9 +21,9 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import TokenizerLike, init_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
-from vllm.tokenizers import TokenizerLike, init_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.func_utils import deprecate_kwargs
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -154,7 +154,7 @@ class AsyncOmni(EngineClient):
         # the tokenizer, input_processor, and io_processor back here from the
         # first stage.
         vllm_config = self.stage_list[0].vllm_config
-        self.tokenizer = init_tokenizer_from_configs(model_config=vllm_config.model_config)
+        self.tokenizer = init_tokenizer_from_config(model_config=vllm_config.model_config)
         self.input_processor = OmniInputProcessor(
             vllm_config=vllm_config,
             tokenizer=self.tokenizer,
