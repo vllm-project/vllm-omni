@@ -79,7 +79,10 @@ def main():
     }
 
     omni_diffusion_config = OmniDiffusionConfig(
-        **config_kwargs, parallel_config=DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
+        **config_kwargs, parallel_config=DiffusionParallelConfig(
+            ulysses_degree=args.ulysses_degree,
+            ring_degree=args.ring_degree
+            )
     )
     with set_current_omni_diffusion_config(omni_diffusion_config):
         omni = Omni(
