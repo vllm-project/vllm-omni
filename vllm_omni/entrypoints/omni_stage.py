@@ -17,6 +17,7 @@ import logging
 import multiprocessing as mp
 import os
 import sys
+import traceback
 from typing import Any
 
 from vllm.inputs import TextPrompt
@@ -857,12 +858,14 @@ def _stage_worker(
                 )
         except Exception as e:
             _logging.getLogger(__name__).exception("[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e)
+            _tb = traceback.format_exc()
             for rid in batch_request_ids:
                 out_q.put(
                     {
                         "request_id": rid,
                         "stage_id": stage_id,
                         "error": str(e),
+                        "error_tb": _tb,
                     }
                 )
 
