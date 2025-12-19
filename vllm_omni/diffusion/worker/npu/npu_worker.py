@@ -50,7 +50,7 @@ class NPUWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
         # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = os.getenv("MASTER_ADDR", "localhost")
+        os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
