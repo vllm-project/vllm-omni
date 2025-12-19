@@ -421,11 +421,12 @@ class QwenImageCrossAttention(nn.Module):
             and self.parallel_config.sequence_parallel_size > 1
             and not get_forward_context().split_text_embed_in_sp
         ):
-            # if using sequence parallel, but not splitting text embed, we need to pass text embedding to attention layer as joint qkv
+            # if using sequence parallel, but not splitting text embed,
+            #  we need to pass text embedding to attention layer as joint qkv
             joint_hidden_states = self.attn(
                 img_query,
-                img_query,
-                img_query,
+                img_key,
+                img_value,
                 AttentionMetadata(
                     joint_query=txt_query,
                     joint_key=txt_key,
