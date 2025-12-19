@@ -739,13 +739,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
             hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
                 get_sequence_parallel_rank()
             ]
-            if encoder_hidden_states.shape[-2] % get_sequence_parallel_world_size() != 0:
-                get_forward_context().split_text_embed_in_sp = False
-            else:
-                get_forward_context().split_text_embed_in_sp = True
-                encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=-2)[
-                    get_sequence_parallel_rank()
-                ]
+            # NOTE:
+            # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
+            # text embeddings to be replicated across SP ranks for correctness.
+            get_forward_context().split_text_embed_in_sp = False
         hidden_states = self.img_in(hidden_states)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
