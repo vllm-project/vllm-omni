@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import struct
-from typing import Any, Sequence, Union
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -13,10 +14,20 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 _PIL_IMAGE_MARKER = "__pil_image__"
 
 # Valid torch dtype names (without 'torch.' prefix)
-_VALID_TORCH_DTYPES = frozenset({
-    "float32", "float16", "bfloat16", "float64",
-    "int64", "int32", "int16", "int8", "uint8", "bool",
-})
+_VALID_TORCH_DTYPES = frozenset(
+    {
+        "float32",
+        "float16",
+        "bfloat16",
+        "float64",
+        "int64",
+        "int32",
+        "int16",
+        "int8",
+        "uint8",
+        "bool",
+    }
+)
 
 
 class OmniMsgpackEncoder(MsgpackEncoder):
@@ -43,7 +54,7 @@ class OmniMsgpackDecoder(MsgpackDecoder):
     For generic objects (dicts containing tensors), we need post-processing.
     """
 
-    def decode(self, bufs: Union[bytes, bytearray, memoryview, Sequence]) -> Any:
+    def decode(self, bufs: bytes | bytearray | memoryview | Sequence) -> Any:
         """Decode with post-processing for nested structures."""
         # For multi-buffer case, save aux_buffers before parent clears them
         if isinstance(bufs, (list, tuple)) and len(bufs) > 1:
@@ -156,12 +167,9 @@ class OmniSerde:
             data = buf if isinstance(buf, bytes) else bytes(memoryview(buf))
             return header + data
 
-        return header + b"".join(
-            buf if isinstance(buf, bytes) else bytes(memoryview(buf))
-            for buf in bufs
-        )
+        return header + b"".join(buf if isinstance(buf, bytes) else bytes(memoryview(buf)) for buf in bufs)
 
-    def serialize_with_metadata(self, obj: Any) -> tuple[Union[bytes, list[bytes]], int, bytes, int]:
+    def serialize_with_metadata(self, obj: Any) -> tuple[bytes | list[bytes], int, bytes, int]:
         """
         Serialize an object to bytes with separate metadata.
 
@@ -178,7 +186,7 @@ class OmniSerde:
         # Convert bufs to bytes
         if len(bufs) == 1:
             buf = bufs[0]
-            data: Union[bytes, list[bytes]] = buf if isinstance(buf, bytes) else bytes(memoryview(buf))
+            data: bytes | list[bytes] = buf if isinstance(buf, bytes) else bytes(memoryview(buf))
         else:
             data = [buf if isinstance(buf, bytes) else bytes(memoryview(buf)) for buf in bufs]
 
@@ -189,7 +197,7 @@ class OmniSerde:
 
         return data, nbytes, metadata, len(metadata)
 
-    def deserialize(self, data: Union[bytes, memoryview]) -> Any:
+    def deserialize(self, data: bytes | memoryview) -> Any:
         """
         Deserialize bytes to an object.
 
@@ -208,7 +216,7 @@ class OmniSerde:
         bufs: list[Any] = []
         offset = header_size
         for length in lengths:
-            bufs.append(data[offset:offset + length])
+            bufs.append(data[offset : offset + length])
             offset += length
 
         # Decode (post-processing happens inside OmniMsgpackDecoder.decode)
