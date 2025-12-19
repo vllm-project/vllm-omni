@@ -19,6 +19,9 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -28,6 +31,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
@@ -405,11 +409,26 @@ class QwenImageCrossAttention(nn.Module):
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
-        joint_hidden_states = self.attn(
-            joint_query,
-            joint_key,
-            joint_value,
-        )
+
+        if self.parallel_config.sequence_parallel_size > 1 and not get_forward_context().split_text_embed_in_sp:
+            # if using sequence parallel, but not splitting text embed, we need to pass text embedding to attention layer as joint qkv
+            joint_hidden_states = self.attn(
+                img_query,
+                img_query,
+                img_query,
+                AttentionMetadata(
+                    joint_query=txt_query,
+                    joint_key=txt_key,
+                    joint_value=txt_value,
+                    joint_strategy="front",
+                ),
+            )
+        else:
+            joint_hidden_states = self.attn(
+                joint_query,
+                joint_key,
+                joint_value,
+            )
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
@@ -709,7 +728,13 @@ class QwenImageTransformer2DModel(CachedTransformer):
             hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
                 get_sequence_parallel_rank()
             ]
-
+            if encoder_hidden_states.shape[-2] % get_sequence_parallel_world_size() != 0:
+                get_forward_context().split_text_embed_in_sp = False
+            else:
+                get_forward_context().split_text_embed_in_sp = True
+                encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=-2)[
+                    get_sequence_parallel_rank()
+                ]
         hidden_states = self.img_in(hidden_states)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
@@ -746,6 +771,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if self.parallel_config.sequence_parallel_size > 1:
             img_freqs, txt_freqs = image_rotary_emb
             img_freqs = get_rotary_emb_chunk(img_freqs)
+            if get_forward_context().split_text_embed_in_sp:
+                txt_freqs = get_rotary_emb_chunk(txt_freqs)
             image_rotary_emb = (img_freqs, txt_freqs)
 
         for index_block, block in enumerate(self.transformer_blocks):
