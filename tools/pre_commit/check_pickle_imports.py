@@ -15,7 +15,12 @@ import regex as re
 #  Before adding new uses of pickle/cloudpickle, please consider safer
 #  alternatives like msgpack or pydantic that are already in use in vLLM. Only
 #  add to this list if absolutely necessary and after careful security review.
-ALLOWED_FILES = {"vllm_omni/entrypoints/omni_llm.py", "tests/e2e/offline_inference/utils.py"}
+ALLOWED_FILES = {
+    "vllm_omni/entrypoints/omni_llm.py",
+    "tests/e2e/offline_inference/utils.py",
+    "vllm_omni/diffusion/distributed/group_coordinator.py",
+    "tests/diffusion/attention/test_ulysses_sequence_parallel.py",
+}
 
 PICKLE_RE = re.compile(
     r"^\s*(import\s+(pickle|cloudpickle)(\s|$|\sas)"
