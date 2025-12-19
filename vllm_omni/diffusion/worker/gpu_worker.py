@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.utils.platform_utils import detect_device_type
 
 logger = init_logger(__name__)
 
@@ -58,8 +59,17 @@ class GPUWorker:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        device_type = detect_device_type()
+        if device_type == "cpu":
+            device = torch.device("cpu")
+        else:
+            device = torch.device(f"{device_type}:{rank}")
+
+        # Set the current device for accelerator backends.
+        if device_type == "cuda":
+            torch.cuda.set_device(rank)
+        elif device_type == "xpu":
+            torch.xpu.set_device(rank)  
 
         # hack
         vllm_config = VllmConfig()
@@ -87,7 +97,7 @@ class GPUWorker:
                 with DeviceMemoryProfiler() as m:
                     self.pipeline = model_loader.load_model(
                         od_config=self.od_config,
-                        load_device=f"cuda:{rank}",
+                        load_device=str(device),
                     )
                 time_after_load = time.perf_counter()
 
