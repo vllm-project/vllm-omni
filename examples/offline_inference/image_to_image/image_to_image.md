@@ -15,7 +15,7 @@ python image_edit.py \
   --cfg_scale 4.0 \
 ```
 
-### Multiple Image Editing (Qwen-Image-Edit-2509+)
+### Multiple Image Editing (Qwen-Image-Edit-2509)
 
 For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or later version:
 
