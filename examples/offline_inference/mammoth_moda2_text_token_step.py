@@ -101,10 +101,12 @@ def main() -> None:
             "- 如果你要用 CPU：需要安装 vLLM 的 CPU build（版本字符串通常包含 'cpu'）。"
         )
 
+    # NOTE: 为了便于验收，这里始终加载 tokenizer 用于 decode 输出文本。
+    tok = MammothUTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+
     if args.prompt_token_ids:
         prompt_token_ids = _parse_token_ids(args.prompt_token_ids)
     else:
-        tok = MammothUTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
         prompt_token_ids = cast(list[int], tok.encode(args.text, add_special_tokens=False))
 
     if not prompt_token_ids:
@@ -140,8 +142,15 @@ def main() -> None:
 
     out = outputs[0]
     gen = out.outputs[0]
-    print("prompt_len:", len(prompt_token_ids))
-    print("generated_token_ids:", gen.token_ids)
+    print("output_len:", len(gen.token_ids))
+    print(
+        "generated_text(skip_special_tokens=True):",
+        tok.decode(gen.token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False),
+    )
+    print(
+        "generated_text(skip_special_tokens=False):",
+        tok.decode(gen.token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False),
+    )
     if gen.logprobs:
         print("top_logprobs(first_token):")
         first = gen.logprobs[0]
