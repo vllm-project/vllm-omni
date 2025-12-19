@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import cloudpickle
-import pickle
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
@@ -64,10 +62,10 @@ class Scheduler:
                 "kwargs": {},
                 "output_rank": 0,  # Only rank 0 replies
             }
-            
+
             # Broadcast RPC request to all workers
             self.mq.enqueue(rpc_request)
-            
+
             # Wait for result from Rank 0
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")

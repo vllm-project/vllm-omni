@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import cloudpickle
 import multiprocessing as mp
 import os
-import pickle
 import time
 
+import cloudpickle
 import torch
 import zmq
 from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
@@ -19,7 +18,6 @@ from vllm.utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import (
-    SHUTDOWN_MESSAGE,
     DiffusionOutput,
     OmniDiffusionConfig,
 )
@@ -93,28 +91,17 @@ class GPUWorker:
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
 
-
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """
         Generate output for the given requests.
-        
+
         Args:
             requests: List of diffusion requests
-            
+
         Returns:
             DiffusionOutput with generated results
         """
         return self.execute_model(requests, self.od_config)
-
-    def do_shutdown(self) -> str:
-        """
-        Shutdown the worker gracefully.
-        
-        Returns:
-            Confirmation message
-        """
-        self.shutdown()
-        return f"Worker {self.rank} shutdown complete"
 
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
