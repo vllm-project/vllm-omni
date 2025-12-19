@@ -100,7 +100,7 @@ def create_demo(server_url: str):
         gr.Markdown("# Qwen-Image-Edit Online Editing")
         gr.Markdown(
             "Upload an image and describe the editing effect you want. "
-            "For multi-image editing, upload extra images (requires Qwen-Image-Edit-2509+ server)."
+            "For multi-image editing, upload extra images (requires Qwen-Image-Edit-2509 server)."
         )
 
         with gr.Row():

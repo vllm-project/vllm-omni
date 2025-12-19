@@ -2,7 +2,7 @@
 
 This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
 
-For **multi-image** input editing, use **Qwen-Image-Edit-2509+** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
+For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
 
 ## Start Server
 
@@ -12,7 +12,7 @@ For **multi-image** input editing, use **Qwen-Image-Edit-2509+** (QwenImageEditP
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 ```
 
-### Multi-Image Edit (Qwen-Image-Edit-2509+)
+### Multi-Image Edit (Qwen-Image-Edit-2509)
 
 ```bash
 vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
@@ -68,7 +68,7 @@ curl -s http://localhost:8092/v1/chat/completions \
 ```bash
 python openai_chat_client.py --input input.png --prompt "Convert to oil painting style" --output output.png
 
-# Multi-image editing (Qwen-Image-Edit-2509+ server required)
+# Multi-image editing (Qwen-Image-Edit-2509 server required)
 python openai_chat_client.py --input input1.png input2.png --prompt "Combine these images into a single scene" --output output.png
 ```
 
@@ -138,7 +138,7 @@ Use `extra_body` to pass generation parameters:
 }
 ```
 
-### Multi-Image Editing (Qwen-Image-Edit-2509+)
+### Multi-Image Editing (Qwen-Image-Edit-2509)
 
 Provide multiple images in `content` (order matters):
 

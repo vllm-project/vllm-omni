@@ -67,11 +67,6 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --cache-config '{"Fn_compute_blocks": 1, "Bn_compute_blocks": 0, "max_warmup_steps": 4, "residual_diff_threshold": 0.12}'
 ```
 
-For complete, runnable scripts (including base64 image extraction), see:
-
-- `docs/user_guide/examples/online_serving/text_to_image.md`
-- `docs/user_guide/examples/online_serving/image_to_image.md`
-
 ## Acceleration Methods
 
 For comprehensive illustration, please view cache-dit [User_Guide](https://github.com/vipshop/cache-dit/blob/main/docs/User_Guide.md)
