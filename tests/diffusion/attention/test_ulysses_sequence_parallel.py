@@ -381,7 +381,7 @@ def ulysses_attention_on_test_model(
 
     # Determine if we can split encoder_hidden_states based on divisibility
     global split_text_embed_in_sp
-    split_text_embed_in_sp = (encoder_seq_len % sequence_parallel_size) == 0
+    split_text_embed_in_sp = (encoder_seq_len % sequence_parallel_size) == 0 and not is_baseline
 
     mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
