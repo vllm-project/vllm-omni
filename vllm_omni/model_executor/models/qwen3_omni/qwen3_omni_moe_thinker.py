@@ -22,15 +22,13 @@
 # limitations under the License.
 """Inference-only Qwen3-Omni-Moe model (thinker part)."""
 
-import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from packaging.version import Version
 from transformers import PretrainedConfig
 from transformers import __version__ as TRANSFORMERS_VERSION
@@ -46,52 +44,44 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
 )
 from transformers.models.whisper import WhisperFeatureExtractor
-from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
+    SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
 )
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniConditionalGenerationMixin,
+    Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
-    Qwen2_5_VisionAttention,
-    Qwen2_5_VisionRotaryEmbedding,
     Qwen2_5_VLProcessingInfo,
 )
-from vllm.model_executor.models.qwen2_audio import Qwen2AudioInputs, Qwen2AudioProcessingInfo
+from vllm.model_executor.models.qwen2_audio import Qwen2AudioProcessingInfo
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel as _Qwen3MoeLLMModel
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3Omni_VisionTransformer,
+    _get_feat_extract_output_lengths,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
-    flatten_bn,
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import (
-    get_vit_attn_backend,
+    get_llm_pos_ids_for_vision,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (
-    MultiModalKwargsItems,
-)
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 from vllm.multimodal.processing import (
     MultiModalPromptUpdates,
@@ -100,502 +90,18 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
-from .qwen3_moe import Qwen3MoeModel
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+    Qwen2_5OmniConditionalGenerationMixin,
+)
 
 try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
-from torch import Tensor
-
 logger = init_logger(__name__)
-
-
-# Local helper functions (not available in vLLM)
-def conv3d_to_linear_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Convert 3D convolutional weight to linear weight for patch embedding."""
-    # Weight shape: (out_channels, in_channels, t, h, w)
-    # Need to flatten spatial dimensions: (out_channels, in_channels * t * h * w)
-    flattened_weight = weight.flatten(1)  # Flatten all dims except out_channels
-    return flattened_weight
-
-
-def get_llm_pos_ids_for_vision(
-    start_idx: int,
-    vision_idx: int,
-    spatial_merge_size: int,
-    t_index: list[torch.Tensor],
-    grid_hs: list[torch.Tensor],
-    grid_ws: list[torch.Tensor],
-) -> torch.Tensor:
-    """Generate 3D position IDs for vision tokens (temporal, height, width)."""
-    llm_grid_h = grid_hs[vision_idx] // spatial_merge_size
-    llm_grid_w = grid_ws[vision_idx] // spatial_merge_size
-    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(len(t_index), -1, llm_grid_w).flatten().float()
-    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(len(t_index), llm_grid_h, -1).flatten().float()
-    t_index_tensor = torch.Tensor(t_index).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float()
-    llm_pos_ids = torch.stack([t_index_tensor, h_index, w_index])
-    llm_pos_ids = llm_pos_ids + start_idx
-    return llm_pos_ids
-
-
-# Type aliases for audio inputs
-Qwen2_5OmniAudioFeatureInputs = Qwen2AudioInputs
-
-
-def _get_feat_extract_output_lengths(input_lengths: torch.Tensor):
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    return feat_lengths, output_lengths
-
-
-class Qwen3_VisionPatchEmbed(nn.Module):
-    def __init__(
-        self,
-        patch_size: int = 14,
-        temporal_patch_size: int = 2,
-        in_channels: int = 3,
-        hidden_size: int = 1152,
-    ) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.hidden_size = hidden_size
-
-        kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = ReplicatedLinear(
-            in_channels * math.prod(kernel_size),
-            hidden_size,
-            bias=True,
-            return_bias=False,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, C = x.shape
-        x = self.proj(x)
-        return x
-
-
-class Qwen3_VisionMLP(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: int,
-        bias: bool = False,
-        act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.linear_fc1 = ColumnParallelLinear(
-            in_features,
-            hidden_features,
-            bias=bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.linear_fc1",
-        )
-        self.linear_fc2 = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.linear_fc2",
-        )
-        self.act_fn = act_fn
-
-    def forward(self, x: torch.Tensor):
-        mlp_output = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-        return mlp_output
-
-
-class Qwen3_VisionBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_hidden_dim: int,
-        act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-        norm_layer: Callable[[int], nn.Module] | None = None,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(dim)
-        self.attn = Qwen2_5_VisionAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            projection_size=dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-        )
-        self.mlp = Qwen3_VisionMLP(
-            dim,
-            mlp_hidden_dim,
-            act_fn=act_fn,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
-        max_seqlen: int | None = None,  # Only used for Flash Attention
-        seqlens: list[int] | None = None,  # Only used for xFormers
-    ) -> torch.Tensor:
-        x = x + self.attn(
-            self.norm1(x),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
-            max_seqlen=max_seqlen,
-            seqlens=seqlens,
-        )
-
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class Qwen3_VisionPatchMerger(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        context_dim: int,
-        norm_layer: Callable[[int], nn.Module] | None = None,
-        spatial_merge_size: int = 2,
-        use_postshuffle_norm: bool = False,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-
-        self.use_postshuffle_norm = use_postshuffle_norm
-        if self.use_postshuffle_norm:
-            context_dim = self.hidden_size
-
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = norm_layer(self.hidden_size if use_postshuffle_norm else context_dim)
-        self.mlp = nn.ModuleList(
-            [
-                ColumnParallelLinear(
-                    self.hidden_size,
-                    self.hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.0",
-                ),
-                nn.GELU(),
-                RowParallelLinear(
-                    self.hidden_size,
-                    d_model,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.mlp.2",
-                ),
-            ]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_postshuffle_norm:
-            x = self.ln_q(x.view(-1, self.hidden_size))
-        else:
-            x = self.ln_q(x).view(-1, self.hidden_size)
-
-        mlp_fc1, mlp_act, mlp_fc2 = self.mlp
-        x_parallel, _ = mlp_fc1(x)
-        x_parallel = mlp_act(x_parallel)
-        out, _ = mlp_fc2(x_parallel)
-        return out
-
-
-class Qwen3Omni_VisionTransformer(nn.Module):
-    def __init__(
-        self,
-        vision_config,
-        norm_eps: float = 1e-6,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        attn_backend_override: _Backend | None = None,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = vision_config.hidden_size
-        self.num_heads = vision_config.num_heads
-        self.image_size = vision_config.image_size
-        self.patch_size = vision_config.patch_size
-        self.spatial_merge_size = vision_config.spatial_merge_size
-        self.spatial_merge_unit = self.spatial_merge_size**2
-        self.temporal_patch_size = vision_config.temporal_patch_size
-        self.num_grid_per_side = self.image_size // self.patch_size
-        self.apply_vit_abs_pos_embed = vision_config.apply_vit_abs_pos_embed
-        self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-
-        self.patch_embed = Qwen3_VisionPatchEmbed(
-            patch_size=self.patch_size,
-            temporal_patch_size=self.temporal_patch_size,
-            in_channels=vision_config.in_channels,
-            hidden_size=self.hidden_size,
-        )
-
-        # vit pos embedding, TODO: spatial_patch_size vs patch_size
-        if self.apply_vit_abs_pos_embed:
-            self.pos_embed = nn.Embedding(self.num_grid_per_side**2, self.hidden_size)
-        else:
-            self.pos_embed = nn.Parameter(torch.empty([1, self.num_grid_per_side**2, self.hidden_size]))
-
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
-
-        self.blocks = nn.ModuleList(
-            [
-                Qwen3_VisionBlock(
-                    dim=self.hidden_size,
-                    num_heads=self.num_heads,
-                    mlp_hidden_dim=vision_config.intermediate_size,
-                    act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
-                    norm_layer=norm_layer,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.blocks.{layer_idx}",
-                )
-                for layer_idx in range(vision_config.depth)
-            ]
-        )
-        self.merger = Qwen3_VisionPatchMerger(
-            d_model=vision_config.out_hidden_size,
-            context_dim=self.hidden_size,
-            norm_layer=norm_layer,
-            spatial_merge_size=self.spatial_merge_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.merger",
-        )
-        if self.deepstack_visual_indexes is not None:
-            self.merger_list = nn.ModuleList(
-                [
-                    Qwen3_VisionPatchMerger(
-                        d_model=vision_config.out_hidden_size,
-                        context_dim=self.hidden_size,
-                        spatial_merge_size=self.spatial_merge_size,
-                        use_postshuffle_norm=True,
-                        norm_layer=norm_layer,
-                        quant_config=quant_config,
-                        prefix=f"{prefix}.merger_list.{layer_idx}",
-                    )
-                    for layer_idx in range(len(self.deepstack_visual_indexes))
-                ]
-            )
-
-        self.attn_backend = get_vit_attn_backend(
-            head_size=head_dim,
-            dtype=torch.get_default_dtype(),
-            # attn_backend_override=attn_backend_override,
-        )
-        if self.attn_backend != _Backend.FLASH_ATTN and get_flash_attn_version() is not None:
-            self.attn_backend = _Backend.FLASH_ATTN
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.patch_embed.proj.weight.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.patch_embed.proj.weight.device
-
-    def rot_pos_emb(self, grid_thw):
-        pos_ids = []
-        for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
-
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
-
-    def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
-        num_grid_per_side = self.num_grid_per_side
-        m_size = self.spatial_merge_size
-        hidden_dim = self.pos_embed.embedding_dim
-
-        outputs = []
-        for t, h, w in grid_thw:
-            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device)
-            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device)
-
-            h_floor = h_idxs.to(torch.long)
-            w_floor = w_idxs.to(torch.long)
-            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
-
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-
-            # Create meshgrid view for all h, w vars
-            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
-            h_floor_grid_idx = h_floor_grid * num_grid_per_side
-            h_ceil_grid_idx = h_ceil_grid * num_grid_per_side
-
-            # original computation of weights
-            # w00 = (1 - dh_grid) * (1 - dw_grid)
-            # w01 = (1 - dh_grid) * dw_grid
-            # w10 = dh_grid * (1 - dw_grid)
-            # w11 = dh_grid * dw_grid
-            # we reuse w11 here to avoid duplicate
-            # dh_grid * dw_grid computation
-            w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - dw_grid + w11
-
-            idx00 = h_floor_grid_idx + w_floor_grid
-            idx01 = h_floor_grid_idx + w_ceil_grid
-            idx10 = h_ceil_grid_idx + w_floor_grid
-            idx11 = h_ceil_grid_idx + w_ceil_grid
-
-            indices = torch.stack([idx00, idx01, idx10, idx11], dim=0).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype, device=self.device)
-
-            embeds = self.pos_embed(indices)
-            weighted_embeds = embeds * weights
-            p0, p1, p2, p3 = weighted_embeds.unbind(dim=0)
-            combined = p0 + p1 + p2 + p3
-
-            combined = combined.view(h * w, hidden_dim)
-            repeated = combined.unsqueeze(0).expand(t, -1, -1).contiguous()
-            repeated = repeated.view(t, h // m_size, m_size, w // m_size, m_size, hidden_dim)
-            repeated = repeated.permute(0, 1, 3, 2, 4, 5).reshape(-1, hidden_dim)
-            outputs.append(repeated)
-
-        return torch.cat(outputs, dim=0)
-
-    def compute_attn_mask_seqlen(
-        self,
-        cu_seqlens: torch.Tensor,
-    ) -> tuple[int | None, list[int] | None]:
-        max_seqlen, seqlens = None, None
-        if self.attn_backend == _Backend.FLASH_ATTN:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        elif self.attn_backend == _Backend.XFORMERS:
-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        return max_seqlen, seqlens
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw: list[list[int]],
-    ) -> torch.Tensor:
-        hidden_states = x.to(device=self.device, dtype=self.dtype)
-        hidden_states = self.patch_embed(hidden_states)
-
-        if self.apply_vit_abs_pos_embed:
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-            hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0,
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        hidden_states = hidden_states.unsqueeze(1)
-        rotary_pos_emb = rotary_pos_emb.to(hidden_states.device)
-        max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
-
-        hidden_states_list = []
-        deepstack_visual_indexes = self.deepstack_visual_indexes
-
-        for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary_pos_emb,
-                max_seqlen=max_seqlen,
-                seqlens=seqlens,
-            )
-            if deepstack_visual_indexes is not None and layer_num in deepstack_visual_indexes:
-                hidden_states_list.append(hidden_states)
-
-        hidden_states = self.merger(hidden_states)
-
-        # processing deepstack
-        if deepstack_visual_indexes is not None:
-            processed_hidden_states_list = [hidden_states]
-            for idx, x in enumerate(hidden_states_list):
-                x = self.merger_list[idx](x)
-                processed_hidden_states_list.append(x)
-            # we cat the original visual features and deepstack features
-            # along the feature dim
-            hidden_states = torch.cat(
-                processed_hidden_states_list, dim=1
-            )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
-
-        return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("attn.qkv.", "attn.q.", "q"),
-            ("attn.qkv.", "attn.k.", "k"),
-            ("attn.qkv.", "attn.v.", "v"),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if name.endswith("patch_embed.proj.weight"):
-                loaded_weight = conv3d_to_linear_weight(loaded_weight)
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 @support_torch_compile(
@@ -607,44 +113,7 @@ class Qwen3Omni_VisionTransformer(nn.Module):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen3MoeLLMModel(Qwen3MoeModel):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeTextRMSNorm
-        # config = vllm_config.model_config.hf_config
-        # self.norm = Qwen3OmniMoeTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.deepstack_multiscale_layer_start = 1
-
-    def _deepstack_process(self, hidden_states: torch.Tensor, visual_embeds: torch.Tensor) -> torch.Tensor:
-        """
-        Process deepstack visual embeddings by selectively adding them only to visual positions.
-        This matches the transformers implementation which uses visual_pos_masks.
-
-        Args:
-            hidden_states: Hidden states tensor [num_tokens, hidden_size]
-            visual_embeds: Visual embeddings tensor [num_tokens, hidden_size] (zero-padded for non-visual positions)
-
-        Returns:
-            Modified hidden_states with visual embeddings added only to visual positions
-        """
-        # Derive visual position mask from visual_embeds (non-zero positions are visual)
-        # Use a small threshold to handle floating point precision issues
-        visual_pos_masks = torch.any(torch.abs(visual_embeds) > 1e-8, dim=-1)
-
-        if visual_pos_masks.any():
-            visual_pos_masks = visual_pos_masks.to(hidden_states.device)
-            visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-            # Match transformers implementation EXACTLY (lines 2966-2969):
-            # In transformers: local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
-            # Note: visual_embeds in transformers is NOT indexed, meaning it's already shaped
-            # [num_visual_tokens, hidden_size]. In vllm-omni, visual_embeds is [num_tokens, hidden_size]
-            # zero-padded, so we extract only visual positions to match transformers behavior.
-            visual_embeds_only = visual_embeds[visual_pos_masks, :]  # Extract only visual positions
-            local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds_only
-            hidden_states[visual_pos_masks, :] = local_this
-
-        return hidden_states
-
+class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -660,7 +129,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -683,11 +152,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             )
 
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
-                # Use _deepstack_process to match transformers implementation
-                # This selectively adds visual embeddings only to visual positions
-                hidden_states = self._deepstack_process(
-                    hidden_states, deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
-                )
+                hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
@@ -856,7 +321,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 # Derive audio placeholders from video placeholders
                 mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_prompt_updates)
             else:
-                prompt_ids, prompt, mm_placeholders = self._apply_prompt_updates(
+                prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
                     mm_prompt_updates,
                 )
@@ -866,7 +331,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 mm_item_counts,
             )
 
-        return prompt_ids, prompt, mm_placeholders
+        return prompt_ids, mm_placeholders
 
     def get_updates_use_audio_in_video(
         self,
@@ -962,7 +427,6 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 
         def get_replacement_qwen2_vision(item_idx: int, modality: str):
             grid_thw = out_mm_data[f"{modality}_grid_thw"][item_idx]
-            # grid_thw = out_mm_kwargs[f"{modality}_grid_thw"][item_idx]
             assert isinstance(grid_thw, torch.Tensor)
             merge_length = image_processor.merge_size**2
 
@@ -974,8 +438,6 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 
         def get_replacement_qwen2_use_audio_in_video(item_idx: int):
             nonlocal audio_in_video_item_idx
-            # audio_num_features = audio_output_lengths[audio_item_idx + item_idx]
-            # video_grid_thw = out_mm_kwargs["video_grid_thw"][item_idx]
             audio_num_features = audio_output_lengths[audio_in_video_item_idx + item_idx]
             video_grid_thw = out_mm_data["video_grid_thw"][item_idx]
 
@@ -1022,7 +484,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
     def _derive_audio_from_video_placeholders(
         self,
         placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
-        mm_prompt_updates: Mapping[str, list[PromptUpdateDetails]],
+        mm_prompt_updates: MultiModalPromptUpdates,
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         """
         Helper to derive audio placeholders from video placeholders when
@@ -1116,8 +578,6 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         input_features = audio_input["input_features"]
         audio_feature_lengths = audio_input["audio_feature_lengths"]
 
-        audio_feature_lengths = flatten_bn(audio_feature_lengths, concat=True)
-
         audio_feat_lengths, audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 
         audio_outputs = self.audio_tower(
@@ -1138,6 +598,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
     SupportsPP,
+    SupportsMRoPE,
     Qwen3OmniMoeConditionalGenerationMixin,
 ):
     merge_by_field_config = True
@@ -1163,6 +624,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self.vllm_config = vllm_config  # needed for torch compile forward context
         thinker_config: Qwen3OmniMoeThinkerConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -1184,24 +646,18 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
 
-        # attn_backend_override = (
-        #     multimodal_config.mm_encoder_attn_backend
-        #     if multimodal_config is not None
-        #     else None
-        # )
+        attn_backend_override = multimodal_config.mm_encoder_attn_backend if multimodal_config is not None else None
         self.visual = Qwen3Omni_VisionTransformer(
             vision_config=thinker_config.vision_config,
             norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "visual"),
-            # attn_backend_override=attn_backend_override,
+            attn_backend_override=attn_backend_override,
         )
         self.quant_config = quant_config
 
-        lm_vllm_config = vllm_config.with_hf_config(thinker_config.text_config, architectures=["Qwen3MoeForCausalLM"])
-
         self.language_model = Qwen3MoeLLMForCausalLM(
-            vllm_config=lm_vllm_config,
+            vllm_config=vllm_config.with_hf_config(thinker_config.text_config, architectures=["Qwen3MoeForCausalLM"]),
             prefix=maybe_prefix(prefix, "language_model"),
         )
 
@@ -1274,7 +730,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
-    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings | None:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
@@ -1298,27 +754,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
-    def _get_text_embeddings(
-        self,
-        input_ids: Tensor,
-        embed_input_ids: Callable[[Tensor], Tensor],
-        *,
-        is_multimodal: Tensor | None,
-        handle_oov_mm_token: bool,
-    ) -> Tensor:
-        if handle_oov_mm_token and is_multimodal is not None:
-            is_text = ~is_multimodal
-            text_embeds = embed_input_ids(input_ids[is_text])
-
-            return torch.empty(
-                (input_ids.shape[0], text_embeds.shape[1]),
-                dtype=text_embeds.dtype,
-                device=text_embeds.device,
-            ).masked_scatter_(is_text.unsqueeze_(-1), text_embeds)
-
-        return embed_input_ids(input_ids)
-
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings: MultiModalEmbeddings | None = None,
@@ -1326,18 +762,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         is_multimodal: torch.Tensor | None = None,
         handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        # Compute is_multimodal if not provided and we have multimodal embeddings
-        if is_multimodal is None and multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
-            # Create a boolean tensor marking which positions are multimodal tokens
-            is_multimodal = (
-                (input_ids == self.config.image_token_id)
-                | (input_ids == self.config.video_token_id)
-                | (input_ids == self.config.audio_token_id)
-            )
-
-        inputs_embeds = self._get_text_embeddings(
+        inputs_embeds = self._embed_text_input_ids(
             input_ids,
-            self.language_model.get_input_embeddings,
+            self.language_model.embed_input_ids,
             is_multimodal=is_multimodal,
             handle_oov_mm_token=handle_oov_mm_token,
         )
@@ -1406,7 +833,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        *,
         capture_layer_indices: Sequence[int] | None = None,
         return_hidden_states: bool = False,
         **kwargs: object,
@@ -1415,7 +841,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             inputs_embeds = None
 
         if self.use_deepstack and inputs_embeds is not None and get_pp_group().is_first_rank:
-            deepstack_input_embeds = self._get_deepstack_input_embeds(input_ids.size(1))
+            deepstack_input_embeds = self._get_deepstack_input_embeds(inputs_embeds.size(0))
         else:
             deepstack_input_embeds = None
 
@@ -1431,14 +857,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         )
 
         if inputs_embeds is not None and get_pp_group().is_first_rank:
-            self._clear_deepstack_input_embeds(input_ids.size(1))
+            self._clear_deepstack_input_embeds(inputs_embeds.size(0))
 
-        return hidden_states.unsqueeze(0), captured_hidden_states
+        return hidden_states, captured_hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata = None,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
 
@@ -1449,55 +874,48 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         )
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-        # Log load summary
-        try:
-            total_bytes = 0
-            for name, param in self.named_parameters():
-                if param is not None and param.data is not None:
-                    total_bytes += param.data.numel() * param.data.element_size()
-            device = next(self.parameters()).device
-            logger.info(
-                "[Model Loaded] name=%s, success=%s, size=%.2f MB, device=%s",
-                self.__class__.__name__,
-                True,
-                total_bytes / (1024**2),
-                str(device),
-            )
-        except Exception:
-            pass
-
         return loaded_weights
 
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
-        hf_config: PretrainedConfig,
-        image_grid_thw: list[list[int]] | torch.Tensor | None,
-        video_grid_thw: list[list[int]] | torch.Tensor | None,
-        second_per_grid_ts: list[float] | None = None,
-        context_len: int = 0,
-        seq_len: int | None = None,
-        audio_feature_lengths: torch.Tensor | None = None,
-        use_audio_in_video: bool = False,
+        mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
-        config = hf_config.thinker_config
-        if isinstance(image_grid_thw, list):
-            image_grid_thw = torch.tensor(image_grid_thw)
-        if isinstance(video_grid_thw, list):
-            video_grid_thw = torch.tensor(video_grid_thw)
+        kwargs = MultiModalFeatureSpec.gather_kwargs(
+            mm_features,
+            {
+                "image_grid_thw",
+                "video_grid_thw",
+                "second_per_grid_ts",
+                "audio_feature_lengths",
+                "use_audio_in_video",
+            },
+        )
+        image_grid_thw = kwargs.get("image_grid_thw", [])
+        video_grid_thw = kwargs.get("video_grid_thw", [])
+        second_per_grid_ts = kwargs.get("second_per_grid_ts", [])
+        audio_feature_lengths = kwargs.get("audio_feature_lengths", [])
+        use_audio_in_video = any(kwargs.get("use_audio_in_video", []))
+
+        image_grid_thw = (torch.stack if image_grid_thw else torch.tensor)(image_grid_thw)
+        video_grid_thw = (torch.stack if video_grid_thw else torch.tensor)(video_grid_thw)
+
         input_ids = torch.tensor(input_tokens)
         if input_ids is None or input_ids.ndim != 1:
             raise ValueError("_omni3_get_input_positions_tensor expects 1D input_ids")
 
         seq_len = input_ids.shape[0]
-        if audio_feature_lengths is not None and not isinstance(audio_feature_lengths, torch.Tensor):
-            audio_feature_lengths = torch.as_tensor(audio_feature_lengths, dtype=torch.long)
+
+        if isinstance(audio_feature_lengths, list):
+            audio_feature_lengths = torch.tensor(audio_feature_lengths, dtype=torch.long)
+
         if not len(second_per_grid_ts) and len(video_grid_thw):
             second_per_grid_ts = 2.0
             second_per_grids = torch.ones(len(video_grid_thw), dtype=torch.float32) * second_per_grid_ts
         else:
             second_per_grids = torch.tensor(second_per_grid_ts, dtype=torch.float32)
 
+        config = self.config
         spatial_merge_size = config.vision_config.spatial_merge_size
         image_token_id = config.image_token_id
         video_token_id = config.video_token_id

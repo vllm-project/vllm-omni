@@ -292,7 +292,7 @@ def build_stage_connectors(
     from .config import ConnectorSpec
 
     connectors: dict[tuple[str, str], Any] = {}
-    # 将字典格式的配置转换为ConnectorSpec对象
+    # Convert dictionary-formatted config to ConnectorSpec objects
     stage_connector_specs = {}
     for input_key, config in connectors_config.items():
         if not input_key.startswith("from_stage_"):
@@ -310,7 +310,7 @@ def build_stage_connectors(
         stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
 
     try:
-        # 使用统一的连接器创建逻辑
+        # Use unified connector creation logic
         connectors = create_connectors_from_config(stage_connector_specs)
     except Exception as exc:  # pragma: no cover - defensive logging
         # Fail fast so the stage does not start with missing connectors.

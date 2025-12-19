@@ -47,7 +47,7 @@ fi
 VENV_PYTHON="${VENV_DIR}/bin/python"
 [[ -x "${VENV_PYTHON}" ]] || { echo "Python not found in ${VENV_DIR}"; exit 1; }
 
-"${UV_BIN}" pip install --python "${VENV_PYTHON}" vllm==0.11.0
+"${UV_BIN}" pip install --python "${VENV_PYTHON}" vllm==0.12.0
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" -e ".[dev]"
 "${VENV_PYTHON}" -m pytest -v -s tests/entrypoints/
 "${VENV_PYTHON}" -m pytest -v -s tests/diffusion/cache/

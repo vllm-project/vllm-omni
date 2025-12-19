@@ -15,6 +15,12 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.qwen2_5_omni_thinker import (
+    Qwen2_5OmniConditionalGenerationMixin,
+    Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+    Qwen2_5OmniThinkerProcessingInfo,
+)
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
@@ -26,12 +32,6 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
-    Qwen2_5OmniConditionalGenerationMixin,
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
-    Qwen2_5OmniThinkerProcessingInfo,
-)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
 from vllm_omni.utils.platform_utils import is_npu
@@ -161,18 +161,21 @@ class Qwen2_5OmniForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
+        is_multimodal=None,
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
-        return self.model.get_input_embeddings(input_ids, multimodal_embeddings)
+        return self.model.embed_input_ids(
+            input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
+        )
 
-    def get_multimodal_embeddings(self, **kwargs):
+    def embed_multimodal(self, **kwargs):
         # Delegate to thinker model for multimodal processing
-        return self.model.get_multimodal_embeddings(**kwargs)
+        return self.model.embed_multimodal(**kwargs)
 
     def last_index_of(self, list, value):
         return len(list) - 1 - list[::-1].index(value)
@@ -258,7 +261,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
             # Text-only path
             return OmniOutput(
-                text_hidden_states=(text_hidden_states.squeeze(0) if added_batch_dim else text_hidden_states),
+                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
                 multimodal_outputs=None,
             )
 
@@ -288,7 +291,7 @@ class Qwen2_5OmniForConditionalGeneration(
 
             # Ensure we have base embeddings when only ids are provided
             if inputs_embeds is None and input_ids is not None:
-                inputs_embeds = self.talker.get_input_embeddings(input_ids)
+                inputs_embeds = self.talker.embed_input_ids(input_ids)
 
             # ------- Request-scoped additional information (no cross-request concat) -------
             request_ids: list[str] | None = kwargs.get("request_ids")  # ordered
@@ -456,7 +459,7 @@ class Qwen2_5OmniForConditionalGeneration(
                         dtype=torch.bfloat16,
                     ).to(self._module_device(self.model)),
                     self.talker.thinker_to_talker_proj(
-                        self.talker.get_input_embeddings(
+                        self.talker.embed_input_ids(
                             torch.tensor([TALKER_CODEC_BOS_TOKEN_ID, TALKER_CODEC_EOS_TOKEN_ID])
                             .to(torch.bfloat16)
                             .to(self._module_device(self.model))
@@ -790,7 +793,7 @@ class Qwen2_5OmniForConditionalGeneration(
         output_prompt_embeds,
         output_token_ids,
     ):
-        processed_output_token_embeds = output_prompt_embeds + self.talker.get_input_embeddings(
+        processed_output_token_embeds = output_prompt_embeds + self.talker.embed_input_ids(
             output_token_ids
         )  # for decode
         return output_token_ids, processed_output_token_embeds

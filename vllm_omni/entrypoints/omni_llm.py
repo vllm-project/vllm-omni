@@ -17,7 +17,7 @@ from vllm.logger import init_logger
 from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import Counter
+from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
 from vllm_omni.distributed.omni_connectors import (
@@ -33,8 +33,8 @@ from vllm_omni.distributed.ray_utils.utils import (
     try_close_ray,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.processor import OmniProcessor
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
     configure_orchestrator_logger,
@@ -624,7 +624,7 @@ class OmniStageLLM(LLM):
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.processor = OmniProcessor(
+        self.llm_engine.input_processor = OmniInputProcessor(
             vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
         )
         self.engine_class = type(self.llm_engine)
@@ -641,3 +641,5 @@ class OmniStageLLM(LLM):
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
         self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
+        self.model_config = self.llm_engine.model_config
+        self.input_processor = self.llm_engine.input_processor

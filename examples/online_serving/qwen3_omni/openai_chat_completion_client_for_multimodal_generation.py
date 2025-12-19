@@ -5,7 +5,7 @@ from typing import NamedTuple
 import requests
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
