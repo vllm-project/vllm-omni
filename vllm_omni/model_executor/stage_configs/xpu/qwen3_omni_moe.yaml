@@ -3,7 +3,6 @@
 # Stage 1: Talker (text embeddings → 8-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
 
-# The following config has been verified on 2x H100-80G GPUs.
 stage_args:
   - stage_id: 0
     runtime:
@@ -13,13 +12,14 @@ stage_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_cls: vllm_omni.worker.xpu.xpu_ar_worker.XPUARWorker
-      scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      gpu_memory_utilization: 0.6
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent # Output hidden states for talker
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
+      max_num_batched_tokens: 32768
       hf_config_name: thinker_config
       tensor_parallel_size: 2
     final_output: true
@@ -36,19 +36,20 @@ stage_args:
 
   - stage_id: 1
     runtime:
-      devices: "1"
+      devices: "2"
       max_batch_size: 1
     engine_args:
       model_stage: talker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_cls: vllm_omni.worker.xpu.xpu_ar_worker.XPUARWorker
-      scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent # Output codec codes for code2wav
-      #  tensor_parallel_size: 2
+      # tensor_parallel_size: 2
       enable_prefix_caching: false
+      max_num_batched_tokens: 32768
       distributed_executor_backend: "mp"
       hf_config_name: talker_config
     engine_input_source: [0]
@@ -66,13 +67,13 @@ stage_args:
 
   - stage_id: 2
     runtime:
-      devices: "0"
+      devices: "3"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_cls: vllm_omni.worker.xpu.xpu_generation_worker.XPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.generation_scheduler.GenerationScheduler
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
