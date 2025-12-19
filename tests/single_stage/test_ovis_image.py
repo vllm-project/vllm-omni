@@ -116,7 +116,7 @@ def ovis_pipeline(mock_dependencies, monkeypatch):
         model="dummy-ovis",
         tf_model_config=tf_config,
         dtype=torch.float32,
-        num_gpus=0,  # Avoid GPU checks
+        num_gpus=1,
     )
 
     # Mock Transformer Layer separately to avoid full init
@@ -233,7 +233,7 @@ def test_real_transformer_init_and_forward():
         }
     )
 
-    od_config = OmniDiffusionConfig(model="dummy-ovis", tf_model_config=tf_config, dtype=torch.float32, num_gpus=0)
+    od_config = OmniDiffusionConfig(model="dummy-ovis", tf_model_config=tf_config, dtype=torch.float32, num_gpus=1)
 
     # Mock distributed state for QKVParallelLinear initialization
     # We patch get_tp_group because get_tensor_model_parallel_rank calls it and asserts _TP is not None
