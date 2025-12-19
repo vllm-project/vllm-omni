@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -112,6 +112,27 @@ def _summary_stats(values: list[float]) -> dict[str, float]:
         "max": float(values_sorted[-1]),
         "count": float(len(values_sorted)),
     }
+
+
+class _NullProgressBar:
+    def update(self, n: int = 1) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
+def _make_progress_bar(*, total: int, desc: str, enabled: bool) -> Any:
+    if not enabled:
+        return _NullProgressBar()
+    try:
+        from tqdm.auto import tqdm  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "tqdm is required for the progress bar. Install with `pip install tqdm` or pass --no-progress."
+        ) from e
+
+    return tqdm(total=total, desc=desc, unit="req", dynamic_ncols=True)
 
 
 def _join_url(base_url: str, path: str) -> str:
@@ -330,6 +351,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", type=str, default=None, help="Optional summary JSON output path.")
     parser.add_argument("--output-jsonl", type=str, default=None, help="Optional per-request JSONL output path.")
 
+    parser.add_argument("--progress", dest="progress", action="store_true", help="Enable tqdm progress bar.")
+    parser.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress bar.")
+    parser.set_defaults(progress=True)
+
     return parser.parse_args()
 
 
@@ -416,9 +441,31 @@ def main() -> None:
     results: list[dict[str, Any]] = []
     start_benchmark = time.perf_counter()
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = [executor.submit(_task, i) for i in range(args.num_requests)]
-        for fut in futures:
-            results.append(fut.result())
+        future_to_idx = {executor.submit(_task, i): i for i in range(args.num_requests)}
+        results_by_idx: list[Optional[dict[str, Any]]] = [None] * args.num_requests
+        pbar = _make_progress_bar(
+            total=args.num_requests,
+            desc="Benchmark requests",
+            enabled=args.progress,
+        )
+        try:
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = {
+                        "request_idx": idx,
+                        "latency_ms": float("nan"),
+                        "success": False,
+                        "error": str(e),
+                        "outputs": None,
+                    }
+                results_by_idx[idx] = r
+                pbar.update(1)
+        finally:
+            pbar.close()
+        results = [r for r in results_by_idx if r is not None]
     total_time_s = time.perf_counter() - start_benchmark
 
     if monitor is not None:
@@ -509,4 +556,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
