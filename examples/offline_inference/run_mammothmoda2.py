@@ -6,12 +6,14 @@ Usage:
         --model /data/datasets/models-hf/MammothModa2-Preview \\
         --stage-config vllm_omni/model_executor/stage_configs/mammoth_moda2_single.yaml \\
         --prompt "你好，介绍一下你自己。" \\
+        --image /path/to/image.png \\
         --max-tokens 64
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 
 from vllm_omni import Omni
 from vllm.sampling_params import SamplingParams
@@ -39,8 +41,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt",
         type=str,
-        default="你好，介绍一下你自己。",
-        help="文本提示",
+        default="你好，介绍一下你自己。然后描述你看到的图片。",
+        help="文本提示（若传入 --image，会作为图像问题/指令）",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default="mammothmoda/doc/example0.png",
+        help="可选：输入图片路径（本地文件）",
     )
     parser.add_argument(
         "--max-tokens",
@@ -68,9 +76,32 @@ def main() -> None:
                 detokenize=True,
             )
         ]
-        # NOTE: 当前 omni pipeline 的 stage worker 侧只会把 `dict` / `list` 输入加入 batch，
-        # 直接传 `str` 会导致 batch 为空，从而不会触发模型 forward，最终得到空输出列表。
-        omni_outputs = omni.generate([{"prompt": args.prompt}], sampling_params_list)
+        engine_prompt: dict[str, object]
+        if args.image:
+            if not os.path.exists(args.image):
+                raise FileNotFoundError(f"Image file not found: {args.image}")
+            from PIL import Image
+
+            image_data = Image.open(args.image).convert("RGB")
+            # Qwen2.5-VL 风格：图片占位符由 chat_template.jinja 渲染为
+            # `<|vision_start|><|image_pad|><|vision_end|>`。
+            prompt = (
+                "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                "<|im_start|>user\n"
+                "<|vision_start|><|image_pad|><|vision_end|>"
+                f"{args.prompt}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+            engine_prompt = {
+                "prompt": prompt,
+                "multi_modal_data": {"image": image_data},
+            }
+        else:
+            # NOTE: 当前 omni pipeline 的 stage worker 侧只会把 `dict` / `list` 输入加入 batch，
+            # 直接传 `str` 会导致 batch 为空，从而不会触发模型 forward，最终得到空输出列表。
+            engine_prompt = {"prompt": args.prompt}
+
+        omni_outputs = omni.generate([engine_prompt], sampling_params_list)
 
         # OmniLLM 的 stage 输出在单 batch 场景下通常是 `list[RequestOutput]`。
         request_output = omni_outputs[0].request_output
