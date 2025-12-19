@@ -213,7 +213,6 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
-    print(f"  Input image size: {input_image.size}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
