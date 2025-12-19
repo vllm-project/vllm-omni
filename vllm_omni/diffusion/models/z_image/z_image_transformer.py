@@ -31,7 +31,6 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.compile import dit_support_compile
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 ADALN_EMBED_DIM = 256
@@ -186,14 +185,7 @@ class FeedForward(nn.Module):
         return self.w2(self.act(self.w13(x)))
 
 
-@dit_support_compile(
-    dynamic_arg_dims={
-        "x": [0, 1],
-        "attn_mask": [0, 1],
-        "freqs_cis": [0, 1],
-        "adaln_input": 0,
-    }
-)
+@torch.compile(dynamic=True)
 class ZImageTransformerBlock(nn.Module):
     def __init__(
         self,

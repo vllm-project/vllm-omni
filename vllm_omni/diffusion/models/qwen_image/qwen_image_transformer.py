@@ -20,7 +20,6 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinea
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.compile import dit_support_compile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
@@ -304,7 +303,7 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-@dit_support_compile()
+@torch.compile(dynamic=True)
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
