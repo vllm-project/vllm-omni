@@ -44,7 +44,7 @@ class GPUWorker:
         self.rank = rank
         self.od_config = od_config
         self.pipeline = None
-
+        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.init_device_and_model()
 
     def init_device_and_model(self) -> None:
@@ -73,11 +73,12 @@ class GPUWorker:
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config)
         time_before_load = time.perf_counter()
-        with DeviceMemoryProfiler() as m:
-            self.pipeline = model_loader.load_model(
-                od_config=self.od_config,
-                load_device=f"cuda:{rank}",
-            )
+        with self._maybe_get_memory_pool_context(tag="weights"):
+            with DeviceMemoryProfiler() as m:
+                self.pipeline = model_loader.load_model(
+                    od_config=self.od_config,
+                    load_device=f"cuda:{rank}",
+                )
         time_after_load = time.perf_counter()
 
         logger.info(
