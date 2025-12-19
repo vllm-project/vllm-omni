@@ -22,8 +22,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.compile import dit_support_compile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-# This is faster than apply_rotary_emb above
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
