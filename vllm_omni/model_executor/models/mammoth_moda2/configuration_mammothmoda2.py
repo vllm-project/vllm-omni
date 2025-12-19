@@ -259,6 +259,35 @@ class Mammothmoda2Config(PretrainedConfig):
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.llm_config
 
+    def _require_llm_config(self) -> PretrainedConfig:
+        if self.llm_config is None:
+            raise AttributeError("Mammothmoda2Config.llm_config is None")
+        return self.llm_config
+
+    # ---- Proxy attrs for vLLM multimodal/mrope helpers ----
+    # vllm_omni/model_executor/layers/mrope.py expects these fields on `hf_config`.
+    # In MammothModa2, they live in the nested `llm_config` (VL config), so we
+    # expose them here to make the top-level composition config compatible.
+    @property
+    def vision_config(self):
+        return self._require_llm_config().vision_config
+
+    @property
+    def image_token_id(self) -> int:
+        return int(self._require_llm_config().image_token_id)
+
+    @property
+    def video_token_id(self) -> int:
+        return int(self._require_llm_config().video_token_id)
+
+    @property
+    def vision_start_token_id(self) -> int:
+        return int(self._require_llm_config().vision_start_token_id)
+
+    @property
+    def vision_end_token_id(self) -> int:
+        return int(self._require_llm_config().vision_end_token_id)
+
 
 # Register model_type -> config class for AutoConfig
 AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
