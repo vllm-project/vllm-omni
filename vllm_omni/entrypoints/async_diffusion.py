@@ -68,6 +68,7 @@ class AsyncOmniDiffusion:
         # Load model class name and transformer config
         config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
         od_config.model_class_name = config_dict.get("_class_name", None)
+        od_config.update_multimodal_support()
 
         tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
         od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)

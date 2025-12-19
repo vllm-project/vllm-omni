@@ -40,6 +40,15 @@ outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_st
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
 
+##### Online Serving
+
+You can enable Ulysses-SP in online serving for diffusion models via `--usp`:
+
+```bash
+# Text-to-image (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
+```
+
 ##### Benchmarks
 !!! note "Benchmark Disclaimer"
     These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
