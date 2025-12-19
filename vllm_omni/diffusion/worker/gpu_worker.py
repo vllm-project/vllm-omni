@@ -93,19 +93,6 @@ class GPUWorker:
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
 
-    def print_message(self, message: str) -> str:
-        """
-        Print a message from the worker.
-        
-        Args:
-            message: The message to print
-            
-        Returns:
-            A confirmation string with the worker rank
-        """
-        print(f"[Worker {self.rank}] {message}", flush=True)
-        logger.info(f"[Worker {self.rank}] {message}")
-        return f"Worker {self.rank} printed: {message}"
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """

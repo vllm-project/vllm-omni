@@ -38,13 +38,6 @@ class DiffusionEngine:
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
-            # Example: Call print_message on all workers (broadcast)
-            # Uncomment to test:
-            # self.collective_rpc(
-            #     method="print_message",
-            #     args=("Starting generation step",),
-            # )
-            
             # Apply pre-processing if available
             if self.pre_process_func is not None:
                 preprocess_start_time = time.time()
@@ -61,15 +54,6 @@ class DiffusionEngine:
             result = self.post_process_func(output.output)
             postprocess_time = time.time() - postprocess_start_time
             logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
-
-            # Example: Call print_message on only worker rank 0
-            # Uncomment to test:
-            # result_msg = self.collective_rpc(
-            #     method="print_message",
-            #     args=("Generation completed!",),
-            #     unique_reply_rank=0,
-            # )
-            # logger.info(f"Worker response: {result_msg}")
 
             return result
         except Exception as e:
