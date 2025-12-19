@@ -7,17 +7,11 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch import Tensor
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionMetadata,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.selector import get_attn_backend
-from vllm_omni.diffusion.data import get_current_omni_diffusion_config
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
-from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
 
 
 class Attention(nn.Module):
@@ -49,25 +43,13 @@ class Attention(nn.Module):
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.use_sync = use_sync
-        self.ring_pg: dist.ProcessGroup | None = None
-        self.ulysses_pg: dist.ProcessGroup | None = None
-        self.use_ulysses = False
-
-        try:
-            config = get_current_omni_diffusion_config()
-            if config.parallel_config.ulysses_degree > 1:
-                self.use_ulysses = True
-                # Get sequence parallel process group
-                try:
-                    sp_group = get_sp_group()
-                    self.ring_pg = sp_group.ring_group
-                    self.ulysses_pg = sp_group.ulysses_group
-                    assert get_sequence_parallel_world_size() > 1, "Sequence parallel world size must be > 1"
-                except (AssertionError, RuntimeError):
-                    # If sequence parallel group is not initialized, disable Ulysses
-                    self.use_ulysses = False
-        except Exception:
-            self.use_ulysses = False
+        # Parallel attention (communication / resharding) is a pluggable strategy.
+        # This keeps the attention kernel backend selection orthogonal.
+        self.parallel = build_parallel_attention_strategy(
+            scatter_idx=scatter_idx,
+            gather_idx=gather_idx,
+            use_sync=use_sync,
+        )
 
     def forward(
         self,
@@ -76,102 +58,13 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        if self.use_ulysses:
-            return self._forward_ulysses(query, key, value, attn_metadata)
-        else:
-            # shape: (batch_size, seq_len, num_heads, head_size)
-            attn_output = self.attention.forward(query, key, value, attn_metadata)
-            return attn_output
+        # Parallel strategy may reshard/communicate QKV before the attention kernel.
+        query, key, value, attn_metadata, ctx = self.parallel.pre_attention(query, key, value, attn_metadata)
 
-    def _forward_ulysses(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        attn_metadata: AttentionMetadata = None,
-    ) -> Tensor:
-        """Ulysses attention forward pass with sequence parallelism."""
+        # shape: (batch_size, seq_len, num_heads, head_size)
+        attn_output = self.attention.forward(query, key, value, attn_metadata)
+        if isinstance(attn_output, tuple):
+            attn_output = attn_output[0]
 
-        if attn_metadata is not None:
-            joint_tensor_query, joint_tensor_key, joint_tensor_value = (
-                attn_metadata.joint_query,
-                attn_metadata.joint_key,
-                attn_metadata.joint_value,
-            )
-            joint_strategy = attn_metadata.joint_strategy
-        else:
-            joint_tensor_query = None
-            joint_tensor_key = None
-            joint_tensor_value = None
-            joint_strategy = None
-
-        is_joint = False
-        if joint_tensor_query is not None and joint_tensor_key is not None and joint_tensor_value is not None:
-            supported_joint_strategy = ["front", "rear"]
-            if joint_strategy not in supported_joint_strategy:
-                raise ValueError(
-                    f"joint_strategy: {joint_strategy} not supported. supported joint strategy: {supported_joint_strategy}"
-                )
-            elif joint_strategy == "rear":
-                query = torch.cat([query, joint_tensor_query], dim=1)
-                is_joint = True
-            else:
-                query = torch.cat([joint_tensor_query, query], dim=1)
-                is_joint = True
-        elif joint_tensor_query is None and joint_tensor_key is None and joint_tensor_value is None:
-            pass
-        else:
-            raise ValueError(
-                "joint_tensor_query, joint_tensor_key, and joint_tensor_value should be None or not None simultaneously."
-            )
-
-        if is_joint:
-            ulysses_world_size = torch.distributed.get_world_size(self.ulysses_pg)
-            ulysses_rank = torch.distributed.get_rank(self.ulysses_pg)
-            attn_heads_per_ulysses_rank = joint_tensor_key.shape[-2] // ulysses_world_size
-            joint_tensor_key = joint_tensor_key[
-                ...,
-                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
-                :,
-            ]
-            joint_tensor_value = joint_tensor_value[
-                ...,
-                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
-                :,
-            ]
-        # scatter 2, gather 1
-        # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
-        query = SeqAllToAll4D.apply(self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync)
-        key = SeqAllToAll4D.apply(self.ulysses_pg, key, self.scatter_idx, self.gather_idx, self.use_sync)
-        value = SeqAllToAll4D.apply(self.ulysses_pg, value, self.scatter_idx, self.gather_idx, self.use_sync)
-        softmax_scale = self.softmax_scale
-        if softmax_scale is None:
-            softmax_scale = query.shape[-1] ** -0.5
-
-        if is_joint:
-            if joint_strategy == "front":
-                key = torch.cat([joint_tensor_key, key], dim=1)
-                value = torch.cat([joint_tensor_value, value], dim=1)
-            elif joint_strategy == "rear":
-                key = torch.cat([key, joint_tensor_key], dim=1)
-                value = torch.cat([value, joint_tensor_value], dim=1)
-            else:
-                raise ValueError(
-                    f"joint_strategy: {joint_strategy} not supported. supported joint strategy: {supported_joint_strategy}"
-                )
-
-        context_layer = self.attention.forward(
-            query,
-            key,
-            value,
-            attn_metadata=attn_metadata,
-        )
-
-        if isinstance(context_layer, tuple):
-            context_layer = context_layer[0]
-
-        # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
-        # scatter 1, gather 2
-        output = SeqAllToAll4D.apply(self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync)
-
-        return output
+        # Parallel strategy may need to reverse resharding after the kernel.
+        return self.parallel.post_attention(attn_output, ctx)

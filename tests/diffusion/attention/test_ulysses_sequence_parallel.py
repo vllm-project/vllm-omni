@@ -554,17 +554,6 @@ def ulysses_attention_on_test_model(
             f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
         )
 
-        # Verify SP usage for non-baseline runs
-        if not is_baseline:
-            if hasattr(model, "attention"):
-                assert hasattr(model.attention, "use_ulysses"), "Attention should have use_ulysses attribute"
-                assert model.attention.use_ulysses, "Attention should be using Ulysses"
-            elif hasattr(model, "layers"):
-                for i, layer in enumerate(model.layers):
-                    assert hasattr(layer.attention, "use_ulysses"), (
-                        f"Layer {i} attention should have use_ulysses attribute"
-                    )
-                    assert layer.attention.use_ulysses, f"Layer {i} attention should be using Ulysses"
         output = output.contiguous()
         # Gather outputs from all ranks AFTER computation
         if world_size > 1:
