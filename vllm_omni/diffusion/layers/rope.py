@@ -5,7 +5,6 @@ from einops import rearrange, repeat
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
-from vllm_omni.utils.platform_utils import is_rocm
 
 logger = init_logger(__name__)
 
@@ -51,20 +50,11 @@ class RotaryEmbedding(CustomOp):
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
-        self.triton_rotary_emb = None
-        if is_rocm():
-            if find_spec("flash_attn") is not None:
-                from flash_attn.ops.triton.rotary import apply_rotary
+        self.apply_rotary_emb_flash_attn = None
+        if find_spec("flash_attn") is not None:
+            from flash_attn.ops.triton.rotary import apply_rotary
 
-                self.triton_rotary_emb = apply_rotary
-            else:
-                logger.warning(
-                    "flash_attn is not installed. Falling back to PyTorch implementation for rotary embeddings."
-                )
-        else:
-            from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
-
-            self.triton_rotary_emb = apply_rotary_emb
+            self.apply_rotary_emb_flash_attn = apply_rotary
 
     def forward_cuda(
         self,
@@ -72,15 +62,33 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.triton_rotary_emb is None:
-            return self.forward_native(x, cos, sin)
-
         if cos.dim() == 3:
             # (B, S, D/2) -> (S, D/2)
             cos = cos[0]
             sin = sin[0]
 
         return self.triton_rotary_emb(
+            x,
+            cos,
+            sin,
+            interleaved=self.interleaved,
+        )
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.apply_rotary_emb_flash_attn is None:
+            return self.forward_cuda(x, cos, sin)
+
+        if cos.dim() == 3:
+            # (B, S, D/2) -> (S, D/2)
+            cos = cos[0]
+            sin = sin[0]
+
+        return self.apply_rotary_emb_flash_attn(
             x,
             cos,
             sin,

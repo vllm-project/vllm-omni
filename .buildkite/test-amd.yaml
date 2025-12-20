@@ -42,7 +42,8 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export MIOPEN_FIND_MODE=FAST
+    - export MIOPEN_DEBUG_CONV_DIRECT=0
+    - export MIOPEN_DEBUG_CONV_GEMM=0
     - export VLLM_ROCM_USE_AITER=1
     - export VLLM_ROCM_USE_AITER_MHA=1
     - export VLLM_ROCM_USE_AITER_LINEAR=0
