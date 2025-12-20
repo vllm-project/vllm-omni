@@ -1,4 +1,8 @@
-from vllm.model_executor.models.registry import _VLLM_MODELS, _LazyRegisteredModel, _ModelRegistry
+from vllm.model_executor.models.registry import (
+    _VLLM_MODELS,
+    _LazyRegisteredModel,
+    _ModelRegistry,
+)
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
@@ -48,7 +52,24 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "BagelForConditionalGeneration": (
+        "bagel",
+        "bagel",
+        "BagelForConditionalGeneration",
+    ),
+    "Qwen2ForCausalLM": (
+        "bagel",
+        "qwen2_bagel",
+        "Qwen2ForCausalLM",
+    ),
 }
+
+## Register omni models to vLLM registry
+# for model_arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
+#    ModelRegistry.register_model(
+#        model_arch,
+#        f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}",
+#    )
 
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
