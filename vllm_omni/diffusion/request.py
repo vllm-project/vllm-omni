@@ -66,6 +66,18 @@ class OmniDiffusionRequest:
     seed: int | None = None
     seeds: list[int] | None = None
 
+    # layered info
+    layers: int = 4
+
+    # cfg info
+    cfg_normalize: bool = False
+
+    # caption language
+    use_en_prompt: bool = False
+
+    # different bucket in (640, 1024) to determine the condition and output resolution
+    resolution: int = 640
+
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
