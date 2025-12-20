@@ -1,7 +1,13 @@
+from importlib.util import find_spec
+
 import torch
 from einops import rearrange, repeat
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.utils.platform_utils import is_rocm
+
+logger = init_logger(__name__)
 
 
 def rotate_half(x, interleaved=False):
@@ -45,6 +51,20 @@ class RotaryEmbedding(CustomOp):
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
+        self.triton_rotary_emb = None
+        if is_rocm():
+            if find_spec("flash_attn") is not None:
+                from flash_attn.ops.triton.rotary import apply_rotary
+
+                self.triton_rotary_emb = apply_rotary
+            else:
+                logger.warning(
+                    "flash_attn is not installed. Falling back to PyTorch implementation for rotary embeddings."
+                )
+        else:
+            from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+
+            self.triton_rotary_emb = apply_rotary_emb
 
     def forward_cuda(
         self,
@@ -52,14 +72,15 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        if self.triton_rotary_emb is None:
+            return self.forward_native(x, cos, sin)
 
         if cos.dim() == 3:
             # (B, S, D/2) -> (S, D/2)
             cos = cos[0]
             sin = sin[0]
 
-        return apply_rotary_emb(
+        return self.triton_rotary_emb(
             x,
             cos,
             sin,
