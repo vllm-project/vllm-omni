@@ -193,7 +193,6 @@ class Qwen2Config(_Qwen2Config):
         )
         self.qk_norm = qk_norm
         self.layer_module = layer_module
-        self.freeze_und = freeze_und
 
 
 class NaiveCache:
@@ -250,10 +249,7 @@ class PackedAttentionMoT(Qwen2Attention):
         self.v_proj_moe_gen = nn.Linear(config.hidden_size, config.num_key_value_heads * head_dim, bias=True)
         self.o_proj_moe_gen = nn.Linear(config.num_attention_heads * head_dim, config.hidden_size, bias=False)
 
-    def forward(self, *args, **kwargs):
-        return self.forward_inference(*args, **kwargs)
-
-    def forward_inference(
+    def forward(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -378,7 +374,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.freeze_und = config.freeze_und
+        self.hidden_size = config.hidden_size
 
         self.self_attn = attn_module(config, layer_idx)
 
@@ -389,10 +385,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, *args, **kwargs):
-        return self.forward_inference(*args, **kwargs)
-
-    def forward_inference(
+    def forward(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -487,10 +480,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def forward(self, *args, **kwargs):
-        return self.forward_inference(*args, **kwargs)
-
-    def forward_inference(
+    def forward(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
@@ -562,16 +552,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         super().__init__(config)
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def init_moe(self):
-        for name, param in self.named_parameters():
-            if "moe_gen" in name:
-                original_name = name.replace("_moe_gen", "")
-                param.data.copy_(self.state_dict()[original_name].data)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -579,22 +563,13 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
     def set_decoder(self, decoder):
         self.model = decoder
 
     def get_decoder(self):
         return self.model
 
-    def forward(self, *args, **kwargs):
-        return self.forward_inference(*args, **kwargs)
-
-    def forward_inference(
+    def forward(
         self,
         packed_query_sequence: torch.Tensor,
         query_lens: torch.Tensor,
