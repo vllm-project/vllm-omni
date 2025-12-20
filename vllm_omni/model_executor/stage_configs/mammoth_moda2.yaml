@@ -11,6 +11,9 @@ stage_args:
       model_arch: MammothModa2ForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      # 文生图用不到 128k 上下文，显式限制 max_model_len 以降低 KV cache 需求，
+      # 避免 vLLM 在启动时因 “max seq len 太大” 直接报错。
+      max_model_len: 8192
       # AR 与 DiT 在单卡上需要共享显存；默认 0.9 会导致 stage-1 启动时可用显存不足。
       # 这里显式降低，以便两阶段可以在同一张 GPU 上同时驻留。
       gpu_memory_utilization: 0.3
