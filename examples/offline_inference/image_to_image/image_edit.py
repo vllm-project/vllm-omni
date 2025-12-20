@@ -22,6 +22,17 @@ Usage (multiple images):
         --cfg_scale 4.0 \
         --guidance_scale 1.0
 
+Usage (layered):
+    python image_layered.py \
+        --model "Qwen/Qwen-Image-Layered" \
+        --image input.png \
+        --prompt "" \
+        --output "layered" \
+        --num_inference_steps 50 \
+        --cfg_scale 4.0 \
+        --layers 4 \
+        --color-format "RGBA"
+
 For more options, run:
     python image_edit.py --help
 """
@@ -100,7 +111,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=str,
         default="output_image_edit.png",
-        help="Path to save the edited image (PNG).",
+        help=("Path to save the edited image (PNG). Or prefix for Qwen-Image-Layered model save images(PNG)."),
     )
     parser.add_argument(
         "--num_outputs_per_prompt",
@@ -132,6 +143,21 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
 
+    parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=640,
+        help="Bucket in (640, 1024) to determine the condition and output resolution",
+    )
+
+    parser.add_argument(
+        "--color-format",
+        type=str,
+        default="RGB",
+        help="For Qwen-Image-Layered, set to RGBA.",
+    )
+
     return parser.parse_args()
 
 
@@ -143,7 +169,8 @@ def main():
     for image_path in args.image:
         if not os.path.exists(image_path):
             raise FileNotFoundError(f"Input image not found: {image_path}")
-        img = Image.open(image_path).convert("RGB")
+
+        img = Image.open(image_path).convert(args.color_format)
         input_images.append(img)
 
     # Use single image or list based on number of inputs
@@ -213,7 +240,6 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
-    print(f"  Input image size: {input_image.size}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
@@ -227,6 +253,7 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_outputs_per_prompt,
+        layers=args.layers,
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -241,13 +268,19 @@ def main():
     stem = output_path.stem or "output_image_edit"
 
     if args.num_outputs_per_prompt <= 1:
-        images[0].save(output_path)
-        print(f"Saved edited image to {os.path.abspath(output_path)}")
+        img = images[0]
+        img = img if isinstance(img, list) else [img]
+        for sub_idx, sub_img in enumerate(img):
+            save_path = output_path.parent / f"{stem}_{sub_idx}{suffix}"
+            sub_img.save(save_path)
+            print(f"Saved edited image to {os.path.abspath(save_path)}")
     else:
         for idx, img in enumerate(images):
-            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-            img.save(save_path)
-            print(f"Saved edited image to {os.path.abspath(save_path)}")
+            img = img if isinstance(img, list) else [img]
+            for sub_idx, sub_img in enumerate(img):
+                save_path = output_path.parent / f"{stem}_{idx}_{sub_idx}{suffix}"
+                sub_img.save(save_path)
+                print(f"Saved edited image to {os.path.abspath(save_path)}")
 
 
 if __name__ == "__main__":

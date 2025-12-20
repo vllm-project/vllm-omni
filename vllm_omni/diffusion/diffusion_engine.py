@@ -48,7 +48,7 @@ class DiffusionEngine:
             logger.info("Generation completed successfully.")
 
             postprocess_start_time = time.time()
-            result = self.post_process_func(output.output)
+            result = self.post_process_func(output.output) if self.post_process_func is not None else output.output
             postprocess_time = time.time() - postprocess_start_time
             logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 
