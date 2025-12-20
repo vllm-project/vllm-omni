@@ -71,8 +71,8 @@ class OmniLLM:
         log_stats: Whether to enable statistics logging
         log_file: Optional path prefix for log files. If provided, logs will
             be written to files with stage-specific suffixes.
-        stage_init_timeout: Number of seconds to sleep between starting
-            each stage process during initialization
+        stage_init_timeout: Timeout in seconds to wait for each stage process to
+            complete its initialization before being considered failed
         shm_threshold_bytes: Threshold in bytes for using shared memory
             for IPC. Objects larger than this threshold will use shared memory.
         batch_timeout: Timeout in seconds for batching requests within a stage

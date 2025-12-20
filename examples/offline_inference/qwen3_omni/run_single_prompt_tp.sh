@@ -2,4 +2,4 @@ python end2end.py --output-wav output_audio \
                   --query-type use_audio \
                   --stage-init-timeout 90
 
-# init-sleep-seconds works to avoid two vLLM stages initialized at the same time within a card.
+# stage-init-timeout sets the maximum wait to avoid two vLLM stages initializing at the same time on the same card.

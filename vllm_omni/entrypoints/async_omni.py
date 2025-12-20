@@ -84,8 +84,7 @@ class AsyncOmni(EngineClient):
             - log_stats: Whether to enable statistics logging
             - log_file: Optional path prefix for log files. If provided, logs will
               be written to files with stage-specific suffixes.
-            - stage_init_timeout: Timeout for initializing a single stage in seconds
-              each stage process during initialization
+            - stage_init_timeout: Timeout for initializing a single stage in seconds.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - batch_timeout: Timeout in seconds for batching requests within a stage
