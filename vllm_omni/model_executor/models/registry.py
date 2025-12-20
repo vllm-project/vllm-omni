@@ -63,6 +63,13 @@ _OMNI_MODELS = {
         "mammoth_moda2_dit",
         "MammothModa2DiTForConditionalGeneration",
     ),
+    # 统一入口：仿照 Qwen2_5OmniForConditionalGeneration，让每个 stage 都使用同一个 model_arch，
+    # 再通过 engine_args.model_stage（ar/dit/vae）在 __init__ 内选择实际子模块。
+    "MammothModa2ForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
     # 顶层入口，匹配 HF 配置里的 architectures= ["Mammothmoda2Model"]
     "Mammothmoda2Model": (
         "mammoth_moda2",

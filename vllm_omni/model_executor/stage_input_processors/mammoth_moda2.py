@@ -29,49 +29,57 @@ def ar2dit(
     ar_outputs = stage_list[source_stage_id].engine_outputs
     dit_inputs: list[OmniTokensPrompt] = []
 
+    # MammothModa2: gen token vocab start（来自 llm_config.gen_vocab_start_index）
+    # NOTE: 先用固定值跑通 ar→dit；后续可从 stage0 的 hf_config 动态读取并透传。
+    gen_vocab_start_index = 152064
+
     for ar_output in ar_outputs:
-        output = ar_output.outputs[0]
-        mm_out = getattr(output, "multimodal_outputs", {}) or {}
-        hidden = getattr(output, "text_hidden_states", None)
-        if hidden is None:
-            hidden = mm_out.get("hidden_states")
-        captured = hidden
+        # vllm-omni 会把 stage0 的 engine_output_type=latent 聚合到 RequestOutput.multimodal_output["latent"]
+        mm = getattr(ar_output, "multimodal_output", None)
+        latent = mm.get("latent") if isinstance(mm, dict) else None
+        if not isinstance(latent, dict):
+            raise RuntimeError(
+                "AR stage did not produce expected latent payload. "
+                "Ensure stage0 has engine_output_type=latent and uses vllm-omni GPUARWorker."
+            )
 
-        additional_information: dict[str, object] = {}
-        if captured:
-            # 将隐藏态转换为 [B, L, H]
-            if isinstance(captured, torch.Tensor):
-                if captured.ndim == 2:
-                    captured = captured.unsqueeze(0)
-                text_condition_tokens = captured
-            elif isinstance(captured, (list, tuple)) and captured and isinstance(captured[0], torch.Tensor):
-                stacked = torch.stack(list(captured), dim=0)  # [K, ...]
-                text_condition_tokens = stacked[-1] if stacked.ndim >= 3 else stacked  # 取最后一层
-                if text_condition_tokens.ndim == 2:
-                    text_condition_tokens = text_condition_tokens.unsqueeze(0)
-            else:
-                text_condition_tokens = None
+        # GPUARModelRunner 侧 payload 使用 "hidden" 存放每个 step 的 hidden slice，
+        # OutputProcessor 会按 token 维度把这些 slice 逐步拼接起来。
+        hidden_states = latent.get("hidden")
+        if hidden_states is None:
+            raise RuntimeError("latent payload missing `hidden`")
+        if not isinstance(hidden_states, torch.Tensor):
+            raise TypeError(f"latent['hidden'] expected torch.Tensor, got {type(hidden_states)}")
 
-            if text_condition_tokens is not None:
-                text_condition_attention_mask = torch.ones(
-                    text_condition_tokens.shape[:2],
-                    dtype=torch.bool,
-                )
-            additional_information["text_condition_tokens"] = text_condition_tokens.detach().cpu()
-            additional_information["text_condition_attention_mask"] = text_condition_attention_mask
+        # token ids 不在 latent payload 里；这里用 RequestOutput 的 generated token ids 对齐最后一段 hidden。
+        gen_token_ids = getattr(ar_output.outputs[0], "token_ids", None) or []
+        if not gen_token_ids:
+            raise RuntimeError("AR outputs have empty generated token ids.")
 
-        prompt_ids = getattr(ar_output, "prompt_token_ids", None)
-        if prompt_ids is None and hasattr(output, "token_ids"):
-            prompt_ids = output.token_ids
-        if isinstance(prompt_ids, torch.Tensor):
-            prompt_token_ids = prompt_ids.detach().cpu().tolist()
-        else:
-            prompt_token_ids = prompt_ids or []
+        gen_len = len(gen_token_ids)
+        if hidden_states.shape[0] < gen_len:
+            raise RuntimeError(
+                f"latent hidden states shorter than generated token ids: {hidden_states.shape[0]} < {gen_len}"
+            )
+        gen_hidden_states = hidden_states[-gen_len:]
+        token_ids_t = torch.tensor(gen_token_ids, dtype=torch.long)
+
+        # 取 gen vocab 范围内 token 的 hidden states 作为 diffusion condition tokens
+        gen_mask = token_ids_t >= gen_vocab_start_index
+        cond = gen_hidden_states[gen_mask]
+        if cond.numel() == 0:
+            raise RuntimeError("No gen tokens found in AR outputs; did you run t2i token generation on AR stage?")
+
+        # DiT stage 通过 prompt_embeds 接收条件 token hidden states（避免依赖额外 kwargs 透传）
+        # prompt_token_ids 仅用于对齐长度；值本身在 DiT stage 不使用。
+        prompt_embeds = cond.to(dtype=torch.float16).contiguous()
+        prompt_token_ids = [0] * int(prompt_embeds.shape[0])
 
         dit_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=prompt_token_ids,
-                additional_information=additional_information,
+                prompt_embeds=prompt_embeds,
+                additional_information=None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

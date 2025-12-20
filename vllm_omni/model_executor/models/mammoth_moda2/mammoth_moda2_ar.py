@@ -270,16 +270,26 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.vocab_size = config.vocab_size
+        # NOTE: MammothModa2 支持 extra gen vocab（用于图像 token）。
+        # token id 范围为 [gen_vocab_start_index, gen_vocab_start_index + gen_vocab_size)。
+        # vLLM 的采样器/processor 期望 “logits 的最后一维 == model_config.get_vocab_size()”，因此我们需要在
+        # compute_logits 中输出 base+gen 的 logits，同时 embedding 也要能接收这些 token id。
+        self.extra_gen_vocab = bool(getattr(config, "extra_gen_vocab", False))
         # 生成 token 的起始下标（用于 gen_token_mask）
         self.gen_vocab_start_index = getattr(
             hf_config, "gen_vocab_start_index", None
         ) or getattr(config, "gen_vocab_start_index", None)
+        self.gen_vocab_size = int(getattr(config, "gen_vocab_size", 0) or 0)
+
+        self.base_vocab_size = int(self.gen_vocab_start_index) if self.extra_gen_vocab else int(config.vocab_size)
+        # 配置层面（hf_text_config.vocab_size）已经被上游配置类扩展为 base+gen，
+        # 这里用 config.vocab_size 作为“总 vocab size”。
+        self.total_vocab_size = int(getattr(config, "vocab_size", self.base_vocab_size))
 
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
                                             and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
+                self.base_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens",
@@ -287,9 +297,22 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        if self.extra_gen_vocab:
+            if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
+                self.gen_embed_tokens = VocabParallelEmbedding(
+                    self.gen_vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.gen_embed_tokens",
+                )
+            else:
+                self.gen_embed_tokens = PPMissingLayer()
+        else:
+            self.gen_embed_tokens = None
+
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                self.base_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.lm_head",
@@ -297,9 +320,23 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         else:
             self.lm_head = PPMissingLayer()
 
+        if self.extra_gen_vocab:
+            if get_pp_group().is_last_rank:
+                self.gen_head = ParallelLMHead(
+                    self.gen_vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.gen_head",
+                )
+            else:
+                self.gen_head = PPMissingLayer()
+        else:
+            self.gen_head = None
+
         # vLLM 的 logits 计算不能直接调用 ParallelLMHead.forward（会抛异常），
         # 需要通过 LogitsProcessor 使用其权重矩阵。
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(self.base_vocab_size)
+        self.gen_logits_processor = LogitsProcessor(self.gen_vocab_size) if self.extra_gen_vocab else None
 
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Mammoth2DecoderLayer
@@ -340,7 +377,33 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         return self
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        if not self.extra_gen_vocab or self.gen_embed_tokens is None:
+            return self.embed_tokens(input_ids)
+
+        # input_ids 可能同时包含 base token 与 gen token；分别走不同 embedding 再合并。
+        gen_mask = input_ids >= int(self.gen_vocab_start_index)
+        if not gen_mask.any():
+            return self.embed_tokens(input_ids)
+        if gen_mask.all():
+            gen_ids = input_ids - int(self.gen_vocab_start_index)
+            return self.gen_embed_tokens(gen_ids)
+
+        flat_ids = input_ids.reshape(-1)
+        flat_mask = gen_mask.reshape(-1)
+        out = torch.empty(
+            (flat_ids.shape[0], self.config.hidden_size),
+            dtype=self.embed_tokens.weight.dtype,  # type: ignore[attr-defined]
+            device=flat_ids.device,
+        )
+
+        base_pos = torch.where(~flat_mask)[0]
+        gen_pos = torch.where(flat_mask)[0]
+        if base_pos.numel() > 0:
+            out[base_pos] = self.embed_tokens(flat_ids[base_pos])
+        if gen_pos.numel() > 0:
+            gen_ids = flat_ids[gen_pos] - int(self.gen_vocab_start_index)
+            out[gen_pos] = self.gen_embed_tokens(gen_ids)
+        return out.view(*input_ids.shape, -1).contiguous()
 
     def forward(
         self,
@@ -386,7 +449,16 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         if isinstance(self.lm_head, PPMissingLayer):
             return None
-        return self.logits_processor(self.lm_head, hidden_states)
+        base_logits = self.logits_processor(self.lm_head, hidden_states)
+        if not self.extra_gen_vocab:
+            return base_logits
+        if self.gen_head is None or isinstance(self.gen_head, PPMissingLayer):
+            return base_logits
+        assert self.gen_logits_processor is not None
+        gen_logits = self.gen_logits_processor(self.gen_head, hidden_states)
+        if base_logits is None or gen_logits is None:
+            return None
+        return torch.cat([base_logits, gen_logits], dim=-1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -472,9 +544,9 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             "gen_vae.": None,
 
             # LLM 主体：checkpoint 使用 llm_model.* 前缀
-            # 注意：先匹配更具体的 gen_embed/gen_head，否则会被通用映射吞掉
-            "llm_model.model.language_model.gen_embed_tokens.": None,
-            "llm_model.gen_head.": None,
+            # 额外 gen vocab（图像 token）权重：需要单独映射到 vLLM 的 language_model 子模块
+            "llm_model.model.language_model.gen_embed_tokens.": "language_model.gen_embed_tokens.",
+            "llm_model.gen_head.": "language_model.gen_head.",
 
             "llm_model.model.language_model.": "language_model.",
             "llm_model.model.visual.": "visual.",

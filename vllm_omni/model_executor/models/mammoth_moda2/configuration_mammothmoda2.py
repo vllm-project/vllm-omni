@@ -137,6 +137,12 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         else:
             self.gen_vocab_start_index = gen_vocab_start_index
 
+        # NOTE: vLLM V1 会用 `hf_text_config.vocab_size` 做采样参数校验（如 allowed_token_ids）。
+        # MammothModa2 的 gen vocab 虽然通过独立的 gen_embed/gen_head 实现，但从“输出 logits 维度”的角度，
+        # 整体 vocab size 仍应覆盖 gen vocab 的 token id 范围。
+        if self.extra_gen_vocab:
+            self.vocab_size = int(self.gen_vocab_start_index) + int(self.gen_vocab_size)
+
         # 额外保存用于多模态占位的 token id
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

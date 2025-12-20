@@ -1,6 +1,6 @@
-# Skeleton stage config for MammothModa2 (AR + DiT).
-# NOTE: The corresponding model implementation is a scaffold and needs
-# real AR/DiT logic before this config becomes runnable.
+# Two-stage config for MammothModa2 (AR -> DiT).
+# 参考 qwen2_5_omni 的做法：两个 stage 都使用同一个入口模型（model_arch），
+# 再通过 engine_args.model_stage（ar/dit）决定实际初始化哪个子模块。
 stage_args:
   - stage_id: 0
     runtime:
@@ -8,9 +8,12 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: ar
-      model_arch: MammothModa2ARForConditionalGeneration
+      model_arch: MammothModa2ForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      # AR 与 DiT 在单卡上需要共享显存；默认 0.9 会导致 stage-1 启动时可用显存不足。
+      # 这里显式降低，以便两阶段可以在同一张 GPU 上同时驻留。
+      gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent
@@ -23,9 +26,11 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      model_arch: MammothModa2DiTForConditionalGeneration
+      model_arch: MammothModa2ForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      # 同上：避免 stage-0 预留过多显存导致 stage-1 init_device 直接报错。
+      gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: image

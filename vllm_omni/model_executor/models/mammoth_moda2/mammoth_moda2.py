@@ -40,25 +40,39 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # 与 Qwen2_5OmniForConditionalGeneration 保持一致：实例级标记
+        self.have_multimodal_outputs = True
+        self.vllm_config = vllm_config
         cfg = vllm_config.model_config.hf_config
         self.model_stage = vllm_config.model_config.model_stage
         self.multimodal_config = vllm_config.model_config.multimodal_config
 
+        # 仅用于调试/对齐 qwen2.5-omni：未使用的 stage 显式置空
+        self.ar = None
+        self.dit = None
+        self.vae = None
+
         if self.model_stage == "ar":
             # AR 阶段：多模态 + MoE 文本
-            self.model = init_vllm_registered_model(
+            self.ar = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "ar"),
                 hf_config=cfg.llm_config if hasattr(cfg, "llm_config") else cfg.text_config,
                 architectures=["MammothModa2ARForConditionalGeneration"],
             )
+            self.model = self.ar
         elif self.model_stage == "dit":
-            self.model = init_vllm_registered_model(
+            self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "dit"),
-                hf_config=cfg.gen_dit_config if hasattr(cfg, "gen_dit_config") else cfg,
+                # NOTE: init_vllm_registered_model -> VllmConfig.with_hf_config 要求传入的是
+                # transformers.PretrainedConfig；而 Mammothmoda2Config.gen_dit_config 是 dict（diffusers config）。
+                # DiT stage 的 hf_config 仍然使用顶层组合配置 Mammothmoda2Config，由 DiT 模块自己读取
+                # config.gen_dit_config / gen_vae_config 等 dict。
+                hf_config=cfg,
                 architectures=["MammothModa2DiTForConditionalGeneration"],
             )
+            self.model = self.dit
         elif self.model_stage == "vae":
             # 预留：目前未实现 VAEs，给出明确报错
             raise NotImplementedError("MammothModa2 VAE stage not implemented yet.")
@@ -111,9 +125,18 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         return None
 
     def load_weights(self, weights):
-        if hasattr(self.model, "load_weights"):
-            loaded = self.model.load_weights(weights)
-            # 本 wrapper 仅把子模型挂在 `self.model` 下，因此需要把返回的已加载参数名补上 "model." 前缀，
-            # 才能与 DefaultModelLoader 的 strict check（基于本对象 named_parameters）对齐。
-            return add_prefix_to_loaded_weights(loaded, "model")
-        return set()
+        # 参考 Qwen2_5OmniForConditionalGeneration：按 stage 把权重交给对应子模块加载，
+        # 并将子模块返回的“已加载参数名集合”补上正确的前缀，以通过 DefaultModelLoader 的严格校验。
+        if self.model_stage == "ar":
+            if self.ar is None or not hasattr(self.ar, "load_weights"):
+                return set()
+            loaded = self.ar.load_weights(weights)
+            return add_prefix_to_loaded_weights(loaded, "ar")
+        if self.model_stage == "dit":
+            if self.dit is None or not hasattr(self.dit, "load_weights"):
+                return set()
+            loaded = self.dit.load_weights(weights)
+            return add_prefix_to_loaded_weights(loaded, "dit")
+        if self.model_stage == "vae":
+            return set()
+        raise ValueError(f"Unsupported model_stage: {self.model_stage}")
