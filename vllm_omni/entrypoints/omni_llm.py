@@ -93,7 +93,7 @@ class OmniLLM:
         stage_configs_path: str | None = None,
         log_stats: bool = False,
         log_file: str | None = None,
-        stage_init_timeout: int = 20,
+        stage_init_timeout: int = 300,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 300,
