@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import math
 import os
 import re
@@ -32,8 +33,41 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
 )
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 
 logger = init_logger(__name__)
+
+
+def get_longcat_image_edit_pre_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    """Pre-processing function for LongCatImageEditPipeline."""
+    pass
+
+
+def get_longcat_image_post_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
+    def post_process_func(
+        images: torch.Tensor,
+    ):
+        return image_processor.postprocess(images)
+
+    return post_process_func
 
 
 def calculate_dimensions(target_area, ratio):
