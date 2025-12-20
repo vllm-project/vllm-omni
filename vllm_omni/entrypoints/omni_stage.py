@@ -627,7 +627,11 @@ def _stage_worker(
             try:
                 _os.close(lock_fd)
                 _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
-                _logging.getLogger(__name__).info("[Stage-%s] Stage successfully initialized with %s seconds including waiting for locks", stage_id, _time.time() - wait_start)
+                _logging.getLogger(__name__).info(
+                    "[Stage-%s] Stage successfully initialized with %s seconds including waiting for locks",
+                    stage_id,
+                    _time.time() - wait_start,
+                )
             except (OSError, ValueError):
                 pass
 
@@ -1112,7 +1116,11 @@ async def _stage_worker_async(
             try:
                 _os.close(lock_fd)
                 _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
-                _logging.getLogger(__name__).info("[Stage-%s] Stage successfully initialized with %s seconds including waiting for locks", stage_id, _time.time() - wait_start)
+                _logging.getLogger(__name__).info(
+                    "[Stage-%s] Stage successfully initialized with %s seconds including waiting for locks",
+                    stage_id,
+                    _time.time() - wait_start,
+                )
             except (OSError, ValueError):
                 pass
     omni_stage.set_async_engine(stage_engine)
