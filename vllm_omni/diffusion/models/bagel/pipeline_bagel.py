@@ -134,8 +134,6 @@ class BagelPipeline(nn.Module):
         self.bagel = Bagel(
             language_model=self.language_model,
             config=BagelConfig(
-                visual_gen=True,
-                visual_und=False,  # Explicitly disabled
                 llm_config=llm_config,
                 vae_config=vae_cfg,
                 latent_patch_size=int(bagel_cfg.get("latent_patch_size", 2)),
@@ -205,7 +203,6 @@ class BagelPipeline(nn.Module):
         # Map request params to Bagel gen params (defaults follow Bagel inferencer)
         gen_params = BagelGenParams(
             cfg_text_scale=float(req.guidance_scale or 4.0),
-            cfg_img_scale=float(req.guidance_scale_2 or 1.5),
             cfg_interval=(0.4, 1.0),
             cfg_renorm_min=0.0,
             cfg_renorm_type="global",
@@ -228,7 +225,8 @@ class BagelPipeline(nn.Module):
             # Keep prompt consistent; for now we only use it to set output size.
             _ = req.pil_image  # reserved
             # In practice you would encode the image into context here.
-            gen_params.cfg_img_scale = 1.0
+            # gen_params.cfg_img_scale = 1.0 # No longer supported
+            pass
 
         # Initialize cfg_text_context BEFORE text update (unconditional on text).
         cfg_text_context = copy.deepcopy(gen_context)
@@ -260,10 +258,6 @@ class BagelPipeline(nn.Module):
             )
         gen_context["kv_lens"] = newlens
         gen_context["ropes"] = new_rope
-
-        # Initialize cfg_img_context AFTER text update (conditional on text, but maybe unconditional on image later).
-        # Typically cfg_img_context mirrors gen_context for text-to-image.
-        cfg_img_context = copy.deepcopy(gen_context)
 
         if req.seed is not None:
             torch.manual_seed(req.seed)
@@ -308,12 +302,7 @@ class BagelPipeline(nn.Module):
             curr_rope=cfg_text_context["ropes"],
             image_sizes=[image_shape],
         )
-        cfg_img_latent = self.bagel.prepare_vae_latent_cfg(
-            curr_kvlens=cfg_img_context["kv_lens"],
-            curr_rope=cfg_img_context["ropes"],
-            image_sizes=[image_shape],
-        )
-        for d in (cfg_text_latent, cfg_img_latent):
+        for d in (cfg_text_latent,):
             for k, v in d.items():
                 if torch.is_tensor(v):
                     d[k] = v.to(self.device)
@@ -322,10 +311,8 @@ class BagelPipeline(nn.Module):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
-                cfg_img_past_key_values=cfg_img_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,
                 cfg_text_scale=gen_params.cfg_text_scale,
-                cfg_img_scale=gen_params.cfg_img_scale,
                 cfg_interval=gen_params.cfg_interval,
                 cfg_renorm_min=gen_params.cfg_renorm_min,
                 cfg_renorm_type=gen_params.cfg_renorm_type,
@@ -334,10 +321,6 @@ class BagelPipeline(nn.Module):
                 cfg_text_packed_query_indexes=cfg_text_latent["cfg_packed_query_indexes"],
                 cfg_text_key_values_lens=cfg_text_latent["cfg_key_values_lens"],
                 cfg_text_packed_key_value_indexes=cfg_text_latent["cfg_packed_key_value_indexes"],
-                cfg_img_packed_position_ids=cfg_img_latent["cfg_packed_position_ids"],
-                cfg_img_packed_query_indexes=cfg_img_latent["cfg_packed_query_indexes"],
-                cfg_img_key_values_lens=cfg_img_latent["cfg_key_values_lens"],
-                cfg_img_packed_key_value_indexes=cfg_img_latent["cfg_packed_key_value_indexes"],
                 **generation_input,
             )
 
