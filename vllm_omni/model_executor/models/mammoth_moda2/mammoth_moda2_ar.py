@@ -81,16 +81,32 @@ def moe_forward(
     if gen_token_mask.all():
         return gen_expert(hidden_states)
 
-    B, L, D = hidden_states.shape
-    flat_hid = hidden_states.reshape(-1, D)  # (B*L, D)
+    # vLLM 在 forward 中通常用 2D token-major layout: [num_tokens, hidden_size]；
+    # 但在一些旧路径/外部调用中也可能是 3D: [B, L, D]。这里两者都支持。
+    if hidden_states.ndim == 2:
+        flat_hid = hidden_states
+        d_model = hidden_states.shape[-1]
+        total_tokens = hidden_states.shape[0]
+    elif hidden_states.ndim == 3:
+        d_model = hidden_states.shape[-1]
+        flat_hid = hidden_states.reshape(-1, d_model)  # (B*L, D)
+        total_tokens = flat_hid.shape[0]
+    else:
+        raise ValueError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
 
-    flat_mask = gen_token_mask.reshape(-1)  # (B*L,)
+    # mask: [num_tokens] or [B, L] -> flatten to [total_tokens]
+    flat_mask = gen_token_mask.reshape(-1)  # type: ignore[union-attr]
+    if flat_mask.numel() != total_tokens:
+        raise ValueError(
+            "gen_token_mask shape mismatch: "
+            f"mask={tuple(gen_token_mask.shape)}, hidden_states={tuple(hidden_states.shape)}"
+        )
     gen_pos = torch.where(flat_mask)[0]
     und_pos = torch.where(~flat_mask)[0]
     permute_order = torch.cat([gen_pos, und_pos], dim=0)
     inverse_order = torch.argsort(permute_order)
-    gen_token_num = gen_token_mask.sum()
-    gen_hid, und_hid = flat_hid[permute_order].split([gen_token_num, B * L - gen_token_num], dim=0)
+    gen_token_num = int(flat_mask.sum().item())
+    gen_hid, und_hid = flat_hid[permute_order].split([gen_token_num, total_tokens - gen_token_num], dim=0)
     # gen_hid = flat_hid[flat_mask]
     # und_hid = flat_hid[~flat_mask]
 
@@ -110,7 +126,9 @@ def moe_forward(
     # merged[~flat_mask] = und_out
 
     # -------- 3) 恢复形状 --------
-    return merged.view(B, L, out_dim).contiguous()
+    if hidden_states.ndim == 2:
+        return merged.view(total_tokens, out_dim).contiguous()
+    return merged.view(*hidden_states.shape[:-1], out_dim).contiguous()
 
 
 class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
