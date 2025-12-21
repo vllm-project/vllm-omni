@@ -198,9 +198,9 @@ def main():
             "Bn_compute_blocks": 0,  # Number of backward compute blocks
             "max_warmup_steps": 4,  # Maximum warmup steps (works for few-step models)
             "residual_diff_threshold": 0.24,  # Higher threshold for more aggressive caching
-            "max_continuous_cached_steps": 3,  # Limit to prevent precision degradation
+            "max_continuous_cached_steps": 2,  # Limit to prevent precision degradation
             # TaylorSeer parameters [cache-dit only]
-            "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
+            "enable_taylorseer": True,  # Disabled by default (not suitable for few-step models)
             "taylorseer_order": 1,  # TaylorSeer polynomial order
             # SCM (Step Computation Masking) parameters [cache-dit only]
             "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"

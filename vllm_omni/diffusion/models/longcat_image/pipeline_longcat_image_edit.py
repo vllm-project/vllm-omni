@@ -9,16 +9,17 @@ from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
+import PIL.Image
 import torch
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
-from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import (
     AutoTokenizer,
+    Qwen2_5_VLForConditionalGeneration,
     Qwen2VLProcessor,
 )
 from vllm.logger import init_logger
@@ -64,7 +65,7 @@ def get_longcat_image_edit_pre_process_func(
             image = req.pil_image
 
             image_size = image[0].size if isinstance(image, list) else image.size
-            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] / image_size[1])
+            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
             height = req.height or calculated_height
             width = req.width or calculated_width
 
@@ -75,13 +76,10 @@ def get_longcat_image_edit_pre_process_func(
             req.width = width
 
             # Preprocess image
-            if image is not None and not (
-                isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels
-            ):
-                image = image_processor.resize(image, height, width)
-                prompt_image = image
-                image = image_processor.preprocess(image, height, width)
-                image = image.unsqueeze(2)
+            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
+                image = image_processor.resize(image, calculated_height, calculated_width)
+                prompt_image = image_processor.resize(image, calculated_height // 2, calculated_width // 2)
+                image = image_processor.preprocess(image, calculated_height, calculated_width)
 
                 # Store preprocessed image and prompt image in request
                 req.preprocessed_image = image
@@ -112,6 +110,20 @@ def get_longcat_image_post_process_func(
         return image_processor.postprocess(images)
 
     return post_process_func
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+def retrieve_latents(
+    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "sample"
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
 
 
 def calculate_dimensions(target_area, ratio):
@@ -210,6 +222,9 @@ class LongcatImageEditPipeline(nn.Module):
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
+        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model, subfolder="text_encoder", local_files_only=local_files_only
+        )
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
         )
@@ -239,7 +254,7 @@ class LongcatImageEditPipeline(nn.Module):
         self.prompt_template_encode_suffix = "<|im_end|>\n<|im_start|>assistant\n"
 
         self.default_sample_size = 128
-        self.max_tokenizer_len = 512
+        self.tokenizer_max_length = 512
 
     def _encode_prompt(self, prompt, image):
         raw_vl_input = self.image_processor_vl(images=image, return_tensors="pt")
@@ -483,7 +498,7 @@ class LongcatImageEditPipeline(nn.Module):
     def forward(
         self,
         req: OmniDiffusionRequest,
-        image: PipelineImageInput | None = None,
+        image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] = None,
         negative_prompt: str | list[str] = None,
         num_inference_steps: int = 50,
@@ -550,7 +565,7 @@ class LongcatImageEditPipeline(nn.Module):
                 num_images_per_prompt=num_images_per_prompt,
             )
 
-        device = self._execution_device
+        device = self.device
 
         # Prepare latent variables
         num_channels_latents = 16
@@ -594,9 +609,6 @@ class LongcatImageEditPipeline(nn.Module):
             latent_image_ids = latents_ids
 
         for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-
             self._current_timestep = t
 
             latent_model_input = latents
@@ -625,7 +637,7 @@ class LongcatImageEditPipeline(nn.Module):
                     return_dict=False,
                 )[0]
                 noise_pred_uncond = noise_pred_uncond[:, :image_seq_len]
-                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
             else:
                 noise_pred = noise_pred_text
             # compute the previous noisy sample x_t -> x_t-1
