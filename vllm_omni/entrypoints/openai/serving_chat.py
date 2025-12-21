@@ -78,7 +78,7 @@ from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.entrypoints.openai.protocol import OmniDeltaMessage, OmniChatCompletionResponseStreamChoice, OmniChatCompletionStreamResponse
+from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
@@ -1168,23 +1168,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
                     
-                elif final_output_type == "image":
-                    choices_data = self._create_image_choice(omni_res, role, request, stream=True)
-                    chunk = OmniChatCompletionStreamResponse(
-                            id=request_id,
-                            object=chunk_object_type,
-                            created=created_time,
-                            choices=choices_data,
-                            model=model_name,
-                            modality=final_output_type,
-                            )
-                    chunk.usage = UsageInfo(
-                                prompt_tokens=num_prompt_tokens,
-                                completion_tokens=0,
-                                total_tokens=num_prompt_tokens,
-                            )
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                else:
+                    logger.warning(f"Unsupported streaming final output type: {final_output_type}")
+                    continue
                 
 
             # once the final token is handled, if stream_options.include_usage
@@ -1645,7 +1631,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             choices.append(choice_data)
         return choices
 
-    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False):
+    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str):
         """Create chat completion response choices for image output.
 
         Converts image tensor or PIL Image output from diffusion models

@@ -238,7 +238,6 @@ class OmniStage:
                 )
         else:
             if is_async:
-                stage_chunk_size = 4
                 self._proc = ctx.Process(
                     target=_stage_worker_async_entry,
                     args=(
@@ -246,7 +245,6 @@ class OmniStage:
                         model,
                         stage_payload,
                         batch_timeout,
-                        stage_chunk_size,
                         self.engine_output_type,
                     ),
                 )
@@ -880,10 +878,9 @@ def _stage_worker_async_entry(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
-    stage_chunk_size: int = 4,
     engine_output_type: str = "latent",
 ) -> None:
-    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout, stage_chunk_size, engine_output_type))
+    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout, engine_output_type))
 
 
 async def _stage_worker_async(
@@ -891,7 +888,6 @@ async def _stage_worker_async(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
-    stage_chunk_size: int = 4,
     engine_output_type: str = "latent",
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
