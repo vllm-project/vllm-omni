@@ -54,7 +54,7 @@ def get_longcat_image_edit_pre_process_func(
         vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
-    latent_channels = vae_config.get("z_dim", 16)
+    latent_channels = vae_config.get("latent_channels", 16)
 
     def pre_process_func(
         requests: list[OmniDiffusionRequest],
@@ -211,7 +211,7 @@ class LongcatImageEditPipeline(nn.Module):
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         self.text_processor = Qwen2VLProcessor.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only
+            model, subfolder="text_processor", local_files_only=local_files_only
         )
 
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
@@ -223,7 +223,7 @@ class LongcatImageEditPipeline(nn.Module):
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.image_processor_vl = self.text_processor.image_processor
-        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
+        self.latent_channels = self.vae_config.get("latent_channels", 16)
 
         self.image_token = "<|image_pad|>"
         self.prompt_template_encode_prefix = (
