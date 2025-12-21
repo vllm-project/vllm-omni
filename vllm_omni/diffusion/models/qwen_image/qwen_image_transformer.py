@@ -20,6 +20,7 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinea
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
@@ -577,7 +578,8 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class QwenImageTransformer2DModel(nn.Module):
+# Note: inheriting from CachedTransformer only when we support caching
+class QwenImageTransformer2DModel(CachedTransformer):
     """
     The Transformer model introduced in Qwen.
 
