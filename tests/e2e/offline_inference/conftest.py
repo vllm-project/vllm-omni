@@ -7,6 +7,7 @@ Pytest configuration and fixtures for vllm-omni tests.
 from typing import Any
 
 import pytest
+import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.sampling_params import SamplingParams
 
@@ -334,6 +335,7 @@ class OmniRunner:
         self.close()
         del self.omni
         cleanup_dist_env_and_memory()
+        torch.cuda.synchronize()
 
     def close(self):
         """Close and cleanup the Omni instance."""
