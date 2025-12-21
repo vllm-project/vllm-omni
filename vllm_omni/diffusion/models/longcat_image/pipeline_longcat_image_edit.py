@@ -19,7 +19,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import (
     AutoTokenizer,
-    CLIPVisionModelWithProjection,
     Qwen2VLProcessor,
 )
 from vllm.logger import init_logger
@@ -44,7 +43,52 @@ def get_longcat_image_edit_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
     """Pre-processing function for LongCatImageEditPipeline."""
-    pass
+    model_name = od_config.model
+    if os.path.exists(model_name):
+        model_path = model_name
+    else:
+        model_path = download_weights_from_hf_specific(model_name, None, ["*"])
+    vae_config_path = os.path.join(model_path, "vae/config.json")
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+        vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
+
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+    latent_channels = vae_config.get("z_dim", 16)
+
+    def pre_process_func(
+        requests: list[OmniDiffusionRequest],
+    ):
+        """Pre-process requests for QwenImageEditPipeline."""
+        for req in requests:
+            image = req.pil_image
+
+            image_size = image[0].size if isinstance(image, list) else image.size
+            calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] / image_size[1])
+            height = req.height or calculated_height
+            width = req.width or calculated_width
+
+            # Store calculated dimensions in request
+            req.calculated_height = calculated_height
+            req.calculated_width = calculated_width
+            req.height = height
+            req.width = width
+
+            # Preprocess image
+            if image is not None and not (
+                isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels
+            ):
+                image = image_processor.resize(image, height, width)
+                prompt_image = image
+                image = image_processor.preprocess(image, height, width)
+                image = image.unsqueeze(2)
+
+                # Store preprocessed image and prompt image in request
+                req.preprocessed_image = image
+                req.prompt_image = prompt_image
+        return requests
+
+    return pre_process_func
 
 
 def get_longcat_image_post_process_func(
@@ -176,13 +220,10 @@ class LongcatImageEditPipeline(nn.Module):
         self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
-        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            model, subfolder="image_encoder", local_files_only=local_files_only
-        )
-
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.image_processor_vl = self.text_processor.image_processor
+        self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
 
         self.image_token = "<|image_pad|>"
         self.prompt_template_encode_prefix = (
@@ -483,6 +524,11 @@ class LongcatImageEditPipeline(nn.Module):
             image_size = image[0].size if isinstance(image, list) else image.size
             calculated_width, calculated_height = calculate_dimensions(1024 * 1024, image_size[0] * 1.0 / image_size[1])
 
+            if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
+                image = self.image_processor.resize(image, calculated_height, calculated_width)
+                prompt_image = self.image_processor.resize(image, calculated_height // 2, calculated_width // 2)
+                image = self.image_processor.preprocess(image, calculated_height, calculated_width)
+
         self.check_inputs(
             prompt,
             calculated_height,
@@ -491,15 +537,6 @@ class LongcatImageEditPipeline(nn.Module):
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
         )
-
-        if (
-            not hasattr(req, "preprocessed_image")
-            and image is not None
-            and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels)
-        ):
-            image = self.image_processor.resize(image, calculated_height, calculated_width)
-            prompt_image = self.image_processor.resize(image, calculated_height // 2, calculated_width // 2)
-            image = self.image_processor.preprocess(image, calculated_height, calculated_width)
 
         (prompt_embeds, text_ids) = self.encode_prompt(
             prompt=prompt, image=prompt_image, prompt_embeds=prompt_embeds, num_images_per_prompt=num_images_per_prompt
