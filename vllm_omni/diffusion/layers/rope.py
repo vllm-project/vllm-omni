@@ -1,7 +1,12 @@
+from importlib.util import find_spec
+
 import torch
 from einops import rearrange, repeat
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+
+logger = init_logger(__name__)
 
 
 def rotate_half(x, interleaved=False):
@@ -45,6 +50,11 @@ class RotaryEmbedding(CustomOp):
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
+        self.apply_rotary_emb_flash_attn = None
+        if find_spec("flash_attn") is not None:
+            from flash_attn.ops.triton.rotary import apply_rotary
+
+            self.apply_rotary_emb_flash_attn = apply_rotary
 
     def forward_cuda(
         self,
@@ -60,6 +70,27 @@ class RotaryEmbedding(CustomOp):
             sin = sin[0]
 
         return apply_rotary_emb(
+            x,
+            cos,
+            sin,
+            interleaved=self.interleaved,
+        )
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.apply_rotary_emb_flash_attn is None:
+            return self.forward_cuda(x, cos, sin)
+
+        if cos.dim() == 3:
+            # (B, S, D/2) -> (S, D/2)
+            cos = cos[0]
+            sin = sin[0]
+
+        return self.apply_rotary_emb_flash_attn(
             x,
             cos,
             sin,

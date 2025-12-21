@@ -32,12 +32,6 @@ class DiffusionEngine:
         self._processes: list[mp.Process] = []
         self._closed = False
         self._make_client()
-        try:
-            self._dummy_run()
-        except Exception as e:
-            logger.error(f"Dummy run failed: {e}")
-            self.close()
-            raise e
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
@@ -54,7 +48,7 @@ class DiffusionEngine:
             logger.info("Generation completed successfully.")
 
             postprocess_start_time = time.time()
-            result = self.post_process_func(output.output)
+            result = self.post_process_func(output.output) if self.post_process_func is not None else output.output
             postprocess_time = time.time() - postprocess_start_time
             logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 

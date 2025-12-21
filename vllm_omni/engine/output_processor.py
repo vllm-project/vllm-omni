@@ -6,7 +6,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -40,13 +40,14 @@ class OmniRequestState(RequestState):
     @classmethod
     def from_new_request(
         cls,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request: EngineCoreRequest,
         prompt: str | None,
         parent_req: ParentRequest | None,
         request_index: int,
         queue: Any | None,
         log_stats: bool,
+        stream_interval: int,
     ) -> "OmniRequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -92,6 +93,7 @@ class OmniRequestState(RequestState):
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
+            stream_interval=stream_interval,
         )
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
@@ -196,6 +198,26 @@ class OmniRequestState(RequestState):
         if not finished and final_only:
             return None
 
+        if self.stream_interval > 1:
+            assert self.detokenizer is not None
+
+            # Send output request only when
+            # 1. It has finished, or
+            # 2. It is the first token, or
+            # 3. It has reached the stream interval number of tokens
+            if not (
+                finished
+                or self.sent_tokens_offset == 0
+                or len(self.detokenizer.output_token_ids) - self.sent_tokens_offset >= self.stream_interval
+            ):
+                return None
+
+            if self.output_kind == RequestOutputKind.DELTA:
+                # Send tokens from the offset in DELTA mode, otherwise all
+                # tokens are sent.
+                new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
+                self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
+
         request_id = self.request_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
 
@@ -247,7 +269,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         log_stats: bool,
         engine_core_output_type: str | None = None,
     ):
@@ -314,9 +336,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             request_index=request_index,
             queue=queue,
             log_stats=self.log_stats,
+            stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
-        self.lora_states.add_request(req_state)
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
@@ -422,6 +444,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 parent_req = req_state.parent_req
                 if parent_req and not parent_req.child_requests:
                     self.parent_requests.pop(parent_req.request_id, None)
+                if not self.request_states:
+                    self._requests_drained.set()
                 if not eco.finished:
                     reqs_to_abort.append(req_id)
                 self._update_stats_from_finished(req_state, finish_reason, iteration_stats)

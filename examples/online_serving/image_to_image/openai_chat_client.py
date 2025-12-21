@@ -5,6 +5,7 @@ Qwen-Image-Edit OpenAI-compatible chat client for image editing.
 Usage:
     python openai_chat_client.py --input qwen_image_output.png --prompt "Convert to watercolor style" --output output.png
     python openai_chat_client.py --input input.png --prompt "Convert to oil painting" --seed 42
+    python openai_chat_client.py --input input1.png input2.png --prompt "Combine these images into a single scene"
 """
 
 import argparse
@@ -16,8 +17,19 @@ import requests
 from PIL import Image
 
 
+def _encode_image_as_data_url(input_path: Path) -> str:
+    image_bytes = input_path.read_bytes()
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        mime_type = f"image/{img.format.lower()}" if img.format else "image/png"
+    except Exception:
+        mime_type = "image/png"
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{image_b64}"
+
+
 def edit_image(
-    input_image: str | Path,
+    input_image: str | Path | list[str | Path],
     prompt: str,
     server_url: str = "http://localhost:8092",
     height: int | None = None,
@@ -30,7 +42,7 @@ def edit_image(
     """Edit an image using the chat completions API.
 
     Args:
-        input_image: Path to input image
+        input_image: Path(s) to input image(s). For multi-image editing, pass multiple paths.
         prompt: Text description of the edit
         server_url: Server URL
         height: Output image height in pixels
@@ -43,28 +55,22 @@ def edit_image(
     Returns:
         Edited image bytes or None if failed
     """
-    # Read and encode input image
-    input_path = Path(input_image)
-    if not input_path.exists():
-        print(f"Error: Input image not found: {input_path}")
-        return None
-
-    with open(input_path, "rb") as f:
-        image_bytes = f.read()
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Detect image type
-    img = Image.open(BytesIO(image_bytes))
-    mime_type = f"image/{img.format.lower()}" if img.format else "image/png"
+    input_images = input_image if isinstance(input_image, list) else [input_image]
+    input_paths = [Path(p) for p in input_images]
+    for p in input_paths:
+        if not p.exists():
+            print(f"Error: Input image not found: {p}")
+            return None
 
     # Build user message with text and image
+    content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+    for p in input_paths:
+        content.append({"type": "image_url", "image_url": {"url": _encode_image_as_data_url(p)}})
+
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
-            ],
+            "content": content,
         }
     ]
 
@@ -113,7 +119,7 @@ def edit_image(
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen-Image-Edit chat client")
-    parser.add_argument("--input", "-i", required=True, help="Input image path")
+    parser.add_argument("--input", "-i", required=True, nargs="+", help="Input image path(s)")
     parser.add_argument("--prompt", "-p", required=True, help="Edit prompt")
     parser.add_argument("--output", "-o", default="output.png", help="Output file")
     parser.add_argument("--server", "-s", default="http://localhost:8092", help="Server URL")
@@ -126,7 +132,10 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"Input: {args.input}")
+    if len(args.input) == 1:
+        print(f"Input: {args.input[0]}")
+    else:
+        print(f"Inputs ({len(args.input)}): {', '.join(args.input)}")
     print(f"Prompt: {args.prompt}")
 
     image_bytes = edit_image(

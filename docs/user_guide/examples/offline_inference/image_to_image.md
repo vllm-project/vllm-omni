@@ -19,7 +19,7 @@ python image_edit.py \
   --guidance_scale 1.0
 ```
 
-### Multiple Image Editing (Qwen-Image-Edit-2509+)
+### Multiple Image Editing (Qwen-Image-Edit-2509)
 
 For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or later version:
 

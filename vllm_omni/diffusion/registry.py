@@ -24,10 +24,20 @@ _DIFFUSION_MODELS = {
         "pipeline_qwen_image_edit_plus",
         "QwenImageEditPlusPipeline",
     ),
+    "QwenImageLayeredPipeline": (
+        "qwen_image",
+        "pipeline_qwen_image_layered",
+        "QwenImageLayeredPipeline",
+    ),
     "ZImagePipeline": (
         "z_image",
         "pipeline_z_image",
         "ZImagePipeline",
+    ),
+    "OvisImagePipeline": (
+        "ovis_image",
+        "pipeline_ovis_image",
+        "OvisImagePipeline",
     ),
     "WanPipeline": (
         "wan2_2",
@@ -82,6 +92,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
     "ZImagePipeline": "get_post_process_func",
+    "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
@@ -94,6 +105,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
+    "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
 }
 
 
@@ -108,9 +120,7 @@ def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
 
 def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
-        raise ValueError(
-            f"Post process function for model class {od_config.model_class_name} not found in diffusion model registry."
-        )
+        return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
 
