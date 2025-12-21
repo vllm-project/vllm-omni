@@ -22,6 +22,7 @@ th {
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
+| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
 | `WanPipeline` | Wan2.2 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |

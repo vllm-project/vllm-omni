@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 
-from vllm_omni.utils import detect_device_type
+from vllm_omni.utils import detect_device_type, is_rocm
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -86,8 +86,10 @@ def resolve_model_config_path(model: str) -> str:
     device_type = detect_device_type()
 
     # Try device-specific config first
-    if device_type != "cuda":
+    if device_type != "cuda" or is_rocm():
         device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
+        if is_rocm():
+            device_config_file = f"vllm_omni/model_executor/stage_configs/rocm/{model_type}.yaml"
         device_config_path = PROJECT_ROOT / device_config_file
         if os.path.exists(device_config_path):
             return str(device_config_path)
