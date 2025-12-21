@@ -593,6 +593,135 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         )
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
+        # -------- t2i (AR grid) token constraints --------
+        # 约束逻辑依赖 per-step 的 sampling_metadata + runtime_additional_information。
+        # 这些都由 vllm-omni runner 每步通过 kwargs 传入，因此只需在模型侧缓存即可。
+        self._last_sampling_metadata = None
+        self._last_runtime_additional_information: list[dict[str, Any]] | None = None
+        self._t2i_defaults: dict[str, int] = {}
+        self._try_load_t2i_generation_defaults(vllm_config)
+
+    def _try_load_t2i_generation_defaults(self, vllm_config: VllmConfig) -> None:
+        """Best-effort 从模型目录读取 t2i_generation_config.json 的默认 token 范围。"""
+        try:
+            model_dir = getattr(vllm_config.model_config, "model", None)
+            if not isinstance(model_dir, str) or not model_dir:
+                return
+            cfg_path = Path(model_dir) / "t2i_generation_config.json"
+            if not cfg_path.is_file():
+                return
+            with cfg_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            eol = int(cfg.get("eol_token_id"))
+            visual_start = int(cfg.get("visual_token_start_id"))
+            visual_end = int(cfg.get("visual_token_end_id"))
+            self._t2i_defaults = {
+                "eol_token_id": eol,
+                "visual_token_start_id": visual_start,
+                "visual_token_end_id": visual_end,
+            }
+        except Exception:
+            # 不要因默认配置读取失败而影响模型初始化；请求侧可通过 additional_information 传入。
+            return
+
+    @staticmethod
+    def _is_t2i_request(runtime_info: dict[str, Any]) -> bool:
+        v = runtime_info.get("omni_task", runtime_info.get("task"))
+        if isinstance(v, str):
+            return v.lower() in {"t2i", "text_image", "text2image"}
+        if isinstance(v, bool):
+            return v
+        return False
+
+    def _get_t2i_runtime_params(self, runtime_info: dict[str, Any]) -> dict[str, int] | None:
+        """从 runtime_info / defaults 获取 t2i 约束参数。"""
+        def _get_int(key: str) -> int | None:
+            val = runtime_info.get(key, self._t2i_defaults.get(key))
+            if val is None:
+                return None
+            try:
+                return int(val)
+            except Exception:
+                return None
+
+        ar_width = _get_int("ar_width")
+        ar_height = _get_int("ar_height")
+        eol = _get_int("eol_token_id")
+        visual_start = _get_int("visual_token_start_id")
+        visual_end = _get_int("visual_token_end_id")
+        if ar_width is None or eol is None or visual_start is None or visual_end is None:
+            return None
+        params = {
+            "ar_width": ar_width,
+            "eol_token_id": eol,
+            "visual_token_start_id": visual_start,
+            "visual_token_end_id": visual_end,
+        }
+        if ar_height is not None:
+            params["ar_height"] = ar_height
+        return params
+
+    def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
+        """对 logits 做 t2i 动态约束：每行末尾 token 强制只能采样 eol_token_id。"""
+        if logits is None or not isinstance(logits, torch.Tensor):
+            return logits
+        sampling_metadata = getattr(self, "_last_sampling_metadata", None)
+        runtime_infos = getattr(self, "_last_runtime_additional_information", None)
+        if sampling_metadata is None or runtime_infos is None:
+            return logits
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+        if not isinstance(output_token_ids, list):
+            return logits
+        if logits.ndim != 2:
+            return logits
+        num_reqs = logits.shape[0]
+        if num_reqs == 0:
+            return logits
+        if len(output_token_ids) < num_reqs or len(runtime_infos) < num_reqs:
+            return logits
+
+        neg_inf = -float("inf")
+        vocab_size = logits.shape[-1]
+        for i in range(num_reqs):
+            runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
+            if not self._is_t2i_request(runtime_info):
+                continue
+            params = self._get_t2i_runtime_params(runtime_info)
+            if params is None:
+                continue
+
+            ar_width = int(params["ar_width"])
+            eol_token_id = int(params["eol_token_id"])
+            visual_start = int(params["visual_token_start_id"])
+            visual_end = int(params["visual_token_end_id"])
+
+            if ar_width < 0:
+                continue
+            if not (0 <= eol_token_id < vocab_size):
+                continue
+            # 允许范围裁剪到 vocab 内，避免越界
+            visual_start_c = max(0, min(visual_start, vocab_size))
+            visual_end_c = max(0, min(visual_end, vocab_size))
+            if visual_end_c <= visual_start_c:
+                continue
+
+            generated_len = len(output_token_ids[i]) if isinstance(output_token_ids[i], list) else 0
+            w = generated_len % (ar_width + 1)
+
+            row = logits[i]
+            if w == ar_width:
+                # 行末 token：只允许 eol
+                eol_logit = row[eol_token_id].clone()
+                row.fill_(neg_inf)
+                row[eol_token_id] = eol_logit
+            else:
+                # 行内 token：只允许视觉 token（并显式禁止 eol）
+                row[:visual_start_c] = neg_inf
+                row[visual_end_c:] = neg_inf
+                row[eol_token_id] = neg_inf
+        return logits
+
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -601,6 +730,13 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ):
+        # vllm-omni runner 会在每步 forward 传入 sampling_metadata 与 runtime_additional_information。
+        # compute_logits 在 forward 之后被立刻调用，因此这里缓存即可实现“随步动态”的 token 约束。
+        self._last_sampling_metadata = kwargs.get("sampling_metadata")
+        runtime_infos = kwargs.get("runtime_additional_information")
+        self._last_runtime_additional_information = (
+            runtime_infos if isinstance(runtime_infos, list) else None
+        )
         hidden_states = super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -631,4 +767,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput):
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
-        return super().compute_logits(hidden_states)
+        logits = super().compute_logits(hidden_states)
+        if isinstance(logits, torch.Tensor):
+            logits = self._apply_t2i_token_constraints(logits)
+        return logits
