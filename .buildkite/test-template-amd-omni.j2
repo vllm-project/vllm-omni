@@ -1,0 +1,53 @@
+{# vllm-omni customized version
+   Based on: https://github.com/vllm-project/ci-infra/blob/main/buildkite/test-template-amd.j2
+   Last synced: 2025-12-15
+   Modifications: Removed unused CUDA/NVIDIA logic, keeping only AMD tests
+#}
+{% set docker_image_amd = "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT-rocm-omni" %}
+{% set default_working_dir = "/app/vllm-omni" %}
+
+  - group: "AMD Tests"
+    depends_on: ~
+    steps:
+      - label: "AMD: :docker: build image"
+        depends_on: ~
+        soft_fail: false
+        commands:
+          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --progress plain ."
+          - "docker push {{ docker_image_amd }}"
+        key: "amd-build"
+        env:
+          DOCKER_BUILDKIT: "1"
+        retry:
+          automatic:
+            - exit_status: -1  # Agent was lost
+              limit: 1
+            - exit_status: -10  # Agent was lost
+              limit: 1
+            - exit_status: 1  # Machine occasionally fail
+              limit: 1
+        agents:
+          queue: cpu_queue_premerge_us_east_1
+
+    {% for step in steps %}
+    {% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}
+      - label: "{{ step.agent_pool }}: {{ step.label }}"
+        depends_on: amd-build
+        agents:
+          {% if step.agent_pool %}
+          queue: amd_{{ step.agent_pool }}
+          {% else %}
+          queue: amd_mi325_1
+          {% endif %}
+        command: bash .buildkite/scripts/hardware_ci/run-amd-test.sh "(command rocm-smi || true) && cd {{ (step.working_dir or default_working_dir) | safe  }} ; {{ step.command  or (step.commands | join(" && ")) | safe }}"
+        env:
+          DOCKER_BUILDKIT: "1"
+        priority: 100
+        {% if step.grade and step.grade == "Blocking" %}
+        soft_fail: false
+        {% else %}
+        soft_fail: true
+        {% endif%}
+    {% endif %}
+    {% endfor %}

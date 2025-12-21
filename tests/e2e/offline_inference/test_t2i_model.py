@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.utils.platform_utils import is_npu, is_rocm
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +24,11 @@ models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 # TODO: When NPU support is ready, remove this branch.
 if is_npu():
     models = ["Qwen/Qwen-Image"]
+elif is_rocm():
+    # TODO: When ROCm support is ready, remove this branch.
+    # vLLM V0.11.0 has issues running riverclouds/qwen_image_random
+    # on ROCm
+    models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
 @pytest.mark.parametrize("model_name", models)
