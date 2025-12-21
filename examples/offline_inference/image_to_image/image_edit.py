@@ -23,7 +23,7 @@ Usage (multiple images):
         --guidance_scale 1.0
 
 Usage (layered):
-    python image_layered.py \
+    python image_edit.py \
         --model "Qwen/Qwen-Image-Layered" \
         --image input.png \
         --prompt "" \
