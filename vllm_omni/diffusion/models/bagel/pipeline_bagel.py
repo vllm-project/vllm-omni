@@ -5,7 +5,6 @@ BagelPipeline implementation for vLLM Omni.
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 from collections.abc import Iterable
@@ -202,10 +201,6 @@ class BagelPipeline(nn.Module):
 
         # Map request params to Bagel gen params (defaults follow Bagel inferencer)
         gen_params = BagelGenParams(
-            cfg_text_scale=float(req.guidance_scale or 4.0),
-            cfg_interval=(0.4, 1.0),
-            cfg_renorm_min=0.0,
-            cfg_renorm_type="global",
             num_timesteps=int(req.num_inference_steps or 50),
             timestep_shift=3.0,
         )
@@ -228,8 +223,8 @@ class BagelPipeline(nn.Module):
             # gen_params.cfg_img_scale = 1.0 # No longer supported
             pass
 
-        # Initialize cfg_text_context BEFORE text update (unconditional on text).
-        cfg_text_context = copy.deepcopy(gen_context)
+        # Initialize cfg_text_context REMOVED
+        # cfg_text_context = copy.deepcopy(gen_context)
 
         # Add text prompt (prefill) on gen context.
         generation_input, newlens, new_rope = self.bagel.prepare_prompts(
@@ -297,30 +292,11 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        cfg_text_latent = self.bagel.prepare_vae_latent_cfg(
-            curr_kvlens=cfg_text_context["kv_lens"],
-            curr_rope=cfg_text_context["ropes"],
-            image_sizes=[image_shape],
-        )
-        for d in (cfg_text_latent,):
-            for k, v in d.items():
-                if torch.is_tensor(v):
-                    d[k] = v.to(self.device)
-
         with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
-                cfg_text_past_key_values=cfg_text_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,
-                cfg_text_scale=gen_params.cfg_text_scale,
-                cfg_interval=gen_params.cfg_interval,
-                cfg_renorm_min=gen_params.cfg_renorm_min,
-                cfg_renorm_type=gen_params.cfg_renorm_type,
                 timestep_shift=gen_params.timestep_shift,
-                cfg_text_packed_position_ids=cfg_text_latent["cfg_packed_position_ids"],
-                cfg_text_packed_query_indexes=cfg_text_latent["cfg_packed_query_indexes"],
-                cfg_text_key_values_lens=cfg_text_latent["cfg_key_values_lens"],
-                cfg_text_packed_key_value_indexes=cfg_text_latent["cfg_packed_key_value_indexes"],
                 **generation_input,
             )
 

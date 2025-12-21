@@ -212,9 +212,6 @@ class Bagel(PreTrainedModel):
     def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
         return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids, is_cfg=False)
 
-    def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
-        return self.prepare_input(curr_kvlens, curr_rope, image_sizes, is_cfg=True)
-
     @torch.no_grad
     def generate_image(
         self,
@@ -231,17 +228,6 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         num_timesteps: int = 24,
         timestep_shift: float = 1.0,
-        cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "global",
-        cfg_interval: tuple[float, float] | None = (0, 1),
-        # cfg_text
-        cfg_text_scale: float = 1.0,
-        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
-        cfg_text_packed_position_ids: torch.LongTensor | None = None,
-        cfg_text_past_key_values: NaiveCache | None = None,
-        cfg_text_key_values_lens: torch.IntTensor | None = None,
-        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
-        cfg_type: str = "parallel",
         # cache_args
     ):
         model_pred_cache_dic, model_pred_current = None, None
@@ -257,10 +243,6 @@ class Bagel(PreTrainedModel):
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-            if t > cfg_interval[0] and t <= cfg_interval[1]:
-                cfg_text_scale_ = cfg_text_scale
-            else:
-                cfg_text_scale_ = 1.0
             v_t = self._forward_flow(
                 x_t=x_t,
                 timestep=timestep,
@@ -274,16 +256,6 @@ class Bagel(PreTrainedModel):
                 key_values_lens=key_values_lens,
                 past_key_values=past_key_values,
                 packed_key_value_indexes=packed_key_value_indexes,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
-                # cfg_text
-                cfg_text_scale=cfg_text_scale_,
-                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
-                cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
-                cfg_text_key_values_lens=cfg_text_key_values_lens,
-                cfg_text_past_key_values=cfg_text_past_key_values,
-                cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
-                cfg_type=cfg_type,
                 # cache
                 model_pred_cache_dic=model_pred_cache_dic,
                 model_pred_current=model_pred_current,
@@ -294,9 +266,6 @@ class Bagel(PreTrainedModel):
             )
 
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
-
-        if True:
-            pass
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
@@ -316,16 +285,6 @@ class Bagel(PreTrainedModel):
         key_values_lens: torch.IntTensor,
         past_key_values: NaiveCache,
         packed_key_value_indexes: torch.LongTensor,
-        cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "global",
-        # cfg_text
-        cfg_text_scale: float = 1.0,
-        cfg_text_packed_position_ids: torch.LongTensor | None = None,
-        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
-        cfg_text_key_values_lens: torch.Tensor | None = None,
-        cfg_text_past_key_values: NaiveCache | None = None,
-        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
-        cfg_type: str = "parallel",
         # cache
         model_pred_cache_dic: dict[str, Any] | None = None,
         model_pred_current: int | None = None,
@@ -368,47 +327,5 @@ class Bagel(PreTrainedModel):
         )
         v_t = self.llm2vae(output.packed_query_sequence)
         v_t = v_t[packed_vae_token_indexes]
-
-        if cfg_text_scale > 1.0:
-            cfg_text_output = self.language_model.forward(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_text_packed_position_ids,
-                packed_query_indexes=cfg_text_packed_query_indexes,
-                past_key_values=cfg_text_past_key_values,
-                key_values_lens=cfg_text_key_values_lens,
-                packed_key_value_indexes=cfg_text_packed_key_value_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
-            )
-            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
-            cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
-
-        if cfg_text_scale > 1.0:
-            if cfg_renorm_type == "text_channel":
-                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
-                norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
-                scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                v_t = v_t_text_ * scale
-            else:
-                v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                v_t_ = v_t_text_
-
-                # NOTE norm is computed over all dimensions, thus currently only supports batch_size = 1 with navit
-                if cfg_renorm_type == "global":
-                    norm_v_t = torch.norm(v_t)
-                    norm_v_t_ = torch.norm(v_t_)
-                elif cfg_renorm_type == "channel":
-                    norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
-                    norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
-                else:
-                    raise NotImplementedError(f"{cfg_renorm_type} is not supported")
-                scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                v_t = v_t_ * scale
-        else:
-            # No CFG
-            pass
 
         return v_t

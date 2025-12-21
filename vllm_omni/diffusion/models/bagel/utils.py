@@ -8,10 +8,6 @@ from torch.nn.attention.flex_attention import and_masks, or_masks
 
 @dataclass
 class BagelGenParams:
-    cfg_text_scale: float = 1.0
-    cfg_interval: tuple[float, float] = (0.0, 1.0)
-    cfg_renorm_min: float = 0.0
-    cfg_renorm_type: str = "global"
     num_timesteps: int = 50
     timestep_shift: float = 1.0
 
