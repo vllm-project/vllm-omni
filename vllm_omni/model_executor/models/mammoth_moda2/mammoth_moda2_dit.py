@@ -104,17 +104,58 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         positions: torch.Tensor | None = None,  # noqa: ARG002
         intermediate_tensors: Any | None = None,  # noqa: ARG002
         inputs_embeds: torch.Tensor | None = None,
+        additional_information: dict[str, object] | None = None,
         **kwargs: Any,  # noqa: ARG002
     ) -> OmniOutput:
-        # DiT stage 依赖上游传入的“条件 token hidden states”
-        if inputs_embeds is None:
-            raise ValueError("DiT stage expects `prompt_embeds` from upstream, but `inputs_embeds` is None.")
+        # MammothModa2 follows the Qwen2.5-Omni pattern: pass condition embeddings
+        # via `additional_information["prompt_embeds"]` to avoid vLLM V1 treating
+        # prompt_embeds as a serialized payload and calling `len()` on it during
+        # request state initialization.
+        cond: torch.Tensor | None = None
+        if isinstance(additional_information, dict):
+            pe = additional_information.get("prompt_embeds")
+            if isinstance(pe, torch.Tensor):
+                cond = pe
 
-        # 当前先按单请求/单 batch 的最小路径实现：把整段 prompt_embeds 视为 condition tokens。
-        if inputs_embeds.ndim != 2:
-            raise ValueError(f"Expected inputs_embeds to be 2D [T,H], got shape={tuple(inputs_embeds.shape)}")
+        # Fallback: runtime_additional_information (per-request dicts)
+        if cond is None:
+            runtime_addi = kwargs.get("runtime_additional_information")
+            if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
+                pe = runtime_addi[0].get("prompt_embeds")
+                if isinstance(pe, torch.Tensor):
+                    cond = pe
+            elif isinstance(runtime_addi, dict):
+                # Map form: {req_id: {...}} (best-effort: take first entry)
+                for v in runtime_addi.values():
+                    if isinstance(v, dict) and isinstance(v.get("prompt_embeds"), torch.Tensor):
+                        cond = v["prompt_embeds"]
+                        break
 
-        prompt_embeds = inputs_embeds.unsqueeze(0)  # [1, T, H]
+        # Dummy/profile fallback: use inputs_embeds (often zeros)
+        if cond is None:
+            cond = inputs_embeds
+
+        if cond is None:
+            raise ValueError("DiT stage expects condition embeddings, but none were provided.")
+
+        # Normalize to token-major [T,H]
+        if cond.ndim == 3 and cond.shape[0] == 1:
+            cond = cond[0]
+        if cond.ndim != 2:
+            raise ValueError(f"Expected condition embeddings to be 2D [T,H], got shape={tuple(cond.shape)}")
+
+        # Move to model device/dtype.
+        #
+        # NOTE: The DiT weights are typically bf16 in vLLM-Omni runs; forcing
+        # fp16 here will cause matmul dtype mismatch inside the refiner / DiT.
+        model_device = next(self.parameters()).device
+        if self.gen_image_condition_refiner is not None:
+            target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
+        else:
+            target_dtype = next(self.gen_transformer.parameters()).dtype
+        cond = cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+
+        prompt_embeds = cond.unsqueeze(0)  # [1, T, H]
         prompt_attention_mask = torch.ones(
             (1, prompt_embeds.shape[1]),
             dtype=torch.bool,

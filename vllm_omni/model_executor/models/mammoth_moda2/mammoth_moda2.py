@@ -105,8 +105,22 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         if hasattr(self.model, "get_input_embeddings"):
             return self.model.get_input_embeddings(
                 input_ids, multimodal_embeddings=multimodal_embeddings)
-        raise NotImplementedError(
-            "Underlying model does not implement get_input_embeddings")
+        # DiT stage does not consume token embeddings from `input_ids`; it uses
+        # condition embeddings passed via additional_information.
+        # However, vLLM's generation runner may still request token embeddings
+        # to populate `inputs_embeds` buffers, so we provide a dummy tensor.
+        if self.model_stage == "dit":
+            hidden_size = int(self.vllm_config.model_config.get_hidden_size())
+            try:
+                target_dtype = next(self.model.parameters()).dtype
+            except StopIteration:
+                target_dtype = self.vllm_config.model_config.dtype
+            return torch.zeros(
+                (input_ids.numel(), hidden_size),
+                device=input_ids.device,
+                dtype=target_dtype,
+            )
+        raise NotImplementedError("Underlying model does not implement get_input_embeddings")
 
     def forward(self, *args, **kwargs) -> OmniOutput | torch.Tensor:
         out = self.model(*args, **kwargs)

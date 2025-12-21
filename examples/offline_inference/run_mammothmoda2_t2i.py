@@ -3,7 +3,7 @@ MammothModa2 文生图（AR -> DiT）离线推理示例，使用 vllm_omni.Omni 
 
 说明：
 - Stage 0（AR）生成 gen tokens（视觉 token 序列），同时输出每个 token 的 hidden states（engine_output_type=latent）。
-- Stage 1（DiT）消费 gen tokens 对应的 hidden states（通过 prompt_embeds 传递），执行 diffusion + VAE decode 输出图像。
+- Stage 1（DiT）消费 gen tokens 对应的 hidden states（通过 additional_information 传递），执行 diffusion + VAE decode 输出图像。
 
 用法示例：
   uv run python examples/offline_inference/run_mammothmoda2_t2i.py \\
@@ -57,6 +57,7 @@ def _load_t2i_token_range(model_dir: str) -> tuple[int, int, int]:
     visual_end = int(cfg["visual_token_end_id"])
     return eol, visual_start, visual_end
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run MammothModa2 t2i (AR -> DiT) with vLLM-Omni.")
     p.add_argument(
@@ -74,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt",
         type=str,
-        default="一只戴着墨镜的柴犬，电影海报风格",
+        default="一个带墨镜的女人",
         help="文本提示",
     )
     p.add_argument("--ar-width", type=int, default=32, help="AR 生成网格宽（token 级）")
@@ -117,11 +118,7 @@ def main() -> None:
         f"<|image start|>{int(args.ar_width)}*{int(args.ar_height)}<|image token|>"
     )
 
-    omni = Omni(
-        model=args.model,
-        stage_configs_path=args.stage_config,
-        trust_remote_code=args.trust_remote_code,
-    )
+    omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
     try:
         ar_sampling = SamplingParams(
             temperature=1.0,

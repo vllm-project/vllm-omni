@@ -34,22 +34,40 @@ def ar2dit(
     gen_vocab_start_index = 152064
 
     for ar_output in ar_outputs:
-        # vllm-omni 会把 stage0 的 engine_output_type=latent 聚合到 RequestOutput.multimodal_output["latent"]
+        # vllm-omni 会把 stage0 的 engine_output_type=latent 聚合到 multimodal_output["latent"]。
+        # 注意：不同输出路径下，multimodal_output 可能在：
+        # - RequestOutput.multimodal_output（stage 输出聚合层）
+        # - RequestOutput.outputs[0].multimodal_output（单个 completion 输出）
         mm = getattr(ar_output, "multimodal_output", None)
+        if not (isinstance(mm, dict) and "latent" in mm):
+            try:
+                first_out = ar_output.outputs[0]
+                mm2 = getattr(first_out, "multimodal_output", None)
+                if isinstance(mm2, dict) and "latent" in mm2:
+                    mm = mm2
+            except Exception:
+                pass
+
+        # MultimodalOutputProcessor.add_multimodal_tensor 会把 producer 的 payload
+        # 正规化到 mm_accumulated 上：
+        # - 如果 payload 是 tensor：mm["latent"] = tensor
+        # - 如果 payload 是 dict{"hidden": tensor}：会 remap 为 mm["latent"] = tensor
+        # - 旧路径也可能是 dict{"hidden": tensor} 直接挂在 latent 下
         latent = mm.get("latent") if isinstance(mm, dict) else None
-        if not isinstance(latent, dict):
+        if isinstance(latent, torch.Tensor):
+            hidden_states = latent
+        elif isinstance(latent, dict):
+            hidden_states = latent.get("hidden")
+        else:
             raise RuntimeError(
                 "AR stage did not produce expected latent payload. "
                 "Ensure stage0 has engine_output_type=latent and uses vllm-omni GPUARWorker."
             )
 
-        # GPUARModelRunner 侧 payload 使用 "hidden" 存放每个 step 的 hidden slice，
-        # OutputProcessor 会按 token 维度把这些 slice 逐步拼接起来。
-        hidden_states = latent.get("hidden")
         if hidden_states is None:
-            raise RuntimeError("latent payload missing `hidden`")
+            raise RuntimeError("latent payload missing hidden states")
         if not isinstance(hidden_states, torch.Tensor):
-            raise TypeError(f"latent['hidden'] expected torch.Tensor, got {type(hidden_states)}")
+            raise TypeError(f"latent hidden states expected torch.Tensor, got {type(hidden_states)}")
 
         # token ids 不在 latent payload 里；这里用 RequestOutput 的 generated token ids 对齐最后一段 hidden。
         gen_token_ids = getattr(ar_output.outputs[0], "token_ids", None) or []
@@ -70,16 +88,25 @@ def ar2dit(
         if cond.numel() == 0:
             raise RuntimeError("No gen tokens found in AR outputs; did you run t2i token generation on AR stage?")
 
-        # DiT stage 通过 prompt_embeds 接收条件 token hidden states（避免依赖额外 kwargs 透传）
-        # prompt_token_ids 仅用于对齐长度；值本身在 DiT stage 不使用。
-        prompt_embeds = cond.to(dtype=torch.float16).contiguous()
+        # 重要：不要使用 prompt_embeds 字段跨 stage 传递 embedding。
+        #
+        # 原因：OmniProcessor 会把 prompt_embeds 序列化成 PromptEmbedsPayload（bytes），
+        # 但 vLLM V1 在构造 CachedRequestState 时会立刻对 prompt_embeds 调用 len()，
+        # 从而触发 `PromptEmbedsPayload has no len()` 并在进入 DiT.forward 前崩溃。
+        #
+        # 参考 qwen2_5_omni 的做法：把 embedding 放到 additional_information 里，
+        # 由 runner 在 runtime_additional_information 中透传给模型。
+        prompt_embeds = cond.to(dtype=torch.float32).contiguous()
         prompt_token_ids = [0] * int(prompt_embeds.shape[0])
+        additional_information = {
+            "prompt_embeds": prompt_embeds,
+            "prompt_embeds_shape": list(prompt_embeds.shape),
+        }
 
         dit_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=prompt_token_ids,
-                prompt_embeds=prompt_embeds,
-                additional_information=None,
+                additional_information=additional_information,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
