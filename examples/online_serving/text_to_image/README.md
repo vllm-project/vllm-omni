@@ -1,4 +1,4 @@
-# Qwen-Image Online Serving
+# Text-To-Image
 
 This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
 
@@ -104,16 +104,16 @@ Use `extra_body` to pass generation parameters:
 
 ## Generation Parameters (extra_body)
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `height` | int | None | Image height in pixels |
-| `width` | int | None | Image width in pixels |
-| `size` | str | None | Image size (e.g., "1024x1024") |
-| `num_inference_steps` | int | 50 | Number of denoising steps |
-| `true_cfg_scale` | float | 4.0 | Qwen-Image CFG scale |
-| `seed` | int | None | Random seed (reproducible) |
-| `negative_prompt` | str | None | Negative prompt |
-| `num_outputs_per_prompt` | int | 1 | Number of images to generate |
+| Parameter                | Type  | Default | Description                    |
+| ------------------------ | ----- | ------- | ------------------------------ |
+| `height`                 | int   | None    | Image height in pixels         |
+| `width`                  | int   | None    | Image width in pixels          |
+| `size`                   | str   | None    | Image size (e.g., "1024x1024") |
+| `num_inference_steps`    | int   | 50      | Number of denoising steps      |
+| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale           |
+| `seed`                   | int   | None    | Random seed (reproducible)     |
+| `negative_prompt`        | str   | None    | Negative prompt                |
+| `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
 
 ## Response Format
 
@@ -148,9 +148,9 @@ cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -
 
 ## File Description
 
-| File | Description |
-|------|-------------|
-| `run_server.sh` | Server startup script |
-| `run_curl_text_to_image.sh` | curl example |
-| `openai_chat_client.py` | Python client |
-| `gradio_demo.py` | Gradio interactive interface |
+| File                        | Description                  |
+| --------------------------- | ---------------------------- |
+| `run_server.sh`             | Server startup script        |
+| `run_curl_text_to_image.sh` | curl example                 |
+| `openai_chat_client.py`     | Python client                |
+| `gradio_demo.py`            | Gradio interactive interface |

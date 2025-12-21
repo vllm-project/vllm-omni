@@ -37,10 +37,10 @@ from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
-from vllm.transformers_utils.tokenizer import MistralTokenizer
-from vllm.utils import decorate_logs
+from vllm.tokenizers import MistralTokenizer
+from vllm.utils.system_utils import decorate_logs
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -236,6 +236,18 @@ async def build_async_diffusion(
         config_field_names = {f.name for f in fields(OmniDiffusionConfig)}
         diffusion_kwargs: dict[str, Any] = {"model": args.model}
 
+        # Diffusion parallelism configuration (e.g. `--usp 2`).
+        parallel_config_kwargs: dict[str, Any] = {}
+        for field in fields(DiffusionParallelConfig):
+            if not hasattr(args, field.name):
+                continue
+            value = getattr(args, field.name)
+            if value is None:
+                continue
+            parallel_config_kwargs[field.name] = value
+        if parallel_config_kwargs:
+            diffusion_kwargs["parallel_config"] = DiffusionParallelConfig(**parallel_config_kwargs)
+
         for field_name in config_field_names:
             if not hasattr(args, field_name):
                 continue
@@ -293,13 +305,8 @@ async def build_async_omni_from_stage_config(
     """
 
     # V1 AsyncLLM.
-    assert envs.VLLM_USE_V1
-
     if disable_frontend_multiprocessing:
-        logger.warning(
-            "V1 is enabled, but got --disable-frontend-multiprocessing. "
-            "To disable frontend multiprocessing, set VLLM_USE_V1=0."
-        )
+        logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing.")
 
     async_omni: EngineClient | None = None
 
@@ -346,7 +353,7 @@ async def omni_init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
-    model_config = vllm_config.model_config
+    _model_config = vllm_config.model_config
     state.log_stats = not args.disable_log_stats
 
     # For omni models
@@ -404,14 +411,12 @@ async def omni_init_app_state(
 
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
-        model_config=model_config,
         base_model_paths=base_model_paths,
         lora_modules=lora_modules,
     )
     await state.openai_serving_models.init_static_loras()
     state.openai_serving_chat = OmniOpenAIServingChat(
         engine_client,
-        model_config,
         state.openai_serving_models,
         args.response_role,
         request_logger=request_logger,

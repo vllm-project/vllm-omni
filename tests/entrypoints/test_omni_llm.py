@@ -393,12 +393,12 @@ def mock_get_config(monkeypatch):
     )
     # Also mock in processor module if it's imported
     monkeypatch.setattr(
-        "vllm_omni.engine.processor.length_from_prompt_token_ids_or_embeds",
+        "vllm_omni.engine.input_processor.length_from_prompt_token_ids_or_embeds",
         _mock_length_from_prompt_token_ids_or_embeds,
         raising=False,
     )
     # If processor module is already imported, patch it directly
-    processor_module_path = "vllm_omni.engine.processor"
+    processor_module_path = "vllm_omni.engine.input_processor"
     if processor_module_path in sys.modules:
         processor_module = sys.modules[processor_module_path]
         setattr(
