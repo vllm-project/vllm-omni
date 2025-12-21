@@ -132,7 +132,7 @@ class Bagel(PreTrainedModel):
 
         return past_key_values
 
-    def prepare_input(self, curr_kvlens, curr_rope, image_sizes, new_token_ids=None, is_cfg=False):
+    def prepare_input(self, curr_kvlens, curr_rope, image_sizes, new_token_ids=None):
         packed_text_ids, packed_text_indexes = list(), list()
         packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = list(), list(), list()
         packed_position_ids, packed_seqlens, packed_indexes = list(), list(), list()
@@ -143,41 +143,31 @@ class Bagel(PreTrainedModel):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            if not is_cfg:
-                packed_text_ids.append(new_token_ids["start_of_image"])
-                packed_text_indexes.append(query_curr)
+            packed_text_ids.append(new_token_ids["start_of_image"])
+            packed_text_indexes.append(query_curr)
 
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
 
-            # VAE Position IDs are needed for x_t (noise), which is shared.
-            # But they are invariant to CFG context offset.
-            # However, we only need to return them once (from main path).
-
-            if not is_cfg:
-                vae_position_ids = self.get_flattened_position_ids(
-                    H, W, self.latent_downsample, max_num_patches_per_side=self.max_latent_size
-                )
-                packed_vae_position_ids.append(vae_position_ids)
+            vae_position_ids = self.get_flattened_position_ids(
+                H, W, self.latent_downsample, max_num_patches_per_side=self.max_latent_size
+            )
+            packed_vae_position_ids.append(vae_position_ids)
 
             h, w = H // self.latent_downsample, W // self.latent_downsample
             num_image_tokens = h * w
 
-            if not is_cfg:
-                packed_init_noises.append(
-                    torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size**2)
-                )
-                packed_vae_token_indexes.extend(range(query_curr, query_curr + num_image_tokens))
-                packed_seqlens.append(num_image_tokens + 2)
+            packed_init_noises.append(torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size**2))
+            packed_vae_token_indexes.extend(range(query_curr, query_curr + num_image_tokens))
+            packed_seqlens.append(num_image_tokens + 2)
 
             packed_indexes.extend(range(curr, curr + num_image_tokens))
             curr += num_image_tokens
             query_curr += num_image_tokens
 
-            if not is_cfg:
-                packed_text_ids.append(new_token_ids["end_of_image"])
-                packed_text_indexes.append(query_curr)
+            packed_text_ids.append(new_token_ids["end_of_image"])
+            packed_text_indexes.append(query_curr)
 
             packed_indexes.append(curr)
             curr += 1
@@ -186,31 +176,23 @@ class Bagel(PreTrainedModel):
             packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
 
         # Construct Output
-        if is_cfg:
-            generation_input = {
-                "cfg_packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
-                "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-                "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long),
-                "cfg_packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
-            }
-        else:
-            generation_input = {
-                "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
-                "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
-                "packed_init_noises": torch.cat(packed_init_noises, dim=0),
-                "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0),
-                "packed_vae_token_indexes": torch.tensor(packed_vae_token_indexes, dtype=torch.long),
-                "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
-                "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
-                "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-                "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
-                "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
-            }
+        generation_input = {
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "packed_init_noises": torch.cat(packed_init_noises, dim=0),
+            "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0),
+            "packed_vae_token_indexes": torch.tensor(packed_vae_token_indexes, dtype=torch.long),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
+            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
 
         return generation_input
 
     def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
-        return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids, is_cfg=False)
+        return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids)
 
     @torch.no_grad
     def generate_image(

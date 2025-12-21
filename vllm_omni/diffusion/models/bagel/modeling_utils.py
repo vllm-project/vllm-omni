@@ -17,11 +17,6 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 
-# --------------------------------------------------------
-# 2D sine-cosine position embedding
-# References:
-# DiT: https://github.com/facebookresearch/DiT/blob/main/models.py
-# --------------------------------------------------------
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     grid_h = np.arange(grid_size, dtype=np.float32)
     grid_w = np.arange(grid_size, dtype=np.float32)
