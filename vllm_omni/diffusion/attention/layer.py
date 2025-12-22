@@ -39,10 +39,6 @@ class Attention(nn.Module):
         scatter_idx: int = 2,
         gather_idx: int = 1,
         use_sync: bool = False,
-        # ulysses attention
-        scatter_idx: int = 2,
-        gather_idx: int = 1,
-        use_sync: bool = False,
     ):
         super().__init__()
         self.attn_backend = get_attn_backend(-1)
