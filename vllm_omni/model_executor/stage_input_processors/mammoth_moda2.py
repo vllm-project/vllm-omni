@@ -8,6 +8,20 @@ from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
+def _infer_gen_vocab_start_index(stage: Any, default: int = 152064) -> int:
+    """Best-effort infer `gen_vocab_start_index` from stage0 hf_config."""
+    try:
+        vllm_cfg = getattr(stage, "vllm_config", None)
+        model_cfg = getattr(vllm_cfg, "model_config", None)
+        hf_cfg = getattr(model_cfg, "hf_config", None)
+        llm_cfg = getattr(hf_cfg, "llm_config", None) or getattr(hf_cfg, "text_config", None)
+        text_cfg = getattr(llm_cfg, "text_config", None) or llm_cfg
+        val = getattr(text_cfg, "gen_vocab_start_index", None) or getattr(hf_cfg, "gen_vocab_start_index", None)
+        return int(val) if val is not None else int(default)
+    except Exception:
+        return int(default)
+
+
 def ar2dit(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -30,8 +44,7 @@ def ar2dit(
     dit_inputs: list[OmniTokensPrompt] = []
 
     # MammothModa2: gen token vocab start（来自 llm_config.gen_vocab_start_index）
-    # NOTE: 先用固定值跑通 ar→dit；后续可从 stage0 的 hf_config 动态读取并透传。
-    gen_vocab_start_index = 152064
+    gen_vocab_start_index = _infer_gen_vocab_start_index(stage_list[source_stage_id], default=152064)
 
     for ar_output in ar_outputs:
         # vllm-omni 会把 stage0 的 engine_output_type=latent 聚合到 multimodal_output["latent"]。
@@ -69,24 +82,42 @@ def ar2dit(
         if not isinstance(hidden_states, torch.Tensor):
             raise TypeError(f"latent hidden states expected torch.Tensor, got {type(hidden_states)}")
 
-        # token ids 不在 latent payload 里；这里用 RequestOutput 的 generated token ids 对齐最后一段 hidden。
+        # 对齐方式必须与 vllm 输出一致：latent 包含 [prompt, generated] 的完整序列 hidden，
+        # 而 CompletionOutput.token_ids 仅包含生成段 token_ids；RequestOutput.prompt_token_ids
+        # 给出 prompt 段长度。
+        prompt_token_ids = getattr(ar_output, "prompt_token_ids", None) or []
+        if not isinstance(prompt_token_ids, list) or not prompt_token_ids:
+            raise RuntimeError("AR RequestOutput missing prompt_token_ids; cannot align hidden states.")
+
         gen_token_ids = getattr(ar_output.outputs[0], "token_ids", None) or []
-        if not gen_token_ids:
+        if not isinstance(gen_token_ids, list) or not gen_token_ids:
             raise RuntimeError("AR outputs have empty generated token ids.")
 
+        prompt_len = len(prompt_token_ids)
         gen_len = len(gen_token_ids)
-        if hidden_states.shape[0] < gen_len:
+        expected_total = prompt_len + gen_len
+        if hidden_states.shape[0] < expected_total:
             raise RuntimeError(
-                f"latent hidden states shorter than generated token ids: {hidden_states.shape[0]} < {gen_len}"
+                "latent hidden states length mismatch with prompt+generated tokens: "
+                f"{hidden_states.shape[0]} < {expected_total} (prompt={prompt_len}, gen={gen_len})"
             )
-        gen_hidden_states = hidden_states[-gen_len:]
-        token_ids_t = torch.tensor(gen_token_ids, dtype=torch.long)
 
-        # 取 gen vocab 范围内 token 的 hidden states 作为 diffusion condition tokens
-        gen_mask = token_ids_t >= gen_vocab_start_index
-        cond = gen_hidden_states[gen_mask]
-        if cond.numel() == 0:
-            raise RuntimeError("No gen tokens found in AR outputs; did you run t2i token generation on AR stage?")
+        prompt_hidden_states = hidden_states[:prompt_len]
+        gen_hidden_states = hidden_states[prompt_len : prompt_len + gen_len]
+
+        # 取 gen vocab 范围内 token 的 hidden states 作为 image condition tokens（排除 eol 等非 gen token）
+        gen_token_ids_t = torch.tensor(gen_token_ids, dtype=torch.long)
+        image_mask = gen_token_ids_t >= gen_vocab_start_index
+        image_condition = gen_hidden_states[image_mask]
+        if image_condition.numel() == 0:
+            raise RuntimeError(
+                "No image condition tokens found in AR outputs "
+                f"(gen_vocab_start_index={gen_vocab_start_index}); did AR generate visual tokens?"
+            )
+
+        # 贴近原 MammothModa2：condition = [text_condition_tokens, image_condition_tokens]
+        # 这里先用“整段 prompt hidden”作为文本条件（后续若需要可进一步剔除视觉占位符 token）。
+        cond = torch.cat([prompt_hidden_states, image_condition], dim=0)
 
         # 重要：不要使用 prompt_embeds 字段跨 stage 传递 embedding。
         #
@@ -97,10 +128,15 @@ def ar2dit(
         # 参考 qwen2_5_omni 的做法：把 embedding 放到 additional_information 里，
         # 由 runner 在 runtime_additional_information 中透传给模型。
         prompt_embeds = cond.to(dtype=torch.float32).contiguous()
-        prompt_token_ids = [0] * int(prompt_embeds.shape[0])
+        # DiT stage 不依赖 token ids；用最短 prompt 以减少 vLLM 在 stage-1 的调度与 KV 开销。
+        prompt_token_ids = [0]
         additional_information = {
             "prompt_embeds": prompt_embeds,
             "prompt_embeds_shape": list(prompt_embeds.shape),
+            "gen_vocab_start_index": int(gen_vocab_start_index),
+            "prompt_len": int(prompt_len),
+            "gen_len": int(gen_len),
+            "image_condition_len": int(image_condition.shape[0]),
         }
 
         dit_inputs.append(
