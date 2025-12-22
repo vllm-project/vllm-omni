@@ -16,7 +16,6 @@ python image_edit.py \
   --output output_image_edit.png \
   --num_inference_steps 50 \
   --cfg_scale 4.0 \
-  --guidance_scale 1.0
 ```
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
@@ -26,7 +25,7 @@ For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or later version:
 ```bash
 python image_edit.py \
   --model Qwen/Qwen-Image-Edit-2509 \
-  --image img1.png img2.png img3.png \
+  --image img1.png img2.png \
   --prompt "Combine these images into a single scene" \
   --output output_image_edit.png \
   --num_inference_steps 50 \
