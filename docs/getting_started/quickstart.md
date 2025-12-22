@@ -40,7 +40,7 @@ For more usages, please refer to [offline inference](../user_guide/examples/offl
 
 ## Online Serving with OpenAI-Completions API
 
-Text-to-image generation quickstart with vLLM-Omni (Z-Image-Turbo):
+Text-to-image generation quickstart with vLLM-Omni:
 
 ```bash
 vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091
