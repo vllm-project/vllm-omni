@@ -5,12 +5,20 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serv
 
 This example demonstrates how to deploy Qwen-Image-Edit model for online image editing service using vLLM-Omni.
 
+For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
+
 ## Start Server
 
 ### Basic Start
 
 ```bash
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
+```
+
+### Multi-Image Edit (Qwen-Image-Edit-2509)
+
+```bash
+vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
 ```
 
 ### Start with Parameters
@@ -20,6 +28,12 @@ Or use the startup script:
 
 ```bash
 bash run_server.sh
+```
+
+To serve Qwen-Image-Edit-2509 with the script:
+
+```bash
+MODEL=Qwen/Qwen-Image-Edit-2509 bash run_server.sh
 ```
 
 ## API Calls
@@ -56,6 +70,9 @@ curl -s http://localhost:8092/v1/chat/completions \
 
 ```bash
 python openai_chat_client.py --input input.png --prompt "Convert to oil painting style" --output output.png
+
+# Multi-image editing (Qwen-Image-Edit-2509 server required)
+python openai_chat_client.py --input input1.png input2.png --prompt "Combine these images into a single scene" --output output.png
 ```
 
 ### Method 3: Using Gradio Demo
@@ -121,6 +138,25 @@ Use `extra_body` to pass generation parameters:
     "guidance_scale": 7.5,
     "seed": 42
   }
+}
+```
+
+### Multi-Image Editing (Qwen-Image-Edit-2509)
+
+Provide multiple images in `content` (order matters):
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Combine these images into a single scene"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."} },
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."} }
+      ]
+    }
+  ]
 }
 ```
 

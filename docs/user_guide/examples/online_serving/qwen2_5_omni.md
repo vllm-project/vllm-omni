@@ -165,3 +165,7 @@ sudo apt install ffmpeg
     ``````sh
     --8<-- "examples/online_serving/qwen2_5_omni/run_curl_multimodal_generation.sh"
     ``````
+??? abstract "run_gradio_demo.sh"
+    ``````sh
+    --8<-- "examples/online_serving/qwen2_5_omni/run_gradio_demo.sh"
+    ``````

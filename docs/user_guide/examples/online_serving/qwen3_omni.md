@@ -150,7 +150,6 @@ The gradio script supports the following arguments:
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
-- `--share`: Share the Gradio demo publicly (creates a public link)
 
 ## Example materials
 
@@ -169,4 +168,8 @@ The gradio script supports the following arguments:
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh
     --8<-- "examples/online_serving/qwen3_omni/run_curl_multimodal_generation.sh"
+    ``````
+??? abstract "run_gradio_demo.sh"
+    ``````sh
+    --8<-- "examples/online_serving/qwen3_omni/run_gradio_demo.sh"
     ``````
