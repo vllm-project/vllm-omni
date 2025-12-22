@@ -78,6 +78,7 @@ class TestGPUWorkerSleep:
     """Test GPUWorker.sleep method."""
 
     @patch("vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info")
+    @patch("vllm.device_allocator.cumem.CuMemAllocator")
     def test_sleep_level_1(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
         # Setup memory info mocks
