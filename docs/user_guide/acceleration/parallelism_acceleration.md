@@ -6,7 +6,7 @@ This guide includes how to use parallelism methods in vLLM-Omni to speed up diff
 
 The following parallelism methods are currently supported in vLLM-Omni:
 
-1. DeepSpeed Ulysses Sequence Parallel (Ulysses-SP) ([paper](https://arxiv.org/pdf/2309.14509)): Ulysses-SP splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
+1. DeepSpeed Ulysses Sequence Parallel (DeepSpeed Ulysses-SP) ([arxiv paper](https://arxiv.org/pdf/2309.14509)): Ulysses-SP splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
 
 
 The following table shows which models are currently supported by parallelism method:
@@ -22,9 +22,9 @@ The following table shows which models are currently supported by parallelism me
 
 #### Ulysses-SP
 
-##### Quick Start
+##### Offline Inference
 
-An example of using Ulysses-SP is shown below:
+An example of offline inference script using [Ulysses-SP](https://arxiv.org/pdf/2309.14509) is shown below:
 ```python
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
@@ -70,7 +70,7 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 
 ##### How to parallelize a new model
 
-If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can refer to the following instructions to parallelize it with Ulysses-SP.
+If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can refer to the following instructions to parallelize it with [Ulysses-SP](https://arxiv.org/pdf/2309.14509).
 
 This section uses **Qwen-Image** (`QwenImageTransformer2DModel`) as the reference implementation. Qwen-Image is a **dual-stream** transformer (text + image) that performs **joint attention** across the concatenated sequences. Because of that, when enabling sequence parallel you typically:
 
@@ -82,7 +82,7 @@ This section uses **Qwen-Image** (`QwenImageTransformer2DModel`) as the referenc
 First, add the sequence-parallel helpers and (for Qwen-Image) the forward-context flag. Then, in the transformer's `forward()`:
 
 - Chunk `hidden_states` by SP world size.
-- Set `get_forward_context().split_text_embed_in_sp = False` because Qwen-Image uses joint attention and expects full text on every rank.
+- Set `get_forward_context().split_text_embed_in_sp = False` because Qwen-Image uses joint attention and we would use a full text embedding in each rank.
 - After `pos_embed`, chunk `img_freqs` on `dim=0` (token axis) to match the chunked image tokens; only chunk `txt_freqs` if you explicitly split text embeddings in SP.
 
 Taking `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` as an example:
