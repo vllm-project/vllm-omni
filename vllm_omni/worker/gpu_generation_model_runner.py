@@ -175,21 +175,21 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
             # Input token count for this iteration (not used by diffusion, but
             # retained to keep DP padding/ordering consistent)
-            (
-                num_scheduled_tokens,
-                num_input_tokens,
-                num_tokens_across_dp,
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-            ) = self._preprocess(
-                scheduler_output,
-                intermediate_tensors,
-                ubatch_slices,
-                num_tokens_after_padding,
-            )
+                (
+                    num_scheduled_tokens,
+                    num_input_tokens,
+                    num_tokens_across_dp,
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                ) = self._preprocess(
+                    scheduler_output,
+                    intermediate_tensors,
+                    ubatch_slices,
+                    num_tokens_after_padding,
+                )
 
         cudagraph_runtime_mode = CUDAGraphMode.NONE
         # Run the model.
@@ -207,12 +207,19 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # NOTE: Unlike the AR runner, the generation runner previously did not
+            # pass per-request runtime additional_information into the model.
+            # For conditional generation stages (e.g., DiT conditioned on AR hidden
+            # states), the model must be able to read `runtime_additional_information`
+            # (and optionally `request_ids` / `request_token_spans`) from kwargs.
+            model_kwargs_extra = self._build_model_kwargs_extra(None, num_scheduled_tokens_np)
             outputs = self._run_generation_model(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 multimodal_kwargs=model_kwargs,
+                model_kwargs_extra=model_kwargs_extra,
                 logits_indices=logits_indices,
             )
 
@@ -262,6 +269,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None,
         multimodal_kwargs: dict,
+        model_kwargs_extra: dict[str, object] | None,
         logits_indices: torch.Tensor,
     ) -> torch.Tensor | list[torch.Tensor]:
         """Run generation from codec codes to waveforms.
@@ -284,6 +292,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             logits_index=logits_indices,
             sampler=self.sampler,
         )
+        if model_kwargs_extra:
+            kwargs.update(model_kwargs_extra)
 
         if hasattr(self.model, "forward"):
             return self.model.forward(**kwargs)

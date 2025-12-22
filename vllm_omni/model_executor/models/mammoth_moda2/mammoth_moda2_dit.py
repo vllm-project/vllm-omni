@@ -226,24 +226,14 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             latents = latents + self.gen_vae.config.shift_factor
         image = self.gen_vae.decode(latents, return_dict=False)[0]
 
-        # 返回给 vLLM-Omni：
-        # - AR runner 路径：pooler_output 的 payload 会默认包含 "hidden"，且会按 output_type 重命名；
-        #   为避免覆盖真实图像，使用 list 形式让 runner 把图像作为独立 key 合并进 payload。
-        # - Generation runner 路径：期望直接返回 Tensor/list[Tensor]，因此在没有额外信息透传时走 tensor 输出。
-        use_ar_runner_channel = (
-            "runtime_additional_information" in kwargs or "additional_information_by_req_id" in kwargs
-        )
-        mm_out: object = {"image": [image]} if use_ar_runner_channel else image
-
         return OmniOutput(
             text_hidden_states=inputs_embeds,  # 占位，runner 不会用到
-            multimodal_outputs=mm_out,
+            multimodal_outputs=image,
             intermediate_tensors=None,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:  # noqa: ARG002
-        # DiT stage 走 AR runner 时仍会进入采样路径；返回一个最小 vocab 的 logits 以完成该流程。
-        return hidden_states.new_zeros((hidden_states.shape[0], 1))
+        return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

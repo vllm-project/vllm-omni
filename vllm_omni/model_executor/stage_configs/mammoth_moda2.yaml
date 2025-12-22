@@ -30,17 +30,13 @@ stage_args:
     engine_args:
       model_stage: dit
       model_arch: MammothModa2ForConditionalGeneration
-      # NOTE: GPUGenerationModelRunner 不会透传 additional/runtime_additional_information，
-      # DiT 需要从上游 AR hidden states 构造的 condition embedding，因此这里复用 AR runner 路径。
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       # 同上：避免 stage-0 预留过多显存导致 stage-1 init_device 直接报错。
       gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
-      # 避免 output processor 将 "hidden" 重命名为 "image" 覆盖真实图像输出
-      engine_output_type: text+image
-      max_model_len: 16
+      engine_output_type: image
       enable_prefix_caching: false
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit

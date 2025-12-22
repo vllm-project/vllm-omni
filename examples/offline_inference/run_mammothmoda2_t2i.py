@@ -4,7 +4,7 @@ MammothModa2 文生图（AR -> DiT）离线推理示例，使用 vllm_omni.Omni 
 说明：
 - Stage 0（AR）生成 gen tokens（视觉 token 序列），同时输出每个 token 的 hidden states（engine_output_type=latent）。
 - Stage 1（DiT）消费 AR hidden states 构造的 condition（通过 additional_information 传递），执行 diffusion + VAE decode 输出图像。
-  注意：当前 stage-1 复用 AR runner 路径以透传 additional_information，因此 SamplingParams 仅用于完成采样流程占位。
+  注意：stage-1 使用 GenerationWorker；condition 通过 GenerationModelRunner 透传的 runtime_additional_information 注入到 DiT.forward。
 
 用法示例：
   uv run python examples/offline_inference/run_mammothmoda2_t2i.py \\
@@ -146,7 +146,7 @@ def main() -> None:
         dit_sampling = SamplingParams(
             temperature=0.0,
             top_p=1.0,
-            top_k=1,
+            top_k=-1,
             max_tokens=1,
             detokenize=False,
         )
