@@ -17,7 +17,7 @@ from vllm.logger import init_logger
 from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import Counter
+from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
 from vllm_omni.distributed.omni_connectors import (
@@ -33,8 +33,8 @@ from vllm_omni.distributed.ray_utils.utils import (
     try_close_ray,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.processor import OmniProcessor
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
     configure_orchestrator_logger,
@@ -44,6 +44,7 @@ from vllm_omni.entrypoints.log_utils import (
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
+    get_final_stage_id_for_e2e,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -147,6 +148,7 @@ class OmniLLM:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
         if self.worker_backend == "ray":
@@ -291,22 +293,17 @@ class OmniLLM:
         _wall_start_ts: float = time.time()
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
-        final_stage_id_for_e2e = -1
-        last_stage_id = len(self.stage_list) - 1
-        try:
-            for _sid in range(last_stage_id, -1, -1):
-                if getattr(self.stage_list[_sid], "final_output", False):
-                    final_stage_id_for_e2e = _sid
-                    break
-            if final_stage_id_for_e2e < 0:
-                final_stage_id_for_e2e = last_stage_id
-        except Exception as e:
-            logger.debug(
-                "[Orchestrator] Failed to determine final stage for E2E; falling back to last: %s",
-                e,
-                exc_info=True,
+        final_stage_id_to_prompt = {}
+        for rid, prompt in request_id_to_prompt.items():
+            if isinstance(prompt, dict):
+                prompt_modalities = prompt.get("modalities", None)
+            else:
+                prompt_modalities = None
+            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
+                prompt_modalities, self.output_modalities, self.stage_list
             )
-            final_stage_id_for_e2e = last_stage_id
+            final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
+
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
             num_stages,
@@ -406,7 +403,7 @@ class OmniLLM:
                     # (only once per request at the designated final stage)
                     try:
                         rid_key = str(req_id)
-                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
+                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -422,7 +419,7 @@ class OmniLLM:
                         )
 
                 next_stage_id = stage_id + 1
-                if next_stage_id < num_stages:
+                if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     try:
                         next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
@@ -479,7 +476,7 @@ class OmniLLM:
 
         # Summarize and print stats
         try:
-            summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
+            summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
             logger.info("[Summary] %s", summary)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
@@ -627,7 +624,7 @@ class OmniStageLLM(LLM):
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.processor = OmniProcessor(
+        self.llm_engine.input_processor = OmniInputProcessor(
             vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
         )
         self.engine_class = type(self.llm_engine)
@@ -644,3 +641,5 @@ class OmniStageLLM(LLM):
         # Load the Input/Output processor plugin if any
         io_processor_plugin = self.llm_engine.model_config.io_processor_plugin
         self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
+        self.model_config = self.llm_engine.model_config
+        self.input_processor = self.llm_engine.input_processor

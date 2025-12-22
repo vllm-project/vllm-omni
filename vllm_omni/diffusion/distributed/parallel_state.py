@@ -10,7 +10,6 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
 """vLLM-Omni distributed state.
 
 It takes over the control of the distributed environment from PyTorch.
@@ -29,12 +28,9 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 
-from typing import Optional
-
 import torch
 import torch.distributed
 import vllm.distributed.parallel_state as vllm_parallel_state
-from torch.cuda import device_count, set_device
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
@@ -239,16 +235,6 @@ class RankGenerator:
                 to obtain multiple parallel types, we can use a hyphen
                 '-' to separate them. For example, if we want to obtain
                 the TP_DP group, the token should be 'tp-dp'.
-<<<<<<< HEAD
-
-            independent_ep (bool: True):
-                This flag controls whether we treat EP and DP independently.
-                EP shares ranks with DP, if we want to get ranks related to
-                EP, we should set the flag. For example, get_ranks('dp', True)
-                will get DP modulo EP group, and get_ranks('dp', False) will
-                get full DP group.
-=======
->>>>>>> wtomin/usp
         """
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
@@ -295,10 +281,6 @@ def get_ring_parallel_world_size():
 
 def get_ring_parallel_rank():
     return get_sp_group().ring_rank
-
-
-def get_ring_parallel_group():
-    return get_sp_group().ring_group
 
 
 # PP

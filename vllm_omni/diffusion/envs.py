@@ -2,8 +2,8 @@
 # Adapted from
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
 import os
-from typing import TYPE_CHECKING, Any, Callable, Optional
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 from packaging import version

@@ -22,7 +22,7 @@ from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -112,7 +112,7 @@ class OmniStage:
         """
         self.vllm_config = vllm_config
 
-    def set_tokenizer(self, tokenizer: AnyTokenizer) -> None:
+    def set_tokenizer(self, tokenizer: TokenizerLike) -> None:
         """Set the tokenizer for this stage.
 
         Args:
@@ -626,6 +626,7 @@ def _stage_worker(
                 idx = 0
                 for ro in unmapped:
                     target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                    ro.request_id = target_rid
                     req_to_outputs[target_rid].append(ro)
                     idx += 1
 

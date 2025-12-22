@@ -14,9 +14,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionMetadata,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
@@ -36,6 +35,10 @@ class Attention(nn.Module):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        # ulysses attention
+        scatter_idx: int = 2,
+        gather_idx: int = 1,
+        use_sync: bool = False,
         # ulysses attention
         scatter_idx: int = 2,
         gather_idx: int = 1,

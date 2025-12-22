@@ -129,6 +129,15 @@ def parse_args():
         default=ASYNC_INIT_TIMEOUT,
         help="Timeout (seconds) for initializing all stages.",
     )
+    parser.add_argument(
+        "--worker-backend", type=str, default="multi_process", choices=["multi_process", "ray"], help="backend"
+    )
+    parser.add_argument(
+        "--ray-address",
+        type=str,
+        default=None,
+        help="Address of the Ray cluster.",
+    )
     return parser.parse_args()
 
 
@@ -143,6 +152,8 @@ def build_async_omni_cli_args(base_args: argparse.Namespace) -> argparse.Namespa
         shm_threshold_bytes=int(getattr(base_args, "shm_threshold_bytes", 65536)),
         batch_timeout=int(getattr(base_args, "batch_timeout", 10)),
         init_timeout=int(getattr(base_args, "init_timeout", ASYNC_INIT_TIMEOUT)),
+        worker_backend=getattr(base_args, "worker_backend", "multi_process"),
+        ray_address=getattr(base_args, "ray_address", None),
     )
 
 
@@ -297,10 +308,14 @@ async def run_inference_async_omni(
     image_file: Image.Image | None = None,
     video_file: str | None = None,
     use_audio_in_video: bool = False,
+    output_modalities: str | None = None,
 ):
     """Run inference using AsyncOmni directly with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
         return "Please provide at least a text prompt or multimodal input.", None
+
+    if output_modalities is not None:
+        output_modalities = output_modalities.split(",")
 
     try:
         # Build prompt with multimodal data
@@ -386,6 +401,7 @@ async def run_inference_async_omni(
             prompt=omni_prompt,
             request_id=request_id,
             sampling_params_list=sampling_params,
+            output_modalities=output_modalities,
         ):
             # stage_outputs.request_output is a RequestOutput object, not a list
             request_output = stage_outputs.request_output
@@ -430,6 +446,7 @@ def build_interface(
         image_file: Image.Image | None,
         video_file: str | None,
         use_audio_in_video: bool,
+        output_modalities: str | None = None,
     ):
         return await run_inference_async_omni(
             omni,
@@ -440,6 +457,7 @@ def build_interface(
             image_file,
             video_file,
             use_audio_in_video,
+            output_modalities,
         )
 
     css = """
@@ -508,6 +526,14 @@ def build_interface(
                 )
 
         with gr.Row():
+            output_modalities = gr.Textbox(
+                label="Output Modalities",
+                placeholder="For example: text, image, video. Use comma to separate multiple modalities.",
+                lines=1,
+                scale=1,
+            )
+
+        with gr.Row():
             generate_btn = gr.Button(
                 "Generate",
                 variant="primary",
@@ -521,7 +547,7 @@ def build_interface(
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox],
+            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox, output_modalities],
             outputs=[text_output, audio_output],
         )
         demo.queue()

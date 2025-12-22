@@ -342,6 +342,9 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
+    # support multi images input
+    supports_multimodal_inputs: bool = False
+
     # Logging
     log_level: str = "info"
 
@@ -395,12 +398,35 @@ class OmniDiffusionConfig:
                 f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
             )
 
+        # Convert string dtype to torch.dtype if needed
+        if isinstance(self.dtype, str):
+            dtype_map = {
+                "auto": torch.bfloat16,
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+                "half": torch.float16,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+                "float": torch.float32,
+            }
+            dtype_lower = self.dtype.lower()
+            if dtype_lower in dtype_map:
+                self.dtype = dtype_map[dtype_lower]
+            else:
+                logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
+                self.dtype = torch.bfloat16
+
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
             self.cache_config = DiffusionCacheConfig.from_dict(self.cache_config)
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+    def update_multimodal_support(self) -> None:
+        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

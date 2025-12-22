@@ -19,11 +19,7 @@ def all_to_all_4D(
         input (torch.tensor): a tensor sharded along dim scatter dim
         scatter_idx (int): default 1
         gather_idx (int): default 2
-<<<<<<< HEAD
-        group : torch process group
-=======
         group (torch.distributed.ProcessGroup): torch process group
->>>>>>> wtomin/usp
         use_sync (bool): whether to synchronize after all-to-all
 
     Returns:
@@ -116,16 +112,6 @@ class SeqAllToAll4D(torch.autograd.Function):
         ctx.use_sync = use_sync
         return all_to_all_4D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
 
-    @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> tuple[None, Tensor, None, None]:
-        return (
-            None,
-            SeqAllToAll4D.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync),
-            None,
-            None,
-            None,
-        )
-
 
 def all_to_all_5D(
     input: torch.tensor, scatter_idx: int = 3, gather_idx: int = 1, group=None, use_sync: bool = False
@@ -138,13 +124,8 @@ def all_to_all_5D(
         input (torch.tensor): a tensor sharded along dim scatter dim
         scatter_idx (int): default 1
         gather_idx (int): default 2
-<<<<<<< HEAD
-        group : torch process group
-        use_sync: whether to synchronize after all-to-all
-=======
         group (torch.distributed.ProcessGroup): torch process group
         use_sync (bool): whether to synchronize after all-to-all
->>>>>>> wtomin/usp
 
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, 3, hc, hs)
@@ -238,13 +219,3 @@ class SeqAllToAll5D(torch.autograd.Function):
         ctx.use_sync = use_sync
 
         return all_to_all_5D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
-
-    @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> tuple[None, Tensor, None, None]:
-        return (
-            None,
-            SeqAllToAll5D.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync),
-            None,
-            None,
-            None,
-        )

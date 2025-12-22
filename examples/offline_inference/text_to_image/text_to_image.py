@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -119,6 +120,7 @@ def main():
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        parallel_config=parallel_config,
         parallel_config=parallel_config,
     )
 
