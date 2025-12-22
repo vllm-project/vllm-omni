@@ -11,17 +11,23 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 The following table shows which models are currently supported by parallelism method:
 
+### ImageGen
 
 | Model | Model Identifier | Ulysses-SP |
 |-------|------------------|-----------|
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ |
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ |
 | **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ |
 | **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ |
 | **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ |
+
+### VideoGen
+
+| Model | Model Identifier | Ulysses-SP |
+|-------|------------------|-----------|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ |
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ |
 
 ### Sequence Parallelism
 
