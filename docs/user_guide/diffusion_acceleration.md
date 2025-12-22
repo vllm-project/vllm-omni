@@ -33,11 +33,15 @@ The following table shows which models are currently supported by each accelerat
 
 
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
-|-------|-----------------|----------|-----------|-----------|
+|-------|------------------|----------|-----------|-----------|
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ |✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ❌ | ✅ |✅ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ | ❌ |
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ |
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ |
 
 
 ## Performance Benchmarks
