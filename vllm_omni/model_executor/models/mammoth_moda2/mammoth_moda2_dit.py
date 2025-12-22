@@ -148,29 +148,10 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
 
         if text_cond is not None or image_cond is not None:
             # Preferred path: separate text/image conditions from preprocess.
-            if text_cond is not None:
-                text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
-            if image_cond is not None:
-                image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
-
-            hidden_size = None
-            if text_cond is not None:
-                hidden_size = int(text_cond.shape[1])
-            elif image_cond is not None:
-                hidden_size = int(image_cond.shape[1])
-
-            if hidden_size is None:
-                raise ValueError("DiT stage expects condition embeddings, but none were provided.")
-
-            if text_cond is None:
-                text_cond = torch.zeros((0, hidden_size), dtype=target_dtype, device=model_device)
-            else:
-                text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
-
-            if image_cond is None:
-                image_cond = torch.zeros((0, hidden_size), dtype=target_dtype, device=model_device)
-            else:
-                image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+            text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
+            image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
+            text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+            image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
 
             text_embeds = text_cond.unsqueeze(0)  # [1, T_text, H]
             text_attention_mask = torch.ones(
@@ -199,6 +180,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
         else:
             # Legacy path: a single concatenated condition tensor.
+            # use in dummy/profile runs
             if legacy_cond is None:
                 raise ValueError("DiT stage expects condition embeddings, but none were provided.")
             legacy_cond = _ensure_2d(legacy_cond, "prompt_embeds")
@@ -225,13 +207,11 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         scheduler = FlowMatchEulerDiscreteScheduler()
         num_inference_steps = 50
 
-        timesteps = scheduler.set_timesteps(
+        scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
             device=prompt_embeds.device,
             num_tokens=latents.shape[-2] * latents.shape[-1],
         )
-        # diffusers 风格：set_timesteps 返回 None，但会写入 scheduler.timesteps
-        _ = timesteps
 
         # Run diffusion loop (no CFG for now)
         for t in scheduler.timesteps:
