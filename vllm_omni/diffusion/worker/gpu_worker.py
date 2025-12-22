@@ -4,7 +4,6 @@ import multiprocessing as mp
 import os
 import time
 
-import cloudpickle
 import torch
 import zmq
 from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
@@ -200,10 +199,6 @@ class WorkerProc:
             # Only execute if we should reply (either output_rank is None or matches our rank)
             if output_rank is not None and output_rank != self.gpu_id:
                 return None
-
-            # Deserialize method if it's a callable
-            if isinstance(method, bytes):
-                method = cloudpickle.loads(method)
 
             # Execute the method
             if isinstance(method, str):

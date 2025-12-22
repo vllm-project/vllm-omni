@@ -2,12 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing as mp
-import pickle
 import time
 from collections.abc import Callable
 from typing import Any
 
-import cloudpickle
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -181,11 +179,8 @@ class DiffusionEngine:
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        # Prepare the method to send
-        if isinstance(method, str):
-            send_method = method
-        else:
-            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+        assert isinstance(method, str)
+        send_method = method
 
         # Prepare RPC request message
         rpc_request = {
@@ -228,7 +223,7 @@ class DiffusionEngine:
         except Exception as e:
             logger.error(f"RPC call failed: {e}")
             raise
-    
+
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         prompt = "dummy run"
