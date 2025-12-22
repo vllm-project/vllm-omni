@@ -56,7 +56,7 @@ class Scheduler:
                 "method": "generate",
                 "args": (requests,),
                 "kwargs": {},
-                "output_rank": 0,  
+                "output_rank": 0,
             }
 
             # Broadcast RPC request to all workers
