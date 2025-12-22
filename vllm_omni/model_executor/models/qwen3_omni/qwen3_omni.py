@@ -6,7 +6,6 @@
 from collections import defaultdict
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -19,6 +18,12 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+    Qwen3OmniMoeConditionalGenerationMixin,
+    Qwen3OmniMoeThinkerDummyInputsBuilder,
+    Qwen3OmniMoeThinkerMultiModalProcessor,
+    Qwen3OmniMoeThinkerProcessingInfo,
+)
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
@@ -28,13 +33,6 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-
-from .qwen3_omni_moe_thinker import (
-    Qwen3OmniMoeConditionalGenerationMixin,
-    Qwen3OmniMoeThinkerDummyInputsBuilder,
-    Qwen3OmniMoeThinkerMultiModalProcessor,
-    Qwen3OmniMoeThinkerProcessingInfo,
-)
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -198,10 +196,10 @@ class Qwen3OmniMoeForConditionalGeneration(
     def move_submodules_to_devices(
         self,
         *,
-        thinker_device: Optional[Union[str, torch.device]] = None,
-        talker_device: Optional[Union[str, torch.device]] = None,
-        code_predictor_device: Optional[Union[str, torch.device]] = None,
-        code2wav_device: Optional[Union[str, torch.device]] = None,
+        thinker_device: str | torch.device | None = None,
+        talker_device: str | torch.device | None = None,
+        code_predictor_device: str | torch.device | None = None,
+        code2wav_device: str | torch.device | None = None,
     ) -> None:
         """
         Optionally move thinker/talker/code2wav to different devices.
@@ -227,20 +225,21 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self.model.sampler
         return Sampler()
 
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
+        is_multimodal=None,
     ) -> torch.Tensor:
-        """Get input embeddings for the active model stage."""
         if self.model_stage == "code2wav":
-            # Code2wav doesn't use text embeddings
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
-        return self.model.get_input_embeddings(input_ids, multimodal_embeddings)
+        return self.model.embed_input_ids(
+            input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
+        )
 
-    def get_multimodal_embeddings(self, **kwargs):
+    def embed_multimodal(self, **kwargs):
         """Delegate to active model for multimodal processing."""
-        return self.model.get_multimodal_embeddings(**kwargs)
+        return self.model.embed_multimodal(**kwargs)
 
     # ==================== Forward Pass ====================
     def _get_talker_suppressed_tokens(self):
@@ -257,16 +256,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         generate_audio: bool = True,
         voice_type: str = "ethan",
-        codec: Optional[torch.Tensor] = None,
-        sampling_metadata: Optional[SamplingMetadata] = None,
-        logits_index: Optional[int] = None,
-        additional_information: Optional[dict[str, object]] = None,
+        codec: torch.Tensor | None = None,
+        sampling_metadata: SamplingMetadata | None = None,
+        logits_index: int | None = None,
+        additional_information: dict[str, object] | None = None,
         **kwargs: object,
-    ) -> Union[torch.Tensor, IntermediateTensors, OmniOutput]:
+    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
         Unified forward pass for all model stages.
 
@@ -282,16 +281,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
             # Normalize to batched inputs if needed
-            added_batch_dim = False
+            _added_batch_dim = False
             if input_ids is not None and input_ids.ndim == 1:
                 input_ids = input_ids.unsqueeze(0)
-                added_batch_dim = True
+                _added_batch_dim = True
             if positions is not None and positions.ndim == 1:
                 positions = positions.unsqueeze(0)
-                added_batch_dim = True
+                _added_batch_dim = True
             if inputs_embeds is not None and inputs_embeds.ndim == 2:
                 inputs_embeds = inputs_embeds.unsqueeze(0)
-                added_batch_dim = True
+                _added_batch_dim = True
 
             thinker_dev = self._module_device(self.thinker)
 
@@ -302,7 +301,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     dtype=torch.long,
                     device=thinker_dev,
                 ).unsqueeze(0)
-                added_batch_dim = True
+                _added_batch_dim = True
 
             # Move to thinker device
             if input_ids is not None and input_ids.device != thinker_dev:
@@ -338,7 +337,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     device=self._module_device(self.thinker),
                     dtype=torch.long,
                 )
-                thinker_tts_embeds = self.thinker.get_input_embeddings(tts_tokens)  # [1,3,thinker_hidden]
+                thinker_tts_embeds = self.thinker.embed_input_ids(tts_tokens)  # [1,3,thinker_hidden]
                 if (
                     isinstance(thinker_tts_embeds, torch.Tensor)
                     and thinker_tts_embeds.ndim == 3
@@ -354,7 +353,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # Return text-only output (with multimodal sidecar)
             return OmniOutput(
-                text_hidden_states=(text_hidden_states.squeeze(0) if added_batch_dim else text_hidden_states),
+                text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
                 multimodal_outputs=multimodal_outputs,
             )
 
@@ -380,12 +379,12 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # Ensure we have base embeddings when only ids are provided
             if inputs_embeds is None and input_ids is not None:
-                inputs_embeds = self.talker.get_input_embeddings(input_ids)
+                inputs_embeds = self.talker.embed_input_ids(input_ids)
 
             # ------- Request-scoped additional information (no cross-request concat) -------
-            request_ids: Optional[list[str]] = kwargs.get("request_ids")  # ordered
-            request_token_spans: Optional[list[tuple[int, int]]] = kwargs.get("request_token_spans")
-            addi_by_req: Optional[dict] = kwargs.get("additional_information_by_req_id")
+            request_ids: list[str] | None = kwargs.get("request_ids")  # ordered
+            request_token_spans: list[tuple[int, int]] | None = kwargs.get("request_token_spans")
+            addi_by_req: dict | None = kwargs.get("additional_information_by_req_id")
             runtime_addi = kwargs.get("runtime_additional_information")
 
             # Normalize runtime_addi into a mapping by request_id for convenience
@@ -749,8 +748,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         - hidden_projection: Used at runtime for multimodal hidden states (audio/image/video)
           from thinker's last layer, not needed for special token initialization
         """
-        # Get embeddings from both models
-        # self.thinker_embedding = self.thinker.model.get_input_embeddings()
         self.talker_embedding = self._load_talker_embedding()
 
         # Get configuration
@@ -808,14 +805,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         thinker_embed: torch.Tensor,
         thinker_hidden: torch.Tensor,
-        multimodal_mask: Optional[torch.Tensor],
+        multimodal_mask: torch.Tensor | None,
         input_ids: torch.Tensor,
         thinker_result_ids: torch.Tensor,
         speaker_id,
-        tts_bos_thinker: Optional[torch.Tensor] = None,
-        tts_eos_thinker: Optional[torch.Tensor] = None,
-        tts_pad_thinker: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        tts_bos_thinker: torch.Tensor | None = None,
+        tts_eos_thinker: torch.Tensor | None = None,
+        tts_pad_thinker: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Project thinker outputs to talker inputs during prefill stage.
 
@@ -845,7 +842,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 return x[-1]
             return x.view(1, 1, -1)
 
-        def _proj_from_thinker(x_opt: Optional[torch.Tensor]) -> torch.Tensor:
+        def _proj_from_thinker(x_opt: torch.Tensor | None) -> torch.Tensor:
             if isinstance(x_opt, torch.Tensor) and x_opt.numel() > 0:
                 xin = _ensure_1x1(x_opt).to(talker_dev)
             else:
@@ -863,7 +860,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         talker_input_embeds = []  # [1 t d]
         talker_input_ids = []
-        trailing_text_hidden_all: Optional[torch.Tensor] = None
+        trailing_text_hidden_all: torch.Tensor | None = None
         # For every chatml parts
         for i in range(len(im_start_indexes) - 1):
             im_start_index = im_start_indexes[i].item()
@@ -961,9 +958,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     device=tts_pad_embed.device,
                     dtype=torch.bfloat16,
                 ),
-                self.talker.get_input_embeddings(codec_special_tokens).to(
-                    device=tts_pad_embed.device, dtype=torch.bfloat16
-                ),
+                self.talker.embed_input_ids(codec_special_tokens).to(device=tts_pad_embed.device, dtype=torch.bfloat16),
             ),
             dim=0,
         )
@@ -986,8 +981,8 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     def _talker_to_code_predictor(
         self,
-        talker_hidden_states: Optional[torch.Tensor],
-        layer0_token_ids: Optional[torch.Tensor],
+        talker_hidden_states: torch.Tensor | None,
+        layer0_token_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Project talker outputs to code predictor inputs.
@@ -1025,9 +1020,9 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     def compute_logits(
         self,
-        hidden_states: Union[torch.Tensor, OmniOutput],
+        hidden_states: torch.Tensor | OmniOutput,
         sampling_metadata: SamplingMetadata = None,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Compute logits from hidden states."""
         # Handle OmniOutput type
         from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -1060,7 +1055,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 logitsprocs=LogitsProcessors(),
             )
         # Use active model for logits computation
-        logits = self.model.compute_logits(hidden_states, sampling_metadata)  # V, d
+        logits = self.model.compute_logits(hidden_states)  # V, d
         # Talker: suppress tokens by setting their probability to ~1e-9 (finite very small),
         # implemented by assigning their logits to log(1e-9).
 
@@ -1083,7 +1078,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         """Sample from logits."""
         return self.model.sample(logits, sampling_metadata)
 

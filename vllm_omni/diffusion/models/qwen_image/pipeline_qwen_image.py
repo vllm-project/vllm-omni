@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -75,10 +75,10 @@ def calculate_shift(
 
 def retrieve_timesteps(
     scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[list[int]] = None,
-    sigmas: Optional[list[float]] = None,
+    num_inference_steps: int | None = None,
+    device: str | torch.device | None = None,
+    timesteps: list[int] | None = None,
+    sigmas: list[float] | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, int]:
     r"""
@@ -186,7 +186,7 @@ def get_timestep_embedding(
 
 def apply_rotary_emb_qwen(
     x: torch.Tensor,
-    freqs_cis: Union[torch.Tensor, tuple[torch.Tensor]],
+    freqs_cis: torch.Tensor | tuple[torch.Tensor],
     use_real: bool = True,
     use_real_unbind_dim: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -270,9 +270,6 @@ class QwenImagePipeline(
         self.transformer = QwenImageTransformer2DModel(od_config=od_config)
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-
-        # Initialize cache backend to None (will be set by worker if needed)
-        self._cache_backend = None
 
         self.stage = None
 
@@ -359,8 +356,8 @@ class QwenImagePipeline(
 
     def _get_qwen_prompt_embeds(
         self,
-        prompt: Union[str, list[str]] = None,
-        dtype: Optional[torch.dtype] = None,
+        prompt: str | list[str] = None,
+        dtype: torch.dtype | None = None,
     ):
         dtype = dtype or self.text_encoder.dtype
 
@@ -400,10 +397,10 @@ class QwenImagePipeline(
 
     def encode_prompt(
         self,
-        prompt: Union[str, list[str]],
+        prompt: str | list[str],
         num_images_per_prompt: int = 1,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_embeds_mask: Optional[torch.Tensor] = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
     ):
         r"""
@@ -555,41 +552,31 @@ class QwenImagePipeline(
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
             # Forward pass for positive prompt (or unconditional if no CFG)
-            # cache_branch is passed to hook for CFG-aware state management
-            transformer_kwargs = {
-                "hidden_states": latents,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states_mask": prompt_embeds_mask,
-                "encoder_hidden_states": prompt_embeds,
-                "img_shapes": img_shapes,
-                "txt_seq_lens": txt_seq_lens,
-                "attention_kwargs": self.attention_kwargs,
-                "return_dict": False,
-            }
-            if self._cache_backend is not None:
-                transformer_kwargs["cache_branch"] = "positive"
-
-            noise_pred = self.transformer(**transformer_kwargs)[0]
-
+            self.transformer.do_true_cfg = do_true_cfg
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / 1000,
+                guidance=guidance,
+                encoder_hidden_states_mask=prompt_embeds_mask,
+                encoder_hidden_states=prompt_embeds,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                attention_kwargs=self.attention_kwargs,
+                return_dict=False,
+            )[0]
             # Forward pass for negative prompt (CFG)
-            # cache_branch is passed to hook for CFG-aware state management
             if do_true_cfg:
-                neg_transformer_kwargs = {
-                    "hidden_states": latents,
-                    "timestep": timestep / 1000,
-                    "guidance": guidance,
-                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "img_shapes": img_shapes,
-                    "txt_seq_lens": negative_txt_seq_lens,
-                    "attention_kwargs": self.attention_kwargs,
-                    "return_dict": False,
-                }
-                if self._cache_backend is not None:
-                    neg_transformer_kwargs["cache_branch"] = "negative"
-
-                neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
+                neg_noise_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=negative_txt_seq_lens,
+                    attention_kwargs=self.attention_kwargs,
+                    return_dict=False,
+                )[0]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
@@ -601,23 +588,23 @@ class QwenImagePipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: Union[str, list[str]] = "",
-        negative_prompt: Union[str, list[str]] = "",
+        prompt: str | list[str] = "",
+        negative_prompt: str | list[str] = "",
         true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
         num_inference_steps: int = 50,
-        sigmas: Optional[list[float]] = None,
+        sigmas: list[float] | None = None,
         guidance_scale: float = 1.0,
         num_images_per_prompt: int = 1,
-        generator: Optional[Union[torch.Generator, list[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_embeds_mask: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "pil",
-        attention_kwargs: Optional[dict[str, Any]] = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_mask: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds_mask: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:

@@ -1,32 +1,19 @@
 import argparse
+import base64
+import io
 import os
 import random
-import signal
-import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 
 import gradio as gr
 import numpy as np
 import soundfile as sf
 import torch
+from openai import OpenAI
 from PIL import Image
-from vllm.assets.video import video_get_metadata, video_to_ndarrays
-from vllm.sampling_params import SamplingParams
-
-from vllm_omni.entrypoints.async_omni import AsyncOmni
-
-# Import utils from offline inference example
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../offline_inference/qwen2_5_omni"))
-try:
-    from utils import make_omni_prompt
-except ImportError:
-    # Fallback if utils doesn't exist - we'll build prompts directly
-    make_omni_prompt = None
 
 SEED = 42
-ASYNC_INIT_TIMEOUT = 600
 
 SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
     "Qwen/Qwen2.5-Omni-7B": {
@@ -76,7 +63,12 @@ def parse_args():
     parser.add_argument(
         "--model",
         default="Qwen/Qwen2.5-Omni-7B",
-        help="Path to local model checkpoint.",
+        help="Model name/path (should match the server model).",
+    )
+    parser.add_argument(
+        "--api-base",
+        default="http://localhost:8091/v1",
+        help="Base URL for the vLLM API server.",
     )
     parser.add_argument(
         "--ip",
@@ -85,67 +77,7 @@ def parse_args():
     )
     parser.add_argument("--port", type=int, default=7861, help="Port for gradio `launch`.")
     parser.add_argument("--share", action="store_true", help="Share the Gradio demo publicly.")
-    parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="Path to custom stage configs YAML file (optional).",
-    )
-    parser.add_argument(
-        "--log-stats",
-        action="store_true",
-        help="Enable statistics logging for AsyncOmni.",
-    )
-    parser.add_argument(
-        "--log-file",
-        type=str,
-        default=None,
-        help="Path prefix for AsyncOmni log files.",
-    )
-    parser.add_argument(
-        "--init-sleep-seconds",
-        type=int,
-        default=30,
-        help="Seconds to sleep between starting stage processes.",
-    )
-    parser.add_argument(
-        "--shm-threshold-bytes",
-        type=int,
-        default=65536,
-        help="Threshold in bytes for using shared memory IPC.",
-    )
-    parser.add_argument(
-        "--batch-timeout",
-        type=int,
-        default=10,
-        help="Batching timeout (seconds) inside each stage.",
-    )
-    parser.add_argument(
-        "--init-timeout",
-        type=int,
-        default=ASYNC_INIT_TIMEOUT,
-        help="Timeout (seconds) for initializing all stages.",
-    )
     return parser.parse_args()
-
-
-def build_async_omni_cli_args(base_args: argparse.Namespace) -> argparse.Namespace:
-    """Construct the minimal CLI args Namespace expected by AsyncOmni."""
-    return argparse.Namespace(
-        model=base_args.model,
-        stage_configs_path=getattr(base_args, "stage_configs_path", None),
-        log_stats=bool(getattr(base_args, "log_stats", False)),
-        log_file=getattr(base_args, "log_file", None),
-        init_sleep_seconds=int(getattr(base_args, "init_sleep_seconds", 30)),
-        shm_threshold_bytes=int(getattr(base_args, "shm_threshold_bytes", 65536)),
-        batch_timeout=int(getattr(base_args, "batch_timeout", 10)),
-        init_timeout=int(getattr(base_args, "init_timeout", ASYNC_INIT_TIMEOUT)),
-    )
-
-
-def build_sampling_params(seed: int, model_key: str) -> list[SamplingParams]:
-    """Build SamplingParams objects by reusing the dict definitions."""
-    return [SamplingParams(**params_dict) for params_dict in build_sampling_params_dict(seed, model_key)]
 
 
 def build_sampling_params_dict(seed: int, model_key: str) -> list[dict]:
@@ -163,28 +95,76 @@ def build_sampling_params_dict(seed: int, model_key: str) -> list[dict]:
     return sampling_params
 
 
-def create_prompt_args(base_args: argparse.Namespace) -> SimpleNamespace:
-    # The prompt builder expects a minimal namespace with these attributes.
-    return SimpleNamespace(
-        model=base_args.model,
-        prompt_type="text",
-        tokenize=True,
-        use_torchvision=True,
-        legacy_omni_video=False,
-    )
+def image_to_base64_data_url(image: Image.Image) -> str:
+    """Convert PIL Image to base64 data URL."""
+    buffered = io.BytesIO()
+    # Convert to RGB if needed
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    image.save(buffered, format="JPEG")
+    img_bytes = buffered.getvalue()
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{img_b64}"
+
+
+def audio_to_base64_data_url(audio_data: tuple[np.ndarray, int]) -> str:
+    """Convert audio (numpy array, sample_rate) to base64 data URL."""
+    audio_np, sample_rate = audio_data
+    # Convert to int16 format for WAV
+    if audio_np.dtype != np.int16:
+        # Normalize to [-1, 1] range if needed
+        if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
+            audio_np = np.clip(audio_np, -1.0, 1.0)
+            audio_np = (audio_np * 32767).astype(np.int16)
+        else:
+            audio_np = audio_np.astype(np.int16)
+
+    # Write to WAV bytes
+    buffered = io.BytesIO()
+    sf.write(buffered, audio_np, sample_rate, format="WAV")
+    wav_bytes = buffered.getvalue()
+    wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+    return f"data:audio/wav;base64,{wav_b64}"
+
+
+def video_to_base64_data_url(video_file: str) -> str:
+    """Convert video file to base64 data URL."""
+    video_path = Path(video_file)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_file}")
+
+    # Detect MIME type from extension
+    video_path_lower = str(video_path).lower()
+    if video_path_lower.endswith(".mp4"):
+        mime_type = "video/mp4"
+    elif video_path_lower.endswith(".webm"):
+        mime_type = "video/webm"
+    elif video_path_lower.endswith(".mov"):
+        mime_type = "video/quicktime"
+    elif video_path_lower.endswith(".avi"):
+        mime_type = "video/x-msvideo"
+    elif video_path_lower.endswith(".mkv"):
+        mime_type = "video/x-matroska"
+    else:
+        mime_type = "video/mp4"
+
+    with open(video_path, "rb") as f:
+        video_bytes = f.read()
+    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{video_b64}"
 
 
 def process_audio_file(
-    audio_file: Optional[Any],
-) -> Optional[tuple[np.ndarray, int]]:
+    audio_file: Any | None,
+) -> tuple[np.ndarray, int] | None:
     """Normalize Gradio audio input to (np.ndarray, sample_rate)."""
     if audio_file is None:
         return None
 
-    sample_rate: Optional[int] = None
-    audio_np: Optional[np.ndarray] = None
+    sample_rate: int | None = None
+    audio_np: np.ndarray | None = None
 
-    def _load_from_path(path_str: str) -> Optional[tuple[np.ndarray, int]]:
+    def _load_from_path(path_str: str) -> tuple[np.ndarray, int] | None:
         if not path_str:
             return None
         path = Path(path_str)
@@ -237,7 +217,7 @@ def process_audio_file(
     return audio_np.astype(np.float32), sample_rate
 
 
-def process_image_file(image_file: Optional[Image.Image]) -> Optional[Image.Image]:
+def process_image_file(image_file: Image.Image | None) -> Image.Image | None:
     """Process image file from Gradio input.
 
     Returns:
@@ -251,158 +231,128 @@ def process_image_file(image_file: Optional[Image.Image]) -> Optional[Image.Imag
     return image_file
 
 
-def process_video_file(
-    video_file: Optional[str],
-    enable_audio_in_video: bool = False,
-    max_frames: int = 32,
-) -> Optional[tuple[np.ndarray, dict[str, Any], Optional[tuple[np.ndarray, int]]]]:
-    """Process video file and optionally extract audio track."""
-    if video_file is None:
-        return None
-
-    video_path = Path(video_file)
-    if not video_path.exists():
-        print(f"Video file not found: {video_path}")
-        return None
-
-    try:
-        frames = video_to_ndarrays(str(video_path), num_frames=max_frames)
-        metadata = video_get_metadata(str(video_path), num_frames=frames.shape[0])
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Failed to decode video {video_path}: {exc}")
-        return None
-
-    audio_tuple: Optional[tuple[np.ndarray, int]] = None
-    if enable_audio_in_video:
-        try:
-            import librosa  # type: ignore import
-
-            audio_signal, sampling_rate = librosa.load(str(video_path), sr=16000)
-            audio_tuple = (audio_signal.astype(np.float32), sampling_rate)
-        except Exception as exc:  # pylint: disable=broad-except
-            print(f"Failed to extract audio from video {video_path}: {exc}")
-
-    return frames, metadata, audio_tuple
-
-
-async def run_inference_async_omni(
-    omni: AsyncOmni,
-    sampling_params: list[SamplingParams],
-    prompt_args_template: SimpleNamespace,
+def run_inference_api(
+    client: OpenAI,
+    model: str,
+    sampling_params_dict: list[dict],
     user_prompt: str,
-    audio_file: Optional[tuple[str, tuple[int, np.ndarray]]] = None,
-    image_file: Optional[Image.Image] = None,
-    video_file: Optional[str] = None,
+    audio_file: tuple[str, tuple[int, np.ndarray]] | None = None,
+    image_file: Image.Image | None = None,
+    video_file: str | None = None,
     use_audio_in_video: bool = False,
+    output_modalities: str | None = None,
 ):
-    """Run inference using AsyncOmni directly with multimodal support."""
+    """Run inference using OpenAI API client with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
         return "Please provide at least a text prompt or multimodal input.", None
 
     try:
-        # Build prompt with multimodal data
-        prompt_args = SimpleNamespace(**prompt_args_template.__dict__)
-
-        # Process multimodal inputs
-        multi_modal_data = {}
-        mm_processor_kwargs = {}
+        # Build message content list
+        content_list = []
 
         # Process audio
         audio_data = process_audio_file(audio_file)
         if audio_data is not None:
-            multi_modal_data["audio"] = audio_data
+            audio_url = audio_to_base64_data_url(audio_data)
+            content_list.append(
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_url},
+                }
+            )
 
         # Process image
-        image_data = process_image_file(image_file)
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
+        if image_file is not None:
+            image_data = process_image_file(image_file)
+            if image_data is not None:
+                image_url = image_to_base64_data_url(image_data)
+                content_list.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    }
+                )
 
         # Process video
-        video_payload = process_video_file(video_file, enable_audio_in_video=use_audio_in_video)
-        if video_payload is not None:
-            video_frames, video_metadata, extracted_audio = video_payload
-            video_entry: Any
-            if video_metadata:
-                video_entry = (video_frames, video_metadata)
-            else:
-                video_entry = video_frames
-            multi_modal_data["video"] = video_entry
-            if use_audio_in_video and extracted_audio is not None and "audio" not in multi_modal_data:
-                multi_modal_data["audio"] = extracted_audio
-                mm_processor_kwargs["use_audio_in_video"] = True
-
-        # Build the prompt input
-        if make_omni_prompt is not None:
-            omni_prompt = make_omni_prompt(prompt_args, user_prompt)
-            # Add multimodal data if present
-            if multi_modal_data:
-                if isinstance(omni_prompt, dict):
-                    omni_prompt["multi_modal_data"] = multi_modal_data
-                    if mm_processor_kwargs:
-                        omni_prompt["mm_processor_kwargs"] = mm_processor_kwargs
-                else:
-                    # If make_omni_prompt returns a string, we need to wrap it
-                    omni_prompt = {
-                        "prompt": omni_prompt,
-                        "multi_modal_data": multi_modal_data,
-                    }
-                    if mm_processor_kwargs:
-                        omni_prompt["mm_processor_kwargs"] = mm_processor_kwargs
-        else:
-            # Fallback: build prompt directly
-            default_system = (
-                "You are Qwen, a virtual human developed by the Qwen Team, "
-                "Alibaba Group, capable of perceiving auditory and visual inputs, "
-                "as well as generating text and speech."
-            )
-            prompt = f"<|im_start|>system\n{default_system}<|im_end|>\n<|im_start|>user\n"
-            if audio_data:
-                prompt += "<|audio_bos|><|AUDIO|><|audio_eos|>"
-            if image_data:
-                prompt += "<|vision_bos|><|IMAGE|><|vision_eos|>"
-            if video_payload is not None:
-                prompt += "<|vision_bos|><|VIDEO|><|vision_eos|>"
-            if user_prompt.strip():
-                prompt += f"{user_prompt}"
-            prompt += "<|im_end|>\n<|im_start|>assistant\n"
-
-            omni_prompt = {
-                "prompt": prompt,
-                "multi_modal_data": multi_modal_data,
+        mm_processor_kwargs = {}
+        if video_file is not None:
+            video_url = video_to_base64_data_url(video_file)
+            video_content = {
+                "type": "video_url",
+                "video_url": {"url": video_url},
             }
-            if mm_processor_kwargs:
-                omni_prompt["mm_processor_kwargs"] = mm_processor_kwargs
+            if use_audio_in_video:
+                video_content["video_url"]["num_frames"] = 32  # Default max frames
+                mm_processor_kwargs["use_audio_in_video"] = True
+            content_list.append(video_content)
 
-        request_id = "0"
+        # Add text prompt
+        if user_prompt.strip():
+            content_list.append(
+                {
+                    "type": "text",
+                    "text": user_prompt,
+                }
+            )
+
+        # Build messages
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are Qwen, a virtual human developed by the Qwen Team, "
+                            "Alibaba Group, capable of perceiving auditory and visual inputs, "
+                            "as well as generating text and speech."
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": content_list,
+            },
+        ]
+
+        # Build extra_body
+        extra_body = {
+            "sampling_params_list": sampling_params_dict,
+        }
+        if mm_processor_kwargs:
+            extra_body["mm_processor_kwargs"] = mm_processor_kwargs
+
+        # Parse output modalities
+        if output_modalities is not None:
+            output_modalities_list = [m.strip() for m in output_modalities.split(",")]
+        else:
+            output_modalities_list = None
+
+        # Call API
+        chat_completion = client.chat.completions.create(
+            messages=messages,
+            model=model,
+            modalities=output_modalities_list,
+            extra_body=extra_body,
+        )
+
+        # Extract outputs
         text_outputs: list[str] = []
         audio_output = None
 
-        async for stage_outputs in omni.generate(
-            prompt=omni_prompt,
-            request_id=request_id,
-            sampling_params_list=sampling_params,
-        ):
-            # stage_outputs.request_output is a RequestOutput object, not a list
-            request_output = stage_outputs.request_output
-            if stage_outputs.final_output_type == "text":
-                if request_output.outputs:
-                    for output in request_output.outputs:
-                        if output.text:
-                            text_outputs.append(output.text)
-            elif stage_outputs.final_output_type == "audio":
-                # multimodal_output is on the RequestOutput object
-                # See vllm_omni/entrypoints/openai/serving_chat.py:680 for reference
-                if hasattr(request_output, "multimodal_output") and request_output.multimodal_output:
-                    if "audio" in request_output.multimodal_output:
-                        audio_tensor = request_output.multimodal_output["audio"]
-                        # Ensure audio is 1D (flatten if needed)
-                        if hasattr(audio_tensor, "ndim") and audio_tensor.ndim > 1:
-                            audio_tensor = audio_tensor.flatten()
-                        audio_np = audio_tensor.detach().cpu().numpy()
-                        audio_output = (
-                            24000,  # sampling rate in Hz
-                            audio_np,
-                        )
+        for choice in chat_completion.choices:
+            if choice.message.content:
+                text_outputs.append(choice.message.content)
+            if choice.message.audio:
+                # Decode base64 audio
+                audio_data = base64.b64decode(choice.message.audio.data)
+                # Load audio from bytes
+                audio_np, sample_rate = sf.read(io.BytesIO(audio_data))
+                # Convert to mono if needed
+                if audio_np.ndim > 1:
+                    audio_np = audio_np[:, 0]
+                audio_output = (int(sample_rate), audio_np.astype(np.float32))
 
         text_response = "\n\n".join(text_outputs) if text_outputs else "No text output."
         return text_response, audio_output
@@ -411,29 +361,30 @@ async def run_inference_async_omni(
 
 
 def build_interface(
-    omni: AsyncOmni,
-    sampling_params: list[SamplingParams],
-    prompt_args_template: SimpleNamespace,
+    client: OpenAI,
     model: str,
+    sampling_params_dict: list[dict],
 ):
-    """Build Gradio interface for AsyncOmni mode."""
+    """Build Gradio interface for API server mode."""
 
-    async def run_inference(
+    def run_inference(
         user_prompt: str,
-        audio_file: Optional[tuple[str, tuple[int, np.ndarray]]],
-        image_file: Optional[Image.Image],
-        video_file: Optional[str],
+        audio_file: tuple[str, tuple[int, np.ndarray]] | None,
+        image_file: Image.Image | None,
+        video_file: str | None,
         use_audio_in_video: bool,
+        output_modalities: str | None = None,
     ):
-        return await run_inference_async_omni(
-            omni,
-            sampling_params,
-            prompt_args_template,
+        return run_inference_api(
+            client,
+            model,
+            sampling_params_dict,
             user_prompt,
             audio_file,
             image_file,
             video_file,
             use_audio_in_video,
+            output_modalities,
         )
 
     css = """
@@ -502,6 +453,14 @@ def build_interface(
                 )
 
         with gr.Row():
+            output_modalities = gr.Textbox(
+                label="Output Modalities",
+                placeholder="For example: text, image, video. Use comma to separate multiple modalities.",
+                lines=1,
+                scale=1,
+            )
+
+        with gr.Row():
             generate_btn = gr.Button(
                 "Generate",
                 variant="primary",
@@ -515,7 +474,7 @@ def build_interface(
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox],
+            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox, output_modalities],
             outputs=[text_output, audio_output],
         )
         demo.queue()
@@ -524,41 +483,27 @@ def build_interface(
 
 def main():
     args = parse_args()
-    omni = None
 
     model_name = "/".join(args.model.split("/")[-2:])
     assert model_name in SUPPORTED_MODELS, (
         f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
     )
 
-    # Register signal handlers for graceful shutdown
-    def signal_handler(sig, frame):
-        print("\nReceived interrupt signal, shutting down...")
-        if omni is not None:
-            try:
-                omni.shutdown()
-            except Exception as e:
-                print(f"Error during shutdown: {e}")
-        sys.exit(0)
+    # Initialize OpenAI client
+    print(f"Connecting to API server at: {args.api_base}")
+    client = OpenAI(
+        api_key="EMPTY",
+        base_url=args.api_base,
+    )
+    print("✓ Connected to API server")
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    print(f"Initializing AsyncOmni with model: {args.model}")
-    if args.stage_configs_path:
-        print(f"Using custom stage configs: {args.stage_configs_path}")
-
-    sampling_params = build_sampling_params(SEED, model_name)
-    cli_args = build_async_omni_cli_args(args)
-    omni = AsyncOmni(model=args.model, cli_args=cli_args)
-    print("✓ AsyncOmni initialized successfully")
-    prompt_args_template = create_prompt_args(args)
+    # Build sampling params
+    sampling_params_dict = build_sampling_params_dict(SEED, model_name)
 
     demo = build_interface(
-        omni,
-        sampling_params,
-        prompt_args_template,
+        client,
         args.model,
+        sampling_params_dict,
     )
     try:
         demo.launch(
@@ -568,13 +513,6 @@ def main():
         )
     except KeyboardInterrupt:
         print("\nShutting down...")
-    finally:
-        # Cleanup
-        if omni is not None:
-            try:
-                omni.shutdown()
-            except Exception as e:
-                print(f"Error during cleanup: {e}")
 
 
 if __name__ == "__main__":

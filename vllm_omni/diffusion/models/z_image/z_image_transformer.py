@@ -17,7 +17,6 @@
 
 import math
 from collections.abc import Iterable
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -32,6 +31,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -115,12 +115,13 @@ class ZImageAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
         )
+        self.rope = RotaryEmbedding(is_neox_style=False)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
+        freqs_cis: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
         query, key, value = qkv.chunk(3, dim=-1)
@@ -132,16 +133,10 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-            x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-            freqs_cis = freqs_cis.unsqueeze(2)
-            x_out = torch.view_as_real(x * freqs_cis).flatten(3)
-            return x_out.type_as(x_in)
-
-        if freqs_cis is not None:
-            query = apply_rotary_emb(query, freqs_cis)
-            key = apply_rotary_emb(key, freqs_cis)
-
+        cos = freqs_cis.real.squeeze(0).to(query.dtype)
+        sin = freqs_cis.imag.squeeze(0).to(query.dtype)
+        query = self.rope(query, cos, sin)
+        key = self.rope(key, cos, sin)
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -232,7 +227,7 @@ class ZImageTransformerBlock(nn.Module):
         x: torch.Tensor,
         attn_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
-        adaln_input: Optional[torch.Tensor] = None,
+        adaln_input: torch.Tensor | None = None,
     ):
         if self.modulation:
             assert adaln_input is not None

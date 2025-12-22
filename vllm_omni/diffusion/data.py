@@ -4,15 +4,76 @@
 import enum
 import os
 import random
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable
+from functools import lru_cache
+from typing import Any
 
 import torch
+from pydantic import model_validator
+from typing_extensions import Self
+from vllm.config.utils import config
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 logger = init_logger(__name__)
+
+
+@config
+@dataclass
+class DiffusionParallelConfig:
+    """Configuration for diffusion model distributed execution."""
+
+    pipeline_parallel_size: int = 1
+    """Number of pipeline parallel stages."""
+
+    data_parallel_size: int = 1
+    """Number of data parallel groups."""
+
+    tensor_parallel_size: int = 1
+    """Number of tensor parallel groups."""
+
+    sequence_parallel_size: int | None = None
+    """Number of sequence parallel groups. sequence_parallel_size = ring_degree * ulysses_degree"""
+
+    ulysses_degree: int = 1
+    """Number of GPUs used for ulysses sequence parallelism."""
+
+    ring_degree: int = 1
+    """Number of GPUs used for ring sequence parallelism."""
+
+    cfg_parallel_size: int = 1
+    """Number of Classifier Free Guidance (CFG) parallel groups."""
+
+    @model_validator(mode="after")
+    def _validate_parallel_config(self) -> Self:
+        """Validates the config relationships among the parallel strategies."""
+        assert self.pipeline_parallel_size > 0, "Pipeline parallel size must be > 0"
+        assert self.data_parallel_size > 0, "Data parallel size must be > 0"
+        assert self.tensor_parallel_size > 0, "Tensor parallel size must be > 0"
+        assert self.sequence_parallel_size > 0, "Sequence parallel size must be > 0"
+        assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
+        assert self.ring_degree > 0, "Ring degree must be > 0"
+        assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
+            "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
+            f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
+        )
+        return self
+
+    def __post_init__(self) -> None:
+        if self.sequence_parallel_size is None:
+            self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+        self.world_size = (
+            self.pipeline_parallel_size
+            * self.data_parallel_size
+            * self.tensor_parallel_size
+            * self.ulysses_degree
+            * self.ring_degree
+            * self.cfg_parallel_size
+        )
 
 
 @dataclass
@@ -179,6 +240,7 @@ class OmniDiffusionConfig:
 
     # Cache strategy (legacy)
     cache_strategy: str = "none"
+    parallel_config: DiffusionParallelConfig = field(default_factory=DiffusionParallelConfig)
 
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
@@ -192,20 +254,7 @@ class OmniDiffusionConfig:
     trust_remote_code: bool = False
     revision: str | None = None
 
-    # Parallelism
-    num_gpus: int = 1
-    tp_size: int = -1
-    sp_degree: int = -1
-    # sequence parallelism
-    ulysses_degree: int | None = None
-    ring_degree: int | None = None
-    # data parallelism
-    # number of data parallelism groups
-    dp_size: int = 1
-    # number of gpu in a dp group
-    dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    num_gpus: int | None = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: int = -1
@@ -286,6 +335,9 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
+    # support multi images input
+    supports_multimodal_inputs: bool = False
+
     # Logging
     log_level: str = "info"
 
@@ -328,6 +380,36 @@ class OmniDiffusionConfig:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
+        if self.num_gpus is None:
+            if self.parallel_config is not None:
+                self.num_gpus = self.parallel_config.world_size
+            else:
+                self.num_gpus = 1
+
+        if self.num_gpus < self.parallel_config.world_size:
+            raise ValueError(
+                f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
+            )
+
+        # Convert string dtype to torch.dtype if needed
+        if isinstance(self.dtype, str):
+            dtype_map = {
+                "auto": torch.bfloat16,
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+                "half": torch.float16,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+                "float": torch.float32,
+            }
+            dtype_lower = self.dtype.lower()
+            if dtype_lower in dtype_map:
+                self.dtype = dtype_map[dtype_lower]
+            else:
+                logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
+                self.dtype = torch.bfloat16
 
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
@@ -335,6 +417,9 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+    def update_multimodal_support(self) -> None:
+        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
@@ -344,6 +429,56 @@ class OmniDiffusionConfig:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
         return cls(**kwargs)
+
+
+_current_omni_diffusion_config: OmniDiffusionConfig | None = None
+_current_prefix: str | None = None
+
+
+@contextmanager
+def set_current_omni_diffusion_config(
+    omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None
+):
+    """
+    Temporarily set the current vLLM-Omni config.
+    Used during model initialization.
+    We save the current vLLM-Omni config in a global variable,
+    so that all modules can access it, e.g. custom ops
+    can access the vLLM-Omni config to determine how to dispatch.
+    """
+    global _current_omni_diffusion_config, _current_prefix
+    old_omni_diffusion_config = _current_omni_diffusion_config
+    old_prefix = _current_prefix
+    # from vllm.compilation.counter import compilation_counter
+
+    # num_models_seen = compilation_counter.num_models_seen
+    try:
+        _current_omni_diffusion_config = omni_diffusion_config
+        _current_prefix = prefix
+        yield
+    except Exception:
+        raise
+    else:
+        if check_compile:
+            raise RuntimeError("Compilation is not yet supported for OmniDiffusion")
+    finally:
+        _current_omni_diffusion_config = old_omni_diffusion_config
+        _current_prefix = old_prefix
+        # Clear the compilation config cache when context changes
+        get_cached_compilation_config.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def get_cached_compilation_config():
+    """Cache config to avoid repeated calls to get_current_omni_diffusion_config()"""
+    return get_current_omni_diffusion_config().compilation_config
+
+
+def get_current_omni_diffusion_config() -> OmniDiffusionConfig:
+    if _current_omni_diffusion_config is None:
+        logger.warning("Current OmniDiffusionConfig is not set.")
+        return OmniDiffusionConfig()
+    return _current_omni_diffusion_config
 
 
 @dataclass

@@ -13,8 +13,9 @@ all model-specific information needed for generic caching, including preprocessi
 transformer execution, and postprocessing logic.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Union
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -146,7 +147,7 @@ def extract_qwen_context(
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor,
     encoder_hidden_states_mask: torch.Tensor,
-    timestep: Union[torch.Tensor, float, int],
+    timestep: torch.Tensor | float | int,
     img_shapes: torch.Tensor,
     txt_seq_lens: torch.Tensor,
     guidance: torch.Tensor | None = None,
@@ -260,6 +261,8 @@ def extract_qwen_context(
 # to ensure consistent lookup without substring matching.
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImagePipeline": extract_qwen_context,
+    "QwenImageEditPipeline": extract_qwen_context,
+    "QwenImageEditPlusPipeline": extract_qwen_context,
     # Future models:
     # "FluxPipeline": extract_flux_context,
     # "CogVideoXPipeline": extract_cogvideox_context,

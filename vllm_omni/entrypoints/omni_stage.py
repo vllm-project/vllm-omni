@@ -11,18 +11,20 @@ the original input processing utilities for cross-stage data wiring.
 """
 
 import asyncio
+import fcntl
 import importlib
 import logging
 import multiprocessing as mp
 import os
 import sys
-from typing import Any, Optional, Union
+import traceback
+from typing import Any
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -81,10 +83,10 @@ class OmniStage:
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
         self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
         # Runtime orchestration state (added)
-        self._in_q: Optional[mp.Queue] = None
-        self._out_q: Optional[mp.Queue] = None
-        self._proc: Optional[mp.Process] = None
-        self._log_file: Optional[str] = None
+        self._in_q: mp.Queue | None = None
+        self._out_q: mp.Queue | None = None
+        self._proc: mp.Process | None = None
+        self._log_file: str | None = None
         self._shm_threshold_bytes: int = 65536
         self._logger = logging.getLogger(__name__)
 
@@ -112,7 +114,7 @@ class OmniStage:
         """
         self.vllm_config = vllm_config
 
-    def set_tokenizer(self, tokenizer: AnyTokenizer) -> None:
+    def set_tokenizer(self, tokenizer: TokenizerLike) -> None:
         """Set the tokenizer for this stage.
 
         Args:
@@ -160,11 +162,11 @@ class OmniStage:
         model: str,
         *,
         is_async: bool = False,
-        log_file: Optional[str] = None,
+        log_file: str | None = None,
         shm_threshold_bytes: int = 65536,
-        ctx: Optional[mp.context.BaseContext] = None,
+        ctx: mp.context.BaseContext | None = None,
         batch_timeout: int = 10,
-        connectors_config: Optional[dict] = None,
+        connectors_config: dict | None = None,
         worker_backend: str = "multi_process",
         **kwargs: Any,
     ) -> None:
@@ -303,7 +305,7 @@ class OmniStage:
         assert self._in_q is not None
         self._in_q.put(payload)
 
-    def try_collect(self) -> Optional[dict[str, Any]]:
+    def try_collect(self) -> dict[str, Any] | None:
         """Try to collect a result from the stage worker without blocking.
 
         Returns:
@@ -317,8 +319,8 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: Union[OmniTokensPrompt, TextPrompt] = None
-    ) -> list[Union[OmniTokensPrompt, TextPrompt]]:
+        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+    ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
         Derives inputs for this stage from outputs of upstream stages.
@@ -372,7 +374,7 @@ def _stage_worker(
     stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
@@ -475,6 +477,7 @@ def _stage_worker(
     _batch_seq = 0
 
     # Device mapping
+    device_type = None
     try:
         from vllm_omni.utils import detect_device_type
 
@@ -483,11 +486,146 @@ def _stage_worker(
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
 
+    # Sequential initialization on the same device to avoid memory calculation errors
+    # when multiple instances start simultaneously
+    # For TP/PP/DP/SP, we need to lock ALL devices that will be used by this stage
+    lock_files = []
+    if device_type == "cuda":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                # Get all parallel sizes from engine_args (defaults to 1)
+                tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
+                pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
+                data_parallel_size = engine_args.get("data_parallel_size", 1)
+                prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+
+                # Calculate total number of devices needed for this stage
+                # For a single stage worker:
+                # - TP: splits model across GPUs (always needed)
+                # - PP: splits layers across pipelinestages, but each stage uses TP devices
+                # - DP: replicates model, but each replica uses TP devices
+                # - PCP: context parallelism, typically uses TP devices
+                # The number of devices per stage is determined by TP * PP * DP * PCP size
+                # (PP/DP/PCP are higher-level parallelism that don't add devices per stage)
+                num_devices_per_stage = (
+                    tensor_parallel_size * pipeline_parallel_size * data_parallel_size * prefill_context_parallel_size
+                )
+
+                # Get physical device IDs from CUDA_VISIBLE_DEVICES
+                # After set_stage_devices, CUDA_VISIBLE_DEVICES is set to physical device(s)
+                cuda_visible_devices = _os.environ.get("CUDA_VISIBLE_DEVICES")
+                physical_devices = []
+
+                if cuda_visible_devices:
+                    try:
+                        physical_devices = [int(x.strip()) for x in cuda_visible_devices.split(",") if x.strip()]
+                    except (ValueError, IndexError):
+                        pass
+
+                if not physical_devices:
+                    # Fallback: use logical device count if CUDA_VISIBLE_DEVICES not set
+                    num_devices = torch.cuda.device_count()
+                    physical_devices = list(range(num_devices))
+
+                # Determine which devices will be used (min of devices per stage and available devices)
+                num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+                devices_to_lock = physical_devices[:num_devices_to_lock]
+
+                # Sort devices_to_lock to prevent deadlock (all processes acquire locks in same order)
+                devices_to_lock = sorted(devices_to_lock)
+
+                _logging.getLogger(__name__).debug(
+                    "[Stage-%s] Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
+                    stage_id,
+                    tensor_parallel_size,
+                    pipeline_parallel_size,
+                    data_parallel_size,
+                    prefill_context_parallel_size,
+                    num_devices_to_lock,
+                    devices_to_lock,
+                )
+
+                # Acquire exclusive locks for all devices using fcntl.flock
+                # Locks are automatically released when process dies
+                max_wait_time = 300  # 5 minutes max wait
+                wait_start = _time.time()
+                acquired_lock_fds = []  # Store file descriptors to keep locks alive
+
+                for device_id in devices_to_lock:
+                    lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+                    lock_acquired = False
+
+                    while not lock_acquired:
+                        try:
+                            # Open or create the lock file
+                            lock_fd = _os.open(lock_file, _os.O_CREAT | _os.O_RDWR, 0o644)
+
+                            # Try to acquire exclusive lock (non-blocking first)
+                            try:
+                                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                # Successfully acquired lock - write PID
+                                _os.ftruncate(lock_fd, 0)  # Clear file
+                                _os.write(lock_fd, f"{_os.getpid()}\n".encode())
+                                _os.fsync(lock_fd)  # Ensure written to disk
+                                lock_acquired = True
+                                acquired_lock_fds.append(lock_fd)
+                                _logging.getLogger(__name__).debug(
+                                    "[Stage-%s] Acquired exclusive lock for device %s", stage_id, device_id
+                                )
+                            except BlockingIOError:
+                                # Lock is held by another process
+                                _os.close(lock_fd)
+
+                                # Check if we've been waiting too long
+                                if _time.time() - wait_start > max_wait_time:
+                                    _logging.getLogger(__name__).warning(
+                                        "[Stage-%s] Timeout waiting for device %s "
+                                        "initialization lock, proceeding anyway",
+                                        stage_id,
+                                        device_id,
+                                    )
+                                    break
+
+                                # Wait a bit before retrying
+                                _time.sleep(0.1)
+                        except OSError as e:
+                            # Other error - log and continue without lock
+                            _logging.getLogger(__name__).debug(
+                                "[Stage-%s] Failed to acquire lock for device %s: %s, continuing anyway",
+                                stage_id,
+                                device_id,
+                                e,
+                            )
+                            try:
+                                _os.close(lock_fd)
+                            except (OSError, NameError):
+                                pass
+                            break
+
+                lock_files = acquired_lock_fds
+        except Exception as e:
+            _logging.getLogger(__name__).debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
+            )
+
     # Init LLM
     _logging.getLogger(__name__).debug(
         "[Stage-%s] Initializing engine with args keys=%s", stage_id, list(engine_args.keys())
     )
-    stage_engine = OmniStageLLM(model=model, **engine_args)
+    try:
+        stage_engine = OmniStageLLM(model=model, **engine_args)
+    finally:
+        # Release all locks by closing file descriptors
+        # Locks are automatically released when file descriptors are closed
+        # or when process dies
+        for lock_fd in lock_files:
+            try:
+                _os.close(lock_fd)
+                _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
+            except (OSError, ValueError):
+                pass
     _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
 
     # Initialize OmniConnectors if configured
@@ -626,6 +764,7 @@ def _stage_worker(
                 idx = 0
                 for ro in unmapped:
                     target_rid = batch_request_ids[idx % len(batch_request_ids)]
+                    ro.request_id = target_rid
                     req_to_outputs[target_rid].append(ro)
                     idx += 1
 
@@ -719,12 +858,14 @@ def _stage_worker(
                 )
         except Exception as e:
             _logging.getLogger(__name__).exception("[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e)
+            _tb = traceback.format_exc()
             for rid in batch_request_ids:
                 out_q.put(
                     {
                         "request_id": rid,
                         "stage_id": stage_id,
                         "error": str(e),
+                        "error_tb": _tb,
                     }
                 )
 
@@ -746,6 +887,7 @@ async def _stage_worker_async(
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
+    import os as _os
     import time as _time
 
     from vllm_omni.distributed.omni_connectors import build_stage_connectors
@@ -801,6 +943,7 @@ async def _stage_worker_async(
     _batch_seq = 0
 
     # Device mapping
+    device_type = None
     try:
         from vllm_omni.utils import detect_device_type
 
@@ -820,20 +963,155 @@ async def _stage_worker_async(
             return
         connectors = built_connectors
 
+    # Sequential initialization on the same device to avoid memory calculation errors
+    # when multiple instances start simultaneously
+    # For TP, we need to lock ALL devices that will be used by this stage
+    lock_files = []
+    if device_type == "cuda":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                # Get all parallel sizes from engine_args (defaults to 1)
+                tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
+                pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
+                data_parallel_size = engine_args.get("data_parallel_size", 1)
+                prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+
+                # Calculate total number of devices needed for this stage
+                # For a single stage worker in omni:
+                # - TP: splits model across GPUs (always needed)
+                # - PP: splits layers across stages, but each stage uses TP devices
+                # - DP: replicates model, but each replica uses TP devices
+                # - PCP: context parallelism, typically uses TP devices
+                # The number of devices per stage is determined by TP * PP * DP * PCP size
+                # (PP/DP/PCP are higher-level parallelism that don't add devices per stage)
+                num_devices_per_stage = (
+                    tensor_parallel_size * pipeline_parallel_size * data_parallel_size * prefill_context_parallel_size
+                )
+
+                # Get physical device IDs from CUDA_VISIBLE_DEVICES
+                # After set_stage_devices, CUDA_VISIBLE_DEVICES is set to physical device(s)
+                cuda_visible_devices = _os.environ.get("CUDA_VISIBLE_DEVICES")
+                physical_devices = []
+
+                if cuda_visible_devices:
+                    try:
+                        physical_devices = [int(x.strip()) for x in cuda_visible_devices.split(",") if x.strip()]
+                    except (ValueError, IndexError):
+                        pass
+
+                if not physical_devices:
+                    # Fallback: use logical device count if CUDA_VISIBLE_DEVICES not set
+                    num_devices = torch.cuda.device_count()
+                    physical_devices = list(range(num_devices))
+
+                # Determine which devices will be used (min of devices per stage and available devices)
+                num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+                devices_to_lock = physical_devices[:num_devices_to_lock]
+
+                # Sort devices_to_lock to prevent deadlock (all processes acquire locks in same order)
+                devices_to_lock = sorted(devices_to_lock)
+
+                _logging.getLogger(__name__).debug(
+                    "[Stage-%s] Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
+                    stage_id,
+                    tensor_parallel_size,
+                    pipeline_parallel_size,
+                    data_parallel_size,
+                    prefill_context_parallel_size,
+                    num_devices_to_lock,
+                    devices_to_lock,
+                )
+
+                # Acquire exclusive locks for all devices using fcntl.flock
+                # Locks are automatically released when process dies
+                max_wait_time = 300  # 5 minutes max wait
+                wait_start = _time.time()
+                acquired_lock_fds = []  # Store file descriptors to keep locks alive
+
+                for device_id in devices_to_lock:
+                    lock_file = f"/tmp/vllm_omni_device_{device_id}_init.lock"
+                    lock_acquired = False
+
+                    while not lock_acquired:
+                        try:
+                            # Open or create the lock file
+                            lock_fd = _os.open(lock_file, _os.O_CREAT | _os.O_RDWR, 0o644)
+
+                            # Try to acquire exclusive lock (non-blocking first)
+                            try:
+                                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                # Successfully acquired lock - write PID
+                                _os.ftruncate(lock_fd, 0)  # Clear file
+                                _os.write(lock_fd, f"{_os.getpid()}\n".encode())
+                                _os.fsync(lock_fd)  # Ensure written to disk
+                                lock_acquired = True
+                                acquired_lock_fds.append(lock_fd)
+                                _logging.getLogger(__name__).debug(
+                                    "[Stage-%s] Acquired exclusive lock for device %s", stage_id, device_id
+                                )
+                            except BlockingIOError:
+                                # Lock is held by another process
+                                _os.close(lock_fd)
+
+                                # Check if we've been waiting too long
+                                if _time.time() - wait_start > max_wait_time:
+                                    _logging.getLogger(__name__).warning(
+                                        "[Stage-%s] Timeout waiting for device %s "
+                                        "initialization lock, proceeding anyway",
+                                        stage_id,
+                                        device_id,
+                                    )
+                                    break
+
+                                # Wait a bit before retrying
+                                _time.sleep(0.1)
+                        except OSError as e:
+                            # Other error - log and continue without lock
+                            _logging.getLogger(__name__).debug(
+                                "[Stage-%s] Failed to acquire lock for device %s: %s, continuing anyway",
+                                stage_id,
+                                device_id,
+                                e,
+                            )
+                            try:
+                                _os.close(lock_fd)
+                            except (OSError, NameError):
+                                pass
+                            break
+
+                lock_files = acquired_lock_fds
+        except Exception as e:
+            _logging.getLogger(__name__).debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
+            )
+
     # Init LLM
     _logging.getLogger(__name__).debug(
         "[Stage-%s] Initializing engine with args keys=%s",
         stage_id,
         list(engine_args.keys()),
     )
-    omni_engine_args = AsyncOmniEngineArgs(**engine_args)
-    usage_context = UsageContext.OPENAI_API_SERVER
-    vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
-    stage_engine = AsyncOmniStageLLM.from_vllm_config(
-        vllm_config=vllm_config,
-        usage_context=usage_context,
-        engine_args=omni_engine_args,
-    )
+    try:
+        omni_engine_args = AsyncOmniEngineArgs(**engine_args)
+        usage_context = UsageContext.OPENAI_API_SERVER
+        vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
+        stage_engine = AsyncOmniStageLLM.from_vllm_config(
+            vllm_config=vllm_config,
+            usage_context=usage_context,
+            engine_args=omni_engine_args,
+        )
+    finally:
+        # Release all locks by closing file descriptors
+        # Locks are automatically released when file descriptors are closed
+        # or when process dies
+        for lock_fd in lock_files:
+            try:
+                _os.close(lock_fd)
+                _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
+            except (OSError, ValueError):
+                pass
     omni_stage.set_async_engine(stage_engine)
     # Don't keep the dummy data in memory
     await stage_engine.reset_mm_cache()

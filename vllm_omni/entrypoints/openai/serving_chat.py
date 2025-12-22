@@ -3,13 +3,14 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional
 
 import jinja2
 from fastapi import Request
+from PIL import Image
 from pydantic import TypeAdapter
 
 try:
@@ -60,33 +61,83 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.transformers_utils.tokenizers import (
+from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.mistral import (
+    MistralTokenizer,
     maybe_serialize_tool_calls,
     truncate_tool_call_ids,
     validate_request_params,
 )
-from vllm.utils import as_list
+from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 
 logger = init_logger(__name__)
 
 
 class OmniOpenAIServingChat(OpenAIServingChat):
+    """OpenAI-compatible chat serving for both LLM and Diffusion models.
+
+    This class extends OpenAIServingChat to support:
+    - Standard LLM chat completions
+    - Diffusion model image generation via chat interface
+
+    For diffusion mode, use the `for_diffusion` class method to create an instance.
+    """
+
+    # Diffusion mode attributes
+    _diffusion_mode: bool = False
+    _diffusion_engine: Optional["AsyncOmniDiffusion"] = None
+    _diffusion_model_name: str = ""
+
+    @classmethod
+    def for_diffusion(
+        cls,
+        diffusion_engine: "AsyncOmniDiffusion",
+        model_name: str,
+    ) -> "OmniOpenAIServingChat":
+        """Create a chat serving instance for diffusion models.
+
+        Args:
+            diffusion_engine: The async diffusion engine
+            model_name: Name of the model being served
+
+        Returns:
+            OmniOpenAIServingChat instance configured for diffusion mode
+
+        Note:
+            Request-level parameters (num_inference_steps, guidance_scale, seed,
+            height, width, num_frames, fps, etc.) are passed per-request via the API.
+        """
+        instance = cls.__new__(cls)
+        instance._diffusion_mode = True
+        instance._diffusion_engine = diffusion_engine
+        instance._diffusion_model_name = model_name
+        return instance
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
-        raw_request: Optional[Request] = None,
-    ) -> Union[AsyncGenerator[str, None], ChatCompletionResponse, ErrorResponse]:
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         """
         Chat Completion API similar to OpenAI's API.
 
         See https://platform.openai.com/docs/api-reference/chat/create
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
+
+        For diffusion models, this generates images and returns them
+        in a chat completion response format.
         """
+        # Handle diffusion mode
+        if self._diffusion_mode:
+            return await self._create_diffusion_chat_completion(request, raw_request)
+
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -172,6 +223,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
+        output_modalities = getattr(request, "modalities", self.engine_client.output_modalities)
+
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
@@ -194,6 +247,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     prompt=engine_prompt,
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
+                    output_modalities=output_modalities,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
                     priority=request.priority,
@@ -236,17 +290,17 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
     async def _preprocess_chat(
         self,
-        request: Union[ChatLikeRequest, ResponsesRequest],
-        tokenizer: AnyTokenizer,
+        request: ChatLikeRequest | ResponsesRequest,
+        tokenizer: TokenizerLike,
         messages: list[ChatCompletionMessageParam],
-        chat_template: Optional[str],
+        chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         add_generation_prompt: bool = True,
         continue_final_message: bool = False,
-        tool_dicts: Optional[list[dict[str, Any]]] = None,
-        documents: Optional[list[dict[str, str]]] = None,
-        chat_template_kwargs: Optional[dict[str, Any]] = None,
-        tool_parser: Optional[Callable[[AnyTokenizer], ToolParser]] = None,
+        tool_dicts: list[dict[str, Any]] | None = None,
+        documents: list[dict[str, str]] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[
         list[ConversationMessage],
@@ -279,7 +333,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         )
         _chat_template_kwargs.update(chat_template_kwargs or {})
 
-        request_prompt: Union[str, list[int]]
+        request_prompt: str | list[int]
 
         if tokenizer is None:
             request_prompt = "placeholder"
@@ -365,9 +419,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     def _log_inputs(
         self,
         request_id: str,
-        inputs: Union[RequestPrompt, PromptType],
-        params_list: Optional[list[SamplingParams]],
-        lora_request: Optional[LoRARequest],
+        inputs: RequestPrompt | PromptType,
+        params_list: list[SamplingParams] | None,
+        lora_request: LoRARequest | None,
     ) -> None:
         if self.request_logger is None:
             return
@@ -397,11 +451,11 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
-    ) -> Union[ErrorResponse, ChatCompletionResponse]:
+    ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
-        final_res: Optional[RequestOutput] = None
+        final_res: RequestOutput | None = None
 
         final_outputs: list[OmniRequestOutput] = []
         try:
@@ -435,6 +489,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 ) = self._create_text_choice(request, omni_outputs, tokenizer, conversation, role)
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role)
+            elif omni_outputs.final_output_type == "image":
+                choices_data = self._create_image_choice(omni_outputs, role)
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
@@ -487,7 +543,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         self,
         request: ChatCompletionRequest,
         omni_outputs: OmniRequestOutput,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         conversation: list[ConversationMessage],
         role: str,
     ):
@@ -698,7 +754,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             choices.append(choice_data)
 
         if request.echo:
-            last_msg_content: Union[str, list[dict[str, str]]] = ""
+            last_msg_content: str | list[dict[str, str]] = ""
             if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
                 last_msg_content = conversation[-1]["content"] or ""
             if isinstance(last_msg_content, list):
@@ -777,3 +833,348 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             )
             choices.append(choice_data)
         return choices
+
+    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str):
+        """Create chat completion response choices for image output.
+
+        Converts image tensor or PIL Image output from diffusion models
+        into base64-encoded image data for API response.
+
+        Args:
+            omni_outputs: Output containing image data from diffusion stage
+            role: The role for the response message (e.g., "assistant")
+
+        Returns:
+            List of ChatCompletionResponseChoice with image content
+        """
+        from PIL import Image
+
+        choices: list[ChatCompletionResponseChoice] = []
+        final_res = omni_outputs.request_output
+
+        # Handle different image output formats
+        images = []
+
+        # First check omni_outputs.images directly (for diffusion mode via from_diffusion)
+        if omni_outputs.images:
+            images = omni_outputs.images
+        # Fall back to request_output for pipeline mode
+        elif final_res is not None:
+            if hasattr(final_res, "multimodal_output") and final_res.multimodal_output:
+                image_data = final_res.multimodal_output.get("image")
+                if image_data is not None:
+                    if isinstance(image_data, Image.Image):
+                        images.append(image_data)
+                    elif hasattr(image_data, "cpu"):  # Tensor
+                        import numpy as np
+
+                        # Convert tensor to PIL Image
+                        img_array = image_data.float().detach().cpu().numpy()
+                        # Handle different tensor formats (CHW -> HWC)
+                        if img_array.ndim == 3 and img_array.shape[0] in [1, 3, 4]:
+                            img_array = np.transpose(img_array, (1, 2, 0))
+                        # Normalize to 0-255
+                        if img_array.max() <= 1.0:
+                            img_array = (img_array * 255).astype(np.uint8)
+                        else:
+                            img_array = img_array.astype(np.uint8)
+                        # Handle grayscale
+                        if img_array.ndim == 2:
+                            images.append(Image.fromarray(img_array, mode="L"))
+                        elif img_array.shape[-1] == 1:
+                            images.append(Image.fromarray(img_array.squeeze(-1), mode="L"))
+                        elif img_array.shape[-1] == 3:
+                            images.append(Image.fromarray(img_array, mode="RGB"))
+                        elif img_array.shape[-1] == 4:
+                            images.append(Image.fromarray(img_array, mode="RGBA"))
+            elif hasattr(final_res, "images") and final_res.images:
+                images = final_res.images
+
+        # Convert images to base64
+        image_contents = []
+        for img in images:
+            with BytesIO() as buffer:
+                img.save(buffer, format="PNG")
+                img_bytes = buffer.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+            image_contents.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{img_base64}",
+                    },
+                }
+            )
+
+        # Create message content
+        if len(image_contents) == 1:
+            content = image_contents
+        elif len(image_contents) > 1:
+            content = image_contents
+        else:
+            content = [{"type": "text", "text": "Image generation completed but no images were produced."}]
+
+        # Create response choice
+        choice_data = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role=role, content=content),
+            logprobs=None,
+            finish_reason="stop",
+            stop_reason=None,
+        )
+        choices.append(choice_data)
+
+        return choices
+
+    # ==================== Diffusion Mode Methods ====================
+
+    async def _create_diffusion_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None = None,
+    ) -> ChatCompletionResponse | ErrorResponse:
+        """Generate images via chat completion interface for diffusion models.
+
+        Args:
+            request: Chat completion request
+            raw_request: Raw FastAPI request object
+
+        Returns:
+            ChatCompletionResponse with generated images or ErrorResponse
+        """
+        try:
+            request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+            created_time = int(time.time())
+
+            # Convert messages to dict format
+            messages = []
+            for msg in request.messages:
+                if hasattr(msg, "model_dump"):
+                    messages.append(msg.model_dump())
+                elif isinstance(msg, dict):
+                    messages.append(msg)
+                else:
+                    messages.append({"role": getattr(msg, "role", "user"), "content": getattr(msg, "content", "")})
+
+            # Extract prompt and images from messages
+            prompt, reference_images = self._extract_diffusion_prompt_and_images(messages)
+
+            if not prompt:
+                return self._create_error_response("No text prompt found in messages")
+
+            # Extract generation parameters from extra_body (preferred)
+            # Reference: text_to_image.py and text_to_video.py for supported parameters
+            extra_body = getattr(request, "extra_body", None) or {}
+
+            # Parse size if provided (supports "1024x1024" format)
+            height = extra_body.get("height")
+            width = extra_body.get("width")
+            if "size" in extra_body:
+                try:
+                    size_str = extra_body["size"]
+                    if isinstance(size_str, str) and "x" in size_str.lower():
+                        w, h = size_str.lower().split("x")
+                        width, height = int(w), int(h)
+                except ValueError:
+                    logger.warning("Invalid size format: %s", extra_body.get("size"))
+
+            # Get request parameters from extra_body
+            # Text-to-image parameters (ref: text_to_image.py)
+            num_inference_steps = extra_body.get("num_inference_steps", 50)
+            guidance_scale = extra_body.get("guidance_scale", 7.5)
+            true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
+            seed = extra_body.get("seed")
+            negative_prompt = extra_body.get("negative_prompt")
+            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+
+            # Text-to-video parameters (ref: text_to_video.py)
+            num_frames = extra_body.get("num_frames")
+            guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+
+            logger.info(
+                "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
+                request_id,
+                prompt[:50] + "..." if len(prompt) > 50 else prompt,
+                len(reference_images),
+                {k: v for k, v in extra_body.items() if v is not None},
+            )
+
+            # Decode reference images if provided
+            pil_images: list[Image.Image] = []
+            for img_b64 in reference_images:
+                try:
+                    img_bytes = base64.b64decode(img_b64)
+                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                except Exception as e:
+                    logger.warning("Failed to decode reference image: %s", e)
+
+            # Build generation kwargs
+            gen_kwargs: dict[str, Any] = {
+                "prompt": prompt,
+                "request_id": request_id,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "height": height,
+                "width": width,
+                "negative_prompt": negative_prompt,
+                "num_outputs_per_prompt": num_outputs_per_prompt,
+                "seed": seed,
+            }
+
+            # Add Qwen-Image specific parameter
+            if true_cfg_scale is not None:
+                gen_kwargs["true_cfg_scale"] = true_cfg_scale
+
+            # Add video generation parameters if set
+            if num_frames is not None:
+                gen_kwargs["num_frames"] = num_frames
+            if guidance_scale_2 is not None:
+                gen_kwargs["guidance_scale_2"] = guidance_scale_2
+
+            # Add reference image if provided
+            if pil_images:
+                if len(pil_images) == 1:
+                    gen_kwargs["pil_image"] = pil_images[0]
+                else:
+                    od_config = getattr(self._diffusion_engine, "od_config", None)
+                    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
+                    if supports_multimodal_inputs:
+                        gen_kwargs["pil_image"] = pil_images
+                    else:
+                        return self._create_error_response(
+                            "Multiple input images are not supported by the current diffusion model. "
+                            "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
+                            "and send multiple images in the user message content.",
+                            status_code=400,
+                        )
+
+            # Generate image
+            result = await self._diffusion_engine.generate(**gen_kwargs)
+
+            # Convert images to base64 content
+            image_contents: list[dict[str, Any]] = []
+            for img in result.images:
+                with BytesIO() as buffer:
+                    img.save(buffer, format="PNG")
+                    img_bytes = buffer.getvalue()
+                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                image_contents.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_base64}",
+                        },
+                    }
+                )
+
+            # Build response
+            if not image_contents:
+                content = "Image generation completed but no images were produced."
+            else:
+                content = image_contents
+
+            # Use model_construct to bypass validation for multimodal content
+            # (ChatMessage.content only accepts str, but we need list for images)
+            message = ChatMessage.model_construct(role="assistant", content=content)
+            choice = ChatCompletionResponseChoice.model_construct(
+                index=0,
+                message=message,
+                finish_reason="stop",
+                logprobs=None,
+                stop_reason=None,
+            )
+
+            response = ChatCompletionResponse(
+                id=request_id,
+                created=created_time,
+                model=self._diffusion_model_name,
+                choices=[choice],
+                usage=UsageInfo(
+                    prompt_tokens=len(prompt.split()),
+                    completion_tokens=1,
+                    total_tokens=len(prompt.split()) + 1,
+                ),
+            )
+
+            logger.info(
+                "Diffusion chat completed for request %s: %d images",
+                request_id,
+                len(result.images),
+            )
+
+            return response
+
+        except Exception as e:
+            logger.exception("Diffusion chat completion failed: %s", e)
+            return self._create_error_response(
+                f"Image generation failed: {str(e)}",
+                status_code=500,
+            )
+
+    def _extract_diffusion_prompt_and_images(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, list[str]]:
+        """Extract text prompt and base64 images from chat messages.
+
+        Args:
+            messages: List of chat messages
+
+        Returns:
+            Tuple of (prompt_text, list_of_base64_images)
+        """
+        prompt_parts: list[str] = []
+        images: list[str] = []
+
+        for message in messages:
+            role = message.get("role", "")
+            if role != "user":
+                continue
+
+            content = message.get("content", "")
+
+            # String content
+            if isinstance(content, str):
+                prompt_parts.append(content)
+                continue
+
+            # List of content items
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, str):
+                        prompt_parts.append(item)
+                    elif isinstance(item, dict):
+                        # Handle {"type": "text", "text": "..."} format
+                        if item.get("type") == "text":
+                            prompt_parts.append(item.get("text", ""))
+                        # Handle {"text": "..."} format
+                        elif "text" in item and "type" not in item:
+                            prompt_parts.append(item["text"])
+                        # Handle {"type": "image_url", "image_url": {"url": "..."}}
+                        elif item.get("type") == "image_url":
+                            url = item.get("image_url", {}).get("url", "")
+                            if url.startswith("data:image"):
+                                try:
+                                    _, b64_data = url.split(",", 1)
+                                    images.append(b64_data)
+                                except ValueError:
+                                    logger.warning("Invalid data URL format")
+                        # Handle {"image": "base64..."} format
+                        elif "image" in item:
+                            images.append(item["image"])
+
+        prompt = " ".join(prompt_parts).strip()
+        return prompt, images
+
+    def _create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> ErrorResponse:
+        """Create an error response following OpenAI error format."""
+        return ErrorResponse(
+            message=message,
+            type=err_type,
+            code=status_code,
+        )

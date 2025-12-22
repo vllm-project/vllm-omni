@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch.nn as nn
 
@@ -37,13 +38,13 @@ class ModelHook:
     """Base class for model hooks that can override a module's forward."""
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
-        return module
+        raise NotImplementedError
 
     def new_forward(self, module: nn.Module, *args: Any, **kwargs: Any):
         raise NotImplementedError
 
     def reset_state(self, module: nn.Module) -> nn.Module:
-        return module
+        raise NotImplementedError
 
 
 @dataclass

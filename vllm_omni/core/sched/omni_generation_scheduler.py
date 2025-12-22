@@ -1,18 +1,15 @@
 import time
 from collections import defaultdict
-from typing import Optional
 
+from vllm.distributed.kv_events import KVEventBatch
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
-from vllm.v1.core.sched.scheduler import (
-    Request,
-    RequestStatus,
-    SchedulerOutput,
-    SpecDecodingStats,
-)
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -27,15 +24,10 @@ class OmniGenerationScheduler(VLLMScheduler):
           default vLLM scheduling.
         """
 
-        # Select requests with zero prompt and using pooling
-        # (diffusion results returned via pooler_output)
         token_budget = self.max_num_scheduled_tokens
-        capacity = self.max_num_running_reqs - len(self.running)
         scheduled_timestamp = time.monotonic()
 
         scheduled_new_reqs: list[Request] = []
-        scheduled_resumed_reqs: list[Request] = []
-        scheduled_running_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -47,7 +39,7 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         # Fast path selection and scheduling (treat all as diffusion requests,
         # independent of pooling_params)
-        while self.waiting and token_budget > 0 and capacity > 0:
+        while self.waiting and token_budget > 0 and len(self.running) < self.max_num_running_reqs:
             request = self.waiting.peek_request()
             # Uniformly treat as diffusion. A feature flag can be added later
             # via config or request tag.
@@ -82,7 +74,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            capacity -= 1
             scheduled_new_reqs.append(request)
 
         # Return skipped waiting requests
@@ -97,25 +88,31 @@ class OmniGenerationScheduler(VLLMScheduler):
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
-            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(
-                any_request, len(self.running)
-            )
+            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
 
-        # Assemble SchedulerOutput
-        new_reqs_data = [
-            OmniNewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
-            for req in scheduled_new_reqs
-        ]
+        # Assemble SchedulerOutput (align with v0.12.0)
+        if self.use_v2_model_runner:
+            # No resumed reqs in fast path; pass prefill_token_ids for new reqs.
+            new_reqs_data = [
+                OmniNewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    getattr(req, "_all_token_ids", None),
+                )
+                for req in scheduled_new_reqs
+            ]
+        else:
+            new_reqs_data = [
+                OmniNewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+                for req in scheduled_new_reqs
+            ]
+        # No running/resumed reqs scheduled in our fast path
         cached_reqs_data = self._make_cached_request_data(
-            scheduled_running_reqs,
-            scheduled_resumed_reqs,
-            num_scheduled_tokens,
-            scheduled_spec_decode_tokens,
-            req_to_new_blocks,
-        )
-        scheduled_requests = scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
-        structured_output_request_ids, grammar_bitmask = self.get_grammar_bitmask(
-            scheduled_requests, scheduled_spec_decode_tokens
+            running_reqs=[],
+            resumed_reqs=[],
+            num_scheduled_tokens=num_scheduled_tokens,
+            spec_decode_tokens=scheduled_spec_decode_tokens,
+            req_to_new_blocks=req_to_new_blocks,
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -129,14 +126,21 @@ class OmniGenerationScheduler(VLLMScheduler):
             num_common_prefix_blocks=num_common_prefix_blocks,
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-            structured_output_request_ids=structured_output_request_ids,
-            grammar_bitmask=grammar_bitmask,
+            preempted_req_ids=set(),
         )
+
+        # Record the request ids scheduled in this step (v0.12.0 behavior).
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # KVTransfer: package metadata
         if self.connector is not None:
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+        # EC Connector: package metadata
+        if self.ec_connector is not None:
+            ec_meta = self.ec_connector.build_connector_meta(scheduler_output)
+            scheduler_output.ec_connector_metadata = ec_meta
 
         # Update internal state (advance num_computed_tokens, free encoder inputs,
         # etc.)
@@ -170,8 +174,17 @@ class OmniGenerationScheduler(VLLMScheduler):
         kv_connector_output = model_runner_output.kv_connector_output
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        spec_decoding_stats: Optional[SpecDecodingStats] = None
+        spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
+        # Merge connector-side stats (align with v0.12.0)
+        if kv_connector_stats and self.connector:
+            kv_stats = self.connector.get_kv_connector_stats()
+            if kv_stats:
+                kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+
+        failed_kv_load_req_ids = None
+        if kv_connector_output and getattr(kv_connector_output, "invalid_block_ids", None):
+            failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -180,6 +193,9 @@ class OmniGenerationScheduler(VLLMScheduler):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                # Skip requests that were recovered from KV load failure
+                continue
             request = self.requests.get(req_id)
             if request is None:
                 # The request is already finished. This can happen if the
@@ -200,7 +216,8 @@ class OmniGenerationScheduler(VLLMScheduler):
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
-                request.num_computed_tokens -= num_rejected
+                if request.num_computed_tokens > 0:
+                    request.num_computed_tokens -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -228,9 +245,7 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
-                # NOTE: once we support N tokens per step (spec decode),
-                # the outer lists can be of length > 1.
-                new_logprobs = logprobs.slice(req_index, req_index + 1)
+                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 # NOTE: structured_output_request should not be None if
@@ -246,12 +261,6 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            # Convert pooler_output tensor to dict format expected by OmniEngineCoreOutput
-            pooling_output_dict = None
-            if pooler_output is not None:
-                # Wrap tensor in dict to match OmniEngineCoreOutput.pooling_output type
-                # which expects Optional[dict[str, torch.Tensor]]
-                pooling_output_dict = {"model_outputs": pooler_output}
             if new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -261,12 +270,13 @@ class OmniGenerationScheduler(VLLMScheduler):
                         finish_reason=request.get_finished_reason(),
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooling_output_dict,
+                        pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
             else:
@@ -281,8 +291,21 @@ class OmniGenerationScheduler(VLLMScheduler):
             self.waiting.remove_requests(stopped_preempted_reqs)
 
         # KV Connector: update state for finished KV Transfers.
-        if model_runner_output.kv_connector_output:
-            self._update_from_kv_xfer_finished(model_runner_output.kv_connector_output)
+        if kv_connector_output:
+            self._update_from_kv_xfer_finished(kv_connector_output)
+
+        # Collect and publish KV cache events (align with v0.12.0)
+        events = self.kv_cache_manager.take_events()
+        if self.connector is not None:
+            connector_events = self.connector.take_events()
+            if connector_events:
+                if events is None:
+                    events = list(connector_events)
+                else:
+                    events.extend(connector_events)
+        if events:
+            batch = KVEventBatch(ts=time.time(), events=events)
+            self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.

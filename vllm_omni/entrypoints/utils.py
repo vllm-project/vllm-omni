@@ -2,15 +2,18 @@ import os
 from collections import Counter
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from omegaconf import OmegaConf
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 
-from vllm_omni.utils import detect_device_type
+from vllm_omni.utils import detect_device_type, is_rocm
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+logger = init_logger(__name__)
 
 
 def _maybe_materialize_bagel_config_py(model: str) -> str | None:
@@ -155,8 +158,10 @@ def resolve_model_config_path(model: str) -> str:
     device_type = detect_device_type()
 
     # Try device-specific config first
-    if device_type != "cuda":
+    if device_type != "cuda" or is_rocm():
         device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
+        if is_rocm():
+            device_config_file = f"vllm_omni/model_executor/stage_configs/rocm/{model_type}.yaml"
         device_config_path = PROJECT_ROOT / device_config_file
         if os.path.exists(device_config_path):
             return str(device_config_path)
@@ -169,7 +174,7 @@ def resolve_model_config_path(model: str) -> str:
     return str(stage_config_path)
 
 
-def load_stage_configs_from_model(model: str, base_engine_args: Optional[dict] = None) -> list:
+def load_stage_configs_from_model(model: str, base_engine_args: dict | None = None) -> list:
     """Load stage configurations from model's default config file.
 
     Loads stage configurations based on the model type and device type.
@@ -192,7 +197,7 @@ def load_stage_configs_from_model(model: str, base_engine_args: Optional[dict] =
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: Optional[dict] = None) -> list:
+def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
     """Load stage configurations from a YAML file.
 
     Args:
@@ -215,3 +220,49 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: Optional[di
             base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
+
+
+def get_final_stage_id_for_e2e(
+    output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
+) -> int:
+    """Get the final stage id for e2e.
+
+    Args:
+        stage_list: List of stage configurations
+
+    Returns:
+        Final stage id for e2e
+    """
+    last_stage_id = len(stage_list) - 1
+    if output_modalities is not None:
+        prompt_modalities = []
+        for modality in output_modalities:
+            if modality not in default_modalities:
+                logger.warning(f"Invalid output modality: {modality}, ignoring it")
+                # TODO: if user specifies unsupported modalities, invalid it and raise an error
+                continue
+            prompt_modalities.append(modality)
+        output_modalities = prompt_modalities
+    else:
+        output_modalities = default_modalities
+
+    try:
+        for _sid in range(last_stage_id, -1, -1):
+            if (
+                getattr(stage_list[_sid], "final_output", False)
+                and stage_list[_sid].final_output_type in output_modalities
+            ):
+                final_stage_id_for_e2e = _sid
+                break
+        if final_stage_id_for_e2e < 0:
+            final_stage_id_for_e2e = last_stage_id
+    except Exception as e:
+        logger.debug(
+            "[Orchestrator] Failed to determine final stage for E2E; \
+                falling back to last: %s",
+            e,
+            exc_info=True,
+        )
+        final_stage_id_for_e2e = last_stage_id
+
+    return final_stage_id_for_e2e

@@ -50,6 +50,22 @@ omni = Omni(
 )
 ```
 
+## Online Serving (OpenAI-Compatible)
+
+Enable Cache-DiT for online serving by passing `--cache-backend cache_dit` when starting the server:
+
+```bash
+# Use Cache-DiT default (recommended) parameters
+vllm serve Qwen/Qwen-Image --omni --port 8091 --cache-backend cache_dit
+```
+
+To customize Cache-DiT settings for online serving, pass a JSON string via `--cache-config`:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --cache-backend cache_dit \
+  --cache-config '{"Fn_compute_blocks": 1, "Bn_compute_blocks": 0, "max_warmup_steps": 4, "residual_diff_threshold": 0.12}'
+```
 
 ## Acceleration Methods
 
@@ -201,7 +217,7 @@ omni = Omni(
 
 You can customize the configuration by modifying the `cache_config` dictionary to use only specific methods (e.g., DBCache only, DBCache + SCM, etc.) based on your quality and speed requirements.
 
-To test another model, you can modify `--model` with the target model identifier like `Tongyi-MAI/Z-Image-Turbo` and update `cache_confg` according the model architecture (e.g., number of transformer blocks).
+To test another model, you can modify `--model` with the target model identifier like `Tongyi-MAI/Z-Image-Turbo` and update `cache_config` according the model architecture (e.g., number of transformer blocks).
 
 
 ## Additional Resources

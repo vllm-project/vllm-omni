@@ -39,6 +39,16 @@ omni = Omni(
 )
 ```
 
+## Online Serving (OpenAI-Compatible)
+
+Enable TeaCache for online serving by passing `--cache-backend tea_cache` when starting the server:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh": 0.2}'
+```
+
 ## Configuration Parameters
 
 ### `rel_l1_thresh` (float, default: `0.2`)
@@ -87,13 +97,29 @@ cache_config={"rel_l1_thresh": 0.1}  # More conservative caching
 
 ## Supported Models
 
-Currently supported models:
+<style>
+th {
+  white-space: nowrap;
+  min-width: 0 !important;
+}
+</style>
 
-- **QwenImagePipeline**
-  - Model identifier: `"Qwen/Qwen-Image"`
-  - Example: `model="Qwen/Qwen-Image"`
+| Architecture | Models | Example HF Models |
+|--------------|--------|-------------------|
+| `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
+| `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
+| `QwenImageEditPlusPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit-2509` |
 
-Future support (extractors in development):
+### Coming Soon
 
-- **FluxPipeline** - Coming soon
-- **CogVideoXPipeline** - Coming soon
+<style>
+th {
+  white-space: nowrap;
+  min-width: 0 !important;
+}
+</style>
+
+| Architecture | Models | Example HF Models |
+|--------------|--------|-------------------|
+| `FluxPipeline` | Flux | - |
+| `CogVideoXPipeline` | CogVideoX | - |

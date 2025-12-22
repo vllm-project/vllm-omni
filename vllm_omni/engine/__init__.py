@@ -4,7 +4,7 @@ Engine components for vLLM-Omni.
 
 import time
 from collections.abc import Mapping
-from typing import Any, Optional, Union
+from typing import Any
 
 import msgspec
 import torch
@@ -42,12 +42,12 @@ class AdditionalInformationEntry(msgspec.Struct):
     """
 
     # Tensor form
-    tensor_data: Optional[bytes] = None
-    tensor_shape: Optional[list[int]] = None
-    tensor_dtype: Optional[str] = None
+    tensor_data: bytes | None = None
+    tensor_shape: list[int] | None = None
+    tensor_dtype: str | None = None
 
     # List form
-    list_data: Optional[list[Any]] = None
+    list_data: list[Any] | None = None
 
 
 class AdditionalInformationPayload(msgspec.Struct):
@@ -74,9 +74,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     """
 
     # Optional prompt embeddings (direct-transfer version)
-    prompt_embeds: Optional[PromptEmbedsPayload] = None
+    prompt_embeds: PromptEmbedsPayload | None = None
     # Optional additional information dictionary (serialized)
-    additional_information: Optional[AdditionalInformationPayload] = None
+    additional_information: AdditionalInformationPayload | None = None
 
 
 class OmniEngineCoreOutput(
@@ -88,19 +88,23 @@ class OmniEngineCoreOutput(
     request_id: str
     new_token_ids: list[int]
 
-    new_logprobs: Optional[LogprobsLists] = None
-    new_prompt_logprobs_tensors: Optional[LogprobsTensors] = None
+    new_logprobs: LogprobsLists | None = None
+    new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
-    pooling_output: Optional[dict[str, torch.Tensor]] = None
+    pooling_output: dict[str, torch.Tensor] | None = None
 
-    finish_reason: Optional[FinishReason] = None
-    stop_reason: Union[int, str, None] = None
-    events: Optional[list[EngineCoreEvent]] = None
-    kv_transfer_params: Optional[dict[str, Any]] = None
+    finish_reason: FinishReason | None = None
+    stop_reason: int | str | None = None
+    events: list[EngineCoreEvent] | None = None
+    kv_transfer_params: dict[str, Any] | None = None
 
-    trace_headers: Optional[Mapping[str, str]] = None
+    trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+
+    # The number of NaNs in logits.
+    # A value greater than 0 indicates that the output is corrupted.
+    num_nans_in_logits: int = 0
 
     @property
     def finished(self) -> bool:
@@ -120,18 +124,18 @@ class OmniEngineCoreOutputs(
 
     # [num_reqs]
     outputs: list[OmniEngineCoreOutput] = []
-    scheduler_stats: Optional[SchedulerStats] = None
+    scheduler_stats: SchedulerStats | None = None
     timestamp: float = 0.0
 
-    utility_output: Optional[UtilityOutput] = None
-    finished_requests: Optional[set[str]] = None
+    utility_output: UtilityOutput | None = None
+    finished_requests: set[str] | None = None
 
     # In DP case, used to signal that the current wave of requests
     # has finished and the engines are paused.
-    wave_complete: Optional[int] = None
+    wave_complete: int | None = None
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
-    start_wave: Optional[int] = None
+    start_wave: int | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:

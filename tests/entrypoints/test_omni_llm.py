@@ -1,3 +1,4 @@
+import uuid
 import warnings
 from queue import Empty, Queue
 from typing import Any
@@ -392,12 +393,12 @@ def mock_get_config(monkeypatch):
     )
     # Also mock in processor module if it's imported
     monkeypatch.setattr(
-        "vllm_omni.engine.processor.length_from_prompt_token_ids_or_embeds",
+        "vllm_omni.engine.input_processor.length_from_prompt_token_ids_or_embeds",
         _mock_length_from_prompt_token_ids_or_embeds,
         raising=False,
     )
     # If processor module is already imported, patch it directly
-    processor_module_path = "vllm_omni.engine.processor"
+    processor_module_path = "vllm_omni.engine.input_processor"
     if processor_module_path in sys.modules:
         processor_module = sys.modules[processor_module_path]
         setattr(
@@ -639,9 +640,17 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
 
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_llm_module, "uuid", uuid)
+
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     llm = OmniLLM(model="any", init_timeout=1)
+
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
 
     # Simulate worker behavior: manually put results into output queues
     # Note: We put results before calling generate, which simulates worker processes
@@ -649,7 +658,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     # Stage 0 output (will be collected first)
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
@@ -661,13 +670,14 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     # then stage 1 result will be collected.
     llm.stage_list[1]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1, "text": "s1"}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
     )
 
-    sampling_params_list = [object(), object()]
+    # Use dicts instead of object() for serializable sampling params
+    sampling_params_list = [{"temperature": 0.7}, {"temperature": 0.8}]
     prompts = ["hi"]
     outputs = llm.generate(prompts=prompts, sampling_params_list=sampling_params_list)
 
@@ -734,27 +744,36 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
 
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_llm_module, "uuid", uuid)
+
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     llm = OmniLLM(model="any", init_timeout=1)
 
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
+
     # Simulate worker behavior: put results into output queues
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
     )
     llm.stage_list[1]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
     )
 
-    outputs = llm.generate(prompts=["p"], sampling_params_list=[object(), object()])
+    # Use dicts instead of object() for serializable sampling params
+    outputs = llm.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}])
     assert outputs == []
 
 
@@ -923,14 +942,22 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
 
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_llm_module, "uuid", uuid)
+
     from vllm_omni.entrypoints.omni_llm import OmniLLM
 
     llm = OmniLLM(model="any", init_timeout=1)
 
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
+
     # Put error message in output queue
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "error": "test error",
         }
     )
@@ -938,14 +965,15 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     # (error handling continues the loop, so we need a valid result to finish)
     llm.stage_list[0]._out_q.put_nowait(
         {
-            "request_id": 0,
+            "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "result"}],
             "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
         }
     )
 
     # Generate should handle error gracefully (log but continue)
-    sampling_params_list = [object()]
+    # Use dict instead of object() for serializable sampling params
+    sampling_params_list = [{"temperature": 0.7}]
     outputs = llm.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
     # Should return final output (error was logged but didn't stop processing)
     assert isinstance(outputs, list)

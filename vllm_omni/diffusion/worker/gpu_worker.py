@@ -8,18 +8,20 @@ import torch
 import zmq
 from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm.distributed.parallel_state import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 from vllm.logger import init_logger
-from vllm.utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import (
     SHUTDOWN_MESSAGE,
     DiffusionOutput,
     OmniDiffusionConfig,
+    set_current_omni_diffusion_config,
+)
+from vllm_omni.diffusion.distributed.parallel_state import (
+    destroy_distributed_env,
+    init_distributed_environment,
+    initialize_model_parallel,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -61,22 +63,33 @@ class GPUWorker:
 
         # hack
         vllm_config = VllmConfig()
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
-        set_current_vllm_config(vllm_config)
+        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
 
-        init_distributed_environment(world_size=world_size, rank=rank)
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
-        logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+        with set_current_omni_diffusion_config(self.od_config):
+            with set_current_vllm_config(vllm_config):
+                init_distributed_environment(world_size=world_size, rank=rank)
+                logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+                parallel_config = self.od_config.parallel_config
+                initialize_model_parallel(
+                    data_parallel_size=parallel_config.data_parallel_size,
+                    cfg_parallel_size=parallel_config.cfg_parallel_size,
+                    sequence_parallel_size=parallel_config.sequence_parallel_size,
+                    ulysses_degree=parallel_config.ulysses_degree,
+                    ring_degree=parallel_config.ring_degree,
+                    tensor_parallel_size=parallel_config.tensor_parallel_size,
+                    pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                )
 
-        load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
-        time_before_load = time.perf_counter()
-        with DeviceMemoryProfiler() as m:
-            self.pipeline = model_loader.load_model(
-                od_config=self.od_config,
-                load_device=f"cuda:{rank}",
-            )
-        time_after_load = time.perf_counter()
+                load_config = LoadConfig()
+                model_loader = DiffusersPipelineLoader(load_config)
+                time_before_load = time.perf_counter()
+                with DeviceMemoryProfiler() as m:
+                    self.pipeline = model_loader.load_model(
+                        od_config=self.od_config,
+                        load_device=f"cuda:{rank}",
+                    )
+                time_after_load = time.perf_counter()
 
         logger.info(
             "Model loading took %.4f GiB and %.6f seconds",
@@ -108,12 +121,7 @@ class GPUWorker:
         return output
 
     def shutdown(self) -> None:
-        if torch.distributed.is_initialized():
-            try:
-                torch.distributed.destroy_process_group()
-                logger.info("Worker %s: Destroyed process group", self.rank)
-            except Exception as exc:  # pragma: no cover - best effort cleanup
-                logger.warning("Worker %s: Failed to destroy process group: %s", self.rank, exc)
+        destroy_distributed_env()
 
 
 class WorkerProc:

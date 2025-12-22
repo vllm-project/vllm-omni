@@ -9,6 +9,14 @@ steps:
     agents:
       queue: "cpu_queue_premerge_us_east_1"
 
+  # - label: "Test on NPU"
+  #   depends_on: ~
+  #   key: npu-test
+  #   commands:
+  #     - ".buildkite/scripts/hardware_ci/run_npu_test.sh"
+  #   agents:
+  #     queue: "ascend"
+
   - label: "Simple Unit Test"
     commands:
       - ".buildkite/scripts/simple_test.sh"
@@ -16,10 +24,11 @@ steps:
       queue: "cpu_queue_premerge"
 
   - label: "Diffusion Model Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
+      - pytest -s -v tests/e2e/offline_inference/test_ovis_image.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -39,6 +48,23 @@ steps:
       - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Parallelism Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -84,6 +110,41 @@ steps:
                 resources:
                   limits:
                     nvidia.com/gpu: 2
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: "Diffusion Image Edit Test with H100 (1 GPU)"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/online_serving/test_i2i_multi_image_input.py
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
                 volumeMounts:
                   - name: devshm
                     mountPath: /dev/shm

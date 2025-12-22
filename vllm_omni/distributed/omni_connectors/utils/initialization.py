@@ -6,7 +6,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from ..factory import OmniConnectorFactory
 from .config import ConnectorSpec, OmniTransferConfig
@@ -21,8 +21,8 @@ logger = get_connector_logger(__name__)
 
 
 def initialize_connectors_from_config(
-    config_path: Optional[Union[str, Path]] = None, default_shm_threshold: int = 65536
-) -> tuple[Optional[OmniTransferConfig], dict[tuple[str, str], OmniConnectorBase]]:
+    config_path: str | Path | None = None, default_shm_threshold: int = 65536
+) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """
     Initialize connectors from configuration file.
 
@@ -64,9 +64,7 @@ def create_connectors_from_config(
     return connectors
 
 
-def get_connectors_config_for_stage(
-    transfer_config: Optional[OmniTransferConfig], stage_id: Union[str, int]
-) -> dict[str, Any]:
+def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
     """
     Extract connector configurations relevant for a specific stage worker.
 
@@ -98,10 +96,10 @@ def get_connectors_config_for_stage(
 
 
 def load_omni_transfer_config(
-    config_path: Optional[Union[str, Path]] = None,
-    config_dict: Optional[dict[str, Any]] = None,
+    config_path: str | Path | None = None,
+    config_dict: dict[str, Any] | None = None,
     default_shm_threshold: int = 65536,
-) -> Optional[OmniTransferConfig]:
+) -> OmniTransferConfig | None:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
         # Even if no config provided, we might want to return a default config with SHM connectors
@@ -239,8 +237,8 @@ def load_omni_transfer_config(
 
 
 def initialize_orchestrator_connectors(
-    config_path: Optional[str], worker_backend: Optional[str] = "multi_process", shm_threshold_bytes: int = 65536
-) -> tuple[Optional[OmniTransferConfig], dict[tuple[str, str], OmniConnectorBase]]:
+    config_path: str | None, worker_backend: str | None = "multi_process", shm_threshold_bytes: int = 65536
+) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
     Args:
         config_path: The path to the configuration file.
@@ -259,7 +257,7 @@ def initialize_orchestrator_connectors(
 
 
 def get_stage_connector_config(
-    transfer_config: Optional[OmniTransferConfig],
+    transfer_config: OmniTransferConfig | None,
     stage_id: int,
 ) -> dict[str, Any]:
     """Return the serialized connector config payload for a specific stage."""
@@ -280,7 +278,7 @@ def get_stage_connector_config(
 def build_stage_connectors(
     stage_id: int,
     connectors_config: dict[str, Any],
-) -> Optional[dict[tuple[str, str], Any]]:
+) -> dict[tuple[str, str], Any] | None:
     """Instantiate OmniConnectors for a stage based on config."""
     if not connectors_config:
         return {}
@@ -294,7 +292,7 @@ def build_stage_connectors(
     from .config import ConnectorSpec
 
     connectors: dict[tuple[str, str], Any] = {}
-    # 将字典格式的配置转换为ConnectorSpec对象
+    # Convert dictionary-formatted config to ConnectorSpec objects
     stage_connector_specs = {}
     for input_key, config in connectors_config.items():
         if not input_key.startswith("from_stage_"):
@@ -312,7 +310,7 @@ def build_stage_connectors(
         stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
 
     try:
-        # 使用统一的连接器创建逻辑
+        # Use unified connector creation logic
         connectors = create_connectors_from_config(stage_connector_specs)
     except Exception as exc:  # pragma: no cover - defensive logging
         # Fail fast so the stage does not start with missing connectors.
