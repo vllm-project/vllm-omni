@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
+from diffusers.pipelines.longcat_image.system_messages import SYSTEM_PROMPT_EN, SYSTEM_PROMPT_ZH
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, SchedulerMixin
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -25,7 +26,6 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
-from vllm_omni.diffusion.models.longcat_image.system_prompt import SYSTEM_PROMPT_EN, SYSTEM_PROMPT_ZH
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
