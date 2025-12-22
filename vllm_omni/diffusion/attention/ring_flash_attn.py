@@ -281,7 +281,6 @@ class RingFlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         assert alibi_slopes is None
-        # 添加 contiguous 确保内存连续
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
