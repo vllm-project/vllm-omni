@@ -95,15 +95,31 @@ def ar2dit(
 
         prompt_len = len(prompt_token_ids)
         gen_len = len(gen_token_ids)
-        expected_total = prompt_len + gen_len
-        if hidden_states.shape[0] < expected_total:
+
+        # 注意：自回归解码下，`CompletionOutput.token_ids` 会包含“最后一次采样出来的 token”，
+        # 但该 token 的 hidden state 只有在下一步 forward 才会产生；当请求在该 token 处停止时，
+        # hidden_states 往往只覆盖到 gen_len-1 个生成 token。
+        #
+        # 因此这里以 hidden_states 的实际长度为准，截断 token_ids 对齐。
+        hidden_total = int(hidden_states.shape[0])
+        if hidden_total < prompt_len:
             raise RuntimeError(
-                "latent hidden states length mismatch with prompt+generated tokens: "
-                f"{hidden_states.shape[0]} < {expected_total} (prompt={prompt_len}, gen={gen_len})"
+                "latent hidden states shorter than prompt tokens: "
+                f"{hidden_total} < {prompt_len} (prompt_len={prompt_len})"
             )
+        gen_hidden_len = hidden_total - prompt_len
+        if gen_hidden_len <= 0:
+            raise RuntimeError(
+                "latent hidden states contain no generated segment: "
+                f"hidden_total={hidden_total}, prompt_len={prompt_len}"
+            )
+        if gen_hidden_len > gen_len:
+            # Best-effort: should be rare; keep the declared generated length.
+            gen_hidden_len = gen_len
 
         prompt_hidden_states = hidden_states[:prompt_len]
-        gen_hidden_states = hidden_states[prompt_len : prompt_len + gen_len]
+        gen_hidden_states = hidden_states[prompt_len : prompt_len + gen_hidden_len]
+        gen_token_ids = gen_token_ids[:gen_hidden_len]
 
         # 取 gen vocab 范围内 token 的 hidden states 作为 image condition tokens（排除 eol 等非 gen token）
         gen_token_ids_t = torch.tensor(gen_token_ids, dtype=torch.long)
@@ -136,6 +152,7 @@ def ar2dit(
             "gen_vocab_start_index": int(gen_vocab_start_index),
             "prompt_len": int(prompt_len),
             "gen_len": int(gen_len),
+            "gen_hidden_len": int(gen_hidden_len),
             "image_condition_len": int(image_condition.shape[0]),
         }
 
