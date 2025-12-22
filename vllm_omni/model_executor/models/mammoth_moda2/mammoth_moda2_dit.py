@@ -112,88 +112,21 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         additional_information: dict[str, object] | None = None,
         **kwargs: Any,  # noqa: ARG002
     ) -> OmniOutput:
-        # MammothModa2 follows the Qwen2.5-Omni pattern: condition embeddings are
-        # passed via additional_information/runtime_additional_information.
-        #
-        # IMPORTANT: the optional `gen_image_condition_refiner` should ONLY be
-        # applied to the image-condition token sequence (as in mammothmoda),
-        # not to the concatenated text+image tokens.
-
-        def _extract_tensor(info: object, key: str) -> torch.Tensor | None:
-            if not isinstance(info, dict):
-                return None
-            v = info.get(key)
-            return v if isinstance(v, torch.Tensor) else None
-
-        def _extract_int_from_list(info: object, key: str) -> int | None:
-            if not isinstance(info, dict):
-                return None
-            v = info.get(key)
-            if isinstance(v, list) and v:
-                try:
-                    return int(v[0])
-                except Exception:
-                    return None
-            if isinstance(v, (int, float)):
-                return int(v)
-            return None
-
-        def _extract_hw(info: object) -> tuple[int, int] | None:
-            if not isinstance(info, dict):
-                return None
-            v = info.get("image_size")
-            if isinstance(v, list) and len(v) >= 2:
-                try:
-                    return int(v[0]), int(v[1])
-                except Exception:
-                    return None
-            h = _extract_int_from_list(info, "image_height")
-            w = _extract_int_from_list(info, "image_width")
-            if h is None or w is None:
-                return None
-            return h, w
-
-        # Collect candidate info dicts in priority order.
-        info_candidates: list[dict[str, object]] = []
-        if isinstance(additional_information, dict):
-            info_candidates.append(additional_information)
-
-        addi_by_req = kwargs.get("additional_information_by_req_id")
-        req_ids = kwargs.get("request_ids")
-        if isinstance(addi_by_req, dict):
-            info = None
-            if isinstance(req_ids, list) and req_ids and isinstance(req_ids[0], str):
-                info = addi_by_req.get(req_ids[0])
-            elif addi_by_req:
-                info = next(iter(addi_by_req.values()))
-            if isinstance(info, dict):
-                info_candidates.append(info)
-
-        runtime_addi = kwargs.get("runtime_additional_information")
-        if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
-            info_candidates.append(runtime_addi[0])
-        elif isinstance(runtime_addi, dict):
-            for v in runtime_addi.values():
-                if isinstance(v, dict):
-                    info_candidates.append(v)
-                    break
-
-        text_cond: torch.Tensor | None = None
-        image_cond: torch.Tensor | None = None
-        legacy_cond: torch.Tensor | None = None
-        image_hw: tuple[int, int] | None = None
-        for info in info_candidates:
-            if text_cond is None:
-                text_cond = _extract_tensor(info, "text_prompt_embeds")
-            if image_cond is None:
-                image_cond = _extract_tensor(info, "image_prompt_embeds")
-            if legacy_cond is None:
-                legacy_cond = _extract_tensor(info, "prompt_embeds")
-            if image_hw is None:
-                image_hw = _extract_hw(info)
+        
+        runtime_addi = kwargs.get("runtime_additional_information", None)
+        text_cond = None
+        image_cond = None
+        legacy_cond = None
+        image_hw = (512, 512)
+        if runtime_addi is not None:
+            # runtime_addi will be none in dummy/profile runs
+            text_cond = runtime_addi[0]["text_prompt_embeds"]
+            image_cond = runtime_addi[0]["image_prompt_embeds"]
+            image_hw = (runtime_addi[0]["image_height"][0], runtime_addi[0]["image_width"][0])
 
         # Dummy/profile fallback: use inputs_embeds (often zeros)
         if text_cond is None and image_cond is None and legacy_cond is None:
+            # runtime_addi will be none in dummy/profile runs
             legacy_cond = inputs_embeds
 
         # Move to model device/dtype.
@@ -278,7 +211,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             )
 
         # Output image size (px), passed from stage input processor.
-        height, width = (512, 512) if image_hw is None else image_hw
+        height, width = image_hw
         if height <= 0 or width <= 0:
             raise ValueError(f"Invalid image size: {height}x{width}")
         if height % 16 != 0 or width % 16 != 0:
