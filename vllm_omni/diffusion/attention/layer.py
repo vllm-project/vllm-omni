@@ -19,7 +19,12 @@ from vllm_omni.diffusion.attention.parallel import build_parallel_attention_stra
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
-from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_world_size, 
+    get_sp_group, 
+    get_ulysses_parallel_world_size,
+    get_ulysses_parallel_rank
+)
 from vllm_omni.utils.platform_utils import is_npu
 from vllm_omni.diffusion.attention.ring_flash_attn import ring_flash_attn_func
 from vllm_omni.diffusion.attention.backends.ring_selector import AttnType
@@ -174,6 +179,24 @@ class Attention(nn.Module):
         except Exception:
             backend_pref = None
         
+        # If backend is flash_attn but dtype is float32, force sdpa
+        if backend_pref == "flash_attn" and query.dtype == torch.float32:
+            backend_pref = "sdpa" # Force backend_pref to sdpa for fallback
+
+        # Extract joint tensors and modify query if needed
+        joint_key, joint_value = None, None
+        joint_strategy = "front"
+        if attn_metadata is not None:
+            if attn_metadata.joint_query is not None:
+                if attn_metadata.joint_strategy == "front":
+                    query = torch.cat([attn_metadata.joint_query, query], dim=1)
+                else:
+                    query = torch.cat([query, attn_metadata.joint_query], dim=1)
+            
+            joint_key = attn_metadata.joint_key
+            joint_value = attn_metadata.joint_value
+            joint_strategy = attn_metadata.joint_strategy
+
         # Use ring_pytorch_attn_func for SDPA/Torch backend
         if backend_pref == "sdpa" or backend_pref == "torch":
              from vllm_omni.diffusion.attention.ring_pytorch_attn import ring_pytorch_attn_func
@@ -182,7 +205,10 @@ class Attention(nn.Module):
                  softmax_scale=softmax_scale, 
                  causal=self.causal,
                  group=self.ring_pg,
-                 op_type="efficient" # Default to flash implementation of SDPA
+                 op_type="flash", # Default to flash implementation of SDPA
+                 joint_tensor_key=joint_key,
+                 joint_tensor_value=joint_value,
+                 joint_strategy=joint_strategy,
              )
             
         out = ring_flash_attn_func(
@@ -199,6 +225,9 @@ class Attention(nn.Module):
             return_attn_probs=False,
             group=self.ring_pg,
             attn_type=AttnType.FA,
+            joint_tensor_key=joint_key,
+            joint_tensor_value=joint_value,
+            joint_strategy=joint_strategy,
         )
         return out
 
@@ -210,6 +239,27 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata = None,
     ) -> Tensor:
         """Ulysses attention forward pass with sequence parallelism."""
+        
+        # Handle Joint inputs for Ulysses
+        q_joint, k_joint, v_joint = None, None, None
+        joint_len = 0
+        joint_strategy = "front"
+        
+        if attn_metadata is not None:
+             joint_strategy = attn_metadata.joint_strategy
+             if attn_metadata.joint_query is not None:
+                 # Slice heads for Ulysses rank
+                 ulysses_world_size = get_ulysses_parallel_world_size()
+                 ulysses_rank = get_ulysses_parallel_rank()
+                 
+                 # joint_query is (B, S, H, D). Split H (dim 2).
+                 # chunk creates views, which is fine
+                 q_joint = attn_metadata.joint_query.chunk(ulysses_world_size, dim=2)[ulysses_rank]
+                 k_joint = attn_metadata.joint_key.chunk(ulysses_world_size, dim=2)[ulysses_rank]
+                 v_joint = attn_metadata.joint_value.chunk(ulysses_world_size, dim=2)[ulysses_rank]
+                 
+                 joint_len = q_joint.shape[1]
+
         # scatter 2, gather 1
         # (bs, seq_len/N, head_cnt, head_size) -> (bs, seq_len, head_cnt/N, head_size)
         q = SeqAllToAll4D.apply(self.ulysses_pg, query, self.scatter_idx, self.gather_idx, self.use_sync)
@@ -228,6 +278,17 @@ class Attention(nn.Module):
             except Exception:
                 backend_pref = None
             
+            # If backend is flash_attn but dtype is float32, force sdpa
+            if backend_pref == "flash_attn" and query.dtype == torch.float32:
+                backend_pref = "sdpa" # Force backend_pref to sdpa for fallback
+
+            # Concatenate joint query to local query
+            if q_joint is not None:
+                if joint_strategy == "front":
+                    q = torch.cat([q_joint, q], dim=1)
+                else:
+                    q = torch.cat([q, q_joint], dim=1)
+
             # Use ring_pytorch_attn_func for SDPA/Torch backend
             if backend_pref == "sdpa" or backend_pref == "torch":
                  from vllm_omni.diffusion.attention.ring_pytorch_attn import ring_pytorch_attn_func
@@ -236,7 +297,10 @@ class Attention(nn.Module):
                      softmax_scale=softmax_scale, 
                      causal=self.causal,
                      group=self.ring_pg,
-                     op_type="efficient" 
+                     op_type="flash",
+                     joint_tensor_key=k_joint,
+                     joint_tensor_value=v_joint,
+                     joint_strategy=joint_strategy,
                  )
             else:
                 context_layer = ring_flash_attn_func(
@@ -253,9 +317,24 @@ class Attention(nn.Module):
                     return_attn_probs=False,
                     group=self.ring_pg,
                     attn_type=AttnType.FA,
+                    joint_tensor_key=k_joint,
+                    joint_tensor_value=v_joint,
+                    joint_strategy=joint_strategy,
                 )
 
         elif is_npu():
+            # NPU implementation might not support joint tensors natively yet?
+            # If q_joint is not None, we should concatenate them
+            if q_joint is not None:
+                if joint_strategy == "front":
+                    q = torch.cat([q_joint, q], dim=1)
+                    k = torch.cat([k_joint, k], dim=1)
+                    v = torch.cat([v_joint, v], dim=1)
+                else:
+                    q = torch.cat([q, q_joint], dim=1)
+                    k = torch.cat([k, k_joint], dim=1)
+                    v = torch.cat([v, v_joint], dim=1)
+            
             context_layer = self.attention(
                 q,
                 k,
@@ -268,18 +347,59 @@ class Attention(nn.Module):
                 next_tokens=65535,
             )
         else:
+            # Standard Ulysses logic for attention computation
+            # If joint tensors exist, we must concatenate them to Q, K, V
+            if q_joint is not None:
+                if joint_strategy == "front":
+                    q = torch.cat([q_joint, q], dim=1)
+                    k = torch.cat([k_joint, k], dim=1)
+                    v = torch.cat([v_joint, v], dim=1)
+                else:
+                    q = torch.cat([q, q_joint], dim=1)
+                    k = torch.cat([k, k_joint], dim=1)
+                    v = torch.cat([v, v_joint], dim=1)
+            
             context_layer = self.attention.forward(
                 q,
                 k,
                 v,
-                attn_metadata=attn_metadata,
+                attn_metadata=None, # Already integrated into q, k, v
             )
 
         if isinstance(context_layer, tuple):
             context_layer = context_layer[0]
 
-        # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
-        # scatter 1, gather 2
-        output = SeqAllToAll4D.apply(self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync)
+        # Post-processing: Split Joint and Img outputs
+        if joint_len > 0:
+            if joint_strategy == "front":
+                output_joint = context_layer[:, :joint_len]
+                output_img = context_layer[:, joint_len:]
+            else:
+                output_img = context_layer[:, :-joint_len]
+                output_joint = context_layer[:, -joint_len:]
+            
+            # Scatter 1, Gather 2 for Img part
+            output_img = SeqAllToAll4D.apply(self.ulysses_pg, output_img, self.gather_idx, self.scatter_idx, self.use_sync)
+            
+            # AllGather for Joint part (Head Gather)
+            # output_joint is (B, JointLen, H_local, D). We want (B, JointLen, H_total, D).
+            # dist.all_gather expects list of tensors.
+            gathered_joint = [torch.zeros_like(output_joint) for _ in range(get_ulysses_parallel_world_size())]
+            dist.all_gather(gathered_joint, output_joint, group=self.ulysses_pg)
+            
+            # Concatenate along Head dimension (dim 2)
+            # Note: all_gather returns tensors in rank order. 
+            # Ulysses distributes heads 0..H/N to rank 0, etc.
+            # So concatenation order corresponds to head order.
+            output_joint = torch.cat(gathered_joint, dim=2)
+            
+            if joint_strategy == "front":
+                output = torch.cat([output_joint, output_img], dim=1)
+            else:
+                output = torch.cat([output_img, output_joint], dim=1)
+        else:
+            # (bs, seq_len, head_cnt/N, head_size) -> (bs, seq_len/N, head_cnt, head_size)
+            # scatter 1, gather 2
+            output = SeqAllToAll4D.apply(self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx, self.use_sync)
 
         return output

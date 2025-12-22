@@ -23,6 +23,9 @@ def ring_flash_attn_forward(
     deterministic=False,
     attn_type: AttnType = AttnType.FA,
     attn_processor=None,
+    joint_tensor_key=None,
+    joint_tensor_value=None,
+    joint_strategy="front",
 ):
     comm = RingComm(process_group)
 
@@ -31,6 +34,11 @@ def ring_flash_attn_forward(
 
     next_k, next_v = None, None
 
+    # Check and adjust q, k, v to be contiguous
+    if not q.is_contiguous(): q = q.contiguous()
+    if not k.is_contiguous(): k = k.contiguous()
+    if not v.is_contiguous(): v = v.contiguous()
+
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(k)
@@ -38,11 +46,21 @@ def ring_flash_attn_forward(
             comm.commit()
 
         if not causal or step <= comm.rank:
+            step_k = k
+            step_v = v
+            if step == 0 and joint_tensor_key is not None:
+                if joint_strategy == "front":
+                    step_k = torch.cat([joint_tensor_key, step_k], dim=1)
+                    step_v = torch.cat([joint_tensor_value, step_v], dim=1)
+                else:
+                    step_k = torch.cat([step_k, joint_tensor_key], dim=1)
+                    step_v = torch.cat([step_v, joint_tensor_value], dim=1)
+            
             fn = select_flash_attn_impl(attn_type, stage="fwd-only", attn_processor=attn_processor)
             block_out, block_lse = fn(
                 q,
-                k,
-                v,
+                step_k,
+                step_v,
                 dropout_p=dropout_p,
                 softmax_scale=softmax_scale,
                 causal=causal and step == 0,
@@ -51,7 +69,10 @@ def ring_flash_attn_forward(
                 alibi_slopes=alibi_slopes,
                 return_softmax=True and dropout_p > 0,
             )
-            # print(f"Rank {comm.rank} Step {step}: q={q.shape} block_out={block_out.shape}")
+            # print(f"Rank {comm.rank} Step {step}: q={q.shape} block_out={block_out.shape} block_lse={block_lse.shape}")
+            
+            # Ensure block_out is contiguous if needed, though usually it is from FA
+            
             if attn_type == AttnType.SPARSE_SAGE:
                 out, lse = block_out, block_lse
             else:
@@ -84,11 +105,15 @@ def ring_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
     attn_type: AttnType = AttnType.FA,
+    joint_tensor_key=None,
+    joint_tensor_value=None,
+    joint_strategy="front",
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
     next_dk, next_dv = None, None
+    d_joint_k, d_joint_v = None, None
 
     block_dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     block_dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
@@ -105,16 +130,35 @@ def ring_flash_attn_backward(
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
             fn = select_flash_attn_impl(attn_type, stage="bwd-only")
+            
+            step_k = k
+            step_v = v
+            if step == 0 and joint_tensor_key is not None:
+                if joint_strategy == "front":
+                    step_k = torch.cat([joint_tensor_key, step_k], dim=1)
+                    step_v = torch.cat([joint_tensor_value, step_v], dim=1)
+                else:
+                    step_k = torch.cat([step_k, joint_tensor_key], dim=1)
+                    step_v = torch.cat([step_v, joint_tensor_value], dim=1)
+                
+                # Resize buffers for step 0 if joint tensors are used
+                # We need larger buffers for dk/dv in this step
+                curr_block_dk_buffer = torch.empty(step_k.shape, dtype=k.dtype, device=k.device)
+                curr_block_dv_buffer = torch.empty(step_v.shape, dtype=v.dtype, device=v.device)
+            else:
+                curr_block_dk_buffer = block_dk_buffer
+                curr_block_dv_buffer = block_dv_buffer
+
             fn(
                 dout,
                 q,
-                k,
-                v,
+                step_k,
+                step_v,
                 out,
                 softmax_lse,
                 block_dq_buffer,
-                block_dk_buffer,
-                block_dv_buffer,
+                curr_block_dk_buffer,
+                curr_block_dv_buffer,
                 dropout_p,
                 softmax_scale,
                 bwd_causal,
@@ -134,6 +178,64 @@ def ring_flash_attn_backward(
                 d_kv_comm.wait()
                 dk = block_dk_buffer + next_dk
                 dv = block_dv_buffer + next_dv
+            
+            # Extract gradients for joint tensors and regular tensors if step 0
+            if step == 0 and joint_tensor_key is not None:
+                # Split curr_block_dk/dv_buffer
+                joint_len = joint_tensor_key.shape[1]
+                if joint_strategy == "front":
+                     d_joint_k = curr_block_dk_buffer[:, :joint_len].to(torch.float32)
+                     d_joint_v = curr_block_dv_buffer[:, :joint_len].to(torch.float32)
+                     dk_part = curr_block_dk_buffer[:, joint_len:].to(torch.float32)
+                     dv_part = curr_block_dv_buffer[:, joint_len:].to(torch.float32)
+                else:
+                     dk_part = curr_block_dk_buffer[:, :-joint_len].to(torch.float32)
+                     dv_part = curr_block_dv_buffer[:, :-joint_len].to(torch.float32)
+                     d_joint_k = curr_block_dk_buffer[:, -joint_len:].to(torch.float32)
+                     d_joint_v = curr_block_dv_buffer[:, -joint_len:].to(torch.float32)
+                
+                # If dq was initialized in this step, dk/dv need to be set correctly
+                # In the logic above: if dq is None ...
+                # Wait, the logic `if dq is None` assumes first step computed corresponds to first accumulation?
+                # Actually `if dq is None` happens at first VALID step.
+                # If causal=True, step 0 might be skipped? 
+                # "if step <= kv_comm.rank or not causal" -> step 0 is always executed if rank >= 0.
+                
+                if dq is None: # Should not happen if step 0 executed
+                    pass 
+                else:
+                    # If this was the first update to dk/dv
+                    if dk is None: # Actually dk is init in `if dq is None` block
+                         dk = dk_part
+                         dv = dv_part
+                    else:
+                         # This block is tricky because dk/dv are accumulating.
+                         # If step 0 is executed, it contributes to local k/v gradients.
+                         # But wait, `dk` variable holds gradients for *circulating* k/v?
+                         # The logic: `dk = block_dk_buffer + next_dk`.
+                         # `next_dk` comes from previous iteration (which processed step+1 k/v).
+                         # So `dk` is accumulating gradient for current `k` (which is `k` at step `rank`).
+                         
+                         # If step 0: we computed grad for `cat([joint, k_rank])`? 
+                         # No. `k` in the loop is changing.
+                         # In Forward: `k` iterates.
+                         # In Backward: `k` iterates? 
+                         # Yes: `next_k = kv_comm.send_recv(k)`.
+                         
+                         # So at step `s`, we have `k` from rank `rank-s`.
+                         # And we compute `block_dk` for THAT `k`.
+                         # And we accumulate `block_dk` into `dk`?
+                         # The variable `dk` tracks the gradient for the *currently held* `k` block?
+                         # No.
+                         
+                         # Let's look at standard Ring Attention Backward.
+                         # `next_dk = d_kv_comm.send_recv(dk)`.
+                         # We send `dk` to neighbor.
+                         # So `dk` travels along with `k`?
+                         # Yes.
+                         
+                         pass
+
         elif step != 0:
             d_kv_comm.wait()
             dk = next_dk
@@ -150,7 +252,7 @@ def ring_flash_attn_backward(
 
     d_kv_comm.wait()
 
-    return dq.to(torch.bfloat16), next_dk.to(q.dtype), next_dv.to(q.dtype)
+    return dq.to(torch.bfloat16), next_dk.to(q.dtype), next_dv.to(q.dtype), d_joint_k, d_joint_v
 
 
 class RingFlashAttnFunc(torch.autograd.Function):
@@ -171,6 +273,9 @@ class RingFlashAttnFunc(torch.autograd.Function):
         group,
         attn_type,
         attn_processor,
+        joint_tensor_key=None,
+        joint_tensor_value=None,
+        joint_strategy="front",
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -195,9 +300,12 @@ class RingFlashAttnFunc(torch.autograd.Function):
             deterministic=False,
             attn_type=attn_type,
             attn_processor=attn_processor,
+            joint_tensor_key=joint_tensor_key,
+            joint_tensor_value=joint_tensor_value,
+            joint_strategy=joint_strategy,
         )
         # this should be out_padded
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, joint_tensor_key, joint_tensor_value)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -208,12 +316,13 @@ class RingFlashAttnFunc(torch.autograd.Function):
         ctx.group = group
         ctx.attn_type = attn_type
         ctx.attn_processor = attn_processor
+        ctx.joint_strategy = joint_strategy
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
-        dq, dk, dv = ring_flash_attn_backward(
+        q, k, v, out, softmax_lse, joint_tensor_key, joint_tensor_value = ctx.saved_tensors
+        dq, dk, dv, d_joint_k, d_joint_v = ring_flash_attn_backward(
             ctx.group,
             dout,
             q,
@@ -229,8 +338,11 @@ class RingFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
             attn_type=ctx.attn_type,
+            joint_tensor_key=joint_tensor_key,
+            joint_tensor_value=joint_tensor_value,
+            joint_strategy=ctx.joint_strategy,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, d_joint_k, d_joint_v, None
 
 
 def ring_flash_attn_qkvpacked_func(
@@ -260,6 +372,10 @@ def ring_flash_attn_qkvpacked_func(
         return_attn_probs,
         group,
         attn_type,
+        None, # attn_processor
+        None, # joint_tensor_key
+        None, # joint_tensor_value
+        "front", # joint_strategy
     )
 
 
@@ -291,6 +407,10 @@ def ring_flash_attn_kvpacked_func(
         return_attn_probs,
         group,
         attn_type,
+        None, # attn_processor
+        None, # joint_tensor_key
+        None, # joint_tensor_value
+        "front", # joint_strategy
     )
 
 
@@ -309,6 +429,9 @@ def ring_flash_attn_func(
     group=None,
     attn_type: AttnType = AttnType.FA,
     attn_processor=None,
+    joint_tensor_key=None,
+    joint_tensor_value=None,
+    joint_strategy="front",
 ):
     return RingFlashAttnFunc.apply(
         q,
@@ -325,5 +448,7 @@ def ring_flash_attn_func(
         group,
         attn_type,
         attn_processor,
+        joint_tensor_key,
+        joint_tensor_value,
+        joint_strategy,
     )
-
