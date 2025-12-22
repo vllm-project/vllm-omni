@@ -79,8 +79,20 @@ def parse_args() -> argparse.Namespace:
         default="一只戴着墨镜的柴犬，电影海报风格",
         help="文本提示",
     )
-    p.add_argument("--ar-width", type=int, default=32, help="AR 生成网格宽（token 级）")
-    p.add_argument("--ar-height", type=int, default=32, help="AR 生成网格高（token 级）")
+    p.add_argument("--ar-width", type=int, default=64, help="AR 生成网格宽（token 级）")
+    p.add_argument("--ar-height", type=int, default=64, help="AR 生成网格高（token 级）")
+    p.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help="输出图片高度(px)，需为16的倍数；默认=ar_height*16",
+    )
+    p.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="输出图片宽度(px)，需为16的倍数；默认=ar_width*16",
+    )
     p.add_argument(
         "--max-tokens",
         type=int,
@@ -106,6 +118,25 @@ def _to_pil(image: torch.Tensor) -> Image.Image:
 def main() -> None:
     args = parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+
+    # 分辨率（像素）与 AR 网格（token）需要匹配：ar_width == width/16, ar_height == height/16
+    if (args.height is None) != (args.width is None):
+        raise ValueError("必须同时提供 --height 和 --width（或都不提供）")
+    if args.height is None:
+        args.height = int(args.ar_height) * 16
+        args.width = int(args.ar_width) * 16
+    else:
+        args.height = int(args.height)
+        args.width = int(args.width)
+        if args.height <= 0 or args.width <= 0:
+            raise ValueError(f"--height/--width 必须为正数，当前: {args.height}x{args.width}")
+        if args.height % 16 != 0 or args.width % 16 != 0:
+            raise ValueError(f"--height/--width 必须为16的倍数，当前: {args.height}x{args.width}")
+        if args.height // 16 != int(args.ar_height) or args.width // 16 != int(args.ar_width):
+            raise ValueError(
+                "分辨率与 AR 网格不匹配：需要满足 ar_height==height/16 且 ar_width==width/16；"
+                f"当前 ar={int(args.ar_width)}*{int(args.ar_height)}，hw={args.width}x{args.height}"
+            )
 
     # 约束 AR stage 只生成视觉 token（额外允许 eol）：
     # vLLM V1 不支持 logits_processors(callable)，用 allowed_token_ids 实现同等效果。
@@ -158,6 +189,10 @@ def main() -> None:
                         "eol_token_id": int(eol_token_id),
                         "visual_token_start_id": int(visual_start),
                         "visual_token_end_id": int(visual_end),
+                        # 该字段不会进入 Stage-0 engine request（text prompt 会丢弃额外字段），
+                        # 但会被 Stage-1 的 ar2dit 读取并透传到 DiT.forward。
+                        "image_height": int(args.height),
+                        "image_width": int(args.width),
                     },
                 }
             ],

@@ -125,6 +125,34 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             v = info.get(key)
             return v if isinstance(v, torch.Tensor) else None
 
+        def _extract_int_from_list(info: object, key: str) -> int | None:
+            if not isinstance(info, dict):
+                return None
+            v = info.get(key)
+            if isinstance(v, list) and v:
+                try:
+                    return int(v[0])
+                except Exception:
+                    return None
+            if isinstance(v, (int, float)):
+                return int(v)
+            return None
+
+        def _extract_hw(info: object) -> tuple[int, int] | None:
+            if not isinstance(info, dict):
+                return None
+            v = info.get("image_size")
+            if isinstance(v, list) and len(v) >= 2:
+                try:
+                    return int(v[0]), int(v[1])
+                except Exception:
+                    return None
+            h = _extract_int_from_list(info, "image_height")
+            w = _extract_int_from_list(info, "image_width")
+            if h is None or w is None:
+                return None
+            return h, w
+
         # Collect candidate info dicts in priority order.
         info_candidates: list[dict[str, object]] = []
         if isinstance(additional_information, dict):
@@ -153,6 +181,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         text_cond: torch.Tensor | None = None
         image_cond: torch.Tensor | None = None
         legacy_cond: torch.Tensor | None = None
+        image_hw: tuple[int, int] | None = None
         for info in info_candidates:
             if text_cond is None:
                 text_cond = _extract_tensor(info, "text_prompt_embeds")
@@ -160,6 +189,8 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
                 image_cond = _extract_tensor(info, "image_prompt_embeds")
             if legacy_cond is None:
                 legacy_cond = _extract_tensor(info, "prompt_embeds")
+            if image_hw is None:
+                image_hw = _extract_hw(info)
 
         # Dummy/profile fallback: use inputs_embeds (often zeros)
         if text_cond is None and image_cond is None and legacy_cond is None:
@@ -246,9 +277,12 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
                 device=prompt_embeds.device,
             )
 
-        # TODO: 后续从上游 prompt 解析分辨率；先固定 512x512 以跑通端到端。
-        height = 512
-        width = 512
+        # Output image size (px), passed from stage input processor.
+        height, width = (512, 512) if image_hw is None else image_hw
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid image size: {height}x{width}")
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(f"Image size must be multiples of 16, got {height}x{width}")
         vae_scale_factor = 16
 
         latent_channels = int(self.gen_transformer.config.in_channels)

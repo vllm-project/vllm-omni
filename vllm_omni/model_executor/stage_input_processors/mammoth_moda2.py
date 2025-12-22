@@ -22,6 +22,55 @@ def _infer_gen_vocab_start_index(stage: Any, default: int = 152064) -> int:
         return int(default)
 
 
+def _infer_image_hw_from_original_prompt(prompt: Any) -> tuple[int | None, int | None]:
+    """从 orchestrator 透传的 original_prompt 里解析输出分辨率（像素）。
+
+    注意：Stage-0 的 text prompt 预处理会丢弃 additional_information，因此这些字段不会进入
+    AR stage 的 engine request；但 orchestrator 会把 original_prompt 原样传给 Stage-1，
+    我们可以在这里读取并透传给 DiT stage。
+    """
+    prompt_obj = None
+    if isinstance(prompt, list):
+        prompt_obj = prompt[0] if prompt else None
+    else:
+        prompt_obj = prompt
+
+    if not isinstance(prompt_obj, dict):
+        return None, None
+    info = prompt_obj.get("additional_information")
+    if not isinstance(info, dict):
+        return None, None
+
+    h = info.get("image_height", info.get("height"))
+    w = info.get("image_width", info.get("width"))
+
+    if h is None or w is None:
+        size = info.get("image_size")
+        if isinstance(size, list) and len(size) >= 2:
+            h, w = size[0], size[1]
+
+    if h is None or w is None:
+        # best-effort fallback: derive from AR grid
+        ar_w = info.get("ar_width")
+        ar_h = info.get("ar_height")
+        try:
+            if ar_w is not None and ar_h is not None:
+                w = int(ar_w) * 16
+                h = int(ar_h) * 16
+        except Exception:
+            pass
+
+    try:
+        h_i = int(h) if h is not None else None
+        w_i = int(w) if w is not None else None
+    except Exception:
+        return None, None
+
+    if h_i is None or w_i is None:
+        return None, None
+    return h_i, w_i
+
+
 def ar2dit(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -45,6 +94,8 @@ def ar2dit(
 
     # MammothModa2: gen token vocab start（来自 llm_config.gen_vocab_start_index）
     gen_vocab_start_index = _infer_gen_vocab_start_index(stage_list[source_stage_id], default=152064)
+
+    image_height, image_width = _infer_image_hw_from_original_prompt(prompt)
 
     for ar_output in ar_outputs:
         # vllm-omni 会把 stage0 的 engine_output_type=latent 聚合到 multimodal_output["latent"]。
@@ -164,6 +215,10 @@ def ar2dit(
             "image_prompt_embeds": image_prompt_embeds,
             "image_prompt_embeds_shape": list(image_prompt_embeds.shape),
         }
+        if image_height is not None and image_width is not None:
+            # vllm_omni/engine/processor.py: list is allowed
+            additional_information["image_height"] = [int(image_height)]
+            additional_information["image_width"] = [int(image_width)]
 
         dit_inputs.append(
             OmniTokensPrompt(
