@@ -172,27 +172,78 @@ def ar2dit(
         gen_hidden_states = hidden_states[prompt_len : prompt_len + gen_hidden_len]
         gen_token_ids = gen_token_ids[:gen_hidden_len]
 
-        # 取 gen vocab 范围内 token 的 hidden states 作为 image condition tokens。
-        # NOTE: MammothModa2 的 eol_token_id == gen_vocab_start_index，本身属于 gen vocab，
-        # 它承载了行边界信息，应当与视觉 token 一起作为条件输入。
-        gen_token_ids_t = torch.tensor(gen_token_ids, dtype=torch.long)
-        image_mask = gen_token_ids_t >= gen_vocab_start_index
-        image_condition_gen = gen_hidden_states[image_mask]
-        if image_condition_gen.numel() == 0:
+        # 对齐 mammothmoda 的 encode_full_prompts：
+        #   text_condition_token_mask = questions_mask & ~(visual_token_mask | gen_token_mask) & attention_mask
+        #   image_condition_token_mask = answers_mask & gen_token_mask
+        # 其中 questions/answers 的分界点在上游实现里用 “末尾 10 个 token” 的启发式切分。
+        #
+        # 注意：mammothmoda 的 decode_diffusion_image 会在序列尾部额外拼接一个 <|image end|> token，
+        # 再基于 (L-10) 切分 question/answer。这里我们用同样的方式在 CPU 上补一个 token，
+        # 并用零 hidden state 占位，确保切分点一致（该 token 通常不会进入 condition）。
+        full_token_ids = prompt_token_ids + gen_token_ids
+        full_hidden_states = torch.cat([prompt_hidden_states, gen_hidden_states], dim=0)
+        if len(full_token_ids) != int(full_hidden_states.shape[0]):
             raise RuntimeError(
-                "No image condition tokens found in AR outputs "
-                f"(gen_vocab_start_index={gen_vocab_start_index}); did AR generate visual tokens?"
+                "AR token ids length mismatch with hidden states after alignment: "
+                f"{len(full_token_ids)} != {int(full_hidden_states.shape[0])}"
             )
 
-        # 贴近原 MammothModa2：text/image 条件分别构造；refiner 只应该作用在 image 条件上。
-        prompt_token_ids_t = torch.tensor(prompt_token_ids, dtype=torch.long)
-        prompt_is_gen = prompt_token_ids_t >= gen_vocab_start_index
-        text_condition = prompt_hidden_states[~prompt_is_gen]
-        image_condition_prompt = prompt_hidden_states[prompt_is_gen]
-        if image_condition_prompt.numel() > 0:
-            image_condition = torch.cat([image_condition_prompt, image_condition_gen], dim=0)
-        else:
-            image_condition = image_condition_gen
+        mask_device = full_hidden_states.device
+        full_token_ids_t = torch.tensor(full_token_ids, dtype=torch.long, device=mask_device)
+        attention_mask = torch.ones_like(full_token_ids_t, dtype=torch.bool)
+
+        # Best-effort 获取 <|image end|> token id（用于对齐原实现的切分点）。
+        tok = getattr(stage_list[source_stage_id], "tokenizer", None)
+        img_end_id = None
+        try:
+            eoi_token = getattr(tok, "eoi_token", None)
+            get_vocab = getattr(tok, "get_vocab", None)
+            if callable(get_vocab) and eoi_token is not None:
+                img_end_id = get_vocab().get(eoi_token)
+        except Exception:
+            img_end_id = None
+
+        if isinstance(img_end_id, int):
+            full_token_ids_t = torch.cat(
+                [full_token_ids_t, torch.tensor([img_end_id], dtype=torch.long, device=mask_device)], dim=0
+            )
+            attention_mask = torch.cat(
+                [attention_mask, torch.tensor([True], dtype=torch.bool, device=mask_device)], dim=0
+            )
+            pad_h = full_hidden_states.new_zeros((1, int(full_hidden_states.shape[1])))
+            full_hidden_states = torch.cat([full_hidden_states, pad_h], dim=0)
+
+        # questions/answers mask：最后 10 个 token 作为 answer（mammothmoda 逻辑）
+        L = int(full_token_ids_t.shape[0])
+        answer_start_index = max(L - 10, 0)
+        pos = torch.arange(L, device=mask_device)
+        questions_mask = pos < answer_start_index
+        answers_mask = ~questions_mask
+
+        gen_token_mask = full_token_ids_t >= gen_vocab_start_index
+
+        # visual_token_mask：排除 Qwen2.5-VL 的视觉占位符 token（<|vision_start|> 等）
+        visual_token_mask = torch.zeros_like(gen_token_mask)
+        visual_ids = getattr(tok, "visual_tokens_ids", None)
+        if isinstance(visual_ids, list) and visual_ids:
+            try:
+                visual_token_mask = torch.isin(
+                    full_token_ids_t,
+                    torch.tensor(visual_ids, dtype=torch.long, device=mask_device),
+                )
+            except Exception:
+                visual_token_mask = torch.zeros_like(gen_token_mask)
+
+        text_condition_token_mask = questions_mask & ~(visual_token_mask | gen_token_mask) & attention_mask
+        image_condition_token_mask = answers_mask & gen_token_mask & attention_mask
+
+        text_condition = full_hidden_states[text_condition_token_mask]
+        image_condition = full_hidden_states[image_condition_token_mask]
+        if image_condition.numel() == 0:
+            raise RuntimeError(
+                "No image condition tokens found in AR outputs after mask alignment "
+                f"(gen_vocab_start_index={gen_vocab_start_index}, answer_tail=10)."
+            )
 
         # 重要：不要使用 prompt_embeds 字段跨 stage 传递 embedding。
         #

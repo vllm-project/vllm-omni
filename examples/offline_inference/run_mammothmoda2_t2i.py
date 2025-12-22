@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt",
         type=str,
-        default="一只戴着墨镜的柴犬，电影海报风格",
+        default="一个墨镜的时尚女郎在纽约大道骑摩托车疾驰，007特工的电影风格",
         help="文本提示",
     )
     p.add_argument("--ar-width", type=int, default=64, help="AR 生成网格宽（token 级）")
