@@ -78,7 +78,6 @@ class TestGPUWorkerSleep:
     """Test GPUWorker.sleep method."""
 
     @patch('vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info')
-    @patch('vllm_omni.diffusion.worker.gpu_worker.CuMemAllocator')
     def test_sleep_level_1(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
         # Setup memory info mocks
@@ -104,7 +103,7 @@ class TestGPUWorkerSleep:
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
 
     @patch('vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info')
-    @patch('vllm_omni.diffusion.worker.gpu_worker.CuMemAllocator')
+    @patch('vllm.device_allocator.cumem.CuMemAllocator')
     def test_sleep_level_2(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test sleep mode level 2 (offload all, save buffers)."""
         # Setup memory info mocks
@@ -139,7 +138,7 @@ class TestGPUWorkerSleep:
         assert "buffer2" in mock_gpu_worker._sleep_saved_buffers
 
     @patch('vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info')
-    @patch('vllm_omni.diffusion.worker.gpu_worker.CuMemAllocator')
+    @patch('vllm.device_allocator.cumem.CuMemAllocator')
     def test_sleep_memory_freed_validation(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test that sleep validates memory was actually freed."""
         # Simulate memory increase (should trigger assertion error)
@@ -160,7 +159,7 @@ class TestGPUWorkerSleep:
 class TestGPUWorkerWakeUp:
     """Test GPUWorker.wake_up method."""
 
-    @patch('vllm_omni.diffusion.worker.gpu_worker.CuMemAllocator')
+    @patch('vllm.device_allocator.cumem.CuMemAllocator')
     def test_wake_up_without_buffers(self, mock_allocator_class, mock_gpu_worker):
         """Test wake_up without saved buffers (level 1 sleep)."""
         # Setup allocator mock
@@ -178,7 +177,7 @@ class TestGPUWorkerWakeUp:
         mock_allocator.wake_up.assert_called_once_with(["weights"])
         assert result is True
 
-    @patch('vllm_omni.diffusion.worker.gpu_worker.CuMemAllocator')
+    @patch('vllm.device_allocator.cumem.CuMemAllocator')
     def test_wake_up_with_buffers(self, mock_allocator_class, mock_gpu_worker):
         """Test wake_up with saved buffers (level 2 sleep)."""
         # Setup allocator mock
@@ -219,7 +218,7 @@ class TestGPUWorkerWakeUp:
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
         assert result is True
 
-    @patch('vllm_omni.diffusion.worker.gpu_worker.CuMemAllocator')
+    @patch('vllm.device_allocator.cumem.CuMemAllocator')
     def test_wake_up_partial_buffer_restore(self, mock_allocator_class, mock_gpu_worker):
         """Test wake_up only restores buffers that were saved."""
         # Setup allocator mock
