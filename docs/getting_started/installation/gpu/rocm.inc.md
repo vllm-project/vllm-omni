@@ -69,9 +69,6 @@ python -c "import setuptools_scm; print(setuptools_scm.get_version())"
 PYTORCH_ROCM_ARCH=gfx942 python3 setup.py develop
 ```
 
-!!! note
-    vLLM release wheels based on the branch with prefix `releases/`, not from the tag as vLLM may cherry pick bugfixes after cutting a branch.
-
 
 #### Installation of vLLM-Omni
 
@@ -109,6 +106,41 @@ export VLLM_ROCM_USE_AITER_RMSNORM=0
 ```
 
 # --8<-- [end:build-wheel-from-source-in-docker]
+
+# --8<-- [start:build-docker]
+
+#### Build docker image
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
+```
+
+If you want to specify which GPU Arch to build for to cutdown build time:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.rocm \
+  --build-arg PYTORCH_ROCM_ARCH="gfx942;gfx950" \
+  -t vllm-omni-rocm .
+```
+
+#### Launch the docker image
+
+```
+docker run -it \
+--network=host \
+--group-add=video \
+--ipc=host \
+--cap-add=SYS_PTRACE \
+--security-opt seccomp=unconfined \
+--device /dev/kfd \
+--device /dev/dri \
+-v <path/to/model>:/app/model \
+vllm-omni-rocm \
+bash
+```
+
+# --8<-- [end:build-docker]
 
 # --8<-- [start:pre-built-images]
 

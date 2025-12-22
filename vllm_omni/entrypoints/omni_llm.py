@@ -350,11 +350,14 @@ class OmniLLM:
                 made_progress = True
                 req_id = result.get("request_id")
                 if "error" in result:
+                    error_msg = result.get("error", "Unknown error")
+                    error_tb = result.get("error_tb", "")
                     logger.error(
-                        "Stage %s error on request %s: %s",
+                        "Stage %s error on request %s: %s\n%s",
                         stage_id,
                         req_id,
-                        result["error"],
+                        error_msg,
+                        error_tb,
                     )
                     continue
 

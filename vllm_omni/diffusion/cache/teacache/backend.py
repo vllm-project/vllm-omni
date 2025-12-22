@@ -75,10 +75,6 @@ class TeaCacheBackend(CacheBackend):
         # Apply hook to transformer
         apply_teacache_hook(transformer, teacache_config)
 
-        # Store backend reference on pipeline for pipeline's internal use
-        # (e.g., checking if cache is enabled for cache_branch parameter)
-        pipeline._cache_backend = self
-
         # Mark as enabled
         self.enabled = True
 

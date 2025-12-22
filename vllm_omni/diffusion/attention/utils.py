@@ -81,7 +81,7 @@ def _update_out_and_lse(
         print(f"ERROR in _update_out_and_lse: {e}")
         print(f"out: {out.shape}, lse: {lse.shape}")
         print(f"block_out: {block_out.shape}, block_lse: {block_lse.shape}")
-        # raise e # Don't raise, let it try to continue or fail up stack? No, raise to see error.
+        # raise e
         raise e
 
     return out, lse

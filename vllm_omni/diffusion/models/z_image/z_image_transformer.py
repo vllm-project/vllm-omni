@@ -185,7 +185,6 @@ class FeedForward(nn.Module):
         return self.w2(self.act(self.w13(x)))
 
 
-@torch.compile(dynamic=True)
 class ZImageTransformerBlock(nn.Module):
     def __init__(
         self,
