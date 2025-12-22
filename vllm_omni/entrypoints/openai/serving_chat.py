@@ -271,7 +271,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 conversation,
                 tokenizer,
                 request_metadata,
-                enable_force_include_usage=self.enable_force_include_usage,
             )
 
         try:
