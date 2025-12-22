@@ -58,6 +58,7 @@ class TeaCacheHook(ModelHook):
         self.rescale_func = np.poly1d(config.coefficients)
         self.state_manager = StateManager(TeaCacheState)
         self.extractor_fn = None
+        self._forward_cnt = 0
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
@@ -112,7 +113,11 @@ class TeaCacheHook(ModelHook):
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
         # Set context based on CFG branch for separate state tracking
-        cache_branch = kwargs.get("cache_branch", "default")
+        if module.do_true_cfg and self._forward_cnt % 2 == 1:
+            cache_branch = "negative"
+        else:
+            cache_branch = "positive"
+
         context_name = f"teacache_{cache_branch}"
         self.state_manager.set_context(context_name)
         state = self.state_manager.get_state()
@@ -155,6 +160,7 @@ class TeaCacheHook(ModelHook):
         # Update state
         state.previous_modulated_input = ctx.modulated_input.detach()
         state.cnt += 1
+        self._forward_cnt += 1
 
         # ============================================================================
         # POSTPROCESSING (model-specific, via callable)
@@ -221,6 +227,7 @@ class TeaCacheHook(ModelHook):
             The module with reset state.
         """
         self.state_manager.reset()
+        self._forward_cnt = 0
         return module
 
 

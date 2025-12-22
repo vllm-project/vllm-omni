@@ -271,9 +271,6 @@ class QwenImagePipeline(
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
-        # Initialize cache backend to None (will be set by worker if needed)
-        self._cache_backend = None
-
         self.stage = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -555,41 +552,31 @@ class QwenImagePipeline(
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
             # Forward pass for positive prompt (or unconditional if no CFG)
-            # cache_branch is passed to hook for CFG-aware state management
-            transformer_kwargs = {
-                "hidden_states": latents,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states_mask": prompt_embeds_mask,
-                "encoder_hidden_states": prompt_embeds,
-                "img_shapes": img_shapes,
-                "txt_seq_lens": txt_seq_lens,
-                "attention_kwargs": self.attention_kwargs,
-                "return_dict": False,
-            }
-            if self._cache_backend is not None:
-                transformer_kwargs["cache_branch"] = "positive"
-
-            noise_pred = self.transformer(**transformer_kwargs)[0]
-
+            self.transformer.do_true_cfg = do_true_cfg
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / 1000,
+                guidance=guidance,
+                encoder_hidden_states_mask=prompt_embeds_mask,
+                encoder_hidden_states=prompt_embeds,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                attention_kwargs=self.attention_kwargs,
+                return_dict=False,
+            )[0]
             # Forward pass for negative prompt (CFG)
-            # cache_branch is passed to hook for CFG-aware state management
             if do_true_cfg:
-                neg_transformer_kwargs = {
-                    "hidden_states": latents,
-                    "timestep": timestep / 1000,
-                    "guidance": guidance,
-                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "img_shapes": img_shapes,
-                    "txt_seq_lens": negative_txt_seq_lens,
-                    "attention_kwargs": self.attention_kwargs,
-                    "return_dict": False,
-                }
-                if self._cache_backend is not None:
-                    neg_transformer_kwargs["cache_branch"] = "negative"
-
-                neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
+                neg_noise_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=negative_txt_seq_lens,
+                    attention_kwargs=self.attention_kwargs,
+                    return_dict=False,
+                )[0]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)

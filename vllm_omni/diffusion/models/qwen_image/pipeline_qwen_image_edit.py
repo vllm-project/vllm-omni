@@ -230,6 +230,9 @@ class QwenImageEditPipeline(
             model, subfolder="processor", local_files_only=local_files_only
         )
 
+        # Initialize cache backend to None (will be set by worker if needed)
+        self._cache_backend = None
+
         self.stage = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -601,6 +604,8 @@ class QwenImageEditPipeline(
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
+            self.transformer.do_true_cfg = do_true_cfg  # used in teacache hook
+            # Forward pass for positive prompt (or unconditional if no CFG)
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep / 1000,
@@ -614,6 +619,7 @@ class QwenImageEditPipeline(
             )[0]
             noise_pred = noise_pred[:, : latents.size(1)]
 
+            # Forward pass for negative prompt (CFG)
             if do_true_cfg:
                 neg_noise_pred = self.transformer(
                     hidden_states=latent_model_input,
