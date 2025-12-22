@@ -5,10 +5,11 @@ on:
     branches:
       - main
     paths-ignore:
-      - '**.md'
       - 'docs/**'
       - 'examples/**'
       - '.github/**'
+      - '.buildkite/**'
+      - '**.md'
       - '*.yml'
       - '.gitignore'
       - '.gitattributes'
@@ -17,11 +18,12 @@ on:
     branches:
       - main
     paths-ignore:
-      - '**.md'
       - 'docs/**'
       - 'examples/**'
       - '.github/**'
+      - '.buildkite/**'
       - '*.yml'
+      - '**.md'
       - '.gitignore'
       - '.gitattributes'
       - 'LICENSE'
