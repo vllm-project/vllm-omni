@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 import torch
+
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -35,7 +37,7 @@ def test_diffusion_model(model_name: str):
     )
     results = m.instance.engine.collective_rpc(
         method="generate",
-        args=([request],), 
+        args=([request],),
         kwargs={},
         unique_reply_rank=0,
     )
