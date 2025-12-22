@@ -76,13 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt",
         type=str,
-        default="一幅极具电影感与哲学意味的超现实主义画面："
-                "在黄昏与夜晚交界的时间点，一座悬浮在半空中的巨大城市遗迹缓慢崩塌，城市由古典石质建筑与未来感金属结构交织而成，仿佛文明在不同时间维度中重叠。城市下方是一片无边无际的深色海洋，海面如镜，倒映着天空中翻涌的云层与破碎的建筑轮廓。"
-                "天空呈现出层次分明的色彩，从地平线处的暗橙色、深紫色逐渐过渡到高空的靛蓝与黑色，厚重的云层中隐约透出冷色调的光束，像是来自未知天体的微弱照明。远处可以看到巨大的行星或月亮，占据画面一角，表面布满清晰可见的纹理与裂隙，暗示着时间与宇宙尺度的存在。"
-                "画面中央站立着一个孤独的人物，背对观者，站在一块漂浮的岩石平台上。人物身披长风衣，衣摆随风飘动，剪影清晰但面部不可见，性别模糊，具有象征意义。人物手中握着一盏微弱发光的光源（可能是灯笼、能量核心或抽象的光体），成为画面中最温暖的光点，与周围冷色调环境形成强烈对比。"
-                "建筑碎片与尘埃缓慢漂浮在空中，呈现出近乎静止的失重状态，强调时间被拉长或暂停的感觉。整体构图遵循电影级构图法则，前景、中景、远景层次分明，景深明显，具有强烈的纵深感与沉浸感。"
-                "风格上融合超现实主义（surrealism）、科幻概念艺术（sci-fi concept art）、史诗电影分镜（cinematic storyboard）、油画质感与数字绘画细节。画面细节极其丰富，纹理清晰，材质真实，光影遵循物理逻辑但略带艺术夸张。氛围情绪：孤独、宏大、沉思、文明的终结与新生、时间与存在的哲学感。"
-                "画质与技术要求：ultra-high resolution, ultra-detailed, 8k quality, sharp focus, global illumination, volumetric lighting, soft cinematic contrast, dramatic lighting, high dynamic range, no text, no watermark, no logo, masterpiece, best quality",
+        default="一只戴着墨镜的柴犬，电影海报风格",
         help="文本提示",
     )
     p.add_argument("--ar-width", type=int, default=32, help="AR 生成网格宽（token 级）")
