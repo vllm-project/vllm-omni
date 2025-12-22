@@ -61,7 +61,8 @@ class Scheduler:
 
             # Broadcast RPC request to all workers
             self.mq.enqueue(rpc_request)
-
+            # Wait for result from Rank 0 (or whoever sends it)
+            
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")
 
