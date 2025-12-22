@@ -4,9 +4,29 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'examples/**'
+      - '.github/**'
+      - '*.yml'
+      - '*.yaml'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'examples/**'
+      - '.github/**'
+      - '*.yml'
+      - '*.yaml'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
   workflow_dispatch:
 
 jobs:
