@@ -238,7 +238,7 @@ class LongcatImageEditPipeline(nn.Module):
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.image_processor_vl = self.text_processor.image_processor
-        self.latent_channels = self.vae_config.get("latent_channels", 16)
+        self.latent_channels = self.vae.config.get("latent_channels", 16)
 
         self.image_token = "<|image_pad|>"
         self.prompt_template_encode_prefix = (

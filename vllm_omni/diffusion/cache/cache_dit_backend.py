@@ -194,7 +194,7 @@ def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable
         cache_config: DiffusionCacheConfig instance with cache configuration.
     """
     # Build DBCacheConfig for transformer
-    cache_config = _build_db_cache_config(cache_config)
+    db_cache_config = _build_db_cache_config(cache_config)
 
     calibrator = None
     if cache_config.enable_taylorseer:
@@ -204,28 +204,31 @@ def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable
 
     # Build ParamsModifier for transformer
     modifier = ParamsModifier(
-        cache_config=cache_config,
+        cache_config=db_cache_config,
         calibrator_config=calibrator,
     )
 
     logger.info(
         f"Enabling cache-dit on LongCatImage transformer with BlockAdapter: "
-        f"Fn={cache_config.Fn_compute_blocks}, "
-        f"Bn={cache_config.Bn_compute_blocks}, "
-        f"W={cache_config.max_warmup_steps}, "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
     )
 
     # Enable cache-dit using BlockAdapter for transformer
     cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=pipeline.transformer,
-            blocks=[
-                pipeline.transformer.transformer_blocks,
-                pipeline.transformer.single_transformer_blocks,
-            ],
-            forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
-            params_modifiers=[modifier],
+        (
+            BlockAdapter(
+                transformer=pipeline.transformer,
+                blocks=[
+                    pipeline.transformer.transformer_blocks,
+                    pipeline.transformer.single_transformer_blocks,
+                ],
+                forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
+                params_modifiers=[modifier],
+            )
         ),
+        cache_config=db_cache_config,
     )
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
@@ -335,8 +338,8 @@ CUSTOM_DIT_ENABLERS.update(
     {
         "WanPipeline": enable_cache_for_wan22,
         "FluxPipeline": enable_cache_for_flux,
-        "LongCatImagePipeline": enable_cache_for_longcat_image,
-        "LongCatImageEditPipeline": enable_cache_for_longcat_image,
+        "LongcatImagePipeline": enable_cache_for_longcat_image,
+        "LongcatImageEditPipeline": enable_cache_for_longcat_image,
     }
 )
 
