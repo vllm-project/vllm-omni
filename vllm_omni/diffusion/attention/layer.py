@@ -10,10 +10,10 @@ from typing import Optional
 import os
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch import Tensor
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.selector import get_attn_backend
