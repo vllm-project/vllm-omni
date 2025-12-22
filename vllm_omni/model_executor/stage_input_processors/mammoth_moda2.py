@@ -121,19 +121,27 @@ def ar2dit(
         gen_hidden_states = hidden_states[prompt_len : prompt_len + gen_hidden_len]
         gen_token_ids = gen_token_ids[:gen_hidden_len]
 
-        # 取 gen vocab 范围内 token 的 hidden states 作为 image condition tokens（排除 eol 等非 gen token）
+        # 取 gen vocab 范围内 token 的 hidden states 作为 image condition tokens。
+        # NOTE: MammothModa2 的 eol_token_id == gen_vocab_start_index，本身属于 gen vocab，
+        # 它承载了行边界信息，应当与视觉 token 一起作为条件输入。
         gen_token_ids_t = torch.tensor(gen_token_ids, dtype=torch.long)
         image_mask = gen_token_ids_t >= gen_vocab_start_index
-        image_condition = gen_hidden_states[image_mask]
-        if image_condition.numel() == 0:
+        image_condition_gen = gen_hidden_states[image_mask]
+        if image_condition_gen.numel() == 0:
             raise RuntimeError(
                 "No image condition tokens found in AR outputs "
                 f"(gen_vocab_start_index={gen_vocab_start_index}); did AR generate visual tokens?"
             )
 
-        # 贴近原 MammothModa2：condition = [text_condition_tokens, image_condition_tokens]
-        # 这里先用“整段 prompt hidden”作为文本条件（后续若需要可进一步剔除视觉占位符 token）。
-        cond = torch.cat([prompt_hidden_states, image_condition], dim=0)
+        # 贴近原 MammothModa2：text/image 条件分别构造；refiner 只应该作用在 image 条件上。
+        prompt_token_ids_t = torch.tensor(prompt_token_ids, dtype=torch.long)
+        prompt_is_gen = prompt_token_ids_t >= gen_vocab_start_index
+        text_condition = prompt_hidden_states[~prompt_is_gen]
+        image_condition_prompt = prompt_hidden_states[prompt_is_gen]
+        if image_condition_prompt.numel() > 0:
+            image_condition = torch.cat([image_condition_prompt, image_condition_gen], dim=0)
+        else:
+            image_condition = image_condition_gen
 
         # 重要：不要使用 prompt_embeds 字段跨 stage 传递 embedding。
         #
@@ -143,15 +151,18 @@ def ar2dit(
         #
         # 参考 qwen2_5_omni 的做法：把 embedding 放到 additional_information 里，
         # 由 runner 在 runtime_additional_information 中透传给模型。
-        prompt_embeds = cond.to(dtype=torch.float32).contiguous()
+        text_prompt_embeds = text_condition.to(dtype=torch.float32).contiguous()
+        image_prompt_embeds = image_condition.to(dtype=torch.float32).contiguous()
         # DiT stage 不依赖 token ids；用最短 prompt 以减少 vLLM 在 stage-1 的调度与 KV 开销。
         prompt_token_ids = [0]
         # vllm_omni/engine/processor.py 要求 additional_information 的 value 只能是
         # torch.Tensor 或 list（会被序列化到 AdditionalInformationPayload）。
-        # 这里仅透传 DiT 必需的 prompt_embeds + 形状信息，避免标量 int 触发序列化报错。
+        # 这里透传 text/image 两路条件 embedding，避免把 refiner 错用在 text 上。
         additional_information = {
-            "prompt_embeds": prompt_embeds,
-            "prompt_embeds_shape": list(prompt_embeds.shape),
+            "text_prompt_embeds": text_prompt_embeds,
+            "text_prompt_embeds_shape": list(text_prompt_embeds.shape),
+            "image_prompt_embeds": image_prompt_embeds,
+            "image_prompt_embeds_shape": list(image_prompt_embeds.shape),
         }
 
         dit_inputs.append(

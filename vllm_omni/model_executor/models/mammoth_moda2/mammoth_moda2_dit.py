@@ -80,9 +80,14 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             self.gen_image_condition_refiner = None
 
         # Precompute rotary freqs for diffusion transformer
-        axes_dim_rope = getattr(self.gen_transformer.config, "axes_dim_rope", None) or self.config.gen_axes_dim_rope
-        axes_lens = getattr(self.gen_transformer.config, "axes_lens", None) or self.config.gen_axes_lens
-        self.gen_freqs_cis = RotaryPosEmbedReal.get_freqs_real(axes_dim_rope, axes_lens, theta=10000)
+        # IMPORTANT: follow upstream mammothmoda: use top-level `config.gen_axes_*`
+        # (the checkpoint's `gen_dit_config.axes_lens` can be as small as 1024,
+        # which is insufficient for vLLM dummy-run/cudagraph warmup).
+        self.gen_freqs_cis = RotaryPosEmbedReal.get_freqs_real(
+            tuple(self.config.gen_axes_dim_rope),
+            tuple(self.config.gen_axes_lens),
+            theta=10000,
+        )
 
         # vLLM PP interface compatibility
         self.make_empty_intermediate_tensors = lambda: None
@@ -107,57 +112,58 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         additional_information: dict[str, object] | None = None,
         **kwargs: Any,  # noqa: ARG002
     ) -> OmniOutput:
-        # MammothModa2 follows the Qwen2.5-Omni pattern: pass condition embeddings
-        # via `additional_information["prompt_embeds"]` to avoid vLLM V1 treating
-        # prompt_embeds as a serialized payload and calling `len()` on it during
-        # request state initialization.
-        cond: torch.Tensor | None = None
-        if isinstance(additional_information, dict):
-            pe = additional_information.get("prompt_embeds")
-            if isinstance(pe, torch.Tensor):
-                cond = pe
+        # MammothModa2 follows the Qwen2.5-Omni pattern: condition embeddings are
+        # passed via additional_information/runtime_additional_information.
+        #
+        # IMPORTANT: the optional `gen_image_condition_refiner` should ONLY be
+        # applied to the image-condition token sequence (as in mammothmoda),
+        # not to the concatenated text+image tokens.
 
-        # Preferred: per-step request-scoped mapping from runner
-        if cond is None:
-            addi_by_req = kwargs.get("additional_information_by_req_id")
-            req_ids = kwargs.get("request_ids")
+        def _extract_tensor(info: object, key: str) -> torch.Tensor | None:
+            if not isinstance(info, dict):
+                return None
+            v = info.get(key)
+            return v if isinstance(v, torch.Tensor) else None
+
+        # Collect candidate info dicts in priority order.
+        info_candidates: list[dict[str, object]] = []
+        if isinstance(additional_information, dict):
+            info_candidates.append(additional_information)
+
+        addi_by_req = kwargs.get("additional_information_by_req_id")
+        req_ids = kwargs.get("request_ids")
+        if isinstance(addi_by_req, dict):
             info = None
-            if isinstance(addi_by_req, dict) and isinstance(req_ids, list) and req_ids and isinstance(req_ids[0], str):
+            if isinstance(req_ids, list) and req_ids and isinstance(req_ids[0], str):
                 info = addi_by_req.get(req_ids[0])
-            elif isinstance(addi_by_req, dict) and addi_by_req:
-                # Best-effort: take the first entry
+            elif addi_by_req:
                 info = next(iter(addi_by_req.values()))
             if isinstance(info, dict):
-                pe = info.get("prompt_embeds")
-                if isinstance(pe, torch.Tensor):
-                    cond = pe
+                info_candidates.append(info)
 
-        # Fallback: runtime_additional_information (per-request dicts)
-        if cond is None:
-            runtime_addi = kwargs.get("runtime_additional_information")
-            if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
-                pe = runtime_addi[0].get("prompt_embeds")
-                if isinstance(pe, torch.Tensor):
-                    cond = pe
-            elif isinstance(runtime_addi, dict):
-                # Map form: {req_id: {...}} (best-effort: take first entry)
-                for v in runtime_addi.values():
-                    if isinstance(v, dict) and isinstance(v.get("prompt_embeds"), torch.Tensor):
-                        cond = v["prompt_embeds"]
-                        break
+        runtime_addi = kwargs.get("runtime_additional_information")
+        if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
+            info_candidates.append(runtime_addi[0])
+        elif isinstance(runtime_addi, dict):
+            for v in runtime_addi.values():
+                if isinstance(v, dict):
+                    info_candidates.append(v)
+                    break
+
+        text_cond: torch.Tensor | None = None
+        image_cond: torch.Tensor | None = None
+        legacy_cond: torch.Tensor | None = None
+        for info in info_candidates:
+            if text_cond is None:
+                text_cond = _extract_tensor(info, "text_prompt_embeds")
+            if image_cond is None:
+                image_cond = _extract_tensor(info, "image_prompt_embeds")
+            if legacy_cond is None:
+                legacy_cond = _extract_tensor(info, "prompt_embeds")
 
         # Dummy/profile fallback: use inputs_embeds (often zeros)
-        if cond is None:
-            cond = inputs_embeds
-
-        if cond is None:
-            raise ValueError("DiT stage expects condition embeddings, but none were provided.")
-
-        # Normalize to token-major [T,H]
-        if cond.ndim == 3 and cond.shape[0] == 1:
-            cond = cond[0]
-        if cond.ndim != 2:
-            raise ValueError(f"Expected condition embeddings to be 2D [T,H], got shape={tuple(cond.shape)}")
+        if text_cond is None and image_cond is None and legacy_cond is None:
+            legacy_cond = inputs_embeds
 
         # Move to model device/dtype.
         #
@@ -168,20 +174,74 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
         else:
             target_dtype = next(self.gen_transformer.parameters()).dtype
-        cond = cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
 
-        prompt_embeds = cond.unsqueeze(0)  # [1, T, H]
-        prompt_attention_mask = torch.ones(
-            (1, prompt_embeds.shape[1]),
-            dtype=torch.bool,
-            device=prompt_embeds.device,
-        )
+        def _ensure_2d(x: torch.Tensor, name: str) -> torch.Tensor:
+            if x.ndim == 3 and x.shape[0] == 1:
+                x = x[0]
+            if x.ndim != 2:
+                raise ValueError(f"Expected {name} to be 2D [T,H], got shape={tuple(x.shape)}")
+            return x
 
-        # Apply optional refiner (keeps shape)
-        if self.gen_image_condition_refiner is not None:
-            prompt_embeds = self.gen_image_condition_refiner(prompt_embeds, ~prompt_attention_mask.bool())
+        if text_cond is not None or image_cond is not None:
+            # Preferred path: separate text/image conditions from preprocess.
+            if text_cond is not None:
+                text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
+            if image_cond is not None:
+                image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
+
+            hidden_size = None
+            if text_cond is not None:
+                hidden_size = int(text_cond.shape[1])
+            elif image_cond is not None:
+                hidden_size = int(image_cond.shape[1])
+
+            if hidden_size is None:
+                raise ValueError("DiT stage expects condition embeddings, but none were provided.")
+
+            if text_cond is None:
+                text_cond = torch.zeros((0, hidden_size), dtype=target_dtype, device=model_device)
+            else:
+                text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+
+            if image_cond is None:
+                image_cond = torch.zeros((0, hidden_size), dtype=target_dtype, device=model_device)
+            else:
+                image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+
+            text_embeds = text_cond.unsqueeze(0)  # [1, T_text, H]
+            text_attention_mask = torch.ones(
+                (1, text_embeds.shape[1]),
+                dtype=torch.bool,
+                device=text_embeds.device,
+            )
+
+            image_embeds = image_cond.unsqueeze(0)  # [1, T_img, H]
+            image_attention_mask = torch.ones(
+                (1, image_embeds.shape[1]),
+                dtype=torch.bool,
+                device=image_embeds.device,
+            )
+
+            # Apply optional refiner ONLY on image condition tokens.
+            if self.gen_image_condition_refiner is not None and image_embeds.shape[1] > 0:
+                image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_attention_mask.bool())
+                image_attention_mask = torch.ones(
+                    image_embeds.shape[:2],
+                    dtype=torch.bool,
+                    device=image_embeds.device,
+                )
+
+            prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
+            prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
+        else:
+            # Legacy path: a single concatenated condition tensor.
+            if legacy_cond is None:
+                raise ValueError("DiT stage expects condition embeddings, but none were provided.")
+            legacy_cond = _ensure_2d(legacy_cond, "prompt_embeds")
+            legacy_cond = legacy_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+            prompt_embeds = legacy_cond.unsqueeze(0)
             prompt_attention_mask = torch.ones(
-                prompt_embeds.shape[:2],
+                (1, prompt_embeds.shape[1]),
                 dtype=torch.bool,
                 device=prompt_embeds.device,
             )
