@@ -146,14 +146,12 @@ def ar2dit(
         prompt_embeds = cond.to(dtype=torch.float32).contiguous()
         # DiT stage 不依赖 token ids；用最短 prompt 以减少 vLLM 在 stage-1 的调度与 KV 开销。
         prompt_token_ids = [0]
+        # vllm_omni/engine/processor.py 要求 additional_information 的 value 只能是
+        # torch.Tensor 或 list（会被序列化到 AdditionalInformationPayload）。
+        # 这里仅透传 DiT 必需的 prompt_embeds + 形状信息，避免标量 int 触发序列化报错。
         additional_information = {
             "prompt_embeds": prompt_embeds,
             "prompt_embeds_shape": list(prompt_embeds.shape),
-            "gen_vocab_start_index": int(gen_vocab_start_index),
-            "prompt_len": int(prompt_len),
-            "gen_len": int(gen_len),
-            "gen_hidden_len": int(gen_hidden_len),
-            "image_condition_len": int(image_condition.shape[0]),
         }
 
         dit_inputs.append(
