@@ -26,6 +26,9 @@ def prepare_requests(prompt: str | list[str], **kwargs):
         if key in field_names:
             init_kwargs[key] = value
 
+    if "guidance_scale" in kwargs:
+        init_kwargs["guidance_scale_provided"] = True
+
     return OmniDiffusionRequest(**init_kwargs)
 
 

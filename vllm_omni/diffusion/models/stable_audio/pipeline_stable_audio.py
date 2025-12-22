@@ -388,7 +388,8 @@ class StableAudioPipeline(nn.Module):
         prompt = req.prompt if req.prompt is not None else prompt
         negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
         num_inference_steps = req.num_inference_steps or num_inference_steps
-        guidance_scale = req.guidance_scale if req.guidance_scale > 1.0 else guidance_scale
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
 
         if generator is None:
             generator = req.generator
