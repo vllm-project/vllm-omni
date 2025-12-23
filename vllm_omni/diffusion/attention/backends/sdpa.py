@@ -52,6 +52,20 @@ class SDPAImpl(AttentionImpl):
     ) -> torch.Tensor:
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                # self-attention mask
+                bs, seq_len = attention_mask.shape
+                assert seq_len == query.shape[-2], (
+                    f"attention mask seq_len != query.shape[-2], {seq_len} != {query.shape[-2]}"
+                )
+                attention_mask = torch.expand(
+                    attention_mask.unsqueeze(1).unsqueeze(1), (bs, 1, seq_len, seq_len)
+                )  # (bs, 1, seq_len, seq_len)
+            elif attention_mask.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Invalid attention mask dimension: {attention_mask.ndim}")
 
         output = torch.nn.functional.scaled_dot_product_attention(
             query,

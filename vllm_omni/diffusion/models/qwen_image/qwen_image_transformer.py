@@ -429,7 +429,6 @@ class QwenImageCrossAttention(nn.Module):
             attn_mask = torch.cat(
                 [encoder_hidden_states_mask.to(dtype=torch.bool), hidden_states_mask], dim=1
             )  # [batch, text_seq_len + image_seq_len]
-            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, text_seq_len + image_seq_len]
             assert attn_mask.shape[-1] == joint_query.shape[1], (
                 f"attn_mask.shape[-1] != joint_query.shape[1], {attn_mask.shape[-1]} != {joint_query.shape[1]}"
             )
