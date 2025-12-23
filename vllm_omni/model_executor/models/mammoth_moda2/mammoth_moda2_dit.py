@@ -131,37 +131,17 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
     ) -> OmniOutput:
         
         runtime_addi = kwargs.get("runtime_additional_information", None)
-        text_cond = None
-        image_cond = None
-        negative_cond = None
-        negative_attention_mask = None
-        legacy_cond = None
-        image_hw = (512, 512)
-        text_guidance_scale = 1.0
-        cfg_range = (0.0, 1.0)
-        num_inference_steps = 50
-
-        if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
-            # runtime_addi will be none in dummy/profile runs
-            info = runtime_addi[0]
-            text_cond = info["text_prompt_embeds"]
-            image_cond = info["image_prompt_embeds"]
-            negative_cond = info.get("negative_prompt_embeds")
-            negative_attention_mask = info.get("negative_prompt_attention_mask")
-            image_hw = info["image_height"][0], info["image_width"][0]
-            text_guidance_scale = info["text_guidance_scale"][0]
-            cfg_range = info["cfg_range"][0], info["cfg_range"][1]
-            num_inference_steps = info["num_inference_steps"][0]
-
-        # Dummy/profile fallback: use inputs_embeds (often zeros)
-        if text_cond is None and image_cond is None and legacy_cond is None:
-            # runtime_addi will be none in dummy/profile runs
-            legacy_cond = inputs_embeds
+        info = runtime_addi[0]
+        text_cond = info["text_prompt_embeds"]
+        image_cond = info["image_prompt_embeds"]
+        negative_cond = info.get("negative_prompt_embeds")
+        negative_attention_mask = info.get("negative_prompt_attention_mask")
+        image_hw = info["image_height"][0], info["image_width"][0]
+        text_guidance_scale = info["text_guidance_scale"][0]
+        cfg_range = info["cfg_range"][0], info["cfg_range"][1]
+        num_inference_steps = info["num_inference_steps"][0]
 
         # Move to model device/dtype.
-        #
-        # NOTE: The DiT weights are typically bf16 in vLLM-Omni runs; forcing
-        # fp16 here will cause matmul dtype mismatch inside the refiner / DiT.
         model_device = next(self.parameters()).device
         if self.gen_image_condition_refiner is not None:
             target_dtype = next(self.gen_image_condition_refiner.parameters()).dtype
@@ -175,51 +155,37 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
                 raise ValueError(f"Expected {name} to be 2D [T,H], got shape={tuple(x.shape)}")
             return x
 
-        if text_cond is not None or image_cond is not None:
-            # Preferred path: separate text/image conditions from preprocess.
-            text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
-            image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
-            text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
-            image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+        text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
+        image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
+        text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
+        image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
 
-            text_embeds = text_cond.unsqueeze(0)  # [1, T_text, H]
-            text_attention_mask = torch.ones(
-                (1, text_embeds.shape[1]),
-                dtype=torch.bool,
-                device=text_embeds.device,
-            )
+        text_embeds = text_cond.unsqueeze(0)  # [1, T_text, H]
+        text_attention_mask = torch.ones(
+            (1, text_embeds.shape[1]),
+            dtype=torch.bool,
+            device=text_embeds.device,
+        )
 
-            image_embeds = image_cond.unsqueeze(0)  # [1, T_img, H]
+        image_embeds = image_cond.unsqueeze(0)  # [1, T_img, H]
+        image_attention_mask = torch.ones(
+            (1, image_embeds.shape[1]),
+            dtype=torch.bool,
+            device=image_embeds.device,
+        )
+
+        # Apply optional refiner ONLY on image condition tokens.
+        if self.gen_image_condition_refiner is not None and image_embeds.shape[1] > 0:
+            image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_attention_mask.bool())
             image_attention_mask = torch.ones(
-                (1, image_embeds.shape[1]),
+                image_embeds.shape[:2],
                 dtype=torch.bool,
                 device=image_embeds.device,
             )
 
-            # Apply optional refiner ONLY on image condition tokens.
-            if self.gen_image_condition_refiner is not None and image_embeds.shape[1] > 0:
-                image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_attention_mask.bool())
-                image_attention_mask = torch.ones(
-                    image_embeds.shape[:2],
-                    dtype=torch.bool,
-                    device=image_embeds.device,
-                )
+        prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
+        prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
 
-            prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
-            prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
-        else:
-            # Legacy path: a single concatenated condition tensor.
-            # use in dummy/profile runs
-            if legacy_cond is None:
-                raise ValueError("DiT stage expects condition embeddings, but none were provided.")
-            legacy_cond = _ensure_2d(legacy_cond, "prompt_embeds")
-            legacy_cond = legacy_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
-            prompt_embeds = legacy_cond.unsqueeze(0)
-            prompt_attention_mask = torch.ones(
-                (1, prompt_embeds.shape[1]),
-                dtype=torch.bool,
-                device=prompt_embeds.device,
-            )
 
         # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
         negative_prompt_embeds = None
