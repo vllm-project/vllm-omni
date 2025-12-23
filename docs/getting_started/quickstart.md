@@ -12,7 +12,15 @@ This guide will help you quickly get started with vLLM-Omni to perform:
 
 ## Installation
 
-Please refer to [installation](installation/README.md)
+For installation on GPU using pre-built-wheel:
+
+```bash
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install vllm==0.11.0 --torch-backend=auto
+uv pip install vllm-omni
+```
+For additional details—including alternative installation methods, installation on NPU and other platforms — please see the installation guide in [installation](installation/README.md)
 
 ## Offline Inference
 

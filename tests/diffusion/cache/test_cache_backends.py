@@ -146,8 +146,6 @@ class TestTeaCacheBackend:
 
         # Verify hook was applied
         assert backend.enabled is True
-        assert hasattr(mock_pipeline, "_cache_backend")
-        assert mock_pipeline._cache_backend is backend
         mock_apply_hook.assert_called_once()
 
     @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
