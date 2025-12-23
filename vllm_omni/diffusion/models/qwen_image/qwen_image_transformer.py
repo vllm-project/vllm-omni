@@ -419,21 +419,20 @@ class QwenImageCrossAttention(nn.Module):
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         if encoder_hidden_states_mask is not None and not (encoder_hidden_states_mask == 1).all().item():
-            sp_world_size = get_sequence_parallel_world_size()
             hidden_states_mask = torch.ones(
                 hidden_states.shape[0],
-                hidden_states.shape[1] * sp_world_size,
+                hidden_states.shape[1],
                 dtype=torch.bool,
                 device=hidden_states.device,
             )  # [batch, image_seq_len]
-            if not get_forward_context().split_text_embed_in_sp:
-                # TODO: using replicated text embedding in ulysses sequence parallelism
-                encoder_hidden_states_mask = torch.cat([encoder_hidden_states_mask] * sp_world_size, dim=1)
 
             attn_mask = torch.cat(
                 [encoder_hidden_states_mask.to(dtype=torch.bool), hidden_states_mask], dim=1
             )  # [batch, text_seq_len + image_seq_len]
             attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, text_seq_len + image_seq_len]
+            assert attn_mask.shape[-1] == joint_query.shape[1], (
+                f"attn_mask.shape[-1] != joint_query.shape[1], {attn_mask.shape[-1]} != {joint_query.shape[1]}"
+            )
         else:
             attn_mask = None  # no mask
 
