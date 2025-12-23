@@ -47,20 +47,20 @@ class TeaCacheBackend(CacheBackend):
         and applies the TeaCache hook to the transformer.
 
         Args:
-            pipeline: Diffusion pipeline instance. Extracts transformer and model_type:
+            pipeline: Diffusion pipeline instance. Extracts transformer and transformer_type:
                      - transformer: pipeline.transformer
-                     - model_type: pipeline.__class__.__name__
+                     - transformer_type: pipeline.transformer.__class__.__name__
         """
-        # Extract transformer and model_type from pipeline
+        # Extract transformer and transformer_type from pipeline
         transformer = pipeline.transformer
-        model_type = pipeline.__class__.__name__
+        transformer_type = transformer.__class__.__name__
 
-        # Create TeaCacheConfig from DiffusionCacheConfig with model_type
+        # Create TeaCacheConfig from DiffusionCacheConfig with transformer_type
         # Access parameters via attribute access: config.rel_l1_thresh
         # rel_l1_thresh already has a default value of 0.2 in DiffusionCacheConfig
         try:
             teacache_config = TeaCacheConfig(
-                model_type=model_type,
+                transformer_type=transformer_type,
                 rel_l1_thresh=self.config.rel_l1_thresh,
                 coefficients=self.config.coefficients,
             )
@@ -69,7 +69,7 @@ class TeaCacheBackend(CacheBackend):
             raise ValueError(
                 f"Invalid TeaCache configuration: {e}. "
                 f"Expected keys: rel_l1_thresh, coefficients (optional). "
-                f"model_type is automatically extracted from pipeline.__class__.__name__."
+                f"transformer_type is automatically extracted from pipeline.transformer.__class__.__name__."
             )
 
         # Apply hook to transformer
@@ -80,7 +80,7 @@ class TeaCacheBackend(CacheBackend):
 
         logger.info(
             f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
-            f"model_type={teacache_config.model_type}"
+            f"transformer_class={teacache_config.transformer_type}"
         )
 
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
