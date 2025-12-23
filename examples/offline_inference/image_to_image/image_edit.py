@@ -322,7 +322,7 @@ def main():
             print(f"    Image {idx + 1} size: {img.size}")
     else:
         print(f"  Input image size: {input_image.size}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, cfg_parallel_size={args.cfg_parallel_size}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
