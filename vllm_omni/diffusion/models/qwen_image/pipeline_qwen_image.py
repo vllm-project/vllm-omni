@@ -572,7 +572,7 @@ class QwenImagePipeline(
                 attention_kwargs=self.attention_kwargs,
                 return_dict=False,
             )[0]
-            # Forward pass for negative prompt (CFG)
+
             if do_true_cfg:
                 noise_pred, neg_noise_pred = noise_pred.chunk(2, dim=0)
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
@@ -669,6 +669,46 @@ class QwenImagePipeline(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
+            )
+            # to concatenate prompt_embeds and negative_prompt_embeds, must pad to the same length
+            max_seq_len = max(prompt_embeds_mask.shape[1], negative_prompt_embeds_mask.shape[1])
+            prompt_embeds = torch.cat(
+                [
+                    prompt_embeds,
+                    prompt_embeds.new_zeros(
+                        prompt_embeds.shape[0], max_seq_len - prompt_embeds.shape[1], prompt_embeds.shape[2]
+                    ),
+                ],
+                dim=1,
+            )
+            prompt_embeds_mask = torch.cat(
+                [
+                    prompt_embeds_mask,
+                    prompt_embeds_mask.new_zeros(
+                        prompt_embeds_mask.shape[0], max_seq_len - prompt_embeds_mask.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
+            negative_prompt_embeds = torch.cat(
+                [
+                    negative_prompt_embeds,
+                    negative_prompt_embeds.new_zeros(
+                        negative_prompt_embeds.shape[0],
+                        max_seq_len - negative_prompt_embeds.shape[1],
+                        negative_prompt_embeds.shape[2],
+                    ),
+                ],
+                dim=1,
+            )
+            negative_prompt_embeds_mask = torch.cat(
+                [
+                    negative_prompt_embeds_mask,
+                    negative_prompt_embeds_mask.new_zeros(
+                        negative_prompt_embeds_mask.shape[0], max_seq_len - negative_prompt_embeds_mask.shape[1]
+                    ),
+                ],
+                dim=1,
             )
 
         num_channels_latents = self.transformer.in_channels // 4
