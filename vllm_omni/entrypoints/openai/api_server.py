@@ -513,6 +513,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
+    Only supports multi-stage omni mode with diffusion stages.
 
     Args:
         request: Image generation request with prompt and parameters
@@ -524,16 +525,56 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     Raises:
         HTTPException: For validation errors, missing engine, or generation failures
     """
-    # Get diffusion engine from app state
-    diffusion_engine: EngineClient | None = getattr(raw_request.app.state, "diffusion_engine", None)
-    if diffusion_engine is None:
+    # Get engine client (AsyncOmni) from app state
+    engine_client: EngineClient | None = getattr(raw_request.app.state, "engine_client", None)
+    if engine_client is None or not hasattr(engine_client, "stage_list"):
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            detail="Diffusion engine not initialized. Start server with a diffusion model.",
+            detail="Multi-stage engine not initialized. Start server with a multi-stage omni model.",
         )
 
-    # Get server's loaded model
-    model_name = getattr(raw_request.app.state, "diffusion_model_name", "unknown")
+    # Check if there's a diffusion stage
+    stage_configs = getattr(raw_request.app.state, "stage_configs", None)
+    if not stage_configs:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Stage configs not found. Start server with a multi-stage omni model.",
+        )
+
+    # Check for diffusion stage
+    has_diffusion_stage = False
+    for stage in stage_configs:
+        # Handle both dict and OmegaConf objects
+        stage_type = None
+        if isinstance(stage, dict):
+            stage_type = stage.get("stage_type", "llm")
+        elif hasattr(stage, "get"):
+            stage_type = stage.get("stage_type", "llm")
+        elif hasattr(stage, "stage_type"):
+            stage_type = stage.stage_type
+        else:
+            # Fallback: try to access as dict-like
+            try:
+                stage_type = stage["stage_type"] if "stage_type" in stage else "llm"
+            except (TypeError, KeyError):
+                stage_type = "llm"
+
+        if stage_type == "diffusion":
+            has_diffusion_stage = True
+            break
+
+    if not has_diffusion_stage:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="No diffusion stage found in multi-stage pipeline.",
+        )
+
+    # Get server's loaded model name
+    serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
+    if serving_models and hasattr(serving_models, "base_model_paths") and serving_models.base_model_paths:
+        model_name = serving_models.base_model_paths[0].name
+    else:
+        model_name = "unknown"
 
     # Validate model field (warn if mismatch, don't error)
     if request.model is not None and request.model != model_name:
@@ -572,11 +613,24 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
-        # Generate images using AsyncOmniDiffusion
-        result = await diffusion_engine.generate(**gen_params)
+        # Generate images using AsyncOmni (multi-stage mode)
+        # AsyncOmni.generate returns an async generator, iterate to get final output
+        result = None
+        async for output in engine_client.generate(
+            prompt=gen_params["prompt"],
+            request_id=f"img_gen_{int(time.time())}",
+            sampling_params_list=[gen_params],
+        ):
+            result = output
+
+        if result is None:
+            raise HTTPException(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                detail="No output generated from multi-stage pipeline.",
+            )
 
         # Extract images from result
-        images = result.images if hasattr(result, "images") else []
+        images = result.images if hasattr(result, "images") and result.images else []
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
