@@ -624,6 +624,7 @@ For a complete reference implementation, see:
 - **Stage config**: `vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml`
 - **Input processors**: `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py`
 - **Registry**: `vllm_omni/model_executor/models/registry.py`
+- **Testing**: `vllm_omni/tests/e2e/offline_inference/test_qwen3_omni.py`
 
 For more information, see:
 - [Architecture Overview](../../design/architecture_overview.md)
