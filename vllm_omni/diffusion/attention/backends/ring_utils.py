@@ -35,6 +35,9 @@ def _update_out_and_lse(
              block_lse = block_lse.transpose(1, 2)
          elif block_lse.shape[1] == H and block_lse.shape[2] >= S: # Padding case
              block_lse = block_lse[:, :, :S, :].transpose(1, 2)
+         # If shape is (B, H, S, 1) but expected (B, S, H, 1) because out is (B, S, H, D)
+         elif block_lse.shape[1] == H and block_lse.shape[2] == S and block_lse.shape[3] == 1:
+             block_lse = block_lse.transpose(1, 2)
 
     # Case 1: block_lse is 3D (B, H, S) or (B, S, H) or (B, ?, ?)
     elif block_lse.dim() == 3:
