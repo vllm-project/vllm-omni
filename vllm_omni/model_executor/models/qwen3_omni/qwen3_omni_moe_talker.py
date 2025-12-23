@@ -23,6 +23,7 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeMLP
+from vllm.model_executor.models.qwen3_omni_moe_thinker import Qwen3Omni_VisionTransformer
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -31,14 +32,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
     Qwen3OmniMoeTalkerCodePredictor,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
-    Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeConditionalGenerationMixin,
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
@@ -106,9 +105,11 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
+        talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
+        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
         self.quant_config = vllm_config.quant_config
         self.prefix = prefix
-
+        self.vllm_config = vllm_config
         self.config = talker_config
         self.vocab_size = talker_config.text_config.vocab_size
         self.router_aux_loss_coef = talker_config.text_config.router_aux_loss_coef
@@ -193,7 +194,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             pos_codes = [layer0_code]  # Start with layer 0: [batch, 1]
 
             # Initial input: [last_talker_hidden, layer0_embed]
-            layer0_embed = self.get_input_embeddings(layer0_code)
+            layer0_embed = self.embed_input_ids(layer0_code)
             prev_embed = layer0_embed  # Track previous layer embedding
             try:
                 current_input = torch.cat([last_talker_hidden, prev_embed], dim=1)  # [batch, 2, hidden_size]
@@ -260,7 +261,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         for pos in range(seq_len):
             # Layer 0 embedding
             layer0_code = result_codes[:, 0, pos : pos + 1]  # [batch, 1]
-            layer0_embed = self.get_input_embeddings(layer0_code)  # [batch, 1, hidden_size]
+            layer0_embed = self.embed_input_ids(layer0_code)  # [batch, 1, hidden_size]
 
             # mid layers hidden states (from CodePredictor)
             mid_residual_hiddens = middle_hidden_states[pos]  # [batch, num_code_groups-2, hidden_size]
@@ -440,7 +441,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata = None,
     ) -> torch.Tensor | None:
         """Compute logits for audio codec codes (layer 0 of RVQ).
 
@@ -471,7 +471,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
         return mm_input_by_modality
 
-    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings | None:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
@@ -504,9 +504,14 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
-    def get_input_embeddings(self, input_ids: torch.Tensor, multimodal_embeddings: MultiModalEmbeddings | None = None):
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        is_multimodal: bool = False,
+    ):
         """Get the input embedding layer (for codec tokens)."""
-        return self.language_model.get_input_embeddings(input_ids, multimodal_embeddings)
+        return self.language_model.embed_input_ids(input_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for the talker model.
@@ -695,10 +700,9 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
 
         return forward_with_shared_expert
 
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        generation_steps=None,
+        **kwargs: object,
     ) -> torch.Tensor:
         return self.model.codec_embedding(input_ids)

@@ -18,7 +18,7 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 #### Installation of vLLM
 
-vLLM-Omni is built based on vLLM v0.12.0. Please install it with command below.
+vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
 uv pip install vllm==0.12.0 --torch-backend=auto
 ```

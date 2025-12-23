@@ -194,6 +194,7 @@ class QwenImageEditPlusPipeline(
         )
 
         self.stage = None
+        self._cache_backend = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
@@ -542,6 +543,8 @@ class QwenImageEditPlusPipeline(
             latent_model_input = latents
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
+
+            self.transformer.do_true_cfg = do_true_cfg
 
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
