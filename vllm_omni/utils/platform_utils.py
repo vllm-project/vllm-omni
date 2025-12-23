@@ -46,6 +46,18 @@ def get_device_control_env_var() -> str:
     return "CUDA_VISIBLE_DEVICES"  # fallback
 
 
+def synchronize_if_needed(use_sync: bool) -> None:
+    if not use_sync:
+        return
+    device_type = detect_device_type()
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    elif device_type == "xpu":
+        torch.xpu.synchronize()
+    elif device_type == "npu":
+        torch.npu.synchronize()
+        
+
 def get_diffusion_worker_class() -> type:
     """Get the appropriate diffusion WorkerProc class based on current device type.
 
@@ -86,3 +98,4 @@ def torch_cuda_wrapper_for_xpu():
     finally:
         # if anything goes wrong, just patch it with a placeholder
         torch.cuda.Event = _EventPlaceholder
+
