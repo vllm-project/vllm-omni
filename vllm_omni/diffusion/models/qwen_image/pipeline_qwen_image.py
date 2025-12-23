@@ -542,6 +542,15 @@ class QwenImagePipeline(
         guidance,
         true_cfg_scale,
     ):
+        if do_true_cfg:
+            prompt_embeds = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
+            prompt_embeds_mask = torch.cat([prompt_embeds_mask, negative_prompt_embeds_mask], dim=0)
+            latents = torch.cat([latents, latents], dim=0)
+            img_shapes = img_shapes * 2
+            if txt_seq_lens is not None:
+                txt_seq_lens = txt_seq_lens + negative_txt_seq_lens
+            if guidance is not None:
+                guidance = guidance.expand(latents.shape[0])
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
             if self.interrupt:
@@ -549,15 +558,6 @@ class QwenImagePipeline(
             self._current_timestep = t
 
             self.transformer.do_true_cfg = do_true_cfg
-            if do_true_cfg:
-                prompt_embeds = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
-                prompt_embeds_mask = torch.cat([prompt_embeds_mask, negative_prompt_embeds_mask], dim=0)
-                latents = torch.cat([latents, latents], dim=0)
-                img_shapes = img_shapes * 2
-                if txt_seq_lens is not None:
-                    txt_seq_lens = txt_seq_lens + negative_txt_seq_lens
-                if guidance is not None:
-                    guidance = guidance.expand(latents.shape[0])
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
