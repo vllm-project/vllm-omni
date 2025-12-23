@@ -284,6 +284,17 @@ class QwenImagePipeline(
         self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"  # noqa: E501
         self.prompt_template_encode_start_idx = 34
         self.default_sample_size = 128
+        #  If cfg_pack_neg_pos is True, CFG expects positive+negative prompts to be packed into the same batch, need to pad to the same length
+        self.cfg_pack_neg_pos: bool = False
+        if (
+            self.od_config.parallel_config is not None
+            and self.od_config.parallel_config.cfg_parallel_size > 1
+            and not self.cfg_pack_neg_pos
+        ):
+            logger.info(
+                f"Pack positive and negative prompts into the same batch for CFG Parallel (parallel_size = {self.od_config.parallel_config.cfg_parallel_size})"
+            )
+            self.cfg_pack_neg_pos = True
 
     def check_inputs(
         self,
@@ -542,7 +553,7 @@ class QwenImagePipeline(
         guidance,
         true_cfg_scale,
     ):
-        if do_true_cfg:
+        if do_true_cfg and self.cfg_pack_neg_pos:
             prompt_embeds = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
             prompt_embeds_mask = torch.cat([prompt_embeds_mask, negative_prompt_embeds_mask], dim=0)
             latents = torch.cat([latents, latents], dim=0)
@@ -557,10 +568,10 @@ class QwenImagePipeline(
                 continue
             self._current_timestep = t
 
-            self.transformer.do_true_cfg = do_true_cfg
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
+            self.transformer.do_true_cfg = do_true_cfg
             noise_pred = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
@@ -574,7 +585,21 @@ class QwenImagePipeline(
             )[0]
 
             if do_true_cfg:
-                noise_pred, neg_noise_pred = noise_pred.chunk(2, dim=0)
+                if self.cfg_pack_neg_pos:
+                    noise_pred, neg_noise_pred = noise_pred.chunk(2, dim=0)
+                else:
+                    # Forward pass for negative prompt (CFG)
+                    neg_noise_pred = self.transformer(
+                        hidden_states=latents,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        img_shapes=img_shapes,
+                        txt_seq_lens=negative_txt_seq_lens,
+                        attention_kwargs=self.attention_kwargs,
+                        return_dict=False,
+                    )[0]
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
@@ -670,46 +695,39 @@ class QwenImagePipeline(
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
-            # to concatenate prompt_embeds and negative_prompt_embeds, must pad to the same length
-            max_seq_len = max(prompt_embeds_mask.shape[1], negative_prompt_embeds_mask.shape[1])
-            prompt_embeds = torch.cat(
-                [
-                    prompt_embeds,
-                    prompt_embeds.new_zeros(
-                        prompt_embeds.shape[0], max_seq_len - prompt_embeds.shape[1], prompt_embeds.shape[2]
-                    ),
-                ],
-                dim=1,
-            )
-            prompt_embeds_mask = torch.cat(
-                [
-                    prompt_embeds_mask,
-                    prompt_embeds_mask.new_zeros(
-                        prompt_embeds_mask.shape[0], max_seq_len - prompt_embeds_mask.shape[1]
-                    ),
-                ],
-                dim=1,
-            )
-            negative_prompt_embeds = torch.cat(
-                [
-                    negative_prompt_embeds,
-                    negative_prompt_embeds.new_zeros(
-                        negative_prompt_embeds.shape[0],
-                        max_seq_len - negative_prompt_embeds.shape[1],
-                        negative_prompt_embeds.shape[2],
-                    ),
-                ],
-                dim=1,
-            )
-            negative_prompt_embeds_mask = torch.cat(
-                [
-                    negative_prompt_embeds_mask,
-                    negative_prompt_embeds_mask.new_zeros(
-                        negative_prompt_embeds_mask.shape[0], max_seq_len - negative_prompt_embeds_mask.shape[1]
-                    ),
-                ],
-                dim=1,
-            )
+            if self.cfg_pack_neg_pos:
+                # to concatenate prompt_embeds and negative_prompt_embeds, must pad to the same length
+                max_seq_len = max(prompt_embeds_mask.shape[1], negative_prompt_embeds_mask.shape[1])
+
+                def pad_embeds_and_mask(embeds, mask, max_seq_len):
+                    padded_embeds = torch.cat(
+                        [
+                            embeds,
+                            embeds.new_zeros(
+                                embeds.shape[0],
+                                max_seq_len - embeds.shape[1],
+                                *embeds.shape[2:],
+                                dtype=embeds.dtype,
+                                device=embeds.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    padded_mask = torch.cat(
+                        [
+                            mask,
+                            mask.new_zeros(
+                                mask.shape[0], max_seq_len - mask.shape[1], dtype=mask.dtype, device=mask.device
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    return padded_embeds, padded_mask
+
+                prompt_embeds, prompt_embeds_mask = pad_embeds_and_mask(prompt_embeds, prompt_embeds_mask, max_seq_len)
+                negative_prompt_embeds, negative_prompt_embeds_mask = pad_embeds_and_mask(
+                    negative_prompt_embeds, negative_prompt_embeds_mask, max_seq_len
+                )
 
         num_channels_latents = self.transformer.in_channels // 4
         latents = self.prepare_latents(
