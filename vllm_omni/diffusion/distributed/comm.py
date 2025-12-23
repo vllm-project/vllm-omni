@@ -11,7 +11,6 @@ from torch import Tensor
 from vllm_omni.utils.platform_utils import synchronize_if_needed
 
 
-
 def all_to_all_4D(
     input: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False
 ) -> torch.tensor:
