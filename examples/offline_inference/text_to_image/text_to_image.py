@@ -8,7 +8,6 @@ from pathlib import Path
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -112,7 +111,7 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    assert args.ring_degree == 1, "Ring attention is not supported yet"
+    # assert args.ring_degree == 1, "Ring attention is not supported yet"
     parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     omni = Omni(
         model=args.model,
@@ -120,7 +119,6 @@ def main():
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
-        parallel_config=parallel_config,
         parallel_config=parallel_config,
     )
 
