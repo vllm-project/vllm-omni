@@ -418,7 +418,7 @@ class QwenImageCrossAttention(nn.Module):
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        if encoder_hidden_states_mask is not None:
+        if encoder_hidden_states_mask is not None and not (encoder_hidden_states_mask == 1).all().item():
             hidden_states_mask = torch.ones(
                 hidden_states.shape[0], hidden_states.shape[1], dtype=torch.bool, device=hidden_states.device
             )  # [batch, image_seq_len]
