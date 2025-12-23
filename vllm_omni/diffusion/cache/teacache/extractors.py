@@ -277,7 +277,7 @@ def register_extractor(transformer_cls_name: str, extractor_fn: Callable) -> Non
     the core TeaCache code.
 
     Args:
-        model_identifier: Model type identifier (class name or type string)
+        transformer_cls_name: Transformer model type identifier (class name or type string)
         extractor_fn: Function with signature (module, *args, **kwargs) -> CacheContext
 
     Example:
@@ -304,14 +304,14 @@ def register_extractor(transformer_cls_name: str, extractor_fn: Callable) -> Non
 
 def get_extractor(transformer_cls_name: str) -> Callable:
     """
-    Get extractor function for given model type.
+    Get extractor function for given transformer class.
 
-    This function looks up the extractor based on the exact model_type string,
-    which should match the pipeline class name from OmniDiffusionConfig.model_class_name.
+    This function looks up the extractor based on the exact transformer_cls_name string,
+    which should match the transformer type in the pipeline (i.e., pipeline.transformer.__class__.__name__).
 
     Args:
-        model_type: Model type string (e.g., "QwenImagePipeline", "FluxPipeline")
-                   Must exactly match a key in EXTRACTOR_REGISTRY.
+        transformer_cls_name: Transformer class name (e.g., "QwenImageTransformer2DModel")
+                                Must exactly match a key in EXTRACTOR_REGISTRY.
 
     Returns:
         Extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -320,8 +320,8 @@ def get_extractor(transformer_cls_name: str) -> Callable:
         ValueError: If model type not found in registry
 
     Example:
-        >>> # Get extractor for Qwen model
-        >>> extractor = get_extractor("QwenImagePipeline")
+        >>> # Get extractor for QwenImageTransformer2DModel
+        >>> extractor = get_extractor("QwenImageTransformer2DModel")
         >>> ctx = extractor(transformer, hidden_states, encoder_hidden_states, timestep, ...)
     """
     # Direct lookup - no substring matching

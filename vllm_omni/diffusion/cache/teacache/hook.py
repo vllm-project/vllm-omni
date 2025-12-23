@@ -62,7 +62,7 @@ class TeaCacheHook(ModelHook):
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
-        Initialize hook with extractor from config model type.
+        Initialize hook with extractor from config transformer model type.
 
         Args:
             module: The module to initialize the hook for.
