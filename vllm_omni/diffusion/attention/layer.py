@@ -56,17 +56,22 @@ class Attention(nn.Module):
         
         self.use_ring = False
         self.ring_pg = None
+        self.ring_runner = None
 
         try:
             config = get_current_omni_diffusion_config()
             if config.parallel_config.ring_degree > 1:
                 self.use_ring = True
                 try:
-                    self.ring_pg = get_sp_group().ring_group
+                    sp_group = get_sp_group()
+                    self.ring_pg = sp_group.ring_group
+                    self.ring_runner = RingParallelAttention(sp_group)
                 except:
                     self.use_ring = False
+                    self.ring_runner = None
         except Exception:
             self.use_ring = False
+            self.ring_runner = None
 
         self.parallel_strategy = build_parallel_attention_strategy(
             scatter_idx=scatter_idx,
@@ -128,8 +133,8 @@ class Attention(nn.Module):
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
         # Delegate to RingParallelAttention strategy if available
-        if isinstance(self.parallel_strategy, RingParallelAttention):
-             return self.parallel_strategy.run_attention(
+        if self.ring_runner is not None:
+             return self.ring_runner.run_attention(
                  query, key, value, attn_metadata, 
                  softmax_scale=self.softmax_scale,
                  causal=self.causal
