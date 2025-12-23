@@ -63,4 +63,4 @@ curl -s http://localhost:8091/v1/chat/completions \
   }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > coffee.png
 ```
 
-For more details, please refer to [text-to-image online serving](../user_guide/examples/online_serving/text_to_image.md).
+For more details, please refer to [online serving](../user_guide/examples/online_serving/text_to_image.md).
