@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         default="Qwen/Qwen-Image-Edit",
         help=(
             "Diffusion model name or local path. "
-            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or later version "
+            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or Qwen/Qwen-Image-Edit-2511"
             "which supports QwenImageEditPlusPipeline."
         ),
     )
