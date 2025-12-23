@@ -373,6 +373,7 @@ class QwenImageCrossAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor,
         vid_freqs: torch.Tensor,
         txt_freqs: torch.Tensor,
     ):
@@ -416,6 +417,17 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+        hidden_states_mask = torch.ones(hidden_states.shape[0], hidden_states.shape[1], dtype=torch.bool)
+        if encoder_hidden_states_mask is not None:
+            attn_mask = torch.cat([encoder_hidden_states_mask.to(dtype=torch.bool), hidden_states_mask], dim=1)
+        else:
+            attn_mask = torch.cat(
+                [
+                    torch.ones(encoder_hidden_states.shape[0], encoder_hidden_states.shape[1], dtype=torch.bool),
+                    hidden_states_mask,
+                ],
+                dim=1,
+            )
 
         # Compute joint attention
 
@@ -431,6 +443,7 @@ class QwenImageCrossAttention(nn.Module):
                 img_key,
                 img_value,
                 AttentionMetadata(
+                    attn_mask=attn_mask,
                     joint_query=txt_query,
                     joint_key=txt_key,
                     joint_value=txt_value,
@@ -442,6 +455,9 @@ class QwenImageCrossAttention(nn.Module):
                 joint_query,
                 joint_key,
                 joint_value,
+                AttentionMetadata(
+                    attn_mask=attn_mask,
+                ),
             )
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
@@ -579,6 +595,7 @@ class QwenImageTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=img_modulated,  # Image stream (will be processed as "sample")
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
             vid_freqs=image_rotary_emb[0],
             txt_freqs=image_rotary_emb[1],
         )
