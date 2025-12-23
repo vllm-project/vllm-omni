@@ -548,11 +548,19 @@ class QwenImagePipeline(
                 continue
             self._current_timestep = t
 
+            self.transformer.do_true_cfg = do_true_cfg
+            if do_true_cfg:
+                prompt_embeds = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
+                prompt_embeds_mask = torch.cat([prompt_embeds_mask, negative_prompt_embeds_mask], dim=0)
+                latents = torch.cat([latents, latents], dim=0)
+                img_shapes = img_shapes * 2
+                if txt_seq_lens is not None:
+                    txt_seq_lens = txt_seq_lens + negative_txt_seq_lens
+                if guidance is not None:
+                    guidance = guidance.expand(latents.shape[0])
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-            # Forward pass for positive prompt (or unconditional if no CFG)
-            self.transformer.do_true_cfg = do_true_cfg
             noise_pred = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
@@ -566,17 +574,7 @@ class QwenImagePipeline(
             )[0]
             # Forward pass for negative prompt (CFG)
             if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
+                noise_pred, neg_noise_pred = noise_pred.chunk(2, dim=0)
                 comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
