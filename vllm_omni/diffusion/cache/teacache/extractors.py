@@ -151,6 +151,7 @@ def extract_qwen_context(
     img_shapes: torch.Tensor,
     txt_seq_lens: torch.Tensor,
     guidance: torch.Tensor | None = None,
+    additional_t_cond: torch.Tensor | None = None,
     attention_kwargs: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> CacheContext:
@@ -170,6 +171,7 @@ def extract_qwen_context(
         img_shapes: Image shapes for position embedding
         txt_seq_lens: Text sequence lengths
         guidance: Optional guidance scale for CFG
+        additional_t_cond: Optional additional timestep conditioning
         attention_kwargs: Additional attention arguments
         **kwargs: Additional keyword arguments ignored by this extractor
 
@@ -193,9 +195,9 @@ def extract_qwen_context(
         guidance = guidance.to(hidden_states.dtype) * 1000
 
     temb = (
-        module.time_text_embed(timestep, hidden_states)
+        module.time_text_embed(timestep, hidden_states, additional_t_cond)
         if guidance is None
-        else module.time_text_embed(timestep, guidance, hidden_states)
+        else module.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
     )
 
     image_rotary_emb = module.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
