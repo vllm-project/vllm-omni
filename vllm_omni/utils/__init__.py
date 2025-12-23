@@ -4,6 +4,7 @@ from vllm_omni.utils.platform_utils import (
     is_npu,
     is_xpu,
     torch_cuda_wrapper_for_xpu,
+    is_rocm,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "is_npu",
     "is_xpu",
     torch_cuda_wrapper_for_xpu,
+    "is_rocm",
 ]

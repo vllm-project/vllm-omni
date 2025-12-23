@@ -10,6 +10,17 @@ from vllm_omni.config import OmniModelConfig
 logger = init_logger(__name__)
 
 
+def register_omni_models_to_vllm():
+    from vllm.model_executor.models import ModelRegistry
+
+    from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+    supported_archs = ModelRegistry.get_supported_archs()
+    for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
+        if arch not in supported_archs:
+            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -38,11 +49,20 @@ class OmniEngineArgs(EngineArgs):
         # we need to draw the text config from the corresponding model stage.
         return getattr(config_dict["hf_config"], config_dict["hf_config_name"]).get_text_config()
 
+    def _ensure_omni_models_registered(self):
+        if hasattr(self, "_omni_models_registered"):
+            return True
+        register_omni_models_to_vllm()
+        self._omni_models_registered = True
+        return True
+
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
+        # register omni models to avoid model not found error
+        self._ensure_omni_models_registered()
 
         # First, get the base ModelConfig from the parent class
         base_config = super().create_model_config()
@@ -99,7 +119,16 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         # we need to draw the text config from the corresponding model stage.
         return getattr(config_dict["hf_config"], config_dict["hf_config_name"]).get_text_config()
 
+    def _ensure_omni_models_registered(self):
+        if hasattr(self, "_omni_models_registered"):
+            return True
+        register_omni_models_to_vllm()
+        self._omni_models_registered = True
+        return True
+
     def create_model_config(self) -> OmniModelConfig:
+        # register omni models to avoid model not found error
+        self._ensure_omni_models_registered()
         # First, get the base ModelConfig from the parent class
         base_config = super().create_model_config()
 
