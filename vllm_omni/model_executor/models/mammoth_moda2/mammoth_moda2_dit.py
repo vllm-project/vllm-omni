@@ -92,6 +92,8 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         # vLLM PP interface compatibility
         self.make_empty_intermediate_tensors = lambda: None
 
+        self._llm_hidden_size = llm_hidden_size
+
     def _reinit_caption_embedder(self, in_features: int) -> None:
         # 与上游 Mammothmoda2Model 的 `reinit_caption_embedder` 对齐：
         # 用 Qwen2RMSNorm(in_features) + Linear(in_features -> out_features)
@@ -100,6 +102,25 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
             Qwen2RMSNorm(in_features, eps=1e-5),
             nn.Linear(in_features, out_features, bias=True),
         )
+
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
+        if num_reqs <= 0:
+            raise ValueError(f"num_reqs must be positive, got {num_reqs}")
+        text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
+        image_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
+        negative_prompt_embeds = torch.zeros((0, self._llm_hidden_size), dtype=torch.float32)
+        info = {
+            "text_prompt_embeds": text_prompt_embeds,
+            "image_prompt_embeds": image_prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_attention_mask": [],
+            "image_height": [512],
+            "image_width": [512],
+            "text_guidance_scale": [1.0],
+            "cfg_range": [0.0, 1.0],
+            "num_inference_steps": [1],
+        }
+        return [info for _ in range(num_reqs)]
 
     @torch.inference_mode()
     def forward(

@@ -447,6 +447,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 input_ids = self.input_ids.gpu[:num_tokens]
                 inputs_embeds = None
 
+            if hasattr(self.model, "get_dummy_runtime_additional_information"):
+                # TODO: support num_reqs > 1
+                runtime_addi = self.model.get_dummy_runtime_additional_information(1)
+                model_kwargs["runtime_additional_information"] = runtime_addi
+
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens]
             else:

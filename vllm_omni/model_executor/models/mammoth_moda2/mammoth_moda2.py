@@ -138,6 +138,15 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             return self.model.compute_logits(hidden_states)
         return None
 
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
+        if self.model_stage != "dit":
+            raise RuntimeError(f"get_dummy_runtime_additional_information only valid for dit stage, got {self.model_stage}")
+        if self.dit is None:
+            raise RuntimeError("dit stage model is not initialized")
+        if not hasattr(self.dit, "get_dummy_runtime_additional_information"):
+            raise AttributeError("dit model missing get_dummy_runtime_additional_information")
+        return self.dit.get_dummy_runtime_additional_information(num_reqs)
+
     def load_weights(self, weights):
         # 参考 Qwen2_5OmniForConditionalGeneration：按 stage 把权重交给对应子模块加载，
         # 并将子模块返回的“已加载参数名集合”补上正确的前缀，以通过 DefaultModelLoader 的严格校验。
