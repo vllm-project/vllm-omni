@@ -41,18 +41,33 @@ def _infer_image_hw_from_original_prompt(prompt: Any) -> tuple[int | None, int |
     if not isinstance(info, dict):
         return None, None
 
-    h = info.get("image_height", info.get("height"))
-    w = info.get("image_width", info.get("width"))
+    def _unwrap_number(val: object) -> int | float | None:
+        if isinstance(val, list) and val:
+            val = val[0]
+        if isinstance(val, torch.Tensor):
+            if val.numel() == 0:
+                return None
+            val = val.flatten()[0].item()
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    h = _unwrap_number(info.get("image_height", info.get("height")))
+    w = _unwrap_number(info.get("image_width", info.get("width")))
 
     if h is None or w is None:
         size = info.get("image_size")
         if isinstance(size, list) and len(size) >= 2:
-            h, w = size[0], size[1]
+            h = _unwrap_number(size[0])
+            w = _unwrap_number(size[1])
 
     if h is None or w is None:
         # best-effort fallback: derive from AR grid
-        ar_w = info.get("ar_width")
-        ar_h = info.get("ar_height")
+        ar_w = _unwrap_number(info.get("ar_width"))
+        ar_h = _unwrap_number(info.get("ar_height"))
         try:
             if ar_w is not None and ar_h is not None:
                 w = int(ar_w) * 16
@@ -69,6 +84,59 @@ def _infer_image_hw_from_original_prompt(prompt: Any) -> tuple[int | None, int |
     if h_i is None or w_i is None:
         return None, None
     return h_i, w_i
+
+
+def _infer_dit_sampling_from_original_prompt(
+    prompt: Any,
+) -> tuple[float | None, tuple[float, float] | None, int | None]:
+    """从 original_prompt 解析 DiT CFG/步数参数。"""
+    prompt_obj = prompt[0] if isinstance(prompt, list) and prompt else prompt
+    if not isinstance(prompt_obj, dict):
+        return None, None, None
+    info = prompt_obj.get("additional_information")
+    if not isinstance(info, dict):
+        return None, None, None
+
+    def _unwrap_scalar(val: object) -> float | None:
+        if isinstance(val, list) and val:
+            val = val[0]
+        if isinstance(val, torch.Tensor):
+            if val.numel() == 0:
+                return None
+            val = val.flatten()[0].item()
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _unwrap_int(val: object) -> int | None:
+        out = _unwrap_scalar(val)
+        if out is None:
+            return None
+        try:
+            return int(out)
+        except Exception:
+            return None
+
+    text_guidance_scale = _unwrap_scalar(info.get("text_guidance_scale"))
+    num_inference_steps = _unwrap_int(info.get("num_inference_steps"))
+
+    cfg_range = info.get("cfg_range")
+    cfg_tuple: tuple[float, float] | None = None
+    if isinstance(cfg_range, list) and len(cfg_range) >= 2:
+        start = _unwrap_scalar(cfg_range[0])
+        end = _unwrap_scalar(cfg_range[1])
+        if start is not None and end is not None:
+            cfg_tuple = (float(start), float(end))
+    elif isinstance(cfg_range, torch.Tensor) and cfg_range.numel() >= 2:
+        start = _unwrap_scalar(cfg_range.flatten()[0].item())
+        end = _unwrap_scalar(cfg_range.flatten()[1].item())
+        if start is not None and end is not None:
+            cfg_tuple = (float(start), float(end))
+
+    return text_guidance_scale, cfg_tuple, num_inference_steps
 
 
 def ar2dit(
@@ -96,6 +164,7 @@ def ar2dit(
     gen_vocab_start_index = _infer_gen_vocab_start_index(stage_list[source_stage_id], default=152064)
 
     image_height, image_width = _infer_image_hw_from_original_prompt(prompt)
+    text_guidance_scale, cfg_range, num_inference_steps = _infer_dit_sampling_from_original_prompt(prompt)
 
     for ar_output in ar_outputs:
         # vllm-omni 会把 stage0 的 engine_output_type=latent 聚合到 multimodal_output["latent"]。
@@ -270,6 +339,12 @@ def ar2dit(
             # vllm_omni/engine/processor.py: list is allowed
             additional_information["image_height"] = [int(image_height)]
             additional_information["image_width"] = [int(image_width)]
+        if text_guidance_scale is not None:
+            additional_information["text_guidance_scale"] = [float(text_guidance_scale)]
+        if cfg_range is not None:
+            additional_information["cfg_range"] = [float(cfg_range[0]), float(cfg_range[1])]
+        if num_inference_steps is not None:
+            additional_information["num_inference_steps"] = [int(num_inference_steps)]
 
         dit_inputs.append(
             OmniTokensPrompt(

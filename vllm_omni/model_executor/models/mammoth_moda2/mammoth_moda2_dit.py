@@ -116,13 +116,78 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         runtime_addi = kwargs.get("runtime_additional_information", None)
         text_cond = None
         image_cond = None
+        negative_cond = None
+        negative_attention_mask = None
         legacy_cond = None
         image_hw = (512, 512)
-        if runtime_addi is not None:
+        text_guidance_scale = 1.0
+        cfg_range = (0.0, 1.0)
+        num_inference_steps = 50
+
+        def _first_scalar(val: object) -> float | None:
+            if isinstance(val, list) and val:
+                val = val[0]
+            if isinstance(val, torch.Tensor):
+                if val.numel() == 0:
+                    return None
+                val = val.flatten()[0].item()
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        def _extract_hw(info: dict[str, object]) -> tuple[int, int] | None:
+            h = info.get("image_height", info.get("height"))
+            w = info.get("image_width", info.get("width"))
+            if h is None or w is None:
+                size = info.get("image_size")
+                if isinstance(size, list) and len(size) >= 2:
+                    h, w = size[0], size[1]
+            h_v = _first_scalar(h)
+            w_v = _first_scalar(w)
+            if h_v is None or w_v is None:
+                return None
+            try:
+                return int(h_v), int(w_v)
+            except Exception:
+                return None
+
+        def _extract_int(info: dict[str, object], key: str, default: int) -> int:
+            val = _first_scalar(info.get(key))
+            if val is None:
+                return default
+            try:
+                return int(val)
+            except Exception:
+                return default
+
+        def _extract_range(info: dict[str, object], key: str, default: tuple[float, float]) -> tuple[float, float]:
+            val = info.get(key)
+            if isinstance(val, list) and len(val) >= 2:
+                v0 = _first_scalar(val[0])
+                v1 = _first_scalar(val[1])
+            elif isinstance(val, torch.Tensor) and val.numel() >= 2:
+                v0 = _first_scalar(val.flatten()[0].item())
+                v1 = _first_scalar(val.flatten()[1].item())
+            else:
+                v0 = v1 = None
+            if v0 is None or v1 is None:
+                return default
+            return float(v0), float(v1)
+
+        if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
             # runtime_addi will be none in dummy/profile runs
-            text_cond = runtime_addi[0]["text_prompt_embeds"]
-            image_cond = runtime_addi[0]["image_prompt_embeds"]
-            image_hw = (runtime_addi[0]["image_height"][0], runtime_addi[0]["image_width"][0])
+            info = runtime_addi[0]
+            text_cond = info.get("text_prompt_embeds")
+            image_cond = info.get("image_prompt_embeds")
+            negative_cond = info.get("negative_prompt_embeds")
+            negative_attention_mask = info.get("negative_prompt_attention_mask")
+            image_hw = _extract_hw(info) or image_hw
+            text_guidance_scale = _first_scalar(info.get("text_guidance_scale")) or text_guidance_scale
+            cfg_range = _extract_range(info, "cfg_range", cfg_range)
+            num_inference_steps = _extract_int(info, "num_inference_steps", num_inference_steps)
 
         # Dummy/profile fallback: use inputs_embeds (often zeros)
         if text_cond is None and image_cond is None and legacy_cond is None:
@@ -192,6 +257,45 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
                 device=prompt_embeds.device,
             )
 
+        # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
+        negative_prompt_embeds = None
+        negative_prompt_attention_mask = None
+        if text_guidance_scale > 1.0:
+            if negative_cond is not None:
+                negative_cond = _ensure_2d(negative_cond, "negative_prompt_embeds")
+                negative_prompt_embeds = negative_cond.to(
+                    device=model_device, dtype=target_dtype, non_blocking=True
+                ).contiguous().unsqueeze(0)
+                if isinstance(negative_attention_mask, torch.Tensor):
+                    neg_mask = negative_attention_mask
+                elif isinstance(negative_attention_mask, list):
+                    neg_mask = torch.tensor(negative_attention_mask, dtype=torch.bool)
+                else:
+                    neg_mask = None
+                if neg_mask is None:
+                    negative_prompt_attention_mask = torch.ones(
+                        (1, negative_prompt_embeds.shape[1]),
+                        dtype=torch.bool,
+                        device=negative_prompt_embeds.device,
+                    )
+                else:
+                    neg_mask = neg_mask.to(device=negative_prompt_embeds.device, dtype=torch.bool)
+                    if neg_mask.ndim == 1:
+                        neg_mask = neg_mask.unsqueeze(0)
+                    negative_prompt_attention_mask = neg_mask
+            else:
+                hidden_size = int(prompt_embeds.shape[-1])
+                negative_prompt_embeds = torch.zeros(
+                    (1, 0, hidden_size),
+                    dtype=target_dtype,
+                    device=prompt_embeds.device,
+                )
+                negative_prompt_attention_mask = torch.zeros(
+                    (1, 0),
+                    dtype=torch.bool,
+                    device=prompt_embeds.device,
+                )
+
         # Output image size (px), passed from stage input processor.
         height, width = image_hw
         if height <= 0 or width <= 0:
@@ -205,7 +309,6 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         latents = randn_tensor(shape, device=prompt_embeds.device, dtype=prompt_embeds.dtype)
 
         scheduler = FlowMatchEulerDiscreteScheduler()
-        num_inference_steps = 50
 
         scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
@@ -213,8 +316,9 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
             num_tokens=latents.shape[-2] * latents.shape[-1],
         )
 
-        # Run diffusion loop (no CFG for now)
-        for t in scheduler.timesteps:
+        # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
+        total_steps = max(1, len(scheduler.timesteps))
+        for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             model_pred = self.gen_transformer(
                 hidden_states=latents,
@@ -224,7 +328,23 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
                 ref_image_hidden_states=None,
                 freqs_cis=self.gen_freqs_cis,
             )
+            guidance_scale = (
+                text_guidance_scale
+                if cfg_range[0] <= i / total_steps <= cfg_range[1]
+                else 1.0
+            )
+            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
+                model_pred_uncond = self.gen_transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_hidden_states=negative_prompt_embeds,
+                    text_attention_mask=negative_prompt_attention_mask,
+                    ref_image_hidden_states=None,
+                    freqs_cis=self.gen_freqs_cis,
+                )
+                model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
+            latents = latents.to(dtype=prompt_embeds.dtype)
 
         # VAE decode
         if self.gen_vae.config.scaling_factor is not None:

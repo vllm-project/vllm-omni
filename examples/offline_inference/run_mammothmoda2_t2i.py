@@ -99,6 +99,26 @@ def parse_args() -> argparse.Namespace:
         default=1056,
         help="AR 生成 token 数（建议 ar_height * (ar_width + 1)，先跑通再调）",
     )
+    p.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=50,
+        help="DiT 扩散步数",
+    )
+    p.add_argument(
+        "--text-guidance-scale",
+        type=float,
+        default=9.0,
+        help="DiT 文本 CFG 强度（>1 启用）",
+    )
+    p.add_argument(
+        "--cfg-range",
+        type=float,
+        nargs=2,
+        default=(0.0, 1.0),
+        metavar=("START", "END"),
+        help="DiT CFG 生效区间（0-1 的相对步数范围）",
+    )
     p.add_argument("--out", type=str, default="out.png", help="输出图片路径")
     p.add_argument("--trust-remote-code", action="store_true", help="信任远端自定义代码（本地目录一般不需要）")
     return p.parse_args()
@@ -184,15 +204,18 @@ def main() -> None:
                     "prompt": prompt,
                     "additional_information": {
                         "omni_task": "t2i",
-                        "ar_width": int(args.ar_width),
-                        "ar_height": int(args.ar_height),
-                        "eol_token_id": int(eol_token_id),
-                        "visual_token_start_id": int(visual_start),
-                        "visual_token_end_id": int(visual_end),
+                        "ar_width": [int(args.ar_width)],
+                        "ar_height": [int(args.ar_height)],
+                        "eol_token_id": [int(eol_token_id)],
+                        "visual_token_start_id": [int(visual_start)],
+                        "visual_token_end_id": [int(visual_end)],
                         # 该字段不会进入 Stage-0 engine request（text prompt 会丢弃额外字段），
                         # 但会被 Stage-1 的 ar2dit 读取并透传到 DiT.forward。
-                        "image_height": int(args.height),
-                        "image_width": int(args.width),
+                        "image_height": [int(args.height)],
+                        "image_width": [int(args.width)],
+                        "num_inference_steps": [int(args.num_inference_steps)],
+                        "text_guidance_scale": [float(args.text_guidance_scale)],
+                        "cfg_range": [float(args.cfg_range[0]), float(args.cfg_range[1])],
                     },
                 }
             ],

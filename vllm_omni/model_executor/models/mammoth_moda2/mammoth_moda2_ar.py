@@ -640,6 +640,12 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             if val is None:
                 return None
             try:
+                if isinstance(val, list) and val:
+                    val = val[0]
+                if isinstance(val, torch.Tensor):
+                    if val.numel() == 0:
+                        return None
+                    val = val.flatten()[0].item()
                 return int(val)
             except Exception:
                 return None
