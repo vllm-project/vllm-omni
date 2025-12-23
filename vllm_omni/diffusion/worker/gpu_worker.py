@@ -100,7 +100,7 @@ class GPUWorker:
             with DeviceMemoryProfiler() as m:
                 self.pipeline = model_loader.load_model(
                     od_config=self.od_config,
-                    load_device=f"cuda:{rank}",
+                    load_device=device,
                 )
             time_after_load = time.perf_counter()
 
