@@ -26,6 +26,9 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig, get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
@@ -734,6 +737,36 @@ class QwenImageTransformer2DModel(CachedTransformer):
         #     lora_scale = attention_kwargs.pop("scale", 1.0)
         # else:
         #     lora_scale = 1.0
+        if self.parallel_config.classifier_free_guidance_size > 1:
+            # distribute timestep and hidden_states to classifier free guidance world size
+            cfg_world_size = get_classifier_free_guidance_world_size()
+            cfg_rank = get_classifier_free_guidance_rank()
+            is_cfg_parallel = True
+            for name, x in (
+                ("timestep", timestep),
+                ("hidden_states", hidden_states),
+                ("encoder_hidden_states", encoder_hidden_states),
+                ("encoder_hidden_states_mask", encoder_hidden_states_mask),
+            ):
+                if x is None:
+                    continue
+                if x.shape[0] % cfg_world_size != 0:
+                    logger.warning(
+                        "Disable CFG parallelism: %s batch=%d not divisible by cfg_world_size=%d",
+                        name,
+                        x.shape[0],
+                        cfg_world_size,
+                    )
+                    is_cfg_parallel = False
+                    break
+
+            if is_cfg_parallel:
+                # Shard along batch dim (dim=0).
+                timestep = timestep.chunk(cfg_world_size, dim=0)[cfg_rank]
+                hidden_states = hidden_states.chunk(cfg_world_size, dim=0)[cfg_rank]
+                encoder_hidden_states = encoder_hidden_states.chunk(cfg_world_size, dim=0)[cfg_rank]
+                if encoder_hidden_states_mask is not None:
+                    encoder_hidden_states_mask = encoder_hidden_states_mask.chunk(cfg_world_size, dim=0)[cfg_rank]
 
         if self.parallel_config.sequence_parallel_size > 1:
             hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
@@ -802,6 +835,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         if self.parallel_config.sequence_parallel_size > 1:
             output = get_sp_group().all_gather(output, dim=-2)
+        if self.parallel_config.classifier_free_guidance_size > 1 and is_cfg_parallel:
+            output = get_cfg_group().all_gather(output, dim=0)
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
