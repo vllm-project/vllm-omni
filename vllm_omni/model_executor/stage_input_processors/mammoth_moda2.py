@@ -11,45 +11,35 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 def ar2dit(
     stage_list: list[Any],
     engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    prompts: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
+    """Convert AR stage outputs to DiT stage inputs."""
 
     source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
     ar_outputs = stage_list[source_stage_id].engine_outputs
+
     dit_inputs: list[OmniTokensPrompt] = []
+    for ar_output, prompt in zip(ar_outputs, prompts):
+        addi_info = prompt["additional_information"]
+        image_height = addi_info["image_height"][0]
+        image_width = addi_info["image_width"][0]
+        text_guidance_scale = addi_info["text_guidance_scale"][0]
+        cfg_range = addi_info["cfg_range"]
+        num_inference_steps = addi_info["num_inference_steps"][0]
+        gen_vocab_start_index = addi_info["visual_token_start_id"][0]
 
-    gen_vocab_start_index = 152064
-
-    addi_info = prompt[0]["additional_information"]
-    image_height, image_width = addi_info["image_height"][0], addi_info["image_width"][0]
-    text_guidance_scale = addi_info["text_guidance_scale"][0]
-    cfg_range = addi_info["cfg_range"]
-    num_inference_steps = addi_info["num_inference_steps"][0]
-
-    for ar_output in ar_outputs:
-        hidden_states = ar_output.multimodal_output["latent"]
-
-        prompt_token_ids = getattr(ar_output, "prompt_token_ids", None) or []
-
-        gen_token_ids = ar_output.outputs[0].token_ids
-
+        prompt_token_ids = ar_output.prompt_token_ids
+         # exclude the last token because it has no corresponding hidden state
+        gen_token_ids = ar_output.outputs[0].token_ids[:-1]
         prompt_len = len(prompt_token_ids)
 
+        hidden_states = ar_output.multimodal_output["latent"]
         hidden_total = int(hidden_states.shape[0])
-
         gen_hidden_len = hidden_total - prompt_len
 
         prompt_hidden_states = hidden_states[:prompt_len]
-
-        gen_hidden_states = hidden_states[prompt_len : prompt_len + gen_hidden_len]
+        gen_hidden_states = hidden_states[prompt_len : ]
 
         gen_token_ids = gen_token_ids[:gen_hidden_len]
 

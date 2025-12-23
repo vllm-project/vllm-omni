@@ -627,11 +627,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
     @staticmethod
     def _is_t2i_request(runtime_info: dict[str, Any]) -> bool:
         v = runtime_info.get("omni_task", runtime_info.get("task"))
-        if isinstance(v, str):
-            return v.lower() in {"t2i", "text_image", "text2image"}
-        if isinstance(v, bool):
-            return v
-        return False
+        return v[0].lower() in {"t2i", "text_image", "text2image"}
 
     def _get_t2i_runtime_params(self, runtime_info: dict[str, Any]) -> dict[str, int] | None:
         """从 runtime_info / defaults 获取 t2i 约束参数。"""
@@ -697,9 +693,11 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 continue
 
             ar_width = int(params["ar_width"])
+            ar_height = int(params["ar_height"])
             eol_token_id = int(params["eol_token_id"])
             visual_start = int(params["visual_token_start_id"])
             visual_end = int(params["visual_token_end_id"])
+            expected_token_num = (ar_width + 1) * ar_height
 
             if ar_width < 0:
                 continue
@@ -725,6 +723,12 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 row[:visual_start_c] = neg_inf
                 row[visual_end_c:] = neg_inf
                 row[eol_token_id] = neg_inf
+            
+            if generated_len >= expected_token_num:
+                row.fill_(neg_inf)
+                end_of_image_id = 152071
+                row[end_of_image_id] = 1.0  # Allow only end_of_image_id after expected tokens
+
         return logits
 
 
