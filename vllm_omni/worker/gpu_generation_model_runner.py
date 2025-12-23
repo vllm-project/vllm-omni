@@ -448,8 +448,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 inputs_embeds = None
 
             if hasattr(self.model, "get_dummy_runtime_additional_information"):
-                # TODO: support num_reqs > 1
-                runtime_addi = self.model.get_dummy_runtime_additional_information(1)
+                runtime_addi = self.model.get_dummy_runtime_additional_information(num_reqs)
                 model_kwargs["runtime_additional_information"] = runtime_addi
 
             if self.uses_mrope:

@@ -104,6 +104,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         )
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
+        num_reqs = 1 # TODO: support num_reqs > 1
         if num_reqs <= 0:
             raise ValueError(f"num_reqs must be positive, got {num_reqs}")
         text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
