@@ -124,70 +124,17 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
         cfg_range = (0.0, 1.0)
         num_inference_steps = 50
 
-        def _first_scalar(val: object) -> float | None:
-            if isinstance(val, list) and val:
-                val = val[0]
-            if isinstance(val, torch.Tensor):
-                if val.numel() == 0:
-                    return None
-                val = val.flatten()[0].item()
-            if val is None:
-                return None
-            try:
-                return float(val)
-            except Exception:
-                return None
-
-        def _extract_hw(info: dict[str, object]) -> tuple[int, int] | None:
-            h = info.get("image_height", info.get("height"))
-            w = info.get("image_width", info.get("width"))
-            if h is None or w is None:
-                size = info.get("image_size")
-                if isinstance(size, list) and len(size) >= 2:
-                    h, w = size[0], size[1]
-            h_v = _first_scalar(h)
-            w_v = _first_scalar(w)
-            if h_v is None or w_v is None:
-                return None
-            try:
-                return int(h_v), int(w_v)
-            except Exception:
-                return None
-
-        def _extract_int(info: dict[str, object], key: str, default: int) -> int:
-            val = _first_scalar(info.get(key))
-            if val is None:
-                return default
-            try:
-                return int(val)
-            except Exception:
-                return default
-
-        def _extract_range(info: dict[str, object], key: str, default: tuple[float, float]) -> tuple[float, float]:
-            val = info.get(key)
-            if isinstance(val, list) and len(val) >= 2:
-                v0 = _first_scalar(val[0])
-                v1 = _first_scalar(val[1])
-            elif isinstance(val, torch.Tensor) and val.numel() >= 2:
-                v0 = _first_scalar(val.flatten()[0].item())
-                v1 = _first_scalar(val.flatten()[1].item())
-            else:
-                v0 = v1 = None
-            if v0 is None or v1 is None:
-                return default
-            return float(v0), float(v1)
-
         if isinstance(runtime_addi, list) and runtime_addi and isinstance(runtime_addi[0], dict):
             # runtime_addi will be none in dummy/profile runs
             info = runtime_addi[0]
-            text_cond = info.get("text_prompt_embeds")
-            image_cond = info.get("image_prompt_embeds")
+            text_cond = info["text_prompt_embeds"]
+            image_cond = info["image_prompt_embeds"]
             negative_cond = info.get("negative_prompt_embeds")
             negative_attention_mask = info.get("negative_prompt_attention_mask")
-            image_hw = _extract_hw(info) or image_hw
-            text_guidance_scale = _first_scalar(info.get("text_guidance_scale")) or text_guidance_scale
-            cfg_range = _extract_range(info, "cfg_range", cfg_range)
-            num_inference_steps = _extract_int(info, "num_inference_steps", num_inference_steps)
+            image_hw = info["image_height"][0], info["image_width"][0]
+            text_guidance_scale = info["text_guidance_scale"][0]
+            cfg_range = info["cfg_range"][0], info["cfg_range"][1]
+            num_inference_steps = info["num_inference_steps"][0]
 
         # Dummy/profile fallback: use inputs_embeds (often zeros)
         if text_cond is None and image_cond is None and legacy_cond is None:
