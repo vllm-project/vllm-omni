@@ -31,13 +31,24 @@ vLLM-Omni also supports the sequence parallelism (SP) for the diffusion model, t
 
 The following table shows which models are currently supported by each acceleration method:
 
+### ImageGen
 
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
-|-------|-----------------|----------|-----------|-----------|
+|-------|------------------|----------|-----------|-----------|
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ |
+| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ |
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ |✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ❌ | ✅ |✅ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ | ❌ |
+
+### VideoGen
+
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
+|-------|------------------|----------|-----------|-----------|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ |
 
 
 ## Performance Benchmarks
