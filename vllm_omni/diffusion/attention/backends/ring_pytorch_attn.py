@@ -9,7 +9,7 @@ import math
 import torch
 import torch.nn.functional as F
 from typing import Any, Optional, Tuple
-from vllm_omni.diffusion.distributed.ring import RingComm
+from vllm_omni.diffusion.distributed.ring_comm import RingComm
 from vllm_omni.diffusion.attention.backends.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.attention.backends.ring_kernels import pytorch_attn_forward, pytorch_attn_backward
 

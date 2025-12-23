@@ -5,7 +5,7 @@
 import torch
 import torch.distributed as dist
 # from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from vllm_omni.diffusion.distributed.ring import RingComm
+from vllm_omni.diffusion.distributed.ring_comm import RingComm
 from vllm_omni.diffusion.attention.backends.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.attention.backends.ring_selector import select_flash_attn_impl, AttnType
 
