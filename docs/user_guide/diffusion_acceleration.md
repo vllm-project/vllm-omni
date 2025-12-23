@@ -58,7 +58,6 @@ The following table shows which models are currently supported by each accelerat
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
 |-------|------------------|----------|-----------|-----------|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ |
->>>>>>> d9faeb29c012087f0df28363a072dbcbf61800ad
 
 
 ## Performance Benchmarks
