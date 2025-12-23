@@ -25,7 +25,7 @@ from .mammothmoda2_dit import (
 from .mammothmoda2_dit.rmsnorm import Qwen2RMSNorm
 
 
-class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
+class MammothModa2DiTForConditionalGeneration(nn.Module):
     """
     MammothModa2 的 DiT + VAE 生成阶段（非自回归）。
 
@@ -105,11 +105,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module, SupportsPP):
     def forward(
         self,
         *,
-        input_ids: torch.Tensor | None = None,  # noqa: ARG002
-        positions: torch.Tensor | None = None,  # noqa: ARG002
-        intermediate_tensors: Any | None = None,  # noqa: ARG002
         inputs_embeds: torch.Tensor | None = None,
-        additional_information: dict[str, object] | None = None,
         **kwargs: Any,  # noqa: ARG002
     ) -> OmniOutput:
         
