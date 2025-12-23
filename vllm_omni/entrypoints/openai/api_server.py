@@ -2,6 +2,9 @@ import json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
+
+# Image generation API imports
+import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -44,9 +47,21 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.image_api_utils import (
+    encode_image_base64,
+    parse_size,
+)
+from vllm_omni.entrypoints.openai.protocol.images import (
+    ImageData,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
+)
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
 logger = init_logger(__name__)
+
+
+# Server entry points
 
 
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
@@ -465,6 +480,7 @@ async def omni_diffusion_init_app_state(
     model_name = served_model_names[0] if served_model_names else args.model
 
     state.diffusion_engine = diffusion_engine
+    state.diffusion_model_name = model_name  # Store for image endpoints
     state.log_stats = not getattr(args, "disable_log_stats", False)
 
     # Initialize chat handler with diffusion engine (uses /v1/chat/completions endpoint)
@@ -516,3 +532,108 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+# Image generation API endpoints
+
+
+@router.post(
+    "/v1/images/generations",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": ImageGenerationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+    """Generate images from text prompts using diffusion models.
+
+    OpenAI DALL-E compatible endpoint for text-to-image generation.
+
+    Args:
+        request: Image generation request with prompt and parameters
+        raw_request: Raw FastAPI request for accessing app state
+
+    Returns:
+        ImageGenerationResponse with generated images as base64 PNG
+
+    Raises:
+        HTTPException: For validation errors, missing engine, or generation failures
+    """
+    # Get diffusion engine from app state
+    diffusion_engine: AsyncOmniDiffusion | None = getattr(raw_request.app.state, "diffusion_engine", None)
+    if diffusion_engine is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Diffusion engine not initialized. Start server with a diffusion model.",
+        )
+
+    # Get server's loaded model
+    model_name = getattr(raw_request.app.state, "diffusion_model_name", "unknown")
+
+    # Validate model field (warn if mismatch, don't error)
+    if request.model is not None and request.model != model_name:
+        logger.warning(
+            f"Model mismatch: request specifies '{request.model}' but "
+            f"server is running '{model_name}'. Using server model."
+        )
+
+    try:
+        # Build params - pass through user values directly
+        gen_params = {
+            "prompt": request.prompt,
+            "num_outputs_per_prompt": request.n,
+        }
+
+        # Parse and add size if provided
+        if request.size:
+            width, height = parse_size(request.size)
+            gen_params["height"] = height
+            gen_params["width"] = width
+            size_str = f"{width}x{height}"
+        else:
+            size_str = "model default"
+
+        # Add optional parameters ONLY if provided
+        if request.num_inference_steps is not None:
+            gen_params["num_inference_steps"] = request.num_inference_steps
+        if request.negative_prompt is not None:
+            gen_params["negative_prompt"] = request.negative_prompt
+        if request.guidance_scale is not None:
+            gen_params["guidance_scale"] = request.guidance_scale
+        if request.true_cfg_scale is not None:
+            gen_params["true_cfg_scale"] = request.true_cfg_scale
+        if request.seed is not None:
+            gen_params["seed"] = request.seed
+
+        logger.info(f"Generating {request.n} image(s) {size_str}")
+
+        # Generate images using AsyncOmniDiffusion
+        result = await diffusion_engine.generate(**gen_params)
+
+        # Extract images from result
+        images = result.images if hasattr(result, "images") else []
+
+        logger.info(f"Successfully generated {len(images)} image(s)")
+
+        # Encode images to base64
+        image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
+
+        return ImageGenerationResponse(
+            created=int(time.time()),
+            data=image_data,
+        )
+
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Image generation failed: {e}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image generation failed: {str(e)}"
+        )
