@@ -263,16 +263,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                enable_force_include_usage=self.enable_force_include_usage,
-            )
+            raise RuntimeError("Not support streaming output now.")
 
         try:
             return await self.chat_completion_full_generator(

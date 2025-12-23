@@ -119,9 +119,8 @@ class GPUWorker:
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
             self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
-        with set_current_omni_diffusion_config(od_config):
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                output = self.pipeline.forward(req)
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+            output = self.pipeline.forward(req)
         return output
 
     def shutdown(self) -> None:
