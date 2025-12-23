@@ -378,12 +378,12 @@ def run_multimodal_generation(args) -> None:
                 else:
                     content = None
 
-                if getattr(chunk, "modality", None) == "audio" and content is not None:
+                if getattr(chunk, "modality", None) == "audio" and content:
                     audio_data = base64.b64decode(content)
                     audio_file_path = f"audio_{count}.wav"
                     with open(audio_file_path, "wb") as f:
                         f.write(audio_data)
-                    print(f"Audio saved to {audio_file_path}")
+                    print(f"\nAudio saved to {audio_file_path}")
                     count += 1
                 
                 elif getattr(chunk, "modality", None) == "text":

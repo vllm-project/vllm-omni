@@ -422,6 +422,7 @@ class AsyncOmni(EngineClient):
 
                 if isinstance(engine_outputs, list):
                     engine_outputs = engine_outputs[0]
+                
                 finished = engine_outputs.finished
 
                 if getattr(stage, "final_output", False):
