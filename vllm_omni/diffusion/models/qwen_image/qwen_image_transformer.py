@@ -737,7 +737,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         #     lora_scale = attention_kwargs.pop("scale", 1.0)
         # else:
         #     lora_scale = 1.0
-        if self.parallel_config.classifier_free_guidance_size > 1:
+        if self.parallel_config.cfg_parallel_size > 1:
             # distribute timestep and hidden_states to classifier free guidance world size
             cfg_world_size = get_classifier_free_guidance_world_size()
             cfg_rank = get_classifier_free_guidance_rank()
@@ -835,7 +835,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         if self.parallel_config.sequence_parallel_size > 1:
             output = get_sp_group().all_gather(output, dim=-2)
-        if self.parallel_config.classifier_free_guidance_size > 1 and is_cfg_parallel:
+        if self.parallel_config.cfg_parallel_size > 1 and is_cfg_parallel:
             output = get_cfg_group().all_gather(output, dim=0)
         return Transformer2DModelOutput(sample=output)
 
