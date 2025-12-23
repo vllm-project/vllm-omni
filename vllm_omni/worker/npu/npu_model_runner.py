@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -66,17 +66,26 @@ class OmniNPUModelRunner(NPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
-        assert supports_mrope(self.get_model()), "M-RoPE support is not implemented."
-
-        req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
-            req_state.prompt_token_ids,
-            hf_config=self.model_config.hf_config,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-            audio_feature_lengths=audio_feature_lengths,
-            use_audio_in_video=use_audio_in_video,
-        )
+        if supports_mrope(self.model):
+            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                hf_config=self.model_config.hf_config,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                audio_feature_lengths=audio_feature_lengths,
+                use_audio_in_video=use_audio_in_video,
+            )
+        else:
+            req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
+                req_state.prompt_token_ids,
+                hf_config=self.model_config.hf_config,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                audio_feature_lengths=audio_feature_lengths,
+                use_audio_in_video=use_audio_in_video,
+            )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove finished requests from the cached states.
@@ -284,8 +293,8 @@ class OmniNPUModelRunner(NPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(
-        self, hidden_states: Union[torch.Tensor, list[torch.Tensor]]
-    ) -> tuple[torch.Tensor, Union[torch.Tensor, list[torch.Tensor], dict]]:
+        self, hidden_states: torch.Tensor | list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | list[torch.Tensor] | dict]:
         """Extract multimodal outputs from hidden states."""
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
@@ -364,7 +373,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         num_tokens: int,
         with_prefill: bool = False,
         is_torchair_compile: bool = False,
-        aclgraph_runtime_mode: Optional[CUDAGraphMode] = None,
+        aclgraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
     ) -> torch.Tensor:

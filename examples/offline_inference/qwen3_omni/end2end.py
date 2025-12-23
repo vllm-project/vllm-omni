@@ -8,13 +8,16 @@ with the correct prompt format on Qwen3-Omni (thinker only).
 import os
 from typing import NamedTuple
 
+import librosa
+import numpy as np
 import soundfile as sf
+from PIL import Image
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
-from vllm.assets.video import VideoAsset
+from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
 
@@ -54,7 +57,7 @@ def get_text_query(question: str = None) -> QueryResult:
     )
 
 
-def get_video_query(question: str = None) -> QueryResult:
+def get_video_query(question: str = None, video_path: str | None = None, num_frames: int = 16) -> QueryResult:
     if question is None:
         question = "Why is this video funny?"
     prompt = (
@@ -64,18 +67,25 @@ def get_video_query(question: str = None) -> QueryResult:
         f"<|im_start|>assistant\n"
     )
 
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "video": VideoAsset(name="baby_reading", num_frames=16).np_ndarrays,
+                "video": video_frames,
             },
         },
         limit_mm_per_prompt={"video": 1},
     )
 
 
-def get_image_query(question: str = None) -> QueryResult:
+def get_image_query(question: str = None, image_path: str | None = None) -> QueryResult:
     if question is None:
         question = "What is the content of this image?"
     prompt = (
@@ -84,18 +94,27 @@ def get_image_query(question: str = None) -> QueryResult:
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
+
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "image": convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB"),
+                "image": image_data,
             },
         },
         limit_mm_per_prompt={"image": 1},
     )
 
 
-def get_audio_query(question: str = None) -> QueryResult:
+def get_audio_query(question: str = None, audio_path: str | None = None, sampling_rate: int = 16000) -> QueryResult:
     if question is None:
         question = "What is the content of this audio?"
     prompt = (
@@ -104,11 +123,20 @@ def get_audio_query(question: str = None) -> QueryResult:
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
+
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
+                "audio": audio_data,
             },
         },
         limit_mm_per_prompt={"audio": 1},
@@ -125,11 +153,33 @@ query_map = {
 
 def main(args):
     model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    query_result = query_map[args.query_type]()
+
+    # Get paths from args
+    video_path = getattr(args, "video_path", None)
+    image_path = getattr(args, "image_path", None)
+    audio_path = getattr(args, "audio_path", None)
+
+    # Get the query function and call it with appropriate parameters
+    query_func = query_map[args.query_type]
+    if args.query_type == "use_video":
+        query_result = query_func(video_path=video_path, num_frames=getattr(args, "num_frames", 16))
+    elif args.query_type == "use_image":
+        query_result = query_func(image_path=image_path)
+    elif args.query_type == "use_audio":
+        query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
+    else:
+        query_result = query_func()
+
+    if not args.enable_stats:
+        log_file = None
+    else:
+        log_file = os.path.join(args.log_dir, f"omni_llm_pipeline_{args.query_type}")
 
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
+        log_file=log_file,
+        log_stats=args.enable_stats,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -178,6 +228,11 @@ def main(args):
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+        for i, prompt in enumerate(prompts):
+            prompt["modalities"] = output_modalities
+
     omni_outputs = omni_llm.generate(prompts, sampling_params_list)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
@@ -186,11 +241,11 @@ def main(args):
     for stage_outputs in omni_outputs:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 text_output = output.outputs[0].text
                 # Save aligned text file per request
-                prompt_text = prompts[request_id]["prompt"]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
                 lines = []
                 lines.append("Prompt:\n")
                 lines.append(str(prompt_text) + "\n")
@@ -204,9 +259,9 @@ def main(args):
                 print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
                 # Convert to numpy array and ensure correct format
                 audio_numpy = audio_tensor.float().detach().cpu().numpy()
@@ -226,7 +281,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="mixed_modalities",
+        default="use_video",
         choices=query_map.keys(),
         help="Query type.",
     )
@@ -282,6 +337,51 @@ def parse_args():
         type=str,
         default=None,
         help="Path to a stage configs file.",
+    )
+    parser.add_argument(
+        "--video-path",
+        "-v",
+        type=str,
+        default=None,
+        help="Path to local video file. If not provided, uses default video asset.",
+    )
+    parser.add_argument(
+        "--image-path",
+        "-i",
+        type=str,
+        default=None,
+        help="Path to local image file. If not provided, uses default image asset.",
+    )
+    parser.add_argument(
+        "--audio-path",
+        "-a",
+        type=str,
+        default=None,
+        help="Path to local audio file. If not provided, uses default audio asset.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=16,
+        help="Number of frames to extract from video (default: 16).",
+    )
+    parser.add_argument(
+        "--sampling-rate",
+        type=int,
+        default=16000,
+        help="Sampling rate for audio loading (default: 16000).",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="Log directory (default: logs).",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Output modalities to use for the prompts.",
     )
 
     return parser.parse_args()

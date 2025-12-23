@@ -1,0 +1,53 @@
+steps:
+
+- label: "Diffusion Model Test"
+  timeout_in_minutes: 15
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdexperimental, amdproduction, amdtentative]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export MIOPEN_DEBUG_CONV_DIRECT=0
+    - export MIOPEN_DEBUG_CONV_GEMM=0
+    - export VLLM_ROCM_USE_AITER=1
+    - export VLLM_ROCM_USE_AITER_MHA=1
+    - export VLLM_ROCM_USE_AITER_LINEAR=0
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
+    - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
+
+- label: "Diffusion Cache Backend Test"
+  timeout_in_minutes: 15
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdexperimental, amdproduction, amdtentative]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export MIOPEN_DEBUG_CONV_DIRECT=0
+    - export MIOPEN_DEBUG_CONV_GEMM=0
+    - export VLLM_ROCM_USE_AITER=1
+    - export VLLM_ROCM_USE_AITER_MHA=1
+    - export VLLM_ROCM_USE_AITER_LINEAR=0
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
+    - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
+
+- label: "Omni Model Test Qwen2-5-Omni"
+  timeout_in_minutes: 15
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdexperimental, amdproduction, amdtentative]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export MIOPEN_DEBUG_CONV_DIRECT=0
+    - export MIOPEN_DEBUG_CONV_GEMM=0
+    - export VLLM_ROCM_USE_AITER=1
+    - export VLLM_ROCM_USE_AITER_MHA=1
+    - export VLLM_ROCM_USE_AITER_LINEAR=0
+    - export VLLM_ROCM_USE_AITER_RMSNORM=0
+    - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py

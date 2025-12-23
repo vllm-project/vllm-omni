@@ -13,10 +13,10 @@ export DEVICE0=/dev/davinci0
 export DEVICE1=/dev/davinci1
 # Update the vllm-ascend image
 # Atlas A2:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.11.0rc2
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.12.0rc1
 # Atlas A3:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.11.0rc2-a3
-export IMAGE=quay.io/ascend/vllm-ascend:v0.11.0rc2
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.12.0rc1-a3
+export IMAGE=quay.io/ascend/vllm-ascend:v0.12.0rc1
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \

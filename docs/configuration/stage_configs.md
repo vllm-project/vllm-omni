@@ -41,7 +41,7 @@ stage_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration # The model implementation registered in model_executor/models/registry.py
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker # The specific worker used
-      scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler # The specific scehduler used
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler # The specific scehduler used
       gpu_memory_utilization: 0.8 # The gpu memory allocation for the stage within a single chip
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true # Needed by huggingface config parsing
@@ -67,7 +67,7 @@ stage_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
-      scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true
       trust_remote_code: true
@@ -92,8 +92,8 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker
-      scheduler_cls: vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.15
       enforce_eager: true
       trust_remote_code: true
@@ -171,17 +171,20 @@ The model architecture class name that is registered in `model_executor/models/r
 
 #### `engine_args.worker_cls`
 
-The specific worker class to use for this stage. This determines how the model computations are executed. Examples include `vllm_omni.worker.gpu_ar_worker.GPUARWorker` for autoregressive stages and `vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker` for diffusion-based stages.
+The specific worker class to use for this stage. This determines how the model computations are executed. Examples include `vllm_omni.worker.gpu_ar_worker.GPUARWorker` for autoregressive stages and `vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker` for diffusion-based stages.
 
 #### `engine_args.scheduler_cls`
 
-The scheduler class to use for this stage. The scheduler manages request queuing, batching, and execution order. Examples include `vllm_omni.core.sched.scheduler.OmniScheduler` for standard stages and `vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler` for diffusion stages.
+The scheduler class to use for this stage. The scheduler manages request queuing, batching, and execution order. Examples include `vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler` for standard stages and `vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler` for diffusion stages.
 
 #### `engine_args.gpu_memory_utilization`
 
 The fraction of GPU memory to allocate for this stage within a single GPU chip. This is a value between 0.0 and 1.0, where 0.8 means 80% of the GPU memory will be used by this stage. This allows fine-grained control over memory allocation when multiple stages share the same GPU or when reserving memory for other operations.
 
 Default: `0.8`
+
+!!! tip "Memory Configuration Guide"
+    For detailed information on how to calculate memory requirements and properly configure `gpu_memory_utilization`, see the [GPU Memory Calculation and Configuration Guide](./gpu_memory_utilization.md).
 
 #### `engine_args.enforce_eager`
 

@@ -23,7 +23,7 @@ repos:
     - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
-    rev: v1.35.5
+    rev: v1.38.1
     hooks:
       - id: typos
         # only for staged files
@@ -58,3 +58,10 @@ repos:
       verbose: true
       pass_filenames: false
     # Insert new entries above the `suggestion` entry
+
+    - id: check-pickle-imports
+      name: Prevent new pickle/cloudpickle imports
+      entry: python tools/pre_commit/check_pickle_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]

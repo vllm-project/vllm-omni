@@ -12,12 +12,55 @@ This guide will help you quickly get started with vLLM-Omni to perform:
 
 ## Installation
 
-Please refer to [installation](installation/README.md)
+For installation on GPU using pre-built-wheel:
+
+```bash
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+uv pip install vllm==0.11.0 --torch-backend=auto
+uv pip install vllm-omni
+```
+For additional details—including alternative installation methods, installation on NPU and other platforms — please see the installation guide in [installation](installation/README.md)
 
 ## Offline Inference
 
-Please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
+Text-to-image generation quickstart with vLLM-Omni:
+
+```python
+from vllm_omni.entrypoints.omni import Omni
+
+if __name__ == "__main__":
+    omni = Omni(model="Tongyi-MAI/Z-Image-Turbo")
+    prompt = "a cup of coffee on the table"
+    images = omni.generate(prompt)
+    images[0].save("coffee.png")
+```
+
+For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 
 ## Online Serving with OpenAI-Completions API
 
-Please refer to [online serving](../user_guide/examples/online_serving/qwen2_5_omni.md)
+Text-to-image generation quickstart with vLLM-Omni:
+
+```bash
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091
+```
+
+```bash
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "a cup of coffee on the table"}
+    ],
+    "extra_body": {
+      "height": 1024,
+      "width": 1024,
+      "num_inference_steps": 50,
+      "guidance_scale": 4.0,
+      "seed": 42
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > coffee.png
+```
+
+For more details, please refer to [online serving](../user_guide/examples/online_serving/text_to_image.md).

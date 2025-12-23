@@ -2,19 +2,29 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing as mp
 import os
+import time
 
 import torch
 import zmq
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-from vllm.distributed.parallel_state import (
+from vllm.logger import init_logger
+from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+
+from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.data import (
+    SHUTDOWN_MESSAGE,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+    set_current_omni_diffusion_config,
+)
+from vllm_omni.diffusion.distributed.parallel_state import (
+    destroy_distributed_env,
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.logger import init_logger
-
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -54,18 +64,48 @@ class GPUWorker:
 
         # hack
         vllm_config = VllmConfig()
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.num_gpus
-        set_current_vllm_config(vllm_config)
+        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
+        self.vllm_config = vllm_config
+        with (
+            set_current_omni_diffusion_config(self.od_config),
+            set_current_vllm_config(vllm_config),
+        ):
+            init_distributed_environment(world_size=world_size, rank=rank)
+            logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+            parallel_config = self.od_config.parallel_config
+            initialize_model_parallel(
+                data_parallel_size=parallel_config.data_parallel_size,
+                cfg_parallel_size=parallel_config.cfg_parallel_size,
+                sequence_parallel_size=parallel_config.sequence_parallel_size,
+                ulysses_degree=parallel_config.ulysses_degree,
+                ring_degree=parallel_config.ring_degree,
+                tensor_parallel_size=parallel_config.tensor_parallel_size,
+                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+            )
 
-        init_distributed_environment(world_size=world_size, rank=rank)
-        initialize_model_parallel(tensor_model_parallel_size=world_size)
+            load_config = LoadConfig()
+            model_loader = DiffusersPipelineLoader(load_config)
+            time_before_load = time.perf_counter()
+            with DeviceMemoryProfiler() as m:
+                self.pipeline = model_loader.load_model(
+                    od_config=self.od_config,
+                    load_device=f"cuda:{rank}",
+                )
+            time_after_load = time.perf_counter()
 
-        with device:
-            self.pipeline = initialize_model(self.od_config)
-            self.pipeline.load_weights()
-            self.pipeline.eval()
-        logger.info(f"Worker {self.rank}: Initialized device, model, and distributed environment.")
+        logger.info(
+            "Model loading took %.4f GiB and %.6f seconds",
+            m.consumed_memory / GiB_bytes,
+            time_after_load - time_before_load,
+        )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
+
+        # Setup cache backend based on type (both backends use enable()/reset() interface)
+        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+
+        if self.cache_backend is not None:
+            self.cache_backend.enable(self.pipeline)
 
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
@@ -75,8 +115,16 @@ class GPUWorker:
         assert self.pipeline is not None
         # TODO: dealing with first req for now
         req = reqs[0]
-        output = self.pipeline.forward(req)
+
+        # Refresh cache context if needed
+        if self.cache_backend is not None and self.cache_backend.is_enabled():
+            self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+            output = self.pipeline.forward(req)
         return output
+
+    def shutdown(self) -> None:
+        destroy_distributed_env()
 
 
 class WorkerProc:
@@ -149,6 +197,14 @@ class WorkerProc:
                 )
                 continue
 
+            if reqs == SHUTDOWN_MESSAGE:
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
+                continue
+            if reqs is None:
+                logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
+                continue
+
             # 2: execute, make sure a reply is always sent
             try:
                 output = self.worker.execute_model(reqs, self.od_config)
@@ -167,6 +223,10 @@ class WorkerProc:
                 continue
 
         logger.info("event loop terminated.")
+        try:
+            self.worker.shutdown()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
         # if self.result_sender is not None:
         #     self.result_sender.close()
         self.context.term()

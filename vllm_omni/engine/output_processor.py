@@ -1,11 +1,12 @@
 from ast import Dict
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -33,19 +34,20 @@ class OmniRequestState(RequestState):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.mm_type: Optional[str] = None
-        self.mm_accumulated: Optional[Dict[str, Any]] = None
+        self.mm_type: str | None = None
+        self.mm_accumulated: Dict[str, Any] | None = None
 
     @classmethod
     def from_new_request(
         cls,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request: EngineCoreRequest,
-        prompt: Optional[str],
-        parent_req: Optional[ParentRequest],
+        prompt: str | None,
+        parent_req: ParentRequest | None,
         request_index: int,
-        queue: Optional[Any],
+        queue: Any | None,
         log_stats: bool,
+        stream_interval: int,
     ) -> "OmniRequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -91,9 +93,10 @@ class OmniRequestState(RequestState):
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
+            stream_interval=stream_interval,
         )
 
-    def add_multimodal_tensor(self, payload: Optional[Any], mm_type: Optional[str]) -> None:
+    def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
             return
         try:
@@ -167,11 +170,11 @@ class OmniRequestState(RequestState):
     def make_request_output(
         self,
         new_token_ids: list[int],
-        pooling_output: Optional[torch.Tensor],
-        finish_reason: Optional[FinishReason],
-        stop_reason: Optional[Union[int, str]],
-        kv_transfer_params: Optional[dict[str, Any]] = None,
-    ) -> Optional[Union[OmniRequestOutput, PoolingRequestOutput]]:
+        pooling_output: torch.Tensor | None,
+        finish_reason: FinishReason | None,
+        stop_reason: int | str | None,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
         Creates a RequestOutput or PoolingRequestOutput from the generated
@@ -195,6 +198,26 @@ class OmniRequestState(RequestState):
         if not finished and final_only:
             return None
 
+        if self.stream_interval > 1:
+            assert self.detokenizer is not None
+
+            # Send output request only when
+            # 1. It has finished, or
+            # 2. It is the first token, or
+            # 3. It has reached the stream interval number of tokens
+            if not (
+                finished
+                or self.sent_tokens_offset == 0
+                or len(self.detokenizer.output_token_ids) - self.sent_tokens_offset >= self.stream_interval
+            ):
+                return None
+
+            if self.output_kind == RequestOutputKind.DELTA:
+                # Send tokens from the offset in DELTA mode, otherwise all
+                # tokens are sent.
+                new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
+                self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
+
         request_id = self.request_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
 
@@ -210,8 +233,8 @@ class OmniRequestState(RequestState):
     def _new_completion_output(
         self,
         token_ids: list[int],
-        finish_reason: Optional[FinishReason],
-        stop_reason: Optional[Union[int, str]],
+        finish_reason: FinishReason | None,
+        stop_reason: int | str | None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
@@ -246,9 +269,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         log_stats: bool,
-        engine_core_output_type: Optional[str] = None,
+        engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
 
@@ -281,10 +304,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def add_request(
         self,
         request: EngineCoreRequest,
-        prompt: Optional[str],
-        parent_req: Optional[ParentRequest] = None,
+        prompt: str | None,
+        parent_req: ParentRequest | None = None,
         request_index: int = 0,
-        queue: Optional[RequestOutputCollector] = None,
+        queue: RequestOutputCollector | None = None,
     ) -> None:
         """Add a new request to be processed.
 
@@ -313,17 +336,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             request_index=request_index,
             queue=queue,
             log_stats=self.log_stats,
+            stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
-        self.lora_states.add_request(req_state)
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
-        engine_core_timestamp: Optional[float] = None,
-        iteration_stats: Optional[IterationStats] = None,
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
         """Process engine core outputs into request outputs.
 
@@ -421,6 +444,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 parent_req = req_state.parent_req
                 if parent_req and not parent_req.child_requests:
                     self.parent_requests.pop(parent_req.request_id, None)
+                if not self.request_states:
+                    self._requests_drained.set()
                 if not eco.finished:
                     reqs_to_abort.append(req_id)
                 self._update_stats_from_finished(req_state, finish_reason, iteration_stats)
@@ -524,7 +549,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             except Exception:
                 pass
 
-    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> Optional[torch.Tensor]:
+    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> torch.Tensor | None:
         mm = getattr(eco, "multimodal_outputs", None)
         if not isinstance(mm, dict):
             return None

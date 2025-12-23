@@ -4,14 +4,17 @@
 
 Main entry points for vLLM-Omni inference and serving.
 
+- [vllm_omni.entrypoints.async_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
 - [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
+- [vllm_omni.entrypoints.client_request_state.ClientRequestState][]
 - [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
 - [vllm_omni.entrypoints.omni.Omni][]
+- [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_llm.OmniStageLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
@@ -40,19 +43,17 @@ Engine classes for offline and online inference.
 - [vllm_omni.engine.PromptEmbedsPayload][]
 - [vllm_omni.engine.arg_utils.AsyncOmniEngineArgs][]
 - [vllm_omni.engine.arg_utils.OmniEngineArgs][]
+- [vllm_omni.engine.input_processor.OmniInputProcessor][]
 - [vllm_omni.engine.output_processor.MultimodalOutputProcessor][]
 - [vllm_omni.engine.output_processor.OmniRequestState][]
-- [vllm_omni.engine.processor.OmniProcessor][]
 
 ## Core
 
 Core scheduling and caching components.
 
-- [vllm_omni.core.dit_cache_manager.DiTCacheManager][]
-- [vllm_omni.core.sched.diffusion_scheduler.DiffusionScheduler][]
-- [vllm_omni.core.sched.generation_scheduler.GenerationScheduler][]
+- [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
+- [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
-- [vllm_omni.core.sched.scheduler.OmniScheduler][]
 
 ## Model Executor
 
@@ -61,13 +62,8 @@ Model execution components.
 - [vllm_omni.model_executor.models.output_templates.OmniOutput][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni.Qwen2_5OmniForConditionalGeneration][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_talker.Qwen2_5OmniTalkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniAudioFeatureInputs][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniConditionalGenerationMixin][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerDummyInputsBuilder][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerMultiModalDataParser][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerMultiModalProcessor][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerProcessingInfo][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavBigVGANModel][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavDiTModel][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavForConditionalGenerationVLLM][]
@@ -88,15 +84,15 @@ Model execution components.
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerForConditionalGeneration][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerMultiModalProcessor][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerProcessingInfo][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3Omni_VisionTransformer][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchEmbed][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchMerger][]
 
 ## Configuration
 
 Configuration classes.
 
 - [vllm_omni.config.model.OmniModelConfig][]
+- [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
+- [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
+- [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
 
 ## Workers
 
@@ -106,15 +102,14 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
 - [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
+- [vllm_omni.worker.gpu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
-- [vllm_omni.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]
-- [vllm_omni.worker.gpu_diffusion_worker.GPUDiffusionWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
 - [vllm_omni.worker.npu.npu_ar_model_runner.NPUARModelRunner][]
 - [vllm_omni.worker.npu.npu_ar_worker.NPUARWorker][]
-- [vllm_omni.worker.npu.npu_diffusion_model_runner.NPUDiffusionModelRunner][]
-- [vllm_omni.worker.npu.npu_diffusion_worker.NPUDiffusionWorker][]
+- [vllm_omni.worker.npu.npu_generation_model_runner.NPUGenerationModelRunner][]
+- [vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker][]
 - [vllm_omni.worker.npu.npu_model_runner.OmniNPUModelRunner][]

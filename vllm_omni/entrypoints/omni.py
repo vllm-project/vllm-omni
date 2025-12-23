@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 
-from vllm_omni.diffusion.omni_diffusion import OmniDiffusion
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
 
@@ -47,3 +47,14 @@ class Omni:
         if hasattr(self.instance, "generate"):
             return getattr(self.instance, "generate")(*args, **kwargs)
         raise AttributeError(f"'{self.instance.__class__.__name__}' has no attribute 'generate'")
+
+    def close(self) -> None:
+        close_method = getattr(self.instance, "close", None)
+        if callable(close_method):
+            close_method()
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass

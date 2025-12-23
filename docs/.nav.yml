@@ -4,20 +4,33 @@ nav:
   - Getting Started:
     - getting_started/quickstart.md
     - getting_started/installation
+  - Serving:
+    - OpenAI-Compatible API:
+      - Image Generation: serving/image_generation_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:
-      - Offline Example of vLLM-Omni for Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
-      - Offline Example of vLLM-Omni for Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
-      - Qwen-Image Offline Inference: user_guide/examples/offline_inference/qwen_image.md
+      - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
+      - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
+      - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
+      - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
+      - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
     - Online Serving:
-      - Online serving Example of vLLM-Omni for Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
-      - Online serving Example of vLLM-Omni for Qwen3-omni: user_guide/examples/online_serving/qwen3_omni.md
+      - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
+      - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
+      - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
+      - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
   - General:
     - usage/*
   - Configuration:
     - configuration/README.md
     - configuration/*
+  - Diffusion Acceleration:
+    - Overview: user_guide/diffusion_acceleration.md
+    - Acceleration Methods:
+      - TeaCache: user_guide/acceleration/teacache.md
+      - Cache-DiT: user_guide/acceleration/cache_dit_acceleration.md
+      - Parallelism Acceleration: user_guide/acceleration/parallelism_acceleration.md
   - Models:
     - models/supported_models.md
 - Developer Guide:
@@ -28,11 +41,18 @@ nav:
   - Model Implementation:
     - contributing/model/README.md
   - CI: contributing/ci
+  - Tests: contributing/tests
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md
-    - design/vllm_omni_design.md
-    - design/mrs_design.md
+    - Feature Design:
+      - design/feature/disaggregated_inference.md
+      - design/feature/multi_request_streaming.md
+      - design/feature/ray_based_execution.md
+    - Module Design:
+      - design/module/ar_module.md
+      - design/module/dit_module.md
+      - design/module/entrypoint_module.md
   - Docs Guide: contributing/DOCS_GUIDE.md
 - API Reference:
   - api/README.md

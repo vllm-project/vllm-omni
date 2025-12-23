@@ -156,9 +156,6 @@ cython_debug/
 # cursor
 .cursor/
 
-# docker
-docker/
-
 # scripts
 /scripts/
 
@@ -182,6 +179,7 @@ checkpoints/
 
 # Cache directories
 cache/
+!vllm_omni/diffusion/cache/
 .cache/
 diffusion_cache/
 kv_cache/
@@ -223,6 +221,7 @@ datasets/
 outputs/
 results/
 generated/
+output_*/
 
 # Configuration overrides
 configs/local.yaml
@@ -232,3 +231,5 @@ configs/development.yaml
 # Docker
 .dockerignore
 Dockerfile.dev
+discussion
+tmp_test
