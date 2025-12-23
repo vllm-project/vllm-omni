@@ -370,8 +370,8 @@ def run_multimodal_generation(args) -> None:
             elif choice.message.content:
                 print("Chat completion output from text:", choice.message.content)
     else:
+        printed_content = False
         for chunk in chat_completion:
-            printed_content = False
             for choice in chunk.choices:
                 if hasattr(choice, "delta"):
                     content = getattr(choice.delta, "content", None)
