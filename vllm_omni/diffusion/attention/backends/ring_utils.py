@@ -98,49 +98,15 @@ def update_out_and_lse(
         if slice_ is not None:
             raise RuntimeError("first update_out_and_lse should not pass slice_ args")
         
-        # Ensure block_out is (B, S, H, D)
-        # If block_out came as (B, H, S, D), transpose it
-        # Heuristic: Check dim 1 and 2 against known H and S? 
-        # But here we don't know expected S and H easily without context.
-        # Assume block_out is correct OR we rely on _update_out_and_lse to fail if mismatch.
-        # Wait, if we init out = block_out, we set the precedent.
-        
-        # In the test failure: block_out was [2, 8, 4, 8]. (B, H, S, D).
-        # We WANT (B, S, H, D).
-        # We can detect this if we assume S < H or S != H.
-        # Here S=4, H=8.
-        # If dim 1 (8) > dim 2 (4), and we expect S to be dim 1...
-        # It's ambiguous.
-        
-        # Let's trust that block_out should be (B, S, H, D).
-        # But if it is [2, 8, 4, 8], it is (B, H, S, D).
-        # We need to fix it here if possible.
-        
-        # CHECK: block_lse usually has info.
-        # block_lse [2, 4, 32]. 
-        # If block_lse corresponds to (B, S, H_something), then S=4.
-        # If block_out is [2, 8, 4, 8]. Then dim 2 is S.
-        # So block_out is (B, H, S, D). We should transpose.
-        
-        # HACK: If we see block_out as (B, H, S, D) pattern, transpose it.
-        # But hard to be sure.
-        # Let's rely on downstream code? No, out is initialized here.
-        
         out = block_out.to(torch.float32)
-        
-        # If block_lse is [2, 4, 32], and out is [2, 8, 4, 8].
-        # We need lse to be compatible with out.
         
         # Initialize LSE with robust logic (same as _update)
         B, D1, D2, D3 = out.shape
-        # We don't know which is S and H yet for sure.
         
-        # Try to deduce S and H from block_lse if possible
         S_guess = D1
         H_guess = D2
         
         if block_lse.dim() == 3:
-             # Try to match dimensions
              if block_lse.shape[1] == H_guess and block_lse.shape[2] == S_guess:
                   lse = block_lse.transpose(1, 2).unsqueeze(-1)
              elif block_lse.shape[1] == S_guess and block_lse.shape[2] == H_guess:
@@ -162,7 +128,22 @@ def update_out_and_lse(
                   # Fallback
                   lse = block_lse.transpose(-2, -1).unsqueeze(dim=-1)
         else:
-             lse = block_lse
+             # Case 0: If block_lse is already 4D, check if it matches
+             if block_lse.dim() == 4:
+                 if block_lse.shape[1] == S_guess and block_lse.shape[2] == H_guess:
+                     lse = block_lse
+                 elif block_lse.shape[1] == H_guess and block_lse.shape[2] == S_guess:
+                     lse = block_lse.transpose(1, 2)
+                 elif block_lse.shape[1] == H_guess and block_lse.shape[2] >= S_guess: # Padding case
+                     lse = block_lse[:, :, :S_guess, :].transpose(1, 2)
+                 elif block_lse.shape[1] == D1 and block_lse.shape[2] >= D2: # Matches (H, S)
+                      # Then out is (B, H, S, D). We should transpose out!
+                      out = out.transpose(1, 2)
+                      lse = block_lse[:, :, :D2].transpose(1, 2) # (B, S, H, 1)
+                 else:
+                     lse = block_lse
+             else:
+                 lse = block_lse
 
     elif slice_ is not None:
         slice_out, slice_lse = out[slice_], lse[slice_]

@@ -184,7 +184,7 @@ class UlyssesParallelAttention:
             
             # 1. Process Image part: Standard Ulysses Reverse (AllToAll)
             # (bs, seq_len, head_cnt/P, head_size) -> (bs, seq_len/P, head_cnt, head_size)
-            # Wait, SeqAllToAll4D handles: Scatter gather_idx, Gather scatter_idx.
+            # SeqAllToAll4D handles: Scatter gather_idx, Gather scatter_idx.
             # Forward: Scatter 2 (H), Gather 1 (S).
             # Reverse: Scatter 1 (S), Gather 2 (H).
             output_img = SeqAllToAll4D.apply(ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

@@ -11,6 +11,8 @@ import torch.distributed as dist
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.attention.backends.ring_selector import AttnType
+from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,8 +35,10 @@ class RingParallelAttention:
     def __init__(
         self,
         sp_group: SequenceParallelGroupCoordinator,
+        attn_backend_pref: str = None,
     ) -> None:
         self._sp_group = sp_group
+        self.attn_backend_pref = attn_backend_pref
 
     @property
     def enabled(self) -> bool:
@@ -75,3 +79,67 @@ class RingParallelAttention:
         # Ring attention output is already sharded correctly along sequence dimension.
         return attn_output
 
+    def run_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        """Run the actual Ring Attention kernel."""
+        if softmax_scale is None:
+            softmax_scale = query.shape[-1] ** -0.5
+
+        backend_pref = self.attn_backend_pref
+        if backend_pref is None:
+            try:
+                config = get_current_omni_diffusion_config()
+                backend_pref = config.attention_backend
+            except Exception:
+                backend_pref = None
+        
+        if backend_pref == "flash_attn" and query.dtype == torch.float32:
+            backend_pref = "sdpa"
+
+        # Extract joint tensors
+        joint_key, joint_value = None, None
+        joint_strategy = "front"
+        if attn_metadata is not None:
+            joint_key = attn_metadata.joint_key
+            joint_value = attn_metadata.joint_value
+            joint_strategy = attn_metadata.joint_strategy
+
+        if backend_pref == "sdpa" or backend_pref == "torch":
+             from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import ring_pytorch_attn_func
+             return ring_pytorch_attn_func(
+                 query, key, value, 
+                 softmax_scale=softmax_scale, 
+                 causal=causal,
+                 group=self._sp_group.ring_group,
+                 op_type="flash", 
+                 joint_tensor_key=joint_key,
+                 joint_tensor_value=joint_value,
+                 joint_strategy=joint_strategy,
+             )
+            
+        from vllm_omni.diffusion.attention.backends.ring_flash_attn import ring_flash_attn_func
+        return ring_flash_attn_func(
+            query,
+            key,
+            value,
+            dropout_p=0.0, 
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=(-1, -1),
+            softcap=0.0,
+            alibi_slopes=None,
+            deterministic=False,
+            return_attn_probs=False,
+            group=self._sp_group.ring_group,
+            attn_type=AttnType.FA,
+            joint_tensor_key=joint_key,
+            joint_tensor_value=joint_value,
+            joint_strategy=joint_strategy,
+        )

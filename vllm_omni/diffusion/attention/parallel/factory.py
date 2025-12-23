@@ -7,7 +7,7 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention, Par
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
-from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_sequence_parallel_world_size
 
 
 def build_parallel_attention_strategy(
@@ -34,6 +34,9 @@ def build_parallel_attention_strategy(
 
     try:
         sp_group = get_sp_group()
+        # Ensure SP group is initialized and world size > 1
+        if get_sequence_parallel_world_size() <= 1:
+             return NoParallelAttention()
     except Exception:
         return NoParallelAttention()
 

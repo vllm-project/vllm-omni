@@ -16,13 +16,11 @@ from torch import Tensor
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
+from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.utils.platform_utils import is_npu
-from vllm_omni.diffusion.attention.ring_flash_attn import ring_flash_attn_func
-from vllm_omni.diffusion.attention.backends.ring_selector import AttnType
-from vllm_omni.diffusion.attention.backends.ring_globals import HAS_FLASH_ATTN
 
 
 class Attention(nn.Module):
@@ -129,55 +127,12 @@ class Attention(nn.Module):
         return self.attention.forward(query, key, value, attn_metadata)
 
     def _run_ring_attention(self, query, key, value, attn_metadata):
-        softmax_scale = self.softmax_scale
-        if softmax_scale is None:
-            softmax_scale = query.shape[-1] ** -0.5
-
-        try:
-            config = get_current_omni_diffusion_config()
-            backend_pref = config.attention_backend
-        except Exception:
-            backend_pref = None
-        
-        if backend_pref == "flash_attn" and query.dtype == torch.float32:
-            backend_pref = "sdpa"
-
-        # Extract joint tensors
-        joint_key, joint_value = None, None
-        joint_strategy = "front"
-        if attn_metadata is not None:
-            joint_key = attn_metadata.joint_key
-            joint_value = attn_metadata.joint_value
-            joint_strategy = attn_metadata.joint_strategy
-
-        if backend_pref == "sdpa" or backend_pref == "torch":
-             from vllm_omni.diffusion.attention.ring_pytorch_attn import ring_pytorch_attn_func
-             return ring_pytorch_attn_func(
-                 query, key, value, 
-                 softmax_scale=softmax_scale, 
-                 causal=self.causal,
-                 group=self.ring_pg,
-                 op_type="flash", 
-                 joint_tensor_key=joint_key,
-                 joint_tensor_value=joint_value,
-                 joint_strategy=joint_strategy,
+        # Delegate to RingParallelAttention strategy if available
+        if isinstance(self.parallel_strategy, RingParallelAttention):
+             return self.parallel_strategy.run_attention(
+                 query, key, value, attn_metadata, 
+                 softmax_scale=self.softmax_scale,
+                 causal=self.causal
              )
-            
-        return ring_flash_attn_func(
-            query,
-            key,
-            value,
-            dropout_p=0.0, 
-            softmax_scale=softmax_scale,
-            causal=self.causal,
-            window_size=(-1, -1),
-            softcap=0.0,
-            alibi_slopes=None,
-            deterministic=False,
-            return_attn_probs=False,
-            group=self.ring_pg,
-            attn_type=AttnType.FA,
-            joint_tensor_key=joint_key,
-            joint_tensor_value=joint_value,
-            joint_strategy=joint_strategy,
-        )
+
+        raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
