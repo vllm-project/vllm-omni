@@ -31,8 +31,8 @@ class UlyssesParallelAttention:
 
     This preserves the semantics previously implemented in
     `Attention._forward_ulysses`:
-    - If `AttentionMetadata.joint_*` is provided, joint_query is concatenated to
-      query *before* all-to-all; joint_key/value are concatenated *after* all-to-all.
+    - If `AttentionMetadata.joint_*` is provided, joint_query/key/value are 
+      concatenated *after* all-to-all.
     - joint_key/value are assumed to be replicated across SP ranks and are sliced
       by ulysses head rank before concatenation.
     """
