@@ -158,6 +158,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
 
     parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
     parser.add_argument(
@@ -268,7 +274,9 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
-    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree, cfg_parallel_size=args.cfg_parallel_size
+    )
     # Configure cache based on backend type
     cache_config = None
     if args.cache_backend == "cache_dit":
