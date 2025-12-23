@@ -59,8 +59,8 @@ class SDPAImpl(AttentionImpl):
                 assert seq_len == query.shape[-2], (
                     f"attention mask seq_len != query.shape[-2], {seq_len} != {query.shape[-2]}"
                 )
-                attention_mask = torch.expand(
-                    attention_mask.unsqueeze(1).unsqueeze(1), (bs, 1, seq_len, seq_len)
+                attention_mask = (
+                    attention_mask.unsqueeze(1).unsqueeze(1).expand(bs, 1, seq_len, seq_len)
                 )  # (bs, 1, seq_len, seq_len)
             elif attention_mask.ndim == 4:
                 pass
