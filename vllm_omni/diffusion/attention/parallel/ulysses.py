@@ -120,6 +120,67 @@ class UlyssesParallelAttention:
                 key = torch.cat([key, joint_tensor_key], dim=1)
                 value = torch.cat([value, joint_tensor_value], dim=1)
 
+        attn_mask = attn_metadata.attn_mask
+        if attn_mask is not None:
+            assert attn_mask.ndim == 2, f"attn_mask.ndim != 2, {attn_mask.ndim}"
+            if is_joint:
+                # `attn_mask` is a per-token padding mask (bool, True=valid) for the
+                # *local* pre-all-to-all sequence: [joint(text), local(image)].
+                #
+                # After Ulysses all-to-all:
+                # - image seq is gathered from all ranks -> global image seq
+                # - joint(text) query is replicated across ranks before all-to-all,
+                #   so it appears `world_size` times along query seq
+                joint_query_len = joint_tensor_query.shape[1]
+                joint_attn_mask = (
+                    attn_mask[:, :joint_query_len] if joint_strategy == "front" else attn_mask[:, -joint_query_len:]
+                )
+                curr_attn_mask = (
+                    attn_mask[:, joint_query_len:] if joint_strategy == "front" else attn_mask[:, :-joint_query_len]
+                )
+
+                ulysses_world_size = dist.get_world_size(self._ulysses_pg)
+
+                # Gather image part to match post-all-to-all global image sequence length.
+                gathered_curr_mask = [torch.zeros_like(curr_attn_mask) for _ in range(ulysses_world_size)]
+                dist.all_gather(gathered_curr_mask, curr_attn_mask, group=self._ulysses_pg)
+                curr_attn_mask = torch.cat(gathered_curr_mask, dim=-1)
+
+                replicated_joint_attn_mask = torch.cat([joint_attn_mask] * ulysses_world_size, dim=-1)
+
+                query_attn_mask = (
+                    torch.cat([replicated_joint_attn_mask, curr_attn_mask], dim=-1)
+                    if joint_strategy == "front"
+                    else torch.cat([curr_attn_mask, replicated_joint_attn_mask], dim=-1)
+                )  # query uses replicated joint query tensor
+                key_attn_mask = (
+                    torch.cat([joint_attn_mask, curr_attn_mask], dim=-1)
+                    if joint_strategy == "front"
+                    else torch.cat([curr_attn_mask, joint_attn_mask], dim=-1)
+                )
+
+                assert query_attn_mask.shape[-1] == query.shape[1], (
+                    f"query_attn_mask.shape[-1] != query.shape[1], {query_attn_mask.shape[-1]} != {query.shape[1]}"
+                )
+                assert key_attn_mask.shape[-1] == key.shape[1], (
+                    f"key_attn_mask.shape[-1] != key.shape[1], {key_attn_mask.shape[-1]} != {key.shape[1]}"
+                )
+
+                # Build full attention mask for SDPA: (bs, 1, query_len, key_len)
+                # For torch SDPA bool masks: True means "keep/attend".
+                attn_metadata.attn_mask = (
+                    query_attn_mask.to(torch.bool)[:, None, :, None] & key_attn_mask.to(torch.bool)[:, None, None, :]
+                )
+
+            else:
+                gathered_mask = [torch.zeros_like(attn_mask) for _ in range(dist.get_world_size(self._ulysses_pg))]
+                dist.all_gather(gathered_mask, attn_mask, group=self._ulysses_pg)
+                attn_mask = torch.cat(gathered_mask, dim=-1)  # (bs, seq_len/P*P)
+                assert attn_mask.shape[-1] == query.shape[1], (
+                    f"attn_mask.shape[-1] != query.shape[1], {attn_mask.shape[-1]} != {query.shape[1]}"
+                )
+                attn_metadata.attn_mask = attn_mask
+
         ctx = _UlyssesCtx(
             name=self.name,
             ulysses_pg=self._ulysses_pg,
