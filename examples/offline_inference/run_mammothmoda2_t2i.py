@@ -142,7 +142,6 @@ def main() -> None:
     # 约束 AR stage 只生成视觉 token（额外允许 eol）：
     # vLLM V1 不支持 logits_processors(callable)，用 allowed_token_ids 实现同等效果。
     eol_token_id, visual_start, visual_end = _load_t2i_token_range(args.model)
-    allowed_token_ids = [eol_token_id] + list(range(visual_start, visual_end))
     expected_grid_tokens = int(ar_height) * (int(ar_width) + 1)
 
     prompt = (
@@ -158,11 +157,11 @@ def main() -> None:
             temperature=1.0,
             top_p=1.0,
             top_k=2048,
-            max_tokens=max(1, expected_grid_tokens),
+            # +1 for generating eoi, +1 for generating hidden state of eoi
+            max_tokens=max(1, expected_grid_tokens + 1 + 1),
             detokenize=False,
-            allowed_token_ids=allowed_token_ids,
         )
-        # DiT stage 使用 pooling 输出；SamplingParams 仅为满足 pipeline 接口
+
         dit_sampling = SamplingParams(
             temperature=0.0,
             top_p=1.0,
@@ -171,21 +170,18 @@ def main() -> None:
             detokenize=False,
         )
 
-        # 通过 additional_information 将 t2i 网格信息透传给 AR 模型，
-        # 使其在 compute_logits 阶段实现“每 (ar_width+1) 个 token 的最后一个必须为 eol”的动态约束。
+
         outputs = omni.generate(
             [
                 {
                     "prompt": prompt,
                     "additional_information": {
-                        "omni_task": "t2i",
+                        "omni_task": ["t2i"],
                         "ar_width": [int(ar_width)],
                         "ar_height": [int(ar_height)],
                         "eol_token_id": [int(eol_token_id)],
                         "visual_token_start_id": [int(visual_start)],
                         "visual_token_end_id": [int(visual_end)],
-                        # 该字段不会进入 Stage-0 engine request（text prompt 会丢弃额外字段），
-                        # 但会被 Stage-1 的 ar2dit 读取并透传到 DiT.forward。
                         "image_height": [int(args.height)],
                         "image_width": [int(args.width)],
                         "num_inference_steps": [int(args.num_inference_steps)],

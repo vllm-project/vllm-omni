@@ -32,38 +32,17 @@ def ar2dit(
         prompt_token_ids = ar_output.prompt_token_ids
          # exclude the last token because it has no corresponding hidden state
         gen_token_ids = ar_output.outputs[0].token_ids[:-1]
-        prompt_len = len(prompt_token_ids)
-
-        hidden_states = ar_output.multimodal_output["latent"]
-        hidden_total = int(hidden_states.shape[0])
-        gen_hidden_len = hidden_total - prompt_len
-
-        prompt_hidden_states = hidden_states[:prompt_len]
-        gen_hidden_states = hidden_states[prompt_len : ]
-
-        gen_token_ids = gen_token_ids[:gen_hidden_len]
-
         full_token_ids = prompt_token_ids + gen_token_ids
-        full_hidden_states = torch.cat([prompt_hidden_states, gen_hidden_states], dim=0)
-        if len(full_token_ids) != int(full_hidden_states.shape[0]):
-            raise RuntimeError(
-                "AR token ids length mismatch with hidden states after alignment: "
-                f"{len(full_token_ids)} != {int(full_hidden_states.shape[0])}"
-            )
+
+        full_hidden_states = ar_output.multimodal_output["latent"]
+        hidden_total = int(full_hidden_states.shape[0])
+        assert hidden_total == len(prompt_token_ids) + len(gen_token_ids), (
+            f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"
+        )
 
         mask_device = full_hidden_states.device
         full_token_ids_t = torch.tensor(full_token_ids, dtype=torch.long, device=mask_device)
         attention_mask = torch.ones_like(full_token_ids_t, dtype=torch.bool)
-
-        img_end_id = 152071
-        full_token_ids_t = torch.cat(
-            [full_token_ids_t, torch.tensor([img_end_id], dtype=torch.long, device=mask_device)], dim=0
-        )
-        attention_mask = torch.cat(
-            [attention_mask, torch.tensor([True], dtype=torch.bool, device=mask_device)], dim=0
-        )
-        pad_h = full_hidden_states.new_zeros((1, int(full_hidden_states.shape[1])))
-        full_hidden_states = torch.cat([full_hidden_states, pad_h], dim=0)
 
         L = int(full_token_ids_t.shape[0])
         answer_start_index = max(L - 10, 0) # the last 10 tokens as answer
