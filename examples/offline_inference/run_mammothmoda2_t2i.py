@@ -11,8 +11,7 @@ MammothModa2 文生图（AR -> DiT）离线推理示例，使用 vllm_omni.Omni 
     --model /data/datasets/models-hf/MammothModa2-Preview \\
     --stage-config vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml \\
     --prompt "一只戴着墨镜的柴犬，电影海报风格" \\
-    --ar-width 32 --ar-height 32 \\
-    --max-tokens 1056 \\
+    --height 1024 --width 1024 \\
     --out out.png
 """
 
@@ -79,25 +78,17 @@ def parse_args() -> argparse.Namespace:
         default="一个墨镜的时尚女郎在纽约大道骑摩托车疾驰，007特工的电影风格",
         help="文本提示",
     )
-    p.add_argument("--ar-width", type=int, default=64, help="AR 生成网格宽（token 级）")
-    p.add_argument("--ar-height", type=int, default=64, help="AR 生成网格高（token 级）")
     p.add_argument(
         "--height",
         type=int,
         default=1024,
-        help="输出图片高度(px)，需为16的倍数；默认=ar_height*16",
+        help="输出图片高度(px)，需为16的倍数",
     )
     p.add_argument(
         "--width",
         type=int,
         default=1024,
-        help="输出图片宽度(px)，需为16的倍数；默认=ar_width*16",
-    )
-    p.add_argument(
-        "--max-tokens",
-        type=int,
-        default=1056,
-        help="AR 生成 token 数（建议 ar_height * (ar_width + 1)，先跑通再调）",
+        help="输出图片宽度(px)，需为16的倍数",
     )
     p.add_argument(
         "--num-inference-steps",
@@ -139,42 +130,26 @@ def main() -> None:
     args = parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
-    # 分辨率（像素）与 AR 网格（token）需要匹配：ar_width == width/16, ar_height == height/16
-    if (args.height is None) != (args.width is None):
-        raise ValueError("必须同时提供 --height 和 --width（或都不提供）")
-    if args.height is None:
-        args.height = int(args.ar_height) * 16
-        args.width = int(args.ar_width) * 16
-    else:
-        args.height = int(args.height)
-        args.width = int(args.width)
-        if args.height <= 0 or args.width <= 0:
-            raise ValueError(f"--height/--width 必须为正数，当前: {args.height}x{args.width}")
-        if args.height % 16 != 0 or args.width % 16 != 0:
-            raise ValueError(f"--height/--width 必须为16的倍数，当前: {args.height}x{args.width}")
-        if args.height // 16 != int(args.ar_height) or args.width // 16 != int(args.ar_width):
-            raise ValueError(
-                "分辨率与 AR 网格不匹配：需要满足 ar_height==height/16 且 ar_width==width/16；"
-                f"当前 ar={int(args.ar_width)}*{int(args.ar_height)}，hw={args.width}x{args.height}"
-            )
+    args.height = int(args.height)
+    args.width = int(args.width)
+    if args.height <= 0 or args.width <= 0:
+        raise ValueError(f"--height/--width 必须为正数，当前: {args.height}x{args.width}")
+    if args.height % 16 != 0 or args.width % 16 != 0:
+        raise ValueError(f"--height/--width 必须为16的倍数，当前: {args.height}x{args.width}")
+    ar_height = args.height // 16
+    ar_width = args.width // 16
 
     # 约束 AR stage 只生成视觉 token（额外允许 eol）：
     # vLLM V1 不支持 logits_processors(callable)，用 allowed_token_ids 实现同等效果。
     eol_token_id, visual_start, visual_end = _load_t2i_token_range(args.model)
     allowed_token_ids = [eol_token_id] + list(range(visual_start, visual_end))
-    expected_grid_tokens = int(args.ar_height) * (int(args.ar_width) + 1)
-    if int(args.max_tokens) != expected_grid_tokens:
-        print(
-            f"[warn] --max-tokens={int(args.max_tokens)} 与网格期望值 "
-            f"ar_height*(ar_width+1)={expected_grid_tokens} 不一致；"
-            "如需完整 2D 网格 token，建议使用期望值。"
-        )
+    expected_grid_tokens = int(ar_height) * (int(ar_width) + 1)
 
     prompt = (
         "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
         f"<|im_start|>user\n{args.prompt}<|im_end|>\n"
         "<|im_start|>assistant\n"
-        f"<|image start|>{int(args.ar_width)}*{int(args.ar_height)}<|image token|>"
+        f"<|image start|>{int(ar_width)}*{int(ar_height)}<|image token|>"
     )
 
     omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
@@ -183,7 +158,7 @@ def main() -> None:
             temperature=1.0,
             top_p=1.0,
             top_k=2048,
-            max_tokens=max(1, int(args.max_tokens)),
+            max_tokens=max(1, expected_grid_tokens),
             detokenize=False,
             allowed_token_ids=allowed_token_ids,
         )
@@ -204,8 +179,8 @@ def main() -> None:
                     "prompt": prompt,
                     "additional_information": {
                         "omni_task": "t2i",
-                        "ar_width": [int(args.ar_width)],
-                        "ar_height": [int(args.ar_height)],
+                        "ar_width": [int(ar_width)],
+                        "ar_height": [int(ar_height)],
                         "eol_token_id": [int(eol_token_id)],
                         "visual_token_start_id": [int(visual_start)],
                         "visual_token_end_id": [int(visual_end)],
