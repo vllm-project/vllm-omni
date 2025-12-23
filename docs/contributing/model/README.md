@@ -4,7 +4,7 @@ This section provides comprehensive guidance on how to add a new model to vLLM-O
 
 ## Documentation
 
-- **[Adding a New Model Guide](adding_a_new_model.md)**: Complete step-by-step guide using Qwen3-Omni as an example
+- **[Adding a New Model Guide](adding_multi_stage_model.md)**: Complete step-by-step guide using Qwen3-Omni as an example
 
 The guide covers:
 - Directory structure and organization
@@ -17,4 +17,4 @@ The guide covers:
 
 ## Quick Start
 
-For a quick reference, see the [Adding a New Model Guide](adding_a_new_model.md) which walks through the complete implementation of Qwen3-Omni, a multi-stage omni-modality model.
+For a quick reference, see the [Adding a New Model Guide](adding_multi_stage_model.md) which walks through the complete implementation of Qwen3-Omni, a multi-stage omni-modality model.

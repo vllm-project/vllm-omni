@@ -12,7 +12,8 @@ This guide walks through the process of adding a new model to vLLM-Omni, using *
 6. [Stage Configuration](#stage-configuration)
 7. [Stage Input Processors](#stage-input-processors)
 8. [Testing](#testing)
-9. [Summary](#summary)
+9. [Adding a Model Recipe](#adding-a-model-recipe)
+10. [Summary](#summary)
 
 ## Overview
 
@@ -36,6 +37,7 @@ vllm_omni/model_executor/models/
     ├── your_model_stage1_implementation.py      # Stage 1 implementation (e.g., thinker)
     ├── your_model_stage2_implementation.py      # Stage 2 implementation (e.g., talker)
     └── your_model_stage3_implementation.py      # Stage 3 implementation (e.g., code2wav)
+    └── ... maybe other stage implementations
 
 vllm_omni/model_executor/stage_input_processors/
 └── your_model_name.py            # Stage transition processors
@@ -73,7 +75,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     SupportsPP
 ):
     """Thinker stage: multimodal understanding → text generation."""
-    
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # Initialize base model
         # Set up multimodal processors
@@ -91,7 +93,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     SupportsPP
 ):
     """Talker stage: text embeddings → RVQ codec codes."""
-    
+
     def __init__(self, vllm_config, talker_config, prefix):
         # Initialize base model
         # Replace LM head with codec head
@@ -106,7 +108,7 @@ The code2wav stage generates audio waveforms:
 ```python
 class Qwen3OmniMoeCode2Wav(nn.Module):
     """Code2Wav stage: RVQ codes → audio waveform."""
-    
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         # Initialize audio decoder
         # Set up codec processing
@@ -128,24 +130,24 @@ class Qwen3OmniMoeForConditionalGeneration(
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
-    
+
     Architecture:
     - Thinker: Multimodal understanding (text + audio + video) → text generation
     - Talker: Text embeddings → RVQ codec codes
     - Code2Wav: RVQ codes → audio waveform
-    
+
     Usage:
         Set `model_stage` in vllm_config to one of: "thinker", "talker", "code2wav"
     """
-    
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
         config: Qwen3OmniMoeConfig = vllm_config.model_config.hf_config
-        
+
         # Determine which stage to initialize
         self.model_stage = vllm_config.model_config.model_stage
-        
+
         if self.model_stage == "thinker":
             # Initialize thinker model
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -159,7 +161,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"],
             )
             self.model = self.thinker
-            
+
         elif self.model_stage == "talker":
             # Initialize talker model
             talker_vllm_config = vllm_config.with_hf_config(
@@ -173,7 +175,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"],
             )
             self.model = self.talker
-            
+
         elif self.model_stage == "code2wav":
             # Initialize code2wav model
             code2wav_vllm_config = vllm_config.with_hf_config(
@@ -248,7 +250,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     thinker_weights = []
     talker_weights = []
     code2wav_weights = []
-    
+
     # Separate weights by component
     for k, v in weights:
         if k.startswith("thinker."):
@@ -257,15 +259,15 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             talker_weights.append((k, v))
         elif k.startswith("code2wav."):
             code2wav_weights.append((k, v))
-    
+
     # Load each component's weights
     if self.thinker and thinker_weights:
         thinker_loaded = self.thinker.load_weights(thinker_weights)
         thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
         loaded_weights.update(thinker_loaded)
-    
+
     # Similar for talker and code2wav...
-    
+
     return loaded_weights
 ```
 
@@ -291,7 +293,7 @@ Register your model in `vllm_omni/model_executor/models/registry.py`:
 ```python
 _OMNI_MODELS = {
     # ... existing models ...
-    
+
     # Your new model
     "YourModelForConditionalGeneration": (
         "your_model_name",        # Module folder name
@@ -311,67 +313,7 @@ The registry uses lazy loading, so the model class is imported only when needed.
 
 ## Stage Configuration
 
-Create a YAML configuration file in `vllm_omni/model_executor/stage_configs/`:
-
-```yaml
-# qwen3_omni_moe.yaml
-stage_args:
-  - stage_id: 0
-    runtime:
-      devices: "0,1"
-      max_batch_size: 1
-    engine_args:
-      model_stage: thinker
-      model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.6
-      enforce_eager: true
-      trust_remote_code: true
-      engine_output_type: latent
-      distributed_executor_backend: "mp"
-      tensor_parallel_size: 2
-    final_output: true
-    final_output_type: text
-    is_comprehension: true
-    default_sampling_params:
-      temperature: 0.4
-      top_p: 0.9
-      max_tokens: 2048
-
-  - stage_id: 1
-    runtime:
-      devices: "1"
-      max_batch_size: 1
-    engine_args:
-      model_stage: talker
-      model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.3
-      engine_output_type: latent
-    engine_input_source: [0]  # Takes input from stage 0
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
-    default_sampling_params:
-      temperature: 0.9
-      top_k: 50
-      max_tokens: 4096
-
-  - stage_id: 2
-    runtime:
-      devices: "0"
-      max_batch_size: 1
-    engine_args:
-      model_stage: code2wav
-      model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
-      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      engine_output_type: audio
-    engine_input_source: [1]  # Takes input from stage 1
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
-    final_output: true
-    final_output_type: audio
-```
+Create a YAML configuration file in `vllm_omni/model_executor/stage_configs/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml).
 
 ### Key Configuration Fields
 
@@ -395,28 +337,28 @@ Stage transitions happen automatically in the orchestrator (`OmniLLM` class) dur
 3. **Execution Flow**:
    ```python
    # In omni_llm.py, _run_generation() method (around line 345-460)
-   
+
    # Main orchestrator loop polls each stage for completed requests
    for stage_id, stage in enumerate(self.stage_list):
        result = stage.try_collect()  # Get completed request
        if result is None:
            continue
-       
+
        # Store outputs from this stage
        engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-       stage.set_engine_outputs(engine_outputs) 
-       
+       stage.set_engine_outputs(engine_outputs)
+
        # Check if there's a next stage to forward to
        next_stage_id = stage_id + 1
        if next_stage_id < len(self.stage_list):
            next_stage: OmniStage = self.stage_list[next_stage_id]
-           
-           # THIS IS WHERE STAGE TRANSITION HAPPENS 
+
+           # THIS IS WHERE STAGE TRANSITION HAPPENS
            next_inputs = next_stage.process_engine_inputs(
-               self.stage_list, 
+               self.stage_list,
                [request_id_to_prompt[req_id]]
            )
-           
+
            # Submit to next stage
            task = {
                "request_id": req_id,
@@ -440,7 +382,7 @@ The stage transition process follows these steps:
        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
    ) -> list[OmniTokensPrompt | TextPrompt]:
        """Process engine inputs for this stage from upstream stage outputs."""
-       
+
        if self.custom_process_input_func is None:
            # Default behavior: pass token IDs directly
            # Extract outputs from source stage
@@ -450,9 +392,9 @@ The stage transition process follows these steps:
        else:
            # Custom transition function (YOUR CODE HERE)
            return self.custom_process_input_func(
-               stage_list, 
-               self.engine_input_source, 
-               prompt, 
+               stage_list,
+               self.engine_input_source,
+               prompt,
                self.requires_multimodal_data
            )
    ```
@@ -498,7 +440,7 @@ These outputs are captured during the forward pass and stored in `multimodal_out
 # In your model's forward() method (e.g., qwen3_omni.py)
 def forward(self, ...):
     # ... processing ...
-    
+
     # For thinker stage: capture embeddings and hidden states
     multimodal_outputs = {
         "0": captured_embeddings,      # Layer 0 embeddings
@@ -507,7 +449,7 @@ def forward(self, ...):
         "tts_eos_embed": tts_eos_embed,
         # ... other intermediate outputs ...
     }
-    
+
     return OmniOutput(
         text_hidden_states=hidden_states,
         multimodal_outputs=multimodal_outputs,
@@ -532,44 +474,12 @@ thinker_hidden_states = output.multimodal_output["24"]
 
 ### Complete Flow Diagram
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 0 (Thinker) Completes Processing                     │
-│  - Generates text tokens                                    │
-│  - Stores outputs via stage.set_engine_outputs()           │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Orchestrator (omni_llm.py)                                 │
-│  - Polls stage output queue                                 │
-│  - Detects stage completion                                 │
-│  - Calls next_stage.process_engine_inputs()                 │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  OmniStage.process_engine_inputs()                          │
-│  - Checks if custom_process_input_func exists                │
-│  - Calls your transition function                           │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Your Transition Function                                   │
-│  (e.g., thinker2talker)                                     │
-│  - Extracts data from stage_list[0].engine_outputs         │
-│  - Transforms data format                                    │
-│  - Returns list[OmniTokensPrompt]                           │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 1 (Talker) Receives Inputs                           │
-│  - Processes transformed inputs                              │
-│  - Generates codec codes                                    │
-└─────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png">
+    <img alt="Data Flow between stages" src="image.png" width=55%>
+  </picture>
+</p>
 
 ### Implementation Example
 
@@ -586,32 +496,32 @@ def thinker2talker(
 ) -> list[OmniTokensPrompt]:
     """
     Process thinker outputs to create talker inputs.
-    
+
     Args:
         stage_list: List of stage objects
         engine_input_source: Source stage IDs (typically [0] for thinker)
         prompt: Original prompt data
-        
+
     Returns:
         List of OmniTokensPrompt for talker stage
     """
     source_stage_id = engine_input_source[0]
     thinker_outputs = stage_list[source_stage_id].engine_outputs
     talker_inputs = []
-    
+
     for thinker_output in thinker_outputs:
         output = thinker_output.outputs[0]
         # Extract thinker embeddings and hidden states
         thinker_embeddings = output.multimodal_output["0"].float().clone().detach().cuda()
         thinker_hidden_states = output.multimodal_output["24"].float().clone().detach().cuda()
-        
+
         info = {
             "thinker_embeddings": thinker_embeddings,
             "thinker_hidden_states": thinker_hidden_states,
             "thinker_sequences": thinker_output.prompt_token_ids + output.token_ids,
             "thinker_input_ids": thinker_output.prompt_token_ids,
         }
-        
+
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * computed_length,
@@ -619,7 +529,7 @@ def thinker2talker(
                 multi_modal_data=None,
             )
         )
-    
+
     return talker_inputs
 
 
@@ -635,7 +545,7 @@ def talker2code2wav(
     source_stage_id = engine_input_source[0]
     talker_outputs = stage_list[source_stage_id].engine_outputs
     code2wav_inputs = []
-    
+
     for talker_output in talker_outputs:
         output = talker_output.outputs[0]
         # Extract codec codes
@@ -648,17 +558,48 @@ def talker2code2wav(
             .reshape(-1)
             .tolist()
         )
-        
+
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
                 multi_modal_data=None,
             )
         )
-    
+
     return code2wav_inputs
 ```
 
+## Testing
+
+For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../tests/tests_style.md).
+
+## Adding a Model Recipe
+
+After implementing and testing your model, please add a model recipe to the [vllm-project/recipes](https://github.com/vllm-project/recipes) repository. This helps other users understand how to use your model with vLLM-Omni.
+
+### What to Include
+
+Your recipe should include:
+
+1. **Model Overview**: Brief description of the model and its capabilities
+2. **Installation Instructions**: Step-by-step setup instructions including:
+   - Installing vllm-omni and dependencies
+   - Installing any additional required packages (e.g., xformers, diffusers)
+   - Any version requirements
+3. **Usage Examples**: Command-line examples demonstrating how to run the model
+4. **Configuration Details**: Important configuration parameters and their meanings
+
+### Example
+
+For reference, see the [LongCat recipe example](https://github.com/vllm-project/recipes/pull/179) which demonstrates the expected format and structure.
+
+### Recipe Location
+
+Create your recipe file in the appropriate directory structure:
+- For organization-specific models: `OrganizationName/ModelName.md`
+- For general models: `ModelName.md`
+
+The recipe should be a Markdown file that provides clear, reproducible instructions for users to get started with your model.
 
 ## Summary
 
@@ -670,6 +611,7 @@ Adding a new model to vLLM-Omni involves:
 4. **Create stage configuration** YAML file
 5. **Implement stage input processors** for stage transitions
 6. **Write tests** to verify functionality
+7. **Add model recipe** to the [vllm-project/recipes](https://github.com/vllm-project/recipes) repository (see [Adding a Model Recipe](#adding-a-model-recipe) section)
 
 ### Qwen3-Omni Reference Files
 
@@ -681,10 +623,9 @@ For a complete reference implementation, see:
 - **Code2Wav**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`
 - **Stage config**: `vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml`
 - **Input processors**: `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py`
-- **Registry**: `vllm_omni/model_executor/models/registry.py` 
+- **Registry**: `vllm_omni/model_executor/models/registry.py`
 
 For more information, see:
-- [Architecture Overview](../design/architecture_overview.md)
-- [Supported Models](../models/supported_models.md)
-- [Stage Configuration Guide](../configuration/stage_configs.md)
-
+- [Architecture Overview](../../design/architecture_overview.md)
+- [Supported Models](../../models/supported_models.md)
+- [Stage Configuration Guide](../../configuration/stage_configs.md)
