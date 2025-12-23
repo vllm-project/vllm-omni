@@ -60,10 +60,13 @@ class TeaCacheConfig:
             raise ValueError(f"rel_l1_thresh must be positive, got {self.rel_l1_thresh}")
 
         if self.coefficients is None:
-            # Use model-specific coefficients, fallback to FluxTransformer2DModel if not found
-            self.coefficients = _MODEL_COEFFICIENTS.get(
-                self.transformer_type, _MODEL_COEFFICIENTS["FluxTransformer2DModel"]
-            )
+            # Use model-specific coefficients, explicitly check if the type exists or not
+            if self.transformer_type not in _MODEL_COEFFICIENTS:
+                raise KeyError(
+                    f"Cannot find coefficients for {self.transformer_type}. "
+                    f"Supported: {list(_MODEL_COEFFICIENTS.keys())}"
+                )
+            self.coefficients = _MODEL_COEFFICIENTS[self.transformer_type]
 
         if len(self.coefficients) != 5:
             raise ValueError(f"coefficients must contain exactly 5 elements, got {len(self.coefficients)}")
