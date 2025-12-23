@@ -124,6 +124,8 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
+        if not reqs or len(reqs) == 0:
+            raise ValueError("Cannot execute model with empty request list")
         # TODO: dealing with first req for now
         req = reqs[0]
 
@@ -238,7 +240,7 @@ class WorkerProc:
                 )
                 continue
 
-            if msg is None:
+            if msg is None or len(msg) == 0:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 

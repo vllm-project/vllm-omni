@@ -74,7 +74,7 @@ from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
-    from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
+    from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 
 logger = init_logger(__name__)
 
@@ -985,9 +985,21 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             content = [{"type": "text", "text": "Image generation completed but no images were produced."}]
 
         # Create response choice
+        # Use model_construct to bypass validation for multimodal content
+        # (ChatMessage.content only accepts str, but we need list for images)
+        # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
+        import warnings as warnings_module
+
+        with warnings_module.catch_warnings():
+            warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
+            message = ChatMessage.model_construct(role=role)
+            object.__setattr__(message, "content", content)
+            # Mark content as set in fields_set to ensure proper serialization
+            if hasattr(message, "__pydantic_fields_set__"):
+                message.__pydantic_fields_set__.add("content")
         choice_data = ChatCompletionResponseChoice(
             index=0,
-            message=ChatMessage(role=role, content=content),
+            message=message,
             logprobs=None,
             finish_reason="stop",
             stop_reason=None,
@@ -1119,7 +1131,21 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                         )
 
             # Generate image
-            result = await self._diffusion_engine.generate(**gen_kwargs)
+            # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
+            if hasattr(self._diffusion_engine, "stage_list"):
+                # AsyncOmni: iterate through async generator to get final output
+                result = None
+                async for output in self._diffusion_engine.generate(
+                    prompt=gen_kwargs["prompt"],
+                    request_id=gen_kwargs.get("request_id"),
+                    sampling_params_list=[gen_kwargs],  # Pass as single-stage params
+                ):
+                    result = output
+                if result is None:
+                    return self._create_error_response("No output generated from AsyncOmni")
+            else:
+                # AsyncOmniDiffusion: direct call
+                result = await self._diffusion_engine.generate(**gen_kwargs)
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
@@ -1145,7 +1171,16 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # Use model_construct to bypass validation for multimodal content
             # (ChatMessage.content only accepts str, but we need list for images)
-            message = ChatMessage.model_construct(role="assistant", content=content)
+            # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
+            import warnings as warnings_module
+
+            with warnings_module.catch_warnings():
+                warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
+                message = ChatMessage.model_construct(role="assistant")
+                object.__setattr__(message, "content", content)
+                # Mark content as set in fields_set to ensure proper serialization
+                if hasattr(message, "__pydantic_fields_set__"):
+                    message.__pydantic_fields_set__.add("content")
             choice = ChatCompletionResponseChoice.model_construct(
                 index=0,
                 message=message,
