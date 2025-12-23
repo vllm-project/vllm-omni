@@ -281,10 +281,15 @@ class QwenImagePipeline(
         #     vae_scale_factor=self.vae_scale_factor * 2
         # )
         self.tokenizer_max_length = 1024
-        self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"  # noqa: E501
+        self.prompt_template_encode = (
+            "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
+            "texture, quantity, text, spatial relationships of the objects and background"
+            ":<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+        )  # noqa: E501
         self.prompt_template_encode_start_idx = 34
         self.default_sample_size = 128
-        #  If cfg_pack_neg_pos is True, CFG expects positive+negative prompts to be packed into the same batch, need to pad to the same length
+        #  If cfg_pack_neg_pos is True, CFG expects positive+negative prompts to be
+        #  packed into the same batch, need to pad to the same length
         self.cfg_pack_neg_pos: bool = False
         if (
             self.od_config.parallel_config is not None
@@ -292,7 +297,8 @@ class QwenImagePipeline(
             and not self.cfg_pack_neg_pos
         ):
             logger.info(
-                f"Pack positive and negative prompts into the same batch for CFG Parallel (parallel_size = {self.od_config.parallel_config.cfg_parallel_size})"
+                "Pack positive and negative prompts into the same batch for"
+                f" CFG Parallel (parallel_size = {self.od_config.parallel_config.cfg_parallel_size})"
             )
             self.cfg_pack_neg_pos = True
 
