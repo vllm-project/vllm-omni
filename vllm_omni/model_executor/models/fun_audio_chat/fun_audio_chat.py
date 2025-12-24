@@ -20,7 +20,7 @@ Components:
 - audio_invert_tower: CRQ Transformer for speech token generation (disabled in S2T mode)
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import cached_property
 from typing import Any
 
@@ -31,6 +31,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalDataDict
+from vllm.multimodal.processing import BaseMultiModalProcessor, BaseProcessingInfo
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -54,98 +57,146 @@ AUDIO_EOS_INDEX = 151671  # <|audio_eos|>
 # ============================================================================
 
 
-class FunAudioChatProcessingInfo:
+class FunAudioChatProcessingInfo(BaseProcessingInfo):
     """Processing info for Fun-Audio-Chat multimodal inputs."""
 
-    def __init__(self, ctx):
-        self.ctx = ctx
-
-    def get_supported_mm_limits(self):
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}  # Currently support single audio input
 
-    def get_mm_max_tokens_per_item(self, seq_len: int, mm_counts: dict):
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int] | None:
         # Fun-Audio-Chat uses 5Hz frame rate, so audio tokens are fewer
         # Estimate: 1 second of audio ≈ 5 tokens at 5Hz
         return {"audio": 1500}  # Max ~5 minutes of audio
 
 
-class FunAudioChatMultiModalProcessor:
+class FunAudioChatDummyInputsBuilder(BaseDummyInputsBuilder[FunAudioChatProcessingInfo]):
+    """Build dummy inputs for Fun-Audio-Chat profiling."""
+
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        """Build the text input corresponding to mm_counts."""
+        num_audio = mm_counts.get("audio", 0)
+        if num_audio > 0:
+            return "Transcribe the audio."
+        return "Hello, how are you?"
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, Any] | None = None,
+    ) -> MultiModalDataDict:
+        """Build dummy multimodal data for profiling."""
+        num_audio = mm_counts.get("audio", 0)
+        if num_audio > 0:
+            # Create dummy audio: 16kHz sample rate, ~5 seconds
+            # This will be processed by the audio encoder
+            audio_length = 16000 * 5  # 5 seconds at 16kHz
+            dummy_audios = self._get_dummy_audios(length=audio_length, num_audios=num_audio)
+            return {"audio": dummy_audios}
+        return {}
+
+
+class FunAudioChatMultiModalProcessor(BaseMultiModalProcessor[FunAudioChatProcessingInfo]):
     """Multimodal processor for Fun-Audio-Chat audio inputs."""
 
-    def __init__(self, ctx):
-        self.ctx = ctx
-        self._processor = None
+    def _get_data_parser(self):
+        """Get data parser for audio inputs."""
+        from vllm.multimodal.parse import MultiModalDataParser
 
-    def _get_processor(self):
+        return MultiModalDataParser()
+
+    def _get_hf_processor(self):
         """Lazy-load the HuggingFace processor."""
-        if self._processor is None:
-            from transformers import AutoProcessor
+        return self.info.get_hf_processor()
 
-            model_config = self.ctx.model_config
-            self._processor = AutoProcessor.from_pretrained(
-                model_config.model,
-                trust_remote_code=model_config.trust_remote_code,
-            )
-        return self._processor
-
-    def apply(
+    def _call_hf_processor(
         self,
-        prompt_text: str,
-        mm_data: dict,
-        hf_processor_mm_kwargs: dict,
+        prompt: str,
+        mm_data: MultiModalDataDict,
+        mm_kwargs: Mapping[str, object],
     ) -> dict:
-        """Process multimodal inputs for Fun-Audio-Chat."""
-        processor = self._get_processor()
+        """Call HuggingFace processor to process inputs."""
+        processor = self._get_hf_processor()
 
         # Extract audio from multimodal data
         audio_data = mm_data.get("audio")
 
         if audio_data is not None:
+            # Convert audio list to proper format if needed
+            if isinstance(audio_data, list) and len(audio_data) > 0:
+                audios = audio_data
+            else:
+                audios = [audio_data] if audio_data is not None else None
+
             # Process audio using HF processor
             processed = processor(
-                text=prompt_text,
-                audios=audio_data,
+                text=prompt,
+                audios=audios,
                 return_tensors="pt",
-                **hf_processor_mm_kwargs,
+                padding=True,
+                **mm_kwargs,
             )
-            return {
-                "prompt_token_ids": processed["input_ids"][0].tolist(),
-                "mm_kwargs": {
-                    "input_features": processed.get("input_features"),
-                    "speech_ids": processed.get("speech_ids"),
-                    "speech_attention_mask": processed.get("speech_attention_mask"),
-                    "feature_attention_mask": processed.get("feature_attention_mask"),
-                },
-            }
+            return processed
         else:
             # Text-only input
-            processed = processor(text=prompt_text, return_tensors="pt")
-            return {
-                "prompt_token_ids": processed["input_ids"][0].tolist(),
-                "mm_kwargs": {},
-            }
+            processed = processor(text=prompt, return_tensors="pt")
+            return processed
 
+    def apply(
+        self,
+        prompt: str,
+        mm_data: MultiModalDataDict,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        *,
+        mm_uuids: Mapping[str, list[str]] | None = None,
+    ):
+        """Process multimodal inputs for Fun-Audio-Chat."""
+        from vllm.multimodal.inputs import MultiModalInputs, MultiModalKwargsItem
 
-class FunAudioChatDummyInputsBuilder:
-    """Build dummy inputs for Fun-Audio-Chat profiling."""
+        processed = self._call_hf_processor(prompt, mm_data, hf_processor_mm_kwargs)
 
-    def __init__(self, ctx):
-        self.ctx = ctx
+        prompt_token_ids = processed["input_ids"][0].tolist()
 
-    def get_dummy_processor_inputs(self, seq_len: int, mm_counts: dict) -> dict:
-        """Create dummy inputs for profiling."""
-        # Create dummy audio features (mel spectrogram)
-        num_audio = mm_counts.get("audio", 0)
-        if num_audio > 0:
-            # Dummy mel features: [batch, num_mel_bins, seq_len]
-            dummy_features = torch.zeros(num_audio, 128, 3000)
-            return {
-                "audio": dummy_features,
-                "prompt_text": "Transcribe the audio.",
-            }
-        return {
-            "prompt_text": "Hello, how are you?",
-        }
+        # Build mm_kwargs from processed outputs
+        mm_kwargs: dict[str, Any] = {}
+
+        if "input_features" in processed:
+            mm_kwargs["input_features"] = processed["input_features"]
+        if "speech_ids" in processed:
+            mm_kwargs["speech_ids"] = processed["speech_ids"]
+        if "speech_attention_mask" in processed:
+            mm_kwargs["speech_attention_mask"] = processed["speech_attention_mask"]
+        if "feature_attention_mask" in processed:
+            mm_kwargs["feature_attention_mask"] = processed["feature_attention_mask"]
+
+        # Build placeholder ranges for audio tokens
+        mm_placeholders: dict[str, list] = {}
+        if mm_data.get("audio") is not None:
+            # Find audio token positions in the prompt
+            audio_token_indices = [i for i, tok in enumerate(prompt_token_ids) if tok == AUDIO_TOKEN_INDEX]
+            if audio_token_indices:
+                mm_placeholders["audio"] = []
+                for idx in audio_token_indices:
+                    mm_placeholders["audio"].append(
+                        {
+                            "offset": idx,
+                            "length": 1,  # Each audio token placeholder
+                        }
+                    )
+
+        return MultiModalInputs(
+            type="multimodal",
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            mm_kwargs=MultiModalKwargsItem.from_items([mm_kwargs])
+            if mm_kwargs
+            else MultiModalKwargsItem.from_items([]),
+            mm_placeholders=mm_placeholders,
+        )
 
 
 # ============================================================================
@@ -264,6 +315,52 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             if hasattr(self.language_model, "sampler"):
                 return self.language_model.sampler
         return Sampler()
+
+    # ==================== Text Generation Interface ====================
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor | OmniOutput,
+    ) -> torch.Tensor | None:
+        """Compute logits from hidden states for text generation.
+
+        This method is required by vLLM's VllmModelForTextGeneration interface.
+
+        Args:
+            hidden_states: Hidden states from forward pass, can be raw tensor
+                or OmniOutput wrapper.
+
+        Returns:
+            Logits tensor or None if TP rank > 0.
+        """
+        # Handle OmniOutput type
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
+
+        # Delegate to language model's compute_logits
+        if hasattr(self, "language_model") and self.language_model is not None:
+            return self.language_model.compute_logits(hidden_states)
+
+        # Fallback for cosyvoice stage or uninitialized language model
+        return None
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor | None:
+        """Sample tokens from logits.
+
+        Args:
+            logits: Logits from compute_logits
+            sampling_metadata: Sampling parameters
+
+        Returns:
+            Sampled tokens or SamplerOutput
+        """
+        if hasattr(self, "language_model") and self.language_model is not None:
+            return self.language_model.sample(logits, sampling_metadata)
+        return self.sampler(logits, sampling_metadata)
 
     # ==================== Embedding Methods ====================
 

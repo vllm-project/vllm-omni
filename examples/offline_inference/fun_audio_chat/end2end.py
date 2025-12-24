@@ -99,7 +99,7 @@ def get_stage_configs_path(mode: str) -> str:
     if mode == "s2s":
         config_path = config_dir / "fun_audio_chat_s2s.yaml"
     else:
-        config_path = config_dir / "fun_audio_chat.yaml"
+        config_path = config_dir / "fun_audio_chat_s2t.yaml"
 
     if not config_path.exists():
         raise FileNotFoundError(f"Stage config not found: {config_path}")
