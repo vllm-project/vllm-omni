@@ -11,6 +11,7 @@ logger = init_logger(__name__)
 
 
 def register_omni_models_to_vllm():
+    """Register vLLM-Omni models to vLLM's ModelRegistry and Transformers' CONFIG_MAPPING."""
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
@@ -19,6 +20,40 @@ def register_omni_models_to_vllm():
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         if arch not in supported_archs:
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    # Register custom model types to Transformers' CONFIG_MAPPING
+    # This is needed for models that have custom model_type in config.json
+    # but don't have auto_map to tell Transformers how to load them
+    _register_custom_configs_to_transformers()
+
+
+def _register_custom_configs_to_transformers():
+    """Register custom model configs to Transformers' CONFIG_MAPPING.
+
+    This allows Transformers to recognize custom model types like 'funaudiochat'
+    that don't have auto_map in their config.json.
+    """
+    try:
+        from transformers import PretrainedConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        # Define custom model types and their base config classes
+        # Format: (model_type, base_config_class)
+        custom_configs = [
+            ("funaudiochat", PretrainedConfig),
+        ]
+
+        for model_type, config_class in custom_configs:
+            try:
+                # Check if already registered
+                _ = CONFIG_MAPPING[model_type]
+            except KeyError:
+                # Not registered, register it
+                CONFIG_MAPPING.register(model_type, config_class, exist_ok=True)
+                logger.debug(f"Registered '{model_type}' to Transformers CONFIG_MAPPING")
+
+    except Exception as e:
+        logger.warning(f"Failed to register custom configs to Transformers: {e}")
 
 
 @dataclass
