@@ -22,7 +22,7 @@ Usage:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
          --backend sglang-image --dataset vbench --task t2v --num-prompts 20
 
-    i2v:
+    i2i:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
          --backend sglang-image --dataset vbench --task i2v --num-prompts 20
 
@@ -721,15 +721,8 @@ async def benchmark(args):
     # except Exception as e:
     #     print(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
-    # Setup dataset
-    if args.backend == "sglang-image":
-        if args.task in ["i2v", "ti2v", "ti2i"]:
-            api_url = f"{args.base_url}/v1/chat/completions"
-            request_func = async_request_chat_completions
-        else:
-            api_url = f"{args.base_url}/v1/images/generations"
-            request_func = async_request_image_sglang
-    elif args.backend == "sglang-video":
+    # Setup dataset (vLLM-Omni supports diffusion via /v1/chat/completions)
+    if args.backend in {"sglang-image", "sglang-video"}:
         api_url = f"{args.base_url}/v1/chat/completions"
         request_func = async_request_chat_completions
     else:
