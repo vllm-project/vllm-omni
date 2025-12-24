@@ -19,7 +19,14 @@ logger = init_logger(__name__)
 
 @dataclass
 class BackgroundResources:
-    """Used as a finalizer for clean shutdown"""
+    """
+    Used as a finalizer for clean shutdown.
+    Create a BackgroundResources instance to encapsulate all background resources
+    (e.g., the scheduler and worker processes) that need explicit cleanup.
+    This object holds references to external system resources that are not managed
+    by Python's garbage collector (like OS processes, message queues, etc.),
+    so they must be cleaned up manually to avoid resource leaks or zombie processes.
+    """
 
     scheduler: Scheduler | None = None
     processes: list[mp.Process] | None = None
@@ -114,7 +121,14 @@ class DiffusionEngine:
             logger.error("Failed to get result queue handle from workers")
 
         self._processes = processes
+
         self.resources = BackgroundResources(scheduler=scheduler, processes=self._processes)
+        # Use weakref.finalize instead of __del__ or relying on self.close() at shutdown.
+        # During interpreter shutdown, global state (e.g., modules, built-ins) may already
+        # be cleared (set to None), so calling normal cleanup methods can fail with
+        # AttributeError: 'NoneType' object has no attribute '...'.
+        # weakref.finalize schedules cleanup *before* such destruction begins,
+        # ensuring resources are released while the runtime environment is still intact.
         self._finalizer = weakref.finalize(self, self.resources)
 
     def _launch_workers(self, broadcast_handle):
@@ -199,6 +213,3 @@ class DiffusionEngine:
 
     def close(self) -> None:
         self._finalizer()
-
-    def __del__(self):  # pragma: no cover - best effort cleanup
-        self.close()
