@@ -374,8 +374,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
-        self._process_additional_information_updates(multimodal_outputs)
-
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
@@ -384,6 +382,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
                 dtype=np.int32,
             )
+
+        self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
 
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
@@ -449,24 +449,3 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
         return async_output
-
-    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
-        req_state = self.requests.get(req_id)
-        if req_state is None:
-            return
-        existing = getattr(req_state, "additional_information_cpu", {})
-        if not isinstance(existing, dict):
-            existing = {}
-        merged = dict(existing)
-        for k, v in upd.items():
-            if isinstance(v, torch.Tensor):
-                merged[k] = v.detach().to("cpu").contiguous()
-            elif isinstance(v, list):
-                merged[k] = [
-                    (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
-                ]
-            else:
-                merged[k] = v
-        setattr(req_state, "additional_information_cpu", merged)
-
-    # ===== Helper functions extracted for clarity and reuse =====
