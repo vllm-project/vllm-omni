@@ -4,7 +4,7 @@
 
 """
 Benchmark online serving for diffusion models (Image/Video Generation).
-
+Before use this benchmark should `uv pip install gdown` first
 
 Usage:
     # Video
@@ -643,12 +643,12 @@ async def benchmark(args):
     # Setup dataset
     if args.backend == "sglang-image":
         if args.task == "i2v":
-            api_url = f"{args.base_url}/v1/images/edits"
+            api_url = f"{args.base_url}/v1/chat/completions"
         else:
             api_url = f"{args.base_url}/v1/images/generations"
         request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
-        api_url = f"{args.base_url}/v1/videos"
+        api_url = f"{args.base_url}/v1/chat/completions"
         request_func = async_request_video_sglang
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
