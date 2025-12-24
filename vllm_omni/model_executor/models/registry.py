@@ -54,6 +54,16 @@ _OMNI_MODELS = {
         "fun_audio_chat",
         "FunAudioChatForConditionalGeneration",
     ),
+    "FunAudioChatCRQDecoder": (
+        "fun_audio_chat",
+        "crq_decoder",
+        "FunAudioChatCRQDecoder",
+    ),
+    "FunAudioChatCosyVoice": (
+        "fun_audio_chat",
+        "cosyvoice",
+        "FunAudioChatCosyVoice",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {

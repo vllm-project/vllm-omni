@@ -30,9 +30,9 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -561,6 +561,9 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 multimodal_embeddings=audio_features,
             )
 
+        # Store text embeddings for CRQ decoder (S2S mode)
+        text_embeds = inputs_embeds.clone()
+
         # Forward through language model
         hidden_states = self.language_model(
             input_ids=None,  # Use embeddings instead
@@ -569,9 +572,21 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             intermediate_tensors=intermediate_tensors,
         )
 
+        # Check if we're in S2S mode (engine_output_type == "latent")
+        engine_output_type = getattr(self.vllm_config.model_config, "engine_output_type", "text")
+
+        # Build multimodal outputs
+        multimodal_outputs: dict[str, Any] = {}
+
+        if engine_output_type == "latent":
+            # S2S mode: output hidden states for CRQ decoder
+            multimodal_outputs["latent"] = hidden_states.reshape(-1, hidden_states.shape[-1])
+            multimodal_outputs["hidden_states"] = hidden_states.reshape(-1, hidden_states.shape[-1])
+            multimodal_outputs["text_embeds"] = text_embeds.reshape(-1, text_embeds.shape[-1])
+
         return OmniOutput(
             text_hidden_states=hidden_states.reshape(-1, hidden_states.shape[-1]),
-            multimodal_outputs={},
+            multimodal_outputs=multimodal_outputs,
         )
 
     def _forward_cosyvoice(
