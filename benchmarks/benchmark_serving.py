@@ -9,22 +9,22 @@ Before use this benchmark should `uv pip install gdown` first
 Usage:
     # Video
     t2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-video --dataset vbench --task t2v --num-prompts 20
+    python3 benchmarks/enchmark_serving.py \
+        --dataset vbench --task t2v --num-prompts 20
 
     i2v:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-video --dataset vbench --task i2v --num-prompts 20
+    python3 benchmarks/enchmark_serving.py \
+        --dataset vbench --task i2v --num-prompts 20
 
 
     # Image
     t2i:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task t2v --num-prompts 20
+    python3 benchmarks/enchmark_serving.py \
+        --dataset vbench --task t2i --num-prompts 20
 
     i2i:
-    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task i2v --num-prompts 20
+    python3 benchmarks/enchmark_serving.py \
+        --dataset vbench --task i2i --num-prompts 20
 
 
 """
@@ -102,13 +102,13 @@ class VBenchDataset(BaseDataset):
 
     def __init__(self, args, api_url: str, model: str):
         super().__init__(args, api_url, model)
-        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "sglang")
+        self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni")
         self.items = self._load_data()
 
     def _load_data(self) -> List[Dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
-        elif self.args.task in ["i2v", "ti2v", "ti2i"]:
+        elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
             return self._load_i2v_data()
         else:
             return self._load_t2v_prompts()
@@ -412,250 +412,6 @@ async def async_request_chat_completions(
     return output
 
 
-async def async_request_image_sglang(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
-
-    # Check if we need to use multipart (for image edits with input images)
-    if input.image_paths and len(input.image_paths) > 0:
-        # Use multipart/form-data for image edits
-        data = aiohttp.FormData()
-        data.add_field("model", input.model)
-        data.add_field("prompt", input.prompt)
-        data.add_field("response_format", "b64_json")
-
-        if input.width and input.height:
-            data.add_field("size", f"{input.width}x{input.height}")
-
-        # Merge extra parameters
-        for key, value in input.extra_body.items():
-            data.add_field(key, str(value))
-
-        # Add image file(s)
-        for idx, img_path in enumerate(input.image_paths):
-            if os.path.exists(img_path):
-                data.add_field(
-                    "image",
-                    open(img_path, "rb"),
-                    filename=os.path.basename(img_path),
-                    content_type="application/octet-stream",
-                )
-            else:
-                output.error = f"Image file not found: {img_path}"
-                output.success = False
-                if pbar:
-                    pbar.update(1)
-                return output
-
-        try:
-            async with session.post(input.api_url, data=data) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    output.response_body = resp_json
-                    output.success = True
-                    if "peak_memory_mb" in resp_json:
-                        output.peak_memory_mb = resp_json["peak_memory_mb"]
-                else:
-                    output.error = f"HTTP {response.status}: {await response.text()}"
-                    output.success = False
-        except Exception as e:
-            output.error = str(e)
-            output.success = False
-    else:
-        # Use JSON for text-to-image generation
-        payload = {
-            "model": input.model,
-            "prompt": input.prompt,
-            "n": 1,
-            "response_format": "b64_json",
-        }
-
-        if input.width and input.height:
-            payload["size"] = f"{input.width}x{input.height}"
-
-        # Merge extra parameters
-        payload.update(input.extra_body)
-
-        try:
-            async with session.post(input.api_url, json=payload) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    output.response_body = resp_json
-                    output.success = True
-                    if "peak_memory_mb" in resp_json:
-                        output.peak_memory_mb = resp_json["peak_memory_mb"]
-                else:
-                    output.error = f"HTTP {response.status}: {await response.text()}"
-                    output.success = False
-        except Exception as e:
-            output.error = str(e)
-            output.success = False
-
-    output.latency = time.perf_counter() - output.start_time
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
-async def async_request_video_sglang(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: Optional[tqdm] = None,
-) -> RequestFuncOutput:
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
-
-    # 1. Submit Job
-    job_id = None
-
-    # Check if we need to upload images (Multipart) or just send JSON
-    if input.image_paths and len(input.image_paths) > 0:
-        # Use multipart/form-data
-        data = aiohttp.FormData()
-        data.add_field("model", input.model)
-        data.add_field("prompt", input.prompt)
-
-        if input.width and input.height:
-            data.add_field("size", f"{input.width}x{input.height}")
-
-        # Add extra body fields to form data if possible, or assume simple key-values
-        # Note: Nested dicts in extra_body might need JSON serialization if API expects it stringified
-        if input.extra_body:
-            data.add_field("extra_body", json.dumps(input.extra_body))
-
-        # Explicitly add fps/num_frames if they are not in extra_body (bench_serving logic overrides)
-        if input.num_frames:
-            data.add_field("num_frames", str(input.num_frames))
-        if input.fps:
-            data.add_field("fps", str(input.fps))
-
-        # Add image file
-        # Currently only support single image upload as 'input_reference' per API spec
-        img_path = input.image_paths[0]
-        if os.path.exists(img_path):
-            data.add_field(
-                "input_reference",
-                open(img_path, "rb"),
-                filename=os.path.basename(img_path),
-                content_type="application/octet-stream",
-            )
-        else:
-            output.error = f"Image file not found: {img_path}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-
-        try:
-            async with session.post(input.api_url, data=data) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    job_id = resp_json.get("id")
-                else:
-                    output.error = (
-                        f"Submit failed HTTP {response.status}: {await response.text()}"
-                    )
-                    output.success = False
-                    if pbar:
-                        pbar.update(1)
-                    return output
-        except Exception as e:
-            output.error = f"Submit exception: {str(e)}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-
-    else:
-        # Use JSON
-        payload = {
-            "model": input.model,
-            "prompt": input.prompt,
-        }
-        if input.width and input.height:
-            payload["size"] = f"{input.width}x{input.height}"
-        if input.num_frames:
-            payload["num_frames"] = input.num_frames
-        if input.fps:
-            payload["fps"] = input.fps
-
-        payload.update(input.extra_body)
-
-        try:
-            async with session.post(input.api_url, json=payload) as response:
-                if response.status == 200:
-                    resp_json = await response.json()
-                    job_id = resp_json.get("id")
-                else:
-                    output.error = (
-                        f"Submit failed HTTP {response.status}: {await response.text()}"
-                    )
-                    output.success = False
-                    if pbar:
-                        pbar.update(1)
-                    return output
-        except Exception as e:
-            output.error = f"Submit exception: {str(e)}"
-            output.success = False
-            if pbar:
-                pbar.update(1)
-            return output
-
-    if not job_id:
-        output.error = "No job_id returned"
-        output.success = False
-        if pbar:
-            pbar.update(1)
-        return output
-
-    # 2. Poll for completion
-    # Assuming the API returns a 'status' field.
-    # We construct the check URL. Assuming api_url is like .../v1/videos
-    # The check url should be .../v1/videos/{id}
-    check_url = f"{input.api_url}/{job_id}"
-
-    while True:
-        try:
-            async with session.get(check_url) as response:
-                if response.status == 200:
-                    status_data = await response.json()
-                    status = status_data.get("status")
-                    if status == "completed":
-                        output.success = True
-                        output.response_body = status_data
-                        if "peak_memory_mb" in status_data:
-                            output.peak_memory_mb = status_data["peak_memory_mb"]
-                        break
-                    elif status == "failed":
-                        output.success = False
-                        output.error = f"Job failed: {status_data.get('error')}"
-                        break
-                    else:
-                        # queued or processing
-                        await asyncio.sleep(1.0)
-                else:
-                    output.success = False
-                    output.error = (
-                        f"Poll failed HTTP {response.status}: {await response.text()}"
-                    )
-                    break
-        except Exception as e:
-            output.success = False
-            output.error = f"Poll exception: {str(e)}"
-            break
-
-    output.latency = time.perf_counter() - output.start_time
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
 def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
     success_outputs = [o for o in outputs if o.success]
     error_outputs = [o for o in outputs if not o.success]
@@ -722,11 +478,8 @@ async def benchmark(args):
     #     print(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
     # Setup dataset (vLLM-Omni supports diffusion via /v1/chat/completions)
-    if args.backend in {"sglang-image", "sglang-video"}:
-        api_url = f"{args.base_url}/v1/chat/completions"
-        request_func = async_request_chat_completions
-    else:
-        raise ValueError(f"Unknown backend: {args.backend}")
+    api_url = f"{args.base_url}/v1/chat/completions"
+    request_func = async_request_chat_completions
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
@@ -842,13 +595,6 @@ if __name__ == "__main__":
         description="Benchmark serving for diffusion models."
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        required=True,
-        choices=["sglang-image", "sglang-video"],
-        help="Backend type.",
-    )
-    parser.add_argument(
         "--base-url",
         type=str,
         default=None,
@@ -868,7 +614,7 @@ if __name__ == "__main__":
         "--task",
         type=str,
         default="t2v",
-        choices=["t2v", "i2v", "ti2v", "ti2i"],
+        choices=["t2v", "i2v", "ti2v", "ti2i", "i2i", "t2i"],
         help="Task type.",
     )
     parser.add_argument(
