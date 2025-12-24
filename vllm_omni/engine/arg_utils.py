@@ -6,12 +6,6 @@ from vllm.logger import init_logger
 from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
-# 导入即可触发 AutoConfig 注册，确保自定义 mammothmoda2* model_type 被识别
-from vllm_omni.model_executor.models.mammoth_moda2.configuration_mammothmoda2 import (  # noqa: F401
-    Mammothmoda2Config,
-    Mammothmoda2Qwen2_5_VLConfig,
-    Mammothmoda2Qwen2_5_VLTextConfig,
-)
 
 logger = init_logger(__name__)
 
