@@ -123,6 +123,18 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         }
         return [info for _ in range(num_reqs)]
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # DiT stage does not consume token embeddings; return a dummy tensor.
+        try:
+            dtype = next(self.parameters()).dtype
+        except StopIteration:
+            dtype = torch.float32
+        return torch.zeros(
+            (input_ids.numel(), self._llm_hidden_size),
+            device=input_ids.device,
+            dtype=dtype,
+        )
+
     @torch.inference_mode()
     def forward(
         self,

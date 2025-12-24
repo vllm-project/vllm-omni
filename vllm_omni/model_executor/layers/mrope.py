@@ -132,6 +132,17 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # M-RoPE uses 2D positions; custom op only supports 1D positions.
+        if positions.ndim == 2:
+            return MRotaryEmbedding.forward(self, positions, query, key)
+        return super().forward_cuda(positions, query, key)
+
     @classmethod
     def get_input_positions(
         cls,

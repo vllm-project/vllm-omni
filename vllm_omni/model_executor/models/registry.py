@@ -95,6 +95,20 @@ if hasattr(VLLMModelRegistry, "register_model"):
         "Mammothmoda2Model",
         "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2:MammothModa2ForConditionalGeneration",
     )
+    VLLMModelRegistry.register_model(
+        "MammothModa2ARForConditionalGeneration",
+        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2_ar:MammothModa2ARForConditionalGeneration",
+    )
+    VLLMModelRegistry.register_model(
+        "MammothModa2DiTForConditionalGeneration",
+        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2_dit:"
+        "MammothModa2DiTForConditionalGeneration",
+    )
+    VLLMModelRegistry.register_model(
+        "MammothModa2Qwen2ForCausalLM",
+        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2_ar:"
+        "MammothModa2Qwen2ForCausalLM",
+    )
 
 OmniModelRegistry = _ModelRegistry(
     {

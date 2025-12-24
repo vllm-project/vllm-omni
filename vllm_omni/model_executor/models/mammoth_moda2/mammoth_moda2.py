@@ -95,6 +95,12 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         return self.model
 
     def get_multimodal_embeddings(self, **kwargs: object):
+        # 兼容旧接口：统一走 embed_multimodal。
+        return self.embed_multimodal(**kwargs)
+
+    def embed_multimodal(self, **kwargs: object):
+        if hasattr(self.model, "embed_multimodal"):
+            return self.model.embed_multimodal(**kwargs)
         if hasattr(self.model, "get_multimodal_embeddings"):
             return self.model.get_multimodal_embeddings(**kwargs)
         return []

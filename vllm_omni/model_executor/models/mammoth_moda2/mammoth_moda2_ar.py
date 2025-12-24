@@ -1,9 +1,9 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from itertools import islice
 from typing import Any, Callable, Optional, Union
 from copy import deepcopy
 import json
-import Path
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -39,6 +39,12 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
     init_vllm_registered_model,
+)
+
+from vllm.transformers_utils.config import (
+    is_interleaved,
+    patch_rope_parameters,
+    set_default_rope_theta,
 )
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -151,6 +157,10 @@ class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
             **kwargs,
         )
 
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # MammothModa2 当前仅支持图像，不支持视频输入。
+        return {"image": None}
+
 
 class MammothModa2ARDummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
     """复用 Qwen2.5-VL 的 dummy 输入生成逻辑。"""
@@ -171,18 +181,17 @@ class Mammoth2DecoderLayer(nn.Module):
         self,
         config: Qwen2Config,
         layer_idx: int,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        dual_chunk_attention_config = getattr(config,
-                                              "dual_chunk_attention_config",
-                                              None)
+        patch_rope_parameters(config)
+        set_default_rope_theta(config, default_theta=1000000)
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
 
         # By default, Qwen2 uses causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable
@@ -198,10 +207,9 @@ class Mammoth2DecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
             cache_config=cache_config,
             quant_config=quant_config,
-            rope_scaling=rope_scaling,
+            rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
             dual_chunk_attention_config=dual_chunk_attention_config,
@@ -225,10 +233,10 @@ class Mammoth2DecoderLayer(nn.Module):
         else:
             self.gen_mlp = None
         
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -424,6 +432,9 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             gen_ids = flat_ids[gen_pos] - int(self.gen_vocab_start_index)
             out[gen_pos] = self.gen_embed_tokens(gen_ids)
         return out.view(*input_ids.shape, -1).contiguous()
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.get_input_embeddings(input_ids)
 
     def forward(
         self,
@@ -732,6 +743,73 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 row[end_of_image_id] = 1.0  # Allow only end_of_image_id after expected tokens
 
         return logits
+
+    def _build_dummy_mm_embeddings(
+        self,
+        grid_thw: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """在 profiling 路径兜底生成零向量 embedding，避免 mm sanity check 失败。"""
+        if not isinstance(grid_thw, torch.Tensor) or grid_thw.numel() == 0:
+            return []
+        if grid_thw.ndim != 2 or grid_thw.shape[-1] != 3:
+            return []
+
+        merge_size = getattr(self.visual, "spatial_merge_size", 1)  # type: ignore[union-attr]
+        hidden_size = int(self.language_model.config.hidden_size)
+        device = self.visual.device if self.visual is not None else grid_thw.device
+        dtype = self.visual.dtype if self.visual is not None else torch.float16
+
+        embeds: list[torch.Tensor] = []
+        for t, h, w in grid_thw.tolist():
+            tokens = int(t * h * w) // int(merge_size) // int(merge_size)
+            embeds.append(
+                torch.zeros((tokens, hidden_size), device=device, dtype=dtype)
+            )
+        return embeds
+
+    def _normalize_mm_kwargs(
+        self,
+        kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        """将 batch 维展开为 vLLM 期望的扁平形状。"""
+        out = dict(kwargs)
+        pv = out.get("pixel_values")
+        if isinstance(pv, torch.Tensor) and pv.ndim == 3:
+            out["pixel_values"] = pv.reshape(-1, pv.shape[-1])
+        pv_v = out.get("pixel_values_videos")
+        if isinstance(pv_v, torch.Tensor) and pv_v.ndim == 3:
+            out["pixel_values_videos"] = pv_v.reshape(-1, pv_v.shape[-1])
+        ig = out.get("image_grid_thw")
+        if isinstance(ig, torch.Tensor) and ig.ndim == 3 and ig.shape[1] == 1:
+            out["image_grid_thw"] = ig.squeeze(1)
+        vg = out.get("video_grid_thw")
+        if isinstance(vg, torch.Tensor) and vg.ndim == 3 and vg.shape[1] == 1:
+            out["video_grid_thw"] = vg.squeeze(1)
+        ie = out.get("image_embeds")
+        if isinstance(ie, torch.Tensor) and ie.ndim == 3:
+            out["image_embeds"] = ie.reshape(-1, ie.shape[-1])
+        ve = out.get("video_embeds")
+        if isinstance(ve, torch.Tensor) and ve.ndim == 3:
+            out["video_embeds"] = ve.reshape(-1, ve.shape[-1])
+        return out
+
+    def embed_multimodal(self, **kwargs: object) -> list[torch.Tensor]:
+        # 先走原生实现（支持 pixel_values / image_embeds / video_embeds）。
+        mm_kwargs = self._normalize_mm_kwargs(kwargs)
+        mm_embeddings = super().embed_multimodal(**mm_kwargs)
+        if mm_embeddings:
+            return list(mm_embeddings)
+
+        # vLLM profiling 的 dummy mm inputs 在某些路径下只带 grid 元信息，
+        # 此时需要构造占位 embedding 以通过 sanity check。
+        embeds: list[torch.Tensor] = []
+        image_grid_thw = mm_kwargs.get("image_grid_thw")
+        video_grid_thw = mm_kwargs.get("video_grid_thw")
+        if isinstance(image_grid_thw, torch.Tensor):
+            embeds.extend(self._build_dummy_mm_embeddings(image_grid_thw))
+        if isinstance(video_grid_thw, torch.Tensor):
+            embeds.extend(self._build_dummy_mm_embeddings(video_grid_thw))
+        return embeds
 
 
     def forward(
