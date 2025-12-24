@@ -20,8 +20,10 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.11.0 --torch-backend=auto
+uv pip install vllm==0.12.0 --torch-backend=auto
 ```
+
+**Note:** If you encounter attn errors after upgrading vllm to 0.12.0, you can uninstall or upgrade xformers manually since vllm 0.12.0 has deprecated xformers dependency.
 
 #### Installation of vLLM-Omni
 
