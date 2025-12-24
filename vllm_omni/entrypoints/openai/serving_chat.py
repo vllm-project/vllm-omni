@@ -232,7 +232,10 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
-                    sampling_params_list = None
+                    # Use standard OpenAI API parameters for thinker stage
+                    sampling_params_list = self._build_sampling_params_list_from_request(
+                        request
+                    )
 
                 self._log_inputs(
                     request_id,
@@ -406,6 +409,58 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list
+
+    def _get_thinker_stage_index(self) -> int:
+        for idx, stage in enumerate(self.engine_client.stage_list):
+            if stage.is_comprehension:
+                return idx
+        raise ValueError("No thinker stage (is_comprehension=True) found in stage_list")
+
+    def _sampling_params_to_dict(self, params: SamplingParams) -> dict:
+        return {
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "top_k": params.top_k,
+            "min_p": params.min_p,
+            "repetition_penalty": params.repetition_penalty,
+            "stop_token_ids": params.stop_token_ids,
+            "max_tokens": params.max_tokens,
+        }
+
+    def _build_sampling_params_list_from_request(
+        self,
+        request: ChatCompletionRequest,
+    ) -> list[SamplingParams]:
+        """Build sampling_params_list using standard OpenAI API parameters.
+
+        For the thinker stage, converts OpenAI API parameters (max_tokens, temperature,
+        top_p, etc.) to SamplingParams. For other stages, uses default sampling params.
+
+        Args:
+            request: The chat completion request containing OpenAI API parameters.
+
+        Returns:
+            List of SamplingParams, one for each stage.
+        """
+        default_params_list = self.engine_client.default_sampling_params_list
+        thinker_idx = self._get_thinker_stage_index()
+
+        sampling_params_list = []
+        for idx, default_params in enumerate(default_params_list):
+            if idx == thinker_idx:
+                default_dict = self._sampling_params_to_dict(default_params)
+                max_tokens = request.max_tokens or default_params.max_tokens
+                params = request.to_sampling_params(
+                    max_tokens=max_tokens,
+                    logits_processor_pattern=None,
+                    default_sampling_params=default_dict,
+                )
+                sampling_params_list.append(params)
+            else:
+                # For other stages, clone default params
+                sampling_params_list.append(default_params.clone())
+
+        return sampling_params_list
 
     def _log_inputs(
         self,
