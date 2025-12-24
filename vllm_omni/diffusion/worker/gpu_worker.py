@@ -132,6 +132,7 @@ class GPUWorker:
         destroy_distributed_env()
 
     def _init_omni_connector(self) -> None:
+        # TODO(wzliu)! get real connector from yaml file instead of hardcode
         """Initialize OmniConnector for KV cache transfer."""
         # Only initialize connector if we are in consumer role or have specific config
         # TODO: Better configuration for roles
@@ -144,8 +145,8 @@ class GPUWorker:
             from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
             from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
-            # Use environment variables as fallback, but prefer config if available (future)
-            # Default to MooncakeConnector for testing without manual metadata transfer
+            # TODO(wzliu)! here hard code using mooncake connector for testing
+            # because shared memory connector requires metadata transfer carried by the queue
             connector_config = {
                 "type": os.environ.get("OMNI_CONNECTOR_TYPE", "MooncakeConnector"),
                 "shm_threshold_bytes": 65536,
@@ -170,6 +171,7 @@ class GPUWorker:
 
     def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
         """Receive KV cache for a request via OmniConnector."""
+        # TODO(wzliu)! must get control info from stage queue instead of hardcode
         if not req.request_id:
             logger.warning("Request has no ID, cannot receive KV cache")
             return

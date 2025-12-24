@@ -547,6 +547,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         pass
 
     def _extract_kv_cache_for_requests(self, req_data: dict[str, dict]) -> dict[str, any]:
+        # TODO(wzliu)! Optimize kv cache transfer using rdma
         """Extract KV cache data for specific requests using provided block IDs."""
         result = {}
 
@@ -711,6 +712,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             traceback.print_exc()
 
     def _get_omni_connector_config(self) -> dict[str, Any] | None:
+        # TODO(wzliu)! get real connector from yaml file instead of hardcode
         """Get OmniConnector configuration from system config."""
         try:
             # Try to get from vLLM config first (if configured for KV transfer)
@@ -793,9 +795,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 success, size, metadata = connector.put(
                     from_stage=from_stage, to_stage=to_stage, request_id=request_id, data=data
                 )
-                # TODO! if no sleep, data actually not stored
-                import time
-
+                # TODO(wzliu)! in offline mode + mooncake connectorif no sleep,
+                # data actually not stored due to the exit of process
                 time.sleep(20)
 
                 if success:
@@ -811,11 +812,3 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 time.sleep(retry_delay * (2**attempt))
 
         return False, 0, None
-
-    # ===== TODO: 需要实现的接收端逻辑 =====
-    # 1. 实现接收端KV cache组装逻辑
-    # 2. 在目标stage的gpu model runner中添加接收处理
-    # 3. 确保KV cache正确放置到目标内存位置
-    # 4. 处理跨节点状态同步
-
-    # ===== Helper functions extracted for clarity and reuse =====

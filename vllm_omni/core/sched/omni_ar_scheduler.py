@@ -311,6 +311,7 @@ class OmniARScheduler(VLLMScheduler):
         return engine_core_outputs
 
     def _free_request(self, request: Request) -> dict[str, Any] | None:
+        # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
         """Mark a request as finished and free its resources."""
         # This overrides VLLMScheduler._free_request completely to add delayed freeing logic.
 
