@@ -57,21 +57,6 @@ class ParallelAttentionStrategy(Protocol):
     ) -> torch.Tensor:
         """Runs after the attention kernel."""
 
-    def run_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata | None,
-        softmax_scale: float | None = None,
-        causal: bool = False,
-    ) -> torch.Tensor:
-        """Runs the actual attention kernel for this strategy.
-        
-        Optional: If not implemented, the standard local attention kernel will be used.
-        """
-        raise NotImplementedError
-
 
 class NoParallelAttention:
     """Default strategy: do nothing (single device / no SP)."""

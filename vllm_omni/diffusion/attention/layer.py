@@ -128,3 +128,15 @@ class Attention(nn.Module):
         
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
+
+    def _run_ring_attention(self, query, key, value, attn_metadata):
+        # Delegate to RingParallelAttention strategy if available
+        if self.ring_runner is not None:
+             return self.ring_runner.run_attention(
+                 query, key, value, attn_metadata, 
+                 softmax_scale=self.softmax_scale,
+                 causal=self.causal
+             )
+
+        raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
+
