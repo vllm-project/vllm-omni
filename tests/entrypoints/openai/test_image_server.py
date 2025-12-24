@@ -110,6 +110,7 @@ class MockGenerationResult:
 def mock_async_diffusion():
     """Mock AsyncOmniDiffusion instance that returns fake images"""
     mock = Mock()
+    mock.is_running = True  # Required for health check endpoint
 
     async def generate(**kwargs):
         # Return n PIL images wrapped in result object
