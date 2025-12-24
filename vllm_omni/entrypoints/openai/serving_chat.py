@@ -1146,10 +1146,15 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             else:
                 # AsyncOmniDiffusion: direct call
                 result = await self._diffusion_engine.generate(**gen_kwargs)
+            # Extract images from result
+            # Handle nested OmniRequestOutput structure where images might be in request_output
+            images: list[Image.Image] = []
+            if result.request_output["images"]:
+                images = result.request_output["images"]
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
-            for img in result.images:
+            for img in images:
                 with BytesIO() as buffer:
                     img.save(buffer, format="PNG")
                     img_bytes = buffer.getvalue()
@@ -1204,7 +1209,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             logger.info(
                 "Diffusion chat completed for request %s: %d images",
                 request_id,
-                len(result.images),
+                len(images),
             )
 
             return response

@@ -345,27 +345,18 @@ def main():
         logger.info("Outputs: %s", outputs)
 
         # Extract images from OmniRequestOutput
-        # Handle both OmniRequestOutput list and direct images list
-        images = []
-        if isinstance(outputs, list) and len(outputs) > 0:
-            first_output = outputs[0]
-            # Check if it's OmniRequestOutput with images attribute
-            if hasattr(first_output, "images") and first_output.images:
-                images = first_output.images
-            elif hasattr(first_output, "request_output") and first_output.request_output:
-                req_out = first_output.request_output
-                if isinstance(req_out, list):
-                    req_out = req_out[0]
-                if hasattr(req_out, "images"):
-                    images = req_out.images or []
-            # Check if outputs is already a list of images
-            elif isinstance(first_output, Image.Image):
-                images = outputs
-        elif isinstance(outputs, Image.Image):
-            images = [outputs]
+        # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0]['images']
+        first_output = outputs[0]
+        if not hasattr(first_output, "request_output") or not first_output.request_output:
+            raise ValueError("No request_output found in OmniRequestOutput")
 
+        req_out = first_output.request_output[0]
+        if not isinstance(req_out, dict) or "images" not in req_out:
+            raise ValueError("Invalid request_output structure or missing 'images' key")
+
+        images = req_out["images"]
         if not images:
-            raise ValueError("No images found in omni.generate() output")
+            raise ValueError("No images found in request_output")
 
         # Save output image(s)
         output_path = Path(args.output)

@@ -40,7 +40,7 @@ def generate_image(
         extra_body["seed"] = seed
     if negative_prompt:
         extra_body["negative_prompt"] = negative_prompt
-    # 与 run_curl_text_to_image.sh 保持一致，始终发送 num_outputs_per_prompt
+    # Keep consistent with run_curl_text_to_image.sh, always send num_outputs_per_prompt
     extra_body["num_outputs_per_prompt"] = num_outputs_per_prompt
 
     # Build request payload
@@ -112,7 +112,7 @@ def create_demo(server_url: str):
                         label="Inference Steps",
                         minimum=10,
                         maximum=100,
-                        # 默认步数与 run_curl_text_to_image.sh 对齐为 100
+                        # Default steps aligned with run_curl_text_to_image.sh to 100
                         value=100,
                         step=5,
                     )

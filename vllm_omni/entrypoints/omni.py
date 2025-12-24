@@ -121,7 +121,6 @@ class Omni:
                     }
                 ]
                 default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
-                logger.info(f"default_stage_cfg: {default_stage_cfg}")
                 self.stage_configs = OmegaConf.create(default_stage_cfg)
         else:
             self.config_path = stage_configs_path
@@ -368,7 +367,6 @@ class Omni:
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
-            logger.info(f"task: {task}")
             self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
             logger.debug("[Orchestrator] Enqueued request %s to stage-0", req_id)

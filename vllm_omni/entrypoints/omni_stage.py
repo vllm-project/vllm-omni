@@ -558,18 +558,8 @@ def _stage_worker(
     )
     try:
         if stage_type == "diffusion":
-            # For diffusion, we need to extract diffusion-specific config
-            od_config = engine_args.get("od_config", {})
-            if not od_config:
-                # Create default config from engine_args
-                od_config = {"model": model}
-                # Copy relevant diffusion args
-                for key in ["model", "device", "dtype", "enable_cpu_offload"]:
-                    if key in engine_args:
-                        od_config[key] = engine_args[key]
-            stage_engine = OmniDiffusion(
-                od_config=od_config, **{k: v for k, v in engine_args.items() if k != "od_config"}
-            )
+            engine_args.pop("model_stage")
+            stage_engine = OmniDiffusion(**engine_args)
         else:
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)

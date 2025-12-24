@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="qwen_image_output1.png",
+        default="qwen_image_output.png",
         help="Path to save the generated image (PNG).",
     )
     parser.add_argument(
@@ -148,7 +148,18 @@ def main():
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    images = outputs[0].request_output[0].images
+    # Extract images from request_output[0]['images']
+    first_output = outputs[0]
+    if not hasattr(first_output, "request_output") or not first_output.request_output:
+        raise ValueError("No request_output found in OmniRequestOutput")
+
+    req_out = first_output.request_output[0]
+    if not isinstance(req_out, dict) or "images" not in req_out:
+        raise ValueError("Invalid request_output structure or missing 'images' key")
+
+    images = req_out["images"]
+    if not images:
+        raise ValueError("No images found in request_output")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
