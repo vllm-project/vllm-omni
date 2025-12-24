@@ -10,21 +10,22 @@ Usage:
     # Video
     t2v:
     python3 benchmarks/enchmark_serving.py \
-        --dataset vbench --task t2v --num-prompts 20
+        --dataset vbench --task t2v --num-prompts 10 \
+        --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/enchmark_serving.py \
-        --dataset vbench --task i2v --num-prompts 20
+        --dataset vbench --task i2v --num-prompts 10
 
 
     # Image
     t2i:
     python3 benchmarks/enchmark_serving.py \
-        --dataset vbench --task t2i --num-prompts 20
+        --dataset vbench --task t2i --num-prompts 10
 
     i2i:
     python3 benchmarks/enchmark_serving.py \
-        --dataset vbench --task i2i --num-prompts 20
+        --dataset vbench --task i2i --num-prompts 10
 
 
 """
@@ -531,7 +532,6 @@ async def benchmark(args):
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
     # Section 1: Configuration
-    print("{:<40} {:<15}".format("Backend:", args.backend))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
