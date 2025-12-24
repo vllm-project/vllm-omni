@@ -14,9 +14,11 @@ vLLM-Omni currently supports two main cache acceleration backends:
 
 Both methods can provide significant speedups (typically **1.5x-2.0x**) while maintaining high output quality.
 
-vLLM-Omni also supports the sequence parallelism (SP) for the diffusion model, that includes:
+vLLM-Omni also supports parallelism methods for diffusion models, including:
 
 1. [Ulysses-SP](acceleration/parallelism_acceleration.md#ulysses-sp) - splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
+
+2. [CFG-Parallel](acceleration/parallelism_acceleration.md#cfg-parallel) - runs the positive/negative prompts of classifier-free guidance (CFG) on different devices, then merges on a single device to perform the scheduler step.
 
 ## Quick Comparison
 
@@ -129,7 +131,7 @@ ulysses_degree = 2
 
 omni = Omni(
     model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
+    parallel_config=DiffusionParallelConfig(ulysses_degree=ulysses_degree)
 )
 
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
@@ -144,11 +146,32 @@ ulysses_degree = 2
 
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
+    parallel_config=DiffusionParallelConfig(ulysses_degree=ulysses_degree)
 )
 
 outputs = omni.generate(prompt="turn this cat to a dog",
         pil_image=input_image, num_inference_steps=50)
+```
+
+
+### Using CFG-Parallel
+
+Run image-to-image:
+
+CFG-Parallel splits the CFG positive/negative branches across GPUs. Use it when you set a non-trivial `true_cfg_scale`.
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+cfg_parallel_size = 2
+
+omni = Omni(
+    model="Qwen/Qwen-Image-Edit",
+    parallel_config=DiffusionParallelConfig(cfg_parallel_size=cfg_parallel_size)
+)
+
+outputs = omni.generate(prompt="turn this cat to a dog",
+        pil_image=input_image, num_inference_steps=50, true_cfg_scale=4.0)
 ```
 
 ## Documentation
