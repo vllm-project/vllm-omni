@@ -92,7 +92,6 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
         elif feature_attention_mask is not None and isinstance(feature_attention_mask, list):
             for i in range(len(feature_attention_mask)):
                 feature_attention_mask[i] = feature_attention_mask[i].reshape(-1)
-            # feature_attention_mask = torch.cat(feature_attention_mask, dim=-1)
         return Qwen2_5OmniAudioFeatureInputs(
             type="audio_features",
             input_features=input_audio_features,
