@@ -64,7 +64,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
-
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
     return parser.parse_args()
 
 
@@ -106,7 +112,9 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree, cfg_parallel_size=args.cfg_parallel_size
+    )
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
@@ -122,7 +130,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, cfg_parallel_size={args.cfg_parallel_size}")
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
