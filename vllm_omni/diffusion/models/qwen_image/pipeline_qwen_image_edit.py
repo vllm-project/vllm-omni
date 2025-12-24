@@ -601,6 +601,8 @@ class QwenImageEditPipeline(
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
+            self.transformer.do_true_cfg = do_true_cfg  # used in teacache hook
+            # Forward pass for positive prompt (or unconditional if no CFG)
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep / 1000,
@@ -614,6 +616,7 @@ class QwenImageEditPipeline(
             )[0]
             noise_pred = noise_pred[:, : latents.size(1)]
 
+            # Forward pass for negative prompt (CFG)
             if do_true_cfg:
                 neg_noise_pred = self.transformer(
                     hidden_states=latent_model_input,

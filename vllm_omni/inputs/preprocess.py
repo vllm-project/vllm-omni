@@ -36,7 +36,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             inputs = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,
-                parsed_content.get("mm_processor_kwargs"),
+                parsed_content.get("mm_processor_kwargs") or {},
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )

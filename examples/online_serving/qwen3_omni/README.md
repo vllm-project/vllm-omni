@@ -78,25 +78,72 @@ sudo apt update
 sudo apt install ffmpeg
 ```
 
+## Modality control
+If you want to control output modalities, e.g. only output text, you can run the command below:
+```bash
+python openai_chat_completion_client_for_multimodal_generation.py \
+    --query-type use_image \
+    --modalities text
+```
+
 ## Run Local Web UI Demo
 
 This Web UI demo allows users to interact with the model through a web browser.
 
 ### Running Gradio Demo
 
-Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmni by
+The Gradio demo connects to a vLLM API server. You have two options:
+
+#### Option 1: One-step Launch Script (Recommended)
+
+The convenience script launches both the vLLM server and Gradio demo together:
 
 ```bash
-python gradio_demo.py  --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 7861
+./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8091 --gradio-port 7861
+```
+
+This script will:
+1. Start the vLLM server in the background
+2. Wait for the server to be ready
+3. Launch the Gradio demo
+4. Handle cleanup when you press Ctrl+C
+
+The script supports the following arguments:
+- `--model`: Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)
+- `--server-port`: Port for vLLM server (default: 8091)
+- `--gradio-port`: Port for Gradio demo (default: 7861)
+- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
+- `--server-host`: Host for vLLM server (default: 0.0.0.0)
+- `--gradio-ip`: IP for Gradio demo (default: 127.0.0.1)
+- `--share`: Share Gradio demo publicly (creates a public link)
+
+#### Option 2: Manual Launch (Two-Step Process)
+
+**Step 1: Launch the vLLM API server**
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+If you have custom stage configs file:
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+```
+
+**Step 2: Run the Gradio demo**
+
+In a separate terminal:
+
+```bash
+python gradio_demo.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --api-base http://localhost:8091/v1 --port 7861
 ```
 
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.
 
-
 The gradio script supports the following arguments:
 
-- `--model`: Model name
+- `--model`: Model name/path (should match the server model)
+- `--api-base`: Base URL for the vLLM API server (default: http://localhost:8091/v1)
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
-- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
 - `--share`: Share the Gradio demo publicly (creates a public link)

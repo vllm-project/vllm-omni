@@ -4,13 +4,50 @@
 """
 Example script for image editing with Qwen-Image-Edit.
 
-Usage:
+Usage (single image):
     python image_edit.py \
         --image input.png \
         --prompt "Let this mascot dance under the moon, surrounded by floating stars and poetic bubbles such as 'Be Kind'" \
         --output output_image_edit.png \
         --num_inference_steps 50 \
-        --cfg_scale 4.0
+        --cfg_scale 4.0 \
+        --guidance_scale 1.0
+
+Usage (multiple images):
+    python image_edit.py \
+        --image input1.png input2.png input3.png \
+        --prompt "Combine these images into a single scene" \
+        --output output_image_edit.png \
+        --num_inference_steps 50 \
+        --cfg_scale 4.0 \
+        --guidance_scale 1.0
+
+Usage (with cache-dit acceleration):
+    python image_edit.py \
+        --image input.png \
+        --prompt "Edit description" \
+        --cache_backend cache_dit \
+        --cache_dit_max_continuous_cached_steps 3 \
+        --cache_dit_residual_diff_threshold 0.24 \
+        --cache_dit_enable_taylorseer
+
+Usage (with tea_cache acceleration):
+    python image_edit.py \
+        --image input.png \
+        --prompt "Edit description" \
+        --cache_backend tea_cache \
+        --tea_cache_rel_l1_thresh 0.25
+
+Usage (layered):
+    python image_edit.py \
+        --model "Qwen/Qwen-Image-Layered" \
+        --image input.png \
+        --prompt "" \
+        --output "layered" \
+        --num_inference_steps 50 \
+        --cfg_scale 4.0 \
+        --layers 4 \
+        --color-format "RGBA"
 
 For more options, run:
     python image_edit.py --help
@@ -24,6 +61,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -33,13 +71,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image-Edit",
-        help="Diffusion model name or local path.",
+        help=(
+            "Diffusion model name or local path. "
+            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or Qwen/Qwen-Image-Edit-2511"
+            "which supports QwenImageEditPlusPipeline."
+        ),
     )
     parser.add_argument(
         "--image",
         type=str,
+        nargs="+",
         required=True,
-        help="Path to input image file (PNG, JPG, etc.).",
+        help="Path(s) to input image file(s) (PNG, JPG, etc.). Can specify multiple images.",
     )
     parser.add_argument(
         "--prompt",
@@ -63,13 +106,28 @@ def parse_args() -> argparse.Namespace:
         "--cfg_scale",
         type=float,
         default=4.0,
-        help="True classifier-free guidance scale specific to Qwen-Image-Edit.",
+        help=(
+            "True classifier-free guidance scale (default: 4.0). Guidance scale as defined in Classifier-Free "
+            "Diffusion Guidance. Classifier-free guidance is enabled by setting cfg_scale > 1 and providing "
+            "a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, "
+            "usually at the expense of lower image quality."
+        ),
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Guidance scale for guidance-distilled models (default: 1.0, disabled). "
+            "Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale "
+            "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
+        ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default="output_image_edit.png",
-        help="Path to save the edited image (PNG).",
+        help=("Path to save the edited image (PNG). Or prefix for Qwen-Image-Layered model save images(PNG)."),
     )
     parser.add_argument(
         "--num_outputs_per_prompt",
@@ -94,19 +152,114 @@ def parse_args() -> argparse.Namespace:
             "Default: None (no cache acceleration)."
         ),
     )
+    parser.add_argument(
+        "--ulysses_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+
+    parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=640,
+        help="Bucket in (640, 1024) to determine the condition and output resolution",
+    )
+
+    parser.add_argument(
+        "--color-format",
+        type=str,
+        default="RGB",
+        help="For Qwen-Image-Layered, set to RGBA.",
+    )
+
+    # Cache-DiT specific parameters
+    parser.add_argument(
+        "--cache_dit_fn_compute_blocks",
+        type=int,
+        default=1,
+        help="[cache-dit] Number of forward compute blocks. Optimized for single-transformer models.",
+    )
+    parser.add_argument(
+        "--cache_dit_bn_compute_blocks",
+        type=int,
+        default=0,
+        help="[cache-dit] Number of backward compute blocks.",
+    )
+    parser.add_argument(
+        "--cache_dit_max_warmup_steps",
+        type=int,
+        default=4,
+        help="[cache-dit] Maximum warmup steps (works for few-step models).",
+    )
+    parser.add_argument(
+        "--cache_dit_residual_diff_threshold",
+        type=float,
+        default=0.24,
+        help="[cache-dit] Residual diff threshold. Higher values enable more aggressive caching.",
+    )
+    parser.add_argument(
+        "--cache_dit_max_continuous_cached_steps",
+        type=int,
+        default=3,
+        help="[cache-dit] Maximum continuous cached steps to prevent precision degradation.",
+    )
+    parser.add_argument(
+        "--cache_dit_enable_taylorseer",
+        action="store_true",
+        default=False,
+        help="[cache-dit] Enable TaylorSeer acceleration (not suitable for few-step models).",
+    )
+    parser.add_argument(
+        "--cache_dit_taylorseer_order",
+        type=int,
+        default=1,
+        help="[cache-dit] TaylorSeer polynomial order.",
+    )
+    parser.add_argument(
+        "--cache_dit_scm_steps_mask_policy",
+        type=str,
+        default=None,
+        choices=[None, "slow", "medium", "fast", "ultra"],
+        help="[cache-dit] SCM mask policy: None (disabled), slow, medium, fast, ultra.",
+    )
+    parser.add_argument(
+        "--cache_dit_scm_steps_policy",
+        type=str,
+        default="dynamic",
+        choices=["dynamic", "static"],
+        help="[cache-dit] SCM steps policy: dynamic or static.",
+    )
+
+    # TeaCache specific parameters
+    parser.add_argument(
+        "--tea_cache_rel_l1_thresh",
+        type=float,
+        default=0.2,
+        help="[tea_cache] Threshold for accumulated relative L1 distance.",
+    )
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Validate input image exists
-    if not os.path.exists(args.image):
-        raise FileNotFoundError(f"Input image not found: {args.image}")
+    # Validate input images exist and load them
+    input_images = []
+    for image_path in args.image:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Input image not found: {image_path}")
 
-    # Load input image
-    input_image = Image.open(args.image).convert("RGB")
-    print(f"Loaded input image from {args.image} (size: {input_image.size})")
+        img = Image.open(image_path).convert(args.color_format)
+        input_images.append(img)
+
+    # Use single image or list based on number of inputs
+    if len(input_images) == 1:
+        input_image = input_images[0]
+    else:
+        input_image = input_images
 
     device = detect_device_type()
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -115,36 +268,37 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
+    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
     # Configure cache based on backend type
     cache_config = None
     if args.cache_backend == "cache_dit":
         # cache-dit configuration: Hybrid DBCache + SCM + TaylorSeer
-        # All parameters marked with [cache-dit only] in DiffusionCacheConfig
         cache_config = {
-            # DBCache parameters [cache-dit only]
-            "Fn_compute_blocks": 1,  # Optimized for single-transformer models
-            "Bn_compute_blocks": 0,  # Number of backward compute blocks
-            "max_warmup_steps": 4,  # Maximum warmup steps (works for few-step models)
-            "residual_diff_threshold": 0.24,  # Higher threshold for more aggressive caching
-            "max_continuous_cached_steps": 3,  # Limit to prevent precision degradation
-            # TaylorSeer parameters [cache-dit only]
-            "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
-            "taylorseer_order": 1,  # TaylorSeer polynomial order
-            # SCM (Step Computation Masking) parameters [cache-dit only]
-            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
-            "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
+            "Fn_compute_blocks": args.cache_dit_fn_compute_blocks,
+            "Bn_compute_blocks": args.cache_dit_bn_compute_blocks,
+            "max_warmup_steps": args.cache_dit_max_warmup_steps,
+            "residual_diff_threshold": args.cache_dit_residual_diff_threshold,
+            "max_continuous_cached_steps": args.cache_dit_max_continuous_cached_steps,
+            "enable_taylorseer": args.cache_dit_enable_taylorseer,
+            "taylorseer_order": args.cache_dit_taylorseer_order,
+            "scm_steps_mask_policy": args.cache_dit_scm_steps_mask_policy,
+            "scm_steps_policy": args.cache_dit_scm_steps_policy,
         }
     elif args.cache_backend == "tea_cache":
-        raise ValueError("TeaCache is not supported for image-to-image generation.")
+        # TeaCache configuration
+        cache_config = {
+            "rel_l1_thresh": args.tea_cache_rel_l1_thresh,
+            # Note: coefficients will use model-specific defaults based on model_type
+        }
 
-    # Initialize Omni with QwenImageEditPipeline
+    # Initialize Omni with appropriate pipeline
     omni = Omni(
         model=args.model,
-        model_class_name="QwenImageEditPipeline",
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        parallel_config=parallel_config,
     )
     print("Pipeline loaded")
 
@@ -154,7 +308,13 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
-    print(f"  Input image size: {input_image.size}")
+    if isinstance(input_image, list):
+        print(f"  Number of input images: {len(input_image)}")
+        for idx, img in enumerate(input_image):
+            print(f"    Image {idx + 1} size: {img.size}")
+    else:
+        print(f"  Input image size: {input_image.size}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
@@ -165,8 +325,10 @@ def main():
         negative_prompt=args.negative_prompt,
         generator=generator,
         true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_outputs_per_prompt,
+        layers=args.layers,
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -181,13 +343,19 @@ def main():
     stem = output_path.stem or "output_image_edit"
 
     if args.num_outputs_per_prompt <= 1:
-        images[0].save(output_path)
-        print(f"Saved edited image to {os.path.abspath(output_path)}")
+        img = images[0]
+        img = img if isinstance(img, list) else [img]
+        for sub_idx, sub_img in enumerate(img):
+            save_path = output_path.parent / f"{stem}_{sub_idx}{suffix}"
+            sub_img.save(save_path)
+            print(f"Saved edited image to {os.path.abspath(save_path)}")
     else:
         for idx, img in enumerate(images):
-            save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-            img.save(save_path)
-            print(f"Saved edited image to {os.path.abspath(save_path)}")
+            img = img if isinstance(img, list) else [img]
+            for sub_idx, sub_img in enumerate(img):
+                save_path = output_path.parent / f"{stem}_{idx}_{sub_idx}{suffix}"
+                sub_img.save(save_path)
+                print(f"Saved edited image to {os.path.abspath(save_path)}")
 
 
 if __name__ == "__main__":

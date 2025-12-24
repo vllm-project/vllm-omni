@@ -7,17 +7,18 @@ from dataclasses import dataclass
 # These coefficients account for model-specific characteristics in how embeddings change
 # Source: TeaCache paper and ComfyUI-TeaCache empirical tuning
 _MODEL_COEFFICIENTS = {
-    # FLUX model coefficients from TeaCache paper
-    "FluxPipeline": [
+    # FLUX transformer coefficients from TeaCache paper
+    "FluxTransformer2DModel": [
         4.98651651e02,
         -2.83781631e02,
         5.58554382e01,
         -3.82021401e00,
         2.64230861e-01,
     ],
-    # Qwen-Image model coefficients from ComfyUI-TeaCache
+    # Qwen-Image transformer coefficients from ComfyUI-TeaCache
     # Tuned specifically for Qwen's dual-stream transformer architecture
-    "QwenImagePipeline": [
+    # Used for all Qwen-Image Family pipelines, in general
+    "QwenImageTransformer2DModel": [
         -4.50000000e02,
         2.80000000e02,
         -4.50000000e01,
@@ -43,15 +44,15 @@ class TeaCacheConfig:
             - 0.4: ~1.8x speedup with slight quality loss
             - 0.6: ~2.0x speedup with noticeable quality loss
         coefficients: Polynomial coefficients for rescaling L1 distance. If None, uses
-            model-specific defaults based on model_type.
-        model_type: Pipeline class name (e.g., "QwenImagePipeline", "FluxPipeline").
-            Must match OmniDiffusionConfig.model_class_name for proper extractor lookup.
-            Defaults to "QwenImagePipeline".
+            model-specific defaults based on transformer_type.
+        transformer_type: Transformer class name (e.g., "QwenImageTransformer2DModel").
+            Auto-detected from pipeline.transformer.__class__.__name__ in backend.
+            Defaults to "QwenImageTransformer2DModel".
     """
 
     rel_l1_thresh: float = 0.2
     coefficients: list[float] | None = None
-    model_type: str = "QwenImagePipeline"
+    transformer_type: str = "QwenImageTransformer2DModel"
 
     def __post_init__(self) -> None:
         """Validate and set default coefficients."""
@@ -59,8 +60,13 @@ class TeaCacheConfig:
             raise ValueError(f"rel_l1_thresh must be positive, got {self.rel_l1_thresh}")
 
         if self.coefficients is None:
-            # Use model-specific coefficients, fallback to FluxPipeline if not found
-            self.coefficients = _MODEL_COEFFICIENTS.get(self.model_type, _MODEL_COEFFICIENTS["FluxPipeline"])
+            # Use model-specific coefficients, explicitly check if the type exists or not
+            if self.transformer_type not in _MODEL_COEFFICIENTS:
+                raise KeyError(
+                    f"Cannot find coefficients for {self.transformer_type}. "
+                    f"Supported: {list(_MODEL_COEFFICIENTS.keys())}"
+                )
+            self.coefficients = _MODEL_COEFFICIENTS[self.transformer_type]
 
         if len(self.coefficients) != 5:
             raise ValueError(f"coefficients must contain exactly 5 elements, got {len(self.coefficients)}")

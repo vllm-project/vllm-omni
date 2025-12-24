@@ -1,9 +1,5 @@
 # Qwen3-Omni
 
-## 🛠️ Installation
-
-Please refer to [README.md](../../../README.md)
-
 ## Run examples (Qwen3-Omni)
 
 ### Multiple Prompts
@@ -28,6 +24,14 @@ bash run_single_prompt.sh
 If you have not enough memory, you can set thinker with tensor parallel. Just run the command below.
 ```bash
 bash run_single_prompt_tp.sh
+```
+
+### Modality control
+If you want to control output modalities, e.g. only output text, you can run the command below:
+```bash
+python end2end.py --output-wav output_audio \
+                  --query-type use_audio \
+                  --modalities text
 ```
 
 #### Using Local Media Files

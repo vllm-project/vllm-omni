@@ -58,3 +58,10 @@ repos:
       verbose: true
       pass_filenames: false
     # Insert new entries above the `suggestion` entry
+
+    - id: check-pickle-imports
+      name: Prevent new pickle/cloudpickle imports
+      entry: python tools/pre_commit/check_pickle_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]

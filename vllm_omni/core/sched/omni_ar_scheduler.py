@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from time import time
 
+from vllm.distributed.kv_events import KVEventBatch
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -63,14 +66,6 @@ class OmniARScheduler(VLLMScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        """Override update_from_output to fix check_stop bug when output_token_ids is empty.
-
-        The original vLLM implementation calls check_stop when pooler_outputs exist,
-        but doesn't check if output_token_ids is empty. This causes IndexError during
-        prefill phase when pooler_outputs exist but output_token_ids is still empty.
-
-        This override adds a safety check before calling check_stop.
-        """
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -81,7 +76,20 @@ class OmniARScheduler(VLLMScheduler):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
-        kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
+        kv_connector_stats: KVConnectorStats | None = (
+            kv_connector_output.kv_connector_stats if kv_connector_output else None
+        )
+        if kv_connector_stats and self.connector:
+            kv_stats = self.connector.get_kv_connector_stats()
+            if kv_stats:
+                kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+
+        failed_kv_load_req_ids = None
+        if kv_connector_output and kv_connector_output.invalid_block_ids:
+            # These blocks contain externally computed tokens that failed to
+            # load. Identify affected requests and adjust their computed token
+            # count to trigger recomputation of the invalid blocks.
+            failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -90,6 +98,9 @@ class OmniARScheduler(VLLMScheduler):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
+            if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                # Skip requests that were recovered from KV load failure
+                continue
             request = self.requests.get(req_id)
             if request is None:
                 # The request is already finished. This can happen if the
@@ -110,9 +121,16 @@ class OmniARScheduler(VLLMScheduler):
                 # tokens and rejections. If some tokens are rejected,
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens.
-                request.num_computed_tokens -= num_rejected
+                if request.num_computed_tokens > 0:
+                    request.num_computed_tokens -= num_rejected
+                # If async scheduling, num_output_placeholders also includes
+                # the scheduled spec tokens count and so is similarly adjusted.
+                if request.num_output_placeholders > 0:
+                    request.num_output_placeholders -= num_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
-                    spec_decoding_stats, num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted
+                    spec_decoding_stats,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted,
                 )
 
             stopped = False
@@ -125,28 +143,12 @@ class OmniARScheduler(VLLMScheduler):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
 
-            """
             # Stop checking for pooler models.
             pooler_output = None
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
-                stopped = check_stop(request, self.max_model_len,
-                                     pooler_output)
-            """
-
-            # Stop checking for pooler models.
-            # FIX: Check if output_token_ids is empty before calling check_stop
-            # to prevent IndexError during prefill phase when pooler_outputs exist
-            # but output_token_ids is still empty.
-            pooler_output = None
-            if pooler_outputs:
-                pooler_output = pooler_outputs[req_index]
-                # Only call check_stop if output_token_ids is not empty
-                # This prevents IndexError when accessing output_token_ids[-1]
                 if request.output_token_ids:
                     stopped = check_stop(request, self.max_model_len, pooler_output)
-                # If output_token_ids is empty, we don't call check_stop
-                # and keep stopped=False (don't stop during prefill phase)
 
             if stopped:
                 kv_transfer_params = self._free_request(request)
@@ -157,17 +159,13 @@ class OmniARScheduler(VLLMScheduler):
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
-                # NOTE: once we support N tokens per step (spec decode),
-                # the outer lists can be of length > 1.
-                new_logprobs = logprobs.slice(req_index, req_index + 1)
+                new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
-                # NOTE: structured_output_request
-                # should not be None if use_structured_output, we have
-                # checked above, so safe to ignore type warning
-                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids
-                )
+                struct_output_request = request.structured_output_request
+                assert struct_output_request is not None
+                assert struct_output_request.grammar is not None
+                struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -189,6 +187,7 @@ class OmniARScheduler(VLLMScheduler):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
             else:
@@ -203,8 +202,25 @@ class OmniARScheduler(VLLMScheduler):
             self.waiting.remove_requests(stopped_preempted_reqs)
 
         # KV Connector: update state for finished KV Transfers.
-        if model_runner_output.kv_connector_output:
-            self._update_from_kv_xfer_finished(model_runner_output.kv_connector_output)
+        if kv_connector_output:
+            self._update_from_kv_xfer_finished(kv_connector_output)
+
+        # collect KV cache events from KV cache manager
+        events = self.kv_cache_manager.take_events()
+
+        # collect KV cache events from connector
+        if self.connector is not None:
+            connector_events = self.connector.take_events()
+            if connector_events:
+                if events is None:
+                    events = list(connector_events)
+                else:
+                    events.extend(connector_events)
+
+        # publish collected KV cache events
+        if events:
+            batch = KVEventBatch(ts=time.time(), events=events)
+            self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
