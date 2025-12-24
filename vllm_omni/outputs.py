@@ -36,7 +36,6 @@ class OmniRequestOutput:
         final_output_type: Type of output ("text", "image", "audio", "latents")
         request_output: The underlying RequestOutput from the stage (pipeline mode)
         images: List of generated PIL images (diffusion mode)
-        videos: List of generated videos (diffusion mode)
         prompt: The prompt used for generation (diffusion mode)
         latents: Optional tensor of latent representations (diffusion mode)
         metrics: Optional dictionary of generation metrics
@@ -52,7 +51,6 @@ class OmniRequestOutput:
 
     # Diffusion model fields
     images: list[Image.Image] = field(default_factory=list)
-    videos: list[Any] = field(default_factory=list)
     prompt: str | None = None
     latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -86,8 +84,7 @@ class OmniRequestOutput:
     def from_diffusion(
         cls,
         request_id: str,
-        images: list[Image.Image] | None = None,
-        videos: list[Any] | None = None,
+        images: list[Image.Image],
         prompt: str | None = None,
         metrics: dict[str, Any] | None = None,
         latents: torch.Tensor | None = None,
@@ -97,7 +94,6 @@ class OmniRequestOutput:
         Args:
             request_id: Request identifier
             images: Generated images
-            videos: Generated videos
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
@@ -105,14 +101,10 @@ class OmniRequestOutput:
         Returns:
             OmniRequestOutput configured for diffusion mode
         """
-        image_list = images or []
-        video_list = videos or []
-        final_output_type = "video" if video_list else "image"
         return cls(
             request_id=request_id,
-            final_output_type=final_output_type,
-            images=image_list,
-            videos=video_list,
+            final_output_type="image",
+            images=images,
             prompt=prompt,
             latents=latents,
             metrics=metrics or {},
@@ -125,18 +117,9 @@ class OmniRequestOutput:
         return len(self.images)
 
     @property
-    def num_videos(self) -> int:
-        """Return the number of generated videos."""
-        return len(self.videos)
-
-    @property
     def is_diffusion_output(self) -> bool:
         """Check if this is a diffusion model output."""
-        return (
-            len(self.images) > 0
-            or len(self.videos) > 0
-            or self.final_output_type in {"image", "video"}
-        )
+        return len(self.images) > 0 or self.final_output_type == "image"
 
     @property
     def is_pipeline_output(self) -> bool:
@@ -155,7 +138,6 @@ class OmniRequestOutput:
             result.update(
                 {
                     "num_images": self.num_images,
-                    "num_videos": self.num_videos,
                     "prompt": self.prompt,
                     "metrics": self.metrics,
                 }

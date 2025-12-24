@@ -924,14 +924,14 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> ChatCompletionResponse | ErrorResponse:
-        """Generate images or videos via chat completion interface for diffusion models.
+        """Generate images via chat completion interface for diffusion models.
 
         Args:
             request: Chat completion request
             raw_request: Raw FastAPI request object
 
         Returns:
-            ChatCompletionResponse with generated images/videos or ErrorResponse
+            ChatCompletionResponse with generated images or ErrorResponse
         """
         try:
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -981,7 +981,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
             guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
-            fps = extra_body.get("fps")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -1022,8 +1021,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 gen_kwargs["num_frames"] = num_frames
             if guidance_scale_2 is not None:
                 gen_kwargs["guidance_scale_2"] = guidance_scale_2
-            if fps is not None:
-                gen_kwargs["fps"] = fps
 
             # Add reference image if provided
             if pil_images:
@@ -1044,59 +1041,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # Generate image
             result = await self._diffusion_engine.generate(**gen_kwargs)
-
-            # Convert videos to base64 content if present
-            videos = getattr(result, "videos", [])
-            if videos:
-                fps_value = int(fps) if fps is not None else 24
-                video_contents: list[dict[str, Any]] = []
-                for video in videos:
-                    frames = self._normalize_video_frames(video)
-                    if not frames:
-                        logger.warning("Video generation completed but no frames were returned.")
-                        continue
-                    video_url = self._encode_video_frames_to_data_url(frames, fps_value)
-                    video_contents.append(
-                        {
-                            "type": "video_url",
-                            "video_url": {"url": video_url},
-                        }
-                    )
-
-                content: str | list[dict[str, Any]]
-                if not video_contents:
-                    content = "Video generation completed but no videos were produced."
-                else:
-                    content = video_contents
-
-                message = ChatMessage.model_construct(role="assistant", content=content)
-                choice = ChatCompletionResponseChoice.model_construct(
-                    index=0,
-                    message=message,
-                    finish_reason="stop",
-                    logprobs=None,
-                    stop_reason=None,
-                )
-
-                response = ChatCompletionResponse(
-                    id=request_id,
-                    created=created_time,
-                    model=self._diffusion_model_name,
-                    choices=[choice],
-                    usage=UsageInfo(
-                        prompt_tokens=len(prompt.split()),
-                        completion_tokens=1,
-                        total_tokens=len(prompt.split()) + 1,
-                    ),
-                )
-
-                logger.info(
-                    "Diffusion chat completed for request %s: %d videos",
-                    request_id,
-                    len(video_contents),
-                )
-
-                return response
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
@@ -1154,7 +1098,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         except Exception as e:
             logger.exception("Diffusion chat completion failed: %s", e)
             return self._create_error_response(
-                f"Diffusion generation failed: {str(e)}",
+                f"Image generation failed: {str(e)}",
                 status_code=500,
             )
 
@@ -1212,65 +1156,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         prompt = " ".join(prompt_parts).strip()
         return prompt, images
-
-    def _normalize_video_frames(self, video: Any) -> list[Any]:
-        """Normalize video output into a list of frames for export_to_video."""
-        import numpy as np
-        import torch
-
-        video_array = None
-        if isinstance(video, torch.Tensor):
-            video_tensor = video.detach().cpu()
-            if video_tensor.dim() == 5:
-                # [B, C, F, H, W] or [B, F, H, W, C]
-                if video_tensor.shape[1] in (3, 4):
-                    video_tensor = video_tensor[0].permute(1, 2, 3, 0)
-                else:
-                    video_tensor = video_tensor[0]
-            elif video_tensor.dim() == 4 and video_tensor.shape[0] in (3, 4):
-                # [C, F, H, W] -> [F, H, W, C]
-                video_tensor = video_tensor.permute(1, 2, 3, 0)
-            if video_tensor.is_floating_point():
-                video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
-            video_array = video_tensor.float().numpy()
-        elif isinstance(video, np.ndarray):
-            video_array = video
-            if video_array.ndim == 5:
-                video_array = video_array[0]
-            if video_array.ndim == 4 and video_array.shape[-1] not in (1, 3, 4) and video_array.shape[0] in (1, 3, 4):
-                video_array = np.transpose(video_array, (1, 2, 3, 0))
-            if video_array.dtype.kind == "f":
-                if video_array.min() < 0:
-                    video_array = np.clip(video_array, -1, 1)
-                    video_array = (video_array + 1) / 2
-                elif video_array.max() > 1.0:
-                    video_array = np.clip(video_array, 0, 255) / 255.0
-                else:
-                    video_array = np.clip(video_array, 0, 1)
-
-        if video_array is None:
-            return []
-
-        if video_array.ndim == 3:
-            video_array = np.expand_dims(video_array, 0)
-        if video_array.ndim != 4:
-            return []
-
-        return list(video_array)
-
-    def _encode_video_frames_to_data_url(self, frames: list[Any], fps: int) -> str:
-        """Encode video frames into a base64 MP4 data URL."""
-        from diffusers.utils import export_to_video
-        from pathlib import Path
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = Path(tmpdir) / "output.mp4"
-            export_to_video(frames, str(output_path), fps=fps)
-            video_bytes = output_path.read_bytes()
-
-        video_base64 = base64.b64encode(video_bytes).decode("utf-8")
-        return f"data:video/mp4;base64,{video_base64}"
 
     def _create_error_response(
         self,

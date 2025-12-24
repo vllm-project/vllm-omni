@@ -15,8 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from typing import Any
 
-import numpy as np
-import torch
 from PIL import Image
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
@@ -34,7 +32,7 @@ class AsyncOmniDiffusion:
 
     This class provides an asynchronous interface for running diffusion models,
     enabling concurrent request handling. It wraps the DiffusionEngine and
-    provides async methods for image/video generation.
+    provides async methods for image generation.
 
     Args:
         model: Model name or path to load
@@ -129,10 +127,10 @@ class AsyncOmniDiffusion:
         seed: int | None = None,
         **kwargs: Any,
     ) -> OmniRequestOutput:
-        """Generate images or videos asynchronously from a text prompt.
+        """Generate images asynchronously from a text prompt.
 
         Args:
-            prompt: Text prompt describing the desired output
+            prompt: Text prompt describing the desired image
             request_id: Optional unique identifier for tracking the request
             num_inference_steps: Number of denoising steps (default: 50)
             guidance_scale: Classifier-free guidance scale (default: 7.5)
@@ -144,7 +142,7 @@ class AsyncOmniDiffusion:
             **kwargs: Additional generation parameters
 
         Returns:
-            OmniRequestOutput containing generated images or videos
+            OmniRequestOutput containing generated images
 
         Raises:
             RuntimeError: If generation fails
@@ -181,19 +179,24 @@ class AsyncOmniDiffusion:
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
 
         # Process results
-        images, videos = self._extract_diffusion_outputs(result)
+        images: list[Image.Image] = []
+        if result is not None:
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, Image.Image):
+                        images.append(item)
+            elif isinstance(result, Image.Image):
+                images.append(result)
 
         logger.debug(
-            "Generation completed for request %s, produced %d images and %d videos",
+            "Generation completed for request %s, produced %d images",
             request_id,
             len(images),
-            len(videos),
         )
 
         return OmniRequestOutput.from_diffusion(
             request_id=request_id,
             images=images,
-            videos=videos,
             prompt=prompt,
             metrics={
                 "num_inference_steps": num_inference_steps,
@@ -207,7 +210,7 @@ class AsyncOmniDiffusion:
         request_id: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate diffusion outputs with streaming progress updates.
+        """Generate images with streaming progress updates.
 
         Currently, diffusion models don't support true streaming, so this
         yields a single result after generation completes. Future implementations
@@ -223,62 +226,6 @@ class AsyncOmniDiffusion:
         """
         result = await self.generate(prompt=prompt, request_id=request_id, **kwargs)
         yield result
-
-    def _extract_diffusion_outputs(self, result: Any) -> tuple[list[Image.Image], list[Any]]:
-        """Split diffusion outputs into image or video outputs."""
-        images: list[Image.Image] = []
-        videos: list[Any] = []
-
-        if result is None:
-            return images, videos
-
-        if isinstance(result, Image.Image):
-            return [result], videos
-
-        if isinstance(result, list):
-            if result and all(isinstance(item, Image.Image) for item in result):
-                return list(result), videos
-            for item in result:
-                if isinstance(item, Image.Image):
-                    images.append(item)
-                else:
-                    videos.extend(self._normalize_video_items(item))
-            return images, videos
-
-        if isinstance(result, (np.ndarray, torch.Tensor)):
-            videos.extend(self._normalize_video_items(result))
-
-        return images, videos
-
-    def _normalize_video_items(self, item: Any) -> list[Any]:
-        """Normalize possible video outputs into a list of video arrays/tensors."""
-        if item is None:
-            return []
-
-        if isinstance(item, list):
-            videos: list[Any] = []
-            for sub_item in item:
-                videos.extend(self._normalize_video_items(sub_item))
-            return videos
-
-        if isinstance(item, torch.Tensor):
-            item = item.detach().cpu()
-
-        if isinstance(item, np.ndarray):
-            if item.ndim == 5:
-                return [item[i] for i in range(item.shape[0])]
-            if item.ndim in (4, 3):
-                return [item]
-            return [item]
-
-        if isinstance(item, torch.Tensor):
-            if item.ndim == 5:
-                return [item[i] for i in range(item.shape[0])]
-            if item.ndim in (4, 3):
-                return [item]
-            return [item]
-
-        return []
 
     def close(self) -> None:
         """Close the engine and release resources.
