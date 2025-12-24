@@ -417,15 +417,13 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         raise ValueError("No thinker stage (is_comprehension=True) found in stage_list")
 
     def _sampling_params_to_dict(self, params: SamplingParams) -> dict:
-        return {
-            "temperature": params.temperature,
-            "top_p": params.top_p,
-            "top_k": params.top_k,
-            "min_p": params.min_p,
-            "repetition_penalty": params.repetition_penalty,
-            "stop_token_ids": params.stop_token_ids,
-            "max_tokens": params.max_tokens,
-        }
+        """Convert SamplingParams to dict for to_sampling_params default values.
+
+        Uses msgspec.structs.asdict to preserve all fields from stage config YAML,
+        including seed, detokenize, and any other fields not explicitly listed.
+        """
+        import msgspec.structs
+        return msgspec.structs.asdict(params)
 
     def _build_sampling_params_list_from_request(
         self,
