@@ -6,9 +6,9 @@ Tests that standard OpenAI API parameters (max_tokens, temperature, etc.)
 are correctly applied to the thinker stage while preserving YAML defaults.
 """
 
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
 from vllm.sampling_params import SamplingParams
 
 
@@ -55,8 +55,7 @@ def default_other_params():
 
 
 @pytest.fixture
-def mock_engine_client(mock_thinker_stage, mock_other_stage,
-                       default_thinker_params, default_other_params):
+def mock_engine_client(mock_thinker_stage, mock_other_stage, default_thinker_params, default_other_params):
     """Create mock engine client with stage_list and default_sampling_params_list."""
     engine_client = MagicMock()
     engine_client.stage_list = [mock_thinker_stage, mock_other_stage]
