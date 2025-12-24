@@ -4,7 +4,6 @@
 
 Main entry points for vLLM-Omni inference and serving.
 
-- [vllm_omni.entrypoints.async_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
@@ -18,7 +17,6 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_llm.OmniStageLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
-- [vllm_omni.entrypoints.openai.serving_chat.OmniOpenAIServingChat][]
 
 ## Inputs
 
