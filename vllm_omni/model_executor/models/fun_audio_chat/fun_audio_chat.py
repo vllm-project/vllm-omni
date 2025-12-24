@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.v1.sample.sampler import Sampler
@@ -469,9 +470,9 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        sampling_metadata=None,
+        sampling_metadata: SamplingMetadata | None = None,
         additional_information: dict[str, Any] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
         Unified forward pass for Fun-Audio-Chat.
