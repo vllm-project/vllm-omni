@@ -9,6 +9,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Optional
 
 import jinja2
+import msgspec.structs
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
@@ -422,7 +423,6 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         Uses msgspec.structs.asdict to preserve all fields from stage config YAML,
         including seed, detokenize, and any other fields not explicitly listed.
         """
-        import msgspec.structs
         return msgspec.structs.asdict(params)
 
     def _build_sampling_params_list_from_request(
