@@ -234,9 +234,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
                     # Use standard OpenAI API parameters for thinker stage
-                    sampling_params_list = self._build_sampling_params_list_from_request(
-                        request
-                    )
+                    sampling_params_list = self._build_sampling_params_list_from_request(request)
 
                 self._log_inputs(
                     request_id,
