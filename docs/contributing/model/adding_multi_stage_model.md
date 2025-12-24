@@ -476,8 +476,8 @@ thinker_hidden_states = output.multimodal_output["24"]
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png">
-    <img alt="Data Flow between stages" src="image.png" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/vllm-omni-dataflow-between-stages.png">
+    <img alt="Data Flow between stages" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/vllm-omni-dataflow-between-stages.png" width=55%>
   </picture>
 </p>
 
