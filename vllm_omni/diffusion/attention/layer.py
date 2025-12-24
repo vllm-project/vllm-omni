@@ -52,6 +52,25 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
         
+        self.use_ring = False
+        self.ring_pg = None
+        self.ring_runner = None
+
+        try:
+            config = get_current_omni_diffusion_config()
+            if config.parallel_config.ring_degree > 1:
+                self.use_ring = True
+                try:
+                    sp_group = get_sp_group()
+                    self.ring_pg = sp_group.ring_group
+                    self.ring_runner = RingParallelAttention(sp_group)
+                except:
+                    self.use_ring = False
+                    self.ring_runner = None
+        except Exception:
+            self.use_ring = False
+            self.ring_runner = None
+
         self.parallel_strategy = build_parallel_attention_strategy(
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
@@ -74,16 +93,9 @@ class Attention(nn.Module):
         )
 
         # 2. Kernel Execution (Computation)
-        try:
-            out = self.parallel_strategy.run_attention(
-                query, 
-                key, 
-                value, 
-                attn_metadata,
-                softmax_scale=self.softmax_scale,
-                causal=self.causal
-            )
-        except NotImplementedError:
+        if self.use_ring:
+            out = self._run_ring_attention(query, key, value, attn_metadata)
+        else:
             out = self._run_local_attention(query, key, value, attn_metadata)
 
         # 3. Post-processing (Reverse Communication)

@@ -58,21 +58,6 @@ class UlyssesParallelAttention:
     def name(self) -> str:
         return "ulysses"
 
-    def run_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata | None,
-        softmax_scale: float | None = None,
-        causal: bool = False,
-    ) -> torch.Tensor:
-        """
-        Ulysses uses local attention kernel after all-to-all.
-        So we raise NotImplementedError to fallback to local attention in layer.py.
-        """
-        raise NotImplementedError
-
     def pre_attention(
         self,
         query: torch.Tensor,
