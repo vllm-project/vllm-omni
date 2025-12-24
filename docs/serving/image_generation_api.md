@@ -233,10 +233,10 @@ Run the test suite to verify functionality:
 
 ```bash
 # All image generation tests
-pytest tests/entrypoints/openai/test_image_server.py -v
+pytest tests/entrypoints/openai_api/test_image_server.py -v
 
 # Specific test
-pytest tests/entrypoints/openai/test_image_server.py::test_generate_single_image -v
+pytest tests/entrypoints/openai_api/test_image_server.py::test_generate_single_image -v
 ```
 
 ## Development

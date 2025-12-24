@@ -27,7 +27,7 @@ steps:
   - label: "Image Generation API Test"
     depends_on: image-build
     commands:
-      - pytest -s -v tests/entrypoints/openai/
+      - pytest -s -v tests/entrypoints/openai_api/
     agents:
       queue: "cpu_queue_premerge"
     plugins:
