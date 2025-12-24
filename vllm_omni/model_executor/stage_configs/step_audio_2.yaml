@@ -1,0 +1,78 @@
+# Stage config for Step-Audio2 with vLLM-Omni
+#
+# Two-stage pipeline:
+#   Stage 0 (Thinker): Audio understanding → Text + Audio tokens
+#   Stage 1 (Token2Wav): Audio tokens → Waveform (24kHz)
+#
+# Hardware requirement: 1-2 GPUs (can run on single GPU with devices: "0" for both)
+
+stage_args:
+  # Stage 0: Thinker (Audio Understanding + Token Generation)
+  - stage_id: 0
+    runtime:
+      process: true              # Run in separate process
+      devices: "0"              # GPU device (CUDA_VISIBLE_DEVICES)
+      max_batch_size: 1         # Single sample at a time
+    engine_args:
+      model_stage: thinker
+      model_arch: StepAudio2ThinkerForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true        # Required for now
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      engine_output_type: text   # Outputs text + audio tokens
+    is_comprehension: true       # This stage does comprehension
+    final_output: true          # Can be final output (for ASR mode)
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: -1
+      max_tokens: 1024
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+
+  # Stage 1: Token2Wav (Audio Synthesis)
+  - stage_id: 1
+    runtime:
+      process: true
+      devices: "1"              # Use different GPU (or "0" for single GPU)
+      max_batch_size: 1
+    engine_args:
+      model_stage: token2wav
+      model_arch: StepAudio2Token2WavModel
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.3  # Token2Wav needs less memory
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 4096
+      engine_output_type: audio    # Outputs waveform
+    engine_input_source: [0]       # Takes input from Stage 0
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.step_audio2.thinker2token2wav
+    final_output: true            # Final output stage
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+# Runtime configuration
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1             # Wait for full input before triggering
+    max_inflight: 1             # Process one at a time
+
+  edges:
+    - from: 0                   # Thinker → Token2Wav
+      to: 1
+      window_size: -1           # Wait for complete output from Thinker
