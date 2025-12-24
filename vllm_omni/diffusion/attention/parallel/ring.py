@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 # import torch.distributed as dist # Not used directly here, but good practice if needed
 
-from vllm_omni.diffusion.attention.backends.ring_selector import AttnType
+from vllm_omni.diffusion.attention.backends.ring.ring_selector import AttnType
 from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
     # ParallelAttentionStrategy, # Not used in type hint below currently

@@ -10,8 +10,8 @@ import torch
 import torch.nn.functional as F
 from typing import Any, Optional, Tuple
 from vllm_omni.diffusion.distributed.ring_comm import RingComm
-from vllm_omni.diffusion.attention.backends.ring_utils import update_out_and_lse
-from vllm_omni.diffusion.attention.backends.ring_kernels import pytorch_attn_forward, pytorch_attn_backward
+from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
+from vllm_omni.diffusion.attention.backends.ring.ring_kernels import pytorch_attn_forward, pytorch_attn_backward
 
 def ring_pytorch_attn_func(
     q,
