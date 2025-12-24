@@ -31,8 +31,10 @@ Usage:
 
 import argparse
 import asyncio
+import base64
 import glob
 import json
+import mimetypes
 import os
 import time
 import uuid
@@ -329,6 +331,85 @@ class RandomDataset(BaseDataset):
 
     def get_requests(self) -> List[RequestFuncInput]:
         return [self[i] for i in range(len(self))]
+
+
+def _guess_mime_type(path: str) -> str:
+    mime, _ = mimetypes.guess_type(path)
+    return mime or "application/octet-stream"
+
+
+def _encode_image_as_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    mime = _guess_mime_type(path)
+    return f"data:{mime};base64,{encoded}"
+
+
+async def async_request_chat_completions(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    extra_body = dict(input.extra_body)
+    if input.width and input.height:
+        extra_body.setdefault("height", input.height)
+        extra_body.setdefault("width", input.width)
+    if input.num_frames:
+        extra_body.setdefault("num_frames", input.num_frames)
+    if input.fps:
+        extra_body.setdefault("fps", input.fps)
+
+    if input.image_paths and len(input.image_paths) > 0:
+        content = []
+        if input.prompt:
+            content.append({"type": "text", "text": input.prompt})
+        for img_path in input.image_paths:
+            if not os.path.exists(img_path):
+                output.error = f"Image file not found: {img_path}"
+                output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _encode_image_as_data_url(img_path)},
+                }
+            )
+        messages = [{"role": "user", "content": content}]
+    else:
+        messages = [{"role": "user", "content": input.prompt}]
+
+    payload = {
+        "model": input.model,
+        "messages": messages,
+    }
+    if extra_body:
+        payload["extra_body"] = extra_body
+
+    try:
+        async with session.post(input.api_url, json=payload) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+                if "peak_memory_mb" in resp_json:
+                    output.peak_memory_mb = resp_json["peak_memory_mb"]
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 async def async_request_image_sglang(
@@ -642,14 +723,15 @@ async def benchmark(args):
 
     # Setup dataset
     if args.backend == "sglang-image":
-        if args.task == "i2v":
+        if args.task in ["i2v", "ti2v", "ti2i"]:
             api_url = f"{args.base_url}/v1/chat/completions"
+            request_func = async_request_chat_completions
         else:
             api_url = f"{args.base_url}/v1/images/generations"
-        request_func = async_request_image_sglang
+            request_func = async_request_image_sglang
     elif args.backend == "sglang-video":
         api_url = f"{args.base_url}/v1/chat/completions"
-        request_func = async_request_video_sglang
+        request_func = async_request_chat_completions
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
 
