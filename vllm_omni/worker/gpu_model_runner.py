@@ -605,7 +605,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
         return hidden_states, hidden_states[logit_indices]
 
     def _preprocess(
