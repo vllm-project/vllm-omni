@@ -9,7 +9,6 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Optional
 
 import jinja2
-import msgspec.structs
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
@@ -415,13 +414,45 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 return idx
         raise ValueError("No thinker stage (is_comprehension=True) found in stage_list")
 
-    def _sampling_params_to_dict(self, params: SamplingParams) -> dict:
-        """Convert SamplingParams to dict for to_sampling_params default values.
+    # OpenAI API standard sampling parameters that can be safely overridden.
+    # These are the most commonly used parameters with compatible types
+    # between ChatCompletionRequest and SamplingParams.
+    # Users who need more control can use sampling_params_list in extra_body.
+    _OPENAI_SAMPLING_FIELDS: set[str] = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    }
 
-        Uses msgspec.structs.asdict to preserve all fields from stage config YAML,
-        including seed, detokenize, and any other fields not explicitly listed.
+    def _apply_request_overrides(
+        self,
+        default_params: SamplingParams,
+        request: ChatCompletionRequest,
+    ) -> SamplingParams:
+        """Clone default params and override with user-provided request values.
+
+        Starts with YAML defaults and only overrides fields that the user
+        explicitly provided (non-None values) in the request.
+
+        Args:
+            default_params: Default SamplingParams from stage config YAML.
+            request: The chat completion request containing user-provided values.
+
+        Returns:
+            New SamplingParams with YAML defaults overridden by request values.
         """
-        return msgspec.structs.asdict(params)
+        params = default_params.clone()
+
+        for field_name in self._OPENAI_SAMPLING_FIELDS:
+            value = getattr(request, field_name, None)
+            if value is not None:
+                setattr(params, field_name, value)
+
+        return params
 
     def _build_sampling_params_list_from_request(
         self,
@@ -429,8 +460,11 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     ) -> list[SamplingParams]:
         """Build sampling_params_list using standard OpenAI API parameters.
 
-        For the thinker stage, converts OpenAI API parameters (max_tokens, temperature,
-        top_p, etc.) to SamplingParams. For other stages, uses default sampling params.
+        For the thinker stage, starts with YAML defaults and overrides with
+        user-provided request values. For other stages, uses cloned YAML defaults.
+
+        This approach ensures all YAML defaults (including seed, detokenize, etc.)
+        are preserved while allowing users to override specific parameters.
 
         Args:
             request: The chat completion request containing OpenAI API parameters.
@@ -444,13 +478,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
             if idx == thinker_idx:
-                default_dict = self._sampling_params_to_dict(default_params)
-                max_tokens = request.max_tokens or default_params.max_tokens
-                params = request.to_sampling_params(
-                    max_tokens=max_tokens,
-                    logits_processor_pattern=None,
-                    default_sampling_params=default_dict,
-                )
+                params = self._apply_request_overrides(default_params, request)
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params

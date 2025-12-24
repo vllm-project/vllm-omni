@@ -77,169 +77,215 @@ def serving_chat(mock_engine_client):
     return instance
 
 
-def test_preserves_yaml_defaults_when_no_request_params(serving_chat):
-    """Test that YAML defaults are preserved when request has no params."""
+@pytest.fixture
+def mock_request():
+    """Create a mock request with all OpenAI sampling params set to None."""
     request = MagicMock()
-    request.max_tokens = None
+    # OpenAI standard sampling fields
     request.temperature = None
     request.top_p = None
-    request.top_k = None
+    request.max_tokens = None
     request.seed = None
-    request.repetition_penalty = None
+    request.stop = None
+    request.frequency_penalty = None
+    request.presence_penalty = None
+    return request
 
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(
-            temperature=default_sampling_params.get("temperature", 1.0),
-            top_p=default_sampling_params.get("top_p", 1.0),
-            top_k=default_sampling_params.get("top_k", 0),
-            max_tokens=max_tokens,
-            seed=default_sampling_params.get("seed"),
-            repetition_penalty=default_sampling_params.get("repetition_penalty", 1.0),
-        )
 
-    request.to_sampling_params = mock_to_sampling_params
+# =============================================================================
+# Tests for _OPENAI_SAMPLING_FIELDS constant
+# =============================================================================
 
-    result = serving_chat._build_sampling_params_list_from_request(request)
+
+def test_openai_sampling_fields_contains_expected_fields():
+    """Test that _OPENAI_SAMPLING_FIELDS contains all expected OpenAI params."""
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    expected_fields = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    }
+    assert OmniOpenAIServingChat._OPENAI_SAMPLING_FIELDS == expected_fields
+
+
+# =============================================================================
+# Tests for _build_sampling_params_list_from_request
+# =============================================================================
+
+
+def test_preserves_yaml_defaults_when_no_request_params(serving_chat, mock_request):
+    """Test that YAML defaults are preserved when request has no params."""
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     assert len(result) == 2
     thinker_params = result[0]
     assert thinker_params.temperature == 0.4
     assert thinker_params.top_p == 0.9
-    assert thinker_params.top_k == 1
+    assert thinker_params.top_k == 1  # YAML custom param preserved
     assert thinker_params.max_tokens == 2048
     assert thinker_params.seed == 42
-    assert thinker_params.repetition_penalty == 1.05
+    assert thinker_params.repetition_penalty == 1.05  # YAML custom param preserved
 
 
-def test_request_temperature_overrides_yaml_default(serving_chat):
+def test_request_temperature_overrides_yaml_default(serving_chat, mock_request):
     """Test that request temperature overrides YAML default."""
-    request = MagicMock()
-    request.max_tokens = None
-    request.temperature = 0.8  # Override
+    mock_request.temperature = 0.8
 
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(
-            temperature=0.8,
-            top_p=default_sampling_params.get("top_p", 1.0),
-            max_tokens=max_tokens,
-            seed=default_sampling_params.get("seed"),
-        )
-
-    request.to_sampling_params = mock_to_sampling_params
-
-    result = serving_chat._build_sampling_params_list_from_request(request)
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     thinker_params = result[0]
-    assert thinker_params.temperature == 0.8
+    assert thinker_params.temperature == 0.8  # Overridden
     assert thinker_params.seed == 42  # Preserved from YAML
+    assert thinker_params.top_k == 1  # YAML custom param preserved
 
 
-def test_request_top_p_overrides_yaml_default(serving_chat):
+def test_request_top_p_overrides_yaml_default(serving_chat, mock_request):
     """Test that request top_p overrides YAML default."""
-    request = MagicMock()
-    request.max_tokens = None
-    request.top_p = 0.95  # Override
+    mock_request.top_p = 0.95
 
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(
-            temperature=default_sampling_params.get("temperature", 1.0),
-            top_p=0.95,
-            max_tokens=max_tokens,
-            seed=default_sampling_params.get("seed"),
-        )
-
-    request.to_sampling_params = mock_to_sampling_params
-
-    result = serving_chat._build_sampling_params_list_from_request(request)
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     thinker_params = result[0]
-    assert thinker_params.top_p == 0.95
+    assert thinker_params.top_p == 0.95  # Overridden
     assert thinker_params.temperature == 0.4  # Preserved from YAML
 
 
-def test_request_max_tokens_overrides_yaml_default(serving_chat):
+def test_request_max_tokens_overrides_yaml_default(serving_chat, mock_request):
     """Test that request max_tokens overrides YAML default."""
-    request = MagicMock()
-    request.max_tokens = 100  # Override
+    mock_request.max_tokens = 100
 
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(
-            temperature=default_sampling_params.get("temperature", 1.0),
-            max_tokens=max_tokens,
-        )
-
-    request.to_sampling_params = mock_to_sampling_params
-
-    result = serving_chat._build_sampling_params_list_from_request(request)
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     assert result[0].max_tokens == 100
 
 
-def test_max_tokens_uses_yaml_default_when_not_specified(serving_chat):
+def test_max_tokens_uses_yaml_default_when_not_specified(serving_chat, mock_request):
     """Test that max_tokens falls back to YAML default when not in request."""
-    request = MagicMock()
-    request.max_tokens = None
-
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(max_tokens=max_tokens)
-
-    request.to_sampling_params = mock_to_sampling_params
-
-    result = serving_chat._build_sampling_params_list_from_request(request)
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     assert result[0].max_tokens == 2048
 
 
-def test_non_thinker_stages_use_cloned_defaults(serving_chat):
+def test_request_seed_overrides_yaml_default(serving_chat, mock_request):
+    """Test that request seed overrides YAML default."""
+    mock_request.seed = 123
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    thinker_params = result[0]
+    assert thinker_params.seed == 123  # Overridden
+    assert thinker_params.temperature == 0.4  # Preserved from YAML
+
+
+def test_request_frequency_penalty_overrides(serving_chat, mock_request):
+    """Test that request frequency_penalty is applied."""
+    mock_request.frequency_penalty = 0.5
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    assert result[0].frequency_penalty == 0.5
+
+
+def test_request_presence_penalty_overrides(serving_chat, mock_request):
+    """Test that request presence_penalty is applied."""
+    mock_request.presence_penalty = 0.3
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    assert result[0].presence_penalty == 0.3
+
+
+def test_non_thinker_stages_use_cloned_defaults(serving_chat, mock_request):
     """Test that non-thinker stages always use cloned YAML defaults."""
-    request = MagicMock()
-    request.max_tokens = 50
-    request.temperature = 0.1
+    mock_request.max_tokens = 50
+    mock_request.temperature = 0.1
 
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(temperature=0.1, max_tokens=max_tokens)
-
-    request.to_sampling_params = mock_to_sampling_params
-
-    result = serving_chat._build_sampling_params_list_from_request(request)
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     other_params = result[1]
-    assert other_params.temperature == 0.9  # YAML default
-    assert other_params.max_tokens == 4096  # YAML default
+    assert other_params.temperature == 0.9  # YAML default (not affected by request)
+    assert other_params.max_tokens == 4096  # YAML default (not affected by request)
     assert other_params.top_k == 50  # YAML default
     assert other_params.seed == 42  # YAML default
 
 
-def test_multiple_params_override_together(serving_chat):
+def test_multiple_params_override_together(serving_chat, mock_request):
     """Test that multiple request params can override together."""
-    request = MagicMock()
-    request.max_tokens = 200
-    request.temperature = 0.7
-    request.top_p = 0.85
+    mock_request.max_tokens = 200
+    mock_request.temperature = 0.7
+    mock_request.top_p = 0.85
+    mock_request.seed = 999
 
-    def mock_to_sampling_params(max_tokens, logits_processor_pattern, default_sampling_params):
-        return SamplingParams(
-            temperature=0.7,
-            top_p=0.85,
-            top_k=default_sampling_params.get("top_k", 0),
-            max_tokens=max_tokens,
-            seed=default_sampling_params.get("seed"),
-            repetition_penalty=default_sampling_params.get("repetition_penalty", 1.0),
-        )
-
-    request.to_sampling_params = mock_to_sampling_params
-
-    result = serving_chat._build_sampling_params_list_from_request(request)
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     thinker_params = result[0]
-    # Overridden
+    # Overridden by request
     assert thinker_params.temperature == 0.7
     assert thinker_params.top_p == 0.85
     assert thinker_params.max_tokens == 200
-    # Preserved from YAML
+    assert thinker_params.seed == 999
+    # Preserved from YAML (not in _OPENAI_SAMPLING_FIELDS)
     assert thinker_params.top_k == 1
-    assert thinker_params.seed == 42
     assert thinker_params.repetition_penalty == 1.05
+
+
+def test_yaml_custom_params_not_overridden_by_request(serving_chat, mock_request):
+    """Test that YAML custom params (top_k, repetition_penalty) are not affected."""
+    # Even if request has these attributes, they should not override YAML
+    # because they're not in _OPENAI_SAMPLING_FIELDS
+    mock_request.top_k = 100  # Not in allowlist
+    mock_request.repetition_penalty = 2.0  # Not in allowlist
+
+    result = serving_chat._build_sampling_params_list_from_request(mock_request)
+
+    thinker_params = result[0]
+    assert thinker_params.top_k == 1  # YAML default preserved
+    assert thinker_params.repetition_penalty == 1.05  # YAML default preserved
+
+
+# =============================================================================
+# Tests for _apply_request_overrides
+# =============================================================================
+
+
+def test_apply_request_overrides_clones_params(serving_chat, mock_request, default_thinker_params):
+    """Test that _apply_request_overrides returns a cloned object."""
+    result = serving_chat._apply_request_overrides(default_thinker_params, mock_request)
+
+    assert result is not default_thinker_params  # Different object
+
+
+def test_apply_request_overrides_preserves_defaults(serving_chat, mock_request, default_thinker_params):
+    """Test that _apply_request_overrides preserves defaults when request has None."""
+    result = serving_chat._apply_request_overrides(default_thinker_params, mock_request)
+
+    assert result.temperature == 0.4
+    assert result.top_p == 0.9
+    assert result.seed == 42
+    assert result.top_k == 1  # YAML custom param
+
+
+def test_apply_request_overrides_applies_values(serving_chat, mock_request, default_thinker_params):
+    """Test that _apply_request_overrides applies non-None request values."""
+    mock_request.temperature = 0.8
+    mock_request.seed = 123
+
+    result = serving_chat._apply_request_overrides(default_thinker_params, mock_request)
+
+    assert result.temperature == 0.8  # Overridden
+    assert result.seed == 123  # Overridden
+    assert result.top_p == 0.9  # Preserved from default
+    assert result.top_k == 1  # YAML custom param preserved
+
+
+# =============================================================================
+# Tests for _get_thinker_stage_index
+# =============================================================================
 
 
 def test_get_thinker_stage_index_finds_first_stage(mock_engine_client):
@@ -285,25 +331,3 @@ def test_get_thinker_stage_index_raises_when_not_found():
 
     with pytest.raises(ValueError, match="No thinker stage"):
         instance._get_thinker_stage_index()
-
-
-def test_sampling_params_to_dict_converts_all_fields(serving_chat):
-    """Test that _sampling_params_to_dict converts all fields."""
-    params = SamplingParams(
-        temperature=0.5,
-        top_p=0.9,
-        top_k=10,
-        max_tokens=100,
-        seed=123,
-        repetition_penalty=1.1,
-    )
-
-    result = serving_chat._sampling_params_to_dict(params)
-
-    assert isinstance(result, dict)
-    assert result["temperature"] == 0.5
-    assert result["top_p"] == 0.9
-    assert result["top_k"] == 10
-    assert result["max_tokens"] == 100
-    assert result["seed"] == 123
-    assert result["repetition_penalty"] == 1.1
