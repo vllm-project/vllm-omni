@@ -885,8 +885,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
-                # When PP and flashcomm1 are enabled, during dummy_run the estimated space should divide num_tokens by tp_size;
-                # otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading to incorrect memory estimation and potentially causing OOM.
+                # When PP and flashcomm1 are enabled,
+                # during dummy_run the estimated space should divide num_tokens by tp_size;
+                # otherwise, on non-first PP ranks it would effectively perform an extra all-gather,
+                # leading to incorrect memory estimation and potentially causing OOM.
                 actual_tokens = num_tokens
                 if enable_sp():
                     tp_size = get_tensor_model_parallel_world_size()
