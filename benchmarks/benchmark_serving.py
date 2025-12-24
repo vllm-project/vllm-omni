@@ -57,6 +57,8 @@ class RequestFuncInput:
     width: Optional[int] = None
     height: Optional[int] = None
     num_frames: Optional[int] = None
+    num_inference_steps: Optional[int] = None
+    seed: Optional[int] = None
     fps: Optional[int] = None
     extra_body: Dict[str, Any] = field(default_factory=dict)
     image_paths: Optional[List[str]] = None
@@ -301,6 +303,8 @@ class VBenchDataset(BaseDataset):
             width=self.args.width,
             height=self.args.height,
             num_frames=self.args.num_frames,
+            num_inference_steps=self.args.num_inference_steps,
+            seed=self.args.seed,
             fps=self.args.fps,
             image_paths=image_paths,
         )
@@ -327,6 +331,8 @@ class RandomDataset(BaseDataset):
             width=self.args.width,
             height=self.args.height,
             num_frames=self.args.num_frames,
+            num_inference_steps=self.args.num_inference_steps,
+            seed=self.args.seed,
             fps=self.args.fps,
         )
 
@@ -360,6 +366,10 @@ async def async_request_chat_completions(
         extra_body.setdefault("width", input.width)
     if input.num_frames:
         extra_body.setdefault("num_frames", input.num_frames)
+    if input.num_inference_steps:
+        extra_body.setdefault("num_inference_steps", input.num_inference_steps)
+    if input.seed is not None:
+        extra_body.setdefault("seed", input.seed)
     if input.fps:
         extra_body.setdefault("fps", input.fps)
 
@@ -650,6 +660,18 @@ if __name__ == "__main__":
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
     parser.add_argument(
         "--num-frames", type=int, default=None, help="Number of frames (for video)."
+    )
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of inference steps (for diffusion models).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (for diffusion models).",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument(
