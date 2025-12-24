@@ -79,14 +79,16 @@ You can control output modalities to specify which types of output the model sho
 
 ### Supported modalities
 
-| Modality | Output |
-|----------|--------|
-| `text`   | Text only |
-| `audio`  | Text + Audio (audio generation requires text) |
-
-If not specified, the model uses its default output modalities.
+| Modalities | Output |
+|------------|--------|
+| `["text"]` | Text only |
+| `["audio"]` | Text + Audio |
+| `["text", "audio"]` | Text + Audio |
+| Not specified | Text + Audio (default) |
 
 ### Using curl
+
+#### Text only
 
 ```bash
 curl http://localhost:8091/v1/chat/completions \
@@ -95,6 +97,18 @@ curl http://localhost:8091/v1/chat/completions \
     "model": "Qwen/Qwen2.5-Omni-7B",
     "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
     "modalities": ["text"]
+  }'
+```
+
+#### Text + Audio
+
+```bash
+curl http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-Omni-7B",
+    "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
+    "modalities": ["audio"]
   }'
 ```
 
@@ -108,6 +122,8 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 
 ### Using OpenAI Python SDK
 
+#### Text only
+
 ```python
 from openai import OpenAI
 
@@ -119,6 +135,23 @@ response = client.chat.completions.create(
     modalities=["text"]
 )
 print(response.choices[0].message.content)
+```
+
+#### Text + Audio
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-Omni-7B",
+    messages=[{"role": "user", "content": "Describe vLLM in brief."}],
+    modalities=["audio"]
+)
+# Response contains two choices: one with text, one with audio
+print(response.choices[0].message.content)  # Text response
+print(response.choices[1].message.audio)    # Audio response
 ```
 
 ## Run Local Web UI Demo
