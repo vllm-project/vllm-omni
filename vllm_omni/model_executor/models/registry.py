@@ -53,6 +53,11 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2_ar",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
     "MammothModa2ARForConditionalGeneration": (
         "mammoth_moda2",
         "mammoth_moda2_ar",
@@ -63,24 +68,15 @@ _OMNI_MODELS = {
         "mammoth_moda2_dit",
         "MammothModa2DiTForConditionalGeneration",
     ),
-    # 统一入口：仿照 Qwen2_5OmniForConditionalGeneration，让每个 stage 都使用同一个 model_arch，
-    # 再通过 engine_args.model_stage（ar/dit/vae）在 __init__ 内选择实际子模块。
     "MammothModa2ForConditionalGeneration": (
         "mammoth_moda2",
         "mammoth_moda2",
         "MammothModa2ForConditionalGeneration",
     ),
-    # 顶层入口，匹配 HF 配置里的 architectures= ["Mammothmoda2Model"]
     "Mammothmoda2Model": (
         "mammoth_moda2",
         "mammoth_moda2",
         "MammothModa2ForConditionalGeneration",
-    ),
-    # 文本骨干架构别名，便于按名称显式加载。
-    "MammothModa2Qwen2ForCausalLM": (
-        "mammoth_moda2",
-        "mammoth_moda2_ar",
-        "MammothModa2Qwen2ForCausalLM",
     ),
 }
 
@@ -88,27 +84,6 @@ _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
     **_OMNI_MODELS,
 }
-
-# 兼容基础 vLLM 的全局 ModelRegistry，确保 architectures=["Mammothmoda2Model"] 可被识别。
-if hasattr(VLLMModelRegistry, "register_model"):
-    VLLMModelRegistry.register_model(
-        "Mammothmoda2Model",
-        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2:MammothModa2ForConditionalGeneration",
-    )
-    VLLMModelRegistry.register_model(
-        "MammothModa2ARForConditionalGeneration",
-        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2_ar:MammothModa2ARForConditionalGeneration",
-    )
-    VLLMModelRegistry.register_model(
-        "MammothModa2DiTForConditionalGeneration",
-        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2_dit:"
-        "MammothModa2DiTForConditionalGeneration",
-    )
-    VLLMModelRegistry.register_model(
-        "MammothModa2Qwen2ForCausalLM",
-        "vllm_omni.model_executor.models.mammoth_moda2.mammoth_moda2_ar:"
-        "MammothModa2Qwen2ForCausalLM",
-    )
 
 OmniModelRegistry = _ModelRegistry(
     {
