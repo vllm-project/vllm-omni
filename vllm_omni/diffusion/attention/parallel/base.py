@@ -80,18 +80,3 @@ class NoParallelAttention:
 
     def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
         return attn_output
-
-    def run_attention(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata | None,
-        softmax_scale: float | None = None,
-        causal: bool = False,
-    ) -> torch.Tensor:
-        """Runs the actual attention kernel for this strategy.
-        
-        Optional: If not implemented, the standard local attention kernel will be used.
-        """
-        raise NotImplementedError

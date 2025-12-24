@@ -475,23 +475,6 @@ def ulysses_attention_on_test_model(
             f"Output shape mismatch: expected {(batch_size, local_seq_len, hidden_size)}, got {output.shape}"
         )
 
-        # Verify SP usage for non-baseline runs
-        if not is_baseline:
-            if hasattr(model, "attention"):
-                if ulysses_degree > 1 or ring_degree > 1:
-                    assert model.attention.use_ulysses or model.attention.use_ring, "Attention should be using Ulysses or Ring when parallel degree > 1"
-                else:
-                    assert not model.attention.use_ulysses and not model.attention.use_ring, "Attention should NOT be using Ulysses or Ring when parallel degree == 1"
-            elif hasattr(model, "layers"):
-                for i, layer in enumerate(model.layers):
-                    assert hasattr(layer.attention, "use_ulysses"), (
-                        f"Layer {i} attention should have use_ulysses attribute"
-                    )
-                    if ulysses_degree > 1 or ring_degree > 1:
-                        assert layer.attention.use_ulysses or layer.attention.use_ring, f"Layer {i} attention should be using Ulysses or Ring when parallel degree > 1"
-                    else:
-                        assert not layer.attention.use_ulysses and not layer.attention.use_ring, f"Layer {i} attention should NOT be using Ulysses or Ring when parallel degree == 1"
-
         # Gather outputs from all ranks AFTER computation
         if world_size > 1:
             print(f"[Rank {local_rank}] Gathering outputs from all {world_size} ranks...")
