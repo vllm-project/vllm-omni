@@ -479,15 +479,18 @@ def ulysses_attention_on_test_model(
         if not is_baseline:
             if hasattr(model, "attention"):
                 if ulysses_degree > 1 or ring_degree > 1:
-                    pass # Parallel strategy object check would be deeper
+                    assert model.attention.use_ulysses or model.attention.use_ring, "Attention should be using Ulysses or Ring when parallel degree > 1"
                 else:
-                    pass
+                    assert not model.attention.use_ulysses and not model.attention.use_ring, "Attention should NOT be using Ulysses or Ring when parallel degree == 1"
             elif hasattr(model, "layers"):
                 for i, layer in enumerate(model.layers):
+                    assert hasattr(layer.attention, "use_ulysses"), (
+                        f"Layer {i} attention should have use_ulysses attribute"
+                    )
                     if ulysses_degree > 1 or ring_degree > 1:
-                        pass
+                        assert layer.attention.use_ulysses or layer.attention.use_ring, f"Layer {i} attention should be using Ulysses or Ring when parallel degree > 1"
                     else:
-                        pass
+                        assert not layer.attention.use_ulysses and not layer.attention.use_ring, f"Layer {i} attention should NOT be using Ulysses or Ring when parallel degree == 1"
 
         # Gather outputs from all ranks AFTER computation
         if world_size > 1:
