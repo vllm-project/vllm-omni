@@ -626,19 +626,19 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
-    # Wait for service
-    wait_for_service(args.base_url)
+    # # Wait for service
+    # wait_for_service(args.base_url)
 
-    # Fetch model info
-    try:
-        resp = requests.get(f"{args.base_url}/v1/model_info", timeout=5)
-        if resp.status_code == 200:
-            info = resp.json()
-            if "model_path" in info and info["model_path"]:
-                args.model = info["model_path"]
-                print(f"Updated model name from server: {args.model}")
-    except Exception as e:
-        print(f"Failed to fetch model info: {e}. Using default: {args.model}")
+    # # Fetch model info
+    # try:
+    #     resp = requests.get(f"{args.base_url}/v1/model_info", timeout=5)
+    #     if resp.status_code == 200:
+    #         info = resp.json()
+    #         if "model_path" in info and info["model_path"]:
+    #             args.model = info["model_path"]
+    #             print(f"Updated model name from server: {args.model}")
+    # except Exception as e:
+    #     print(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
     # Setup dataset
     if args.backend == "sglang-image":
