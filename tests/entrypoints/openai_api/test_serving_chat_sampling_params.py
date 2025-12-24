@@ -3,7 +3,7 @@
 Unit tests for OmniOpenAIServingChat sampling params handling.
 
 Tests that standard OpenAI API parameters (max_tokens, temperature, etc.)
-are correctly applied to the thinker stage while preserving YAML defaults.
+are correctly applied to the comprehension stage while preserving YAML defaults.
 """
 
 from unittest.mock import MagicMock
@@ -13,26 +13,26 @@ from vllm.sampling_params import SamplingParams
 
 
 @pytest.fixture
-def mock_thinker_stage():
-    """Create a mock thinker stage with is_comprehension=True."""
+def mock_comprehension_stage():
+    """Create a mock comprehension stage with is_comprehension=True."""
     stage = MagicMock()
     stage.is_comprehension = True
-    stage.model_stage = "thinker"
+    stage.model_stage = "comprehension"
     return stage
 
 
 @pytest.fixture
 def mock_other_stage():
-    """Create a mock non-thinker stage."""
+    """Create a mock non-comprehension stage."""
     stage = MagicMock()
     stage.is_comprehension = False
-    stage.model_stage = "talker"
+    stage.model_stage = "other"
     return stage
 
 
 @pytest.fixture
-def default_thinker_params():
-    """Default sampling params for thinker stage (from YAML)."""
+def default_comprehension_params():
+    """Default sampling params for comprehension stage (from YAML)."""
     return SamplingParams(
         temperature=0.4,
         top_p=0.9,
@@ -45,7 +45,7 @@ def default_thinker_params():
 
 @pytest.fixture
 def default_other_params():
-    """Default sampling params for non-thinker stage (from YAML)."""
+    """Default sampling params for non-comprehension stage (from YAML)."""
     return SamplingParams(
         temperature=0.9,
         top_k=50,
@@ -55,12 +55,12 @@ def default_other_params():
 
 
 @pytest.fixture
-def mock_engine_client(mock_thinker_stage, mock_other_stage, default_thinker_params, default_other_params):
+def mock_engine_client(mock_comprehension_stage, mock_other_stage, default_comprehension_params, default_other_params):
     """Create mock engine client with stage_list and default_sampling_params_list."""
     engine_client = MagicMock()
-    engine_client.stage_list = [mock_thinker_stage, mock_other_stage]
+    engine_client.stage_list = [mock_comprehension_stage, mock_other_stage]
     engine_client.default_sampling_params_list = [
-        default_thinker_params,
+        default_comprehension_params,
         default_other_params,
     ]
     return engine_client
@@ -123,13 +123,13 @@ def test_preserves_yaml_defaults_when_no_request_params(serving_chat, mock_reque
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
     assert len(result) == 2
-    thinker_params = result[0]
-    assert thinker_params.temperature == 0.4
-    assert thinker_params.top_p == 0.9
-    assert thinker_params.top_k == 1  # YAML custom param preserved
-    assert thinker_params.max_tokens == 2048
-    assert thinker_params.seed == 42
-    assert thinker_params.repetition_penalty == 1.05  # YAML custom param preserved
+    comprehension_params = result[0]
+    assert comprehension_params.temperature == 0.4
+    assert comprehension_params.top_p == 0.9
+    assert comprehension_params.top_k == 1  # YAML custom param preserved
+    assert comprehension_params.max_tokens == 2048
+    assert comprehension_params.seed == 42
+    assert comprehension_params.repetition_penalty == 1.05  # YAML custom param preserved
 
 
 def test_request_temperature_overrides_yaml_default(serving_chat, mock_request):
@@ -138,10 +138,10 @@ def test_request_temperature_overrides_yaml_default(serving_chat, mock_request):
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    thinker_params = result[0]
-    assert thinker_params.temperature == 0.8  # Overridden
-    assert thinker_params.seed == 42  # Preserved from YAML
-    assert thinker_params.top_k == 1  # YAML custom param preserved
+    comprehension_params = result[0]
+    assert comprehension_params.temperature == 0.8  # Overridden
+    assert comprehension_params.seed == 42  # Preserved from YAML
+    assert comprehension_params.top_k == 1  # YAML custom param preserved
 
 
 def test_request_top_p_overrides_yaml_default(serving_chat, mock_request):
@@ -150,9 +150,9 @@ def test_request_top_p_overrides_yaml_default(serving_chat, mock_request):
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    thinker_params = result[0]
-    assert thinker_params.top_p == 0.95  # Overridden
-    assert thinker_params.temperature == 0.4  # Preserved from YAML
+    comprehension_params = result[0]
+    assert comprehension_params.top_p == 0.95  # Overridden
+    assert comprehension_params.temperature == 0.4  # Preserved from YAML
 
 
 def test_request_max_tokens_overrides_yaml_default(serving_chat, mock_request):
@@ -177,9 +177,9 @@ def test_request_seed_overrides_yaml_default(serving_chat, mock_request):
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    thinker_params = result[0]
-    assert thinker_params.seed == 123  # Overridden
-    assert thinker_params.temperature == 0.4  # Preserved from YAML
+    comprehension_params = result[0]
+    assert comprehension_params.seed == 123  # Overridden
+    assert comprehension_params.temperature == 0.4  # Preserved from YAML
 
 
 def test_request_frequency_penalty_overrides(serving_chat, mock_request):
@@ -200,8 +200,8 @@ def test_request_presence_penalty_overrides(serving_chat, mock_request):
     assert result[0].presence_penalty == 0.3
 
 
-def test_non_thinker_stages_use_cloned_defaults(serving_chat, mock_request):
-    """Test that non-thinker stages always use cloned YAML defaults."""
+def test_non_comprehension_stages_use_cloned_defaults(serving_chat, mock_request):
+    """Test that non-comprehension stages always use cloned YAML defaults."""
     mock_request.max_tokens = 50
     mock_request.temperature = 0.1
 
@@ -223,15 +223,15 @@ def test_multiple_params_override_together(serving_chat, mock_request):
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    thinker_params = result[0]
+    comprehension_params = result[0]
     # Overridden by request
-    assert thinker_params.temperature == 0.7
-    assert thinker_params.top_p == 0.85
-    assert thinker_params.max_tokens == 200
-    assert thinker_params.seed == 999
+    assert comprehension_params.temperature == 0.7
+    assert comprehension_params.top_p == 0.85
+    assert comprehension_params.max_tokens == 200
+    assert comprehension_params.seed == 999
     # Preserved from YAML (not in _OPENAI_SAMPLING_FIELDS)
-    assert thinker_params.top_k == 1
-    assert thinker_params.repetition_penalty == 1.05
+    assert comprehension_params.top_k == 1
+    assert comprehension_params.repetition_penalty == 1.05
 
 
 def test_yaml_custom_params_not_overridden_by_request(serving_chat, mock_request):
@@ -243,9 +243,9 @@ def test_yaml_custom_params_not_overridden_by_request(serving_chat, mock_request
 
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    thinker_params = result[0]
-    assert thinker_params.top_k == 1  # YAML default preserved
-    assert thinker_params.repetition_penalty == 1.05  # YAML default preserved
+    comprehension_params = result[0]
+    assert comprehension_params.top_k == 1  # YAML default preserved
+    assert comprehension_params.repetition_penalty == 1.05  # YAML default preserved
 
 
 # =============================================================================
@@ -253,16 +253,16 @@ def test_yaml_custom_params_not_overridden_by_request(serving_chat, mock_request
 # =============================================================================
 
 
-def test_apply_request_overrides_clones_params(serving_chat, mock_request, default_thinker_params):
+def test_apply_request_overrides_clones_params(serving_chat, mock_request, default_comprehension_params):
     """Test that _apply_request_overrides returns a cloned object."""
-    result = serving_chat._apply_request_overrides(default_thinker_params, mock_request)
+    result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
 
-    assert result is not default_thinker_params  # Different object
+    assert result is not default_comprehension_params  # Different object
 
 
-def test_apply_request_overrides_preserves_defaults(serving_chat, mock_request, default_thinker_params):
+def test_apply_request_overrides_preserves_defaults(serving_chat, mock_request, default_comprehension_params):
     """Test that _apply_request_overrides preserves defaults when request has None."""
-    result = serving_chat._apply_request_overrides(default_thinker_params, mock_request)
+    result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
 
     assert result.temperature == 0.4
     assert result.top_p == 0.9
@@ -270,12 +270,12 @@ def test_apply_request_overrides_preserves_defaults(serving_chat, mock_request, 
     assert result.top_k == 1  # YAML custom param
 
 
-def test_apply_request_overrides_applies_values(serving_chat, mock_request, default_thinker_params):
+def test_apply_request_overrides_applies_values(serving_chat, mock_request, default_comprehension_params):
     """Test that _apply_request_overrides applies non-None request values."""
     mock_request.temperature = 0.8
     mock_request.seed = 123
 
-    result = serving_chat._apply_request_overrides(default_thinker_params, mock_request)
+    result = serving_chat._apply_request_overrides(default_comprehension_params, mock_request)
 
     assert result.temperature == 0.8  # Overridden
     assert result.seed == 123  # Overridden
@@ -284,39 +284,39 @@ def test_apply_request_overrides_applies_values(serving_chat, mock_request, defa
 
 
 # =============================================================================
-# Tests for _get_thinker_stage_index
+# Tests for _get_comprehension_stage_index
 # =============================================================================
 
 
-def test_get_thinker_stage_index_finds_first_stage(mock_engine_client):
-    """Test finding thinker stage when it's at index 0."""
+def test_get_comprehension_stage_index_finds_first_stage(mock_engine_client):
+    """Test finding comprehension stage when it's at index 0."""
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     instance = object.__new__(OmniOpenAIServingChat)
     instance.engine_client = mock_engine_client
 
-    assert instance._get_thinker_stage_index() == 0
+    assert instance._get_comprehension_stage_index() == 0
 
 
-def test_get_thinker_stage_index_finds_second_stage():
-    """Test finding thinker stage when it's at index 1."""
+def test_get_comprehension_stage_index_finds_second_stage():
+    """Test finding comprehension stage when it's at index 1."""
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     instance = object.__new__(OmniOpenAIServingChat)
 
     other = MagicMock()
     other.is_comprehension = False
-    thinker = MagicMock()
-    thinker.is_comprehension = True
+    comprehension = MagicMock()
+    comprehension.is_comprehension = True
 
     instance.engine_client = MagicMock()
-    instance.engine_client.stage_list = [other, thinker]
+    instance.engine_client.stage_list = [other, comprehension]
 
-    assert instance._get_thinker_stage_index() == 1
+    assert instance._get_comprehension_stage_index() == 1
 
 
-def test_get_thinker_stage_index_raises_when_not_found():
-    """Test that ValueError is raised when no thinker stage exists."""
+def test_get_comprehension_stage_index_raises_when_not_found():
+    """Test that ValueError is raised when no comprehension stage exists."""
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     instance = object.__new__(OmniOpenAIServingChat)
@@ -329,5 +329,5 @@ def test_get_thinker_stage_index_raises_when_not_found():
     instance.engine_client = MagicMock()
     instance.engine_client.stage_list = [stage1, stage2]
 
-    with pytest.raises(ValueError, match="No thinker stage"):
-        instance._get_thinker_stage_index()
+    with pytest.raises(ValueError, match="No comprehension stage"):
+        instance._get_comprehension_stage_index()

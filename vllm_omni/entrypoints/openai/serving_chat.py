@@ -232,7 +232,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
-                    # Use standard OpenAI API parameters for thinker stage
+                    # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
 
                 self._log_inputs(
@@ -408,11 +408,11 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list
 
-    def _get_thinker_stage_index(self) -> int:
+    def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_list):
             if stage.is_comprehension:
                 return idx
-        raise ValueError("No thinker stage (is_comprehension=True) found in stage_list")
+        raise ValueError("No comprehension stage (is_comprehension=True) found in stage_list")
 
     # OpenAI API standard sampling parameters that can be safely overridden.
     # These are the most commonly used parameters with compatible types
@@ -460,7 +460,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     ) -> list[SamplingParams]:
         """Build sampling_params_list using standard OpenAI API parameters.
 
-        For the thinker stage, starts with YAML defaults and overrides with
+        For the comprehension stage, starts with YAML defaults and overrides with
         user-provided request values. For other stages, uses cloned YAML defaults.
 
         This approach ensures all YAML defaults (including seed, detokenize, etc.)
@@ -473,11 +473,11 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             List of SamplingParams, one for each stage.
         """
         default_params_list = self.engine_client.default_sampling_params_list
-        thinker_idx = self._get_thinker_stage_index()
+        comprehension_idx = self._get_comprehension_stage_index()
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
-            if idx == thinker_idx:
+            if idx == comprehension_idx:
                 params = self._apply_request_overrides(default_params, request)
                 sampling_params_list.append(params)
             else:
