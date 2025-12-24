@@ -48,7 +48,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
-from vllm_omni.model_executor.models.utils import safe_tensor_reshape
 
 logger = init_logger(__name__)
 

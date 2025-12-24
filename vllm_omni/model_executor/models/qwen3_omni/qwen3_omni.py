@@ -3,7 +3,6 @@
 # Copyright 2025 The Qwen team.
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
-from collections import defaultdict
 from collections.abc import Iterable
 from functools import cached_property
 
@@ -390,7 +389,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
-
                 )
 
             # merge the code_predictor_codes from the info_dict list into a single tensor
