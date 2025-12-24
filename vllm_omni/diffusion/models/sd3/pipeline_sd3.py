@@ -74,7 +74,7 @@ def retrieve_timesteps(
     timesteps: list[int] | None = None,
     sigmas: list[float] | None = None,
     **kwargs,
-):
+) -> tuple[torch.Tensor, int]:
     r"""
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
@@ -270,7 +270,8 @@ class StableDiffusion3Pipeline(
 
     def _get_clip_prompt_embeds(
         self,
-        prompt: str | list[str] = None,
+        prompt: str | list[str] = "",
+        num_images_per_prompt: int = 1,
         dtype: torch.dtype | None = None,
         clip_model_index: int = 0,
     ):
@@ -282,6 +283,7 @@ class StableDiffusion3Pipeline(
         text_encoder = clip_text_encoders[clip_model_index]
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
 
         text_inputs = tokenizer(
             prompt,
@@ -305,12 +307,18 @@ class StableDiffusion3Pipeline(
         prompt_embeds = prompt_embeds.hidden_states[-2]
 
         prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=self.device)
+        _, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+        pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt)
+        pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
 
         return prompt_embeds, pooled_prompt_embeds
 
     def _get_t5_prompt_embeds(
         self,
-        prompt: str | list[str] = None,
+        prompt: str | list[str] = "",
+        num_images_per_prompt: int = 1,
         max_sequence_length: int = 256,
         dtype: torch.dtype | None = None,
     ):
@@ -352,6 +360,9 @@ class StableDiffusion3Pipeline(
 
         dtype = self.text_encoder_3.dtype
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)
+        _, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
         return prompt_embeds
 
@@ -362,6 +373,7 @@ class StableDiffusion3Pipeline(
         prompt_3: str | list[str],
         prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 256,
+        num_images_per_prompt: int = 1,
     ):
         r"""
 
@@ -393,16 +405,19 @@ class StableDiffusion3Pipeline(
 
             prompt_embed, pooled_prompt_embed = self._get_clip_prompt_embeds(
                 prompt=prompt,
+                num_images_per_prompt=num_images_per_prompt,
                 clip_model_index=0,
             )
             prompt_2_embed, pooled_prompt_2_embed = self._get_clip_prompt_embeds(
                 prompt=prompt_2,
+                num_images_per_prompt=num_images_per_prompt,
                 clip_model_index=1,
             )
             clip_prompt_embeds = torch.cat([prompt_embed, prompt_2_embed], dim=-1)
 
             t5_prompt_embed = self._get_t5_prompt_embeds(
                 prompt=prompt_3,
+                num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
 
