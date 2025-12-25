@@ -107,22 +107,23 @@ class OmniRequestState(RequestState):
             def _to_cpu(x):
                 if isinstance(x, torch.Tensor):
                     try:
-                        return x.detach().to("cpu").contiguous()
+                        return x.detach().to("cpu", non_blocking=True).contiguous()
                     except Exception:
                         return x
                 return x
 
             if isinstance(payload, dict):
                 incoming: Dict[str, Any] = {}
-                # Optional remap: if producer used "model_outputs" or "hidden", rename to mm_type
-                # to keep a consistent key namespace per engine_core_output_type.
-                remapped_tensor = dict(payload)
                 target_key = self.mm_type or "hidden"
-                if "model_outputs" in remapped_tensor:
-                    remapped_tensor[target_key] = remapped_tensor.pop("model_outputs")
-                elif "hidden" in remapped_tensor and target_key != "hidden":
-                    remapped_tensor[target_key] = remapped_tensor.pop("hidden")
-                for k, v in remapped_tensor.items():
+
+                # Iterate directly without unnecessary dict copy
+                for k, v in payload.items():
+                    # Optional remap: if producer used "model_outputs" or "hidden", rename to mm_type
+                    if k == "model_outputs":
+                        k = target_key
+                    elif k == "hidden" and target_key != "hidden":
+                        k = target_key
+
                     if isinstance(v, dict):
                         incoming[k] = {str(sk): _to_cpu(sv) for sk, sv in v.items()}
                     else:
@@ -134,29 +135,27 @@ class OmniRequestState(RequestState):
             if self.mm_accumulated is None:
                 self.mm_accumulated = incoming
             else:
-                # Merge keys; concatenate tensors along token dim when possible
+                # Merge keys; accumulate tensors in lists for deferred concatenation
                 for k, v in incoming.items():
                     if k not in self.mm_accumulated:
                         self.mm_accumulated[k] = v
                     else:
                         existing = self.mm_accumulated[k]
                         if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
-                            try:
-                                self.mm_accumulated[k] = torch.cat([existing, v], dim=0)  # type: ignore[index]
-                            except Exception:
-                                self.mm_accumulated[k] = v
+                            # Use list accumulation to avoid O(n²) repeated concatenation
+                            self.mm_accumulated[k] = [existing, v]
+                        elif isinstance(v, torch.Tensor) and isinstance(existing, list):
+                            # Append to existing list
+                            existing.append(v)
                         elif isinstance(v, dict) and isinstance(existing, dict):
-                            # Merge nested dicts by concatenating tensors along token dim when possible
+                            # Merge nested dicts with list accumulation for tensors
                             for sk, sv in v.items():
                                 if sk not in existing:
                                     existing[sk] = sv
-                                    continue
-                                ev = existing[sk]
-                                if isinstance(sv, torch.Tensor) and isinstance(ev, torch.Tensor):
-                                    try:
-                                        existing[sk] = torch.cat([ev, sv], dim=0)
-                                    except Exception:
-                                        existing[sk] = sv
+                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], torch.Tensor):
+                                    existing[sk] = [existing[sk], sv]
+                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], list):
+                                    existing[sk].append(sv)
                                 else:
                                     existing[sk] = sv
                         else:
@@ -164,6 +163,28 @@ class OmniRequestState(RequestState):
         except Exception:
             # Log and continue without crashing the output pipeline
             logger.exception("Error accumulating multimodal tensor")
+
+    def _consolidate_multimodal_tensors(self) -> None:
+        """Consolidate accumulated tensor lists into single tensors via concatenation."""
+        if self.mm_accumulated is None:
+            return
+        try:
+            for k, v in self.mm_accumulated.items():
+                if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    try:
+                        self.mm_accumulated[k] = torch.cat(v, dim=0)
+                    except Exception:
+                        # Keep last tensor on failure
+                        self.mm_accumulated[k] = v[-1]
+                elif isinstance(v, dict):
+                    for sk, sv in v.items():
+                        if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
+                            try:
+                                v[sk] = torch.cat(sv, dim=0)
+                            except Exception:
+                                v[sk] = sv[-1]
+        except Exception:
+            logger.exception("Error consolidating multimodal tensors")
 
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
@@ -416,6 +437,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             if pooling_output is not None and new_token_ids:
                 # Do not consume pooling path now; keep ids and attach mm later
                 pooling_for_make = None
+
+            # Consolidate any accumulated tensor lists before creating output
+            if isinstance(req_state, OmniRequestState) and finish_reason is not None:
+                req_state._consolidate_multimodal_tensors()
 
             ro = req_state.make_request_output(
                 new_token_ids,

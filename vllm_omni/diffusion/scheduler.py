@@ -29,7 +29,7 @@ class Scheduler:
         self.od_config = od_config
         self.context = zmq.Context()  # Standard synchronous context
 
-        # Initialize MessageQueue for broadcasting requests
+        # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
         self.mq = MessageQueue(
             n_reader=self.num_workers,
@@ -51,9 +51,20 @@ class Scheduler:
     def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
         try:
-            # Broadcast request to all workers
-            self.mq.enqueue(requests)
+            # Prepare RPC request for generation
+            rpc_request = {
+                "type": "rpc",
+                "method": "generate",
+                "args": (requests,),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+            }
+
+            # Broadcast RPC request to all workers
+            self.mq.enqueue(rpc_request)
             # Wait for result from Rank 0 (or whoever sends it)
+
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")
 
