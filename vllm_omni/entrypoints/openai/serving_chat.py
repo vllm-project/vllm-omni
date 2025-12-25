@@ -1295,7 +1295,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         for omni_outputs in final_outputs:
             choices_data = []
-            if not getattr(omni_outputs.request_output, "finished", False):
+            if not omni_outputs.finished:
                 continue
 
             if omni_outputs.final_output_type == "text":

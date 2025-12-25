@@ -249,6 +249,7 @@ def run_inference_api(
     """Run inference using OpenAI API client with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
         yield "Please provide at least a text prompt or multimodal input.", None
+        return
 
     try:
         # Build message content list
