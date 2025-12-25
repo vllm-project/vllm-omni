@@ -610,18 +610,12 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params["true_cfg_scale"] = request.true_cfg_scale
         if request.seed is not None:
             gen_params["seed"] = request.seed
+        gen_params["request_id"] = f"img_gen_{int(time.time())}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
-        # AsyncOmni.generate returns an async generator, iterate to get final output
-        result = None
-        async for output in engine_client.generate(
-            prompt=gen_params["prompt"],
-            request_id=f"img_gen_{int(time.time())}",
-            sampling_params_list=[gen_params],
-        ):
-            result = output
+        result = await engine_client.generate(**gen_params)
 
         if result is None:
             raise HTTPException(
