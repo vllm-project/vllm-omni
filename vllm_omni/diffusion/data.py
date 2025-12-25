@@ -335,6 +335,9 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
+    # support multi images input
+    supports_multimodal_inputs: bool = False
+
     # Logging
     log_level: str = "info"
 
@@ -414,6 +417,9 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+    def update_multimodal_support(self) -> None:
+        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
