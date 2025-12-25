@@ -232,7 +232,7 @@ class OmniLLM:
         self,
         prompts: PromptType | Sequence[PromptType],
         sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
-    ) -> list[OmniRequestOutput]:
+    ) -> Generator[OmniRequestOutput, None, None]:
         """Generate outputs for the given prompts.
 
         Processes prompts through all stages in the pipeline and returns
@@ -278,8 +278,6 @@ class OmniLLM:
             request_prompts: list[PromptType] = [prompts]
         else:
             request_prompts = list(prompts)
-
-        # final_outputs: list[OmniRequestOutput] = []
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
@@ -389,13 +387,6 @@ class OmniLLM:
                 stage.set_engine_outputs(engine_outputs)
 
                 if getattr(stage, "final_output", False):
-                    # final_outputs.append(
-                    #     OmniRequestOutput(
-                    #         stage_id=stage_id,
-                    #         final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
-                    #         request_output=engine_outputs,
-                    #     )
-                    # )
                     logger.debug(
                         "[Orchestrator] Request %s finalized at stage-%s",
                         req_id,
@@ -489,8 +480,6 @@ class OmniLLM:
             logger.info("[Summary] %s", summary)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
-
-        # return final_outputs
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
         deadline = time.time() + max(0, int(timeout))

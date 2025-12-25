@@ -244,7 +244,6 @@ class OmniStage:
                         model,
                         stage_payload,
                         batch_timeout,
-                        self.engine_output_type,
                     ),
                 )
             else:
@@ -877,9 +876,8 @@ def _stage_worker_async_entry(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
-    engine_output_type: str = "latent",
 ) -> None:
-    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout, engine_output_type))
+    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout))
 
 
 async def _stage_worker_async(
@@ -887,7 +885,6 @@ async def _stage_worker_async(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
-    engine_output_type: str = "latent",
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     import logging as _logging
