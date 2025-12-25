@@ -112,9 +112,6 @@ def test_app():
     mock_engine_client.generate = MagicMock(side_effect=mock_generate_fn)
     mock_engine_client.default_sampling_params_list = [{}]
 
-    # Mock model_config and models for OpenAIServing base class
-    mock_model_config = MagicMock()
-
     # Mock models to have an is_base_model method
     mock_models = MagicMock()
     mock_models.is_base_model.return_value = True
