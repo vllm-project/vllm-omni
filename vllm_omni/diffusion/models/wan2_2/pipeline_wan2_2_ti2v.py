@@ -1,12 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""
+Wan2.2 TI2V (Text-Image-to-Video) Pipeline.
+
+This pipeline supports the unified TI2V-5B model that can generate videos from:
+- Text only (T2V mode)
+- Text + Image (I2V mode)
+
+The key difference from the MoE-based I2V pipeline is:
+- Single transformer (not MoE with two transformers)
+- Uses expand_timesteps mode for image conditioning
+- No CLIP image encoder - only VAE encoding for image condition
+"""
+
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterable
 
+import numpy as np
 import PIL.Image
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
@@ -18,88 +31,12 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 
-def retrieve_latents(
-    encoder_output: torch.Tensor,
-    generator: torch.Generator | None = None,
-    sample_mode: str = "sample",
-):
-    """Retrieve latents from VAE encoder output."""
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-
-
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
-    """Load transformer config from model directory or HF Hub."""
-    if local_files_only:
-        config_path = os.path.join(model_path, subfolder, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                return json.load(f)
-    else:
-        # Try to download config from HF Hub
-        try:
-            from huggingface_hub import hf_hub_download
-
-            config_path = hf_hub_download(
-                repo_id=model_path,
-                filename=f"{subfolder}/config.json",
-            )
-            with open(config_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
-    kwargs = {}
-
-    if "patch_size" in config:
-        kwargs["patch_size"] = tuple(config["patch_size"])
-    if "num_attention_heads" in config:
-        kwargs["num_attention_heads"] = config["num_attention_heads"]
-    if "attention_head_dim" in config:
-        kwargs["attention_head_dim"] = config["attention_head_dim"]
-    if "in_channels" in config:
-        kwargs["in_channels"] = config["in_channels"]
-    if "out_channels" in config:
-        kwargs["out_channels"] = config["out_channels"]
-    if "text_dim" in config:
-        kwargs["text_dim"] = config["text_dim"]
-    if "freq_dim" in config:
-        kwargs["freq_dim"] = config["freq_dim"]
-    if "ffn_dim" in config:
-        kwargs["ffn_dim"] = config["ffn_dim"]
-    if "num_layers" in config:
-        kwargs["num_layers"] = config["num_layers"]
-    if "cross_attn_norm" in config:
-        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
-    if "eps" in config:
-        kwargs["eps"] = config["eps"]
-    if "image_dim" in config:
-        kwargs["image_dim"] = config["image_dim"]
-    if "added_kv_proj_dim" in config:
-        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
-    if "rope_max_seq_len" in config:
-        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
-    if "pos_embed_seq_len" in config:
-        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
-
-    return WanTransformer3DModel(**kwargs)
-
-
-def get_wan22_post_process_func(
+def get_wan22_ti2v_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
     from diffusers.video_processor import VideoProcessor
@@ -117,11 +54,10 @@ def get_wan22_post_process_func(
     return post_process_func
 
 
-def get_wan22_pre_process_func(
+def get_wan22_ti2v_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
-    """Pre-process function for Wan2.2: optionally load and resize input image for I2V mode."""
-    import numpy as np
+    """Pre-process function for TI2V: optionally load and resize input image."""
     from diffusers.video_processor import VideoProcessor
 
     video_processor = VideoProcessor(vae_scale_factor=8)
@@ -137,7 +73,7 @@ def get_wan22_pre_process_func(
 
                 # Calculate dimensions based on aspect ratio if not provided
                 if req.height is None or req.width is None:
-                    # Default max area for 720P
+                    # Default max area for 720P (TI2V-5B default)
                     max_area = 720 * 1280
                     aspect_ratio = image.height / image.width
 
@@ -163,7 +99,18 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module):
+class Wan22TI2VPipeline(nn.Module):
+    """
+    Wan2.2 Text-Image-to-Video (TI2V) Pipeline.
+
+    This is a unified pipeline that supports both:
+    - Text-to-Video (T2V): when no image is provided
+    - Image-to-Video (I2V): when an image is provided
+
+    Uses expand_timesteps mode for I2V conditioning where the first frame
+    is conditioned on the input image latent.
+    """
+
     def __init__(
         self,
         *,
@@ -179,20 +126,7 @@ class Wan22Pipeline(nn.Module):
         model = od_config.model
         local_files_only = os.path.exists(model)
 
-        # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
-        self.expand_timesteps = False
-        if local_files_only:
-            model_index_path = os.path.join(model, "model_index.json")
-            if os.path.exists(model_index_path):
-                with open(model_index_path) as f:
-                    model_index = json.load(f)
-                    self.expand_timesteps = model_index.get("expand_timesteps", False)
-
-        # Check if this is a two-stage model (MoE with transformer_2)
-        transformer_2_path = os.path.join(model, "transformer_2") if local_files_only else None
-        self.has_transformer_2 = transformer_2_path is not None and os.path.exists(transformer_2_path)
-
-        # Set up weights sources for transformer(s)
+        # Set up weights sources for single transformer
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -202,51 +136,36 @@ class Wan22Pipeline(nn.Module):
                 fall_back_to_pt=True,
             ),
         ]
-        if self.has_transformer_2:
-            self.weights_sources.append(
-                DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=od_config.model,
-                    subfolder="transformer_2",
-                    revision=None,
-                    prefix="transformer_2.",
-                    fall_back_to_pt=True,
-                )
-            )
 
+        # Text encoder
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
+
+        # VAE
         self.vae = AutoencoderKLWan.from_pretrained(
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
-        # Initialize transformers with correct config (weights loaded via load_weights)
-        if local_files_only:
-            transformer_config = load_transformer_config(model, "transformer")
-            self.transformer = create_transformer_from_config(transformer_config)
-            if self.has_transformer_2:
-                transformer_2_config = load_transformer_config(model, "transformer_2")
-                self.transformer_2 = create_transformer_from_config(transformer_2_config)
-            else:
-                self.transformer_2 = None
-        else:
-            self.transformer = WanTransformer3DModel()
-            self.transformer_2 = WanTransformer3DModel() if self.has_transformer_2 else None
+        # Single transformer (TI2V uses dense 5B model, not MoE)
+        self.transformer = WanTransformer3DModel()
 
+        # Scheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        # Apply flow_shift if specified (12.0 for 480p, 5.0 for 720p recommended for Wan2.2)
         if od_config.flow_shift is not None:
             self.scheduler.config.flow_shift = od_config.flow_shift
 
-        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
-        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
-        self.boundary_ratio = od_config.boundary_ratio
+        # VAE scale factors
+        self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
+        self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
+
+        # TI2V always uses expand_timesteps mode
+        self.expand_timesteps = True
 
         self._guidance_scale = None
-        self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
 
@@ -272,10 +191,11 @@ class Wan22Pipeline(nn.Module):
         req: OmniDiffusionRequest,
         prompt: str | None = None,
         negative_prompt: str | None = None,
+        image: PIL.Image.Image | torch.Tensor | None = None,
         height: int | None = None,
         width: int | None = None,
         num_inference_steps: int | None = None,
-        guidance_scale: float | tuple[float, float] = 4.0,
+        guidance_scale: float = 5.0,
         frame_num: int | None = None,
         output_type: str | None = "np",
         generator: torch.Generator | None = None,
@@ -284,49 +204,36 @@ class Wan22Pipeline(nn.Module):
         attention_kwargs: dict | None = None,
         **kwargs,
     ) -> DiffusionOutput:
+        # Get parameters from request or arguments
         prompt = req.prompt if req.prompt is not None else prompt
         negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 TI2V generation.")
 
-        height = req.height or height or 720
+        # Get image from request (optional for TI2V)
+        if image is None:
+            image = req.pil_image
+
+        # Default dimensions for TI2V-5B (720P)
+        height = req.height or height or 704
         width = req.width or width or 1280
-        num_frames = req.num_frames if req.num_frames else frame_num or 81
+        num_frames = req.num_frames if req.num_frames else frame_num or 121
+        num_steps = req.num_inference_steps or num_inference_steps or 50
 
-        # Ensure dimensions are compatible with VAE and patch size
-        # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
-        patch_size = self.transformer.config.patch_size
-        mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
-        height = (height // mod_value) * mod_value
-        width = (width // mod_value) * mod_value
-        num_steps = req.num_inference_steps or num_inference_steps or 40
+        self._guidance_scale = guidance_scale
 
-        guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
-        guidance_high = (
-            req.guidance_scale_2
-            if req.guidance_scale_2 is not None
-            else (
-                guidance_scale[1]
-                if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
-                else guidance_low
-            )
-        )
-
-        # record guidance for properties
-        self._guidance_scale = guidance_low
-        self._guidance_scale_2 = guidance_high
-
-        # validate shapes
+        # Validate inputs
         self.check_inputs(
             prompt=prompt,
             negative_prompt=negative_prompt,
+            image=image,
             height=height,
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
-            guidance_scale_2=guidance_high if self.boundary_ratio is not None else None,
         )
 
+        # Adjust num_frames to be compatible with VAE temporal scaling
         if num_frames % self.vae_scale_factor_temporal != 1:
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
@@ -334,7 +241,7 @@ class Wan22Pipeline(nn.Module):
         device = self.device
         dtype = self.transformer.dtype
 
-        # Seed / generator
+        # Generator setup
         if generator is None:
             generator = req.generator
         if generator is None and req.seed is not None:
@@ -345,7 +252,7 @@ class Wan22Pipeline(nn.Module):
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
+                do_classifier_free_guidance=guidance_scale > 1.0,
                 num_videos_per_prompt=req.num_outputs_per_prompt or 1,
                 max_sequence_length=req.max_sequence_length or 512,
                 device=device,
@@ -355,42 +262,47 @@ class Wan22Pipeline(nn.Module):
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
-            elif guidance_low > 1.0 or guidance_high > 1.0:
-                raise ValueError(
-                    "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
-                )
+
+        batch_size = prompt_embeds.shape[0]
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
-        boundary_timestep = None
-        if self.boundary_ratio is not None:
-            boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
 
-        # Handle I2V mode when expand_timesteps=True and image is provided
-        image = req.pil_image
-        latent_condition = None
-        first_frame_mask = None
+        # Prepare latents
+        num_channels_latents = self.transformer.config.in_channels
+        num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        latent_height = height // self.vae_scale_factor_spatial
+        latent_width = width // self.vae_scale_factor_spatial
 
-        if self.expand_timesteps and image is not None:
-            # I2V mode: encode image and prepare condition
+        # Check if we have an image (I2V mode) or not (T2V mode)
+        if image is not None:
+            # I2V mode: prepare latents with image condition
             from diffusers.video_processor import VideoProcessor
 
             video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-            # Preprocess image
             if isinstance(image, PIL.Image.Image):
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
                 image_tensor = video_processor.preprocess(image, height=height, width=width)
             else:
                 image_tensor = image
+            image_tensor = image_tensor.to(device=device, dtype=torch.float32)
 
-            # Use out_channels for noise latents (not in_channels which includes condition)
-            num_channels_latents = self.transformer.config.out_channels
-            batch_size = prompt_embeds.shape[0]
-
-            # Prepare noise latents
+            latents, latent_condition, first_frame_mask = self.prepare_i2v_latents(
+                image=image_tensor,
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+                latents=req.latents,
+            )
+        else:
+            # T2V mode: prepare random latents
             latents = self.prepare_latents(
                 batch_size=batch_size,
                 num_channels_latents=num_channels_latents,
@@ -402,83 +314,38 @@ class Wan22Pipeline(nn.Module):
                 generator=generator,
                 latents=req.latents,
             )
-
-            # Encode image condition
-            num_latent_frames = latents.shape[2]
-            latent_height = latents.shape[3]
-            latent_width = latents.shape[4]
-
-            image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
-            image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
-            latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
-            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
-
-            # Normalize condition latents
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latent_condition.device, latent_condition.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latent_condition.device, latent_condition.dtype
-            )
-            latent_condition = (latent_condition - latents_mean) * latents_std
-            latent_condition = latent_condition.to(torch.float32)
-
-            # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
+            latent_condition = None
             first_frame_mask = torch.ones(
                 1, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
-            )
-            first_frame_mask[:, :, 0] = 0
-        else:
-            # T2V mode: standard latent preparation
-            num_channels_latents = self.transformer.config.in_channels
-            latents = self.prepare_latents(
-                batch_size=prompt_embeds.shape[0],
-                num_channels_latents=num_channels_latents,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                dtype=torch.float32,
-                device=device,
-                generator=generator,
-                latents=req.latents,
             )
 
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        # Denoising
+        # Denoising loop
         for t in timesteps:
             self._current_timestep = t
-            current_model = self.transformer
-            current_guidance_scale = guidance_low
-            if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                current_model = self.transformer_2
-                current_guidance_scale = guidance_high
 
-            if self.expand_timesteps and latent_condition is not None:
+            # Prepare latent input
+            if latent_condition is not None:
                 # I2V mode: blend condition with latents using mask
                 latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
                 latent_model_input = latent_model_input.to(dtype)
 
-                # Expand timesteps per patch - use floor division to match patch embedding
-                patch_size = self.transformer.config.patch_size
-                num_latent_frames = latents.shape[2]
-                patch_height = latents.shape[3] // patch_size[1]
-                patch_width = latents.shape[4] // patch_size[2]
-
-                # Create mask at patch resolution (same as hidden states sequence length)
-                patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
-                patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
-                temp_ts = (patch_mask[0][0] * t).flatten()
+                # Expand timesteps for each patch (TI2V style)
+                temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
                 timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
             else:
-                # T2V mode: standard forward
+                # T2V mode: use latents directly
                 latent_model_input = latents.to(dtype)
-                timestep = t.expand(latents.shape[0])
 
-            noise_pred = current_model(
+                # Expand timesteps for TI2V model architecture
+                mask = torch.ones(1, 1, num_latent_frames, latent_height, latent_width, device=device)
+                temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+
+            # Forward pass
+            noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
@@ -486,22 +353,24 @@ class Wan22Pipeline(nn.Module):
                 return_dict=False,
             )[0]
 
-            if current_guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                noise_uncond = current_model(
+            # Classifier-free guidance
+            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
+                noise_uncond = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
                     encoder_hidden_states=negative_prompt_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
-                noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+                noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
+            # Scheduler step
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
         self._current_timestep = None
 
-        # For I2V mode: blend final latents with condition
-        if self.expand_timesteps and latent_condition is not None:
+        # For I2V mode, blend final latents with condition
+        if latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
         # Decode
@@ -532,6 +401,7 @@ class Wan22Pipeline(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
+        """Encode text prompts using T5 text encoder."""
         device = device or self.device
         dtype = dtype or self.text_encoder.dtype
 
@@ -608,6 +478,7 @@ class Wan22Pipeline(nn.Module):
         generator: torch.Generator | list[torch.Generator] | None,
         latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Prepare random latents for T2V mode."""
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
 
@@ -624,45 +495,89 @@ class Wan22Pipeline(nn.Module):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+    def prepare_i2v_latents(
+        self,
+        image: torch.Tensor,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        dtype: torch.dtype | None,
+        device: torch.device | None,
+        generator: torch.Generator | list[torch.Generator] | None,
+        latents: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Prepare latents for I2V mode with image conditioning.
+
+        Returns:
+            latents: Initial noise latents
+            latent_condition: Encoded first frame condition
+            first_frame_mask: Mask (0 for first frame, 1 for rest)
+        """
+        num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        latent_height = height // self.vae_scale_factor_spatial
+        latent_width = width // self.vae_scale_factor_spatial
+
+        shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            latents = latents.to(device=device, dtype=dtype)
+
+        # Prepare first frame condition
+        image = image.unsqueeze(2)  # [batch, channels, 1, height, width]
+        image = image.to(device=device, dtype=self.vae.dtype)
+
+        # Encode through VAE
+        latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax")
+        latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+
+        # Normalize latents
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latent_condition.device, latent_condition.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latent_condition.device, latent_condition.dtype
+        )
+        latent_condition = (latent_condition - latents_mean) * latents_std
+        latent_condition = latent_condition.to(dtype)
+
+        # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
+        first_frame_mask = torch.ones(1, 1, num_latent_frames, latent_height, latent_width, dtype=dtype, device=device)
+        first_frame_mask[:, :, 0] = 0
+
+        return latents, latent_condition, first_frame_mask
 
     def check_inputs(
         self,
         prompt,
         negative_prompt,
+        image,
         height,
         width,
         prompt_embeds=None,
         negative_prompt_embeds=None,
-        guidance_scale_2=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
 
         if prompt is not None and prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
-        elif negative_prompt is not None and negative_prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `negative_prompt`: {negative_prompt} and "
-                f"`negative_prompt_embeds`: {negative_prompt_embeds}. "
-                "Please make sure to only forward one of the two."
-            )
-        elif prompt is None and prompt_embeds is None:
-            raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
-            )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
-        elif negative_prompt is not None and (
-            not isinstance(negative_prompt, str) and not isinstance(negative_prompt, list)
-        ):
-            raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
+            raise ValueError("Cannot forward both `prompt` and `prompt_embeds`. Please provide only one.")
 
-        if self.boundary_ratio is None and guidance_scale_2 is not None:
-            raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
+        if negative_prompt is not None and negative_prompt_embeds is not None:
+            raise ValueError(
+                "Cannot forward both `negative_prompt` and `negative_prompt_embeds`. Please provide only one."
+            )
+
+        if prompt is None and prompt_embeds is None:
+            raise ValueError("Provide either `prompt` or `prompt_embeds`.")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights using AutoWeightsLoader for vLLM integration."""
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
