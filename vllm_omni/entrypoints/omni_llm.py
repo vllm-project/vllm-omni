@@ -137,6 +137,8 @@ class OmniLLM:
         shm_threshold_bytes: int,
         init_timeout: int,
     ) -> None:
+        self.stage_list: list[OmniStage] = []
+
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
             idx, cfg = idx_cfg
