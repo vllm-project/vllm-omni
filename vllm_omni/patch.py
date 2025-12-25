@@ -19,6 +19,7 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import Qwen2_5OmniThinkerForConditionalGeneration
 from vllm_omni.request import OmniRequest
+from vllm_omni.utils import is_npu
 
 for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others
@@ -82,11 +83,11 @@ class AscendQwen2_5OmniThinkerForConditionalGeneration(nn.Module):
 
         return video_embeds.split(sizes.tolist())
 
-
-# NOTE: These will be removed after ascend_forward_context is refactored.
-Qwen2_5OmniThinkerForConditionalGeneration._process_image_input = (
-    AscendQwen2_5OmniThinkerForConditionalGeneration._process_image_input
-)
-Qwen2_5OmniThinkerForConditionalGeneration._process_video_input = (
-    AscendQwen2_5OmniThinkerForConditionalGeneration._process_video_input
-)
+if is_npu:
+    # NOTE: These will be removed after ascend_forward_context is refactored.
+    Qwen2_5OmniThinkerForConditionalGeneration._process_image_input = (
+        AscendQwen2_5OmniThinkerForConditionalGeneration._process_image_input
+    )
+    Qwen2_5OmniThinkerForConditionalGeneration._process_video_input = (
+        AscendQwen2_5OmniThinkerForConditionalGeneration._process_video_input
+    )
