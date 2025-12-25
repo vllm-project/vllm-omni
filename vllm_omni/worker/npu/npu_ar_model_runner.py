@@ -411,17 +411,37 @@ class NPUARModelRunner(OmniNPUModelRunner):
         #  -------------------------------------- Omni-new -------------------------------------------------
         self._omni_num_scheduled_tokens_np = num_scheduled_tokens
 
-        # Always collect additional_information, not only in prefill.
-        # _collect_additional_information_for_prefill handles prompt_embeds overlay during prefill,
-        # but even in decode we need per_req_additional_information so that
-        # _build_model_kwargs_extra can pass runtime_additional_information correctly.
-        per_req_additional_information: dict[str, dict] = {}
+        # Note: only prefill need collect additional_information for now.
+        # Decode don't need per_req_additional_information anymore.
         if inputs_embeds is not None:
             # Prefill: overlay prompt_embeds and collect additional_information
-            per_req_additional_information = self._collect_additional_information_for_prefill(num_scheduled_tokens)
-        # Save for _model_forward regardless of prefill; runtime_additional_information
-        # will be fetched from request state inside _build_model_kwargs_extra
-        self._omni_per_req_additional_information = per_req_additional_information
+            self._collect_additional_information_for_prefill(num_scheduled_tokens)
+
+        if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
+            # Overlay custom prompt_embeds per request for the prompt portion;
+            # collect additional_information (tensor/list) for prefill portion only
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_state = self.requests.get(req_id)
+                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+
+                start_offset = int(self.query_start_loc.cpu[req_index])
+                sched_tokens = int(num_scheduled_tokens[req_index])
+                s, e = start_offset, start_offset + sched_tokens
+                span_len = int(e) - int(s)
+
+                # call the custom process function
+                req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                    input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
+                )
+                # TODO(Peiqi): the merge stage could move out from the critical path
+                self._merge_additional_information_update(req_id, update_dict)
+
+                # update the inputs_embeds and input_ids
+                seg_len = min(span_len, req_embeds.shape[0])
+                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                    input_ids[s : s + seg_len] = req_input_ids
+
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1071,8 +1091,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 get_kv_transfer_group().clear_connector_metadata()
 
         #  -------------------------------------- Omni-new -------------------------------------------------
-        self._process_additional_information_updates(multimodal_outputs)
-
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
@@ -1081,6 +1099,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 [scheduler_output.num_scheduled_tokens[rid] for rid in req_ids],
                 dtype=np.int32,
             )
+
+        self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
 
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
@@ -1179,10 +1199,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                              input_ids, positions,
                                              intermediate_tensors,
                                              inputs_embeds):
-        model_kwargs_extra = self._build_model_kwargs_extra(
-            self._omni_per_req_additional_information,
-            self._omni_num_scheduled_tokens_np,
-        )
+        model_kwargs_extra = self._build_model_kwargs_extra()
 
         runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
         if runtime_info:
@@ -1238,49 +1255,29 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 self.pcp_allgather_restore_idx[:hidden_states.shape[0]])
         return hidden_states
 
-    def _process_additional_information_updates(self, multimodal_outputs: object) -> None:
+    def _process_additional_information_updates(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: object,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
         """Process model-provided per-request additional_information updates and merge into request state."""
         try:
-            if multimodal_outputs is None:
-                logger.debug("[OMNI] multimodal_outputs is None, no updates to process")
-                return
-            if not isinstance(multimodal_outputs, dict):
-                logger.debug(f"[OMNI] multimodal_outputs is not dict: {type(multimodal_outputs)}")
-                return
-            if (
-                "additional_information_update" not in multimodal_outputs
-                and "additional_information_update_by_req_id" not in multimodal_outputs
-            ):
-                logger.debug(f"[OMNI] multimodal_outputs has no update keys: {list(multimodal_outputs.keys())}")
-                return
-            updates_list = multimodal_outputs.get("additional_information_update")
-            if isinstance(updates_list, list):
-                logger.debug(f"[OMNI] Processing additional_information_update list with {len(updates_list)} items")
-                for idx, upd in enumerate(updates_list):
-                    if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
-                        continue
-                    req_id = self.input_batch.req_ids[idx]
-                    self._merge_additional_information_update(req_id, upd)
-            updates_map = multimodal_outputs.get("additional_information_update_by_req_id")
-            if isinstance(updates_map, dict):
-                logger.debug(
-                    f"[OMNI] Processing additional_information_update_by_req_id for {list(updates_map.keys())}"
-                )
-                for req_id, upd in updates_map.items():
-                    if not isinstance(upd, dict):
-                        continue
-                    if req_id not in self.requests:
-                        logger.warning(f"[OMNI] req_id {req_id} not found in requests")
-                        continue
-                    self._merge_additional_information_update(req_id, upd)
-
+            # execute the custom postprocess function
+            # TODO(Peiqi): do we have a more elegant way to do this?
+            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
                     req_state = self.requests.get(req_id)
-                    if req_state:
-                        info = getattr(req_state, "additional_information_cpu", {})
-                        if "thinker_reply_part_per_request" in info:
-                            q = info["thinker_reply_part_per_request"]
-                            if hasattr(q, "shape"):
-                                logger.debug(f"[OMNI] After update, req={req_id} queue shape: {q.shape}")
+                    req_infos = (
+                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                    )
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    # only consider to store data into update dict.
+                    hidden_states_slice = hidden_states[s:e]
+                    update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
+                    self._merge_additional_information_update(req_id, update_dict)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "

@@ -598,25 +598,13 @@ class OmniNPUModelRunner(NPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
-    def _build_model_kwargs_extra(
-        self,
-        per_req_additional_information: dict[str, dict] | None,
-        num_scheduled_tokens_np,
-    ) -> dict:
+    def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step, including:
-        - additional_information_by_req_id: per-request additional information provided by preprocess for this step
         - runtime_additional_information: per-request additional information stored in request state
-        - request_ids: the request id list in batch order
-        - request_token_spans: token spans per request within the flattened sequence
         """
         model_kwargs_extra: dict[str, object] = {}
-        if per_req_additional_information:
-            model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
         try:
             model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
-            model_kwargs_extra["request_ids"] = list(self.input_batch.req_ids)
-            if num_scheduled_tokens_np is not None:
-                model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(num_scheduled_tokens_np)
         except Exception as e:
             logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
             import traceback
@@ -630,17 +618,15 @@ class OmniNPUModelRunner(NPUModelRunner):
     ) -> dict[str, dict]:
         """Overlay per-request prompt_embeds for the prefill portion and collect
         additional_information slices for this step. Returns a map req_id -> dict."""
-        per_req_additional_information: dict[str, dict] = {}
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
-            addi_cpu = getattr(req_state, "additional_information_cpu", None)
             num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
             prompt_len = len(req_state.prompt_token_ids)
             prompt_remaining = max(0, prompt_len - num_computed_tokens)
             sched_tokens = int(num_scheduled_tokens_np[req_index])
             overlay_len = min(sched_tokens, prompt_remaining)
-            if overlay_len <= 0 and not (isinstance(addi_cpu, dict) and addi_cpu):
+            if overlay_len <= 0:
                 continue
             if overlay_len > 0 and pe_cpu is not None:
                 src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(
@@ -648,15 +634,3 @@ class OmniNPUModelRunner(NPUModelRunner):
                 )
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
-            if addi_cpu is not None and isinstance(addi_cpu, dict):
-                req_info: dict[str, object] = {}
-                for k, v in addi_cpu.items():
-                    if isinstance(v, torch.Tensor):
-                        req_info[k] = v.detach().to("cpu").contiguous()
-                    elif isinstance(v, list):
-                        req_info[k] = v
-                    else:
-                        req_info[k] = v
-                if req_info:
-                    per_req_additional_information[req_id] = req_info
-        return per_req_additional_information
