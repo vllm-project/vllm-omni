@@ -12,8 +12,8 @@ tar -xf <Your Download Path>/seedtts_testset.tar
 cp seedtts_testset/en/meta.lst examples/offline_inference/qwen2_5_omni/meta.lst
 python3 examples/offline_inference/qwen2_5_omni/extract_prompts.py \
   --input examples/offline_inference/qwen2_5_omni/meta.lst \
-  --output examples/offline_inference/qwen2_5_omni/top100.txt \
-  --topk 100
+  --output examples/offline_inference/qwen2_5_omni/top10.txt \
+  --topk 10
 ```
 Get into the example folder
 ```bash
