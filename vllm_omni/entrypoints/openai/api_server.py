@@ -47,11 +47,11 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.protocol import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.protocol import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -564,6 +564,8 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         return await handler.create_speech(request, raw_request)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
 # Image generation API endpoints
 
 
