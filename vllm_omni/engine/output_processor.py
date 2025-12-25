@@ -107,7 +107,7 @@ class OmniRequestState(RequestState):
             def _to_cpu(x):
                 if isinstance(x, torch.Tensor):
                     try:
-                        return x.detach().to("cpu", non_blocking=False).contiguous()
+                        return x.detach().to("cpu", non_blocking=True).contiguous()
                     except Exception:
                         return x
                 return x
