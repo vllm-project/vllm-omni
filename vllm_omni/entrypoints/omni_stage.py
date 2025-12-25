@@ -1141,7 +1141,6 @@ async def _stage_worker_async(
     _rx_bytes_by_rid: dict[Any, int] = {}
     _rx_decode_ms_by_rid: dict[Any, float] = {}
     _in_flight_ms_by_rid: dict[Any, float] = {}
-    _generation_tasks_by_rid: dict[Any, asyncio.Task] = {}
 
     async def generation_single_request(task: dict[str, Any]):
         _recv_dequeue_ts = _time.time()
@@ -1198,9 +1197,7 @@ async def _stage_worker_async(
             if task is None:
                 _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
                 break
-            generation_task = asyncio.create_task(generation_single_request(task))
-            rid = task["request_id"]
-            _generation_tasks_by_rid[rid] = generation_task
+            asyncio.create_task(generation_single_request(task))
         except queue.Empty:
             await asyncio.sleep(0.001)
         batch_request_outputs: list[Any] = []
@@ -1242,9 +1239,6 @@ async def _stage_worker_async(
         logger.info("[Stage-%s] Sending outputs to main process", stage_id)
         for rid, output, _gen_ms in zip(batch_request_ids, batch_request_outputs, _gen_ms_list):
             try:
-                generation_task = _generation_tasks_by_rid.pop(rid, None)
-                if generation_task is None or not generation_task.done():
-                    raise asyncio.InvalidStateError(f"[Stage-{stage_id}] generation task failed for request: {rid}")
                 r_outputs = [output]
                 use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
                 _metrics = {
