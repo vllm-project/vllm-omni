@@ -37,7 +37,6 @@ class TestAudioMixin:
             # Check that the tensor passed to speed adjustment is mono
             mock_speed.assert_called_once()
             adjusted_tensor = mock_speed.call_args[0][0]
-            assert adjusted_tensor.ndim == 1
             assert len(adjusted_tensor) == 24000
 
     @patch("librosa.effects.time_stretch")
@@ -51,7 +50,7 @@ class TestAudioMixin:
         assert adjusted_audio.shape == (12000,)
 
     @patch("soundfile.write")
-    def test_unsupported_format_fallback(self, mock_write, audio_mixin):
+    def test_unsupported_format_fallback(self, mock_write, audio_mixin, caplog):
         audio_tensor = np.random.rand(24000).astype(np.float32)
         # Use a format that is not in the list of supported formats
         audio_obj = CreateAudio(audio_tensor=audio_tensor, response_format="vorbis")
@@ -62,6 +61,63 @@ class TestAudioMixin:
         mock_write.assert_called_once()
         write_kwargs = mock_write.call_args.kwargs
         assert write_kwargs["format"] == "WAV"
+
+    def test_mono_audio_preservation(self, audio_mixin):
+        """Test that mono (1D) audio tensors are processed correctly and passed to writer."""
+        mono_tensor = np.random.rand(24000).astype(np.float32)
+        audio_obj = CreateAudio(audio_tensor=mono_tensor)
+
+        with patch("soundfile.write") as mock_write:
+            audio_mixin.create_audio(audio_obj)
+
+            mock_write.assert_called_once()
+            # Verify the tensor passed to soundfile.write is the exact 1D tensor
+            output_tensor = mock_write.call_args[0][1]
+            assert output_tensor.ndim == 1
+            assert output_tensor.shape == (24000,)
+            assert np.array_equal(output_tensor, mono_tensor)
+
+    def test_stereo_audio_preservation(self, audio_mixin):
+        """Test that stereo (2D) audio tensors are processed correctly and preserved."""
+        stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
+        audio_obj = CreateAudio(audio_tensor=stereo_tensor)
+
+        with patch("soundfile.write") as mock_write:
+            audio_mixin.create_audio(audio_obj)
+
+            mock_write.assert_called_once()
+            # Verify the tensor passed to soundfile.write is the exact 2D tensor
+            output_tensor = mock_write.call_args[0][1]
+            assert output_tensor.ndim == 2
+            assert output_tensor.shape == (24000, 2)
+            assert np.array_equal(output_tensor, stereo_tensor)
+
+    def test_speed_adjustment_bypass(self, audio_mixin):
+        """Test that speed=1.0 bypasses the expensive librosa time stretching."""
+        audio_tensor = np.random.rand(24000).astype(np.float32)
+
+        with patch("librosa.effects.time_stretch") as mock_time_stretch:
+            # speed=1.0 should return immediately without calling librosa
+            result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
+
+            mock_time_stretch.assert_not_called()
+            assert np.array_equal(result, audio_tensor)
+
+    @patch("librosa.effects.time_stretch")
+    def test_speed_adjustment_stereo_handling(self, mock_time_stretch, audio_mixin):
+        """Test that speed adjustment is attempted on stereo inputs."""
+        stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
+        # Mock return value representing a sped-up version (half length)
+        mock_time_stretch.return_value = np.zeros((12000, 2), dtype=np.float32)
+
+        result, _ = audio_mixin._apply_speed_adjustment(stereo_tensor, speed=2.0, sample_rate=24000)
+
+        mock_time_stretch.assert_called_once()
+        # Ensure the stereo tensor was passed to librosa
+        call_args = mock_time_stretch.call_args
+        assert np.array_equal(call_args.kwargs["y"], stereo_tensor)
+        assert call_args.kwargs["rate"] == 2.0
+        assert result.shape == (12000, 2)
 
 
 # Helper to create mock model output for endpoint tests

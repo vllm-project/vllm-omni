@@ -44,10 +44,6 @@ class AudioMixin:
                 f"Unsupported audio tensor dimension: {audio_tensor.ndim}. "
                 "Only mono (1D) and stereo (2D) are supported."
             )
-        if audio_tensor.ndim == 2:
-            # Converting stereo to mono by averaging channels
-            logger.debug("Stereo audio detected. Converting to mono.")
-            audio_tensor = audio_tensor.mean(axis=1)
 
         audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
 
