@@ -44,10 +44,20 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
+    "WanImageToVideoPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "Wan22I2VPipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
         "LongCatImagePipeline",
+    ),
+    "LongCatImageEditPipeline": (
+        "longcat_image",
+        "pipeline_longcat_image_edit",
+        "LongcatImageEditPipeline",
     ),
 }
 
@@ -89,7 +99,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
+    "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -98,7 +110,10 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
+    "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
+    "WanPipeline": "get_wan22_pre_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
 }
 
 
