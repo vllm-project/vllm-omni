@@ -40,7 +40,7 @@ for module_name, module in sys.modules.items():
 # if they exist, which causes AttributeError when prefetch_mlp_enabled is not set.
 # TODO: Remove this patch after upgrading to vllm-ascend v0.13.0 or later.
 # This issue has been fixed in https://github.com/vllm-project/vllm-ascend/pull/5035
-if is_npu:
+if is_npu():
     import torch
     import torch.nn as nn
     from vllm.model_executor.models.qwen2_5_omni_thinker import Qwen2_5_VLImageInputs, Qwen2_5_VLVideoInputs
