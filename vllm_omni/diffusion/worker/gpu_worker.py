@@ -13,7 +13,6 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import (
-    SHUTDOWN_MESSAGE,
     DiffusionOutput,
     OmniDiffusionConfig,
     set_current_omni_diffusion_config,
@@ -107,6 +106,18 @@ class GPUWorker:
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
 
+    def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+        """
+        Generate output for the given requests.
+
+        Args:
+            requests: List of diffusion requests
+
+        Returns:
+            DiffusionOutput with generated results
+        """
+        return self.execute_model(requests, self.od_config)
+
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
@@ -141,7 +152,7 @@ class WorkerProc:
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
 
-        # Initialize MessageQueue reader from handle
+        # Initialize MessageQueue reader from handle (unified for generation & RPC)
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
 
         self.result_mq = None
@@ -173,11 +184,38 @@ class WorkerProc:
         if self.result_mq is not None:
             self.result_mq.enqueue(output)
 
-    def recv_reqs(self):
+    def recv_message(self):
         """
-        Receive requests from broadcast queue
+        Receive unified messages (RPC requests, shutdown) from broadcast queue.
+        Uses indefinite=True to block until a message arrives.
         """
         return self.mq.dequeue(indefinite=True)
+
+    def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
+        """Execute an RPC request and indicate whether to reply."""
+
+        method = rpc_request["method"]
+        args = rpc_request.get("args", ())
+        kwargs = rpc_request.get("kwargs", {})
+        output_rank = rpc_request.get("output_rank")
+        exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+
+        should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
+        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+
+        if not should_execute:
+            return None, False
+
+        try:
+            if isinstance(method, str):
+                func = getattr(self.worker, method)
+                result = func(*args, **kwargs)
+            else:
+                result = method(self.worker, *args, **kwargs)
+            return result, should_reply
+        except Exception as e:
+            logger.error(f"Error executing RPC: {e}", exc_info=True)
+            return {"status": "error", "error": str(e)}, should_reply
 
     # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
@@ -186,41 +224,56 @@ class WorkerProc:
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
-            reqs = None
-            # 1: receive requests
+            # Receive unified message (generation request, RPC request, or shutdown)
+            msg = None
             try:
-                reqs = self.recv_reqs()
+                msg = self.recv_message()
             except Exception as e:
                 logger.error(
-                    f"Error receiving requests in scheduler event loop: {e}",
+                    f"Error receiving message in worker loop: {e}",
                     exc_info=True,
                 )
                 continue
 
-            if reqs == SHUTDOWN_MESSAGE:
-                logger.info("Worker %s: Received shutdown message", self.gpu_id)
-                self._running = False
-                continue
-            if reqs is None:
+            if msg is None:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
-            # 2: execute, make sure a reply is always sent
-            try:
-                output = self.worker.execute_model(reqs, self.od_config)
-            except Exception as e:
-                logger.error(
-                    f"Error executing forward in event loop: {e}",
-                    exc_info=True,
-                )
-                output = DiffusionOutput(error=str(e))
+            # Route message based on type
+            if isinstance(msg, dict) and msg.get("type") == "rpc":
+                # Handle RPC request
+                try:
+                    result, should_reply = self.execute_rpc(msg)
+                    if should_reply:
+                        self.return_result(result)
+                except Exception as e:
+                    logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    if self.result_mq is not None:
+                        self.return_result({"status": "error", "error": str(e)})
 
-            try:
-                self.return_result(output)
-            except zmq.ZMQError as e:
-                # Reply failed; log and keep loop alive to accept future requests
-                logger.error(f"ZMQ error sending reply: {e}")
+            elif isinstance(msg, dict) and msg.get("type") == "shutdown":
+                # Handle shutdown message
+                logger.info("Worker %s: Received shutdown message", self.gpu_id)
+                self._running = False
                 continue
+
+            else:
+                # Handle generation request (OmniDiffusionRequest list)
+                try:
+                    output = self.worker.execute_model(msg, self.od_config)
+                except Exception as e:
+                    logger.error(
+                        f"Error executing forward in event loop: {e}",
+                        exc_info=True,
+                    )
+                    output = DiffusionOutput(error=str(e))
+
+                try:
+                    self.return_result(output)
+                except zmq.ZMQError as e:
+                    # Reply failed; log and keep loop alive to accept future requests
+                    logger.error(f"ZMQ error sending reply: {e}")
+                    continue
 
         logger.info("event loop terminated.")
         try:
