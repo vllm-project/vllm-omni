@@ -112,7 +112,7 @@ class VBenchDataset(BaseDataset):
         self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni")
         self.items = self._load_data()
 
-    def _load_t2v_prompts(self) -> list[dict[str, Any]]:
+    def _load_data(self) -> list[dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
         elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
