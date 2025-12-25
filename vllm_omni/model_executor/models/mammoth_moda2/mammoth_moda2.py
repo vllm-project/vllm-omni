@@ -38,6 +38,9 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
     # `hidden_states[logit_indices]` 因类型不匹配（list/tuple）而报错。
     have_multimodal_outputs = True
 
+    multimodal_cpu_fields = {"image_grid_thw", "video_grid_thw"}
+    merge_by_field_config = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         # 与 Qwen2_5OmniForConditionalGeneration 保持一致：实例级标记

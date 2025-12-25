@@ -563,10 +563,8 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
     """在 Qwen2_5_VLForConditionalGeneration 的多模态框架下替换语言骨干为 MoE。"""
 
-    # 兼容 gpu_model_runner 的 OmniOutput 解包逻辑。
     have_multimodal_outputs = True
 
-    # 复用原有权重映射，再加一层 model. -> language_model.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # 生成侧（DiT/VAE）权重不属于 AR stage，跳过
@@ -766,51 +764,6 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 torch.zeros((tokens, hidden_size), device=device, dtype=dtype)
             )
         return embeds
-
-    def _normalize_mm_kwargs(
-        self,
-        kwargs: dict[str, object],
-    ) -> dict[str, object]:
-        """将 batch 维展开为 vLLM 期望的扁平形状。"""
-        out = dict(kwargs)
-        pv = out.get("pixel_values")
-        if isinstance(pv, torch.Tensor) and pv.ndim == 3:
-            out["pixel_values"] = pv.reshape(-1, pv.shape[-1])
-        pv_v = out.get("pixel_values_videos")
-        if isinstance(pv_v, torch.Tensor) and pv_v.ndim == 3:
-            out["pixel_values_videos"] = pv_v.reshape(-1, pv_v.shape[-1])
-        ig = out.get("image_grid_thw")
-        if isinstance(ig, torch.Tensor) and ig.ndim == 3 and ig.shape[1] == 1:
-            out["image_grid_thw"] = ig.squeeze(1)
-        vg = out.get("video_grid_thw")
-        if isinstance(vg, torch.Tensor) and vg.ndim == 3 and vg.shape[1] == 1:
-            out["video_grid_thw"] = vg.squeeze(1)
-        ie = out.get("image_embeds")
-        if isinstance(ie, torch.Tensor) and ie.ndim == 3:
-            out["image_embeds"] = ie.reshape(-1, ie.shape[-1])
-        ve = out.get("video_embeds")
-        if isinstance(ve, torch.Tensor) and ve.ndim == 3:
-            out["video_embeds"] = ve.reshape(-1, ve.shape[-1])
-        return out
-
-    def embed_multimodal(self, **kwargs: object) -> list[torch.Tensor]:
-        # 先走原生实现（支持 pixel_values / image_embeds / video_embeds）。
-        mm_kwargs = self._normalize_mm_kwargs(kwargs)
-        mm_embeddings = super().embed_multimodal(**mm_kwargs)
-        if mm_embeddings:
-            return list(mm_embeddings)
-
-        # vLLM profiling 的 dummy mm inputs 在某些路径下只带 grid 元信息，
-        # 此时需要构造占位 embedding 以通过 sanity check。
-        embeds: list[torch.Tensor] = []
-        image_grid_thw = mm_kwargs.get("image_grid_thw")
-        video_grid_thw = mm_kwargs.get("video_grid_thw")
-        if isinstance(image_grid_thw, torch.Tensor):
-            embeds.extend(self._build_dummy_mm_embeddings(image_grid_thw))
-        if isinstance(video_grid_thw, torch.Tensor):
-            embeds.extend(self._build_dummy_mm_embeddings(video_grid_thw))
-        return embeds
-
 
     def forward(
         self,
