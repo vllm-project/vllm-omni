@@ -105,6 +105,14 @@ class Omni:
             self.config_path = resolve_model_config_path(model)
             self.stage_configs = load_stage_configs_from_model(model)
             if not self.stage_configs:
+                # TODO: hack here, convert dtype to string to avoid non-premitive omegaconf create error.
+                kwargs["dtype"] = str(kwargs["dtype"])
+                # TODO: hack, calculate devices based on parallel config.
+                devices = "0"
+                if "parallel_config" in kwargs:
+                    num_devices = kwargs["parallel_config"].world_size
+                    for i in range(1, num_devices):
+                        devices += f",{i}"
                 logger.info(f"model: {model}, kwargs: {kwargs}")
                 default_stage_cfg = [
                     {
@@ -112,7 +120,7 @@ class Omni:
                         "stage_type": "diffusion",
                         "runtime": {
                             "process": True,
-                            "devices": "0",
+                            "devices": devices,
                             "max_batch_size": 1,
                         },
                         "engine_args": OmegaConf.create(kwargs),

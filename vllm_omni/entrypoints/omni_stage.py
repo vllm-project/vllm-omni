@@ -444,11 +444,20 @@ def _stage_worker(
             import torch
 
             if torch.cuda.is_available():
-                # Get all parallel sizes from engine_args (defaults to 1)
-                tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
-                pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
-                data_parallel_size = engine_args.get("data_parallel_size", 1)
-                prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+                # Get all parallel sizes from engine_args or parallel_config (defaults to 1)
+                if "parallel_config" in engine_args:
+                    parallel_config = engine_args["parallel_config"]
+                    tensor_parallel_size = parallel_config.get("tensor_parallel_size", 1)
+                    pipeline_parallel_size = parallel_config.get("pipeline_parallel_size", 1)
+                    data_parallel_size = parallel_config.get("data_parallel_size", 1)
+                    prefill_context_parallel_size = 1  # not used for diffusion
+                    sequence_parallel_size = parallel_config.get("sequence_parallel_size", 1)
+                else:
+                    tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
+                    pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
+                    data_parallel_size = engine_args.get("data_parallel_size", 1)
+                    prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+                    sequence_parallel_size = 1  # not use in omni model
 
                 # Calculate total number of devices needed for this stage
                 # For a single stage worker:
@@ -456,10 +465,15 @@ def _stage_worker(
                 # - PP: splits layers across pipelinestages, but each stage uses TP devices
                 # - DP: replicates model, but each replica uses TP devices
                 # - PCP: context parallelism, typically uses TP devices
-                # The number of devices per stage is determined by TP * PP * DP * PCP size
+                # - SP: sequence parallelism, typically uses TP devices
+                # The number of devices per stage is determined by TP * PP * DP * PCP * SP size
                 # (PP/DP/PCP are higher-level parallelism that don't add devices per stage)
                 num_devices_per_stage = (
-                    tensor_parallel_size * pipeline_parallel_size * data_parallel_size * prefill_context_parallel_size
+                    tensor_parallel_size
+                    * pipeline_parallel_size
+                    * data_parallel_size
+                    * prefill_context_parallel_size
+                    * sequence_parallel_size
                 )
 
                 # Get physical device IDs from CUDA_VISIBLE_DEVICES
@@ -486,11 +500,12 @@ def _stage_worker(
                 devices_to_lock = sorted(devices_to_lock)
 
                 logger.debug(
-                    "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
+                    "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d, SP=%d; will lock %d devices: %s",
                     tensor_parallel_size,
                     pipeline_parallel_size,
                     data_parallel_size,
                     prefill_context_parallel_size,
+                    sequence_parallel_size,
                     num_devices_to_lock,
                     devices_to_lock,
                 )
