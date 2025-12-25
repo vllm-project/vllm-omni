@@ -4,12 +4,12 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
+import concurrent.futures
 import os
 import socket
 import subprocess
 import sys
 import time
-import concurrent.futures
 from pathlib import Path
 
 import openai
@@ -181,7 +181,7 @@ def test_video_to_audio_concurrent(
 
     # Test multiple concurrent completions
     num_concurrent_requests = 5
-    
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
         # Submit multiple completion requests concurrently
         futures = [
@@ -192,13 +192,13 @@ def test_video_to_audio_concurrent(
             )
             for _ in range(num_concurrent_requests)
         ]
-        
+
         # Wait for all requests to complete and collect results
         chat_completions = [future.result() for future in concurrent.futures.as_completed(futures)]
-    
+
     # Verify all completions succeeded
     assert len(chat_completions) == num_concurrent_requests
-    
+
     for chat_completion in chat_completions:
         assert len(chat_completion.choices) == 2  # 1 for text output, 1 for audio output
 

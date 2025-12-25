@@ -15,8 +15,8 @@ import fcntl
 import importlib
 import logging
 import multiprocessing as mp
-import queue
 import os
+import queue
 import sys
 import traceback
 from typing import Any
@@ -1191,6 +1191,7 @@ async def _stage_worker_async(
                 }
             )
 
+    _batch_gen_t0 = _time.time()
     while True:
         try:
             task = in_q.get_nowait()
@@ -1213,15 +1214,17 @@ async def _stage_worker_async(
                 _gen_ms_list.append(_gen_ms)
                 batch_request_ids.append(rids)
                 _agg_total_tokens += _num_tokens
-                _agg_total_gen_time_ms += _gen_ms
             except asyncio.QueueEmpty:
                 await asyncio.sleep(0.001)
                 break
-        
+
         if not batch_request_outputs:
             continue
         _batch_seq += 1
         if _stats_file:
+            _batch_gen_t1 = _time.time()
+            _agg_total_gen_time_ms += (_batch_gen_t1 - _batch_gen_t0) * 1000
+            _batch_gen_t0 = _batch_gen_t1
             _avg_tokens_per_s = (
                 (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
             )
