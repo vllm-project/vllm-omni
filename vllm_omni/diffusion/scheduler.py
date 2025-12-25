@@ -25,15 +25,16 @@ class Scheduler:
             logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
             self.close()
 
+        self.num_workers = od_config.num_gpus
         self.od_config = od_config
         self.context = zmq.Context()  # Standard synchronous context
 
         # Initialize MessageQueue for broadcasting requests
         # Assuming all readers are local for now as per current launch_engine implementation
         self.mq = MessageQueue(
-            n_reader=od_config.num_gpus,
-            n_local_reader=od_config.num_gpus,
-            local_reader_ranks=list(range(od_config.num_gpus)),
+            n_reader=self.num_workers,
+            n_local_reader=self.num_workers,
+            local_reader_ranks=list(range(self.num_workers)),
         )
 
         self.result_mq = None
