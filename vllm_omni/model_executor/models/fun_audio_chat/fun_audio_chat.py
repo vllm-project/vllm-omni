@@ -20,19 +20,31 @@ Components:
 - audio_invert_tower: CRQ Transformer for speech token generation (disabled in S2T mode)
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
 from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import BatchFeature
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalDataDict
-from vllm.multimodal.processing import BaseMultiModalProcessor, BaseProcessingInfo
+from vllm.multimodal.inputs import (
+    MultiModalDataDict,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import MultiModalDataItems
+from vllm.multimodal.processing import (
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    PromptReplacement,
+    PromptUpdate,
+    PromptUpdateDetails,
+)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -42,6 +54,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
 
 from .audio_encoder import FunAudioChatAudioEncoder, FunAudioChatDiscreteEncoder
+from .processing_fun_audio_chat import FunAudioChatProcessor
 
 logger = init_logger(__name__)
 
@@ -60,6 +73,37 @@ AUDIO_EOS_INDEX = 151671  # <|audio_eos|>
 class FunAudioChatProcessingInfo(BaseProcessingInfo):
     """Processing info for Fun-Audio-Chat multimodal inputs."""
 
+    _cached_processor: FunAudioChatProcessor | None = None
+
+    def get_hf_processor(self, **kwargs) -> FunAudioChatProcessor:
+        """
+        Override to return our custom FunAudioChatProcessor.
+        The default implementation uses AutoProcessor which doesn't work
+        because the model doesn't have proper processor registration in HF Hub.
+        """
+        if self._cached_processor is not None:
+            return self._cached_processor
+
+        import os
+
+        model_path = self.ctx.model_config.model
+
+        # Check if speech_tokenizer folder exists
+        speech_tokenizer_path = os.path.join(model_path, "speech_tokenizer")
+        if not os.path.exists(speech_tokenizer_path):
+            raise FileNotFoundError(
+                f"speech_tokenizer folder not found at {speech_tokenizer_path}. "
+                f"The Fun-Audio-Chat model requires the speech_tokenizer subfolder. "
+                f"Please download the complete model from HuggingFace: "
+                f"huggingface-cli download FunAudioLLM/Fun-Audio-Chat-8B --local-dir {model_path}"
+            )
+
+        self._cached_processor = FunAudioChatProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=self.ctx.model_config.trust_remote_code,
+        )
+        return self._cached_processor
+
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": 1}  # Currently support single audio input
 
@@ -77,10 +121,17 @@ class FunAudioChatDummyInputsBuilder(BaseDummyInputsBuilder[FunAudioChatProcessi
     """Build dummy inputs for Fun-Audio-Chat profiling."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        """Build the text input corresponding to mm_counts."""
+        """Build the text input corresponding to mm_counts.
+
+        For audio inputs, we need to include the <|AUDIO|> placeholder token
+        that the HF processor will expand to audio tokens.
+        """
         num_audio = mm_counts.get("audio", 0)
         if num_audio > 0:
-            return "Transcribe the audio."
+            # Include audio placeholder for processor to expand
+            hf_processor = self.info.get_hf_processor()
+            audio_token = getattr(hf_processor, "audio_token", "<|AUDIO|>")
+            return audio_token * num_audio
         return "Hello, how are you?"
 
     def get_dummy_mm_data(
@@ -100,103 +151,216 @@ class FunAudioChatDummyInputsBuilder(BaseDummyInputsBuilder[FunAudioChatProcessi
         return {}
 
 
+def _funaudiochat_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+    """Get field config for Fun-Audio-Chat multimodal inputs.
+
+    Fun-Audio-Chat uses a simple batched format where each tensor has
+    a batch dimension that gets squeezed for single-item inputs.
+
+    All tensors should be 2D (no batch dim) or 3D (with batch dim) and
+    properly handled by batched() config.
+    """
+    config = {}
+
+    # Packed continuous audio features
+    # Use flat_from_sizes for packed 2D tensors with known sizes
+    if "input_audio_features" in hf_inputs:
+        audio_feature_lengths = hf_inputs.get("audio_feature_lengths")
+        if audio_feature_lengths is not None:
+            config["input_audio_features"] = MultiModalFieldConfig.flat_from_sizes(
+                "audio", audio_feature_lengths, dim=1
+            )
+        else:
+            # Fallback: treat as single item
+            config["input_audio_features"] = MultiModalFieldConfig.batched("audio")
+
+    if "audio_feature_lengths" in hf_inputs:
+        config["audio_feature_lengths"] = MultiModalFieldConfig.batched("audio")
+    if "feature_attention_mask" in hf_inputs:
+        config["feature_attention_mask"] = MultiModalFieldConfig.batched("audio")
+
+    # Legacy format (if not packed)
+    if "input_features" in hf_inputs:
+        config["input_features"] = MultiModalFieldConfig.batched("audio")
+    if "feature_exist_mask" in hf_inputs:
+        config["feature_exist_mask"] = MultiModalFieldConfig.batched("audio")
+
+    # Discrete speech tokens
+    if "speech_ids" in hf_inputs:
+        config["speech_ids"] = MultiModalFieldConfig.batched("audio")
+    if "speech_attention_mask" in hf_inputs:
+        config["speech_attention_mask"] = MultiModalFieldConfig.batched("audio")
+
+    return config
+
+
 class FunAudioChatMultiModalProcessor(BaseMultiModalProcessor[FunAudioChatProcessingInfo]):
     """Multimodal processor for Fun-Audio-Chat audio inputs."""
 
-    def _get_data_parser(self):
-        """Get data parser for audio inputs."""
-        from vllm.multimodal.parse import MultiModalDataParser
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        """Given the HF-processed data, output the metadata of each field."""
+        return _funaudiochat_field_config(hf_inputs)
 
-        return MultiModalDataParser()
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        """
+        Given the original multi-modal items and HF-processed data,
+        output the updates to perform on the prompt.
 
-    def _get_hf_processor(self):
-        """Lazy-load the HuggingFace processor."""
-        return self.info.get_hf_processor()
+        Fun-Audio-Chat uses <|AUDIO|> as a placeholder that gets expanded
+        to multiple audio tokens. We need to provide this info so vLLM
+        can track placeholder positions.
+        """
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+        tokenizer = self.info.get_tokenizer()
+        vocab = tokenizer.get_vocab()
+
+        # Get audio tokens from processor
+        audio_token = getattr(processor, "audio_token", "<|AUDIO|>")
+        audio_bos_token = getattr(processor, "audio_bos_token", "<|audio_bos|>")
+        audio_eos_token = getattr(processor, "audio_eos_token", "<|audio_eos|>")
+
+        audio_token_id = vocab.get(audio_token, AUDIO_TOKEN_INDEX)
+        audio_bos_id = vocab.get(audio_bos_token, AUDIO_BOS_INDEX)
+        audio_eos_id = vocab.get(audio_eos_token, AUDIO_EOS_INDEX)
+
+        # Get audio group size from processor (default 5)
+        audio_group_size = getattr(processor, "audio_group_size", 5)
+
+        # Get processed audio data to compute token counts
+        out_mm_data = out_mm_kwargs.get_data()
+
+        # Try to get audio lengths from different sources
+        audio_output_lengths = []
+
+        # 1. First try audio_feature_lengths (packed format)
+        audio_feature_lengths = out_mm_data.get("audio_feature_lengths")
+        if audio_feature_lengths is not None:
+            if isinstance(audio_feature_lengths, torch.Tensor):
+                # Compute output lengths through the encoder's length calculation
+                # For Whisper-like encoder: output = ceil(input / 2) convolutions twice
+                feature_lengths = audio_feature_lengths
+                # Similar to _get_feat_extract_output_lengths
+                feat_lengths = (feature_lengths - 1) // 2 + 1
+                output_lengths = (feat_lengths - 2) // 2 + 1
+                # Then group by audio_group_size
+                audio_output_lengths = [
+                    (int(length) + (audio_group_size - 1)) // audio_group_size for length in output_lengths.tolist()
+                ]
+
+        # 2. Fall back to speech_attention_mask if available
+        if not audio_output_lengths:
+            speech_attention_mask = out_mm_data.get("speech_attention_mask")
+            if speech_attention_mask is not None:
+                if isinstance(speech_attention_mask, torch.Tensor):
+                    speech_lengths = speech_attention_mask.sum(-1)
+                    audio_output_lengths = [
+                        (int(length) + (audio_group_size - 1)) // audio_group_size for length in speech_lengths.tolist()
+                    ]
+
+        # 3. Fall back to feature_attention_mask
+        if not audio_output_lengths:
+            feature_attention_mask = out_mm_data.get("feature_attention_mask")
+            if feature_attention_mask is not None:
+                if isinstance(feature_attention_mask, torch.Tensor):
+                    feature_lengths = feature_attention_mask.sum(-1)
+                    # Compute encoder output lengths
+                    feat_lengths = (feature_lengths - 1) // 2 + 1
+                    output_lengths = (feat_lengths - 2) // 2 + 1
+                    audio_output_lengths = [
+                        (int(length) + (audio_group_size - 1)) // audio_group_size for length in output_lengths.tolist()
+                    ]
+
+        def get_replacement_funaudiochat(item_idx: int):
+            if audio_output_lengths and item_idx < len(audio_output_lengths):
+                num_audio_tokens = audio_output_lengths[item_idx]
+            else:
+                # Fallback: estimate based on ~5 seconds audio at 5Hz
+                num_audio_tokens = 25  # ~5 seconds
+
+            # Audio tokens surrounded by bos/eos
+            audio_tokens = [audio_token_id] * num_audio_tokens
+
+            return PromptUpdateDetails.select_token_id(
+                [audio_bos_id] + audio_tokens + [audio_eos_id],
+                embed_token_id=audio_token_id,
+            )
+
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=audio_token,
+                replacement=get_replacement_funaudiochat,
+            )
+        ]
 
     def _call_hf_processor(
         self,
         prompt: str,
-        mm_data: MultiModalDataDict,
+        mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-    ) -> dict:
-        """Call HuggingFace processor to process inputs."""
-        processor = self._get_hf_processor()
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """Call HuggingFace processor to process inputs.
 
-        # Extract audio from multimodal data
-        audio_data = mm_data.get("audio")
+        Following Qwen2_5_Omni pattern: pack audio features into a 2D tensor
+        with audio_feature_lengths to track individual lengths.
+        """
+        processor = self.info.get_hf_processor(**mm_kwargs)
+
+        # Handle audios key (vLLM uses "audios" but processor expects "audios")
+        mm_data = dict(mm_data)  # Make mutable copy
+        audio_data = mm_data.pop("audios", None) or mm_data.pop("audio", None)
 
         if audio_data is not None:
-            # Convert audio list to proper format if needed
-            if isinstance(audio_data, list) and len(audio_data) > 0:
-                audios = audio_data
-            else:
-                audios = [audio_data] if audio_data is not None else None
+            # Convert to list format if needed
+            if not isinstance(audio_data, list):
+                audio_data = [audio_data]
 
+            # FunAudioChatProcessor expects audios as a list of audio arrays
             # Process audio using HF processor
             processed = processor(
                 text=prompt,
-                audios=audios,
+                audios=audio_data,
                 return_tensors="pt",
                 padding=True,
-                **mm_kwargs,
             )
+
+            # Pack audio features similar to Qwen2_5_Omni:
+            # Convert [batch, num_mel_bins, seq_len] -> [num_mel_bins, total_frames]
+            input_features = processed.get("input_features")
+            feature_attention_mask = processed.get("feature_attention_mask")
+
+            if input_features is not None and feature_attention_mask is not None:
+                # Pack features by removing padding
+                # input_features: [batch, num_mel_bins, seq_len]
+                # feature_attention_mask: [batch, seq_len]
+                packed_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+                # packed_features is now [num_mel_bins, total_valid_frames]
+
+                processed["input_audio_features"] = packed_features
+                processed["audio_feature_lengths"] = feature_attention_mask.sum(-1)
+            elif input_features is not None:
+                # No attention mask - treat as all valid
+                # Flatten batch dimension
+                batch_size, num_mel_bins, seq_len = input_features.shape
+                packed_features = input_features.permute(0, 2, 1).reshape(-1, num_mel_bins).permute(1, 0)
+                processed["input_audio_features"] = packed_features
+                processed["audio_feature_lengths"] = torch.full((batch_size,), seq_len, dtype=torch.long)
+
             return processed
         else:
             # Text-only input
             processed = processor(text=prompt, return_tensors="pt")
             return processed
-
-    def apply(
-        self,
-        prompt: str,
-        mm_data: MultiModalDataDict,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        *,
-        mm_uuids: Mapping[str, list[str]] | None = None,
-    ):
-        """Process multimodal inputs for Fun-Audio-Chat."""
-        from vllm.multimodal.inputs import MultiModalInputs, MultiModalKwargsItem
-
-        processed = self._call_hf_processor(prompt, mm_data, hf_processor_mm_kwargs)
-
-        prompt_token_ids = processed["input_ids"][0].tolist()
-
-        # Build mm_kwargs from processed outputs
-        mm_kwargs: dict[str, Any] = {}
-
-        if "input_features" in processed:
-            mm_kwargs["input_features"] = processed["input_features"]
-        if "speech_ids" in processed:
-            mm_kwargs["speech_ids"] = processed["speech_ids"]
-        if "speech_attention_mask" in processed:
-            mm_kwargs["speech_attention_mask"] = processed["speech_attention_mask"]
-        if "feature_attention_mask" in processed:
-            mm_kwargs["feature_attention_mask"] = processed["feature_attention_mask"]
-
-        # Build placeholder ranges for audio tokens
-        mm_placeholders: dict[str, list] = {}
-        if mm_data.get("audio") is not None:
-            # Find audio token positions in the prompt
-            audio_token_indices = [i for i, tok in enumerate(prompt_token_ids) if tok == AUDIO_TOKEN_INDEX]
-            if audio_token_indices:
-                mm_placeholders["audio"] = []
-                for idx in audio_token_indices:
-                    mm_placeholders["audio"].append(
-                        {
-                            "offset": idx,
-                            "length": 1,  # Each audio token placeholder
-                        }
-                    )
-
-        return MultiModalInputs(
-            type="multimodal",
-            prompt=prompt,
-            prompt_token_ids=prompt_token_ids,
-            mm_kwargs=MultiModalKwargsItem.from_items([mm_kwargs])
-            if mm_kwargs
-            else MultiModalKwargsItem.from_items([]),
-            mm_placeholders=mm_placeholders,
-        )
 
 
 # ============================================================================
@@ -375,8 +539,17 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         input_ids: torch.Tensor,
         multimodal_embeddings: torch.Tensor | None = None,
         is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         """Embed input token IDs and merge with audio embeddings if present."""
+        # Note: handle_oov_mm_token is accepted for vLLM compatibility but we
+        # handle audio token merging ourselves below.
+
+        # Debug: log input_ids info
+        # audio_token_count = (input_ids == self.audio_token_index).sum().item()
+        # logger.info(f"embed_input_ids: input_ids.shape={input_ids.shape}, "
+        #            f"audio_token_index={self.audio_token_index}, count={audio_token_count}")
+
         if self.model_stage == "cosyvoice":
             return torch.zeros(
                 input_ids.shape[0],
@@ -390,8 +563,37 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         # Merge with multimodal embeddings if provided
         if multimodal_embeddings is not None:
-            audio_mask = input_ids == self.audio_token_index
+            # Flatten list of per-item embeddings if needed
+            if isinstance(multimodal_embeddings, (list, tuple)):
+                if len(multimodal_embeddings) == 0:
+                    return embeddings
+                multimodal_embeddings = torch.cat(multimodal_embeddings, dim=0)
+
+            # Match audio tokens - use is_multimodal mask if provided (more reliable)
+            if is_multimodal is not None:
+                audio_mask = is_multimodal.bool()
+                logger.info(f"embed_input_ids: using is_multimodal mask, sum={audio_mask.sum().item()}")
+            else:
+                audio_mask = input_ids == self.audio_token_index
+                logger.info(
+                    f"embed_input_ids: using audio_token_index={self.audio_token_index}, "
+                    f"mask sum={audio_mask.sum().item()}"
+                )
+
             if audio_mask.any() and multimodal_embeddings.numel() > 0:
+                logger.info(
+                    f"embed_input_ids: merging {multimodal_embeddings.shape[0]} audio "
+                    f"embeddings into {audio_mask.sum().item()} positions"
+                )
+                logger.info(
+                    f"embed_input_ids: multimodal_embeddings stats: "
+                    f"min={multimodal_embeddings.min():.4f}, "
+                    f"max={multimodal_embeddings.max():.4f}, mean={multimodal_embeddings.mean():.4f}"
+                )
+                logger.info(
+                    f"embed_input_ids: text embeddings stats: min={embeddings.min():.4f}, "
+                    f"max={embeddings.max():.4f}, mean={embeddings.mean():.4f}"
+                )
                 # Flatten for masked scatter
                 flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1])
                 flat_mask = audio_mask.reshape(-1)
@@ -418,6 +620,11 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
                 flat_embeddings[flat_mask] = multimodal_embeddings.to(flat_embeddings.device, flat_embeddings.dtype)
                 embeddings = flat_embeddings.reshape(embeddings.shape)
+                logger.info(
+                    f"embed_input_ids: merged embeddings stats: "
+                    f"min={embeddings.min():.4f}, max={embeddings.max():.4f}, "
+                    f"mean={embeddings.mean():.4f}"
+                )
 
         return embeddings
 
@@ -467,23 +674,59 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         return audio_features, audio_output_lengths
 
-    def embed_multimodal(
-        self,
-        input_features: torch.Tensor | None = None,
-        speech_ids: torch.Tensor | None = None,
-        speech_attention_mask: torch.Tensor | None = None,
-        feature_attention_mask: torch.Tensor | None = None,
-        feature_exist_mask: torch.Tensor | None = None,
-        text_ids: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor | None:
+    def embed_multimodal(self, **kwargs) -> list[torch.Tensor] | None:
         """
         Process and embed multimodal (audio) inputs.
 
+        This method is called by vLLM framework to compute multimodal embeddings
+        before they are merged with text embeddings.
+
         This combines continuous and discrete audio representations
         following the dual-resolution approach in Fun-Audio-Chat.
+
+        Supports two input formats:
+        1. Packed format (Qwen2_5_Omni style):
+           - input_audio_features: [num_mel_bins, total_frames]
+           - audio_feature_lengths: [num_audios]
+        2. Legacy batched format:
+           - input_features: [batch, num_mel_bins, seq_len]
+           - feature_attention_mask: [batch, seq_len]
+
+        Returns:
+            List of audio embedding tensors, one per audio item.
         """
-        if input_features is None and speech_ids is None:
+        # Extract parameters from kwargs
+        input_features = kwargs.get("input_features")
+        input_audio_features = kwargs.get("input_audio_features")
+        audio_feature_lengths = kwargs.get("audio_feature_lengths")
+        speech_ids = kwargs.get("speech_ids")
+        speech_attention_mask = kwargs.get("speech_attention_mask")
+        feature_attention_mask = kwargs.get("feature_attention_mask")
+        feature_exist_mask = kwargs.get("feature_exist_mask")
+
+        # Use packed format if available, otherwise fall back to legacy
+        logger.info(
+            f"embed_multimodal called: input_audio_features={input_audio_features is not None}, "
+            f"input_features={input_features is not None}, speech_ids={speech_ids is not None}, "
+            f"audio_feature_lengths={audio_feature_lengths is not None}"
+        )
+        logger.info(f"embed_multimodal: feature_exist_mask={feature_exist_mask}")
+        if input_audio_features is not None:
+            logger.info(f"  input_audio_features.shape={input_audio_features.shape}")
+        if speech_ids is not None:
+            logger.info(f"  speech_ids.shape={speech_ids.shape}")
+        if input_audio_features is None and input_features is not None:
+            # Legacy format - use old input_features
+            packed_features = input_features
+            use_packed_format = False
+        elif input_audio_features is not None:
+            packed_features = input_audio_features
+            use_packed_format = True
+        else:
+            packed_features = None
+            use_packed_format = False
+
+        if packed_features is None and speech_ids is None:
             return None
 
         device = self._module_device(self.continuous_audio_tower)
@@ -492,6 +735,10 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # Process speech IDs (discrete tokens)
         if speech_ids is not None:
             speech_ids = speech_ids.to(device)
+
+            # Handle 3D input from vLLM batching: [batch, 1, seq] -> [batch, seq]
+            if speech_ids.dim() == 3 and speech_ids.shape[1] == 1:
+                speech_ids = speech_ids.squeeze(1)
 
             # Pad to multiple of group_size
             seq_len = speech_ids.shape[-1]
@@ -504,6 +751,9 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # Get output lengths
             if speech_attention_mask is not None:
                 speech_attention_mask = speech_attention_mask.to(device)
+                # Handle 3D attention mask from vLLM batching
+                if speech_attention_mask.dim() == 3 and speech_attention_mask.shape[1] == 1:
+                    speech_attention_mask = speech_attention_mask.squeeze(1)
                 speech_lengths = speech_attention_mask.sum(dim=-1)
             else:
                 speech_lengths = torch.full((speech_ids.shape[0],), speech_ids.shape[-1], device=device)
@@ -513,16 +763,64 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # Process continuous features if available
             continuous_audio_features = None
             continuous_audio_output_lengths = None
-            if input_features is not None:
-                input_features = input_features.to(device)
-                if feature_attention_mask is not None:
+            if packed_features is not None:
+                packed_features = packed_features.to(device)
+                # logger.info(
+                #     f"embed_multimodal: processing continuous features, "
+                #     f"packed_features.shape={packed_features.shape}"
+                # )
+                if use_packed_format and audio_feature_lengths is not None:
+                    audio_feature_lengths = audio_feature_lengths.to(device)
+                    # logger.info(
+                    #     f"embed_multimodal: using packed format, "
+                    #     f"audio_feature_lengths={audio_feature_lengths}"
+                    # )
+                    continuous_audio_features, continuous_audio_output_lengths = self._get_audio_features_packed(
+                        input_audio_features=packed_features,
+                        audio_feature_lengths=audio_feature_lengths,
+                        speech_maxlen=speech_ids.shape[-1],
+                    )
+                    # logger.info(
+                    #     f"embed_multimodal: continuous_audio_features.shape="
+                    #     f"{continuous_audio_features.shape}"
+                    # )
+                    # logger.info(
+                    #     f"embed_multimodal: continuous_audio_features stats: "
+                    #     f"min={continuous_audio_features.min():.4f}, "
+                    #     f"max={continuous_audio_features.max():.4f}, "
+                    #     f"mean={continuous_audio_features.mean():.4f}"
+                    # )
+                elif feature_attention_mask is not None:
                     feature_attention_mask = feature_attention_mask.to(device)
+                    (
+                        continuous_audio_features,
+                        continuous_audio_output_lengths,
+                    ) = self.get_audio_features(
+                        input_features=packed_features,
+                        feature_attention_mask=feature_attention_mask,
+                        speech_maxlen=speech_ids.shape[-1],
+                    )
+                    logger.info(f"embed_multimodal: continuous_audio_features.shape={continuous_audio_features.shape}")
+                else:
+                    logger.warning(
+                        "embed_multimodal: packed_features provided but no "
+                        "audio_feature_lengths or feature_attention_mask!"
+                    )
+            else:
+                logger.warning("embed_multimodal: no packed_features (continuous audio) available!")
 
-                continuous_audio_features, continuous_audio_output_lengths = self.get_audio_features(
-                    input_features=input_features,
-                    feature_attention_mask=feature_attention_mask,
-                    speech_maxlen=speech_ids.shape[-1],
+            # Debug: log continuous features before combining
+            if continuous_audio_features is not None:
+                logger.info(
+                    f"embed_multimodal: continuous_audio_features.shape={continuous_audio_features.shape}, "
+                    f"stats: min={continuous_audio_features.min():.4f}, max={continuous_audio_features.max():.4f}, "
+                    f"mean={continuous_audio_features.mean():.4f}"
                 )
+                logger.info(f"embed_multimodal: continuous_audio_output_lengths={continuous_audio_output_lengths}")
+
+            # Debug: log speech_ids values
+            logger.info(f"embed_multimodal: speech_ids unique values: {speech_ids.unique()[:10].tolist()}...")
+            logger.info(f"embed_multimodal: audio_output_lengths={audio_output_lengths}")
 
             # Encode discrete tokens and combine with continuous features
             audio_features = self.audio_tower(
@@ -532,32 +830,114 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 feature_exist_mask=feature_exist_mask,
             )
 
+            # Debug: log output features
+            logger.info(
+                f"embed_multimodal: audio_features.shape={audio_features.shape}, "
+                f"stats: min={audio_features.min():.4f}, max={audio_features.max():.4f}, "
+                f"mean={audio_features.mean():.4f}"
+            )
+
             # Create mask for valid audio tokens
             max_audio_tokens = audio_features.shape[1]
             audio_features_mask = torch.arange(max_audio_tokens, device=device)[None, :]
             audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
 
-            # Pack audio features (remove padding)
+            # Pack audio features (remove padding) and split into list
             audio_features = audio_features[audio_features_mask]
+            audio_features = audio_features.split(audio_output_lengths.tolist())
 
-        elif input_features is not None:
+        elif packed_features is not None:
             # Only continuous features (no speech IDs)
-            input_features = input_features.to(device)
-            if feature_attention_mask is not None:
-                feature_attention_mask = feature_attention_mask.to(device)
+            packed_features = packed_features.to(device)
 
-            audio_features, audio_output_lengths = self.get_audio_features(
-                input_features=input_features,
-                feature_attention_mask=feature_attention_mask,
-            )
+            if use_packed_format and audio_feature_lengths is not None:
+                audio_feature_lengths = audio_feature_lengths.to(device)
+                audio_features, audio_output_lengths = self._get_audio_features_packed(
+                    input_audio_features=packed_features,
+                    audio_feature_lengths=audio_feature_lengths,
+                )
+                # Split into list by output lengths
+                audio_features = audio_features.split(audio_output_lengths.tolist())
+            else:
+                if feature_attention_mask is not None:
+                    feature_attention_mask = feature_attention_mask.to(device)
+                audio_features, audio_output_lengths = self.get_audio_features(
+                    input_features=packed_features,
+                    feature_attention_mask=feature_attention_mask,
+                )
+                # Pack features and split into list
+                max_len = audio_features.shape[1]
+                audio_features_mask = torch.arange(max_len, device=device)[None, :]
+                audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
+                audio_features = audio_features[audio_features_mask]
+                audio_features = audio_features.split(audio_output_lengths.tolist())
 
-            # Pack features
-            max_len = audio_features.shape[1]
-            audio_features_mask = torch.arange(max_len, device=device)[None, :]
-            audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
-            audio_features = audio_features[audio_features_mask]
+        if isinstance(audio_features, (list, tuple)) and len(audio_features) == 0:
+            return None
 
         return audio_features
+
+    def _get_audio_features_packed(
+        self,
+        input_audio_features: torch.Tensor,
+        audio_feature_lengths: torch.Tensor,
+        speech_maxlen: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode packed continuous audio features using the audio encoder.
+
+        Args:
+            input_audio_features: Packed mel features [num_mel_bins, total_frames]
+                                  or batched [batch, num_mel_bins, frames]
+            audio_feature_lengths: Lengths per audio [num_audios] or [num_audios, 1]
+            speech_maxlen: Maximum output length
+
+        Returns:
+            Tuple of (audio_features, audio_output_lengths)
+        """
+        # Handle audio_feature_lengths shape: squeeze extra dimension
+        if audio_feature_lengths.dim() == 2 and audio_feature_lengths.shape[1] == 1:
+            audio_feature_lengths = audio_feature_lengths.squeeze(1)
+
+        # Handle 3D batched input [batch, num_mel_bins, frames] -> convert to packed [num_mel_bins, total_frames]
+        if input_audio_features.dim() == 3:
+            batch_size = input_audio_features.shape[0]
+            logger.info(
+                f"_get_audio_features_packed: converting 3D input {input_audio_features.shape} to packed format"
+            )
+            # Pack by concatenating along frames dimension
+            # First, extract valid frames for each sample
+            packed_list = []
+            for i in range(batch_size):
+                length = (
+                    audio_feature_lengths[i].item()
+                    if audio_feature_lengths.numel() > 1
+                    else audio_feature_lengths.item()
+                )
+                packed_list.append(input_audio_features[i, :, : int(length)])
+            input_audio_features = torch.cat(packed_list, dim=1)  # [num_mel_bins, total_frames]
+            logger.info(f"_get_audio_features_packed: packed shape {input_audio_features.shape}")
+
+        # Get output lengths from the continuous audio tower
+        audio_feat_lengths, audio_output_lengths = self.continuous_audio_tower._get_feat_extract_output_lengths(
+            audio_feature_lengths
+        )
+
+        # Cast input to model dtype (audio features from processor may be float32)
+        input_audio_features = input_audio_features.to(
+            dtype=self.continuous_audio_tower.conv1.weight.dtype,
+            device=self.continuous_audio_tower.conv1.weight.device,
+        )
+
+        # Encode through continuous audio tower
+        audio_features = self.continuous_audio_tower(
+            input_features=input_audio_features,
+            feature_lens=audio_feature_lengths,
+            aftercnn_lens=audio_feat_lengths,
+            speech_maxlen=speech_maxlen,
+        )
+
+        return audio_features, audio_output_lengths
 
     # ==================== Forward Pass ====================
 
@@ -637,26 +1017,24 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds.to(device)
 
-        # Process audio features if present
-        input_features = kwargs.get("input_features")
-        speech_ids = kwargs.get("speech_ids")
+        # Note: In vLLM v1, multimodal embeddings are computed by embed_multimodal()
+        # and merged by embed_input_ids() before forward() is called.
+        # The inputs_embeds parameter already contains the merged embeddings.
 
-        audio_features = None
-        if input_features is not None or speech_ids is not None:
-            audio_features = self.embed_multimodal(
-                input_features=input_features,
-                speech_ids=speech_ids,
-                speech_attention_mask=kwargs.get("speech_attention_mask"),
-                feature_attention_mask=kwargs.get("feature_attention_mask"),
-                feature_exist_mask=kwargs.get("feature_exist_mask"),
+        # Debug: check if inputs_embeds is provided
+        logger.info(
+            f"_forward_main: inputs_embeds provided={inputs_embeds is not None}, "
+            f"input_ids.shape={input_ids.shape if input_ids is not None else None}"
+        )
+        if inputs_embeds is not None:
+            logger.info(
+                f"_forward_main: inputs_embeds.shape={inputs_embeds.shape}, "
+                f"stats: min={inputs_embeds.min():.4f}, max={inputs_embeds.max():.4f}"
             )
 
-        # Get embeddings
+        # Get embeddings if not already provided
         if inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(
-                input_ids=input_ids,
-                multimodal_embeddings=audio_features,
-            )
+            inputs_embeds = self.embed_input_ids(input_ids=input_ids)
 
         # Store text embeddings for CRQ decoder (S2S mode)
         text_embeds = inputs_embeds.clone()

@@ -31,8 +31,14 @@ from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
 
-# Default system prompt for Fun-Audio-Chat
-DEFAULT_SYSTEM = "You are a helpful voice assistant. You can understand speech and respond naturally."
+# Default system prompts for Fun-Audio-Chat
+# S2T mode: generate text only
+DEFAULT_S2T_SYSTEM = "You are asked to generate text tokens."
+# S2S mode: generate both text and speech tokens
+DEFAULT_S2S_SYSTEM = "You are asked to generate both text and speech tokens at the same time."
+
+# Audio template with bos/eos markers
+AUDIO_TEMPLATE = "<|audio_bos|><|AUDIO|><|audio_eos|>"
 
 
 class QueryResult(NamedTuple):
@@ -44,25 +50,53 @@ def get_audio_query(
     audio_path: str | None = None,
     question: str | None = None,
     sampling_rate: int = 16000,
+    mode: str = "s2t",
 ) -> QueryResult:
     """Build audio query for Fun-Audio-Chat."""
-    if question is None:
-        question = "Please transcribe and respond to the audio."
+    # Select system prompt based on mode
+    system_prompt = DEFAULT_S2T_SYSTEM if mode == "s2t" else DEFAULT_S2S_SYSTEM
 
-    # Fun-Audio-Chat uses <|AUDIO|> token for audio placeholder
+    # Build user content with audio template
+    if question:
+        user_content = f"{AUDIO_TEMPLATE}\n{question}"
+    else:
+        user_content = AUDIO_TEMPLATE
+
+    # Fun-Audio-Chat uses <|audio_bos|><|AUDIO|><|audio_eos|> for audio placeholder
     prompt = (
-        f"<|im_start|>system\n{DEFAULT_SYSTEM}<|im_end|>\n"
-        "<|im_start|>user\n<|AUDIO|>"
-        f"{question}<|im_end|>\n"
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_content}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
 
     if audio_path and os.path.exists(audio_path):
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
-        audio_data = (audio_signal.astype(np.float32), sr)
+        audio_signal, _ = librosa.load(audio_path, sr=sampling_rate)
+        # Pass only the waveform; avoid resampler complaining about target_sr
+        audio_data = audio_signal.astype(np.float32)
+        print(
+            f"[Debug] Loaded audio from file: shape={audio_data.shape}, duration={len(audio_data) / sampling_rate:.2f}s"
+        )
     else:
-        # Use built-in test audio
-        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+        # Try to use Fun-Audio-Chat's test audio first
+        fun_audio_chat_test = Path(__file__).parent.parent.parent.parent / "Fun-Audio-Chat/examples/ck7vv9ag.wav"
+        if fun_audio_chat_test.exists():
+            audio_signal, orig_sr = librosa.load(str(fun_audio_chat_test), sr=None)
+            print(f"[Debug] Using Fun-Audio-Chat test audio: {fun_audio_chat_test}")
+            print(f"[Debug] Original: shape={audio_signal.shape}, sr={orig_sr}")
+            if orig_sr != sampling_rate:
+                audio_signal = librosa.resample(audio_signal, orig_sr=orig_sr, target_sr=sampling_rate)
+                print(f"[Debug] Resampled to {sampling_rate}Hz: shape={audio_signal.shape}")
+            audio_data = audio_signal.astype(np.float32)
+        else:
+            # Fall back to vLLM's built-in test audio
+            audio_signal, orig_sr = AudioAsset("mary_had_lamb").audio_and_sample_rate
+            print(f"[Debug] AudioAsset original: shape={audio_signal.shape}, sr={orig_sr}")
+            # Resample to target sampling rate if needed
+            if orig_sr != sampling_rate:
+                audio_signal = librosa.resample(audio_signal, orig_sr=orig_sr, target_sr=sampling_rate)
+                print(f"[Debug] Resampled to {sampling_rate}Hz: shape={audio_signal.shape}")
+            audio_data = audio_signal.astype(np.float32)
+        print(f"[Debug] Final audio: shape={audio_data.shape}, duration={len(audio_data) / sampling_rate:.2f}s")
 
     return QueryResult(
         inputs={
@@ -75,13 +109,15 @@ def get_audio_query(
     )
 
 
-def get_text_query(question: str | None = None) -> QueryResult:
+def get_text_query(question: str | None = None, mode: str = "s2t") -> QueryResult:
     """Build text-only query."""
     if question is None:
         question = "Hello! How can I help you today?"
 
+    system_prompt = DEFAULT_S2T_SYSTEM if mode == "s2t" else DEFAULT_S2S_SYSTEM
+
     prompt = (
-        f"<|im_start|>system\n{DEFAULT_SYSTEM}<|im_end|>\n"
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         f"<|im_start|>user\n{question}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
@@ -126,12 +162,14 @@ def main(args):
             audio_path=args.audio_path,
             question=args.question,
             sampling_rate=args.sampling_rate,
+            mode=args.mode,
         )
     else:
         # Use default audio
         query_result = get_audio_query(
             question=args.question,
             sampling_rate=args.sampling_rate,
+            mode=args.mode,
         )
 
     # Initialize Omni engine

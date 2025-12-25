@@ -263,6 +263,47 @@ class FunAudioChatAudioEncoder(nn.Module):
         output_lengths = (after_cnn - 2) // 2 + 1
         return after_cnn, output_lengths
 
+    def padded_and_mask_function(self, tensor_list, tensor_len, padding_value=0, padding_side="right"):
+        """
+        Pads a sequence of tensors to their maximum length on indicated `padding_side`.
+        Then prepares a mask so that pad tokens are not attended to.
+        """
+        max_len = tensor_len.max()
+        dim = tensor_list[0].shape[0]
+        device = tensor_list[0].device
+        dtype = tensor_list[0].dtype
+
+        padded_tensor = torch.full(
+            size=(len(tensor_list), dim, max_len),
+            fill_value=padding_value,
+            dtype=dtype,
+            device=device,
+        )
+
+        batch_mask = torch.zeros(
+            (len(tensor_len), max_len),
+            dtype=torch.long,
+            device=device,
+        )
+        for i, length in enumerate(tensor_len):
+            batch_mask[i, :length] = 1
+            padded_tensor[i, :, :length] = tensor_list[i]
+
+        feature_lens_after_cnn = (tensor_len - 1) // 2 + 1
+        max_len_after_cnn = feature_lens_after_cnn.max()
+        batch_mask_after_cnn = torch.zeros(
+            (len(tensor_len), max_len_after_cnn),
+            dtype=torch.long,
+            device=device,
+        )
+        for i, length in enumerate(feature_lens_after_cnn):
+            batch_mask_after_cnn[i, :length] = 1
+        return (
+            padded_tensor,
+            batch_mask.unsqueeze(1),
+            batch_mask_after_cnn.bool(),
+        )
+
     def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
         """Prepare attention mask for variable-length sequences."""
         seq_length = inputs_tensor.shape[0]
@@ -284,7 +325,7 @@ class FunAudioChatAudioEncoder(nn.Module):
         speech_maxlen: int | None = None,
     ) -> torch.Tensor:
         """
-        Process mel spectrogram features.
+        Process mel spectrogram features using chunking strategy.
 
         Args:
             input_features: Mel features [num_mel_bins, total_frames] (packed)
@@ -301,9 +342,7 @@ class FunAudioChatAudioEncoder(nn.Module):
         # Handle packed vs batched input
         if input_features.ndim == 2:
             # Packed input: [num_mel_bins, total_frames]
-            # Need to unpack using feature_lens
             if feature_lens is None:
-                # Assume single audio
                 feature_lens = torch.tensor([input_features.shape[1]], device=device)
 
             batch_size = feature_lens.size(0)
@@ -327,51 +366,74 @@ class FunAudioChatAudioEncoder(nn.Module):
                 feature_lens = torch.full((batch_size,), input_features.shape[2], device=device)
             input_features_list = [input_features[i, :, : feature_lens[i]] for i in range(batch_size)]
 
-        # Process through CNN
-        processed_list = []
-        processed_lens = []
+        # Calculate aftercnn_lens if not provided
+        if aftercnn_lens is None:
+            aftercnn_lens = (feature_lens - 1) // 2 + 1
 
-        for feat in input_features_list:
-            if feat.shape[1] == 0:
-                continue
-            # feat: [num_mel_bins, frames]
-            feat = feat.unsqueeze(0)  # [1, num_mel_bins, frames]
+        # Filter valid inputs
+        valid_mask = feature_lens > 0
+        valid_indices = torch.where(valid_mask)[0]
 
-            # Conv layers
-            x = F.gelu(self.conv1(feat))  # [1, d_model, frames]
-            x = F.gelu(self.conv2(x))  # [1, d_model, frames//2]
-
-            x = x.transpose(1, 2)  # [1, seq_len, d_model]
-
-            # Add positional embeddings
-            seq_len = x.shape[1]
-            pos_emb = self.positional_embedding.positional_embedding[:seq_len, :].to(x.dtype)
-            x = x + pos_emb.unsqueeze(0)
-
-            processed_list.append(x.squeeze(0))  # [seq_len, d_model]
-            processed_lens.append(x.shape[1])
-
-        if not processed_list:
+        if len(valid_indices) == 0:
             return torch.zeros(
                 (batch_size, speech_maxlen or 1, self.output_dim),
                 device=device,
                 dtype=self.proj.weight.dtype,
             )
 
-        # Pack sequences for efficient processing
-        hidden_states = torch.cat(processed_list, dim=0)  # [total_seq_len, d_model]
+        valid_input_features_list = [input_features_list[i] for i in valid_indices]
+        valid_input_features = torch.cat(valid_input_features_list, dim=1)
+        valid_feature_lens = feature_lens[valid_mask]
+        valid_aftercnn_lens = aftercnn_lens[valid_mask]
 
-        # Create cumulative sequence lengths
-        cu_seqlens = torch.tensor(
-            [0] + list(np.cumsum(processed_lens)),
-            device=device,
-            dtype=torch.int32,
+        # Chunking logic
+        chunk_num = torch.ceil(valid_feature_lens / (self.n_window * 2)).long()
+
+        chunk_lengths_list = []
+        full_chunk_len = self.n_window * 2
+        for i, length in enumerate(valid_feature_lens):
+            num_chunks_for_sample = chunk_num[i].item()
+            if num_chunks_for_sample == 0:
+                continue
+            chunk_lengths_list.extend([full_chunk_len] * (num_chunks_for_sample - 1))
+            last_chunk_len = length % full_chunk_len
+            if last_chunk_len == 0:
+                last_chunk_len = full_chunk_len
+            chunk_lengths_list.append(last_chunk_len)
+
+        chunk_lengths = torch.tensor(chunk_lengths_list, dtype=torch.long, device=device)
+
+        # Split into chunks
+        chunk_list = valid_input_features.split(chunk_lengths.tolist(), dim=1)
+
+        # Pad chunks
+        padded_feature, padded_mask, padded_mask_after_cnn = self.padded_and_mask_function(
+            chunk_list, chunk_lengths, padding_value=0, padding_side="right"
         )
 
-        # Prepare attention mask
+        # CNN processing
+        padded_embed = F.gelu(self.conv1(padded_feature)) * padded_mask
+        padded_embed = F.gelu(self.conv2(padded_embed)).transpose(1, 2)
+
+        # Add positional embeddings (per chunk)
+        padded_embed = padded_embed + self.positional_embedding.positional_embedding[
+            : padded_embed.shape[1], :
+        ].unsqueeze(0).to(padded_embed.dtype)
+
+        # Flatten chunks for transformer
+        hidden_states = padded_embed[padded_mask_after_cnn]
+
+        # Create cu_seqlens for attention (respecting chunk boundaries)
+        cu_seqlens = torch.cat(
+            (
+                torch.zeros(1, device=padded_mask_after_cnn.device, dtype=torch.int32),
+                padded_mask_after_cnn.sum(1).cumsum(0),
+            )
+        ).to(torch.int32)
+
         attention_mask = self._prepare_attention_mask(hidden_states, cu_seqlens)
 
-        # Process through transformer layers
+        # Transformer layers
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -380,7 +442,7 @@ class FunAudioChatAudioEncoder(nn.Module):
             )
 
         # Split back to individual sequences
-        hidden_states_list = hidden_states.split(processed_lens, dim=0)
+        hidden_states_list = hidden_states.split(valid_aftercnn_lens.tolist(), dim=0)
 
         # Apply pooling, layer norm, and projection
         output_list = []
@@ -396,6 +458,9 @@ class FunAudioChatAudioEncoder(nn.Module):
                     .squeeze(0)
                     .transpose(0, 1)
                 )
+            else:
+                # For sequences shorter than kernel_size, skip pooling
+                pass
 
             # Layer norm and projection
             hs = self.proj(self.ln_post(hs))
@@ -488,7 +553,7 @@ class FunAudioChatDiscreteEncoder(nn.Module):
         Encode discrete speech tokens.
 
         Args:
-            audio_ids: Discrete token IDs [batch, seq_len]
+            audio_ids: Discrete token IDs [batch, seq_len] or [seq_len] (packed)
             continuous_audio_features: Optional continuous features to combine
             continuous_audio_output_lengths: Lengths of continuous features
             feature_exist_mask: Mask for samples that have continuous features
@@ -496,12 +561,36 @@ class FunAudioChatDiscreteEncoder(nn.Module):
         Returns:
             Audio embeddings [batch, grouped_seq_len, output_dim]
         """
+        # Handle different input shapes:
+        # - 1D [total_tokens]: packed format, add batch dim
+        # - 2D [batch, seq_len]: standard batched format
+        # - 3D [batch, 1, seq_len]: vLLM batched format (needs squeeze)
+        squeeze_output = False
+        if audio_ids.dim() == 1:
+            audio_ids = audio_ids.unsqueeze(0)
+            squeeze_output = True
+        elif audio_ids.dim() == 3 and audio_ids.shape[1] == 1:
+            # Squeeze out the extra dimension from vLLM batching
+            audio_ids = audio_ids.squeeze(1)  # [batch, 1, seq] -> [batch, seq]
+
         # Embed discrete tokens
         inputs_embeds = self.embed_tokens(audio_ids)  # [batch, seq_len, output_dim]
 
         # Group embeddings (5 tokens → 1 grouped embedding)
         batch_size = inputs_embeds.shape[0]
         seq_len = inputs_embeds.shape[1]
+
+        # Debug logging (can remove later)
+        # import logging
+        # _logger = logging.getLogger(__name__)
+        # _logger.info(
+        #     f"DiscreteEncoder forward: after squeeze audio_ids.shape={audio_ids.shape}"
+        # )
+        # _logger.info(f"DiscreteEncoder forward: inputs_embeds.shape={inputs_embeds.shape}")
+        # _logger.info(
+        #     f"DiscreteEncoder forward: batch_size={batch_size}, seq_len={seq_len}, "
+        #     f"group_size={self.group_size}"
+        # )
 
         # Pad to multiple of group_size
         pad_len = (self.group_size - seq_len % self.group_size) % self.group_size
@@ -535,8 +624,26 @@ class FunAudioChatDiscreteEncoder(nn.Module):
 
             continuous_hidden_states = self.continual_output_matching(continuous_audio_features)
 
+            import logging
+
+            _logger = logging.getLogger(__name__)
+            _logger.info(
+                f"DiscreteEncoder: continuous_hidden_states.shape={continuous_hidden_states.shape}, "
+                f"stats: min={continuous_hidden_states.min():.4f}, max={continuous_hidden_states.max():.4f}"
+            )
+            _logger.info(
+                f"DiscreteEncoder: discrete hidden_states before combine stats: "
+                f"min={hidden_states.min():.4f}, max={hidden_states.max():.4f}"
+            )
+            _logger.info(
+                f"DiscreteEncoder: feature_exist_mask={feature_exist_mask}, mode={self.continuous_features_mode}"
+            )
+
             # Combine based on mode
             if feature_exist_mask is not None:
+                # Handle 2D mask from vLLM batching: [batch, 1] -> [batch]
+                if feature_exist_mask.dim() == 2 and feature_exist_mask.shape[1] == 1:
+                    feature_exist_mask = feature_exist_mask.squeeze(1)
                 if self.continuous_features_mode == "add":
                     hidden_states[feature_exist_mask] += continuous_hidden_states
                 else:  # "replace"
@@ -546,6 +653,10 @@ class FunAudioChatDiscreteEncoder(nn.Module):
                     hidden_states = hidden_states + continuous_hidden_states
                 else:
                     hidden_states = continuous_hidden_states
+
+        # Squeeze if input was 1D
+        if squeeze_output:
+            hidden_states = hidden_states.squeeze(0)
 
         return hidden_states
 
