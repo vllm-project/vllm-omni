@@ -1,9 +1,9 @@
-"""顶层入口：MammothModa2ForConditionalGeneration
+"""Top-level entry: MammothModa2ForConditionalGeneration
 
-仿照 Qwen2_5OmniForConditionalGeneration，根据 model_stage 选择子模块：
-- ar  : 自定义 MoE 语言 + 视觉塔
-- dit : 生成 DiT 阶段
-- vae : 预留（暂不实现）
+Modeled after Qwen2_5OmniForConditionalGeneration, selects submodules based on model_stage:
+- ar  : Custom MoE language model + Vision tower
+- dit : Generation DiT stage
+- vae : Reserved (not implemented)
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGenera
 )
 class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
                                            SupportsPP):
-    # 让 vllm_omni/worker/gpu_model_runner.py 的 `extract_multimodal_outputs`
-    # 走 OmniOutput 分支，从而拿到纯 torch.Tensor 的 text_hidden_states，避免后续
-    # `hidden_states[logit_indices]` 因类型不匹配（list/tuple）而报错。
+    # Ensure vllm_omni/worker/gpu_model_runner.py's `extract_multimodal_outputs` follows 
+    # the OmniOutput branch to retrieve text_hidden_states as a pure torch.Tensor, 
+    # preventing errors in `hidden_states[logit_indices]` due to type mismatch (list/tuple).
     have_multimodal_outputs = True
 
     multimodal_cpu_fields = {"image_grid_thw", "video_grid_thw"}
@@ -43,20 +43,20 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        # 与 Qwen2_5OmniForConditionalGeneration 保持一致：实例级标记
+        # Consistent with Qwen2_5OmniForConditionalGeneration: instance-level flag.
         self.have_multimodal_outputs = True
         self.vllm_config = vllm_config
         cfg = vllm_config.model_config.hf_config
         self.model_stage = vllm_config.model_config.model_stage
         self.multimodal_config = vllm_config.model_config.multimodal_config
 
-        # 仅用于调试/对齐 qwen2.5-omni：未使用的 stage 显式置空
+        # For debugging/alignment with qwen2.5-omni: explicitly nullify unused stages.
         self.ar = None
         self.dit = None
         self.vae = None
 
         if self.model_stage == "ar":
-            # AR 阶段：多模态 + MoE 文本
+            # AR stage: multi-modal + MoE text.
             self.ar = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "ar"),
@@ -68,21 +68,22 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "dit"),
-                # NOTE: init_vllm_registered_model -> VllmConfig.with_hf_config 要求传入的是
-                # transformers.PretrainedConfig；而 Mammothmoda2Config.gen_dit_config 是 dict（diffusers config）。
-                # DiT stage 的 hf_config 仍然使用顶层组合配置 Mammothmoda2Config，由 DiT 模块自己读取
-                # config.gen_dit_config / gen_vae_config 等 dict。
+                # NOTE: init_vllm_registered_model -> VllmConfig.with_hf_config requires a 
+                # transformers.PretrainedConfig; however, Mammothmoda2Config.gen_dit_config 
+                # is a dict (diffusers config). The DiT stage hf_config still uses the 
+                # top-level Mammothmoda2Config, and the DiT module reads its own 
+                # gen_dit_config / gen_vae_config dicts.
                 hf_config=cfg,
                 architectures=["MammothModa2DiTForConditionalGeneration"],
             )
             self.model = self.dit
         elif self.model_stage == "vae":
-            # 预留：目前未实现 VAEs，给出明确报错
+            # Reserved: VAEs not implemented yet; raise explicit error.
             raise NotImplementedError("MammothModa2 VAE stage not implemented yet.")
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
-        # 暴露中间张量创建器供 PP 使用（若子模块提供）
+        # Expose intermediate tensor factory for PP if provided by the submodule.
         self.make_empty_intermediate_tensors = getattr(
             self.model, "make_empty_intermediate_tensors", lambda: None
         )
@@ -98,7 +99,7 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
         return self.model
 
     def get_multimodal_embeddings(self, **kwargs: object):
-        # 兼容旧接口：统一走 embed_multimodal。
+        # Backward compatibility: route through embed_multimodal.
         return self.embed_multimodal(**kwargs)
 
     def embed_multimodal(self, **kwargs: object):

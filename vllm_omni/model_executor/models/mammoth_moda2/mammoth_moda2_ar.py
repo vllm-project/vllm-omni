@@ -66,31 +66,15 @@ def moe_forward(
     gen_expert: Callable[[torch.Tensor], torch.Tensor] | None,
     gen_token_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    多专家前向（按布尔 mask 分流）.
 
-    Parameters
-    ----------
-    hidden_states : Tensor           # (B, L, D)
-    und_expert    : nn.Module / fn   # False 区域用的专家
-    gen_expert    : nn.Module / fn   # True  区域用的专家
-    gen_token_mask: BoolTensor|(B,L) # True  → gen_expert；若 None 则全部走 und_expert
-
-    Returns
-    -------
-    merged : Tensor                  # (B, L, D) 与输入顺序一致
-    """
-    # 若该层不启用 MoE（gen_expert=None），直接全量走 und_expert
     if gen_expert is None:
         return und_expert(hidden_states)
-    # 若没有提供 mask，直接全量走 und_expert
+    
     if gen_token_mask is None or not gen_token_mask.any():
         return und_expert(hidden_states)
     if gen_token_mask.all():
         return gen_expert(hidden_states)
 
-    # vLLM 在 forward 中通常用 2D token-major layout: [num_tokens, hidden_size]；
-    # 但在一些旧路径/外部调用中也可能是 3D: [B, L, D]。这里两者都支持。
     if hidden_states.ndim == 2:
         flat_hid = hidden_states
         d_model = hidden_states.shape[-1]
@@ -115,39 +99,31 @@ def moe_forward(
     inverse_order = torch.argsort(permute_order)
     gen_token_num = int(flat_mask.sum().item())
     gen_hid, und_hid = flat_hid[permute_order].split([gen_token_num, total_tokens - gen_token_num], dim=0)
-    # gen_hid = flat_hid[flat_mask]
-    # und_hid = flat_hid[~flat_mask]
 
-    # -------- 1) 两路前向 --------
-    # 1.1 gen-token（True）
+    # 1.1 Generation tokens (True)
     gen_out = gen_expert(gen_hid)  # (N_gen, D)
 
-    # 1.2 普通 token（False）
+    # 1.2 Understanding tokens (False)
     und_out = und_expert(und_hid)  # (N_und, D)
     out_dim = und_out.shape[-1]
 
-    # -------- 2) 合并结果 --------
     merged = torch.cat([gen_out, und_out], dim=0)
     merged = merged[inverse_order]
-    # merged = torch.empty((B * L, out_dim), dtype=und_out.dtype, device=und_out.device)  # (B*L, D)
-    # merged[flat_mask] = gen_out
-    # merged[~flat_mask] = und_out
 
-    # -------- 3) 恢复形状 --------
     if hidden_states.ndim == 2:
         return merged.view(total_tokens, out_dim).contiguous()
     return merged.view(*hidden_states.shape[:-1], out_dim).contiguous()
 
 
 class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
-    """处理 Mammoth Moda2 AR 的多模态信息，返回子配置的 VL config。"""
+    """Processes multi-modal information for MammothModa2 AR, returning the VL sub-configuration."""
 
     def get_hf_config(self):
         mammoth_cfg: Mammothmoda2Config = self.ctx.get_hf_config(Mammothmoda2Config)
         llm_cfg = getattr(mammoth_cfg, "llm_config", None)
         if llm_cfg is not None:
             return llm_cfg
-        # 兜底：若配置已是子配置则直接返回
+        # Fallback: return directly if the config is already a sub-config.
         return getattr(mammoth_cfg, "text_config", mammoth_cfg)
 
     def get_hf_processor(self, **kwargs: object) -> Mammothmoda2Processor:
@@ -158,16 +134,17 @@ class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # MammothModa2 当前仅支持图像，不支持视频输入。
+        # MammothModa2 currently supports only image input, not video.
         return {"image": None}
 
 
 class MammothModa2ARDummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
-    """复用 Qwen2.5-VL 的 dummy 输入生成逻辑。"""
+    """ Reuse Qwen2.5-VL's dummy input generation logic. """
 
 
 class MammothModa2ARMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
-    """复用 Qwen2.5-VL 的多模态处理，只调整 parser 初始化入口。"""
+    """ Reuse Qwen2.5-VL's multi-modal processing, """
+    """only adjusting parser initialization entry. """
 
     def _get_data_parser(self) -> Qwen2VLMultiModalDataParser:
         return Qwen2VLMultiModalDataParser(
@@ -298,20 +275,20 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        # NOTE: MammothModa2 支持 extra gen vocab（用于图像 token）。
-        # token id 范围为 [gen_vocab_start_index, gen_vocab_start_index + gen_vocab_size)。
-        # vLLM 的采样器/processor 期望 “logits 的最后一维 == model_config.get_vocab_size()”，因此我们需要在
-        # compute_logits 中输出 base+gen 的 logits，同时 embedding 也要能接收这些 token id。
+        # NOTE: MammothModa2 supports extra generation vocabulary (for image tokens).
+        # Token ID range: [gen_vocab_start_index, gen_vocab_start_index + gen_vocab_size).
+        # vLLM sampler/processor expects "last dimension of logits == model_config.get_vocab_size()",
+        # so we output base+gen logits in compute_logits, and embeddings must accept these IDs.
         self.extra_gen_vocab = bool(getattr(config, "extra_gen_vocab", False))
-        # 生成 token 的起始下标（用于 gen_token_mask）
+        # Starting index for generation tokens (used for gen_token_mask).
         self.gen_vocab_start_index = getattr(
             hf_config, "gen_vocab_start_index", None
         ) or getattr(config, "gen_vocab_start_index", None)
         self.gen_vocab_size = int(getattr(config, "gen_vocab_size", 0) or 0)
 
         self.base_vocab_size = int(self.gen_vocab_start_index) if self.extra_gen_vocab else int(config.vocab_size)
-        # 配置层面（hf_text_config.vocab_size）已经被上游配置类扩展为 base+gen，
-        # 这里用 config.vocab_size 作为“总 vocab size”。
+        # The configuration level (hf_text_config.vocab_size) has been extended to base+gen 
+        # by the upstream config class. Use config.vocab_size as the total vocab size.
         self.total_vocab_size = int(getattr(config, "vocab_size", self.base_vocab_size))
 
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
@@ -361,8 +338,8 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         else:
             self.gen_head = None
 
-        # vLLM 的 logits 计算不能直接调用 ParallelLMHead.forward（会抛异常），
-        # 需要通过 LogitsProcessor 使用其权重矩阵。
+        # vLLM logits computation cannot directly call ParallelLMHead.forward (throws exception);
+        # it must use the weight matrix via LogitsProcessor.
         self.logits_processor = LogitsProcessor(self.base_vocab_size)
         self.gen_logits_processor = LogitsProcessor(self.gen_vocab_size) if self.extra_gen_vocab else None
 
@@ -370,8 +347,8 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         decoder_layer_type = decoder_layer_type or Mammoth2DecoderLayer
 
         def _make_decoder_layer(*, prefix: str) -> nn.Module:
-            # vLLM make_layers 只会传 prefix，形如 "{prefix}.layers.{idx}"。
-            # 这里从 prefix 提取 idx，确保 layer_idx 能用于按层启用 MoE。
+            # vLLM make_layers only passes prefix, e.g., "{prefix}.layers.{idx}".
+            # Extract idx here to ensure layer_idx can be used for layer-wise MoE activation.
             try:
                 layer_idx = int(prefix.rsplit(".", 1)[-1])
             except Exception:
@@ -449,9 +426,9 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             else:
                 assert input_ids is not None
                 hidden_states = self.get_input_embeddings(input_ids)
-            # gen token mask: True 表示生成图像 token，走 gen_mlp
-            # vLLM v1 路径下可能只提供 inputs_embeds，并将 input_ids 置为 None；
-            # 此时无法按 token id 区分 gen token，退化为全量走 und_expert。
+            # gen_token_mask: True indicates image generation tokens, which use gen_mlp.
+            # In vLLM v1 path, only inputs_embeds might be provided, with input_ids set to None.
+            # In this case, gen tokens cannot be distinguished by ID, falling back to und_expert.
             if self.gen_vocab_start_index is None or input_ids is None:
                 gen_token_mask = None
             else:
@@ -561,19 +538,19 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
     dummy_inputs=MammothModa2ARDummyInputsBuilder,
 )
 class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
-    """在 Qwen2_5_VLForConditionalGeneration 的多模态框架下替换语言骨干为 MoE。"""
+    """Replaces the language backbone with MoE within the Qwen2_5_VLForConditionalGeneration multi-modal framework."""
 
     have_multimodal_outputs = True
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
-            # 生成侧（DiT/VAE）权重不属于 AR stage，跳过
+            # Skip generation-side (DiT/VAE) weights as they do not belong to the AR stage.
             "gen_image_condition_refiner.": None,
             "gen_transformer.": None,
             "gen_vae.": None,
 
-            # LLM 主体：checkpoint 使用 llm_model.* 前缀
-            # 额外 gen vocab（图像 token）权重：需要单独映射到 vLLM 的 language_model 子模块
+            # LLM backbone: checkpoint uses the llm_model.* prefix.
+            # Extra generation vocab (image tokens) weights: mapped separately to the vLLM language_model submodule.
             "llm_model.model.language_model.gen_embed_tokens.": "language_model.gen_embed_tokens.",
             "llm_model.gen_head.": "language_model.gen_head.",
 
@@ -584,15 +561,15 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # 将 hf_config 切换为 AR 子配置，保证 Qwen2.5-VL 路径拿到正确类型
+        # Switch hf_config to the AR sub-config to ensure the Qwen2.5-VL path receives the correct type.
         mammoth_cfg = vllm_config.model_config.hf_config
         ar_hf_config = getattr(mammoth_cfg, "llm_config", mammoth_cfg)
         ar_vllm_config = vllm_config.with_hf_config(
             ar_hf_config, architectures=vllm_config.model_config.architectures
         )
-        # 先初始化视觉塔等多模态组件
+        # Initialize multi-modal components like the vision tower first.
         super().__init__(vllm_config=ar_vllm_config, prefix=prefix)
-        # 用自定义 MoE 语言模型替换
+        # Replace with the custom MoE language model.
         lm_hf_config = getattr(
             ar_vllm_config.model_config.hf_config, "text_config", ar_vllm_config.model_config.hf_config
         )
@@ -605,15 +582,15 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
         # -------- t2i (AR grid) token constraints --------
-        # 约束逻辑依赖 per-step 的 sampling_metadata + runtime_additional_information。
-        # 这些都由 vllm-omni runner 每步通过 kwargs 传入，因此只需在模型侧缓存即可。
+        # Constraint logic depends on per-step sampling_metadata + runtime_additional_information.
+        # These are passed by the vllm-omni runner via kwargs, so caching them in the model is sufficient.
         self._last_sampling_metadata = None
         self._last_runtime_additional_information: list[dict[str, Any]] | None = None
         self._t2i_defaults: dict[str, int] = {}
         self._try_load_t2i_generation_defaults(vllm_config)
 
     def _try_load_t2i_generation_defaults(self, vllm_config: VllmConfig) -> None:
-        """Best-effort 从模型目录读取 t2i_generation_config.json 的默认 token 范围。"""
+        """Best-effort attempt to read default token ranges from t2i_generation_config.json in the model directory."""
         try:
             model_dir = getattr(vllm_config.model_config, "model", None)
             if not isinstance(model_dir, str) or not model_dir:
@@ -632,7 +609,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 "visual_token_end_id": visual_end,
             }
         except Exception:
-            # 不要因默认配置读取失败而影响模型初始化；请求侧可通过 additional_information 传入。
+            # Do not let default config read failure affect model initialization; the request side can pass it via additional_information.
             return
 
     @staticmethod
@@ -641,7 +618,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         return v[0].lower() in {"t2i", "text_image", "text2image"}
 
     def _get_t2i_runtime_params(self, runtime_info: dict[str, Any]) -> dict[str, int] | None:
-        """从 runtime_info / defaults 获取 t2i 约束参数。"""
+        """Retrieves T2I constraint parameters from runtime_info or defaults."""
         def _get_int(key: str) -> int | None:
             val = runtime_info.get(key, self._t2i_defaults.get(key))
             if val is None:
@@ -675,7 +652,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         return params
 
     def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
-        """对 logits 做 t2i 动态约束：每行末尾 token 强制只能采样 eol_token_id。"""
+        """Applies dynamic T2I constraints to logits: tokens at the end of each row are forced to eol_token_id."""
         if logits is None or not isinstance(logits, torch.Tensor):
             return logits
         sampling_metadata = getattr(self, "_last_sampling_metadata", None)
@@ -714,7 +691,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 continue
             if not (0 <= eol_token_id < vocab_size):
                 continue
-            # 允许范围裁剪到 vocab 内，避免越界
+            # Allow range clipping to within vocab to avoid out-of-bounds access.
             visual_start_c = max(0, min(visual_start, vocab_size))
             visual_end_c = max(0, min(visual_end, vocab_size))
             if visual_end_c <= visual_start_c:
@@ -725,12 +702,12 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
 
             row = logits[i]
             if w == ar_width:
-                # 行末 token：只允许 eol
+                # End-of-row token: only allow eol.
                 eol_logit = row[eol_token_id].clone()
                 row.fill_(neg_inf)
                 row[eol_token_id] = eol_logit
             else:
-                # 行内 token：只允许视觉 token（并显式禁止 eol）
+                # Intra-row tokens: only allow visual tokens (explicitly forbid eol).
                 row[:visual_start_c] = neg_inf
                 row[visual_end_c:] = neg_inf
                 row[eol_token_id] = neg_inf
@@ -750,8 +727,8 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ):
-        # vllm-omni runner 会在每步 forward 传入 sampling_metadata 与 runtime_additional_information。
-        # compute_logits 在 forward 之后被立刻调用，因此这里缓存即可实现“随步动态”的 token 约束。
+        # vllm-omni runner passes sampling_metadata and runtime_additional_information in each forward step.
+        # compute_logits is called immediately after forward, so caching here enables step-by-step dynamic token constraints.
         self._last_sampling_metadata = kwargs.get("sampling_metadata")
         runtime_infos = kwargs.get("runtime_additional_information")
         self._last_runtime_additional_information = (
@@ -764,10 +741,9 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        # NOTE:
-        # `gpu_model_runner._dummy_run` 会在 forward 之后对 hidden_states 做
-        # `hidden_states[logit_indices]` 抽样，因此这里必须保证
-        # `text_hidden_states` 是 `torch.Tensor`。
+        # NOTE: gpu_model_runner._dummy_run performs hidden_states[logit_indices] after forward.
+        # We must ensure text_hidden_states is a torch.Tensor to avoid errors when 
+        # indexing (which happens if it's a list/tuple).
         if isinstance(hidden_states, IntermediateTensors):
             text_hidden_states = hidden_states["hidden_states"]
             out_intermediate_tensors = hidden_states

@@ -27,21 +27,21 @@ from .mammothmoda2_dit.rmsnorm import Qwen2RMSNorm
 
 class MammothModa2DiTForConditionalGeneration(nn.Module):
     """
-    MammothModa2 的 DiT + VAE 生成阶段（非自回归）。
+    MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
-    该 stage 期望从上游 AR stage 拿到“图像条件 token 的 hidden states”，并通过
-    diffusion transformer + VAE decode 输出图像张量。
+    This stage expects "image condition token hidden states" from the upstream AR stage,
+    and outputs image tensors via diffusion transformer + VAE decode.
 
-    说明：
-    - vLLM-Omni 的 `GPUGenerationModelRunner` 会调用 `forward(...)` 并将结果
-      作为 pooling_output 透传给上层。
-    - 为兼容 runner 的解包逻辑，这里使用 `OmniOutput(multimodal_outputs=...)`
-      返回生成结果，`text_hidden_states` 仅作为占位张量。
+    Notes:
+    - vLLM-Omni's `GPUGenerationModelRunner` calls `forward(...)` and passes the result 
+      as pooling_output to the upper layer.
+    - For compatibility with runner unpacking, we use `OmniOutput(multimodal_outputs=...)` 
+      to return results; `text_hidden_states` serves as a placeholder.
     """
 
     have_multimodal_outputs = True
 
-    # 只加载 gen_* 权重；忽略 llm_model.*（避免 DiT stage 把整套 LLM 权重也加载进来）
+    # Load only gen_* weights; ignore llm_model.* to prevent loading the entire LLM backbone in the DiT stage.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "llm_model.": None,
@@ -95,8 +95,8 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         self._llm_hidden_size = llm_hidden_size
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
-        # 与上游 Mammothmoda2Model 的 `reinit_caption_embedder` 对齐：
-        # 用 Qwen2RMSNorm(in_features) + Linear(in_features -> out_features)
+        # Align with upstream Mammothmoda2Model's `reinit_caption_embedder`:
+        # Use Qwen2RMSNorm(in_features) + Linear(in_features -> out_features).
         out_features = int(getattr(self.gen_transformer, "hidden_size", 0) or self.gen_transformer.config.hidden_size)
         self.gen_transformer.time_caption_embed.caption_embedder = nn.Sequential(
             Qwen2RMSNorm(in_features, eps=1e-5),

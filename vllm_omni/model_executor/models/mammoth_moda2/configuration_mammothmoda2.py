@@ -1,4 +1,4 @@
-"""本地配置实现，复刻 mammothmoda2 的 HF 配置并注册 AutoConfig."""
+"""Configuration implementation for MammothModa2, replicating HF configuration and registering with AutoConfig."""
 
 from typing import ClassVar, Literal
 
@@ -22,10 +22,11 @@ __all__ = [
 
 
 class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
-    # NOTE: 不能与 `Mammothmoda2Qwen2_5_VLConfig.model_type` 冲突。
-    # 否则 `AutoConfig.for_model(model_type="mammothmoda2_qwen2_5_vl")` 会被错误解析为 VisionConfig，
-    # 导致 llm_config 变成“视觉子配置”，其 `vision_config` 只是一个 dict，从而在 vLLM 里出现
-    # `vision_config.patch_size` 这类属性访问报错。
+    # NOTE: Must not conflict with `Mammothmoda2Qwen2_5_VLConfig.model_type`.
+    # Otherwise, `AutoConfig.for_model(model_type="mammothmoda2_qwen2_5_vl")` might be 
+    # incorrectly parsed as a VisionConfig, causing `llm_config` to become a 
+    # "vision sub-config" where `vision_config` is just a dict, leading to 
+    # attribute access errors like `vision_config.patch_size` in vLLM.
     model_type = "mammothmoda2_qwen2_5_vl_vision"
     base_config_key = "vision_config"
 
@@ -67,7 +68,7 @@ class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
 
 
 class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
-    """文本子配置，保持与上游 mammothmoda2_qwen2_5_vl_text 完全一致。"""
+    """Text sub-configuration, consistent with upstream mammothmoda2_qwen2_5_vl_text."""
 
     model_type = "mammothmoda2_qwen2_5_vl_text"
     base_config_key = "text_config"
@@ -137,19 +138,20 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         else:
             self.gen_vocab_start_index = gen_vocab_start_index
 
-        # NOTE: vLLM V1 会用 `hf_text_config.vocab_size` 做采样参数校验（如 allowed_token_ids）。
-        # MammothModa2 的 gen vocab 虽然通过独立的 gen_embed/gen_head 实现，但从“输出 logits 维度”的角度，
-        # 整体 vocab size 仍应覆盖 gen vocab 的 token id 范围。
+        # NOTE: vLLM V1 uses `hf_text_config.vocab_size` for sampling parameter validation 
+        # (e.g., allowed_token_ids). Although MammothModa2's gen vocab is implemented via 
+        # independent gen_embed/gen_head, the overall vocab size should still cover the 
+        # gen vocab token ID range from the perspective of "output logits dimension".
         if self.extra_gen_vocab:
             self.vocab_size = int(self.gen_vocab_start_index) + int(self.gen_vocab_size)
 
-        # 额外保存用于多模态占位的 token id
+        # Extra token IDs for multi-modal placeholders.
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
 
 
 class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
-    """组合配置：text_config + vision_config。"""
+    """Combined configuration: text_config + vision_config."""
 
     model_type = "mammothmoda2_qwen2_5_vl"
     sub_configs = {
@@ -215,12 +217,12 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
         self.gen_vocab_start_index = getattr(
             self.text_config, "gen_vocab_start_index", gen_vocab_start_index
         )
-        # 继承 tokenizer_class，避免 AutoTokenizer 退回 Qwen2 系列
+        # Inherit tokenizer_class to prevent AutoTokenizer from falling back to Qwen2.
         self.tokenizer_class = "MammothUTokenizer"
 
 
 class Mammothmoda2Config(PretrainedConfig):
-    """顶层 mammothmoda2 组合配置，与上游保持一致。"""
+    """Top-level MammothModa2 composition configuration, consistent with upstream."""
 
     model_type = "mammothmoda2"
     is_composition = True
@@ -252,9 +254,9 @@ class Mammothmoda2Config(PretrainedConfig):
         self.gen_axes_lens = gen_axes_lens or [10000, 10000, 10000]
         self.gen_transport_config = gen_transport_config or {}
         self.initializer_range = initializer_range
-        # 确保 AutoTokenizer 优先选用 MammothUTokenizer，而不是默认的 Qwen2Tokenizer
+        # Ensure AutoTokenizer prioritizes MammothUTokenizer over the default Qwen2Tokenizer.
         self.tokenizer_class = "MammothUTokenizer"
-        # HF 权重里 architectures = ["Mammothmoda2Model"]，此处保持该名称，若用户传入其它值则按用户为准
+        # HF weights use architectures = ["Mammothmoda2Model"]; maintain this name by default.
         if architectures is None:
             self.architectures = ["Mammothmoda2Model"]
         else:
