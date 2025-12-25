@@ -9,23 +9,23 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 Usage:
     # Video
     t2v:
-    python3 benchmarks/benchmark_serving.py \
+    python3 benchmarks/diffusion_benchmark_serving.py \
         --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
-    python3 benchmarks/benchmark_serving.py \
+    python3 benchmarks/diffusion_benchmark_serving.py \
         --dataset vbench --task i2v --num-prompts 10
 
 
     # Image
     t2i:
-    python3 benchmarks/benchmark_serving.py \
+    python3 benchmarks/diffusion_benchmark_serving.py \
         --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
     i2i:
-    python3 benchmarks/benchmark_serving.py \
+    python3 benchmarks/diffusion_benchmark_serving.py \
         --dataset vbench --task i2i --num-prompts 10
 
 """
