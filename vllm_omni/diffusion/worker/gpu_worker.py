@@ -200,11 +200,9 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
 
-        should_execute = (
-            exec_all_ranks or output_rank is None or output_rank == self.gpu_id
-        )
-        should_reply = (
-            output_rank is None or output_rank == self.gpu_id
+        should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
+        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+
         ) and self.result_mq is not None
 
         if not should_execute:
