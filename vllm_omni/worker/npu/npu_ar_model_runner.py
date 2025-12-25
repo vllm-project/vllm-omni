@@ -369,7 +369,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
             self.inputs_embeds.gpu[:total_num_scheduled_tokens].copy_(
                 inputs_embeds)
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+            #  -------------------------------------- Omni-new -------------------------------------------------
             input_ids = self.input_ids.gpu[:num_input_tokens]
+            #  -------------------------------------- Omni-new -------------------------------------------------
         elif self.enable_prompt_embeds and get_pp_group().is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -420,7 +422,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # Save for _model_forward regardless of prefill; runtime_additional_information
         # will be fetched from request state inside _build_model_kwargs_extra
         self._omni_per_req_additional_information = per_req_additional_information
-        #  ------------------------------------------------------------------------------------------------
+        #  -------------------------------------- Omni-new -------------------------------------------------
 
 
         # type: ignore
@@ -808,7 +810,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
             else:
                 logger.debug("[AR] execute_model: multimodal_outputs is None")
-            #  ------------------------------------------------------------------------------------------------
+            #  -------------------------------------- Omni-new -------------------------------------------------
             # Broadcast PP output for external_launcher (torchrun)
             # to make sure we are synced across pp ranks
             # TODO: Support overlapping mirco-batches
@@ -1121,7 +1123,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
             kv_connector_output=kv_connector_output,
         )
-        #  ------------------------------------------------------------------------------------------------
+        #  -------------------------------------- Omni-new -------------------------------------------------
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:

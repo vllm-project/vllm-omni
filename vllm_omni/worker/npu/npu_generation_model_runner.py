@@ -298,10 +298,13 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:total_num_scheduled_tokens].copy_(inputs_embeds)
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+            #  -------------------------------------- Omni-new -------------------------------------------------
+            # NOTE(gcanlin): We don't set input_ids to None in vllm-omni.
             model_kwargs = {
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
+            #  -------------------------------------- Omni-new -------------------------------------------------
         elif self.enable_prompt_embeds and get_pp_group().is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -651,7 +654,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 weight_prefetch_method=self.weight_prefetch_method,
             ):
                 self.maybe_setup_kv_connector(scheduler_output)
-
+                #  -------------------------------------- Omni-new -------------------------------------------------
                 outputs = self._run_generation(
                     input_ids=input_ids,
                     positions=positions,
@@ -660,6 +663,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     multimodal_kwargs=model_kwargs,
                     logits_indices=logits_indices,
                 )
+                #  -------------------------------------- Omni-new -------------------------------------------------
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(scheduler_output)
@@ -671,6 +675,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         kv_connector_output = KVConnectorOutput(finished_sending=finished_sending, finished_recving=finished_recving)
         finished_sending = None
         finished_recving = None
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # We don't need any post-process for generation model outputs
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):
@@ -703,6 +709,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
         )
+        #  -------------------------------------- Omni-new -------------------------------------------------
         if not self.use_async_scheduling:
             return output
 
