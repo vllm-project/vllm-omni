@@ -40,15 +40,16 @@ def fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window: t
 class StepAudio2Token2WavCore(nn.Module):
     """Core Token2Wav model - handles token to waveform conversion"""
 
-    def __init__(self, model_path: str, float16: bool = False):
+    def __init__(self, model_path: str, float16: bool = False, device: str = "cuda"):
         super().__init__()
         self.model_path = model_path
         self.float16 = float16
+        self.device = torch.device(device)
 
         # Load audio tokenizer (ONNX)
         self.audio_tokenizer = s3tokenizer.load_model(
             f"{model_path}/speech_tokenizer_v2_25hz.onnx"
-        ).cuda().eval()
+        ).to(self.device).eval()
 
         # Load speaker embedding model (ONNX)
         option = onnxruntime.SessionOptions()
@@ -71,7 +72,7 @@ class StepAudio2Token2WavCore(nn.Module):
             torch.load(f"{model_path}/flow.pt", map_location="cpu", weights_only=True),
             strict=True
         )
-        self.flow.cuda().eval()
+        self.flow.to(self.device).eval()
 
         # Load HiFT Generator (vocoder)
         self.hift = HiFTGenerator()
@@ -80,7 +81,7 @@ class StepAudio2Token2WavCore(nn.Module):
             for k, v in torch.load(f"{model_path}/hift.pt", map_location="cpu", weights_only=True).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.cuda().eval()
+        self.hift.to(self.device).eval()
 
         # Cache for prompt processing
         self.cache = {}
@@ -88,7 +89,7 @@ class StepAudio2Token2WavCore(nn.Module):
         # Stream configuration
         self.mel_cache_len = 8  # 160ms
         self.source_cache_len = int(self.mel_cache_len * 480)  # 50hz mel -> 24kHz wave
-        self.speech_window = torch.from_numpy(np.hamming(2 * self.source_cache_len)).cuda()
+        self.speech_window = torch.from_numpy(np.hamming(2 * self.source_cache_len)).to(self.device)
 
         # Streaming cache
         self.hift_cache_dict = {}
@@ -101,7 +102,7 @@ class StepAudio2Token2WavCore(nn.Module):
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
         prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            mels.cuda(), mels_lens.cuda()
+            mels.to(self.device), mels_lens.to(self.device)
         )
 
         # Extract speaker embedding
@@ -117,7 +118,7 @@ class StepAudio2Token2WavCore(nn.Module):
                 None,
                 {self.spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()}
             )[0],
-            device='cuda'
+            device=self.device
         )
 
         # Load prompt mel spectrogram
@@ -126,8 +127,8 @@ class StepAudio2Token2WavCore(nn.Module):
         if sample_rate != 24000:
             audio = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=24000)(audio)
         prompt_mel = mel_spectrogram(audio).transpose(1, 2).squeeze(0)  # [T, num_mels]
-        prompt_mels = prompt_mel.unsqueeze(0).cuda()
-        prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device='cuda')
+        prompt_mels = prompt_mel.unsqueeze(0).to(self.device)
+        prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
         prompt_mels = torch.nn.functional.pad(
             prompt_mels,
             (0, 0, 0, prompt_speech_tokens.shape[1] * self.flow.up_rate - prompt_mels.shape[1]),
@@ -163,16 +164,16 @@ class StepAudio2Token2WavCore(nn.Module):
         generated_speech_tokens = torch.tensor(
             [generated_speech_tokens],
             dtype=torch.int32,
-            device='cuda'
+            device=self.device
         )
         generated_speech_tokens_lens = torch.tensor(
             [generated_speech_tokens.shape[1]],
             dtype=torch.int32,
-            device='cuda'
+            device=self.device
         )
 
         # Generate mel spectrogram using flow model
-        with torch.amp.autocast("cuda", dtype=torch.float16 if self.float16 else torch.float32):
+        with torch.amp.autocast(str(self.device.type), dtype=torch.float16 if self.float16 else torch.float32):
             mel = self.flow.inference(
                 generated_speech_tokens, generated_speech_tokens_lens,
                 prompt_speech_tokens, prompt_speech_tokens_lens,
@@ -203,9 +204,9 @@ class StepAudio2Token2WavCore(nn.Module):
 
         # Initialize HiFT cache
         self.hift_cache_dict = dict(
-            mel=torch.zeros(1, prompt_mels.shape[2], 0, device='cuda'),
-            source=torch.zeros(1, 1, 0, device='cuda'),
-            speech=torch.zeros(1, 0, device='cuda'),
+            mel=torch.zeros(1, prompt_mels.shape[2], 0, device=self.device),
+            source=torch.zeros(1, 1, 0, device=self.device),
+            speech=torch.zeros(1, 0, device=self.device),
         )
 
     def stream(
@@ -233,14 +234,14 @@ class StepAudio2Token2WavCore(nn.Module):
         generated_speech_tokens = torch.tensor(
             [generated_speech_tokens],
             dtype=torch.int32,
-            device='cuda'
+            device=self.device
         )
 
         if self.stream_cache is None:
             raise ValueError("stream_cache is not set. Call set_stream_cache() first.")
 
         # Generate mel chunk
-        with torch.amp.autocast("cuda", dtype=torch.float16 if self.float16 else torch.float32):
+        with torch.amp.autocast(str(self.device.type), dtype=torch.float16 if self.float16 else torch.float32):
             chunk_mel, self.stream_cache = self.flow.inference_chunk(
                 token=generated_speech_tokens,
                 spk=spk_emb,
@@ -289,8 +290,6 @@ class StepAudio2Token2WavCore(nn.Module):
 class StepAudio2Token2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     """vLLM-compatible wrapper for Step-Audio2 Token2Wav"""
 
-    logger = init_logger(__name__)
-
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.": "token2wav.",
@@ -311,10 +310,16 @@ class StepAudio2Token2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
         float16 = getattr(self.config, 'token2wav_float16', False)
 
+        # Get device from vllm_config
+        device = "cuda"
+        if hasattr(vllm_config, 'device_config') and vllm_config.device_config:
+            device = str(vllm_config.device_config.device)
+
         # Initialize core Token2Wav model
         self.token2wav = StepAudio2Token2WavCore(
             model_path=model_path,
-            float16=float16
+            float16=float16,
+            device=device
         )
 
         # vLLM compatibility

@@ -119,24 +119,30 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargs,
     ) -> Sequence[PromptUpdate]:
-        # Simplified: use constant token replacement
+        # Calculate actual audio feature lengths from audio_lens
+        audio_lens = out_mm_kwargs.get("audio_lens", [])
+        if audio_lens is not None and hasattr(audio_lens, '__iter__'):
+            # Convert to list if tensor
+            if isinstance(audio_lens, torch.Tensor):
+                audio_lens = flatten_bn(audio_lens, concat=True).tolist()
+            # Calculate feature lengths: (audio_len - 1) // 8 + 1 (after encoder + adapter)
+            feature_lens = [max(1, (length - 1) // 8 + 1) for length in audio_lens]
+        else:
+            # Fallback to conservative estimate
+            feature_lens = [250]  # max_audio_tokens from get_mm_max_tokens_per_item
+
         return [
             PromptReplacement(
                 modality="audio",
                 target=[AUDIO_PATCH_TOKEN_ID],
                 replacement=lambda item_idx: PromptUpdateDetails.select_token_id(
-                    seq=[AUDIO_PATCH_TOKEN_ID] * 100,  # Placeholder
+                    seq=[AUDIO_PATCH_TOKEN_ID] * feature_lens[item_idx],
                     embed_token_id=AUDIO_PATCH_TOKEN_ID,
                 ),
             )
         ]
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    StepAudio2MultiModalProcessor,
-    info=StepAudio2ProcessingInfo,
-    dummy_inputs=StepAudio2DummyInputsBuilder
-)
 class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
     """
     Step-Audio2 Thinker - Stage 1 LLM
@@ -227,8 +233,8 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         self, **kwargs: object
     ) -> Optional[Step1fAudioInputs]:
         """Parse audio inputs from kwargs"""
-        audio_mels = kwargs.pop("audio_mels", None)
-        audio_lens = kwargs.pop("audio_lens", None)
+        audio_mels = kwargs.get("audio_mels", None)
+        audio_lens = kwargs.get("audio_lens", None)
 
         if audio_mels is None:
             return None
