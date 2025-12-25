@@ -4,7 +4,7 @@
 
 """
 Benchmark online serving for diffusion models (Image/Video Generation).
-Before use this benchmark should `uv pip install gdown` first
+If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Usage:
     # Video
