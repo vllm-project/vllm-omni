@@ -739,9 +739,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.12 preprocess and omni's additional information handling."""
-        # Decode payload first, ensure request state has prompt_embeds / additional_information
-        self._decode_and_store_request_payloads(scheduler_output)
-
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
