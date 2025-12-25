@@ -7,15 +7,25 @@ QUERY_TYPE="${1:-mixed_modalities}"
 # Default modalities argument
 MODALITIES="${2:-null}"
 
+# Default stream argument
+STREAM="${3:-false}"
+
 # Validate query type
 if [[ ! "$QUERY_TYPE" =~ ^(mixed_modalities|use_audio_in_video|multi_audios|text)$ ]]; then
     echo "Error: Invalid query type '$QUERY_TYPE'"
-    echo "Usage: $0 [mixed_modalities|use_audio_in_video|multi_audios|text] [modalities]"
+    echo "Usage: $0 [mixed_modalities|use_audio_in_video|multi_audios|text] [modalities] [stream]"
     echo "  mixed_modalities: Audio + Image + Video + Text query"
     echo "  use_audio_in_video: Video + Text query (with audio extraction from video)"
     echo "  multi_audios: Two audio clips + Text query"
     echo "  text: Text query"
     echo "  modalities: Modalities parameter (default: null)"
+    echo "  stream: Stream the response (default: false)"
+    exit 1
+fi
+
+# Validate stream argument
+if [[ ! "$STREAM" =~ ^(true|false)$ ]]; then
+    echo "Error: Invalid stream value '$STREAM'. Must be 'true' or 'false'"
     exit 1
 fi
 
@@ -169,6 +179,7 @@ output=$(curl -sS -X POST http://localhost:8091/v1/chat/completions \
   "sampling_params_list": $sampling_params_list,
   "mm_processor_kwargs": $mm_processor_kwargs,
   "modalities": $MODALITIES,
+  "stream": $STREAM,
   "messages": [
     {
       "role": "system",
