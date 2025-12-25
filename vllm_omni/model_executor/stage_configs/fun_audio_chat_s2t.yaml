@@ -28,7 +28,7 @@ stage_args:
       engine_output_type: text
       enable_prefix_caching: false
       max_num_batched_tokens: 16384
-      max_model_len: 16384 # Reduced from 262144 to fit in GPU memory
+      max_model_len: 8192 # Reduced from 262144 to fit in GPU memory
       distributed_executor_backend: "mp"
     final_output: true
     final_output_type: text

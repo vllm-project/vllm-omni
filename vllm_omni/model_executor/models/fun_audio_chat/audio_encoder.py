@@ -106,8 +106,9 @@ class FunAudioChatAudioAttention(nn.Module):
 
         attn_output = torch.matmul(attn_weights, value_states)
 
-        # Reshape output
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        # Reshape output: [1, num_heads, seq_len, head_dim] -> [seq_len, num_heads * head_dim]
+        # Must transpose to [1, seq_len, num_heads, head_dim] first for correct interleaving
+        attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
         attn_output = self.out_proj(attn_output)
 
         return attn_output
@@ -623,21 +624,6 @@ class FunAudioChatDiscreteEncoder(nn.Module):
             continuous_audio_features = continuous_audio_features.mean(dim=2)
 
             continuous_hidden_states = self.continual_output_matching(continuous_audio_features)
-
-            import logging
-
-            _logger = logging.getLogger(__name__)
-            _logger.info(
-                f"DiscreteEncoder: continuous_hidden_states.shape={continuous_hidden_states.shape}, "
-                f"stats: min={continuous_hidden_states.min():.4f}, max={continuous_hidden_states.max():.4f}"
-            )
-            _logger.info(
-                f"DiscreteEncoder: discrete hidden_states before combine stats: "
-                f"min={hidden_states.min():.4f}, max={hidden_states.max():.4f}"
-            )
-            _logger.info(
-                f"DiscreteEncoder: feature_exist_mask={feature_exist_mask}, mode={self.continuous_features_mode}"
-            )
 
             # Combine based on mode
             if feature_exist_mask is not None:

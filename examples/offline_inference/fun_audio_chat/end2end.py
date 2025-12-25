@@ -183,6 +183,8 @@ def main(args):
         stage_configs_path=stage_configs_path,
         log_file=log_file,
         log_stats=args.enable_stats,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     # Sampling parameters for main model
@@ -377,6 +379,18 @@ def parse_args():
         type=str,
         default="logs",
         help="Log directory. Default: logs",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=8192,
+        help="Maximum model length for KV cache. Default: 8192",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization. Default: 0.9",
     )
 
     return parser.parse_args()

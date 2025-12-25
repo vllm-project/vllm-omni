@@ -225,12 +225,8 @@ class FunAudioChatMultiModalProcessor(BaseMultiModalProcessor[FunAudioChatProces
 
         # Get audio tokens from processor
         audio_token = getattr(processor, "audio_token", "<|AUDIO|>")
-        audio_bos_token = getattr(processor, "audio_bos_token", "<|audio_bos|>")
-        audio_eos_token = getattr(processor, "audio_eos_token", "<|audio_eos|>")
 
         audio_token_id = vocab.get(audio_token, AUDIO_TOKEN_INDEX)
-        audio_bos_id = vocab.get(audio_bos_token, AUDIO_BOS_INDEX)
-        audio_eos_id = vocab.get(audio_eos_token, AUDIO_EOS_INDEX)
 
         # Get audio group size from processor (default 5)
         audio_group_size = getattr(processor, "audio_group_size", 5)
@@ -286,11 +282,13 @@ class FunAudioChatMultiModalProcessor(BaseMultiModalProcessor[FunAudioChatProces
                 # Fallback: estimate based on ~5 seconds audio at 5Hz
                 num_audio_tokens = 25  # ~5 seconds
 
-            # Audio tokens surrounded by bos/eos
+            # Only emit audio_token_id repetitions - NO BOS/EOS here!
+            # The prompt template already contains <|audio_bos|><|AUDIO|><|audio_eos|>
+            # so we just replace <|AUDIO|> with the actual audio token sequence.
             audio_tokens = [audio_token_id] * num_audio_tokens
 
             return PromptUpdateDetails.select_token_id(
-                [audio_bos_id] + audio_tokens + [audio_eos_id],
+                audio_tokens,
                 embed_token_id=audio_token_id,
             )
 
@@ -431,7 +429,14 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         # Initialize the language model (Qwen3)
         logger.info("Initializing language_model (Qwen3)")
+
+        # CRITICAL FIX: Fun-Audio-Chat does NOT tie lm_head to embed_tokens
+        # The checkpoint has separate weights for lm_head.weight and model.embed_tokens.weight
+        # Force tie_word_embeddings=False BEFORE creating the vllm config and model
+        text_config.tie_word_embeddings = False
+
         text_vllm_config = vllm_config.with_hf_config(text_config, architectures=["Qwen3ForCausalLM"])
+
         self.language_model = init_vllm_registered_model(
             vllm_config=text_vllm_config,
             prefix=maybe_prefix(prefix, "language_model"),
@@ -572,28 +577,10 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # Match audio tokens - use is_multimodal mask if provided (more reliable)
             if is_multimodal is not None:
                 audio_mask = is_multimodal.bool()
-                logger.info(f"embed_input_ids: using is_multimodal mask, sum={audio_mask.sum().item()}")
             else:
                 audio_mask = input_ids == self.audio_token_index
-                logger.info(
-                    f"embed_input_ids: using audio_token_index={self.audio_token_index}, "
-                    f"mask sum={audio_mask.sum().item()}"
-                )
 
             if audio_mask.any() and multimodal_embeddings.numel() > 0:
-                logger.info(
-                    f"embed_input_ids: merging {multimodal_embeddings.shape[0]} audio "
-                    f"embeddings into {audio_mask.sum().item()} positions"
-                )
-                logger.info(
-                    f"embed_input_ids: multimodal_embeddings stats: "
-                    f"min={multimodal_embeddings.min():.4f}, "
-                    f"max={multimodal_embeddings.max():.4f}, mean={multimodal_embeddings.mean():.4f}"
-                )
-                logger.info(
-                    f"embed_input_ids: text embeddings stats: min={embeddings.min():.4f}, "
-                    f"max={embeddings.max():.4f}, mean={embeddings.mean():.4f}"
-                )
                 # Flatten for masked scatter
                 flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1])
                 flat_mask = audio_mask.reshape(-1)
@@ -620,11 +607,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
                 flat_embeddings[flat_mask] = multimodal_embeddings.to(flat_embeddings.device, flat_embeddings.dtype)
                 embeddings = flat_embeddings.reshape(embeddings.shape)
-                logger.info(
-                    f"embed_input_ids: merged embeddings stats: "
-                    f"min={embeddings.min():.4f}, max={embeddings.max():.4f}, "
-                    f"mean={embeddings.mean():.4f}"
-                )
 
         return embeddings
 
@@ -705,16 +687,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         feature_exist_mask = kwargs.get("feature_exist_mask")
 
         # Use packed format if available, otherwise fall back to legacy
-        logger.info(
-            f"embed_multimodal called: input_audio_features={input_audio_features is not None}, "
-            f"input_features={input_features is not None}, speech_ids={speech_ids is not None}, "
-            f"audio_feature_lengths={audio_feature_lengths is not None}"
-        )
-        logger.info(f"embed_multimodal: feature_exist_mask={feature_exist_mask}")
-        if input_audio_features is not None:
-            logger.info(f"  input_audio_features.shape={input_audio_features.shape}")
-        if speech_ids is not None:
-            logger.info(f"  speech_ids.shape={speech_ids.shape}")
         if input_audio_features is None and input_features is not None:
             # Legacy format - use old input_features
             packed_features = input_features
@@ -800,7 +772,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                         feature_attention_mask=feature_attention_mask,
                         speech_maxlen=speech_ids.shape[-1],
                     )
-                    logger.info(f"embed_multimodal: continuous_audio_features.shape={continuous_audio_features.shape}")
                 else:
                     logger.warning(
                         "embed_multimodal: packed_features provided but no "
@@ -809,32 +780,12 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             else:
                 logger.warning("embed_multimodal: no packed_features (continuous audio) available!")
 
-            # Debug: log continuous features before combining
-            if continuous_audio_features is not None:
-                logger.info(
-                    f"embed_multimodal: continuous_audio_features.shape={continuous_audio_features.shape}, "
-                    f"stats: min={continuous_audio_features.min():.4f}, max={continuous_audio_features.max():.4f}, "
-                    f"mean={continuous_audio_features.mean():.4f}"
-                )
-                logger.info(f"embed_multimodal: continuous_audio_output_lengths={continuous_audio_output_lengths}")
-
-            # Debug: log speech_ids values
-            logger.info(f"embed_multimodal: speech_ids unique values: {speech_ids.unique()[:10].tolist()}...")
-            logger.info(f"embed_multimodal: audio_output_lengths={audio_output_lengths}")
-
             # Encode discrete tokens and combine with continuous features
             audio_features = self.audio_tower(
                 audio_ids=speech_ids,
                 continuous_audio_features=continuous_audio_features,
                 continuous_audio_output_lengths=continuous_audio_output_lengths,
                 feature_exist_mask=feature_exist_mask,
-            )
-
-            # Debug: log output features
-            logger.info(
-                f"embed_multimodal: audio_features.shape={audio_features.shape}, "
-                f"stats: min={audio_features.min():.4f}, max={audio_features.max():.4f}, "
-                f"mean={audio_features.mean():.4f}"
             )
 
             # Create mask for valid audio tokens
@@ -902,9 +853,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # Handle 3D batched input [batch, num_mel_bins, frames] -> convert to packed [num_mel_bins, total_frames]
         if input_audio_features.dim() == 3:
             batch_size = input_audio_features.shape[0]
-            logger.info(
-                f"_get_audio_features_packed: converting 3D input {input_audio_features.shape} to packed format"
-            )
             # Pack by concatenating along frames dimension
             # First, extract valid frames for each sample
             packed_list = []
@@ -916,7 +864,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 )
                 packed_list.append(input_audio_features[i, :, : int(length)])
             input_audio_features = torch.cat(packed_list, dim=1)  # [num_mel_bins, total_frames]
-            logger.info(f"_get_audio_features_packed: packed shape {input_audio_features.shape}")
 
         # Get output lengths from the continuous audio tower
         audio_feat_lengths, audio_output_lengths = self.continuous_audio_tower._get_feat_extract_output_lengths(
@@ -1021,17 +968,6 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # and merged by embed_input_ids() before forward() is called.
         # The inputs_embeds parameter already contains the merged embeddings.
 
-        # Debug: check if inputs_embeds is provided
-        logger.info(
-            f"_forward_main: inputs_embeds provided={inputs_embeds is not None}, "
-            f"input_ids.shape={input_ids.shape if input_ids is not None else None}"
-        )
-        if inputs_embeds is not None:
-            logger.info(
-                f"_forward_main: inputs_embeds.shape={inputs_embeds.shape}, "
-                f"stats: min={inputs_embeds.min():.4f}, max={inputs_embeds.max():.4f}"
-            )
-
         # Get embeddings if not already provided
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids=input_ids)
@@ -1039,10 +975,13 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # Store text embeddings for CRQ decoder (S2S mode)
         text_embeds = inputs_embeds.clone()
 
+        # Prepare positions for language model
+        pos_to_use = positions[0] if positions.ndim > 1 else positions
+
         # Forward through language model
         hidden_states = self.language_model(
             input_ids=None,  # Use embeddings instead
-            positions=positions[0] if positions.ndim > 1 else positions,
+            positions=pos_to_use,
             inputs_embeds=inputs_embeds.reshape(-1, inputs_embeds.shape[-1]),
             intermediate_tensors=intermediate_tensors,
         )
@@ -1118,36 +1057,38 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             and continuous_audio_tower_weights
         ):
             logger.info(f"Loading {len(continuous_audio_tower_weights)} continuous_audio_tower weights")
-            state_dict = self.continuous_audio_tower.state_dict()
+
+            # Build state dict and load using load_state_dict
+            weights_to_load = {}
             for name, weight in continuous_audio_tower_weights:
                 param_name = name.replace("continuous_audio_tower.", "")
-                if param_name in state_dict:
-                    if state_dict[param_name].shape == weight.shape:
-                        state_dict[param_name].copy_(weight)
-                        loaded_weights.add(name)
-                    else:
-                        logger.warning(
-                            f"Shape mismatch for {name}: expected {state_dict[param_name].shape}, got {weight.shape}"
-                        )
-                else:
-                    logger.debug(f"Skipping weight: {name}")
+                weights_to_load[param_name] = weight
+
+            missing, unexpected = self.continuous_audio_tower.load_state_dict(weights_to_load, strict=False)
+            if missing:
+                logger.warning(f"Missing continuous_audio_tower weights ({len(missing)}): {missing[:10]}...")
+            if unexpected:
+                logger.warning(f"Unexpected continuous_audio_tower weights: {unexpected}")
+
+            loaded_weights.update(name for name, _ in continuous_audio_tower_weights)
 
         # Load discrete audio tower weights
         if hasattr(self, "audio_tower") and self.audio_tower is not None and audio_tower_weights:
             logger.info(f"Loading {len(audio_tower_weights)} audio_tower weights")
-            state_dict = self.audio_tower.state_dict()
+
+            # Build state dict and load using load_state_dict
+            weights_to_load = {}
             for name, weight in audio_tower_weights:
                 param_name = name.replace("audio_tower.", "")
-                if param_name in state_dict:
-                    if state_dict[param_name].shape == weight.shape:
-                        state_dict[param_name].copy_(weight)
-                        loaded_weights.add(name)
-                    else:
-                        logger.warning(
-                            f"Shape mismatch for {name}: expected {state_dict[param_name].shape}, got {weight.shape}"
-                        )
-                else:
-                    logger.debug(f"Skipping weight: {name}")
+                weights_to_load[param_name] = weight
+
+            missing, unexpected = self.audio_tower.load_state_dict(weights_to_load, strict=False)
+            if missing:
+                logger.warning(f"Missing audio_tower weights ({len(missing)}): {missing}")
+            if unexpected:
+                logger.warning(f"Unexpected audio_tower weights: {unexpected}")
+
+            loaded_weights.update(name for name, _ in audio_tower_weights)
 
         # Log skipped audio_invert_tower weights (S2T mode doesn't use them)
         if audio_invert_tower_weights:
