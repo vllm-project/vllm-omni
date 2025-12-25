@@ -452,7 +452,7 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, model_config, state.openai_serving_models, request_logger=request_logger
+        engine_client, _model_config, state.openai_serving_models, request_logger=request_logger
     )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
