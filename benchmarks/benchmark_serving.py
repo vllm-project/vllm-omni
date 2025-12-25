@@ -503,7 +503,8 @@ async def benchmark(args):
     async with aiohttp.ClientSession() as session:
         if args.warmup_requests and requests_list:
             print(
-                f"Running {args.warmup_requests} warmup request(s) with num_inference_steps={args.warmup_num_inference_steps}..."
+                f"Running {args.warmup_requests} warmup request(s) \
+                with num_inference_steps={args.warmup_num_inference_steps}..."
             )
             for i in range(args.warmup_requests):
                 warm_req = requests_list[i % len(requests_list)]
