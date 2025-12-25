@@ -38,5 +38,5 @@ class CreateAudio(BaseModel):
 
 
 class AudioResponse(BaseModel):
-    audio_data: bytes
+    audio_data: bytes | str
     media_type: str
