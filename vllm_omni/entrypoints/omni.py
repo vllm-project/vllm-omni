@@ -106,7 +106,8 @@ class Omni:
             self.stage_configs = load_stage_configs_from_model(model)
             if not self.stage_configs:
                 # TODO: hack here, convert dtype to string to avoid non-premitive omegaconf create error.
-                kwargs["dtype"] = str(kwargs["dtype"])
+                if "dtype" in kwargs:
+                    kwargs["dtype"] = str(kwargs["dtype"])
                 # TODO: hack, calculate devices based on parallel config.
                 devices = "0"
                 if "parallel_config" in kwargs:
