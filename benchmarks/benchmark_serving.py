@@ -26,7 +26,7 @@ Usage:
 
     i2i:
     python3 benchmarks/benchmark_serving.py \
-        --dataset vbench --task i2i --num-prompts 10 
+        --dataset vbench --task i2i --num-prompts 10
 
 """
 
@@ -40,8 +40,8 @@ import os
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import aiohttp
 import numpy as np
@@ -54,14 +54,14 @@ class RequestFuncInput:
     prompt: str
     api_url: str
     model: str
-    width: Optional[int] = None
-    height: Optional[int] = None
-    num_frames: Optional[int] = None
-    num_inference_steps: Optional[int] = None
-    seed: Optional[int] = None
-    fps: Optional[int] = None
-    extra_body: Dict[str, Any] = field(default_factory=dict)
-    image_paths: Optional[List[str]] = None
+    width: int | None = None
+    height: int | None = None
+    num_frames: int | None = None
+    num_inference_steps: int | None = None
+    seed: int | None = None
+    fps: int | None = None
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
@@ -71,7 +71,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     error: str = ""
     start_time: float = 0.0
-    response_body: Dict[str, Any] = field(default_factory=dict)
+    response_body: dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
 
 
@@ -90,7 +90,7 @@ class BaseDataset(ABC):
         pass
 
     @abstractmethod
-    def get_requests(self) -> List[RequestFuncInput]:
+    def get_requests(self) -> list[RequestFuncInput]:
         pass
 
 
@@ -100,15 +100,19 @@ class VBenchDataset(BaseDataset):
     Supports t2v, i2v.
     """
 
-    T2V_PROMPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/prompts/prompts_per_dimension/subject_consistency.txt"
-    I2V_DOWNLOAD_SCRIPT_URL = "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
+    T2V_PROMPT_URL = (
+        "https://raw.githubusercontent.com/Vchitect/VBench/master/prompts/prompts_per_dimension/subject_consistency.txt"
+    )
+    I2V_DOWNLOAD_SCRIPT_URL = (
+        "https://raw.githubusercontent.com/Vchitect/VBench/master/vbench2_beta_i2v/download_data.sh"
+    )
 
     def __init__(self, args, api_url: str, model: str):
         super().__init__(args, api_url, model)
         self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vllm-omni")
         self.items = self._load_data()
 
-    def _load_data(self) -> List[Dict[str, Any]]:
+    def _load_t2v_prompts(self) -> list[dict[str, Any]]:
         if self.args.task == "t2v":
             return self._load_t2v_prompts()
         elif self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
@@ -138,7 +142,7 @@ class VBenchDataset(BaseDataset):
                     return [{"prompt": "A cat sitting on a bench"}] * 50
 
         prompts = []
-        with open(path, "r") as f:
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -179,21 +183,17 @@ class VBenchDataset(BaseDataset):
         except Exception as e:
             print(f"Failed to download VBench I2V dataset: {e}")
             print("Please manually download following instructions at:")
-            print(
-                "https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download"
-            )
+            print("https://github.com/Vchitect/VBench/tree/master/vbench2_beta_i2v#22-download")
             return None
 
         return vbench_i2v_dir if os.path.exists(info_json_path) else None
 
-    def _load_from_i2v_json(self, json_path: str) -> List[Dict[str, Any]]:
+    def _load_from_i2v_json(self, json_path: str) -> list[dict[str, Any]]:
         """Load I2V data from i2v-bench-info.json format."""
-        with open(json_path, "r") as f:
+        with open(json_path) as f:
             items = json.load(f)
 
-        base_dir = os.path.dirname(
-            os.path.dirname(json_path)
-        )  # Go up to vbench2_beta_i2v
+        base_dir = os.path.dirname(os.path.dirname(json_path))  # Go up to vbench2_beta_i2v
         origin_dir = os.path.join(base_dir, "data", "origin")
 
         data = []
@@ -207,7 +207,7 @@ class VBenchDataset(BaseDataset):
         print(f"Loaded {len(data)} I2V samples from VBench I2V dataset")
         return data
 
-    def _scan_directory_for_images(self, path: str) -> List[Dict[str, Any]]:
+    def _scan_directory_for_images(self, path: str) -> list[dict[str, Any]]:
         """Scan directory for image files."""
         exts = ["*.jpg", "*.jpeg", "*.png", "*.webp"]
         files = []
@@ -222,12 +222,9 @@ class VBenchDataset(BaseDataset):
                 files.extend(glob.glob(os.path.join(origin_dir, ext)))
                 files.extend(glob.glob(os.path.join(origin_dir, ext.upper())))
 
-        return [
-            {"prompt": os.path.splitext(os.path.basename(f))[0], "image_path": f}
-            for f in files
-        ]
+        return [{"prompt": os.path.splitext(os.path.basename(f))[0], "image_path": f} for f in files]
 
-    def _create_dummy_data(self) -> List[Dict[str, Any]]:
+    def _create_dummy_data(self) -> list[dict[str, Any]]:
         """Create dummy data with a placeholder image in cache directory."""
         print("No I2V data found. Using dummy placeholders.")
 
@@ -246,7 +243,7 @@ class VBenchDataset(BaseDataset):
 
         return [{"prompt": "A moving cat", "image_path": dummy_image}] * 10
 
-    def _load_i2v_data(self) -> List[Dict[str, Any]]:
+    def _load_i2v_data(self) -> list[dict[str, Any]]:
         """Load I2V data from VBench I2V dataset or user-provided path."""
         path = self.args.dataset_path
 
@@ -278,7 +275,7 @@ class VBenchDataset(BaseDataset):
         # Last resort: dummy data
         return self._resize_data(self._create_dummy_data())
 
-    def _resize_data(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _resize_data(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Resize data to match num_prompts."""
         if not self.args.num_prompts:
             return data
@@ -309,7 +306,7 @@ class VBenchDataset(BaseDataset):
             image_paths=image_paths,
         )
 
-    def get_requests(self) -> List[RequestFuncInput]:
+    def get_requests(self) -> list[RequestFuncInput]:
         return [self[i] for i in range(len(self))]
 
 
@@ -318,7 +315,7 @@ class RandomDataset(BaseDataset):
         self.args = args
         self.api_url = api_url
         self.model = model
-        self.num_prompts = args.num_prompts or 100
+        self.num_prompts = args.num_prompts
 
     def __len__(self) -> int:
         return self.num_prompts
@@ -355,7 +352,7 @@ def _encode_image_as_data_url(path: str) -> str:
 async def async_request_chat_completions(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
-    pbar: Optional[tqdm] = None,
+    pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
@@ -423,7 +420,7 @@ async def async_request_chat_completions(
     return output
 
 
-def calculate_metrics(outputs: List[RequestFuncOutput], total_duration: float):
+def calculate_metrics(outputs: list[RequestFuncOutput], total_duration: float):
     success_outputs = [o for o in outputs if o.success]
     error_outputs = [o for o in outputs if not o.success]
 
@@ -462,9 +459,7 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
             pass
 
         if time.time() - start_time > timeout:
-            raise TimeoutError(
-                f"Service at {base_url} did not start within {timeout} seconds."
-            )
+            raise TimeoutError(f"Service at {base_url} did not start within {timeout} seconds.")
 
         time.sleep(1)
 
@@ -473,20 +468,6 @@ async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
-
-    # # Wait for service
-    # wait_for_service(args.base_url)
-
-    # # Fetch model info
-    # try:
-    #     resp = requests.get(f"{args.base_url}/v1/model_info", timeout=5)
-    #     if resp.status_code == 200:
-    #         info = resp.json()
-    #         if "model_path" in info and info["model_path"]:
-    #             args.model = info["model_path"]
-    #             print(f"Updated model name from server: {args.model}")
-    # except Exception as e:
-    #     print(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
     # Setup dataset (vLLM-Omni supports diffusion via /v1/chat/completions)
     api_url = f"{args.base_url}/v1/chat/completions"
@@ -499,7 +480,7 @@ async def benchmark(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    print(f"Loading requests...")
+    print("Loading requests...")
     requests_list = dataset.get_requests()
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
@@ -520,6 +501,22 @@ async def benchmark(args):
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
     async with aiohttp.ClientSession() as session:
+        if args.warmup_requests and requests_list:
+            print(
+                "Running {} warmup request(s) with num_inference_steps={}...".format(
+                    args.warmup_requests,
+                    args.warmup_num_inference_steps,
+                )
+            )
+            for i in range(args.warmup_requests):
+                warm_req = requests_list[i % len(requests_list)]
+                if args.warmup_num_inference_steps is not None:
+                    warm_req = replace(
+                        warm_req,
+                        num_inference_steps=args.warmup_num_inference_steps,
+                    )
+                await limited_request_func(warm_req, session, None)
+
         start_time = time.perf_counter()
         tasks = []
         for req in requests_list:
@@ -556,41 +553,21 @@ async def benchmark(args):
             str(args.max_concurrency) if args.max_concurrency else "not set",
         )
     )
-    print(
-        "{:<40} {}/{:<15}".format(
-            "Successful requests:", metrics["completed_requests"], len(requests_list)
-        )
-    )
+    print("{:<40} {}/{:<15}".format("Successful requests:", metrics["completed_requests"], len(requests_list)))
 
     # Section 3: Performance Metrics
     print(f"{'-' * 50}")
 
-    print(
-        "{:<40} {:<15.2f}".format(
-            "Request throughput (req/s):", metrics["throughput_qps"]
-        )
-    )
+    print("{:<40} {:<15.2f}".format("Request throughput (req/s):", metrics["throughput_qps"]))
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
 
     if metrics["peak_memory_mb_max"] > 0:
         print(f"{'-' * 50}")
-        print(
-            "{:<40} {:<15.2f}".format(
-                "Peak Memory Max (MB):", metrics["peak_memory_mb_max"]
-            )
-        )
-        print(
-            "{:<40} {:<15.2f}".format(
-                "Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]
-            )
-        )
-        print(
-            "{:<40} {:<15.2f}".format(
-                "Peak Memory Median (MB):", metrics["peak_memory_mb_median"]
-            )
-        )
+        print("{:<40} {:<15.2f}".format("Peak Memory Max (MB):", metrics["peak_memory_mb_max"]))
+        print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
+        print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
 
     print("\n" + "=" * 60)
 
@@ -601,9 +578,7 @@ async def benchmark(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Benchmark serving for diffusion models."
-    )
+    parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
     parser.add_argument(
         "--base-url",
         type=str,
@@ -633,9 +608,7 @@ if __name__ == "__main__":
         default=None,
         help="Path to local dataset file (optional).",
     )
-    parser.add_argument(
-        "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."
-    )
+    parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
     parser.add_argument(
         "--max-concurrency",
         type=int,
@@ -656,11 +629,21 @@ if __name__ == "__main__":
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before measurement.",
+    )
+    parser.add_argument(
+        "--warmup-num-inference-steps",
+        type=int,
+        default=1,
+        help="num_inference_steps used for warmup requests.",
+    )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
-    parser.add_argument(
-        "--num-frames", type=int, default=None, help="Number of frames (for video)."
-    )
+    parser.add_argument("--num-frames", type=int, default=None, help="Number of frames (for video).")
     parser.add_argument(
         "--num-inference-steps",
         type=int,
@@ -674,12 +657,8 @@ if __name__ == "__main__":
         help="Random seed (for diffusion models).",
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
-    parser.add_argument(
-        "--output-file", type=str, default=None, help="Output JSON file for metrics."
-    )
-    parser.add_argument(
-        "--disable-tqdm", action="store_true", help="Disable progress bar."
-    )
+    parser.add_argument("--output-file", type=str, default=None, help="Output JSON file for metrics.")
+    parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
 
     args = parser.parse_args()
 
