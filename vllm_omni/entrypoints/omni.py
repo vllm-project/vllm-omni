@@ -280,7 +280,7 @@ class Omni:
             prompts = kwargs.get("prompt")
 
         if sampling_params_list is None:
-            omni_params_kwargs = {k: v for k, v in kwargs.items() if k != "prompts"}
+            omni_params_kwargs = {k: v for k, v in kwargs.items() if k not in ["prompts", "sampling_params_list"]}
 
             per_stage_params: list[Any] = []
             for stage in self.stage_list:
