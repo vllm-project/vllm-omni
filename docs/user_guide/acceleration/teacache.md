@@ -97,6 +97,8 @@ cache_config={"rel_l1_thresh": 0.1}  # More conservative caching
 
 ## Supported Models
 
+### ImageGen
+
 <style>
 th {
   white-space: nowrap;
@@ -108,7 +110,12 @@ th {
 |--------------|--------|-------------------|
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
-| `QwenImageEditPlusPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit-2509` |
+| `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
+| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
+
+### VideoGen
+
+No VideoGen models are supported by TeaCache yet.
 
 ### Coming Soon
 

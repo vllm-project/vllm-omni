@@ -662,25 +662,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
-    def _build_model_kwargs_extra(
-        self,
-        per_req_additional_information: dict[str, dict] | None,
-        num_scheduled_tokens_np,
-    ) -> dict:
+    def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step, including:
-        - additional_information_by_req_id: per-request additional information provided by preprocess for this step
         - runtime_additional_information: per-request additional information stored in request state
-        - request_ids: the request id list in batch order
-        - request_token_spans: token spans per request within the flattened sequence
         """
         model_kwargs_extra: dict[str, object] = {}
-        if per_req_additional_information:
-            model_kwargs_extra["additional_information_by_req_id"] = per_req_additional_information
         try:
             model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
-            model_kwargs_extra["request_ids"] = list(self.input_batch.req_ids)
-            if num_scheduled_tokens_np is not None:
-                model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(num_scheduled_tokens_np)
         except Exception as e:
             logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
             import traceback
@@ -688,49 +676,29 @@ class OmniGPUModelRunner(GPUModelRunner):
             traceback.print_exc()
         return model_kwargs_extra
 
-    def _process_additional_information_updates(self, multimodal_outputs: object) -> None:
+    def _process_additional_information_updates(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: object,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> None:
         """Process model-provided per-request additional_information updates and merge into request state."""
         try:
-            if multimodal_outputs is None:
-                logger.debug("[OMNI] multimodal_outputs is None, no updates to process")
-                return
-            if not isinstance(multimodal_outputs, dict):
-                logger.debug(f"[OMNI] multimodal_outputs is not dict: {type(multimodal_outputs)}")
-                return
-            if (
-                "additional_information_update" not in multimodal_outputs
-                and "additional_information_update_by_req_id" not in multimodal_outputs
-            ):
-                logger.debug(f"[OMNI] multimodal_outputs has no update keys: {list(multimodal_outputs.keys())}")
-                return
-            updates_list = multimodal_outputs.get("additional_information_update")
-            if isinstance(updates_list, list):
-                logger.debug(f"[OMNI] Processing additional_information_update list with {len(updates_list)} items")
-                for idx, upd in enumerate(updates_list):
-                    if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
-                        continue
-                    req_id = self.input_batch.req_ids[idx]
-                    self._merge_additional_information_update(req_id, upd)
-            updates_map = multimodal_outputs.get("additional_information_update_by_req_id")
-            if isinstance(updates_map, dict):
-                logger.debug(
-                    f"[OMNI] Processing additional_information_update_by_req_id for {list(updates_map.keys())}"
-                )
-                for req_id, upd in updates_map.items():
-                    if not isinstance(upd, dict):
-                        continue
-                    if req_id not in self.requests:
-                        logger.warning(f"[OMNI] req_id {req_id} not found in requests")
-                        continue
-                    self._merge_additional_information_update(req_id, upd)
-
+            # execute the custom postprocess function
+            # TODO(Peiqi): do we have a more elegant way to do this?
+            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
                     req_state = self.requests.get(req_id)
-                    if req_state:
-                        info = getattr(req_state, "additional_information_cpu", {})
-                        if "thinker_reply_part_per_request" in info:
-                            q = info["thinker_reply_part_per_request"]
-                            if hasattr(q, "shape"):
-                                logger.debug(f"[OMNI] After update, req={req_id} queue shape: {q.shape}")
+                    req_infos = (
+                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                    )
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    # only consider to store data into update dict.
+                    hidden_states_slice = hidden_states[s:e]
+                    update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
+                    self._merge_additional_information_update(req_id, update_dict)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "
@@ -741,46 +709,21 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             traceback.print_exc()
 
-    def _build_mm_inputs_and_overlays(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_scheduled_tokens: int,
-        num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Run MM encoder, fill scheduled inputs_embeds, and overlay prompt embeds;
-        collect per-request additional_information for the prefill portion."""
-        # Run the multimodal encoder if any.
-        self._execute_mm_encoder(scheduler_output)
-        mm_embeds = self._gather_mm_embeddings(scheduler_output)
-        # Always use embeddings as inputs for MM models
-        inputs_embeds_scheduled = self.model.get_input_embeddings(
-            input_ids=self.input_ids.gpu[:num_scheduled_tokens],
-            multimodal_embeddings=mm_embeds or None,
-        )
-        self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
-        # Reset per-step additional information collector (deprecated concat path)
-        if hasattr(self, "_forward_additional_information"):
-            self._forward_additional_information = None
-        # Overlay and collect per-request info
-        return self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
-
     def _collect_additional_information_for_prefill(
         self,
         num_scheduled_tokens_np: np.ndarray,
     ) -> dict[str, dict]:
         """Overlay per-request prompt_embeds for the prefill portion and collect
         additional_information slices for this step. Returns a map req_id -> dict."""
-        per_req_additional_information: dict[str, dict] = {}
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
-            addi_cpu = getattr(req_state, "additional_information_cpu", None)
             num_computed_tokens = int(self.input_batch.num_computed_tokens_cpu[req_index])
             prompt_len = len(req_state.prompt_token_ids)
             prompt_remaining = max(0, prompt_len - num_computed_tokens)
             sched_tokens = int(num_scheduled_tokens_np[req_index])
             overlay_len = min(sched_tokens, prompt_remaining)
-            if overlay_len <= 0 and not (isinstance(addi_cpu, dict) and addi_cpu):
+            if overlay_len <= 0:
                 continue
             if overlay_len > 0 and pe_cpu is not None:
                 src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(
@@ -788,18 +731,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
-            if addi_cpu is not None and isinstance(addi_cpu, dict):
-                req_info: dict[str, object] = {}
-                for k, v in addi_cpu.items():
-                    if isinstance(v, torch.Tensor):
-                        req_info[k] = v.detach().to("cpu").contiguous()
-                    elif isinstance(v, list):
-                        req_info[k] = v
-                    else:
-                        req_info[k] = v
-                if req_info:
-                    per_req_additional_information[req_id] = req_info
-        return per_req_additional_information
 
     def _preprocess(
         self,
@@ -909,17 +840,36 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
         self._omni_num_scheduled_tokens_np = num_scheduled_tokens_np
 
-        # Always collect additional_information, not only in prefill.
-        # _collect_additional_information_for_prefill handles prompt_embeds overlay during prefill,
-        # but even in decode we need per_req_additional_information so that
-        # _build_model_kwargs_extra can pass runtime_additional_information correctly.
-        per_req_additional_information: dict[str, dict] = {}
+        # Note: only prefill need collect additional_information for now.
+        # Decode don't need per_req_additional_information anymore.
         if inputs_embeds is not None:
             # Prefill: overlay prompt_embeds and collect additional_information
-            per_req_additional_information = self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
-        # Save for _model_forward regardless of prefill; runtime_additional_information
-        # will be fetched from request state inside _build_model_kwargs_extra
-        self._omni_per_req_additional_information = per_req_additional_information
+            self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
+
+        if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
+            # Overlay custom prompt_embeds per request for the prompt portion;
+            # collect additional_information (tensor/list) for prefill portion only
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_state = self.requests.get(req_id)
+                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+
+                start_offset = int(self.query_start_loc.cpu[req_index])
+                sched_tokens = int(num_scheduled_tokens_np[req_index])
+                s, e = start_offset, start_offset + sched_tokens
+                span_len = int(e) - int(s)
+
+                # call the custom process function
+                req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                    input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
+                )
+                # TODO(Peiqi): the merge stage could move out from the critical path
+                self._merge_additional_information_update(req_id, update_dict)
+
+                # update the inputs_embeds and input_ids
+                seg_len = min(span_len, req_embeds.shape[0])
+                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                    input_ids[s : s + seg_len] = req_input_ids
 
         return (
             input_ids,
@@ -939,10 +889,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
-        model_kwargs_extra = self._build_model_kwargs_extra(
-            self._omni_per_req_additional_information,
-            self._omni_num_scheduled_tokens_np,
-        )
+        model_kwargs_extra = self._build_model_kwargs_extra()
 
         runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
         if runtime_info:
@@ -961,3 +908,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output
+
+    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+        existing = getattr(req_state, "additional_information_cpu", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for k, v in upd.items():
+            if isinstance(v, torch.Tensor):
+                merged[k] = v.detach().to("cpu").contiguous()
+            elif isinstance(v, list):
+                merged[k] = [
+                    (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
+                ]
+            else:
+                merged[k] = v
+        setattr(req_state, "additional_information_cpu", merged)

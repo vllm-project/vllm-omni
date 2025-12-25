@@ -4,6 +4,9 @@ nav:
   - Getting Started:
     - getting_started/quickstart.md
     - getting_started/installation
+  - Serving:
+    - OpenAI-Compatible API:
+      - Image Generation: serving/image_generation_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:
@@ -37,6 +40,7 @@ nav:
       flatten_single_child_sections: true
   - Model Implementation:
     - contributing/model/README.md
+    - contributing/model/adding_multi_stage_model.md
   - CI: contributing/ci
   - Tests: contributing/tests
   - Design Documents:

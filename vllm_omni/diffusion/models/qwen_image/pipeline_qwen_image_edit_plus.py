@@ -194,7 +194,6 @@ class QwenImageEditPlusPipeline(
         )
 
         self.stage = None
-        self._cache_backend = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16

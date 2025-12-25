@@ -232,7 +232,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
-                    sampling_params_list = None
+                    # Use standard OpenAI API parameters for comprehension stage
+                    sampling_params_list = self._build_sampling_params_list_from_request(request)
 
                 self._log_inputs(
                     request_id,
@@ -263,16 +264,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                enable_force_include_usage=self.enable_force_include_usage,
-            )
+            raise RuntimeError("Not support streaming output now.")
 
         try:
             return await self.chat_completion_full_generator(
@@ -415,6 +407,84 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list
+
+    def _get_comprehension_stage_index(self) -> int:
+        for idx, stage in enumerate(self.engine_client.stage_list):
+            if stage.is_comprehension:
+                return idx
+        raise ValueError("No comprehension stage (is_comprehension=True) found in stage_list")
+
+    # OpenAI API standard sampling parameters that can be safely overridden.
+    # These are the most commonly used parameters with compatible types
+    # between ChatCompletionRequest and SamplingParams.
+    # Users who need more control can use sampling_params_list in extra_body.
+    _OPENAI_SAMPLING_FIELDS: set[str] = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    }
+
+    def _apply_request_overrides(
+        self,
+        default_params: SamplingParams,
+        request: ChatCompletionRequest,
+    ) -> SamplingParams:
+        """Clone default params and override with user-provided request values.
+
+        Starts with YAML defaults and only overrides fields that the user
+        explicitly provided (non-None values) in the request.
+
+        Args:
+            default_params: Default SamplingParams from stage config YAML.
+            request: The chat completion request containing user-provided values.
+
+        Returns:
+            New SamplingParams with YAML defaults overridden by request values.
+        """
+        params = default_params.clone()
+
+        for field_name in self._OPENAI_SAMPLING_FIELDS:
+            value = getattr(request, field_name, None)
+            if value is not None:
+                setattr(params, field_name, value)
+
+        return params
+
+    def _build_sampling_params_list_from_request(
+        self,
+        request: ChatCompletionRequest,
+    ) -> list[SamplingParams]:
+        """Build sampling_params_list using standard OpenAI API parameters.
+
+        For the comprehension stage, starts with YAML defaults and overrides with
+        user-provided request values. For other stages, uses cloned YAML defaults.
+
+        This approach ensures all YAML defaults (including seed, detokenize, etc.)
+        are preserved while allowing users to override specific parameters.
+
+        Args:
+            request: The chat completion request containing OpenAI API parameters.
+
+        Returns:
+            List of SamplingParams, one for each stage.
+        """
+        default_params_list = self.engine_client.default_sampling_params_list
+        comprehension_idx = self._get_comprehension_stage_index()
+
+        sampling_params_list = []
+        for idx, default_params in enumerate(default_params_list):
+            if idx == comprehension_idx:
+                params = self._apply_request_overrides(default_params, request)
+                sampling_params_list.append(params)
+            else:
+                # For other stages, clone default params
+                sampling_params_list.append(default_params.clone())
+
+        return sampling_params_list
 
     def _log_inputs(
         self,

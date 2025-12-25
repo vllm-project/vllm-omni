@@ -22,6 +22,22 @@ Usage (multiple images):
         --cfg_scale 4.0 \
         --guidance_scale 1.0
 
+Usage (with cache-dit acceleration):
+    python image_edit.py \
+        --image input.png \
+        --prompt "Edit description" \
+        --cache_backend cache_dit \
+        --cache_dit_max_continuous_cached_steps 3 \
+        --cache_dit_residual_diff_threshold 0.24 \
+        --cache_dit_enable_taylorseer
+
+Usage (with tea_cache acceleration):
+    python image_edit.py \
+        --image input.png \
+        --prompt "Edit description" \
+        --cache_backend tea_cache \
+        --tea_cache_rel_l1_thresh 0.25
+
 Usage (layered):
     python image_edit.py \
         --model "Qwen/Qwen-Image-Layered" \
@@ -57,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         default="Qwen/Qwen-Image-Edit",
         help=(
             "Diffusion model name or local path. "
-            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or later version "
+            "For multiple image inputs, use Qwen/Qwen-Image-Edit-2509 or Qwen/Qwen-Image-Edit-2511"
             "which supports QwenImageEditPlusPipeline."
         ),
     )
@@ -158,6 +174,72 @@ def parse_args() -> argparse.Namespace:
         help="For Qwen-Image-Layered, set to RGBA.",
     )
 
+    # Cache-DiT specific parameters
+    parser.add_argument(
+        "--cache_dit_fn_compute_blocks",
+        type=int,
+        default=1,
+        help="[cache-dit] Number of forward compute blocks. Optimized for single-transformer models.",
+    )
+    parser.add_argument(
+        "--cache_dit_bn_compute_blocks",
+        type=int,
+        default=0,
+        help="[cache-dit] Number of backward compute blocks.",
+    )
+    parser.add_argument(
+        "--cache_dit_max_warmup_steps",
+        type=int,
+        default=4,
+        help="[cache-dit] Maximum warmup steps (works for few-step models).",
+    )
+    parser.add_argument(
+        "--cache_dit_residual_diff_threshold",
+        type=float,
+        default=0.24,
+        help="[cache-dit] Residual diff threshold. Higher values enable more aggressive caching.",
+    )
+    parser.add_argument(
+        "--cache_dit_max_continuous_cached_steps",
+        type=int,
+        default=3,
+        help="[cache-dit] Maximum continuous cached steps to prevent precision degradation.",
+    )
+    parser.add_argument(
+        "--cache_dit_enable_taylorseer",
+        action="store_true",
+        default=False,
+        help="[cache-dit] Enable TaylorSeer acceleration (not suitable for few-step models).",
+    )
+    parser.add_argument(
+        "--cache_dit_taylorseer_order",
+        type=int,
+        default=1,
+        help="[cache-dit] TaylorSeer polynomial order.",
+    )
+    parser.add_argument(
+        "--cache_dit_scm_steps_mask_policy",
+        type=str,
+        default=None,
+        choices=[None, "slow", "medium", "fast", "ultra"],
+        help="[cache-dit] SCM mask policy: None (disabled), slow, medium, fast, ultra.",
+    )
+    parser.add_argument(
+        "--cache_dit_scm_steps_policy",
+        type=str,
+        default="dynamic",
+        choices=["dynamic", "static"],
+        help="[cache-dit] SCM steps policy: dynamic or static.",
+    )
+
+    # TeaCache specific parameters
+    parser.add_argument(
+        "--tea_cache_rel_l1_thresh",
+        type=float,
+        default=0.2,
+        help="[tea_cache] Threshold for accumulated relative L1 distance.",
+    )
+
     return parser.parse_args()
 
 
@@ -191,29 +273,22 @@ def main():
     cache_config = None
     if args.cache_backend == "cache_dit":
         # cache-dit configuration: Hybrid DBCache + SCM + TaylorSeer
-        # All parameters marked with [cache-dit only] in DiffusionCacheConfig
         cache_config = {
-            # DBCache parameters [cache-dit only]
-            "Fn_compute_blocks": 1,  # Optimized for single-transformer models
-            "Bn_compute_blocks": 0,  # Number of backward compute blocks
-            "max_warmup_steps": 4,  # Maximum warmup steps (works for few-step models)
-            "residual_diff_threshold": 0.24,  # Higher threshold for more aggressive caching
-            "max_continuous_cached_steps": 3,  # Limit to prevent precision degradation
-            # TaylorSeer parameters [cache-dit only]
-            "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
-            "taylorseer_order": 1,  # TaylorSeer polynomial order
-            # SCM (Step Computation Masking) parameters [cache-dit only]
-            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
-            "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
+            "Fn_compute_blocks": args.cache_dit_fn_compute_blocks,
+            "Bn_compute_blocks": args.cache_dit_bn_compute_blocks,
+            "max_warmup_steps": args.cache_dit_max_warmup_steps,
+            "residual_diff_threshold": args.cache_dit_residual_diff_threshold,
+            "max_continuous_cached_steps": args.cache_dit_max_continuous_cached_steps,
+            "enable_taylorseer": args.cache_dit_enable_taylorseer,
+            "taylorseer_order": args.cache_dit_taylorseer_order,
+            "scm_steps_mask_policy": args.cache_dit_scm_steps_mask_policy,
+            "scm_steps_policy": args.cache_dit_scm_steps_policy,
         }
     elif args.cache_backend == "tea_cache":
         # TeaCache configuration
-        # All parameters marked with [tea_cache only] in DiffusionCacheConfig
         cache_config = {
-            # TeaCache parameters [tea_cache only]
-            "rel_l1_thresh": 0.2,  # Threshold for accumulated relative L1 distance
+            "rel_l1_thresh": args.tea_cache_rel_l1_thresh,
             # Note: coefficients will use model-specific defaults based on model_type
-            #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
     # Initialize Omni with appropriate pipeline

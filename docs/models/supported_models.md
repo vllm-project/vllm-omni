@@ -28,6 +28,7 @@ th {
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
+|`LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` |
 
 
 ## List of Supported Models for NPU
