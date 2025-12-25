@@ -18,10 +18,23 @@ steps:
   #     queue: "ascend"
 
   - label: "Simple Unit Test"
+    depends_on: ~
     commands:
       - ".buildkite/scripts/simple_test.sh"
     agents:
       queue: "cpu_queue_premerge"
+
+  - label: "Image Generation API Test"
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/entrypoints/openai_api/
+    agents:
+      queue: "cpu_queue_premerge"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
 
   - label: "Diffusion Model Test"
     timeout_in_minutes: 20

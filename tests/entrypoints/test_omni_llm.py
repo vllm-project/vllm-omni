@@ -676,7 +676,8 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         }
     )
 
-    sampling_params_list = [object(), object()]
+    # Use dicts instead of object() for serializable sampling params
+    sampling_params_list = [{"temperature": 0.7}, {"temperature": 0.8}]
     prompts = ["hi"]
     outputs = llm.generate(prompts=prompts, sampling_params_list=sampling_params_list)
 
@@ -771,7 +772,8 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
         }
     )
 
-    outputs = llm.generate(prompts=["p"], sampling_params_list=[object(), object()])
+    # Use dicts instead of object() for serializable sampling params
+    outputs = llm.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}])
     assert outputs == []
 
 
@@ -970,7 +972,8 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     )
 
     # Generate should handle error gracefully (log but continue)
-    sampling_params_list = [object()]
+    # Use dict instead of object() for serializable sampling params
+    sampling_params_list = [{"temperature": 0.7}]
     outputs = llm.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
     # Should return final output (error was logged but didn't stop processing)
     assert isinstance(outputs, list)

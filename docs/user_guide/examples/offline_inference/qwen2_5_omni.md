@@ -3,10 +3,6 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen2_5_omni>.
 
 
-## 🛠️ Installation
-
-Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
-
 ## Run examples (Qwen2.5-Omni)
 
 ### Multiple Prompts

@@ -4,7 +4,6 @@
 
 Main entry points for vLLM-Omni inference and serving.
 
-- [vllm_omni.entrypoints.async_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
@@ -18,7 +17,6 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_llm.OmniStageLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
-- [vllm_omni.entrypoints.openai.serving_chat.OmniOpenAIServingChat][]
 
 ## Inputs
 
@@ -43,9 +41,9 @@ Engine classes for offline and online inference.
 - [vllm_omni.engine.PromptEmbedsPayload][]
 - [vllm_omni.engine.arg_utils.AsyncOmniEngineArgs][]
 - [vllm_omni.engine.arg_utils.OmniEngineArgs][]
+- [vllm_omni.engine.input_processor.OmniInputProcessor][]
 - [vllm_omni.engine.output_processor.MultimodalOutputProcessor][]
 - [vllm_omni.engine.output_processor.OmniRequestState][]
-- [vllm_omni.engine.processor.OmniProcessor][]
 
 ## Core
 
@@ -62,13 +60,8 @@ Model execution components.
 - [vllm_omni.model_executor.models.output_templates.OmniOutput][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni.Qwen2_5OmniForConditionalGeneration][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_talker.Qwen2_5OmniTalkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniAudioFeatureInputs][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniConditionalGenerationMixin][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerDummyInputsBuilder][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerMultiModalDataParser][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerMultiModalProcessor][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerProcessingInfo][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavBigVGANModel][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavDiTModel][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavForConditionalGenerationVLLM][]
@@ -89,9 +82,6 @@ Model execution components.
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerForConditionalGeneration][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerMultiModalProcessor][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerProcessingInfo][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3Omni_VisionTransformer][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchEmbed][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3_VisionPatchMerger][]
 
 ## Configuration
 
@@ -110,6 +100,7 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
 - [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
+- [vllm_omni.worker.gpu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
