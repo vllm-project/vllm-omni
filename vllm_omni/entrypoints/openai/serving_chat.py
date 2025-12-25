@@ -1120,6 +1120,9 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 else:
                     od_config = getattr(self._diffusion_engine, "od_config", None)
                     supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
+                    if od_config is None:
+                        # TODO: entry is asyncOmni. We hack the od config here.
+                        supports_multimodal_inputs = True
                     if supports_multimodal_inputs:
                         gen_kwargs["pil_image"] = pil_images
                     else:
