@@ -17,7 +17,7 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
 
@@ -170,9 +170,16 @@ def main(args):
     else:
         query_result = query_func()
 
+    if not args.enable_stats:
+        log_file = None
+    else:
+        log_file = os.path.join(args.log_dir, f"omni_llm_pipeline_{args.query_type}")
+
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
+        log_file=log_file,
+        log_stats=args.enable_stats,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -274,7 +281,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="mixed_modalities",
+        default="use_video",
         choices=query_map.keys(),
         help="Query type.",
     )
@@ -363,6 +370,12 @@ def parse_args():
         type=int,
         default=16000,
         help="Sampling rate for audio loading (default: 16000).",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="Log directory (default: logs).",
     )
     parser.add_argument(
         "--modalities",

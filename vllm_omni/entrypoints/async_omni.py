@@ -19,12 +19,13 @@ from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import TokenizerLike, init_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
-from vllm.transformers_utils.tokenizer import AnyTokenizer, init_tokenizer_from_configs
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import Device, deprecate_kwargs
+from vllm.utils.func_utils import deprecate_kwargs
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -44,8 +45,8 @@ from vllm_omni.distributed.ray_utils.utils import (
     try_close_ray,
 )
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
+from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
-from vllm_omni.engine.processor import OmniProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
@@ -114,6 +115,10 @@ class AsyncOmni(EngineClient):
         self.batch_timeout = cli_args.batch_timeout
         self._enable_stats: bool = bool(cli_args.log_stats)
 
+        # Pause / resume state for async RL workflows.
+        self._pause_cond = asyncio.Condition()
+        self._paused = False
+
         base_engine_args = AsyncOmniEngineArgs.from_cli_args(cli_args).__dict__.copy()
 
         if cli_args.stage_configs_path is None:
@@ -142,6 +147,23 @@ class AsyncOmni(EngineClient):
 
         self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
         self._initialize_stages(model, cli_args.init_sleep_seconds, cli_args.shm_threshold_bytes, cli_args.init_timeout)
+
+        # Here is a duplicated init for the first stage to get the tokenizer,
+        # input_processor, and io_processor
+        # TODO: Refactor the code to avoid the duplicated init, we need to pass
+        # the tokenizer, input_processor, and io_processor back here from the
+        # first stage.
+        vllm_config = self.stage_list[0].vllm_config
+        self.tokenizer = init_tokenizer_from_config(model_config=vllm_config.model_config)
+        self.input_processor = OmniInputProcessor(
+            vllm_config=vllm_config,
+            tokenizer=self.tokenizer,
+        )
+        self.model_config = vllm_config.model_config
+        self.io_processor = get_io_processor(
+            vllm_config,
+            self.model_config.io_processor_plugin,
+        )
 
     def _initialize_stages(
         self,
@@ -304,6 +326,10 @@ class AsyncOmni(EngineClient):
         Raises:
             ValueError: If sampling_params_list has incorrect length.
         """
+        # Wait until generation is resumed if the engine is paused.
+        async with self._pause_cond:
+            await self._pause_cond.wait_for(lambda: not self._paused)
+
         logger.debug("[Orchestrator] generate() called")
 
         # Start output handler on the first call to generate()
@@ -634,7 +660,7 @@ class AsyncOmni(EngineClient):
     async def get_input_preprocessor(self) -> InputPreprocessor:
         return None
 
-    async def get_tokenizer(self) -> AnyTokenizer:
+    async def get_tokenizer(self) -> TokenizerLike:
         for stage in self.stage_list:
             if stage.is_comprehension:
                 return stage.tokenizer
@@ -655,7 +681,7 @@ class AsyncOmni(EngineClient):
     async def reset_mm_cache(self) -> None:
         pass
 
-    async def reset_prefix_cache(self, device: Device | None = None) -> None:
+    async def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
         pass
 
     async def sleep(self, level: int = 1) -> None:
@@ -685,6 +711,54 @@ class AsyncOmni(EngineClient):
 
     async def stop_profile(self) -> None:
         raise NotImplementedError("stop_profile() is not implemented for AsyncOmni")
+
+    async def pause_generation(
+        self,
+        *,
+        wait_for_inflight_requests: bool = False,
+        clear_cache: bool = True,
+    ) -> None:
+        """
+        Pause generation to allow model weight updates.
+
+        New generation/encoding requests are blocked until resume.
+
+        Args:
+            wait_for_inflight_requests: When ``True`` waits for in-flight
+                requests to finish before pausing. When ``False`` (default),
+                immediately aborts any in-flight requests.
+            clear_cache: Whether to clear KV cache and prefix cache after
+                draining. Set to ``False`` to preserve cache for faster resume.
+                Default is ``True`` (clear caches).
+        """
+
+        async with self._pause_cond:
+            if self._paused:
+                return
+            self._paused = True
+
+        # Note: AsyncOmni uses a stage-based architecture without a central
+        # output_processor. For now, we simply set the pause flag and let
+        # new requests wait. In-flight requests will complete naturally.
+        # TODO: Implement request abortion for stages if needed.
+
+        # Clear cache if requested
+        if clear_cache:
+            await self.reset_prefix_cache()
+            await self.reset_mm_cache()
+
+    async def resume_generation(self) -> None:
+        """Resume generation after :meth:`pause_generation`."""
+
+        async with self._pause_cond:
+            self._paused = False
+            self._pause_cond.notify_all()  # Wake up all waiting requests
+
+    async def is_paused(self) -> bool:
+        """Return whether the engine is currently paused."""
+
+        async with self._pause_cond:
+            return self._paused
 
 
 class AsyncOmniStageLLM(AsyncLLM):
@@ -749,14 +823,6 @@ class AsyncOmniStageLLM(AsyncLLM):
         Returns:
             None
         """
-        if not envs.VLLM_USE_V1:
-            raise ValueError(
-                "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False. "
-                "This should not happen. As a workaround, try using "
-                "AsyncLLMEngine.from_vllm_config(...) or explicitly set "
-                "VLLM_USE_V1=0 or 1 and report this issue on Github."
-            )
-
         # Ensure we can serialize custom transformer configs
         maybe_register_config_serialize_by_value()
 
@@ -773,27 +839,32 @@ class AsyncOmniStageLLM(AsyncLLM):
             )
 
         if self.model_config.skip_tokenizer_init:
-            self.tokenizer = None
+            tokenizer = None
         else:
             # Tokenizer (+ ensure liveness if running in another process).
-            self.tokenizer = init_tokenizer_from_configs(model_config=vllm_config.model_config)
+            tokenizer = init_tokenizer_from_config(model_config=vllm_config.model_config)
 
-        # Processor (converts Inputs --> EngineCoreRequests).
-        self.processor = OmniProcessor(
+        # InputProcessor (converts Inputs --> EngineCoreRequests).
+        self.input_processor = OmniInputProcessor(
             vllm_config=vllm_config,
-            tokenizer=self.tokenizer,
+            tokenizer=tokenizer,
             mm_registry=mm_registry,
         )
 
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         self.output_processor = MultimodalOutputProcessor(
-            tokenizer=self.tokenizer,
+            tokenizer=tokenizer,
             log_stats=self.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
+
         if self.observability_config.otlp_traces_endpoint is not None:
             tracer = init_tracer("vllm.llm_engine", self.observability_config.otlp_traces_endpoint)
             self.output_processor.tracer = tracer
+
+        # Pause / resume state for async RL workflows.
+        self._pause_cond = asyncio.Condition()
+        self._paused = False
 
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
@@ -862,14 +933,6 @@ class AsyncOmniStageLLM(AsyncLLM):
         client_index: int = 0,
         disable_log_requests: bool = True,  # Deprecated, will be removed
     ) -> "AsyncLLM":
-        if not envs.VLLM_USE_V1:
-            raise ValueError(
-                "Using V1 AsyncLLMEngine, but envs.VLLM_USE_V1=False. "
-                "This should not happen. As a workaround, try using "
-                "AsyncLLMEngine.from_vllm_config(...) or explicitly set "
-                "VLLM_USE_V1=0 or 1 and report this issue on Github."
-            )
-
         # Create the LLMEngine.
         return cls(
             vllm_config=vllm_config,

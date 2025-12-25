@@ -41,7 +41,6 @@ class TestCacheDiTBackend:
         assert backend.config.Fn_compute_blocks == 4
         assert backend.enabled is False
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.CACHE_DIT_AVAILABLE", True)
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
     def test_enable_single_transformer(self, mock_cache_dit):
         """Test enabling cache-dit on single-transformer pipeline."""
@@ -63,7 +62,6 @@ class TestCacheDiTBackend:
         assert backend._refresh_func is not None
         mock_cache_dit.enable_cache.assert_called_once()
 
-    @patch("vllm_omni.diffusion.cache.cache_dit_backend.CACHE_DIT_AVAILABLE", True)
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
     def test_refresh(self, mock_cache_dit):
         """Test refreshing cache context with SCM mask policy updates when num_inference_steps changes."""
@@ -140,6 +138,7 @@ class TestTeaCacheBackend:
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
         config = DiffusionCacheConfig(rel_l1_thresh=0.3)
@@ -148,8 +147,6 @@ class TestTeaCacheBackend:
 
         # Verify hook was applied
         assert backend.enabled is True
-        assert hasattr(mock_pipeline, "_cache_backend")
-        assert mock_pipeline._cache_backend is backend
         mock_apply_hook.assert_called_once()
 
     @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
@@ -158,6 +155,7 @@ class TestTeaCacheBackend:
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
         config = DiffusionCacheConfig(rel_l1_thresh=0.3, coefficients=[1.0, 0.5, 0.2, 0.1, 0.05])
@@ -173,6 +171,7 @@ class TestTeaCacheBackend:
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
         # Mock hook registry

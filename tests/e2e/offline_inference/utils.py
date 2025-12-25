@@ -195,7 +195,11 @@ def create_new_process_for_each_test(
         A decorator to run test functions in separate processes.
     """
     if method is None:
-        use_spawn = current_platform.is_rocm() or current_platform.is_xpu()
+        # TODO: Find out why spawn is not working correctly on ROCm
+        # The test content will not run and tests passed immediately.
+        # For now, using `fork` for ROCm as it can run with `fork`
+        # and tests are running correctly.
+        use_spawn = current_platform.is_xpu()
         method = "spawn" if use_spawn else "fork"
 
     assert method in ["spawn", "fork"], "Method must be either 'spawn' or 'fork'"

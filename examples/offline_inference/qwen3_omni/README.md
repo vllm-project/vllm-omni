@@ -1,9 +1,5 @@
 # Qwen3-Omni
 
-## 🛠️ Installation
-
-Please refer to [README.md](../../../README.md)
-
 ## Run examples (Qwen3-Omni)
 
 ### Multiple Prompts

@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 
-from vllm_omni.utils import detect_device_type
+from vllm_omni.utils import detect_device_type, is_rocm
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -86,8 +86,10 @@ def resolve_model_config_path(model: str) -> str:
     device_type = detect_device_type()
 
     # Try device-specific config first
-    if device_type != "cuda":
+    if device_type != "cuda" or is_rocm():
         device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
+        if is_rocm():
+            device_config_file = f"vllm_omni/model_executor/stage_configs/rocm/{model_type}.yaml"
         device_config_path = PROJECT_ROOT / device_config_file
         if os.path.exists(device_config_path):
             return str(device_config_path)
@@ -148,7 +150,9 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     return stage_args
 
 
-def get_final_stage_id_for_e2e(output_modalities: list[str], default_modalities: list[str], stage_list: list) -> int:
+def get_final_stage_id_for_e2e(
+    output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
+) -> int:
     """Get the final stage id for e2e.
 
     Args:
@@ -163,6 +167,7 @@ def get_final_stage_id_for_e2e(output_modalities: list[str], default_modalities:
         for modality in output_modalities:
             if modality not in default_modalities:
                 logger.warning(f"Invalid output modality: {modality}, ignoring it")
+                # TODO: if user specifies unsupported modalities, invalid it and raise an error
                 continue
             prompt_modalities.append(modality)
         output_modalities = prompt_modalities
