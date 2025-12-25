@@ -84,7 +84,6 @@ class AscendQwen2_5OmniThinkerForConditionalGeneration(nn.Module):
         return video_embeds.split(sizes.tolist())
 
 if is_npu:
-    # NOTE: These will be removed after ascend_forward_context is refactored.
     Qwen2_5OmniThinkerForConditionalGeneration._process_image_input = (
         AscendQwen2_5OmniThinkerForConditionalGeneration._process_image_input
     )
