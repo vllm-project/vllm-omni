@@ -742,29 +742,6 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
 
         return logits
 
-    def _build_dummy_mm_embeddings(
-        self,
-        grid_thw: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        """在 profiling 路径兜底生成零向量 embedding，避免 mm sanity check 失败。"""
-        if not isinstance(grid_thw, torch.Tensor) or grid_thw.numel() == 0:
-            return []
-        if grid_thw.ndim != 2 or grid_thw.shape[-1] != 3:
-            return []
-
-        merge_size = getattr(self.visual, "spatial_merge_size", 1)  # type: ignore[union-attr]
-        hidden_size = int(self.language_model.config.hidden_size)
-        device = self.visual.device if self.visual is not None else grid_thw.device
-        dtype = self.visual.dtype if self.visual is not None else torch.float16
-
-        embeds: list[torch.Tensor] = []
-        for t, h, w in grid_thw.tolist():
-            tokens = int(t * h * w) // int(merge_size) // int(merge_size)
-            embeds.append(
-                torch.zeros((tokens, hidden_size), device=device, dtype=dtype)
-            )
-        return embeds
-
     def forward(
         self,
         input_ids: torch.Tensor,
