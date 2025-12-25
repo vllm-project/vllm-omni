@@ -4,6 +4,13 @@
 import enum
 import os
 import random
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any, Callable
+
+import torch
+from pydantic import Field, model_validator
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
@@ -230,7 +237,7 @@ class OmniDiffusionConfig:
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
-    # attention_backend: str = None
+    attention_backend: str | None = None
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE

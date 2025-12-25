@@ -5,7 +5,7 @@ import os
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 from vllm_omni.entrypoints.omni_llm import OmniLLM
-
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 def _dummy_snapshot_download(model_id):
     return model_id
@@ -33,7 +33,14 @@ class Omni:
             args[0] = model
         elif kwargs.get("model", "") != "":
             kwargs["model"] = model
-        if is_diffusion_model(model):
+            
+        # Check if parallel_config suggests a diffusion model
+        is_diffusion = is_diffusion_model(model)
+        if not is_diffusion and "parallel_config" in kwargs:
+            if isinstance(kwargs["parallel_config"], DiffusionParallelConfig):
+                is_diffusion = True
+
+        if is_diffusion:
             self.instance: OmniLLM | OmniDiffusion = OmniDiffusion(*args, **kwargs)
         else:
             self.instance: OmniLLM | OmniDiffusion = OmniLLM(*args, **kwargs)
