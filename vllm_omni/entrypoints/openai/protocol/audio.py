@@ -1,7 +1,7 @@
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OpenAICreateSpeechRequest(BaseModel):
@@ -16,6 +16,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         le=4.0,
     )
     stream_format: Literal["sse", "audio"] | None = "audio"
+
+    @field_validator("stream_format")
+    @classmethod
+    def validate_stream_format(cls, v: str) -> str:
+        if v == "sse":
+            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
+        return v
 
 
 class CreateAudio(BaseModel):

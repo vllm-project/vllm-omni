@@ -51,7 +51,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -452,7 +452,7 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, _model_config, state.openai_serving_models, request_logger=request_logger
+        engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking

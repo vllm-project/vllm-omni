@@ -3,7 +3,7 @@ from io import BytesIO
 import numpy as np
 from vllm.logger import init_logger
 
-from vllm_omni.entrypoints.openai.protocol import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 
 try:
     import soundfile

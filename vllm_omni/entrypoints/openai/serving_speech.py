@@ -7,7 +7,7 @@ from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol import AudioResponse, CreateAudio, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio, OpenAICreateSpeechRequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -77,4 +77,4 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
         except Exception as e:
-            return self.create_error_response(str(e))
+            return self.create_error_response(f"{e} {e.__cause__}")

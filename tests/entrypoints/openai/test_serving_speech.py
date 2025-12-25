@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol import CreateAudio
+from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -123,7 +123,6 @@ def test_app():
 
     speech_server = OmniOpenAIServingSpeech(
         engine_client=mock_engine_client,
-        model_config=mock_model_config,
         models=mock_models,
         request_logger=mock_request_logger,
     )
