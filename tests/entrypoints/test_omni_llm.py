@@ -586,7 +586,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
 
     llm = OmniLLM(model="any", init_timeout=1)
     with pytest.raises(ValueError):
-        llm.generate(prompts=["hi"], sampling_params_list=[])
+        list(llm.generate(prompts=["hi"], sampling_params_list=[]))
 
 
 def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
@@ -679,7 +679,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     # Use dicts instead of object() for serializable sampling params
     sampling_params_list = [{"temperature": 0.7}, {"temperature": 0.8}]
     prompts = ["hi"]
-    outputs = llm.generate(prompts=prompts, sampling_params_list=sampling_params_list)
+    outputs = list(llm.generate(prompts=prompts, sampling_params_list=sampling_params_list))
 
     # Both stages have final_output=True, so should aggregate two OmniRequestOutput
     assert len(outputs) == 2
@@ -773,7 +773,7 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     )
 
     # Use dicts instead of object() for serializable sampling params
-    outputs = llm.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}])
+    outputs = list(llm.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}]))
     assert outputs == []
 
 
@@ -829,7 +829,7 @@ def test_generate_sampling_params_none_raises(monkeypatch, fake_stage_config):
 
     llm = OmniLLM(model="any", init_timeout=1)
     with pytest.raises(ValueError):
-        llm.generate(prompts=["p"], sampling_params_list=None)
+        list(llm.generate(prompts=["p"], sampling_params_list=None))
 
 
 def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
@@ -974,7 +974,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     # Generate should handle error gracefully (log but continue)
     # Use dict instead of object() for serializable sampling params
     sampling_params_list = [{"temperature": 0.7}]
-    outputs = llm.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
+    outputs = list(llm.generate(prompts=["hi"], sampling_params_list=sampling_params_list))
     # Should return final output (error was logged but didn't stop processing)
     assert isinstance(outputs, list)
     # Since final_output=True, should have one output

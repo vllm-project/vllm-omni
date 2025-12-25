@@ -11,7 +11,6 @@ the original input processing utilities for cross-stage data wiring.
 """
 
 import asyncio
-import copy
 import fcntl
 import importlib
 import logging
@@ -1180,14 +1179,11 @@ async def _stage_worker_async(
             if isinstance(ein, list):
                 ein = ein[0]
 
-            loop_num = 0
-            prev_token_count = [0]  # Track previous cumulative token count
-            prev_multimodal_len = [0]
             async for res in stage_engine.generate(ein, sampling_params, rid):
                 gen_output = res
-            _gen_t1 = _time.time()
-            _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-            await generation_out_q.put((rid, gen_output, _gen_ms))
+                _gen_t1 = _time.time()
+                _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             _logging.getLogger(__name__).exception("[Stage-%s] Failed on request %s: %s", stage_id, rid, e)
             out_q.put(
@@ -1244,7 +1240,6 @@ async def _stage_worker_async(
             for rid, _gen_ms in zip(batch_request_ids, _gen_ms_list):
                 log_stage_batch_stats(_stats_file, stage_id, 1, float(_gen_ms), [rid])
 
-        logger.info("[Stage-%s] Sending outputs to main process", stage_id)
         for rid, output, _gen_ms in zip(batch_request_ids, batch_request_outputs, _gen_ms_list):
             try:
                 r_outputs = [output]

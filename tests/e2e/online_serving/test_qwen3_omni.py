@@ -4,8 +4,8 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
-import concurrent.futures
 import base64
+import concurrent.futures
 import os
 import socket
 import subprocess
@@ -219,7 +219,7 @@ def test_video_to_audio_concurrent(
         if hasattr(audio_message, "audio") and audio_message.audio:
             assert audio_message.audio.data is not None
             assert len(audio_message.audio.data) > 0
-    
+
     # Test streaming completion
     chat_completion = client.chat.completions.create(
         model=omni_server.model,
@@ -253,6 +253,6 @@ def test_video_to_audio_concurrent(
     # Verify text output
     assert text_content is not None and len(text_content) >= 2
 
-    # Verify audio output    
+    # Verify audio output
     assert audio_data is not None
     assert len(audio_data) > 0

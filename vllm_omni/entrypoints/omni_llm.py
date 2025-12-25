@@ -2,9 +2,9 @@ import multiprocessing as mp
 import os
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Generator
+from typing import Any
 
 import cloudpickle
 from pydantic import ValidationError
@@ -420,12 +420,12 @@ class OmniLLM:
                             stage_id,
                             e,
                         )
-                    
+
                     yield OmniRequestOutput(
-                            stage_id=stage_id,
-                            final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
-                            request_output=engine_outputs,
-                        )
+                        stage_id=stage_id,
+                        final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
+                        request_output=engine_outputs,
+                    )
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:

@@ -387,7 +387,7 @@ def run_inference_api(
                             audio_output = (int(sample_rate), audio_np.astype(np.float32))
                             # Yield current text and audio
                             yield text_content if text_content else "", audio_output
-                        except Exception as audio_exc:  # pylint: disable=broad-except
+                        except Exception:  # pylint: disable=broad-except
                             # If audio processing fails, just yield text
                             yield text_content if text_content else "", None
 
@@ -530,7 +530,15 @@ def build_interface(
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox, output_modalities, stream_checkbox],
+            inputs=[
+                input_box,
+                audio_input,
+                image_input,
+                video_input,
+                use_audio_in_video_checkbox,
+                output_modalities,
+                stream_checkbox,
+            ],
             outputs=[text_output, audio_output],
         )
         demo.queue()
