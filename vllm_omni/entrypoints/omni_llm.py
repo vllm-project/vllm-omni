@@ -8,6 +8,7 @@ from typing import Any
 
 import cloudpickle
 from pydantic import ValidationError
+from tqdm import tqdm
 
 # External library imports (vLLM)
 from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
@@ -335,6 +336,16 @@ class OmniLLM:
         completed_requests = 0
         total_requests = len(request_prompts)
 
+        pbar = tqdm(
+            total=total_requests,
+            desc="Generating",
+            unit="req",
+            dynamic_ncols=True,
+            smoothing=0.1,
+            position=0,
+            leave=True,
+        )
+
         logger.debug(
             "[Orchestrator] Entering scheduling loop: total_requests=%d, stages=%d",
             total_requests,
@@ -421,6 +432,12 @@ class OmniLLM:
                             e,
                         )
 
+                    completed_requests += 1
+                    pbar.update(1)
+                    elapsed = time.time() - _wall_start_ts
+                    throughput = completed_requests / elapsed if elapsed > 0 else 0
+                    pbar.set_postfix({"throughput": f"{throughput:.2f} req/s"})
+
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
@@ -475,6 +492,8 @@ class OmniLLM:
 
             if not made_progress:
                 time.sleep(0.005)
+
+        pbar.close()
         logger.debug("[Orchestrator] All requests completed")
 
         # Summarize and print stats

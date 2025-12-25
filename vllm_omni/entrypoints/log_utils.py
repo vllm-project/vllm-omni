@@ -7,6 +7,10 @@ from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import append_jsonl as _append_jsonl
 
+# =========================
+# File/log helpers
+# =========================
+
 
 def remove_old_logs(log_file: str | None, num_stages: int) -> None:
     try:
@@ -83,6 +87,11 @@ def _safe_append_jsonl(path: str | None, record: dict[str, Any]) -> None:
         _append_jsonl(path, record)  # type: ignore[arg-type]
     except Exception:
         pass
+
+
+# =========================
+# Transfer logging
+# =========================
 
 
 def log_transfer_tx(
@@ -165,6 +174,11 @@ def log_transfer_total(
     )
 
 
+# =========================
+# Orchestrator logging
+# =========================
+
+
 def log_orchestrator_e2e(
     stats_file: str | None,
     request_id: Any,
@@ -196,6 +210,11 @@ def log_overall_summary(overall_stats_file: str | None, summary: dict[str, Any])
 
 def log_overall_record(overall_stats_file: str | None, record: dict[str, Any]) -> None:
     _safe_append_jsonl(overall_stats_file, record)
+
+
+# =========================
+# Stage logging
+# =========================
 
 
 def log_stage_request_stats(
@@ -297,7 +316,9 @@ def compute_and_log_stage_request_stats(
     )
 
 
-# ----------------- Aggregation helpers for orchestrator -----------------
+# =========================
+# Aggregation helpers
+# =========================
 
 
 def record_stage_metrics(
@@ -309,6 +330,7 @@ def record_stage_metrics(
     req_id: Any,
     metrics: dict[str, Any],
 ) -> None:
+    """Store per-request stage stats and aggregate counts/tokens."""
     try:
         stage_req_counts[stage_id] += 1
         stage_total_tokens[stage_id] += int(metrics.get("num_tokens_out", 0))
@@ -333,6 +355,7 @@ def aggregate_rx_and_maybe_total(
     rx_ms: float,
     in_flight_ms: float,
 ) -> tuple[int, float, float] | None:
+    """Record RX aggregates and (if TX exists) compute total transfer ms for an edge."""
     try:
         # Update RX aggregates for (stage_id-1 -> stage_id)
         if stage_id > 0:
@@ -350,20 +373,23 @@ def aggregate_rx_and_maybe_total(
                     "total_count": 0.0,
                 }
                 transfer_agg[key] = agg
+
             agg["sum_rx_bytes"] += float(rx_bytes)
             agg["sum_rx_ms"] += float(rx_ms)
             agg["rx_count"] += 1.0
 
-            # Try combine with sender-side timing if present
             rid_key = str(req_id)
             s = transfer_edge_req.get((stage_id - 1, stage_id, rid_key))
             if s is None:
                 return None
+
             tx_ms = float(s.get("tx_ms", 0.0))
             size_b = float(s.get("size_bytes", rx_bytes))
+
             total_ms = tx_ms + float(in_flight_ms) + float(rx_ms)
             agg["sum_total_ms"] += total_ms
             agg["total_count"] += 1.0
+
             # accumulate per-request transfer totals
             try:
                 pr = per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
@@ -371,7 +397,9 @@ def aggregate_rx_and_maybe_total(
                 pr["transfers_bytes"] = int(pr.get("transfers_bytes", 0)) + int(rx_bytes)  # type: ignore[index]
             except Exception:
                 pass
+
             return int(size_b), float(tx_ms), float(total_ms)
+
         return None
     except Exception:
         return None
@@ -386,6 +414,7 @@ def record_sender_transfer_agg(
     size_bytes: int,
     tx_ms: float,
 ) -> None:
+    """Record TX aggregate; store per-request TX timing for later combination with RX."""
     try:
         key = (from_stage, to_stage)
         agg = transfer_agg.get(key)
@@ -401,10 +430,11 @@ def record_sender_transfer_agg(
                 "total_count": 0.0,
             }
             transfer_agg[key] = agg
+
         agg["sum_bytes"] += float(size_bytes)
         agg["sum_ms"] += float(tx_ms)
         agg["count"] += 1.0
-        # Store sender-side timing for per-request combination
+
         rid_key = str(req_id)
         transfer_edge_req[(from_stage, to_stage, rid_key)] = {
             "tx_ms": float(tx_ms),
@@ -428,31 +458,6 @@ def count_tokens_from_outputs(engine_outputs: list[Any]) -> int:
     return total
 
 
-def build_stage_summary(
-    stage_req_counts: list[int],
-    stage_total_tokens: list[int],
-    stage_total_time_ms: list[float],
-) -> list[dict[str, Any]]:
-    summary: list[dict[str, Any]] = []
-    for sid in range(len(stage_req_counts)):
-        reqs = stage_req_counts[sid]
-        tokens = stage_total_tokens[sid]
-        total_ms = float(stage_total_time_ms[sid])
-        avg_req = (total_ms / reqs) if reqs > 0 else 0.0
-        avg_tok = (tokens * 1000.0 / total_ms) if total_ms > 0 else 0.0
-        summary.append(
-            {
-                "stage_id": sid,
-                "requests": int(reqs),
-                "tokens": int(tokens),
-                "total_time_ms": total_ms,
-                "avg_time_per_request_ms": avg_req,
-                "avg_tokens_per_s": avg_tok,
-            }
-        )
-    return summary
-
-
 def build_transfer_summary(
     transfer_agg: dict[tuple[int, int], dict[str, float]],
 ) -> list[dict[str, Any]]:
@@ -462,34 +467,51 @@ def build_transfer_summary(
         sum_ms = float(agg.get("sum_ms", 0.0))
         samples = int(agg.get("count", 0.0))
         tx_mbps = (sum_bytes * 8.0) / (max(sum_ms, 1e-6) * 1000.0) if sum_bytes > 0 else 0.0
+
         sum_rx_bytes = float(agg.get("sum_rx_bytes", 0.0))
         sum_rx_ms = float(agg.get("sum_rx_ms", 0.0))
         samples_rx = int(agg.get("rx_count", 0.0))
         rx_mbps = (sum_rx_bytes * 8.0) / (max(sum_rx_ms, 1e-6) * 1000.0) if sum_rx_bytes > 0 else 0.0
+
         sum_total_ms = float(agg.get("sum_total_ms", 0.0))
         samples_total = int(agg.get("total_count", 0.0))
         total_mbps = (sum_bytes * 8.0) / (max(sum_total_ms, 1e-6) * 1000.0) if sum_bytes > 0 else 0.0
+
         summary.append(
             {
                 "from_stage": src,
                 "to_stage": dst,
                 "samples": samples,
                 "total_bytes": int(sum_bytes),
-                "total_time_ms": sum_ms,
-                "tx_mbps": tx_mbps,
+                "tx_total_time_ms": float(sum_ms),
+                "tx_mbps": float(tx_mbps),
                 "rx_samples": samples_rx,
                 "rx_total_bytes": int(sum_rx_bytes),
-                "rx_total_time_ms": sum_rx_ms,
-                "rx_mbps": rx_mbps,
+                "rx_total_time_ms": float(sum_rx_ms),
+                "rx_mbps": float(rx_mbps),
                 "total_samples": samples_total,
-                "total_transfer_time_ms": sum_total_ms,
-                "total_mbps": total_mbps,
+                "total_transfer_time_ms": float(sum_total_ms),
+                "total_mbps": float(total_mbps),
             }
         )
     return summary
 
 
+# =========================
+# Orchestrator metrics class
+# =========================
+
+
 class OrchestratorMetrics:
+    """
+    Collects per-stage, per-request, transfer, and end-to-end metrics.
+
+    Key improvement vs your current output:
+      - Adds E2E breakdown: service_ms (sum of stage compute),
+        transfer_ms (sum of edge transfers), queue_ms (everything else)
+      - Adds wall_tokens_per_s vs service_tokens_per_s
+    """
+
     def __init__(
         self,
         num_stages: int,
@@ -502,22 +524,65 @@ class OrchestratorMetrics:
         self.enable_stats = bool(enable_stats)
         self.stats_file = stats_file
         self.overall_stats_file = overall_stats_file
-        self.stage_total_time_ms: list[float] = [0.0 for _ in range(self.num_stages)]
+
+        # Aggregates
+        self.stage_total_time_ms: list[float] = [0.0 for _ in range(self.num_stages)]  # sum of unique batches
         self.stage_total_tokens: list[int] = [0 for _ in range(self.num_stages)]
         self.stage_req_counts: list[int] = [0 for _ in range(self.num_stages)]
+
+        # Transfers
         self.transfer_agg: dict[tuple[int, int], dict[str, float]] = {}
         self.transfer_edge_req: dict[tuple[int, int, str], dict[str, float]] = {}
-        self.e2e_total_ms: float = 0.0
+
+        # E2E
+        self.e2e_total_ms: float = 0.0  # sum of per-request e2e
         self.e2e_total_tokens: int = 0
         self.e2e_count: int = 0
         self.e2e_done: set[str] = set()
+
+        # Per-request store
         self.per_request: dict[str, dict[str, Any]] = {}
-        self.sum_per_request_transfer_ms: float = 0.0
+
+        # For wall time
         self.wall_start_ts: float = float(wall_start_ts)
         self.last_finish_ts: float = float(wall_start_ts)
-        self.stage_seen_batches: dict[int, set] = {sid: set() for sid in range(self.num_stages)}
+
+        # For stage window (busy interval)
         self.stage_first_ts: list[float | None] = [None for _ in range(self.num_stages)]
         self.stage_last_ts: list[float | None] = [None for _ in range(self.num_stages)]
+
+        # Avoid counting stage_total_time_ms multiple times for same batch_id
+        self.stage_seen_batches: dict[int, set] = {sid: set() for sid in range(self.num_stages)}
+
+        # New: breakdown accumulators
+        self.sum_service_ms: float = 0.0
+        self.sum_queue_ms: float = 0.0
+        self.sum_transfer_ms: float = 0.0
+
+    def _compute_request_breakdown_ms(self, rid_key: str, e2e_ms: float) -> dict[str, float]:
+        pr = self.per_request.get(rid_key, {})
+        stages = pr.get("stages", {}) if isinstance(pr, dict) else {}
+
+        service_ms = 0.0
+        try:
+            for _sid, sm in stages.items():
+                if isinstance(sm, dict):
+                    service_ms += float(sm.get("stage_gen_time_ms", 0.0))
+        except Exception:
+            pass
+
+        transfer_ms = 0.0
+        try:
+            transfer_ms = float(pr.get("transfers_ms", 0.0)) if isinstance(pr, dict) else 0.0
+        except Exception:
+            transfer_ms = 0.0
+
+        queue_ms = max(0.0, float(e2e_ms) - service_ms - transfer_ms)
+        return {
+            "service_ms": float(service_ms),
+            "transfer_ms": float(transfer_ms),
+            "queue_ms": float(queue_ms),
+        }
 
     def on_stage_metrics(self, stage_id: int, req_id: Any, metrics: dict[str, Any]) -> None:
         record_stage_metrics(
@@ -529,6 +594,8 @@ class OrchestratorMetrics:
             req_id,
             metrics,
         )
+
+        # count stage_total_time_ms only once per unique batch_id
         try:
             batch_id_raw = metrics.get("batch_id", None)
             if batch_id_raw is not None:
@@ -538,9 +605,11 @@ class OrchestratorMetrics:
                     self.stage_seen_batches[stage_id].add(batch_id)
         except Exception:
             pass
+
         rx_b = float(metrics.get("rx_transfer_bytes", 0.0))
         rx_ms = float(metrics.get("rx_decode_time_ms", 0.0))
         in_flight_ms = float(metrics.get("rx_in_flight_time_ms", 0.0))
+
         combined = aggregate_rx_and_maybe_total(
             self.transfer_edge_req,
             self.transfer_agg,
@@ -551,6 +620,7 @@ class OrchestratorMetrics:
             rx_ms,
             in_flight_ms,
         )
+
         if self.enable_stats and self.stats_file and stage_id > 0:
             log_transfer_rx(
                 self.stats_file,
@@ -584,9 +654,10 @@ class OrchestratorMetrics:
         tx_ms: float,
         used_shm: bool,
     ) -> None:
-        # Mark first input time for the destination stage if not set
+        # Mark first input time for destination stage if not set
         if self.stage_first_ts[to_stage] is None:
             self.stage_first_ts[to_stage] = time.time()
+
         if self.enable_stats and self.stats_file:
             log_transfer_tx(
                 self.stats_file,
@@ -597,6 +668,7 @@ class OrchestratorMetrics:
                 float(tx_ms),
                 bool(used_shm),
             )
+
         record_sender_transfer_agg(
             self.transfer_agg,
             self.transfer_edge_req,
@@ -611,74 +683,117 @@ class OrchestratorMetrics:
         rid_key = str(req_id)
         _t0 = float(req_start_ts)
         _t1 = time.time()
-        # Update last output time for this stage
+
+        # Update stage last output time
         prev_last = self.stage_last_ts[stage_id]
         self.stage_last_ts[stage_id] = _t1 if prev_last is None else max(prev_last, _t1)
+
         self.last_finish_ts = max(self.last_finish_ts, _t1)
+
         e2e_ms = (_t1 - _t0) * 1000.0
         num_tokens = count_tokens_from_outputs(engine_outputs)
+
         self.e2e_total_ms += e2e_ms
         self.e2e_total_tokens += int(num_tokens)
         self.e2e_count += 1
         self.e2e_done.add(rid_key)
+
         pr = self.per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+
+        breakdown = self._compute_request_breakdown_ms(rid_key, e2e_ms)
+        self.sum_service_ms += breakdown["service_ms"]
+        self.sum_transfer_ms += breakdown["transfer_ms"]
+        self.sum_queue_ms += breakdown["queue_ms"]
+
         per_req_record = {
             "type": "overall_request",
             "request_id": rid_key,
-            "e2e_time_ms": e2e_ms,
+            "final_stage_id": int(stage_id),
+            "e2e_time_ms": float(e2e_ms),
             "num_tokens_out": int(num_tokens),
+            "service_time_ms": float(breakdown["service_ms"]),
+            "transfer_time_ms": float(breakdown["transfer_ms"]),
+            "queue_time_ms": float(breakdown["queue_ms"]),
             "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
             "transfers_total_bytes": int(pr.get("transfers_bytes", 0)),
             "stages": pr.get("stages", {}),
         }
-        self.sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
+
         if self.enable_stats and self.overall_stats_file:
             log_overall_record(self.overall_stats_file, per_req_record)
+
         if self.enable_stats and self.stats_file:
             e2e_tpt = (e2e_ms / num_tokens) if num_tokens > 0 else 0.0
             log_orchestrator_e2e(self.stats_file, req_id, stage_id, e2e_ms, int(num_tokens), e2e_tpt)
 
     def build_and_log_summary(self, final_stage_id_to_prompt: dict[str, int]) -> dict[str, Any]:
-        # Compute stage summary using wall time between first input and last output per stage
+        # Stage summary: report both wall-busy (first->last) and service sum (batch times)
         stage_summary: list[dict[str, Any]] = []
         for sid in range(self.num_stages):
             first_ts = self.stage_first_ts[sid]
             last_ts = self.stage_last_ts[sid]
-            total_ms = (
+            wall_busy_ms = (
                 (max(0.0, (last_ts - first_ts)) * 1000.0) if (first_ts is not None and last_ts is not None) else 0.0
             )
+
             reqs = self.stage_req_counts[sid]
             tokens = self.stage_total_tokens[sid]
-            avg_req = (total_ms / reqs) if reqs > 0 else 0.0
-            avg_tok = (tokens * 1000.0 / total_ms) if total_ms > 0 else 0.0
+            service_ms = float(self.stage_total_time_ms[sid])
+
             stage_summary.append(
                 {
                     "stage_id": sid,
                     "requests": int(reqs),
                     "tokens": int(tokens),
-                    "total_time_ms": float(total_ms),
-                    "avg_time_per_request_ms": float(avg_req),
-                    "avg_tokens_per_s": float(avg_tok),
+                    "wall_busy_time_ms": float(wall_busy_ms),
+                    "service_time_ms": float(service_ms),
+                    "avg_service_time_per_request_ms": float(service_ms / reqs) if reqs > 0 else 0.0,
+                    "avg_tokens_per_s_service": float(tokens * 1000.0 / service_ms) if service_ms > 0 else 0.0,
+                    "avg_tokens_per_s_wall": float(tokens * 1000.0 / wall_busy_ms) if wall_busy_ms > 0 else 0.0,
                 }
             )
+
         transfer_summary = build_transfer_summary(self.transfer_agg)
+
         e2e_avg_req = (self.e2e_total_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
         e2e_avg_tok = (self.e2e_total_tokens * 1000.0 / self.e2e_total_ms) if self.e2e_total_ms > 0 else 0.0
+
         wall_time_ms = max(0.0, (self.last_finish_ts - self.wall_start_ts) * 1000.0)
+
+        # New: breakdown averages
+        avg_service_ms = (self.sum_service_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
+        avg_transfer_ms = (self.sum_transfer_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
+        avg_queue_ms = (self.sum_queue_ms / self.e2e_count) if self.e2e_count > 0 else 0.0
+
+        # New: throughput definitions
+        wall_toks_per_s = (self.e2e_total_tokens * 1000.0 / wall_time_ms) if wall_time_ms > 0 else 0.0
+        service_toks_per_s = (self.e2e_total_tokens * 1000.0 / self.sum_service_ms) if self.sum_service_ms > 0 else 0.0
+
         summary: dict[str, Any] = {
             "e2e_requests": int(self.e2e_count),
-            "e2e_total_time_ms": float(wall_time_ms),
-            "e2e_sum_time_ms": float(self.e2e_total_ms),
+            "e2e_total_time_ms": float(wall_time_ms),  # total wall time (what you waited)
+            "e2e_sum_time_ms": float(self.e2e_total_ms),  # sum of per-request e2e (includes queueing)
             "e2e_total_tokens": int(self.e2e_total_tokens),
-            "e2e_avg_time_per_request_ms": e2e_avg_req,
-            "e2e_avg_tokens_per_s": e2e_avg_tok,
-            "wall_time_ms": wall_time_ms,
+            "e2e_avg_time_per_request_ms": float(e2e_avg_req),
+            "e2e_avg_tokens_per_s": float(e2e_avg_tok),
+            "wall_time_ms": float(wall_time_ms),
             "final_stage_id": final_stage_id_to_prompt,
+            "breakdown_avg_ms": {
+                "service_ms": float(avg_service_ms),
+                "transfer_ms": float(avg_transfer_ms),
+                "queue_ms": float(avg_queue_ms),
+            },
+            "throughput": {
+                "wall_tokens_per_s": float(wall_toks_per_s),
+                "service_tokens_per_s": float(service_toks_per_s),
+            },
             "stages": stage_summary,
             "transfers": transfer_summary,
         }
+
         if self.enable_stats and self.stats_file:
             log_orchestrator_summary(self.stats_file, summary)
         if self.enable_stats and self.overall_stats_file:
             log_overall_summary(self.overall_stats_file, summary)
+
         return summary
