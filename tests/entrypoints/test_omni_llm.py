@@ -6,6 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vllm.sampling_params import SamplingParams
+from vllm_omni.entrypoints.stage_utils import _to_dict
+
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
     "ignore",
@@ -90,6 +93,9 @@ class _FakeStage:
         self._in_q = None
         self._out_q = None
         self._proc = None  # Mock process reference
+
+        default_sampling_params = getattr(config, "default_sampling_params", {})
+        self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
 
     def attach_queues(self, in_q, out_q):
         """Attach input and output queues."""
