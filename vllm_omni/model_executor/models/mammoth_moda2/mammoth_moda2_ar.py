@@ -615,7 +615,13 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
     @staticmethod
     def _is_t2i_request(runtime_info: dict[str, Any]) -> bool:
         v = runtime_info.get("omni_task", runtime_info.get("task"))
-        return v[0].lower() in {"t2i", "text_image", "text2image"}
+        if isinstance(v, str):
+            v0 = v
+        elif isinstance(v, (list, tuple)) and v:
+            v0 = v[0]
+        else:
+            return False
+        return str(v0).lower() in {"t2i", "text_image", "text2image"}
 
     def _get_t2i_runtime_params(self, runtime_info: dict[str, Any]) -> dict[str, int] | None:
         """Retrieves T2I constraint parameters from runtime_info or defaults."""
@@ -652,29 +658,35 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         return params
 
     def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
-        """Applies dynamic T2I constraints to logits: tokens at the end of each row are forced to eol_token_id."""
+        """Applies per-request token constraints.
+
+        - For T2I requests: constrain AR grid tokens (force EOL at row end and
+          restrict intra-row sampling to visual token range).
+        - For non-T2I (text/understanding/chat) requests: disallow sampling
+          from the extra generation vocabulary (image tokens) to prevent
+          accidentally emitting visual-token sequences.
+        """
         if logits is None or not isinstance(logits, torch.Tensor):
             return logits
-        sampling_metadata = getattr(self, "_last_sampling_metadata", None)
         runtime_infos = getattr(self, "_last_runtime_additional_information", None)
-        if sampling_metadata is None or runtime_infos is None:
+        if runtime_infos is None:
+            # There is no runtime info in dummy/profile run
             return logits
-        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
-        if not isinstance(output_token_ids, list):
-            return logits
-        if logits.ndim != 2:
-            return logits
-        num_reqs = logits.shape[0]
-        if num_reqs == 0:
-            return logits
-        if len(output_token_ids) < num_reqs or len(runtime_infos) < num_reqs:
-            return logits
+
+        sampling_metadata = getattr(self, "_last_sampling_metadata", None)
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) if sampling_metadata is not None else None
+        output_token_ids_list = output_token_ids if isinstance(output_token_ids, list) else []
 
         neg_inf = -float("inf")
         vocab_size = logits.shape[-1]
-        for i in range(num_reqs):
+        base_vocab_size = getattr(getattr(self, "language_model", None), "base_vocab_size", None)
+
+        for i in range(len(runtime_infos)):
             runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
             if not self._is_t2i_request(runtime_info):
+                # Text/understanding/chat: forbid sampling from the extra gen vocab.
+                if isinstance(base_vocab_size, int) and 0 < base_vocab_size < vocab_size:
+                    logits[i, base_vocab_size:] = neg_inf
                 continue
             params = self._get_t2i_runtime_params(runtime_info)
             if params is None:
