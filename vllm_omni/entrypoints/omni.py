@@ -75,7 +75,7 @@ class Omni:
         >>> print(outputs)
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
         model = args[0] if args else kwargs.get("model", "")
         assert model != "", "Null model id detected, please specify a model id."
         model = omni_snapshot_download(model)
