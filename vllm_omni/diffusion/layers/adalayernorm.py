@@ -56,7 +56,7 @@ class AdaLayerNorm(CustomOp):
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-        
+
         return shift_result, scale_result, gate_result
 
     def forward_cuda(
@@ -82,8 +82,9 @@ class AdaLayerNorm(CustomOp):
         index: torch.Tensor = None,
     ) -> torch.Tensor:
         shift_result, scale_result, gate_result = self.preprocess(mod_params, index)
-        
+
         import torch_npu
+
         output = torch_npu.npu_layer_norm_eval(
             x, normalized_shape=[self.hidden_size], weight=(1 + scale_result), bias=shift_result, eps=self.eps
         )
