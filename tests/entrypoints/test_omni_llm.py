@@ -5,6 +5,9 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.sampling_params import SamplingParams
+
+from vllm_omni.entrypoints.stage_utils import _to_dict
 
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
@@ -90,6 +93,9 @@ class _FakeStage:
         self._in_q = None
         self._out_q = None
         self._proc = None  # Mock process reference
+
+        default_sampling_params = getattr(config, "default_sampling_params", {})
+        self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
 
     def attach_queues(self, in_q, out_q):
         """Attach input and output queues."""
@@ -775,61 +781,6 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     # Use dicts instead of object() for serializable sampling params
     outputs = llm.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}])
     assert outputs == []
-
-
-def test_generate_sampling_params_none_raises(monkeypatch, fake_stage_config):
-    """Test that generate raises ValueError when sampling_params_list is None."""
-
-    def _fake_loader(model: str):
-        return [_FakeStageConfig(fake_stage_config)]
-
-    import sys
-
-    for module_name in [
-        "vllm_omni.entrypoints.utils",
-        "vllm_omni.entrypoints.omni_llm",
-        "vllm_omni.entrypoints.omni_stage",
-    ]:
-        if module_name in sys.modules:
-            del sys.modules[module_name]
-
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
-    _setup_ipc_mocks(monkeypatch)
-    _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni_llm.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
-        _fake_loader,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni_llm.load_stage_configs_from_model",
-        _fake_loader,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg: _FakeStage(cfg),
-        raising=False,
-    )
-
-    import vllm_omni.entrypoints.omni_llm as omni_llm_module
-
-    monkeypatch.setattr(omni_llm_module, "load_stage_configs_from_model", _fake_loader)
-    monkeypatch.setattr(omni_llm_module, "OmniStage", lambda cfg: _FakeStage(cfg))
-
-    from vllm_omni.entrypoints.omni_llm import OmniLLM
-
-    llm = OmniLLM(model="any", init_timeout=1)
-    with pytest.raises(ValueError):
-        llm.generate(prompts=["p"], sampling_params_list=None)
 
 
 def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
