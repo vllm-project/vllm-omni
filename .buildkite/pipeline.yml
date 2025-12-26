@@ -7,7 +7,7 @@ steps:
       - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
       - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
     agents:
-      queue: "cpu_queue_premerge_us_east_1"
+      queue: "cpu_queue_premerge"
 
   # - label: "Test on NPU"
   #   depends_on: ~
