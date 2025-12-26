@@ -68,8 +68,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt",
         type=str,
-        default="A stylish woman with sunglasses riding a motorcycle in NYC.",
-        help="Text prompt for image generation.",
+        action="append",
+        default=None,
+        help=(
+            "Text prompt for image generation. Can be provided multiple times "
+            "to generate multiple images with shared height/width/CFG settings."
+        ),
     )
     p.add_argument(
         "--height",
@@ -109,7 +113,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trust-remote-code",
                    action="store_true",
                    help="Trust remote code when loading the model.")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.prompt:
+        args.prompt = ["A stylish woman with sunglasses riding a motorcycle in NYC."]
+    return args
 
 
 def tensor_to_pil(image: torch.Tensor) -> Image.Image:
@@ -143,10 +150,13 @@ def main() -> None:
         args.model)
     expected_grid_tokens = ar_height * (ar_width + 1)
 
-    prompt = (f"<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
-              f"<|im_start|>user\n{args.prompt}<|im_end|>\n"
-              f"<|im_start|>assistant\n"
-              f"<|image start|>{ar_width}*{ar_height}<|image token|>")
+    def _format_prompt(user_prompt: str) -> str:
+        return (
+            "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
+            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+            f"<|image start|>{ar_width}*{ar_height}<|image token|>"
+        )
 
     logger.info("Initializing Omni pipeline...")
     omni = Omni(model=args.model,
@@ -172,44 +182,84 @@ def main() -> None:
         )
 
         logger.info("Starting generation...")
-        inputs = [{
-            "prompt": prompt,
-            "additional_information": {
-                "omni_task": ["t2i"],
-                "ar_width": [ar_width],
-                "ar_height": [ar_height],
-                "eol_token_id": [eol_token_id],
-                "visual_token_start_id": [visual_start],
-                "visual_token_end_id": [visual_end],
-                "image_height": [args.height],
-                "image_width": [args.width],
-                "num_inference_steps": [args.num_inference_steps],
-                "text_guidance_scale": [args.text_guidance_scale],
-                "cfg_range": [args.cfg_range[0], args.cfg_range[1]],
-            },
-        }]
+        shared_additional_information = {
+            "omni_task": ["t2i"],
+            "ar_width": [ar_width],
+            "ar_height": [ar_height],
+            "eol_token_id": [eol_token_id],
+            "visual_token_start_id": [visual_start],
+            "visual_token_end_id": [visual_end],
+            "image_height": [args.height],
+            "image_width": [args.width],
+            "num_inference_steps": [args.num_inference_steps],
+            "text_guidance_scale": [args.text_guidance_scale],
+            "cfg_range": [args.cfg_range[0], args.cfg_range[1]],
+        }
+        inputs = [
+            {
+                "prompt": _format_prompt(p),
+                "additional_information": dict(shared_additional_information),
+            }
+            for p in args.prompt
+        ]
 
         outputs = omni.generate(inputs, [ar_sampling, dit_sampling])
 
-        ro = outputs[0].request_output
-        if isinstance(ro, list):
-            if not ro:
+        # `outputs` may contain one or multiple request results.
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+
+        logger.info("Post-processing and saving image(s)...")
+        out_base, out_ext = os.path.splitext(args.out)
+        saved_paths: list[str] = []
+
+        # Flatten to (image_tensor, suffix) list so we can decide filenames.
+        images_to_save: list[tuple[torch.Tensor, str]] = []
+        for out_idx, out in enumerate(outputs):
+            ro = getattr(out, "request_output", out)
+            ro_list = ro if isinstance(ro, list) else [ro]
+            if not ro_list:
                 raise RuntimeError("Empty request_output from final stage.")
-            ro = ro[0]
 
-        mm = getattr(ro, "multimodal_output", None)
-        if not isinstance(mm, dict) or "image" not in mm:
-            raise RuntimeError(
-                f"Unexpected final output payload: {type(mm)} {mm}")
+            req_id = getattr(out, "request_id", None)
+            req_suffix = f"_{req_id}" if isinstance(req_id, str) and req_id else f"_{out_idx}"
 
-        img_tensor = mm["image"]
-        if not isinstance(img_tensor, torch.Tensor):
-            raise TypeError(f"Expected image tensor, got {type(img_tensor)}")
+            for sample_idx, ro_item in enumerate(ro_list):
+                mm = getattr(ro_item, "multimodal_output", None)
+                if not isinstance(mm, dict) or "image" not in mm:
+                    raise RuntimeError(
+                        f"Unexpected final output payload: {type(mm)} {mm}")
 
-        logger.info("Post-processing and saving image...")
-        pil = tensor_to_pil(img_tensor)
-        pil.save(args.out)
-        logger.info(f"Successfully saved generated image to: {args.out}")
+                img_payload = mm["image"]
+                img_list = img_payload if isinstance(img_payload, list) else [img_payload]
+                for img_idx, img_tensor in enumerate(img_list):
+                    if not isinstance(img_tensor, torch.Tensor):
+                        raise TypeError(
+                            f"Expected image tensor, got {type(img_tensor)}")
+                    suffix_parts = [req_suffix]
+                    if len(ro_list) > 1:
+                        suffix_parts.append(f"_s{sample_idx}")
+                    if len(img_list) > 1:
+                        suffix_parts.append(f"_i{img_idx}")
+                    images_to_save.append((img_tensor, "".join(suffix_parts)))
+
+        # If there's only one image, respect `--out` exactly.
+        if len(images_to_save) == 1:
+            img_tensor, _ = images_to_save[0]
+            pil = tensor_to_pil(img_tensor)
+            pil.save(args.out)
+            saved_paths.append(args.out)
+        else:
+            if not out_ext:
+                out_ext = ".png"
+            for img_tensor, suffix in images_to_save:
+                out_path = f"{out_base}{suffix}{out_ext}"
+                pil = tensor_to_pil(img_tensor)
+                pil.save(out_path)
+                saved_paths.append(out_path)
+
+        for p in saved_paths:
+            logger.info(f"Successfully saved generated image to: {p}")
 
     except Exception as e:
         logger.exception(f"An error occurred during generation: {e}")
