@@ -4,6 +4,8 @@ import time
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
+from pprint import pformat
 from typing import Any
 
 import cloudpickle
@@ -37,9 +39,6 @@ from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
-    configure_orchestrator_logger,
-    init_stats_paths,
-    remove_old_logs,
 )
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -69,8 +68,6 @@ class OmniLLM:
         stage_configs_path: Optional path to YAML file containing stage
             configurations. If None, configurations are loaded from the model.
         log_stats: Whether to enable statistics logging
-        log_file: Optional path prefix for log files. If provided, logs will
-            be written to files with stage-specific suffixes.
         init_sleep_seconds: Number of seconds to sleep between starting
             each stage process during initialization
         shm_threshold_bytes: Threshold in bytes for using shared memory
@@ -92,7 +89,6 @@ class OmniLLM:
         model: str,
         stage_configs_path: str | None = None,
         log_stats: bool = False,
-        log_file: str | None = None,
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
@@ -118,14 +114,7 @@ class OmniLLM:
             self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
         )
 
-        # Optional file handler for orchestrator
-        self._log_file = log_file
-
-        self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
         self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
-        if self._log_file:
-            remove_old_logs(self._log_file, len(self.stage_list))
-            configure_orchestrator_logger(logger, self._log_file)
 
     def _initialize_stages(
         self,
@@ -187,7 +176,6 @@ class OmniLLM:
 
             stage.init_stage_worker(
                 model,
-                log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
@@ -308,8 +296,6 @@ class OmniLLM:
         metrics = OrchestratorMetrics(
             num_stages,
             self._enable_stats,
-            self._stats_file,
-            self._overall_stats_file,
             _wall_start_ts,
         )
 
@@ -371,7 +357,7 @@ class OmniLLM:
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = result.get("metrics")
+                    _m = asdict(result.get("metrics"))
                     if _m is not None:
                         metrics.on_stage_metrics(stage_id, req_id, _m)
                 except Exception as e:
@@ -480,7 +466,7 @@ class OmniLLM:
         # Summarize and print stats
         try:
             summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
-            logger.info("[Summary] %s", summary)
+            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
 
@@ -522,8 +508,6 @@ class OmniLLM:
                     "Check model weights path and network reachability (if loading remotely).",
                     "Increase initialization wait time (init_sleep_seconds or call-site timeout).",
                 ]
-                if getattr(self, "_log_file", None):
-                    suggestions.append(f"Inspect per-stage log files for details: {self._log_file}.stage<id>.log")
                 logger.error(
                     "[Orchestrator] Stage initialization failed, shutting down. Suggestions:\n- %s",
                     "\n- ".join(suggestions),

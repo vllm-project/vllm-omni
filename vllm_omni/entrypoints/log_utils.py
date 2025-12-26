@@ -1,92 +1,16 @@
 from __future__ import annotations
 
-import logging
-import os
 import time
+from dataclasses import dataclass
+from pprint import pformat
 from typing import Any
 
-from vllm_omni.entrypoints.stage_utils import append_jsonl as _append_jsonl
+from vllm.logger import init_logger
 
-
-def remove_old_logs(log_file: str | None, num_stages: int) -> None:
-    try:
-        if not log_file:
-            return
-        try:
-            if os.path.exists(log_file):
-                os.remove(log_file)
-        except Exception:
-            pass
-        # Per-stage logs and stats
-        for sid in range(num_stages):
-            try:
-                p = f"{log_file}.stage{sid}.log"
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-            try:
-                p = f"{log_file}.stage{sid}.stats.jsonl"
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-        # Orchestrator stats files
-        try:
-            p = f"{log_file}.orchestrator.stats.jsonl"
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-        try:
-            p = f"{log_file}.overall.stats.jsonl"
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-def configure_orchestrator_logger(logger: logging.Logger, log_file: str | None) -> None:
-    try:
-        if not log_file:
-            return
-        has_file_handler = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
-        if not has_file_handler:
-            fh = logging.FileHandler(log_file)
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(logging.Formatter("%(asctime)s [PID:%(process)d] %(levelname)s: %(message)s"))
-            logger.addHandler(fh)
-            logger.setLevel(logging.DEBUG)
-    except Exception:
-        pass
-
-
-def init_stats_paths(enable_stats: bool, log_file: str | None) -> tuple[str | None, str | None]:
-    stats_file: str | None = None
-    overall_file: str | None = None
-    try:
-        if enable_stats and log_file:
-            stats_file = f"{log_file}.orchestrator.stats.jsonl"
-            overall_file = f"{log_file}.overall.stats.jsonl"
-    except Exception:
-        stats_file = None
-        overall_file = None
-    return stats_file, overall_file
-
-
-def _safe_append_jsonl(path: str | None, record: dict[str, Any]) -> None:
-    if not path:
-        return
-    try:
-        _append_jsonl(path, record)  # type: ignore[arg-type]
-    except Exception:
-        pass
+logger = init_logger(__name__)
 
 
 def log_transfer_tx(
-    stats_file: str | None,
     from_stage: int,
     to_stage: int,
     request_id: Any,
@@ -94,23 +18,24 @@ def log_transfer_tx(
     tx_time_ms: float,
     used_shm: bool,
 ) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "transfer_stats",
-            "from_stage": from_stage,
-            "to_stage": to_stage,
-            "request_id": request_id,
-            "size_bytes": int(size_bytes),
-            "tx_time_ms": float(tx_time_ms),
-            "tx_mbps": (float(size_bytes) * 8.0) / (max(tx_time_ms, 1e-6) * 1000.0),
-            "used_shm": bool(used_shm),
-        },
+    logger.info(
+        pformat(
+            {
+                "type": "transfer_stats",
+                "from_stage": from_stage,
+                "to_stage": to_stage,
+                "request_id": request_id,
+                "size_bytes": int(size_bytes),
+                "tx_time_ms": float(tx_time_ms),
+                "tx_mbps": (float(size_bytes) * 8.0) / (max(tx_time_ms, 1e-6) * 1000.0),
+                "used_shm": bool(used_shm),
+            },
+            sort_dicts=False,
+        )
     )
 
 
 def log_transfer_rx(
-    stats_file: str | None,
     from_stage: int,
     to_stage: int,
     request_id: Any,
@@ -118,25 +43,26 @@ def log_transfer_rx(
     rx_decode_time_ms: float,
     in_flight_time_ms: float,
 ) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "transfer_rx_stats",
-            "from_stage": from_stage,
-            "to_stage": to_stage,
-            "request_id": request_id,
-            "rx_bytes": int(rx_bytes),
-            "rx_decode_time_ms": float(rx_decode_time_ms),
-            "in_flight_time_ms": float(in_flight_time_ms),
-            "rx_time_per_kb_ms": (
-                (float(rx_decode_time_ms) / max(float(rx_bytes) / 1024.0, 1e-6)) if rx_bytes > 0 else 0.0
-            ),
-        },
+    logger.info(
+        pformat(
+            {
+                "type": "transfer_rx_stats",
+                "from_stage": from_stage,
+                "to_stage": to_stage,
+                "request_id": request_id,
+                "rx_bytes": int(rx_bytes),
+                "rx_decode_time_ms": float(rx_decode_time_ms),
+                "in_flight_time_ms": float(in_flight_time_ms),
+                "rx_time_per_kb_ms": (
+                    (float(rx_decode_time_ms) / max(float(rx_bytes) / 1024.0, 1e-6)) if rx_bytes > 0 else 0.0
+                ),
+            },
+            sort_dicts=False,
+        )
     )
 
 
 def log_transfer_total(
-    stats_file: str | None,
     from_stage: int,
     to_stage: int,
     request_id: Any,
@@ -146,60 +72,28 @@ def log_transfer_total(
     rx_decode_time_ms: float,
     total_time_ms: float,
 ) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "transfer_total_stats",
-            "from_stage": from_stage,
-            "to_stage": to_stage,
-            "request_id": request_id,
-            "size_bytes": int(size_bytes),
-            "tx_time_ms": float(tx_time_ms),
-            "in_flight_time_ms": float(in_flight_time_ms),
-            "rx_decode_time_ms": float(rx_decode_time_ms),
-            "total_time_ms": float(total_time_ms),
-            "total_time_per_kb_ms": (
-                float(total_time_ms) / max(float(size_bytes) / 1024.0, 1e-6) if size_bytes > 0 else 0.0
-            ),
-        },
+    logger.info(
+        pformat(
+            {
+                "type": "transfer_total_stats",
+                "from_stage": from_stage,
+                "to_stage": to_stage,
+                "request_id": request_id,
+                "size_bytes": int(size_bytes),
+                "tx_time_ms": float(tx_time_ms),
+                "in_flight_time_ms": float(in_flight_time_ms),
+                "rx_decode_time_ms": float(rx_decode_time_ms),
+                "total_time_ms": float(total_time_ms),
+                "total_time_per_kb_ms": (
+                    float(total_time_ms) / max(float(size_bytes) / 1024.0, 1e-6) if size_bytes > 0 else 0.0
+                ),
+            },
+            sort_dicts=False,
+        )
     )
-
-
-def log_orchestrator_e2e(
-    stats_file: str | None,
-    request_id: Any,
-    final_stage_id: int,
-    e2e_time_ms: float,
-    num_tokens_out: int,
-    e2e_time_per_token_ms: float,
-) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "orchestrator_request_e2e",
-            "request_id": request_id,
-            "final_stage_id": final_stage_id,
-            "e2e_time_ms": float(e2e_time_ms),
-            "num_tokens_out": int(num_tokens_out),
-            "e2e_time_per_token_ms": float(e2e_time_per_token_ms),
-        },
-    )
-
-
-def log_orchestrator_summary(stats_file: str | None, summary: dict[str, Any]) -> None:
-    _safe_append_jsonl(stats_file, {"type": "orchestrator_summary", **summary})
-
-
-def log_overall_summary(overall_stats_file: str | None, summary: dict[str, Any]) -> None:
-    _safe_append_jsonl(overall_stats_file, {"type": "overall_summary", **summary})
-
-
-def log_overall_record(overall_stats_file: str | None, record: dict[str, Any]) -> None:
-    _safe_append_jsonl(overall_stats_file, record)
 
 
 def log_stage_request_stats(
-    stats_file: str | None,
     stage_id: int,
     request_id: Any,
     batch_size: int,
@@ -210,85 +104,46 @@ def log_stage_request_stats(
     rx_decode_time_ms: float,
     rx_mbps: float,
 ) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "stage_request_stats",
-            "stage_id": stage_id,
-            "request_id": request_id,
-            "batch_size": int(batch_size),
-            "num_tokens_out": int(num_tokens_out),
-            "stage_gen_time_ms": float(stage_gen_time_ms),
-            "tokens_per_s": float(tokens_per_s),
-            "rx_transfer_bytes": int(rx_transfer_bytes),
-            "rx_decode_time_ms": float(rx_decode_time_ms),
-            "rx_mbps": float(rx_mbps),
-        },
-    )
-
-
-def log_stage_running_avg(
-    stats_file: str | None,
-    stage_id: int,
-    total_tokens: int,
-    total_gen_time_ms: float,
-    avg_tokens_per_s: float,
-) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "stage_running_avg",
-            "stage_id": stage_id,
-            "total_tokens": int(total_tokens),
-            "total_gen_time_ms": float(total_gen_time_ms),
-            "avg_tokens_per_s": float(avg_tokens_per_s),
-        },
-    )
-
-
-def log_stage_batch_stats(
-    stats_file: str | None,
-    stage_id: int,
-    batch_size: int,
-    batch_gen_time_ms: float,
-    request_ids: list[Any],
-) -> None:
-    _safe_append_jsonl(
-        stats_file,
-        {
-            "type": "stage_batch_stats",
-            "stage_id": stage_id,
-            "batch_size": int(batch_size),
-            "batch_gen_time_ms": float(batch_gen_time_ms),
-            "request_ids": list(request_ids),
-        },
+    logger.info(
+        pformat(
+            {
+                "type": "Request_stage_stats",
+                "stage_id": stage_id,
+                "request_id": request_id,
+                "batch_size": int(batch_size),
+                "num_tokens_out": int(num_tokens_out),
+                "stage_gen_time_ms": float(stage_gen_time_ms),
+                "tokens_per_s": float(tokens_per_s),
+                "rx_transfer_bytes": int(rx_transfer_bytes),
+                "rx_decode_time_ms": float(rx_decode_time_ms),
+                "rx_mbps": float(rx_mbps),
+            },
+            sort_dicts=False,
+        )
     )
 
 
 def compute_and_log_stage_request_stats(
-    stats_file: str | None,
     stage_id: int,
     request_id: Any,
     batch_size: int,
-    engine_outputs: list[Any],
+    num_engine_outputs: int,
     stage_gen_time_ms: float,
     rx_transfer_bytes: int,
     rx_decode_time_ms: float,
 ) -> None:
     """Compute per-request metrics and log them in one call."""
-    num_tokens = count_tokens_from_outputs(engine_outputs)
-    tokens_per_s = (num_tokens * 1000.0 / stage_gen_time_ms) if stage_gen_time_ms > 0 else 0.0
+    tokens_per_s = (num_engine_outputs * 1000.0 / stage_gen_time_ms) if stage_gen_time_ms > 0 else 0.0
     rx_mbps = (
         (float(rx_transfer_bytes) * 8.0) / (max(float(rx_decode_time_ms), 1e-6) * 1000.0)
         if rx_transfer_bytes > 0
         else 0.0
     )
     log_stage_request_stats(
-        stats_file,
         stage_id,
         request_id,
         int(batch_size),
-        int(num_tokens),
+        int(num_engine_outputs),
         float(stage_gen_time_ms),
         float(tokens_per_s),
         int(rx_transfer_bytes),
@@ -489,19 +344,34 @@ def build_transfer_summary(
     return summary
 
 
+@dataclass
+class StageStats:
+    total_token: int
+    total_gen_time: float
+
+
+@dataclass
+class StageRequestMetrics:
+    num_tokens_out: int
+    stage_gen_time_ms: float
+    batch_id: int
+    batch_size: int
+    rx_decode_time_ms: float
+    rx_transfer_bytes: int
+    rx_in_flight_time_ms: float
+
+    stage_stats: StageStats
+
+
 class OrchestratorMetrics:
     def __init__(
         self,
         num_stages: int,
         enable_stats: bool,
-        stats_file: str | None,
-        overall_stats_file: str | None,
         wall_start_ts: float,
     ) -> None:
         self.num_stages = int(num_stages)
         self.enable_stats = bool(enable_stats)
-        self.stats_file = stats_file
-        self.overall_stats_file = overall_stats_file
         self.stage_total_time_ms: list[float] = [0.0 for _ in range(self.num_stages)]
         self.stage_total_tokens: list[int] = [0 for _ in range(self.num_stages)]
         self.stage_req_counts: list[int] = [0 for _ in range(self.num_stages)]
@@ -529,6 +399,32 @@ class OrchestratorMetrics:
             req_id,
             metrics,
         )
+        if self.enable_stats:
+            compute_and_log_stage_request_stats(
+                stage_id=stage_id,
+                request_id=req_id,
+                batch_size=metrics.get("batch_size"),
+                num_engine_outputs=metrics.get("num_tokens_out"),
+                stage_gen_time_ms=metrics.get("stage_gen_time_ms"),
+                rx_decode_time_ms=metrics.get("rx_decode_time_ms"),
+                rx_transfer_bytes=metrics.get("rx_transfer_bytes"),
+            )
+            if stage_stats := metrics.get("stage_stats", None):
+                total_token = int(stage_stats.get("total_token"))
+                total_gen_time = float(stage_stats.get("total_gen_time"))
+                _avg_tokens_per_s = (total_token * 1000.0 / total_gen_time) if total_gen_time > 0 else 0.0
+                logger.info(
+                    pformat(
+                        {
+                            "type": "Stage_running_avg",
+                            "stage_id": stage_id,
+                            "total_tokens": total_token,
+                            "total_gen_time_ms": total_gen_time,
+                            "avg_tokens_per_s": _avg_tokens_per_s,
+                        },
+                        sort_dicts=False,
+                    )
+                )
         try:
             batch_id_raw = metrics.get("batch_id", None)
             if batch_id_raw is not None:
@@ -551,9 +447,8 @@ class OrchestratorMetrics:
             rx_ms,
             in_flight_ms,
         )
-        if self.enable_stats and self.stats_file and stage_id > 0:
+        if self.enable_stats and stage_id > 0:
             log_transfer_rx(
-                self.stats_file,
                 stage_id - 1,
                 stage_id,
                 req_id,
@@ -564,7 +459,6 @@ class OrchestratorMetrics:
             if combined is not None:
                 size_b_c, tx_ms_c, total_ms_c = combined
                 log_transfer_total(
-                    self.stats_file,
                     stage_id - 1,
                     stage_id,
                     req_id,
@@ -587,9 +481,8 @@ class OrchestratorMetrics:
         # Mark first input time for the destination stage if not set
         if self.stage_first_ts[to_stage] is None:
             self.stage_first_ts[to_stage] = time.time()
-        if self.enable_stats and self.stats_file:
+        if self.enable_stats:
             log_transfer_tx(
-                self.stats_file,
                 from_stage,
                 to_stage,
                 req_id,
@@ -623,20 +516,17 @@ class OrchestratorMetrics:
         self.e2e_done.add(rid_key)
         pr = self.per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         per_req_record = {
-            "type": "overall_request",
+            "type": "request_level_metrics",
             "request_id": rid_key,
             "e2e_time_ms": e2e_ms,
+            "e2e_tpt": (e2e_ms / num_tokens) if num_tokens > 0 else 0.0,
             "num_tokens_out": int(num_tokens),
             "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
             "transfers_total_bytes": int(pr.get("transfers_bytes", 0)),
             "stages": pr.get("stages", {}),
         }
         self.sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
-        if self.enable_stats and self.overall_stats_file:
-            log_overall_record(self.overall_stats_file, per_req_record)
-        if self.enable_stats and self.stats_file:
-            e2e_tpt = (e2e_ms / num_tokens) if num_tokens > 0 else 0.0
-            log_orchestrator_e2e(self.stats_file, req_id, stage_id, e2e_ms, int(num_tokens), e2e_tpt)
+        logger.info(pformat(per_req_record, sort_dicts=False))
 
     def build_and_log_summary(self, final_stage_id_to_prompt: dict[str, int]) -> dict[str, Any]:
         # Compute stage summary using wall time between first input and last output per stage
@@ -677,8 +567,4 @@ class OrchestratorMetrics:
             "stages": stage_summary,
             "transfers": transfer_summary,
         }
-        if self.enable_stats and self.stats_file:
-            log_orchestrator_summary(self.stats_file, summary)
-        if self.enable_stats and self.overall_stats_file:
-            log_overall_summary(self.overall_stats_file, summary)
         return summary

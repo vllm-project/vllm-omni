@@ -314,7 +314,7 @@ def _setup_log_mocks(monkeypatch):
     # Mock OrchestratorMetrics to be a simple class that doesn't require file operations
 
     class _FakeOrchestratorMetrics:
-        def __init__(self, num_stages, enable_stats, stats_file, overall_stats_file, wall_start_ts):
+        def __init__(self, num_stages, enable_stats, wall_start_ts):
             self.num_stages = num_stages
             self.enable_stats = enable_stats
             self.stage_first_ts = [None] * num_stages
