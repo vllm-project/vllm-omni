@@ -13,12 +13,7 @@ class AdaLayerNorm(CustomOp):
         out = layernorm(x) * (1 + scale) + shift
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        elementwise_affine: bool=False,
-        eps: float=1e-6
-    ) -> None:
+    def __init__(self, hidden_size: int, elementwise_affine: bool = False, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
         self.elementwise_affine = elementwise_affine
@@ -90,11 +85,7 @@ class AdaLayerNorm(CustomOp):
         
         import torch_npu
         output = torch_npu.npu_layer_norm_eval(
-            x, 
-            normalized_shape=[self.hidden_size], 
-            weight=(1 + scale_result), 
-            bias=shift_result, 
-            eps=self.eps
+            x, normalized_shape=[self.hidden_size], weight=(1 + scale_result), bias=shift_result, eps=self.eps
         )
 
         return output, gate_result

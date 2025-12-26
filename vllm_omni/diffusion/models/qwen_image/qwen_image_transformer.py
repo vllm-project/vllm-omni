@@ -31,8 +31,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 

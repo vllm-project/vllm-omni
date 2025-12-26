@@ -1,4 +1,3 @@
-import os
 from importlib.util import find_spec
 
 import torch
@@ -42,7 +41,7 @@ def apply_rotary_emb_mindiesd(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
-    half_head_dim: bool = True, # if true, size of sin and cos is (B, S, D/2), otherwise (B, S, D)
+    half_head_dim: bool = True,  # if true, size of sin and cos is (B, S, D/2), otherwise (B, S, D)
 ) -> torch.Tensor:
     from mindiesd import rotary_position_embedding
 
@@ -57,27 +56,13 @@ def apply_rotary_emb_mindiesd(
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(
-            x, 
-            cos, 
-            sin, 
-            rotated_mode="rotated_interleaved", 
-            head_first=False, 
-            fused=True
-        )
+        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(
-            x, 
-            cos, 
-            sin, 
-            rotated_mode="rotated_half", 
-            head_first=False, 
-            fused=True
-        )
+        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
 
 
 class RotaryEmbedding(CustomOp):

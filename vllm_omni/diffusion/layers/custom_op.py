@@ -3,7 +3,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from vllm_omni.utils.platform_utils import detect_device_type, is_rocm, is_npu
+from vllm_omni.utils.platform_utils import detect_device_type, is_npu, is_rocm
 
 
 class CustomOp(nn.Module):
