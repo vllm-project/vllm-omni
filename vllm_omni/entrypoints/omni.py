@@ -58,7 +58,7 @@ def omni_snapshot_download(model_id) -> str:
 
 class Omni:
     """Unified entrypoint for both LLM and Diffusion models for better usability.
-    
+
     Args:
         *args: Variable length argument list.
             - args[0]: Model name or path to load.
