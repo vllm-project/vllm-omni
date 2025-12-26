@@ -3,16 +3,55 @@
 
 import multiprocessing as mp
 import time
+import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import get_diffusion_post_process_func, get_diffusion_pre_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.scheduler import scheduler
+from vllm_omni.diffusion.scheduler import Scheduler, scheduler
 from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class BackgroundResources:
+    """
+    Used as a finalizer for clean shutdown.
+    Create a BackgroundResources instance to encapsulate all background resources
+    (e.g., the scheduler and worker processes) that need explicit cleanup.
+    This object holds references to external system resources that are not managed
+    by Python's garbage collector (like OS processes, message queues, etc.),
+    so they must be cleaned up manually to avoid resource leaks or zombie processes.
+    """
+
+    scheduler: Scheduler | None = None
+    processes: list[mp.Process] | None = None
+
+    def __call__(self):
+        """Clean up background resources."""
+        if self.scheduler is not None:
+            try:
+                for _ in range(self.scheduler.num_workers):
+                    self.scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
+                self.scheduler.close()
+            except Exception as exc:
+                logger.warning("Failed to send shutdown signal: %s", exc)
+        if not self.processes:
+            return
+        for proc in self.processes:
+            if not proc.is_alive():
+                continue
+            proc.join(30)
+            if proc.is_alive():
+                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
+                proc.terminate()
+                proc.join(30)
 
 
 class DiffusionEngine:
@@ -87,6 +126,15 @@ class DiffusionEngine:
 
         self._processes = processes
 
+        self.resources = BackgroundResources(scheduler=scheduler, processes=self._processes)
+        # Use weakref.finalize instead of __del__ or relying on self.close() at shutdown.
+        # During interpreter shutdown, global state (e.g., modules, built-ins) may already
+        # be cleared (set to None), so calling normal cleanup methods can fail with
+        # AttributeError: 'NoneType' object has no attribute '...'.
+        # weakref.finalize schedules cleanup *before* such destruction begins,
+        # ensuring resources are released while the runtime environment is still intact.
+        self._finalizer = weakref.finalize(self, self.resources)
+
     def _launch_workers(self, broadcast_handle):
         od_config = self.od_config
         logger.info("Starting server...")
@@ -151,6 +199,77 @@ class DiffusionEngine:
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
 
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Call a method on worker processes and get results immediately.
+
+        Args:
+            method: The method name (str) or callable to execute on workers
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            unique_reply_rank: If set, only get reply from this rank
+
+        Returns:
+            Single result if unique_reply_rank is provided, otherwise list of results
+        """
+        if self._closed:
+            raise RuntimeError("DiffusionEngine is closed.")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        assert isinstance(method, str)
+        send_method = method
+
+        # Prepare RPC request message
+        rpc_request = {
+            "type": "rpc",
+            "method": send_method,
+            "args": args,
+            "kwargs": kwargs,
+            "output_rank": unique_reply_rank,
+        }
+
+        try:
+            # Broadcast RPC request to all workers via unified message queue
+            scheduler.mq.enqueue(rpc_request)
+
+            # Determine which workers we expect responses from
+            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+
+            responses = []
+            for _ in range(num_responses):
+                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                try:
+                    if scheduler.result_mq is None:
+                        raise RuntimeError("Result queue not initialized")
+
+                    response = scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+
+                    # Check if response indicates an error
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        raise RuntimeError(
+                            f"Worker failed with error '{response.get('error')}', "
+                            "please check the stack trace above for the root cause"
+                        )
+
+                    responses.append(response)
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+
+            return responses[0] if unique_reply_rank is not None else responses
+
+        except Exception as e:
+            logger.error(f"RPC call failed: {e}")
+            raise
+
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         prompt = "dummy run"
@@ -167,31 +286,5 @@ class DiffusionEngine:
         logger.info("dummy run to warm up the model")
         self.add_req_and_wait_for_response([req])
 
-    def close(self, *, timeout_s: float = 30.0) -> None:
-        if self._closed:
-            return
-        self._closed = True
-
-        # Send shutdown signal to worker processes via broadcast queue
-        try:
-            if getattr(scheduler, "mq", None) is not None:
-                for _ in range(self.od_config.num_gpus or 1):
-                    scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
-        except Exception as exc:  # pragma: no cover - best effort cleanup
-            logger.warning("Failed to send shutdown signal: %s", exc)
-
-        # Join all worker processes, terminate if they refuse to exit
-        for proc in self._processes:
-            if not proc.is_alive():
-                continue
-            proc.join(timeout_s)
-            if proc.is_alive():
-                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
-                proc.terminate()
-                proc.join(timeout_s)
-
-        scheduler.close()
-        self._processes = []
-
-    def __del__(self):  # pragma: no cover - best effort cleanup
-        self.close()
+    def close(self) -> None:
+        self._finalizer()
