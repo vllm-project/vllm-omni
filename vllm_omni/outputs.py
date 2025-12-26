@@ -151,3 +151,23 @@ class OmniRequestOutput:
             )
 
         return result
+
+    def __repr__(self) -> str:
+        """Custom repr to properly show image count instead of image objects."""
+        # For images, show count instead of full list
+        images_repr = f"[{len(self.images)} PIL Images]" if self.images else "[]"
+
+        # Build repr string
+        parts = [
+            f"request_id={self.request_id!r}",
+            f"finished={self.finished}",
+            f"stage_id={self.stage_id}",
+            f"final_output_type={self.final_output_type!r}",
+            f"request_output={self.request_output}",
+            f"images={images_repr}",
+            f"prompt={self.prompt!r}",
+            f"latents={self.latents}",
+            f"metrics={self.metrics}",
+        ]
+
+        return f"OmniRequestOutput({', '.join(parts)})"

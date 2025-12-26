@@ -69,7 +69,7 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
-        return [st.default_sampling_params for st in self.omni.instance.stage_list]
+        return [st.default_sampling_params for st in self.omni.stage_list]
 
     def get_omni_inputs(
         self,
@@ -337,8 +337,8 @@ class OmniRunner:
 
     def close(self):
         """Close and cleanup the Omni instance."""
-        if hasattr(self.omni.instance, "close"):
-            self.omni.instance.close()
+        if hasattr(self.omni, "close"):
+            self.omni.close()
 
 
 @pytest.fixture(scope="session")

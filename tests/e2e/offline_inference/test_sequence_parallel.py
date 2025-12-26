@@ -78,7 +78,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
         dtype=dtype,
     )
     try:
-        baseline_images = baseline.generate(
+        outputs = baseline.generate(
             PROMPT,
             height=height,
             width=width,
@@ -87,6 +87,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
+        baseline_images = outputs[0].request_output[0]["images"]
     finally:
         baseline.close()
 
@@ -103,7 +104,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
         dtype=dtype,
     )
     try:
-        sp_images = sp.generate(
+        outputs = sp.generate(
             PROMPT,
             height=height,
             width=width,
@@ -112,6 +113,7 @@ def test_sequence_parallel(model_name: str, ulysses_degree: int, ring_degree: in
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
+        sp_images = outputs[0].request_output[0]["images"]
     finally:
         sp.close()
 
