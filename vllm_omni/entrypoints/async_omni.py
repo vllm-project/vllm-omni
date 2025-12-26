@@ -6,6 +6,8 @@ import time
 from argparse import Namespace
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
+from pprint import pformat
 from typing import Any
 
 import torch
@@ -50,9 +52,6 @@ from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
-    configure_orchestrator_logger,
-    init_stats_paths,
-    remove_old_logs,
 )
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -82,7 +81,6 @@ class AsyncOmni(EngineClient):
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
-            - log_file: Optional path prefix for log files. If provided, logs will
               be written to files with stage-specific suffixes.
             - init_sleep_seconds: Number of seconds to sleep between starting
               each stage process during initialization
@@ -139,13 +137,7 @@ class AsyncOmni(EngineClient):
 
         self.stage_list: list[OmniStage] = []
         self.default_sampling_params_list: list[SamplingParams] = []
-        # Optional file handler for orchestrator
-        self._log_file = cli_args.log_file
-        if self._log_file:
-            remove_old_logs(self._log_file, len(self.stage_configs))
-            configure_orchestrator_logger(logger, self._log_file)
 
-        self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
         self._initialize_stages(model, cli_args.init_sleep_seconds, cli_args.shm_threshold_bytes, cli_args.init_timeout)
 
         # Here is a duplicated init for the first stage to get the tokenizer,
@@ -231,7 +223,6 @@ class AsyncOmni(EngineClient):
             stage.init_stage_worker(
                 model,
                 is_async=True,
-                log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
@@ -358,8 +349,6 @@ class AsyncOmni(EngineClient):
         metrics = OrchestratorMetrics(
             num_stages,
             self._enable_stats,
-            self._stats_file,
-            self._overall_stats_file,
             _wall_start_ts,
         )
         # Seed stage-0 queue with all requests
@@ -399,7 +388,7 @@ class AsyncOmni(EngineClient):
             # Mark last output time for this stage whenever we receive outputs
             metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
             try:
-                _m = result.get("metrics")
+                _m = asdict(result.get("metrics"))
                 if _m is not None:
                     metrics.on_stage_metrics(stage_id, req_id, _m)
             except Exception as e:
@@ -502,7 +491,7 @@ class AsyncOmni(EngineClient):
         # Summarize and print stats
         try:
             summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
-            logger.info("[Summary] %s", summary)
+            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
         finally:
@@ -559,11 +548,6 @@ class AsyncOmni(EngineClient):
                     "Increase initialization wait time (init_sleep_seconds or \
                         call-site timeout).",
                 ]
-                if getattr(self, "_log_file", None):
-                    suggestions.append(
-                        f"Inspect per-stage log files for details: \
-                            {self._log_file}.stage<id>.log"
-                    )
                 logger.error(
                     "[Orchestrator] Stage initialization failed, shutting down. \
                         Suggestions:\n- %s",
