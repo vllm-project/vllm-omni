@@ -4,7 +4,10 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
+import concurrent.futures
+import ctypes
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -64,11 +67,22 @@ class OmniServer:
             str(self.port),
         ] + self.serve_args
 
+        # Helper to ensure child process dies when parent dies
+        libc = ctypes.CDLL("libc.so.6")
+
+        def preexec_fn():
+            # Ensure the child process receives SIGTERM when the parent (this test runner) dies.
+            # This prevents orphaned processes if the test is killed unexpectedly.
+            PR_SET_PDEATHSIG = 1
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
+            start_new_session=True,
+            preexec_fn=preexec_fn,
         )
 
         # Wait for server to be ready
@@ -94,11 +108,18 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
-            self.proc.terminate()
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
             try:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.proc.wait()
 
 
@@ -167,40 +188,55 @@ def dummy_messages_from_video_data(
 
 
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_video_to_audio(
+def test_video_to_audio_concurrent(
     client: openai.OpenAI,
     omni_server,
     base64_encoded_video: str,
 ) -> None:
-    """Test processing video, generating audio output via OpenAI API."""
+    """Test processing video with multiple concurrent completions, generating audio output via OpenAI API."""
     # Create data URL for the base64 encoded video
     video_data_url = f"data:video/mp4;base64,{base64_encoded_video}"
 
     messages = dummy_messages_from_video_data(video_data_url)
 
-    # Test single completion
-    chat_completion = client.chat.completions.create(
-        model=omni_server.model,
-        messages=messages,
-    )
+    # Test multiple concurrent completions
+    num_concurrent_requests = 5
 
-    assert len(chat_completion.choices) == 2  # 1 for text output, 1 for audio output
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+        # Submit multiple completion requests concurrently
+        futures = [
+            executor.submit(
+                client.chat.completions.create,
+                model=omni_server.model,
+                messages=messages,
+            )
+            for _ in range(num_concurrent_requests)
+        ]
 
-    # Verify text output
-    text_choice = chat_completion.choices[0]
-    assert text_choice.finish_reason == "length"
+        # Wait for all requests to complete and collect results
+        chat_completions = [future.result() for future in concurrent.futures.as_completed(futures)]
 
-    # Verify we got a response
-    text_message = text_choice.message
-    assert text_message.content is not None and len(text_message.content) >= 10
-    assert text_message.role == "assistant"
+    # Verify all completions succeeded
+    assert len(chat_completions) == num_concurrent_requests
 
-    # Verify audio output
-    audio_choice = chat_completion.choices[1]
-    assert audio_choice.finish_reason == "stop"
-    audio_message = audio_choice.message
+    for chat_completion in chat_completions:
+        assert len(chat_completion.choices) == 2  # 1 for text output, 1 for audio output
 
-    # Check if audio was generated
-    if hasattr(audio_message, "audio") and audio_message.audio:
-        assert audio_message.audio.data is not None
-        assert len(audio_message.audio.data) > 0
+        # Verify text output
+        text_choice = chat_completion.choices[0]
+        assert text_choice.finish_reason == "length"
+
+        # Verify we got a response
+        text_message = text_choice.message
+        assert text_message.content is not None and len(text_message.content) >= 10
+        assert text_message.role == "assistant"
+
+        # Verify audio output
+        audio_choice = chat_completion.choices[1]
+        assert audio_choice.finish_reason == "stop"
+        audio_message = audio_choice.message
+
+        # Check if audio was generated
+        if hasattr(audio_message, "audio") and audio_message.audio:
+            assert audio_message.audio.data is not None
+            assert len(audio_message.audio.data) > 0

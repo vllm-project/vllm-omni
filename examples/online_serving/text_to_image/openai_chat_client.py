@@ -57,8 +57,7 @@ def generate_image(
         extra_body["seed"] = seed
     if negative_prompt:
         extra_body["negative_prompt"] = negative_prompt
-    if num_outputs_per_prompt > 1:
-        extra_body["num_outputs_per_prompt"] = num_outputs_per_prompt
+    extra_body["num_outputs_per_prompt"] = num_outputs_per_prompt
 
     # Build request payload
     payload = {"messages": messages}

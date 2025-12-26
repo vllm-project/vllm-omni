@@ -16,6 +16,8 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
@@ -308,7 +310,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.input_batch.refresh_metadata()
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor]) -> dict:
+    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
@@ -739,9 +741,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.12 preprocess and omni's additional information handling."""
-        # Decode payload first, ensure request state has prompt_embeds / additional_information
-        self._decode_and_store_request_payloads(scheduler_output)
-
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder

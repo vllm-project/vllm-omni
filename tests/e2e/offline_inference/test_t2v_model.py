@@ -30,7 +30,7 @@ def test_video_diffusion_model(model_name: str):
     height = 480
     width = 640
     num_frames = 5
-    frames = m.generate(
+    outputs = m.generate(
         "A cat sitting on a table",
         height=height,
         width=width,
@@ -39,6 +39,16 @@ def test_video_diffusion_model(model_name: str):
         guidance_scale=1.0,
         generator=torch.Generator("cuda").manual_seed(42),
     )
+    first_output = outputs[0]
+    assert first_output.final_output_type == "image"
+    if not hasattr(first_output, "request_output") or not first_output.request_output:
+        raise ValueError("No request_output found in OmniRequestOutput")
+
+    req_out = first_output.request_output[0]
+    if not isinstance(req_out, dict) or "images" not in req_out:
+        raise ValueError("Invalid request_output structure or missing 'images' key")
+
+    frames = req_out["images"][0]
 
     assert frames is not None
     assert hasattr(frames, "shape")
@@ -46,3 +56,5 @@ def test_video_diffusion_model(model_name: str):
     assert frames.shape[1] == num_frames
     assert frames.shape[2] == height
     assert frames.shape[3] == width
+    # manually close the Omni instance
+    m.close()
