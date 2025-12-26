@@ -505,10 +505,9 @@ class StableDiffusion3Pipeline(
         latents,
         timesteps,
         do_cfg,
-        guidance_scale,
     ):
         self.scheduler.set_begin_index(0)
-        for i, t in enumerate(timesteps):
+        for _, t in enumerate(timesteps):
             if self.interrupt:
                 continue
             self._current_timestep = t
@@ -516,8 +515,6 @@ class StableDiffusion3Pipeline(
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-            # Forward pass for positive prompt (or unconditional if no CFG)
-            # cache_branch is passed to hook for CFG-aware state management
             transformer_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,
@@ -528,8 +525,6 @@ class StableDiffusion3Pipeline(
 
             noise_pred = self.transformer(**transformer_kwargs)[0]
 
-            # Forward pass for negative prompt (CFG)
-            # cache_branch is passed to hook for CFG-aware state management
             if do_cfg:
                 neg_transformer_kwargs = {
                     "hidden_states": latents,
@@ -653,7 +648,6 @@ class StableDiffusion3Pipeline(
             latents,
             timesteps,
             do_cfg,
-            self.guidance_scale,
         )
 
         self._current_timestep = None
