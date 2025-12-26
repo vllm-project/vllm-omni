@@ -85,8 +85,6 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 
 If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can refer to the following instructions to parallelize it with [Ulysses-SP](https://arxiv.org/pdf/2309.14509).
 
-<details>
-<summary><strong>Fold: Qwen-Image Ulysses-SP reference implementation (click to expand)</strong></summary>
 
 This section uses **Qwen-Image** (`QwenImageTransformer2DModel`) as the reference implementation. Qwen-Image is a **dual-stream** transformer (text + image) that performs **joint attention** across the concatenated sequences. Because of that, when enabling sequence parallel you typically:
 
@@ -180,7 +178,6 @@ omni = Omni(
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
 ```
 
-</details>
 
 ### CFG-Parallel
 
@@ -216,39 +213,12 @@ Notes:
 
 This section describes how to add CFG-Parallel to a diffusion **pipeline**. We use the Qwen-Image pipeline (`vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py`) as the reference implementation.
 
-<details>
-<summary><strong>Fold: Qwen-Image CFG-Parallel reference implementation (click to expand)</strong></summary>
 In `QwenImagePipeline`, each diffusion step runs two denoiser forward passes sequentially:
 
 - positive (prompt-conditioned)
 - negative (negative-prompt-conditioned)
 
 CFG-Parallel assigns these two branches to different ranks in the **CFG group** and synchronizes the results.
-
-1. Determine whether CFG-Parallel should run:
-
-- CFG must be enabled (`do_true_cfg`).
-- CFG group size must be > 1 (`get_classifier_free_guidance_world_size() > 1`).
-
-2. Split the two branches across ranks:
-
-- cfg-rank 0 runs the **positive** forward pass
-- cfg-rank 1 runs the **negative** forward pass
-
-3. Gather predictions to cfg-rank 0:
-
-- `gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)`
-- cfg-rank 0 reads `gathered[0]` as positive and `gathered[1]` as negative
-
-4. Perform CFG mixing + scheduler step on cfg-rank 0:
-
-- `comb = neg + scale * (pos - neg)`
-- (optional) normalization of the combined prediction (if your pipeline uses it)
-- `latents = scheduler.step(comb, t, latents)[0]`
-
-5. Broadcast updated latents back to all ranks so the next timestep stays in sync:
-
-- `get_cfg_group().broadcast(latents, src=0)`
 
 Below is an example of CFG-Parallel implementation:
 
@@ -305,5 +275,3 @@ def diffuse(
         # fallback: run positive then negative sequentially on one rank
         ...
 ```
-
-</details>
