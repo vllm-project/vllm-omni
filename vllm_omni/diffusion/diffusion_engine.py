@@ -4,7 +4,9 @@
 import multiprocessing as mp
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -194,6 +196,77 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Call a method on worker processes and get results immediately.
+
+        Args:
+            method: The method name (str) or callable to execute on workers
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            unique_reply_rank: If set, only get reply from this rank
+
+        Returns:
+            Single result if unique_reply_rank is provided, otherwise list of results
+        """
+        if self._closed:
+            raise RuntimeError("DiffusionEngine is closed.")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        assert isinstance(method, str)
+        send_method = method
+
+        # Prepare RPC request message
+        rpc_request = {
+            "type": "rpc",
+            "method": send_method,
+            "args": args,
+            "kwargs": kwargs,
+            "output_rank": unique_reply_rank,
+        }
+
+        try:
+            # Broadcast RPC request to all workers via unified message queue
+            scheduler.mq.enqueue(rpc_request)
+
+            # Determine which workers we expect responses from
+            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+
+            responses = []
+            for _ in range(num_responses):
+                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                try:
+                    if scheduler.result_mq is None:
+                        raise RuntimeError("Result queue not initialized")
+
+                    response = scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+
+                    # Check if response indicates an error
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        raise RuntimeError(
+                            f"Worker failed with error '{response.get('error')}', "
+                            "please check the stack trace above for the root cause"
+                        )
+
+                    responses.append(response)
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+
+            return responses[0] if unique_reply_rank is not None else responses
+
+        except Exception as e:
+            logger.error(f"RPC call failed: {e}")
+            raise
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
