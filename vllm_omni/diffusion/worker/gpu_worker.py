@@ -168,14 +168,17 @@ class WorkerProc:
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
-        worker = GPUWorker(
+        self.worker = self._create_worker(gpu_id, od_config)
+        self.gpu_id = gpu_id
+        self._running = True
+
+    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> GPUWorker:
+        """Create a worker instance. Override in subclasses for different worker types."""
+        return GPUWorker(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
         )
-        self.worker = worker
-        self.gpu_id = gpu_id
-        self._running = True
 
     def return_result(self, output: DiffusionOutput):
         """
