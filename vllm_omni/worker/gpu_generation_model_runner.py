@@ -129,7 +129,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_kwargs_extra = self._build_model_kwargs_extra(None, num_scheduled_tokens_np)
+            model_kwargs_extra = self._build_model_kwargs_extra()
             outputs = self._run_generation_model(
                 input_ids=input_ids,
                 positions=positions,
