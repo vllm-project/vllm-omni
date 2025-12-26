@@ -7,18 +7,20 @@ from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
+from vllm.platforms import current_platform
 
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
-def _compute_talker_prompt_ids_length(info):
+def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
 
-    thinker_sequences = torch.tensor(info["thinker_sequences"]).unsqueeze(0).cuda().long()  # [1, T]
-    input_ids = torch.tensor(info["thinker_input_ids"]).unsqueeze(0).cuda().long()  # [1, T]
+    thinker_sequences = torch.tensor(info["thinker_sequences"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+
+    input_ids = torch.tensor(info["thinker_input_ids"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
     im_start_indexes = torch.cat(
         [
@@ -82,12 +84,14 @@ def thinker2talker(
     thinker_outputs = stage_list[source_stage_id].engine_outputs
     talker_inputs = []
 
+    device = torch.device(current_platform.device_type)
+
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
-        thinker_embeddings = output.multimodal_output["0"].float().clone().detach().cuda()
+        thinker_embeddings = output.multimodal_output["0"].detach().to(device=device, dtype=torch.float)
 
-        thinker_hidden_states = output.multimodal_output["24"].float().clone().detach().cuda()
+        thinker_hidden_states = output.multimodal_output["24"].detach().to(device=device, dtype=torch.float)
         info = {
             "thinker_embeddings": thinker_embeddings,
             "thinker_hidden_states": thinker_hidden_states,
@@ -95,13 +99,19 @@ def thinker2talker(
             + output.token_ids,  # the thinker_sequences is the whole ids
             "thinker_input_ids": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": output.multimodal_output.get("tts_bos_embed").float().clone().detach().cuda(),
-            "tts_eos_embed": output.multimodal_output.get("tts_eos_embed").float().clone().detach().cuda(),
-            "tts_pad_embed": output.multimodal_output.get("tts_pad_embed").float().clone().detach().cuda(),
+            "tts_bos_embed": (
+                output.multimodal_output.get("tts_bos_embed").detach().to(device=device, dtype=torch.float)
+            ),
+            "tts_eos_embed": (
+                output.multimodal_output.get("tts_eos_embed").detach().to(device=device, dtype=torch.float)
+            ),
+            "tts_pad_embed": (
+                output.multimodal_output.get("tts_pad_embed").detach().to(device=device, dtype=torch.float)
+            ),
         }
         talker_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0] * _compute_talker_prompt_ids_length(info),
+                prompt_token_ids=[0] * _compute_talker_prompt_ids_length(info, device=device),
                 additional_information=info,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
