@@ -86,7 +86,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 op_type="fused_attn_score",
                 layout="BNSD",
             )
+            return output
         else:
             return self.forward_native(query, key, value, attn_metadata)
-
-        return output
