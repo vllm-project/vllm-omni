@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from importlib.util import find_spec
+
 import torch
 from vllm.logger import init_logger
 
@@ -75,6 +76,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if find_spec("mindiesd"):
             from mindiesd import attention_forward
+
             attention_mask = attn_metadata.attn_mask if attn_metadata else None
             output = attention_forward(
                 query,
