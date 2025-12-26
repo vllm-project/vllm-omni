@@ -2,7 +2,7 @@ import multiprocessing as mp
 import os
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -232,7 +232,7 @@ class OmniLLM:
         self,
         prompts: PromptType | Sequence[PromptType],
         sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
-    ) -> list[OmniRequestOutput]:
+    ) -> Generator[OmniRequestOutput, None, None]:
         """Generate outputs for the given prompts.
 
         Processes prompts through all stages in the pipeline and returns
@@ -255,7 +255,7 @@ class OmniLLM:
             ValueError: If sampling_params_list is None or has incorrect length.
         """
         try:
-            return self._run_generation(prompts, sampling_params_list)
+            yield from self._run_generation(prompts, sampling_params_list)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
             raise e
@@ -266,7 +266,7 @@ class OmniLLM:
         self,
         prompts: PromptType | Sequence[PromptType],
         sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
-    ) -> list[OmniRequestOutput]:
+    ) -> Generator[OmniRequestOutput, None, None]:
         logger.debug("[Orchestrator] generate() called")
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
@@ -278,8 +278,6 @@ class OmniLLM:
             request_prompts: list[PromptType] = [prompts]
         else:
             request_prompts = list(prompts)
-
-        final_outputs: list[OmniRequestOutput] = []
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
@@ -389,13 +387,6 @@ class OmniLLM:
                 stage.set_engine_outputs(engine_outputs)
 
                 if getattr(stage, "final_output", False):
-                    final_outputs.append(
-                        OmniRequestOutput(
-                            stage_id=stage_id,
-                            final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
-                            request_output=engine_outputs,
-                        )
-                    )
                     logger.debug(
                         "[Orchestrator] Request %s finalized at stage-%s",
                         req_id,
@@ -420,6 +411,12 @@ class OmniLLM:
                             stage_id,
                             e,
                         )
+
+                    yield OmniRequestOutput(
+                        stage_id=stage_id,
+                        final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
+                        request_output=engine_outputs,
+                    )
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
@@ -483,8 +480,6 @@ class OmniLLM:
             logger.info("[Summary] %s", summary)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
-
-        return final_outputs
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
         deadline = time.time() + max(0, int(timeout))

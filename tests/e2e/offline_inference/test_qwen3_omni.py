@@ -37,9 +37,6 @@ def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
             videos=video,
         )
 
-        # Verify we got outputs from multiple stages
-        assert len(outputs) > 0
-
         # Find and verify text output (thinker stage)
         text_output = None
         for stage_output in outputs:

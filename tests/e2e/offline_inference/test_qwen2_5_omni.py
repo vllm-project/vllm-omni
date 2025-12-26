@@ -58,9 +58,6 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
             videos=video,
         )
 
-        # Verify we got outputs from multiple stages
-        assert len(outputs) > 0
-
         # Find and verify text output (thinker stage)
         text_output = None
         for stage_output in outputs:
@@ -113,15 +110,10 @@ def test_mixed_modalities_to_text_only(omni_runner: type[OmniRunner], test_confi
             modalities=modalities,
         )
 
-        # Verify we got outputs from multiple stages
-        assert len(outputs) > 0
-
-        for stage_output in outputs:
-            assert stage_output.final_output_type != "audio"
-
         # Find and verify text output (thinker stage)
         text_output = None
         for stage_output in outputs:
+            assert stage_output.final_output_type != "audio"
             if stage_output.final_output_type == "text":
                 text_output = stage_output
                 break

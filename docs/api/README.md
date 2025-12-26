@@ -32,6 +32,7 @@ Input data structures for multi-modal inputs.
 
 Engine classes for offline and online inference.
 
+- [vllm_omni.diffusion.diffusion_engine.BackgroundResources][]
 - [vllm_omni.diffusion.diffusion_engine.DiffusionEngine][]
 - [vllm_omni.engine.AdditionalInformationEntry][]
 - [vllm_omni.engine.AdditionalInformationPayload][]
@@ -57,6 +58,7 @@ Core scheduling and caching components.
 
 Model execution components.
 
+- [vllm_omni.model_executor.custom_process_mixin.CustomProcessMixin][]
 - [vllm_omni.model_executor.models.output_templates.OmniOutput][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni.Qwen2_5OmniForConditionalGeneration][]
 - [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_talker.Qwen2_5OmniTalkerForConditionalGeneration][]
