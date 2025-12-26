@@ -21,6 +21,8 @@ from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -300,7 +302,7 @@ class OmniNPUModelRunner(NPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(
-        self, hidden_states: torch.Tensor | list[torch.Tensor]
+        self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput
     ) -> tuple[torch.Tensor, torch.Tensor | list[torch.Tensor] | dict]:
         """Extract multimodal outputs from hidden states."""
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
