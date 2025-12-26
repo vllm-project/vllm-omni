@@ -324,9 +324,7 @@ class RopeEmbedder:
         device = ids.device
 
         if self.cos_cached is None:
-            self.cos_cached, self.sin_cached = self.precompute_freqs(
-                self.axes_dims, self.axes_lens, theta=self.theta
-            )
+            self.cos_cached, self.sin_cached = self.precompute_freqs(self.axes_dims, self.axes_lens, theta=self.theta)
             self.cos_cached = [c.to(device) for c in self.cos_cached]
             self.sin_cached = [s.to(device) for s in self.sin_cached]
         else:
