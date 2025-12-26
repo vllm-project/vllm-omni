@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from vllm_omni.utils.platform_utils import synchronize_if_needed
+
 
 def all_to_all_4D(
     input: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False
@@ -45,8 +47,7 @@ def all_to_all_4D(
 
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
-            if use_sync:
-                torch.cuda.synchronize()
+            synchronize_if_needed(use_sync)
         else:
             output = input_t
         # if scattering the seq-dim, transpose the heads back to the original dimension
@@ -80,8 +81,7 @@ def all_to_all_4D(
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
-            if use_sync:
-                torch.cuda.synchronize()
+            synchronize_if_needed(use_sync)
         else:
             output = input_t
 
@@ -152,8 +152,7 @@ def all_to_all_5D(
         # (P, seq_len/P, 3, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, 3, bs, hc/P, hs) scatter head
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
-            if use_sync:
-                torch.cuda.synchronize()
+            synchronize_if_needed(use_sync)
         else:
             output = input_t
 
@@ -187,8 +186,7 @@ def all_to_all_5D(
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
-            if use_sync:
-                torch.cuda.synchronize()
+            synchronize_if_needed(use_sync)
         else:
             output = input_t
 

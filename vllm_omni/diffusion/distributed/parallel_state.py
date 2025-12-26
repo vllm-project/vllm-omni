@@ -46,6 +46,8 @@ if envs._is_npu():
     from torch.npu import device_count, set_device
 elif envs._is_musa():
     from torch_musa.core.device import device_count, set_device
+elif envs._is_xpu():
+    from torch.xpu import device_count, set_device
 else:
     from torch.cuda import device_count, set_device
 

@@ -111,3 +111,7 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.worker.npu.npu_generation_model_runner.NPUGenerationModelRunner][]
 - [vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker][]
 - [vllm_omni.worker.npu.npu_model_runner.OmniNPUModelRunner][]
+- [vllm_omni.worker.xpu.xpu_ar_model_runner.XPUARModelRunner][]
+- [vllm_omni.worker.xpu.xpu_ar_worker.XPUARWorker][]
+- [vllm_omni.worker.xpu.xpu_generation_model_runner.XPUGenerationModelRunner][]
+- [vllm_omni.worker.xpu.xpu_generation_worker.XPUGenerationWorker][]

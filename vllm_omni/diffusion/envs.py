@@ -67,6 +67,14 @@ def _is_npu():
         return False
 
 
+def _is_xpu():
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return True
+    except ModuleNotFoundError:
+        return False
+
+
 def get_device(local_rank: int) -> torch.device:
     if _is_cuda() or _is_hip():
         return torch.device("cuda", local_rank)
@@ -76,6 +84,8 @@ def get_device(local_rank: int) -> torch.device:
         return torch.device("mps")
     elif _is_npu():
         return torch.device("npu", local_rank)
+    elif _is_xpu():
+        return torch.device("xpu", local_rank)
     else:
         return torch.device("cpu")
 
@@ -89,6 +99,8 @@ def get_device_name() -> str:
         return "mps"
     elif _is_npu():
         return "npu"
+    elif _is_xpu():
+        return "xpu"
     else:
         return "cpu"
 
@@ -106,6 +118,8 @@ def get_device_version():
         return None
     elif _is_npu():
         return None
+    elif _is_xpu():
+        return None
     else:
         raise NotImplementedError("No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available")
 
@@ -119,6 +133,8 @@ def get_torch_distributed_backend() -> str:
         return "gloo"
     elif _is_npu():
         return "hccl"
+    elif _is_xpu():
+        return "xccl"
     else:
         raise NotImplementedError("No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available")
 
