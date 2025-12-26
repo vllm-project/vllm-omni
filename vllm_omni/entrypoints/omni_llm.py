@@ -115,6 +115,9 @@ class OmniLLM:
             self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
         )
 
+        self.stage_list: list[OmniStage] = []
+        self.default_sampling_params_list: list[SamplingParams] = []
+
         self._initialize_stages(model, init_sleep_seconds, shm_threshold_bytes, init_timeout)
 
     def _initialize_stages(
@@ -125,6 +128,7 @@ class OmniLLM:
         init_timeout: int,
     ) -> None:
         self.stage_list: list[OmniStage] = []
+        self.default_sampling_params_list: list[SamplingParams] = []
 
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
@@ -138,6 +142,7 @@ class OmniLLM:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
@@ -244,6 +249,8 @@ class OmniLLM:
             ValueError: If sampling_params_list is None or has incorrect length.
         """
         try:
+            if sampling_params_list is None:
+                sampling_params_list = self.default_sampling_params_list
             return self._run_generation(prompts, sampling_params_list)
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
