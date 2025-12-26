@@ -477,6 +477,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
+            if isinstance(default_params, dict):
+                default_params = SamplingParams(**default_params)
             if idx == comprehension_idx:
                 params = self._apply_request_overrides(default_params, request)
                 sampling_params_list.append(params)

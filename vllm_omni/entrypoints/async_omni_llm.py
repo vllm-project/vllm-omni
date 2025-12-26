@@ -73,7 +73,7 @@ class AsyncOmniLLM(AsyncLLM):
         client_index: int = 0,
     ) -> None:
         """
-        Create an AsyncLLM.
+        Create an AsyncOmniLLM.
 
         Args:
             vllm_config: global configuration.

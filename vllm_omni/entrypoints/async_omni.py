@@ -149,7 +149,6 @@ class AsyncOmni:
         batch_timeout = kwargs.get("batch_timeout", 10)
         stage_configs_path = kwargs.get("stage_configs_path", None)
         log_stats = kwargs.get("log_stats", False)
-        log_file = kwargs.get("log_file", None)
 
         # Load stage configs from YAML
         if stage_configs_path is None:
@@ -256,7 +255,6 @@ class AsyncOmni:
 
             stage.init_stage_worker(
                 model,
-                log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
@@ -315,8 +313,6 @@ class AsyncOmni:
                     "Check model weights path and network reachability (if loading remotely).",
                     "Increase initialization wait time (init_sleep_seconds or call-site timeout).",
                 ]
-                if getattr(self, "_log_file", None):
-                    suggestions.append(f"Inspect per-stage log files for details: {self._log_file}.stage<id>.log")
                 logger.error(
                     "[AsyncOrchestrator] Stage initialization failed, shutting down. Suggestions:\n- %s",
                     "\n- ".join(suggestions),
@@ -370,48 +366,6 @@ class AsyncOmni:
                 self.input_processor = None
                 self.io_processor = None
                 self.model_config = None
-
-    async def generate_legacy(self, *args, **kwargs) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Legacy async generation entrypoint (backward compatibility).
-
-        Coordinates multi-stage pipeline through YAML configuration.
-        Each stage will use AsyncOmniLLM or AsyncOmniDiffusion based on stage_type.
-
-        Args:
-            prompts: Input prompts for generation.
-            sampling_params_list: Optional list of per-stage parameters.
-                - For LLM stages: vLLM ``SamplingParams``
-                - For diffusion stages: plain ``dict``.
-            **kwargs: Parameters used to construct per-stage parameters when
-                ``sampling_params_list`` is not provided.
-        """
-        prompts = args[0] if args else kwargs.get("prompts")
-        sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
-        if prompts is None:
-            if kwargs.get("prompt") is None:
-                raise ValueError("prompts is required for generation")
-            prompts = kwargs.get("prompt")
-
-        if sampling_params_list is None:
-            omni_params_kwargs = {k: v for k, v in kwargs.items() if k != "prompts"}
-
-            per_stage_params: list[Any] = []
-            for stage in self.stage_list:
-                stage_type = getattr(stage, "stage_type", "llm")
-                default_dict = msgspec.to_builtins(getattr(stage, "default_sampling_params", {}))
-                # Merge user-provided kwargs
-                merged = {**default_dict, **omni_params_kwargs}
-                if stage_type == "diffusion":
-                    # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
-                    per_stage_params.append(merged)
-                else:
-                    # LLM directly constructs SamplingParams
-                    per_stage_params.append(SamplingParams(**merged))
-
-            sampling_params_list = per_stage_params
-
-        async for output in self._run_generation_async(prompts, sampling_params_list):
-            yield output
 
     async def _run_generation_async(
         self,
@@ -658,7 +612,7 @@ class AsyncOmni:
         # Summarize and print statistics
         try:
             summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
-            logger.info("[Summary] %s", summary)
+            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
             logger.exception("[AsyncOrchestrator] Failed to build/log summary: %s", e)
 
