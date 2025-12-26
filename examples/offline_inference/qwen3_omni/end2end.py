@@ -273,6 +273,7 @@ def main(args):
                 # Save audio file with explicit WAV format
                 sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+    omni_llm.close()
 
 
 def parse_args():
