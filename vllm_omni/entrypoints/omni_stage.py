@@ -568,7 +568,7 @@ def _stage_worker(
             while len(batch_tasks) < max_batch_size:
                 if not in_q.empty():
                     extra = in_q.get_nowait()
-                    if extra is SHUTDOWN_TASK:
+                    if extra == SHUTDOWN_TASK:
                         in_q.put(SHUTDOWN_TASK)
                         break
                     batch_tasks.append(extra)
