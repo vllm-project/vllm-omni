@@ -7,6 +7,7 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 import base64
 import concurrent.futures
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -71,6 +72,7 @@ class OmniServer:
             cmd,
             env=env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
+            start_new_session=True,  # Create a new process group to enable killing all child processes
         )
 
         # Wait for server to be ready
@@ -96,12 +98,37 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
-            self.proc.terminate()
             try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
+                # Get the process group ID to kill all child processes
+                pgid = os.getpgid(self.proc.pid)
+                # Ignore SIGTERM signal itself to avoid killing the test process
+                old_signal_handler = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                try:
+                    # Terminate the entire process group (kills all child processes)
+                    os.killpg(pgid, signal.SIGTERM)
+                    # Wait for the process to terminate
+                    try:
+                        self.proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        # If graceful termination fails, force kill
+                        os.killpg(pgid, signal.SIGKILL)
+                        self.proc.wait()
+                finally:
+                    # Restore the signal handler
+                    signal.signal(signal.SIGTERM, old_signal_handler)
+            except (ProcessLookupError, OSError):
+                # Process group may not exist if process already terminated
+                # Try to clean up the process directly
+                try:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                        self.proc.wait()
+                except (ProcessLookupError, OSError):
+                    # Process already terminated, nothing to do
+                    pass
 
 
 @pytest.fixture
