@@ -410,7 +410,6 @@ def _stage_worker(
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     # Use local aliases to avoid conflicts with global imports in worker process
     logger.info(f"Starting stage worker with model: {model}")
-    import logging as _logging
     import os as _os
     import time as _time
 
@@ -564,13 +563,9 @@ def _stage_worker(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            logger.debug(
-                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
-            )
+            logger.debug("[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e)
     # Init engine based on stage_type
-    logger.debug(
-        "[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys())
-    )
+    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage")
@@ -1030,9 +1025,7 @@ async def _stage_worker_async(
                 for key in ["model", "device", "dtype", "enable_cpu_offload"]:
                     if key in engine_args:
                         od_config[key] = engine_args[key]
-            logger.debug(
-                f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id
-            )
+            logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
             stage_engine = AsyncOmniDiffusion(
                 model=model, od_config=od_config, **{k: v for k, v in engine_args.items() if k != "od_config"}
             )
@@ -1257,7 +1250,6 @@ def make_request_stats(
 ):
     from vllm_omni.entrypoints.log_utils import (
         StageRequestMetrics,
-        count_tokens_from_outputs,
     )
 
     num_tokens_out = count_tokens_from_outputs(req_output)

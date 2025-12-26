@@ -27,9 +27,7 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
-from vllm_omni.entrypoints.log_utils import (
-    OrchestratorMetrics
-)
+from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
@@ -142,9 +140,6 @@ class Omni:
 
         # Initialize stats paths
         self._enable_stats: bool = bool(log_stats)
-
-        # Calculate number of stages for log cleanup
-        num_stages = len(self.stage_configs)
 
         self.worker_backend = worker_backend
         self.ray_address = ray_address
@@ -558,4 +553,4 @@ class Omni:
         try:
             self.close()
         except Exception:
-            logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
+            logger.debug("[Orchestrator] __del__ close() raised", exc_info=True)

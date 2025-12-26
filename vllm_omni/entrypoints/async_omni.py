@@ -11,7 +11,6 @@ from dataclasses import asdict
 from pprint import pformat
 from typing import Any
 
-import msgspec
 from omegaconf import OmegaConf
 from vllm.config import VllmConfig
 from vllm.inputs import PromptType
@@ -196,9 +195,6 @@ class AsyncOmni:
 
         # Initialize stats paths
         self._enable_stats: bool = bool(log_stats)
-
-        # Calculate number of stages for log cleanup
-        num_stages = len(self.stage_configs)
 
         self.worker_backend = worker_backend
         self.ray_address = ray_address

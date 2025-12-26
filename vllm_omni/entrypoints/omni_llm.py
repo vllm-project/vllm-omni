@@ -93,9 +93,6 @@ class OmniLLM(LLM):
             self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
         )
 
-        # Calculate number of stages for log cleanup
-        num_stages = len(self.stage_configs)
-
         # Initialize LLM engine
         if "disable_log_stats" not in kwargs:
             kwargs["disable_log_stats"] = True
