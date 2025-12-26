@@ -3,6 +3,7 @@
 # The following config has been verified on 1x H100-80G GPU.
 stage_args:
   - stage_id: 0
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true            # Run this stage in a separate process
       devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
@@ -32,6 +33,7 @@ stage_args:
     output_connectors:
       to_stage_1: mooncake_connector
   - stage_id: 1
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true
       devices: "1"
@@ -63,6 +65,7 @@ stage_args:
     output_connectors:
       to_stage_2: mooncake_connector
   - stage_id: 2
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true
       devices: "2"            # Example: use a different GPU than the previous stage; use "0" if single GPU
