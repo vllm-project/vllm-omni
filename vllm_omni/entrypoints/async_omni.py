@@ -76,9 +76,10 @@ class AsyncOmni:
     asynchronous LLM and Diffusion models.
 
     Args:
-        model: Model name or path to load
-        cli_args: Namespace object containing command-line arguments.
-            Expected attributes include:
+        *args: Variable length argument list.
+            - args[0] (str): Model name or path to load.
+        **kwargs: Arbitrary keyword arguments.
+            - model (str): Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -89,10 +90,10 @@ class AsyncOmni:
               for IPC. Objects larger than this threshold will use shared memory.
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
-        **kwargs: Additional keyword arguments passed to stage engines
+            - Additional keyword arguments passed to stage engines.
 
     Example:
-        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B", cli_args=args)
+        >>> async_llm = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
         >>> async for output in async_llm.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
@@ -101,7 +102,7 @@ class AsyncOmni:
         ...     print(output)
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
         model = args[0] if args else kwargs.get("model", "")
         assert model != "", "Null model id detected, please specify a model id."
         model = omni_snapshot_download(model)

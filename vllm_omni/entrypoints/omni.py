@@ -57,7 +57,23 @@ def omni_snapshot_download(model_id) -> str:
 
 
 class Omni:
-    """Unified entrypoint for both LLM and Diffusion models for better usability."""
+    """Unified entrypoint for both LLM and Diffusion models for better usability.
+    
+    Args:
+        *args: Variable length argument list.
+            - args[0]: Model name or path to load.
+        **kwargs: Arbitrary keyword arguments.
+            - model: Model name or path to load (if not in args).
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are loaded from the model.
+            - log_stats: Whether to enable statistics logging
+              be written to files with stage-specific suffixes.
+
+    Example:
+        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
+        >>> print(outputs)
+    """
 
     def __init__(self, *args, **kwargs):
         model = args[0] if args else kwargs.get("model", "")
@@ -254,19 +270,19 @@ class Omni:
         elif len(self._stages_ready) == num_stages:
             logger.info("[Orchestrator] All stages initialized successfully")
 
-    def generate(self, *args, **kwargs):
+    def generate(self, *args: Any, **kwargs: dict[str, Any]) -> list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
         Orchestrates the multi-stage pipeline based on YAML configuration.
         Each stage will use OmniLLM or OmniDiffusion based on stage_type.
 
         Args:
-            prompts: Input prompts for generation.
-            sampling_params_list: Optional list of per-stage parameters.
-                - For LLM stages: vLLM ``SamplingParams``
-                - For diffusion stages: plain ``dict``.
-            **kwargs: Additional parameters used to construct per-stage params
-                when ``sampling_params_list`` is not provided.
+            *args: Variable length argument list.
+                - args[0]: Input prompts for generation.
+                - args[1]: Optional list of per-stage parameters.
+            **kwargs: Arbitrary keyword arguments.
+                - prompt: Input prompts for generation (if not in args).
+                - sampling_params_list: Optional list of per-stage parameters (if not in args).
 
         Returns:
             List of OmniRequestOutput objects, one for each input prompt.
