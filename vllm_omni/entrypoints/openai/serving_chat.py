@@ -548,6 +548,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         prompt_logprobs = None
         prompt_token_ids = None
         kv_transfer_params = None
+        extra_body = getattr(request, "extra_body", None) or {}
+        fps = extra_body.get("fps")
 
         for omni_outputs in final_outputs:
             choices_data = []
@@ -562,7 +564,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role)
             elif omni_outputs.final_output_type == "image":
-                choices_data = self._create_image_choice(omni_outputs, role)
+                choices_data = self._create_image_choice(omni_outputs, role, fps=fps)
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
@@ -906,7 +908,122 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             choices.append(choice_data)
         return choices
 
-    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str):
+    def _is_video_payload(self, payload: Any) -> bool:
+        if payload is None:
+            return False
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
+        if np is not None and isinstance(payload, np.ndarray):
+            return payload.ndim >= 4
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and isinstance(payload, torch.Tensor):
+            return payload.ndim >= 4
+        return False
+
+    def _video_payload_to_frames(self, payload: Any) -> list[Any]:
+        try:
+            import numpy as np
+        except ImportError:
+            np = None
+        try:
+            import torch
+        except ImportError:
+            torch = None
+
+        if torch is not None and isinstance(payload, torch.Tensor):
+            video_tensor = payload.detach().cpu()
+            if video_tensor.is_floating_point():
+                if video_tensor.min() < 0:
+                    video_tensor = video_tensor.clamp(-1, 1) * 0.5 + 0.5
+                elif video_tensor.max() > 1.0:
+                    video_tensor = video_tensor / 255.0
+            else:
+                video_tensor = video_tensor.float()
+                if video_tensor.max() > 1.0:
+                    video_tensor = video_tensor / 255.0
+            video_array = video_tensor.numpy()
+        elif np is not None and isinstance(payload, np.ndarray):
+            video_array = payload
+            if video_array.dtype.kind in ("f",):
+                if video_array.min() < 0:
+                    video_array = np.clip(video_array, -1, 1)
+                    video_array = (video_array + 1.0) * 0.5
+                elif video_array.max() > 1.0:
+                    video_array = video_array / 255.0
+            else:
+                video_array = video_array.astype(np.float32)
+                if video_array.max() > 1.0:
+                    video_array = video_array / 255.0
+        else:
+            return []
+
+        if video_array.ndim == 5:
+            if video_array.shape[1] in (3, 4):
+                video_array = video_array.transpose(0, 2, 3, 4, 1)
+            elif video_array.shape[2] in (3, 4) and video_array.shape[-1] not in (3, 4):
+                video_array = video_array.transpose(0, 1, 3, 4, 2)
+            video_array = video_array[0]
+        elif video_array.ndim == 4:
+            if video_array.shape[0] in (3, 4) and video_array.shape[-1] not in (3, 4):
+                video_array = video_array.transpose(1, 2, 3, 0)
+            elif video_array.shape[1] in (3, 4) and video_array.shape[-1] not in (3, 4):
+                video_array = video_array.transpose(0, 2, 3, 1)
+        else:
+            return []
+
+        return list(video_array)
+
+    def _encode_video_frames(self, frames: list[Any], fps: int | None) -> str | None:
+        try:
+            from diffusers.utils import export_to_video
+        except ImportError as exc:
+            raise ImportError("diffusers is required for export_to_video.") from exc
+
+        import os
+        import tempfile
+
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        try:
+            if fps is None:
+                export_to_video(frames, tmp_path)
+            else:
+                export_to_video(frames, tmp_path, fps=int(fps))
+            with open(tmp_path, "rb") as f:
+                video_bytes = f.read()
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        return base64.b64encode(video_bytes).decode("utf-8")
+
+    def _build_video_contents(self, videos: list[Any], fps: int | None) -> list[dict[str, Any]]:
+        video_contents: list[dict[str, Any]] = []
+        for video in videos:
+            frames = self._video_payload_to_frames(video)
+            if not frames:
+                continue
+            video_base64 = self._encode_video_frames(frames, fps)
+            if not video_base64:
+                continue
+            video_contents.append(
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": f"data:video/mp4;base64,{video_base64}",
+                    },
+                }
+            )
+        return video_contents
+
+    def _create_image_choice(self, omni_outputs: OmniRequestOutput, role: str, fps: int | None = None):
         """Create chat completion response choices for image output.
 
         Converts image tensor or PIL Image output from diffusion models
@@ -961,6 +1078,30 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                             images.append(Image.fromarray(img_array, mode="RGBA"))
             elif hasattr(final_res, "images") and final_res.images:
                 images = final_res.images
+
+        video_items = [item for item in images if self._is_video_payload(item)]
+        if video_items:
+            video_contents = self._build_video_contents(video_items, fps)
+            if not video_contents:
+                video_contents = [{"type": "text", "text": "Video generation completed but no videos were produced."}]
+
+            import warnings as warnings_module
+
+            with warnings_module.catch_warnings():
+                warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
+                message = ChatMessage.model_construct(role=role)
+                object.__setattr__(message, "content", video_contents)
+                if hasattr(message, "__pydantic_fields_set__"):
+                    message.__pydantic_fields_set__.add("content")
+            choice_data = ChatCompletionResponseChoice(
+                index=0,
+                message=message,
+                logprobs=None,
+                finish_reason="stop",
+                stop_reason=None,
+            )
+            choices.append(choice_data)
+            return choices
 
         # Convert images to base64
         image_contents = []
@@ -1074,6 +1215,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
             guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+            fps = extra_body.get("fps")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -1114,6 +1256,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 gen_kwargs["num_frames"] = num_frames
             if guidance_scale_2 is not None:
                 gen_kwargs["guidance_scale_2"] = guidance_scale_2
+            if fps is not None:
+                gen_kwargs["fps"] = fps
 
             # Add reference image if provided
             if pil_images:
@@ -1153,31 +1297,45 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 result = await self._diffusion_engine.generate(**gen_kwargs)
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
-            images: list[Image.Image] = []
-            if result.request_output["images"]:
-                images = result.request_output["images"]
+            images: list[Any] = []
+            if isinstance(result, OmniRequestOutput) and result.images:
+                images = result.images
+            elif hasattr(result, "request_output") and result.request_output:
+                request_output = result.request_output
+                if isinstance(request_output, dict):
+                    images = request_output.get("images") or []
+                elif hasattr(request_output, "images") and request_output.images:
+                    images = request_output.images
 
-            # Convert images to base64 content
-            image_contents: list[dict[str, Any]] = []
-            for img in images:
-                with BytesIO() as buffer:
-                    img.save(buffer, format="PNG")
-                    img_bytes = buffer.getvalue()
-                img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-                image_contents.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_base64}",
-                        },
-                    }
-                )
-
-            # Build response
-            if not image_contents:
-                content = "Image generation completed but no images were produced."
+            video_items = [item for item in images if self._is_video_payload(item)]
+            if video_items:
+                video_contents = self._build_video_contents(video_items, fps)
+                if not video_contents:
+                    content = "Video generation completed but no videos were produced."
+                else:
+                    content = video_contents
             else:
-                content = image_contents
+                # Convert images to base64 content
+                image_contents: list[dict[str, Any]] = []
+                for img in images:
+                    with BytesIO() as buffer:
+                        img.save(buffer, format="PNG")
+                        img_bytes = buffer.getvalue()
+                    img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    image_contents.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}",
+                            },
+                        }
+                    )
+
+                # Build response
+                if not image_contents:
+                    content = "Image generation completed but no images were produced."
+                else:
+                    content = image_contents
 
             # Use model_construct to bypass validation for multimodal content
             # (ChatMessage.content only accepts str, but we need list for images)
