@@ -6,7 +6,7 @@ import importlib
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.offload import apply_cpu_offload
+from vllm_omni.diffusion.offload import apply_offload_hooks
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
@@ -87,8 +87,8 @@ def initialize_model(
             if hasattr(model.vae, "use_tiling"):
                 model.vae.use_tiling = od_config.vae_use_tiling
         
-        # Apply CPU offloading based on config flags
-        apply_cpu_offload(model, od_config)
+        # Apply CPU offloading with hooks - works for ALL pipelines automatically
+        apply_offload_hooks(model, od_config)
         
         return model
     else:

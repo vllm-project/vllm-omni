@@ -25,7 +25,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.offload import move_to_device, offload_to_cpu
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
@@ -360,14 +359,6 @@ class QwenImagePipeline(
         prompt: str | list[str] = None,
         dtype: torch.dtype | None = None,
     ):
-        # Check if text_encoder CPU offload is enabled
-        should_offload = getattr(self.od_config, "text_encoder_cpu_offload", False)
-        pin_memory = getattr(self.od_config, "pin_cpu_memory", True)
-        
-        # Move text_encoder to GPU if offloaded
-        if should_offload:
-            move_to_device(self.text_encoder, self.device)
-        
         dtype = dtype or self.text_encoder.dtype
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -382,7 +373,7 @@ class QwenImagePipeline(
             truncation=True,
             return_tensors="pt",
         ).to(self.device)
-        # print(f"attention mask: {txt_tokens.attention_mask}")
+        # Note: CPU offloading is handled automatically by hooks in offload.py
         encoder_hidden_states = self.text_encoder(
             input_ids=txt_tokens.input_ids,
             attention_mask=txt_tokens.attention_mask,
@@ -401,10 +392,6 @@ class QwenImagePipeline(
         )
 
         prompt_embeds = prompt_embeds.to(dtype=dtype)
-        
-        # Move text_encoder back to CPU if offloaded
-        if should_offload:
-            offload_to_cpu(self.text_encoder, pin_memory)
 
         return prompt_embeds, encoder_attention_mask
 
@@ -746,14 +733,6 @@ class QwenImagePipeline(
         if output_type == "latent":
             image = latents
         else:
-            # Check if VAE CPU offload is enabled
-            vae_offload = getattr(self.od_config, "vae_cpu_offload", False)
-            pin_memory = getattr(self.od_config, "pin_cpu_memory", True)
-            
-            # Move VAE to GPU if offloaded
-            if vae_offload:
-                move_to_device(self.vae, self.device)
-            
             latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
             latents = latents.to(self.vae.dtype)
             latents_mean = (
@@ -765,12 +744,8 @@ class QwenImagePipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
+            # Note: CPU offloading is handled automatically by hooks in offload.py
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-            # processed_image = self.image_processor.postprocess(image, output_type=output_type)
-            
-            # Move VAE back to CPU if offloaded
-            if vae_offload:
-                offload_to_cpu(self.vae, pin_memory)
 
         return DiffusionOutput(output=image)
 
