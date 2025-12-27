@@ -48,17 +48,34 @@ class OmniDiffusion:
 
         self.od_config = od_config
 
-        config_dict = get_hf_file_to_dict(
-            "model_index.json",
-            od_config.model,
-        )
-        od_config.model_class_name = config_dict.get("_class_name", None)
-        od_config.update_multimodal_support()
-        tf_config_dict = get_hf_file_to_dict(
-            "transformer/config.json",
-            od_config.model,
-        )
-        od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        # Diffusers-style models expose `model_index.json` with `_class_name`.
+        # Bagel models (and other non-diffusers) typically expose `config.json`.
+        try:
+            config_dict = get_hf_file_to_dict(
+                "model_index.json",
+                od_config.model,
+            )
+            od_config.model_class_name = config_dict.get("_class_name", None)
+            od_config.update_multimodal_support()
+
+            tf_config_dict = get_hf_file_to_dict(
+                "transformer/config.json",
+                od_config.model,
+            )
+            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        except (AttributeError, OSError, ValueError):
+            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            if cfg is None:
+                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                od_config.model_class_name = "BagelPipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
+            else:
+                raise
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
@@ -76,11 +93,20 @@ class OmniDiffusion:
             raise ValueError("Prompt must be a string or a list of strings")
 
         requests: list[OmniDiffusionRequest] = []
-        for p in prompts:
+
+        # Check if request_id is provided in kwargs
+        request_id = kwargs.get("request_id")
+
+        for i, p in enumerate(prompts):
+            req_kwargs = kwargs.copy()
+            if request_id is None:
+                # Generate default ID consistent with OmniLLM: "{i}_{uuid}"
+                req_kwargs["request_id"] = f"{i}"
+
             requests.append(
                 prepare_requests(
                     p,
-                    **kwargs,
+                    **req_kwargs,
                 )
             )
         logger.info(f"Prepared {len(requests)} requests for generation.")
