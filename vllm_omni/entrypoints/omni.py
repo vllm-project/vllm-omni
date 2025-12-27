@@ -63,11 +63,20 @@ class Omni:
         *args: Variable length argument list.
             - args[0]: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
+            - model (str): Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
+            - init_sleep_seconds: Number of seconds to sleep between starting
+              each stage process during initialization
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+            - Additional keyword arguments passed to stage engines.
 
     Example:
         >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
