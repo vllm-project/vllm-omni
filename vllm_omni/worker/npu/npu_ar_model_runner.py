@@ -1199,21 +1199,11 @@ class NPUARModelRunner(OmniNPUModelRunner):
                                              input_ids, positions,
                                              intermediate_tensors,
                                              inputs_embeds):
-        model_kwargs_extra = self._build_model_kwargs_extra()
-
-        runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
-        if runtime_info:
-            for i, info in enumerate(runtime_info):
-                if info:
-                    logger.debug(f"[OMNI] req[{i}] runtime_additional_information keys: {list(info.keys())}")
-
-        assert self.model is not None
-        hidden_states = self.model(input_ids=input_ids,
+        hidden_states = self._model_forward(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
                                    inputs_embeds=inputs_embeds,
-                                   **self._init_model_kwargs(),
-                                   **model_kwargs_extra)
+                                   **self._init_model_kwargs())
 
         forward_context = get_forward_context()
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL \
