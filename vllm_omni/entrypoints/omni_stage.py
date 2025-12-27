@@ -14,6 +14,7 @@ import os
 import queue
 import sys
 import traceback
+from dataclasses import fields
 from typing import Any
 
 from vllm.inputs import TextPrompt
@@ -26,6 +27,7 @@ from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors import build_stage_connectors
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
@@ -1021,12 +1023,12 @@ async def _stage_worker_async(
             # For diffusion, we need to extract diffusion-specific config
             od_config = engine_args.get("od_config", {})
             if not od_config:
-                # Create default config from engine_args
+                # Create default config from engine_args using OmniDiffusionConfig fields
                 od_config = {"model": model}
-                # Copy relevant diffusion args
-                for key in ["model", "device", "dtype", "enable_cpu_offload"]:
-                    if key in engine_args:
-                        od_config[key] = engine_args[key]
+                od_field_names = {f.name for f in fields(OmniDiffusionConfig)}
+                for key, value in engine_args.items():
+                    if key in od_field_names:
+                        od_config[key] = value
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
             stage_engine = AsyncOmniDiffusion(
                 model=model, od_config=od_config, **{k: v for k, v in engine_args.items() if k != "od_config"}
