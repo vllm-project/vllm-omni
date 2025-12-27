@@ -156,8 +156,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
+            # Handle dict with single key containing a list of outputs (one per request)
             for key, out in multimodal_outputs.items():
-                pooler_output.append({key: out.detach().to("cpu").contiguous() if out is not None else None})
+                if isinstance(out, list):
+                    # Multiple outputs in a list - one per request
+                    for item in out:
+                        pooler_output.append({key: item.detach().to("cpu").contiguous() if item is not None else None})
+                else:
+                    # Single output - treat as before
+                    pooler_output.append({key: out.detach().to("cpu").contiguous() if out is not None else None})
         else:
             raise RuntimeError("Unsupported diffusion output type")
         output = OmniModelRunnerOutput(
@@ -184,6 +191,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     def _run_generation_model(
         self,
         *,
+        scheduler_output: SchedulerOutput,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor | None,
         intermediate_tensors: IntermediateTensors | None,
@@ -201,6 +209,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             Audio waveforms: [batch, 1, waveform_len] or list of tensors
         """
         # Keep inputs identical to AR runner
+        # Get per-request token counts for variable-length sequences
+        req_ids = self.input_batch.req_ids
+        tokens_per_req = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+
         kwargs = dict(
             input_ids=input_ids,
             positions=positions,
@@ -210,6 +222,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             sampling_metadata=self.input_batch.sampling_metadata,
             logits_index=logits_indices,
             sampler=self.sampler,
+            num_reqs=self.input_batch.num_reqs,  # Pass batch size to model
+            tokens_per_req=tokens_per_req,  # Pass per-request token counts
         )
 
         if hasattr(self.model, "forward"):

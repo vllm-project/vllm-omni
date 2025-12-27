@@ -271,6 +271,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
         additional_information: dict[str, object] | None = None,
+        num_reqs: int | None = None,
+        tokens_per_req: list[int] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
@@ -424,37 +426,49 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 3: Code2Wav ==========
         elif self.model_stage == "code2wav":
             # Extract codec codes from input
-            codes = []
-            if input_ids is not None:
-                codes.append(input_ids.reshape(1, 16, -1))
+            # Use batch size and per-request token counts from model runner
+            batch_size = num_reqs if num_reqs is not None else 1
 
+            codes = []
+            if input_ids is not None and tokens_per_req is not None:
+                # Split input_ids using actual per-request token counts (variable-length)
+                start_idx = 0
+                for token_count in tokens_per_req:
+                    end_idx = start_idx + token_count
+                    request_codes = input_ids[start_idx:end_idx]
+                    # Reshape to [1, 16, seq_len] for each request
+                    codes.append(request_codes.reshape(1, 16, -1))
+                    start_idx = end_idx
+            elif input_ids is not None:
+                # Fallback: equal split (for backward compatibility)
+                total_tokens = input_ids.shape[0]
+                tokens_per_request = total_tokens // batch_size
+                for i in range(batch_size):
+                    start_idx = i * tokens_per_request
+                    end_idx = start_idx + tokens_per_request
+                    request_codes = input_ids[start_idx:end_idx]
+                    codes.append(request_codes.reshape(1, 16, -1))
             else:
                 # for profile, we use max length from inputs_embeds
-                codes.append(
-                    torch.zeros(
-                        (1, 16, inputs_embeds.shape[1]),
-                        dtype=torch.long,
-                        device=inputs_embeds.device,
+                for i in range(batch_size):
+                    codes.append(
+                        torch.zeros(
+                            (1, 16, inputs_embeds.shape[1] // batch_size),
+                            dtype=torch.long,
+                            device=inputs_embeds.device,
+                        )
                     )
-                )
-
-            # # Remove EOS token if present
-            # if code[-1] == TALKER_CODEC_EOS_TOKEN_ID:
-            #     code = code[:-1]
 
             # Generate audio from codec codes
             audio_tensors = []
             for code in codes:
                 audio_tensor = self.generate_audio(code, voice_type)
                 audio_tensors.append(audio_tensor)
-            if len(audio_tensors) > 1:
-                logger.warning(
-                    "Batched input for code2wav is not supported yet, only the first audio tensor will be returned"
-                )
 
+            # Return all audio tensors as a list
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": audio_tensors[0].reshape(1, -1)},
+                multimodal_outputs={"model_outputs": audio_tensors},
             )
 
         # Fallback (shouldn't reach here)
