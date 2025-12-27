@@ -59,6 +59,11 @@ _DIFFUSION_MODELS = {
         "pipeline_longcat_image_edit",
         "LongcatImageEditPipeline",
     ),
+    "StableDiffusion3Pipeline": (
+        "sd3",
+        "pipeline_sd3",
+        "StableDiffusion3Pipeline",
+    ),
 }
 
 
@@ -102,6 +107,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
+    "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
