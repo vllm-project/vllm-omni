@@ -13,10 +13,10 @@ from typing import Any
 import msgspec
 from omegaconf import OmegaConf
 from tqdm import tqdm  # Added for progress visualization
-
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
@@ -51,6 +51,7 @@ def omni_snapshot_download(model_id) -> str:
     # modelscope in weight loading feature instead of using `snapshot_download`
     if os.environ.get("VLLM_USE_MODELSCOPE", False):
         from modelscope.hub.snapshot_download import snapshot_download
+
         return snapshot_download(model_id)
     else:
         return _dummy_snapshot_download(model_id)
@@ -140,10 +141,10 @@ class Omni:
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
         # SKIP CODE2WAV: Filter to keep only thinker (stage 0) and talker (stage 1)
-        self.stage_configs = [s for s in self.stage_configs if s['stage_id'] in [0, 1]]
+        self.stage_configs = [s for s in self.stage_configs if s["stage_id"] in [0, 1]]
         for s in self.stage_configs:
-            if s['stage_id'] == 1:
-                s['final_output'] = True
+            if s["stage_id"] == 1:
+                s["final_output"] = True
 
         # Initialize connectors for inter-stage communication
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -293,7 +294,7 @@ class Omni:
             sampling_params_list = per_stage_params
 
         if len(sampling_params_list) > len(self.stage_list):
-            sampling_params_list = sampling_params_list[:len(self.stage_list)]
+            sampling_params_list = sampling_params_list[: len(self.stage_list)]
 
         return self._run_generation(prompts, sampling_params_list)
 
@@ -400,7 +401,9 @@ class Omni:
                     if _m is not None:
                         metrics.on_stage_metrics(stage_id, req_id, _m)
                 except Exception as e:
-                    logger.exception("[Orchestrator] Failed to process metrics for stage %s, req %s: %s", stage_id, req_id, e)
+                    logger.exception(
+                        "[Orchestrator] Failed to process metrics for stage %s, req %s: %s", stage_id, req_id, e
+                    )
 
                 logger.debug("[Orchestrator] Stage-%s completed request %s", stage_id, req_id)
                 stage.set_engine_outputs(engine_outputs)
@@ -423,11 +426,13 @@ class Omni:
                     if elapsed > 0:
                         rps = completed_requests / elapsed
                         tps = metrics.e2e_total_tokens / elapsed if metrics.e2e_total_tokens > 0 else 0.0
-                        pbar.set_postfix({
-                            "req/s": f"{rps:.2f}",
-                            "tok/s": f"{tps:.1f}",
-                            "done": f"{completed_requests}/{total_requests}"
-                        })
+                        pbar.set_postfix(
+                            {
+                                "req/s": f"{rps:.2f}",
+                                "tok/s": f"{tps:.1f}",
+                                "done": f"{completed_requests}/{total_requests}",
+                            }
+                        )
 
                     # Record E2E latency only once per request
                     try:
