@@ -71,6 +71,8 @@ from vllm.tokenizers.mistral import (
 from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -79,7 +81,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class OmniOpenAIServingChat(OpenAIServingChat):
+class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     """OpenAI-compatible chat serving for both LLM and Diffusion models.
 
     This class extends OpenAIServingChat to support:
@@ -860,26 +862,21 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         final_res = omni_outputs.request_output
         audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
 
-        # Convert numpy array to WAV bytes and encode as base64
-        if soundfile is None:
-            raise ImportError(
-                "soundfile is required for audio generation. Please install it with: pip install soundfile"
-            )
-
-        # Default sample rate for TTS models (typically 24000 Hz)
-        # You may need to adjust this based on your model's configuration
-        sample_rate = 24000
-
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
-        # Convert to WAV format and encode as base64
-        with BytesIO() as buffer:
-            soundfile.write(buffer, audio_tensor, sample_rate, format="WAV")
-            wav_bytes = buffer.getvalue()
+        audio_obj = CreateAudio(
+            audio_tensor=audio_tensor,
+            sample_rate=24000,
+            response_format="wav",
+            speed=1.0,
+            stream_format="audio",
+            base64_encode=True,
+        )
 
-        audio_base64 = base64.b64encode(wav_bytes).decode("utf-8")
+        audio_response: AudioResponse = self.create_audio(audio_obj)
+        audio_base64 = audio_response.audio_data
 
         # Generate unique ID for the audio
         audio_id = f"audio-{uuid.uuid4().hex[:16]}"
