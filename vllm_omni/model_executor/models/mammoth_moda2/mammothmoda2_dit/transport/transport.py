@@ -90,8 +90,12 @@ class Transport:
         """
         shape = th.tensor(z.size())
         N = th.prod(shape[1:])
-        _fn = lambda x: -N / 2.0 * np.log(2 * np.pi) - th.sum(x**2) / 2.0
-        return th.vmap(_fn)(z)
+
+        # Use a nested def (instead of lambda) to satisfy ruff E731.
+        def _prior_logp_one(x):
+            return -N / 2.0 * np.log(2 * np.pi) - th.sum(x**2) / 2.0
+
+        return th.vmap(_prior_logp_one)(z)
 
     def check_interval(
         self,
@@ -154,7 +158,7 @@ class Transport:
                     t[_] = 0.0
             # print(t)
         else:
-            raise NotImplementedError("Not implemented snr_type %s" % self.snr_type)
+            raise NotImplementedError(f"Not implemented snr_type {self.snr_type}")
 
         if self.do_shift:
             if self.dynamic_time_shift:
@@ -259,7 +263,7 @@ class Transport:
                     dim=0,
                 )
             else:
-                terms["task_loss"] = mean_flat(((model_output - ut) ** 2))
+                terms["task_loss"] = mean_flat((model_output - ut) ** 2)
         else:
             raise NotImplementedError
 
@@ -306,16 +310,18 @@ class Transport:
         """member function for obtaining score of
         x_t = alpha_t * x + sigma_t * eps"""
         if self.model_type == ModelType.NOISE:
-            score_fn = (
-                lambda x, t, model, **kwargs: model(x, t, **kwargs)
-                / -self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))[0]
-            )
+
+            def score_fn(x, t, model, **kwargs):
+                sigma = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))[0]
+                return model(x, t, **kwargs) / -sigma
         elif self.model_type == ModelType.SCORE:
-            score_fn = lambda x, t, model, **kwagrs: model(x, t, **kwagrs)
+
+            def score_fn(x, t, model, **kwargs):
+                return model(x, t, **kwargs)
         elif self.model_type == ModelType.VELOCITY:
-            score_fn = lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(
-                model(x, t, **kwargs), x, t
-            )
+
+            def score_fn(x, t, model, **kwargs):
+                return self.path_sampler.get_score_from_velocity(model(x, t, **kwargs), x, t)
         else:
             raise NotImplementedError()
 

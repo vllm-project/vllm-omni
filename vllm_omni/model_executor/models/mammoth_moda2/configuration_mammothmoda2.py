@@ -3,8 +3,6 @@
 from typing import ClassVar, Literal
 
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
-from transformers.configuration_utils import layer_type_validation
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
@@ -23,9 +21,9 @@ __all__ = [
 
 class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
     # NOTE: Must not conflict with `Mammothmoda2Qwen2_5_VLConfig.model_type`.
-    # Otherwise, `AutoConfig.for_model(model_type="mammothmoda2_qwen2_5_vl")` might be 
-    # incorrectly parsed as a VisionConfig, causing `llm_config` to become a 
-    # "vision sub-config" where `vision_config` is just a dict, leading to 
+    # Otherwise, `AutoConfig.for_model(model_type="mammothmoda2_qwen2_5_vl")` might be
+    # incorrectly parsed as a VisionConfig, causing `llm_config` to become a
+    # "vision sub-config" where `vision_config` is just a dict, leading to
     # attribute access errors like `vision_config.patch_size` in vLLM.
     model_type = "mammothmoda2_qwen2_5_vl_vision"
     base_config_key = "vision_config"
@@ -138,9 +136,9 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         else:
             self.gen_vocab_start_index = gen_vocab_start_index
 
-        # NOTE: vLLM V1 uses `hf_text_config.vocab_size` for sampling parameter validation 
-        # (e.g., allowed_token_ids). Although MammothModa2's gen vocab is implemented via 
-        # independent gen_embed/gen_head, the overall vocab size should still cover the 
+        # NOTE: vLLM V1 uses `hf_text_config.vocab_size` for sampling parameter validation
+        # (e.g., allowed_token_ids). Although MammothModa2's gen vocab is implemented via
+        # independent gen_embed/gen_head, the overall vocab size should still cover the
         # gen vocab token ID range from the perspective of "output logits dimension".
         if self.extra_gen_vocab:
             self.vocab_size = int(self.gen_vocab_start_index) + int(self.gen_vocab_size)
@@ -214,9 +212,7 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
         self.extra_gen_vocab = getattr(self.text_config, "extra_gen_vocab", extra_gen_vocab)
         self.gen_vocab_size = getattr(self.text_config, "gen_vocab_size", gen_vocab_size)
         self.moe_type = getattr(self.text_config, "moe_type", moe_type)
-        self.gen_vocab_start_index = getattr(
-            self.text_config, "gen_vocab_start_index", gen_vocab_start_index
-        )
+        self.gen_vocab_start_index = getattr(self.text_config, "gen_vocab_start_index", gen_vocab_start_index)
         # Inherit tokenizer_class to prevent AutoTokenizer from falling back to Qwen2.
         self.tokenizer_class = "MammothUTokenizer"
 
@@ -260,9 +256,7 @@ class Mammothmoda2Config(PretrainedConfig):
         if architectures is None:
             self.architectures = ["Mammothmoda2Model"]
         else:
-            self.architectures = [
-                "Mammothmoda2Model" if a.lower() == "mammothmoda2model" else a for a in architectures
-            ]
+            self.architectures = ["Mammothmoda2Model" if a.lower() == "mammothmoda2model" else a for a in architectures]
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.llm_config
@@ -303,11 +297,5 @@ AutoConfig.register(Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5
 AutoConfig.register(Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig)
 
-AutoTokenizer.register(
-    config_class=Mammothmoda2Config,
-    slow_tokenizer_class=MammothUTokenizer
-)
-AutoTokenizer.register(
-    config_class=Mammothmoda2Qwen2_5_VLConfig,
-    slow_tokenizer_class=MammothUTokenizer
-)
+AutoTokenizer.register(config_class=Mammothmoda2Config, slow_tokenizer_class=MammothUTokenizer)
+AutoTokenizer.register(config_class=Mammothmoda2Qwen2_5_VLConfig, slow_tokenizer_class=MammothUTokenizer)

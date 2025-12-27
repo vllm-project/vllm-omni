@@ -20,4 +20,3 @@ class Qwen2RMSNorm(nn.Module):
         variance = x_float.pow(2).mean(-1, keepdim=True)
         x_norm = x_float * torch.rsqrt(variance + self.eps)
         return (x_norm * self.weight).to(dtype)
-

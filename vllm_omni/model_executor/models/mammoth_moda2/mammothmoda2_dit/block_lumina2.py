@@ -24,7 +24,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps
@@ -34,9 +34,8 @@ from transformers.modeling_flash_attention_utils import (
     is_torch_npu_available,
 )
 
-from .rmsnorm import Qwen2RMSNorm
-
 from .embeddings import TimestepEmbedding
+from .rmsnorm import Qwen2RMSNorm
 
 
 def _swiglu(x, y):
@@ -122,7 +121,8 @@ class LuminaLayerNormContinuous(nn.Module):
         x: torch.Tensor,
         conditioning_embedding: torch.Tensor,
     ) -> torch.Tensor:
-        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        # Convert back to the original dtype in case `conditioning_embedding`
+        # is upcasted to float32 (needed for hunyuanDiT).
         scale = self.linear_1(self.silu(conditioning_embedding).to(x.dtype))
         x = self.norm(x) * (1 + scale)[:, None, :]
 
@@ -218,7 +218,7 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
         timestep: torch.Tensor,
         text_hidden_states: torch.Tensor,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         timestep_proj = self.time_proj(timestep).to(dtype=dtype)
         time_embed = self.timestep_embedder(timestep_proj)
         caption_embed = self.caption_embedder(text_hidden_states)

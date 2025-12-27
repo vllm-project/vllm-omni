@@ -2,7 +2,6 @@ from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
     _ModelRegistry,
-    ModelRegistry as VLLMModelRegistry,
 )
 
 _OMNI_MODELS = {
