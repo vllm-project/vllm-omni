@@ -1,11 +1,12 @@
 from ast import Dict
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -33,19 +34,20 @@ class OmniRequestState(RequestState):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.mm_type: Optional[str] = None
-        self.mm_accumulated: Optional[Dict[str, Any]] = None
+        self.mm_type: str | None = None
+        self.mm_accumulated: Dict[str, Any] | None = None
 
     @classmethod
     def from_new_request(
         cls,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request: EngineCoreRequest,
-        prompt: Optional[str],
-        parent_req: Optional[ParentRequest],
+        prompt: str | None,
+        parent_req: ParentRequest | None,
         request_index: int,
-        queue: Optional[Any],
+        queue: Any | None,
         log_stats: bool,
+        stream_interval: int,
     ) -> "OmniRequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -91,9 +93,10 @@ class OmniRequestState(RequestState):
             arrival_time=request.arrival_time,
             queue=queue,
             log_stats=log_stats,
+            stream_interval=stream_interval,
         )
 
-    def add_multimodal_tensor(self, payload: Optional[Any], mm_type: Optional[str]) -> None:
+    def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
             return
         try:
@@ -104,22 +107,23 @@ class OmniRequestState(RequestState):
             def _to_cpu(x):
                 if isinstance(x, torch.Tensor):
                     try:
-                        return x.detach().to("cpu").contiguous()
+                        return x.detach().to("cpu", non_blocking=True).contiguous()
                     except Exception:
                         return x
                 return x
 
             if isinstance(payload, dict):
                 incoming: Dict[str, Any] = {}
-                # Optional remap: if producer used "model_outputs" or "hidden", rename to mm_type
-                # to keep a consistent key namespace per engine_core_output_type.
-                remapped_tensor = dict(payload)
                 target_key = self.mm_type or "hidden"
-                if "model_outputs" in remapped_tensor:
-                    remapped_tensor[target_key] = remapped_tensor.pop("model_outputs")
-                elif "hidden" in remapped_tensor and target_key != "hidden":
-                    remapped_tensor[target_key] = remapped_tensor.pop("hidden")
-                for k, v in remapped_tensor.items():
+
+                # Iterate directly without unnecessary dict copy
+                for k, v in payload.items():
+                    # Optional remap: if producer used "model_outputs" or "hidden", rename to mm_type
+                    if k == "model_outputs":
+                        k = target_key
+                    elif k == "hidden" and target_key != "hidden":
+                        k = target_key
+
                     if isinstance(v, dict):
                         incoming[k] = {str(sk): _to_cpu(sv) for sk, sv in v.items()}
                     else:
@@ -131,29 +135,27 @@ class OmniRequestState(RequestState):
             if self.mm_accumulated is None:
                 self.mm_accumulated = incoming
             else:
-                # Merge keys; concatenate tensors along token dim when possible
+                # Merge keys; accumulate tensors in lists for deferred concatenation
                 for k, v in incoming.items():
                     if k not in self.mm_accumulated:
                         self.mm_accumulated[k] = v
                     else:
                         existing = self.mm_accumulated[k]
                         if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
-                            try:
-                                self.mm_accumulated[k] = torch.cat([existing, v], dim=0)  # type: ignore[index]
-                            except Exception:
-                                self.mm_accumulated[k] = v
+                            # Use list accumulation to avoid O(n²) repeated concatenation
+                            self.mm_accumulated[k] = [existing, v]
+                        elif isinstance(v, torch.Tensor) and isinstance(existing, list):
+                            # Append to existing list
+                            existing.append(v)
                         elif isinstance(v, dict) and isinstance(existing, dict):
-                            # Merge nested dicts by concatenating tensors along token dim when possible
+                            # Merge nested dicts with list accumulation for tensors
                             for sk, sv in v.items():
                                 if sk not in existing:
                                     existing[sk] = sv
-                                    continue
-                                ev = existing[sk]
-                                if isinstance(sv, torch.Tensor) and isinstance(ev, torch.Tensor):
-                                    try:
-                                        existing[sk] = torch.cat([ev, sv], dim=0)
-                                    except Exception:
-                                        existing[sk] = sv
+                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], torch.Tensor):
+                                    existing[sk] = [existing[sk], sv]
+                                elif isinstance(sv, torch.Tensor) and isinstance(existing[sk], list):
+                                    existing[sk].append(sv)
                                 else:
                                     existing[sk] = sv
                         else:
@@ -162,16 +164,38 @@ class OmniRequestState(RequestState):
             # Log and continue without crashing the output pipeline
             logger.exception("Error accumulating multimodal tensor")
 
+    def _consolidate_multimodal_tensors(self) -> None:
+        """Consolidate accumulated tensor lists into single tensors via concatenation."""
+        if self.mm_accumulated is None:
+            return
+        try:
+            for k, v in self.mm_accumulated.items():
+                if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    try:
+                        self.mm_accumulated[k] = torch.cat(v, dim=0)
+                    except Exception:
+                        # Keep last tensor on failure
+                        self.mm_accumulated[k] = v[-1]
+                elif isinstance(v, dict):
+                    for sk, sv in v.items():
+                        if isinstance(sv, list) and sv and isinstance(sv[0], torch.Tensor):
+                            try:
+                                v[sk] = torch.cat(sv, dim=0)
+                            except Exception:
+                                v[sk] = sv[-1]
+        except Exception:
+            logger.exception("Error consolidating multimodal tensors")
+
     # Override: do not route to pooling-only path; always create completion
     # outputs, and attach pooling_result into the CompletionOutput.
     def make_request_output(
         self,
         new_token_ids: list[int],
-        pooling_output: Optional[torch.Tensor],
-        finish_reason: Optional[FinishReason],
-        stop_reason: Optional[Union[int, str]],
-        kv_transfer_params: Optional[dict[str, Any]] = None,
-    ) -> Optional[Union[OmniRequestOutput, PoolingRequestOutput]]:
+        pooling_output: torch.Tensor | None,
+        finish_reason: FinishReason | None,
+        stop_reason: int | str | None,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
         Creates a RequestOutput or PoolingRequestOutput from the generated
@@ -195,6 +219,26 @@ class OmniRequestState(RequestState):
         if not finished and final_only:
             return None
 
+        if self.stream_interval > 1:
+            assert self.detokenizer is not None
+
+            # Send output request only when
+            # 1. It has finished, or
+            # 2. It is the first token, or
+            # 3. It has reached the stream interval number of tokens
+            if not (
+                finished
+                or self.sent_tokens_offset == 0
+                or len(self.detokenizer.output_token_ids) - self.sent_tokens_offset >= self.stream_interval
+            ):
+                return None
+
+            if self.output_kind == RequestOutputKind.DELTA:
+                # Send tokens from the offset in DELTA mode, otherwise all
+                # tokens are sent.
+                new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
+                self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
+
         request_id = self.request_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
 
@@ -210,8 +254,8 @@ class OmniRequestState(RequestState):
     def _new_completion_output(
         self,
         token_ids: list[int],
-        finish_reason: Optional[FinishReason],
-        stop_reason: Optional[Union[int, str]],
+        finish_reason: FinishReason | None,
+        stop_reason: int | str | None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
@@ -246,9 +290,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         log_stats: bool,
-        engine_core_output_type: Optional[str] = None,
+        engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
 
@@ -281,10 +325,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def add_request(
         self,
         request: EngineCoreRequest,
-        prompt: Optional[str],
-        parent_req: Optional[ParentRequest] = None,
+        prompt: str | None,
+        parent_req: ParentRequest | None = None,
         request_index: int = 0,
-        queue: Optional[RequestOutputCollector] = None,
+        queue: RequestOutputCollector | None = None,
     ) -> None:
         """Add a new request to be processed.
 
@@ -313,17 +357,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             request_index=request_index,
             queue=queue,
             log_stats=self.log_stats,
+            stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
-        self.lora_states.add_request(req_state)
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
-        engine_core_timestamp: Optional[float] = None,
-        iteration_stats: Optional[IterationStats] = None,
+        engine_core_timestamp: float | None = None,
+        iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
         """Process engine core outputs into request outputs.
 
@@ -394,6 +438,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # Do not consume pooling path now; keep ids and attach mm later
                 pooling_for_make = None
 
+            # Consolidate any accumulated tensor lists before creating output
+            if isinstance(req_state, OmniRequestState) and finish_reason is not None:
+                req_state._consolidate_multimodal_tensors()
+
             ro = req_state.make_request_output(
                 new_token_ids,
                 pooling_for_make,
@@ -421,6 +469,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 parent_req = req_state.parent_req
                 if parent_req and not parent_req.child_requests:
                     self.parent_requests.pop(parent_req.request_id, None)
+                if not self.request_states:
+                    self._requests_drained.set()
                 if not eco.finished:
                     reqs_to_abort.append(req_id)
                 self._update_stats_from_finished(req_state, finish_reason, iteration_stats)
@@ -524,7 +574,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             except Exception:
                 pass
 
-    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> Optional[torch.Tensor]:
+    def _extract_from_multimodal_outputs(self, eco: EngineCoreOutput, keys: tuple[str, ...]) -> torch.Tensor | None:
         mm = getattr(eco, "multimodal_outputs", None)
         if not isinstance(mm, dict):
             return None

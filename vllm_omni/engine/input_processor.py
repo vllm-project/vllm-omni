@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any, Optional, Union
+from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -9,14 +9,14 @@ from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine.processor import Processor
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.engine import (
     AdditionalInformationEntry,
@@ -29,7 +29,7 @@ from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 logger = init_logger(__name__)
 
 
-class OmniProcessor(Processor):
+class OmniInputProcessor(InputProcessor):
     """Processor for omni models, handling multimodal inputs and embeddings.
 
     Extends the base vLLM Processor with support for processing prompt
@@ -75,7 +75,7 @@ class OmniProcessor(Processor):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
         super().__init__(vllm_config, tokenizer, mm_registry)
@@ -90,14 +90,14 @@ class OmniProcessor(Processor):
         self,
         request_id: str,
         prompt: PromptType,
-        params: Union[SamplingParams, PoolingParams],
-        arrival_time: Optional[float] = None,
-        lora_request: Optional[LoRARequest] = None,
-        tokenization_kwargs: Optional[dict[str, Any]] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
+        params: SamplingParams | PoolingParams,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
-        data_parallel_rank: Optional[int] = None,
-    ) -> tuple[Optional[str], OmniEngineCoreRequest]:
+        data_parallel_rank: int | None = None,
+    ) -> tuple[str | None, OmniEngineCoreRequest]:
         """Process input prompt into an engine core request.
 
         Converts a prompt (text, tokens, or multimodal) into an
@@ -127,8 +127,6 @@ class OmniProcessor(Processor):
             ValueError: If data_parallel_rank is out of range or prompt_embeds
                 has incorrect shape
         """
-        # TODO(woosuk): Support pooling models.
-        # TODO(woosuk): Support encoder-decoder models.
         self._validate_lora(lora_request)
         self._validate_params(params)
 
@@ -158,7 +156,7 @@ class OmniProcessor(Processor):
             # if provided.
             self._validate_multi_modal_uuids(prompt)
             if isinstance(prompt, dict):
-                mm_uuids = prompt.get("multi_modal_uuids")
+                mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
             else:
                 mm_uuids = None
 
@@ -171,11 +169,13 @@ class OmniProcessor(Processor):
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
         )
+
         current_platform.validate_request(
             prompt=prompt,
             params=params,
             processed_inputs=processed_inputs,
         )
+
         eos_token_id = self.input_preprocessor.get_eos_token_id()
 
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
@@ -185,7 +185,7 @@ class OmniProcessor(Processor):
         # discriminated unions of TypedDicts, because of how it handles
         # inheritance of TypedDict. If we explicitly extract the items we want
         # we can avoid type errors from using `dict.get` later in the method.
-        prompt_str: Optional[str] = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
+        _prompt_str: str | None = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
         prompt_token_ids = decoder_inputs["prompt_token_ids"] if decoder_inputs["type"] != "embeds" else None
         prompt_embeds = decoder_inputs["prompt_embeds"] if decoder_inputs["type"] == "embeds" else None
 
@@ -205,7 +205,7 @@ class OmniProcessor(Processor):
             pooling_params = params.clone()
 
         # Multimodal related.
-        mm_features: Optional[list[MultiModalFeatureSpec]] = None
+        mm_features: list[MultiModalFeatureSpec] | None = None
 
         if decoder_inputs["type"] == "multimodal":
             decoder_mm_inputs = decoder_inputs["mm_kwargs"]
@@ -230,8 +230,8 @@ class OmniProcessor(Processor):
 
         # Serialize prompt_embeds and additional_information if provided
         # (direct-transfer path)
-        prompt_embeds_payload: Optional[PromptEmbedsPayload] = None
-        additional_information_payload: Optional[AdditionalInformationPayload] = None
+        prompt_embeds_payload: PromptEmbedsPayload | None = None
+        additional_information_payload: AdditionalInformationPayload | None = None
         if "prompt_embeds" in decoder_inputs:  # type: ignore[operator]
             pe: torch.Tensor = decoder_inputs["prompt_embeds"]  # type: ignore[index]
             if pe.ndim != 2:
@@ -266,7 +266,7 @@ class OmniProcessor(Processor):
                 entries[key] = entry
             additional_information_payload = AdditionalInformationPayload(entries=entries)
 
-        return prompt_str, OmniEngineCoreRequest(
+        return OmniEngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             mm_features=mm_features,

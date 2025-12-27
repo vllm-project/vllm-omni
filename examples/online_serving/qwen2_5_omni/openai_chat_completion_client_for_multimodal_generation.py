@@ -1,11 +1,10 @@
 import base64
 import os
-from typing import Optional
 
 import requests
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
@@ -38,7 +37,7 @@ def encode_base64_content_from_file(file_path: str) -> str:
     return result
 
 
-def get_video_url_from_path(video_path: Optional[str]) -> str:
+def get_video_url_from_path(video_path: str | None) -> str:
     """Convert a video path (local file or URL) to a video URL format for the API.
 
     If video_path is None or empty, returns the default URL.
@@ -77,7 +76,7 @@ def get_video_url_from_path(video_path: Optional[str]) -> str:
     return f"data:{mime_type};base64,{video_base64}"
 
 
-def get_image_url_from_path(image_path: Optional[str]) -> str:
+def get_image_url_from_path(image_path: str | None) -> str:
     """Convert an image path (local file or URL) to an image URL format for the API.
 
     If image_path is None or empty, returns the default URL.
@@ -114,7 +113,7 @@ def get_image_url_from_path(image_path: Optional[str]) -> str:
     return f"data:{mime_type};base64,{image_base64}"
 
 
-def get_audio_url_from_path(audio_path: Optional[str]) -> str:
+def get_audio_url_from_path(audio_path: str | None) -> str:
     """Convert an audio path (local file or URL) to an audio URL format for the API.
 
     If audio_path is None or empty, returns the default URL.
@@ -169,7 +168,7 @@ def get_system_prompt():
     }
 
 
-def get_text_query(custom_prompt: Optional[str] = None):
+def get_text_query(custom_prompt: str | None = None):
     question = (
         custom_prompt or "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words."
     )
@@ -186,10 +185,10 @@ def get_text_query(custom_prompt: Optional[str] = None):
 
 
 def get_mixed_modalities_query(
-    video_path: Optional[str] = None,
-    image_path: Optional[str] = None,
-    audio_path: Optional[str] = None,
-    custom_prompt: Optional[str] = None,
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    custom_prompt: str | None = None,
 ):
     question = (
         custom_prompt or "What is recited in the audio? What is the content of this image? Why is this video funny?"
@@ -222,7 +221,7 @@ def get_mixed_modalities_query(
     return prompt
 
 
-def get_use_audio_in_video_query(video_path: Optional[str] = None, custom_prompt: Optional[str] = None):
+def get_use_audio_in_video_query(video_path: str | None = None, custom_prompt: str | None = None):
     question = custom_prompt or "Describe the content of the video, then convert what the baby say into text."
     video_url = get_video_url_from_path(video_path)
 
@@ -246,7 +245,7 @@ def get_use_audio_in_video_query(video_path: Optional[str] = None, custom_prompt
     return prompt
 
 
-def get_multi_audios_query(audio_path: Optional[str] = None, custom_prompt: Optional[str] = None):
+def get_multi_audios_query(audio_path: str | None = None, custom_prompt: str | None = None):
     question = custom_prompt or "Are these two audio clips the same?"
     audio_url = get_audio_url_from_path(audio_path)
     prompt = {
@@ -342,12 +341,18 @@ def run_multimodal_generation(args) -> None:
     if args.query_type == "use_audio_in_video":
         extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
 
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+    else:
+        output_modalities = None
+
     chat_completion = client.chat.completions.create(
         messages=[
             get_system_prompt(),
             prompt,
         ],
         model=model_name,
+        modalities=output_modalities,
         extra_body=extra_body,
     )
 
@@ -401,6 +406,12 @@ def parse_args():
         type=str,
         default=None,
         help="Custom text prompt/question to use instead of the default prompt for the selected query type.",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Output modalities to use for the prompts.",
     )
 
     return parser.parse_args()

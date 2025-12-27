@@ -69,7 +69,7 @@ class OmniRunner:
         Returns:
             List of SamplingParams with default decoding for each stage
         """
-        return [st.default_sampling_params for st in self.omni.instance.stage_list]
+        return [st.default_sampling_params for st in self.omni.stage_list]
 
     def get_omni_inputs(
         self,
@@ -79,6 +79,7 @@ class OmniRunner:
         images: PromptImageInput = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        modalities: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Construct Omni input format from prompts and multimodal data.
@@ -175,6 +176,8 @@ class OmniRunner:
             input_dict: dict[str, Any] = {"prompt": full_prompt}
             if multi_modal_data:
                 input_dict["multi_modal_data"] = multi_modal_data
+            if modalities:
+                input_dict["modalities"] = modalities
             if mm_processor_kwargs:
                 input_dict["mm_processor_kwargs"] = mm_processor_kwargs
 
@@ -213,6 +216,7 @@ class OmniRunner:
         images: PromptImageInput = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        modalities: list[str] | None = None,
     ) -> list[Any]:
         """
         Convenience method to generate with multimodal inputs.
@@ -236,6 +240,7 @@ class OmniRunner:
             images=images,
             videos=videos,
             mm_processor_kwargs=mm_processor_kwargs,
+            modalities=modalities,
         )
         return self.generate(omni_inputs, sampling_params_list)
 
@@ -332,8 +337,8 @@ class OmniRunner:
 
     def close(self):
         """Close and cleanup the Omni instance."""
-        if hasattr(self.omni.instance, "close"):
-            self.omni.instance.close()
+        if hasattr(self.omni, "close"):
+            self.omni.close()
 
 
 @pytest.fixture(scope="session")

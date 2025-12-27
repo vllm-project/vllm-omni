@@ -4,7 +4,8 @@
 # and vllm_omni.entrypoints.omni_llm.py
 
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .utils.logging import get_connector_logger
 
@@ -90,7 +91,7 @@ def try_recv_via_connector(
     task: dict[str, Any],
     connectors: dict[Any, Any],
     stage_id: int,
-) -> tuple[Any, Optional[dict[str, Any]]]:
+) -> tuple[Any, dict[str, Any] | None]:
     """
     Attempts to resolve input data from either connector or IPC.
     Returns (engine_inputs, rx_metrics) or (None, None) if failed/skipped.
