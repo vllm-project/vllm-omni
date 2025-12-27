@@ -28,7 +28,7 @@
             - exit_status: 1  # Machine occasionally fail
               limit: 1
         agents:
-          queue: cpu_queue_premerge_us_east_1
+          queue: cpu_queue_premerge
 
     {% for step in steps %}
     {% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}

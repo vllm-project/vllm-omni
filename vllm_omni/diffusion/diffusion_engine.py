@@ -4,7 +4,9 @@
 import multiprocessing as mp
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -12,6 +14,7 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import get_diffusion_post_process_func, get_diffusion_pre_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler, scheduler
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
 logger = init_logger(__name__)
@@ -82,12 +85,86 @@ class DiffusionEngine:
                 raise Exception(f"{output.error}")
             logger.info("Generation completed successfully.")
 
+            if output.output is None:
+                logger.warning("Output is None, returning empty OmniRequestOutput")
+                # Return empty output for the first request
+                if len(requests) > 0:
+                    request = requests[0]
+                    request_id = request.request_id or ""
+                    prompt = request.prompt
+                    if isinstance(prompt, list):
+                        prompt = prompt[0] if prompt else None
+                    return OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics={},
+                        latents=None,
+                    )
+                return None
+
             postprocess_start_time = time.time()
-            result = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+            images = self.post_process_func(output.output) if self.post_process_func is not None else output.output
             postprocess_time = time.time() - postprocess_start_time
             logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
 
-            return result
+            # Convert to OmniRequestOutput format
+            # Ensure images is a list
+            if not isinstance(images, list):
+                images = [images] if images is not None else []
+
+            # Handle single request or multiple requests
+            if len(requests) == 1:
+                # Single request: return single OmniRequestOutput
+                request = requests[0]
+                request_id = request.request_id or ""
+                prompt = request.prompt
+                if isinstance(prompt, list):
+                    prompt = prompt[0] if prompt else None
+
+                metrics = {}
+                if output.trajectory_timesteps is not None:
+                    metrics["trajectory_timesteps"] = output.trajectory_timesteps
+
+                return OmniRequestOutput.from_diffusion(
+                    request_id=request_id,
+                    images=images,
+                    prompt=prompt,
+                    metrics=metrics,
+                    latents=output.trajectory_latents,
+                )
+            else:
+                # Multiple requests: return list of OmniRequestOutput
+                # Split images based on num_outputs_per_prompt for each request
+                results = []
+                image_idx = 0
+
+                for request in requests:
+                    request_id = request.request_id or ""
+                    prompt = request.prompt
+                    if isinstance(prompt, list):
+                        prompt = prompt[0] if prompt else None
+
+                    # Get images for this request
+                    num_outputs = request.num_outputs_per_prompt
+                    request_images = images[image_idx : image_idx + num_outputs] if image_idx < len(images) else []
+                    image_idx += num_outputs
+
+                    metrics = {}
+                    if output.trajectory_timesteps is not None:
+                        metrics["trajectory_timesteps"] = output.trajectory_timesteps
+
+                    results.append(
+                        OmniRequestOutput.from_diffusion(
+                            request_id=request_id,
+                            images=request_images,
+                            prompt=prompt,
+                            metrics=metrics,
+                            latents=output.trajectory_latents,
+                        )
+                    )
+
+                return results
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return None
@@ -194,6 +271,77 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Call a method on worker processes and get results immediately.
+
+        Args:
+            method: The method name (str) or callable to execute on workers
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            unique_reply_rank: If set, only get reply from this rank
+
+        Returns:
+            Single result if unique_reply_rank is provided, otherwise list of results
+        """
+        if self._closed:
+            raise RuntimeError("DiffusionEngine is closed.")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        assert isinstance(method, str)
+        send_method = method
+
+        # Prepare RPC request message
+        rpc_request = {
+            "type": "rpc",
+            "method": send_method,
+            "args": args,
+            "kwargs": kwargs,
+            "output_rank": unique_reply_rank,
+        }
+
+        try:
+            # Broadcast RPC request to all workers via unified message queue
+            scheduler.mq.enqueue(rpc_request)
+
+            # Determine which workers we expect responses from
+            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+
+            responses = []
+            for _ in range(num_responses):
+                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                try:
+                    if scheduler.result_mq is None:
+                        raise RuntimeError("Result queue not initialized")
+
+                    response = scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+
+                    # Check if response indicates an error
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        raise RuntimeError(
+                            f"Worker failed with error '{response.get('error')}', "
+                            "please check the stack trace above for the root cause"
+                        )
+
+                    responses.append(response)
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+
+            return responses[0] if unique_reply_rank is not None else responses
+
+        except Exception as e:
+            logger.error(f"RPC call failed: {e}")
+            raise
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_text_config
 from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
@@ -47,7 +48,19 @@ class OmniEngineArgs(EngineArgs):
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
-        return getattr(config_dict["hf_config"], config_dict["hf_config_name"]).get_text_config()
+        hf_config = config_dict["hf_config"]
+        hf_config_name = config_dict["hf_config_name"]
+        try:
+            # Try to get the stage-specific config (e.g., thinker_config, talker_config)
+            stage_config = getattr(hf_config, hf_config_name)
+            return stage_config.get_text_config()
+        except AttributeError:
+            # Fallback: if the attribute doesn't exist, use the default get_hf_text_config
+            logger.warning(
+                f"Config attribute '{hf_config_name}' not found in hf_config, "
+                "falling back to default get_hf_text_config"
+            )
+            return get_hf_text_config(hf_config)
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -117,7 +130,19 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
-        return getattr(config_dict["hf_config"], config_dict["hf_config_name"]).get_text_config()
+        hf_config = config_dict["hf_config"]
+        hf_config_name = config_dict["hf_config_name"]
+        try:
+            # Try to get the stage-specific config (e.g., thinker_config, talker_config)
+            stage_config = getattr(hf_config, hf_config_name)
+            return stage_config.get_text_config()
+        except AttributeError:
+            # Fallback: if the attribute doesn't exist, use the default get_hf_text_config
+            logger.warning(
+                f"Config attribute '{hf_config_name}' not found in hf_config, "
+                "falling back to default get_hf_text_config"
+            )
+            return get_hf_text_config(hf_config)
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):

@@ -48,6 +48,11 @@ _DIFFUSION_MODELS = {
         "stable_audio",
         "pipeline_stable_audio",
         "StableAudioPipeline",
+    "WanImageToVideoPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "Wan22I2VPipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
@@ -57,6 +62,11 @@ _DIFFUSION_MODELS = {
         "longcat_image",
         "pipeline_longcat_image_edit",
         "LongcatImageEditPipeline",
+    ),
+    "StableDiffusion3Pipeline": (
+        "sd3",
+        "pipeline_sd3",
+        "StableDiffusion3Pipeline",
     ),
 }
 
@@ -99,8 +109,10 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
+    "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -111,6 +123,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
+    "WanPipeline": "get_wan22_pre_process_func",
+    "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
 }
 
 
