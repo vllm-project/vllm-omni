@@ -373,7 +373,7 @@ class QwenImagePipeline(
             truncation=True,
             return_tensors="pt",
         ).to(self.device)
-        # Note: CPU offloading is handled automatically by hooks in offload.py
+        # print(f"attention mask: {txt_tokens.attention_mask}")
         encoder_hidden_states = self.text_encoder(
             input_ids=txt_tokens.input_ids,
             attention_mask=txt_tokens.attention_mask,
@@ -744,8 +744,8 @@ class QwenImagePipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            # Note: CPU offloading is handled automatically by hooks in offload.py
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            # processed_image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(output=image)
 

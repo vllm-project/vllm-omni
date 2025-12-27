@@ -86,10 +86,10 @@ def initialize_model(
                 model.vae.use_slicing = od_config.vae_use_slicing
             if hasattr(model.vae, "use_tiling"):
                 model.vae.use_tiling = od_config.vae_use_tiling
-        
+
         # Apply CPU offloading with hooks - works for ALL pipelines automatically
         apply_offload_hooks(model, od_config)
-        
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
