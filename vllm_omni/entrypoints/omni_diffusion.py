@@ -54,6 +54,7 @@ class OmniDiffusion:
         )
         od_config.model_class_name = config_dict.get("_class_name", None)
         od_config.update_multimodal_support()
+        od_config.resolve_model_class_name(config_dict)
         tf_config_dict = get_hf_file_to_dict(
             "transformer/config.json",
             od_config.model,
