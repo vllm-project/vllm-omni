@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -636,3 +636,32 @@ class OmniNPUModelRunner(NPUModelRunner):
                 )
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
+
+    def _model_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
+    ):
+        """Inject omni-specific kwargs into forward and cache model output"""
+        model_kwargs_extra = self._build_model_kwargs_extra()
+
+        runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
+        if runtime_info:
+            for i, info in enumerate(runtime_info):
+                if info:
+                    logger.debug(f"[OMNI] req[{i}] runtime_additional_information keys: {list(info.keys())}")
+
+        model_output = super()._model_forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+            **model_kwargs_extra,
+        )
+        # Cache model output so later sample_tokens can consume multimodal results.
+        self._omni_last_model_output = model_output
+        return model_output
