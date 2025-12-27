@@ -584,78 +584,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         # -------- t2i (AR grid) token constraints --------
         # Constraint logic depends on per-step sampling_metadata + runtime_additional_information.
         # These are passed by the vllm-omni runner via kwargs, so caching them in the model is sufficient.
-        self._last_sampling_metadata = None
         self._last_runtime_additional_information: list[dict[str, Any]] | None = None
-        self._t2i_defaults: dict[str, int] = {}
-        self._try_load_t2i_generation_defaults(vllm_config)
-
-    def _try_load_t2i_generation_defaults(self, vllm_config: VllmConfig) -> None:
-        """Best-effort attempt to read default token ranges from t2i_generation_config.json in the model directory."""
-        try:
-            model_dir = getattr(vllm_config.model_config, "model", None)
-            if not isinstance(model_dir, str) or not model_dir:
-                return
-            cfg_path = Path(model_dir) / "t2i_generation_config.json"
-            if not cfg_path.is_file():
-                return
-            with cfg_path.open("r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            eol = int(cfg.get("eol_token_id"))
-            visual_start = int(cfg.get("visual_token_start_id"))
-            visual_end = int(cfg.get("visual_token_end_id"))
-            self._t2i_defaults = {
-                "eol_token_id": eol,
-                "visual_token_start_id": visual_start,
-                "visual_token_end_id": visual_end,
-            }
-        except Exception:
-            # Do not let default config read failure affect model initialization; the request side can pass it via additional_information.
-            return
-
-    @staticmethod
-    def _is_t2i_request(runtime_info: dict[str, Any]) -> bool:
-        v = runtime_info.get("omni_task", runtime_info.get("task"))
-        if isinstance(v, str):
-            v0 = v
-        elif isinstance(v, (list, tuple)) and v:
-            v0 = v[0]
-        else:
-            return False
-        return str(v0).lower() in {"t2i", "text_image", "text2image"}
-
-    def _get_t2i_runtime_params(self, runtime_info: dict[str, Any]) -> dict[str, int] | None:
-        """Retrieves T2I constraint parameters from runtime_info or defaults."""
-        def _get_int(key: str) -> int | None:
-            val = runtime_info.get(key, self._t2i_defaults.get(key))
-            if val is None:
-                return None
-            try:
-                if isinstance(val, list) and val:
-                    val = val[0]
-                if isinstance(val, torch.Tensor):
-                    if val.numel() == 0:
-                        return None
-                    val = val.flatten()[0].item()
-                return int(val)
-            except Exception:
-                return None
-
-        ar_width = _get_int("ar_width")
-        ar_height = _get_int("ar_height")
-        eol = _get_int("eol_token_id")
-        visual_start = _get_int("visual_token_start_id")
-        visual_end = _get_int("visual_token_end_id")
-        if ar_width is None or eol is None or visual_start is None or visual_end is None:
-            return None
-        params = {
-            "ar_width": ar_width,
-            "eol_token_id": eol,
-            "visual_token_start_id": visual_start,
-            "visual_token_end_id": visual_end,
-        }
-        if ar_height is not None:
-            params["ar_height"] = ar_height
-        return params
 
     def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
         """Applies per-request token constraints.
@@ -668,66 +597,48 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         """
         if logits is None or not isinstance(logits, torch.Tensor):
             return logits
-        runtime_infos = getattr(self, "_last_runtime_additional_information", None)
+        
+        runtime_infos = self._last_runtime_additional_information
+
         if runtime_infos is None:
             # There is no runtime info in dummy/profile run
             return logits
 
-        sampling_metadata = getattr(self, "_last_sampling_metadata", None)
-        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) if sampling_metadata is not None else None
-        output_token_ids_list = output_token_ids if isinstance(output_token_ids, list) else []
-
         neg_inf = -float("inf")
-        vocab_size = logits.shape[-1]
-        base_vocab_size = getattr(getattr(self, "language_model", None), "base_vocab_size", None)
-
-        for i in range(len(runtime_infos)):
+        num_reqs = int(logits.shape[0])
+        for i in range(num_reqs):
             runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
-            if not self._is_t2i_request(runtime_info):
+            if runtime_info["omni_task"][0] != "t2i":
                 # Text/understanding/chat: forbid sampling from the extra gen vocab.
-                if isinstance(base_vocab_size, int) and 0 < base_vocab_size < vocab_size:
-                    logits[i, base_vocab_size:] = neg_inf
+                logits[i, self.language_model.base_vocab_size:] = neg_inf
                 continue
-            params = self._get_t2i_runtime_params(runtime_info)
-            if params is None:
-                continue
+            
+            ar_width = runtime_info["ar_width"][0]
+            ar_height = runtime_info["ar_height"][0]
+            eol_token_id = runtime_info["eol_token_id"][0]
+            visual_start = runtime_info["visual_token_start_id"][0]
+            visual_end = runtime_info["visual_token_end_id"][0]
+            generated_len = runtime_info["generated_len"]
 
-            ar_width = int(params["ar_width"])
-            ar_height = int(params["ar_height"])
-            eol_token_id = int(params["eol_token_id"])
-            visual_start = int(params["visual_token_start_id"])
-            visual_end = int(params["visual_token_end_id"])
             expected_token_num = (ar_width + 1) * ar_height
 
-            if ar_width < 0:
-                continue
-            if not (0 <= eol_token_id < vocab_size):
-                continue
-            # Allow range clipping to within vocab to avoid out-of-bounds access.
-            visual_start_c = max(0, min(visual_start, vocab_size))
-            visual_end_c = max(0, min(visual_end, vocab_size))
-            if visual_end_c <= visual_start_c:
-                continue
-
-            generated_len = len(output_token_ids[i]) if isinstance(output_token_ids[i], list) else 0
-            w = generated_len % (ar_width + 1)
-
             row = logits[i]
-            if w == ar_width:
+            column_id = generated_len % (ar_width + 1)
+            if column_id == ar_width:
                 # End-of-row token: only allow eol.
                 eol_logit = row[eol_token_id].clone()
                 row.fill_(neg_inf)
                 row[eol_token_id] = eol_logit
             else:
                 # Intra-row tokens: only allow visual tokens (explicitly forbid eol).
-                row[:visual_start_c] = neg_inf
-                row[visual_end_c:] = neg_inf
+                row[:visual_start] = neg_inf
+                row[visual_end:] = neg_inf
                 row[eol_token_id] = neg_inf
             
             if generated_len >= expected_token_num:
                 row.fill_(neg_inf)
                 end_of_image_id = 152071
-                row[end_of_image_id] = 1.0  # Allow only end_of_image_id after expected tokens
+                row[end_of_image_id] = 1.0  # Allow only end_of_image_id after expected tokens num
 
         return logits
 
@@ -741,7 +652,6 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
     ):
         # vllm-omni runner passes sampling_metadata and runtime_additional_information in each forward step.
         # compute_logits is called immediately after forward, so caching here enables step-by-step dynamic token constraints.
-        self._last_sampling_metadata = kwargs.get("sampling_metadata")
         runtime_infos = kwargs.get("runtime_additional_information")
         self._last_runtime_additional_information = (
             runtime_infos if isinstance(runtime_infos, list) else None
