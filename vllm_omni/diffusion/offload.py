@@ -6,11 +6,16 @@ This module provides hook-based CPU offloading that works automatically
 with any pipeline - no per-pipeline code changes needed.
 """
 
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -52,7 +57,7 @@ class OffloadHooks:
         logger.debug("Hook: moved %s back to CPU", self._name)
         return output
 
-    def register(self) -> "OffloadHooks":
+    def register(self) -> OffloadHooks:
         """Register the hooks on the module."""
         h1 = self.module.register_forward_pre_hook(self._pre_forward_hook)
         h2 = self.module.register_forward_hook(self._post_forward_hook)
@@ -106,7 +111,7 @@ def _wrap_method_with_offload(module: nn.Module, method_name: str, exec_device: 
     logger.debug("Wrapped %s.%s with offload", module.__class__.__name__, method_name)
 
 
-def apply_offload_hooks(model: nn.Module, od_config) -> list[OffloadHooks]:
+def apply_offload_hooks(model: nn.Module, od_config: OmniDiffusionConfig) -> list[OffloadHooks]:
     """Apply offload hooks to model components based on config.
 
     This is the main entry point for hook-based offloading.
@@ -228,7 +233,7 @@ def move_to_device(module: nn.Module, device: torch.device) -> None:
         pass
 
 
-def apply_cpu_offload(model: nn.Module, od_config) -> None:
+def apply_cpu_offload(model: nn.Module, od_config: OmniDiffusionConfig) -> None:
     """Apply CPU offloading to diffusion model components based on config.
 
     Args:
