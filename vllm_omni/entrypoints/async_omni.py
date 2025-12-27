@@ -84,8 +84,7 @@ class AsyncOmni:
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-            - init_sleep_seconds: Number of seconds to sleep between starting
-              each stage process during initialization
+            - stage_init_timeout: Timeout for initializing a single stage in seconds.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - batch_timeout: Timeout in seconds for batching requests within a stage
@@ -642,7 +641,7 @@ class AsyncOmni:
     def _initialize_stages(
         self,
         model: str,
-        init_sleep_seconds: int,
+        stage_init_timeout: int,
         shm_threshold_bytes: int,
         init_timeout: int,
     ) -> None:
@@ -651,7 +650,7 @@ class AsyncOmni:
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
             idx, cfg = idx_cfg
-            return idx, OmniStage(cfg)
+            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
 
         with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
             futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
@@ -672,7 +671,7 @@ class AsyncOmni:
 
         self._stage_in_queues: list[mp.Queue] = []
         self._stage_out_queues: list[mp.Queue] = []
-        self._init_sleep_seconds = max(0, int(init_sleep_seconds))
+        self._stage_init_timeout = max(0, int(stage_init_timeout))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
         # Wait for all stages to report readiness before seeding
@@ -714,7 +713,6 @@ class AsyncOmni:
             )
 
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
-            time.sleep(self._init_sleep_seconds)
 
     def close(self) -> None:
         """Close all stage processes and clean up resources.
@@ -1041,7 +1039,7 @@ class AsyncOmni:
                         correct.",
                     "Check GPU/host memory availability; reduce model or batch size if needed.",  # noqa: E501
                     "Check model weights path and network reachability (if loading remotely).",  # noqa: E501
-                    "Increase initialization wait time (init_sleep_seconds or \
+                    "Increase initialization wait time (stage_init_timeout or \
                         call-site timeout).",
                 ]
                 logger.error(

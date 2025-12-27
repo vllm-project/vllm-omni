@@ -26,7 +26,7 @@ class OmniRunner:
         self,
         model_name: str,
         seed: int = 42,
-        init_sleep_seconds: int = 20,
+        stage_init_timeout: int = 300,
         batch_timeout: int = 10,
         init_timeout: int = 300,
         shm_threshold_bytes: int = 65536,
@@ -40,7 +40,7 @@ class OmniRunner:
         Args:
             model_name: The model name or path
             seed: Random seed for reproducibility
-            init_sleep_seconds: Sleep time after starting each stage
+            stage_init_timeout: Timeout for initializing a single stage in seconds
             batch_timeout: Timeout for batching in seconds
             init_timeout: Timeout for initializing stages in seconds
             shm_threshold_bytes: Threshold for using shared memory
@@ -54,7 +54,7 @@ class OmniRunner:
         self.omni = Omni(
             model=model_name,
             log_stats=log_stats,
-            init_sleep_seconds=init_sleep_seconds,
+            stage_init_timeout=stage_init_timeout,
             batch_timeout=batch_timeout,
             init_timeout=init_timeout,
             shm_threshold_bytes=shm_threshold_bytes,

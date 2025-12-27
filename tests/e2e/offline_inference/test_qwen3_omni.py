@@ -27,7 +27,7 @@ test_params = [(model, stage_config) for model in models for stage_config in sta
 def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
     """Test processing video, generating audio output."""
     model, stage_config_path = test_config
-    with omni_runner(model, seed=42, stage_configs_path=stage_config_path, init_sleep_seconds=90) as runner:
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
         # Prepare inputs
         question = "Describe the video briefly."
         video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays

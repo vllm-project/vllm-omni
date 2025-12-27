@@ -87,7 +87,7 @@ class OmniStage:
             runtime settings, and stage-specific parameters
     """
 
-    def __init__(self, stage_config: Any):
+    def __init__(self, stage_config: Any, stage_init_timeout: int = 300):
         logger.info(f"[OmniStage] stage_config: {stage_config}")
         self.stage_config = stage_config
         self.engine = None
@@ -258,6 +258,7 @@ class OmniStage:
                         model=model,
                         stage_payload=stage_payload,
                         batch_timeout=batch_timeout,
+                        stage_init_timeout=self._stage_init_timeout,
                     )
                 else:
                     self._ray_actor = start_ray_actor(
@@ -279,6 +280,7 @@ class OmniStage:
                             model,
                             stage_payload,
                             batch_timeout,
+                            self._stage_init_timeout,
                         ),
                     )
                 else:
@@ -290,6 +292,7 @@ class OmniStage:
                             self._in_q,
                             self._out_q,
                             batch_timeout,
+                            self._stage_init_timeout,
                         ),
                     )
                 self._proc.start()
@@ -406,6 +409,7 @@ def _stage_worker(
     in_q: mp.Queue,
     out_q: mp.Queue,
     batch_timeout: int = 10,
+    stage_init_timeout: int = 300,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     # Use local aliases to avoid conflicts with global imports in worker process
@@ -511,7 +515,6 @@ def _stage_worker(
 
                 # Acquire exclusive locks for all devices using fcntl.flock
                 # Locks are automatically released when process dies
-                max_wait_time = 300  # 5 minutes max wait
                 wait_start = _time.time()
                 acquired_lock_fds = []  # Store file descriptors to keep locks alive
 
@@ -539,7 +542,7 @@ def _stage_worker(
                                 _os.close(lock_fd)
 
                                 # Check if we've been waiting too long
-                                if _time.time() - wait_start > max_wait_time:
+                                if _time.time() - wait_start > stage_init_timeout:
                                     logger.warning(
                                         "Timeout waiting for device %s initialization lock, proceeding anyway",
                                         device_id,
@@ -838,8 +841,9 @@ def _stage_worker_async_entry(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
+    stage_init_timeout: int = 300,
 ) -> None:
-    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout))
+    asyncio.run(_stage_worker_async(omni_stage, model, stage_payload, batch_timeout, stage_init_timeout))
 
 
 async def _stage_worker_async(
@@ -847,6 +851,7 @@ async def _stage_worker_async(
     model: str,
     stage_payload: dict[str, Any],
     batch_timeout: int = 10,
+    stage_init_timeout: int = 300,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     # Use local aliases to avoid conflicts with global imports in worker process
@@ -955,7 +960,6 @@ async def _stage_worker_async(
 
                 # Acquire exclusive locks for all devices using fcntl.flock
                 # Locks are automatically released when process dies
-                max_wait_time = 300  # 5 minutes max wait
                 wait_start = _time.time()
                 acquired_lock_fds = []  # Store file descriptors to keep locks alive
 
@@ -983,7 +987,7 @@ async def _stage_worker_async(
                                 _os.close(lock_fd)
 
                                 # Check if we've been waiting too long
-                                if _time.time() - wait_start > max_wait_time:
+                                if _time.time() - wait_start > stage_init_timeout:
                                     logger.warning(
                                         "Timeout waiting for device %s initialization lock, proceeding anyway",
                                         device_id,

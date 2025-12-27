@@ -180,6 +180,7 @@ def main(args):
         stage_configs_path=args.stage_configs_path,
         log_file=log_file,
         log_stats=args.enable_stats,
+        stage_init_timeout=args.stage_init_timeout,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -293,10 +294,10 @@ def parse_args():
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(
-        "--init-sleep-seconds",
+        "--stage-init-timeout",
         type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300)",
     )
     parser.add_argument(
         "--batch-timeout",
