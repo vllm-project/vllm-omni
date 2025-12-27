@@ -22,7 +22,7 @@ Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1. For
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.11.0 --torch-backend=auto
+uv pip install vllm==0.12.0 --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
@@ -91,7 +91,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.11.0rc1 \
+    vllm/vllm-omni:v0.12.0rc1 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 
