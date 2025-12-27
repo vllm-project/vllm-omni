@@ -17,65 +17,6 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 logger = init_logger(__name__)
 
 
-def _maybe_materialize_bagel_config_py(model: str) -> str | None:
-    """Best-effort: ensure `configuration_bagel.py` exists for Bagel repos.
-
-    Some Bagel model repos declare `model_type="bagel"` and rely on remote code,
-    but do not ship `configuration_bagel.py`. With `trust_remote_code=True`,
-    Transformers will error out before we can read `model_type`.
-
-    We keep the original behavior (trust remote code) and only patch in this file
-    when the repo is Bagel and missing it. Returns a local directory path to retry
-    `get_config` with, or None if no action was taken.
-    """
-    try:
-        # If it's already a local directory, patch in place.
-        if os.path.isdir(model):
-            model_dir = model
-        else:
-            # For remote IDs, materialize a local snapshot folder (config-only is enough).
-            # Using HF cache ensures subsequent loads reuse the same folder.
-            from huggingface_hub import snapshot_download
-
-            model_dir = snapshot_download(
-                repo_id=model,
-                allow_patterns=["config.json"],
-                local_files_only=False,
-            )
-
-        cfg_path = os.path.join(model_dir, "config.json")
-        if not os.path.exists(cfg_path):
-            return None
-
-        # Detect Bagel by config.json
-        import json
-
-        with open(cfg_path, encoding="utf-8") as f:
-            cfg = json.load(f)
-        model_type = cfg.get("model_type")
-        architectures = cfg.get("architectures") or []
-        is_bagel = model_type == "bagel" or "BagelForConditionalGeneration" in architectures
-        if not is_bagel:
-            return None
-
-        config_py = os.path.join(model_dir, "configuration_bagel.py")
-        if os.path.exists(config_py):
-            return model_dir
-
-        # Write a minimal config module that satisfies transformers' remote-code lookup.
-        # Keep it tiny: stage config resolution only needs `model_type`.
-        with open(config_py, "w", encoding="utf-8") as f:
-            f.write(
-                "from transformers.configuration_utils import PretrainedConfig\n\n\n"
-                "class BagelConfig(PretrainedConfig):\n"
-                '    model_type = "bagel"\n'
-            )
-        return model_dir
-    except Exception:
-        # Best-effort only; caller will handle the original exception path.
-        return None
-
-
 def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     """Try to get class name from diffusers model configuration files.
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-BagelPipeline implementation for vLLM Omni.
+BagelPipeline implementation for vLLM-Omni.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams
-from .bagel_core import Bagel, BagelConfig
+from .bagel_transformer import Bagel, BagelConfig
 from .qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
 from .utils import BagelGenParams, add_special_tokens
 
@@ -213,18 +214,6 @@ class BagelPipeline(nn.Module):
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-
-        # Optional image conditioning: if provided, just treat it as "present image" input.
-        # NOTE: Full image-conditioned editing requires prepare_vae_images + cache update; not yet wired here.
-        if req.pil_image is not None:
-            # Keep prompt consistent; for now we only use it to set output size.
-            _ = req.pil_image  # reserved
-            # In practice you would encode the image into context here.
-            # gen_params.cfg_img_scale = 1.0 # No longer supported
-            pass
-
-        # Initialize cfg_text_context REMOVED
-        # cfg_text_context = copy.deepcopy(gen_context)
 
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
