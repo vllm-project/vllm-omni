@@ -9,6 +9,14 @@ This example edits an input image with `Qwen/Qwen-Image-Edit` using the `image_e
 
 ### Single Image Editing
 
+Download the example image:
+
+```bash
+wget https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png
+```
+
+Then run:
+
 ```bash
 python image_edit.py \
   --image qwen_bear.png \
@@ -20,7 +28,7 @@ python image_edit.py \
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
 
-For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or later version:
+For multiple image inputs, use `Qwen/Qwen-Image-Edit-2509` or  `Qwen/Qwen-Image-Edit-2511`:
 
 ```bash
 python image_edit.py \
@@ -48,4 +56,8 @@ Key arguments:
 ??? abstract "image_edit.py"
     ``````py
     --8<-- "examples/offline_inference/image_to_image/image_edit.py"
+    ``````
+??? abstract "run_qwen_image_edit_2511.sh"
+    ``````sh
+    --8<-- "examples/offline_inference/image_to_image/run_qwen_image_edit_2511.sh"
     ``````

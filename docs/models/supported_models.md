@@ -24,10 +24,12 @@ th {
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
-| `WanPipeline` | Wan2.2 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| `WanPipeline` | Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` |
+| `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
-|`LongCatImageEditPipeline` | LongCat-Image | `meituan-longcat/LongCat-Image-Edit` |
+|`LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` |
+|`StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` |
 
 
 ## List of Supported Models for NPU
@@ -43,3 +45,8 @@ th {
 |--------------|--------|-------------------|
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B`|
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
+| `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
+| `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
+| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
+| `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2511 | `Qwen/Qwen-Image-Edit-2511` |
+|`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |

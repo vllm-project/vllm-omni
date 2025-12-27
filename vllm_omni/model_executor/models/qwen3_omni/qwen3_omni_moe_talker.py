@@ -48,7 +48,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
-from vllm_omni.model_executor.models.utils import safe_tensor_reshape
 
 logger = init_logger(__name__)
 
@@ -368,75 +367,22 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
     def forward(
         self,
-        batched_talker_inputs: dict,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        """Forward pass through the talker model.
-
-        For inference, the talker receives inputs_embeds that should already be
-        projected to talker's hidden dimension. If receiving raw thinker outputs,
-        use project_thinker_outputs() first.
-        """
-        # If intermediate_tensors is provided (pipeline parallel),
-        # inputs_embeds should be None
-        batched_input_ids = []
-        batched_positions = []
-        batched_input_embeds = []
-        batched_code_predictor_codes = []
-        if intermediate_tensors is not None:
-            inputs_embeds = None
-        for rid in batched_talker_inputs:
-            input_ids = safe_tensor_reshape(batched_talker_inputs[rid]["input_ids"], (1, -1))
-            positions = batched_talker_inputs[rid]["positions"]
-            inputs_embeds = safe_tensor_reshape(
-                batched_talker_inputs[rid]["inputs_embeds"], (-1, self.config.text_config.hidden_size)
-            )
-            text_step = safe_tensor_reshape(batched_talker_inputs[rid]["text_step"], (1, -1))
-            last_talker_hidden = safe_tensor_reshape(
-                batched_talker_inputs[rid]["last_talker_hidden"], (1, 1, self.config.text_config.hidden_size)
-            )
-            # for profiling
-            if inputs_embeds.shape[-1] == 2048:
-                inputs_embeds = self.text_projection(inputs_embeds)
-            if inputs_embeds.shape[0] == 1:
-                code_predictor_codes, summed_embeddings = self.code_predictor_forward(
-                    input_ids, inputs_embeds.clone(), last_talker_hidden=last_talker_hidden
-                )
-                inputs_embeds = summed_embeddings.clone()
-            else:
-                code_predictor_codes = torch.zeros((0, self.num_code_groups), dtype=torch.long)
-            batched_input_ids.append(input_ids.reshape(-1))
-            batched_positions.append(positions)
-            batched_input_embeds.append((inputs_embeds + text_step).reshape(-1, self.config.text_config.hidden_size))
-            batched_code_predictor_codes.append(code_predictor_codes.squeeze(-1).detach().to("cpu").contiguous())
-        try:
-            talker_input_ids = torch.cat(batched_input_ids, dim=0)
-            talker_positions = torch.cat(batched_positions, dim=0)
-            talker_input_embeds = torch.cat(batched_input_embeds, dim=0)
-        except Exception as e:
-            print(f"Error in talker_input_embeds: {e}")
-            print(f"talker_input_embeds shape: {[tensor.shape for tensor in batched_input_embeds]}")
-            print(f"talker_input_ids shape: {[tensor.shape for tensor in batched_input_ids]}")
-            print(f"talker_positions shape: {[tensor.shape for tensor in batched_positions]}")
-            raise e
+        """Forward pass through the talker model."""
         talker_hidden_states, _ = self.language_model.model(
-            talker_input_ids,
-            talker_positions,
+            input_ids,
+            positions,
             intermediate_tensors,
-            inputs_embeds=talker_input_embeds,
+            inputs_embeds=inputs_embeds,
             **kwargs,
         )
 
-        # Pass talker hidden states to code predictor
-        # Returns: (residual_codes, summed_embeddings=sum of all layer embeddings at each position)
-
-        # Return both talker hidden states and code predictor results
-        # code_predictor_codes: [batch, num_code_groups, seq_len]
-        # summed_embeddings: [batch, seq_len, hidden_size]
-        #   - Sum of all layer embeddings at each position (like Transformers)
-
-        return talker_hidden_states, batched_code_predictor_codes
+        return talker_hidden_states
 
     def compute_logits(
         self,

@@ -6,6 +6,7 @@ E2E online serving test for Qwen-Image-Edit-2509 multi-image input.
 
 import base64
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -66,6 +67,7 @@ class OmniServer:
             cmd,
             env=env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
+            start_new_session=True,
         )
 
         # Wait for server to be ready
@@ -91,11 +93,18 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
-            self.proc.terminate()
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
             try:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.proc.wait()
 
 

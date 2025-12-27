@@ -230,9 +230,6 @@ class QwenImageEditPipeline(
             model, subfolder="processor", local_files_only=local_files_only
         )
 
-        # Initialize cache backend to None (will be set by worker if needed)
-        self._cache_backend = None
-
         self.stage = None
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8

@@ -3,7 +3,7 @@ default_install_hook_types:
   - commit-msg
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v6.0.0
     hooks:
       # list of supported hooks: https://pre-commit.com/hooks.html
       - id: check-yaml
@@ -16,20 +16,20 @@ repos:
         args: ["--markdown-linebreak-ext=md"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.0
+    rev: v0.14.10
     hooks:
     - id: ruff-check
       args: [--output-format, github, --fix]
     - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
-    rev: v1.38.1
+    rev: typos-dict-v0.13.13
     hooks:
       - id: typos
         # only for staged files
 
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.7
+    rev: v1.7.9
     hooks:
       - id: actionlint
         files: ^\.github/workflows/.*\.ya?ml$
