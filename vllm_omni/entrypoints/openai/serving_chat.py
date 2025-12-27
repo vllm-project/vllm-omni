@@ -61,19 +61,20 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
-from vllm.transformers_utils.tokenizers import (
+from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.mistral import (
+    MistralTokenizer,
     maybe_serialize_tool_calls,
     truncate_tool_call_ids,
     validate_request_params,
 )
-from vllm.utils import as_list
+from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
-    from vllm_omni.entrypoints.async_diffusion import AsyncOmniDiffusion
+    from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 
 logger = init_logger(__name__)
 
@@ -231,7 +232,8 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
                 else:
-                    sampling_params_list = None
+                    # Use standard OpenAI API parameters for comprehension stage
+                    sampling_params_list = self._build_sampling_params_list_from_request(request)
 
                 self._log_inputs(
                     request_id,
@@ -262,16 +264,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                enable_force_include_usage=self.enable_force_include_usage,
-            )
+            raise RuntimeError("Not support streaming output now.")
 
         try:
             return await self.chat_completion_full_generator(
@@ -290,7 +283,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
     async def _preprocess_chat(
         self,
         request: ChatLikeRequest | ResponsesRequest,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         messages: list[ChatCompletionMessageParam],
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
@@ -299,7 +292,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         tool_dicts: list[dict[str, Any]] | None = None,
         documents: list[dict[str, str]] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
-        tool_parser: Callable[[AnyTokenizer], ToolParser] | None = None,
+        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[
         list[ConversationMessage],
@@ -415,6 +408,86 @@ class OmniOpenAIServingChat(OpenAIServingChat):
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list
 
+    def _get_comprehension_stage_index(self) -> int:
+        for idx, stage in enumerate(self.engine_client.stage_list):
+            if stage.is_comprehension:
+                return idx
+        raise ValueError("No comprehension stage (is_comprehension=True) found in stage_list")
+
+    # OpenAI API standard sampling parameters that can be safely overridden.
+    # These are the most commonly used parameters with compatible types
+    # between ChatCompletionRequest and SamplingParams.
+    # Users who need more control can use sampling_params_list in extra_body.
+    _OPENAI_SAMPLING_FIELDS: set[str] = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+    }
+
+    def _apply_request_overrides(
+        self,
+        default_params: SamplingParams,
+        request: ChatCompletionRequest,
+    ) -> SamplingParams:
+        """Clone default params and override with user-provided request values.
+
+        Starts with YAML defaults and only overrides fields that the user
+        explicitly provided (non-None values) in the request.
+
+        Args:
+            default_params: Default SamplingParams from stage config YAML.
+            request: The chat completion request containing user-provided values.
+
+        Returns:
+            New SamplingParams with YAML defaults overridden by request values.
+        """
+        params = default_params.clone()
+
+        for field_name in self._OPENAI_SAMPLING_FIELDS:
+            value = getattr(request, field_name, None)
+            if value is not None:
+                setattr(params, field_name, value)
+
+        return params
+
+    def _build_sampling_params_list_from_request(
+        self,
+        request: ChatCompletionRequest,
+    ) -> list[SamplingParams]:
+        """Build sampling_params_list using standard OpenAI API parameters.
+
+        For the comprehension stage, starts with YAML defaults and overrides with
+        user-provided request values. For other stages, uses cloned YAML defaults.
+
+        This approach ensures all YAML defaults (including seed, detokenize, etc.)
+        are preserved while allowing users to override specific parameters.
+
+        Args:
+            request: The chat completion request containing OpenAI API parameters.
+
+        Returns:
+            List of SamplingParams, one for each stage.
+        """
+        default_params_list = self.engine_client.default_sampling_params_list
+        comprehension_idx = self._get_comprehension_stage_index()
+
+        sampling_params_list = []
+        for idx, default_params in enumerate(default_params_list):
+            if isinstance(default_params, dict):
+                default_params = SamplingParams(**default_params)
+            if idx == comprehension_idx:
+                params = self._apply_request_overrides(default_params, request)
+                sampling_params_list.append(params)
+            else:
+                # For other stages, clone default params
+                sampling_params_list.append(default_params.clone())
+
+        return sampling_params_list
+
     def _log_inputs(
         self,
         request_id: str,
@@ -450,7 +523,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         request_id: str,
         model_name: str,
         conversation: list[ConversationMessage],
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
@@ -542,7 +615,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
         self,
         request: ChatCompletionRequest,
         omni_outputs: OmniRequestOutput,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         conversation: list[ConversationMessage],
         role: str,
     ):
@@ -914,9 +987,21 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             content = [{"type": "text", "text": "Image generation completed but no images were produced."}]
 
         # Create response choice
+        # Use model_construct to bypass validation for multimodal content
+        # (ChatMessage.content only accepts str, but we need list for images)
+        # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
+        import warnings as warnings_module
+
+        with warnings_module.catch_warnings():
+            warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
+            message = ChatMessage.model_construct(role=role)
+            object.__setattr__(message, "content", content)
+            # Mark content as set in fields_set to ensure proper serialization
+            if hasattr(message, "__pydantic_fields_set__"):
+                message.__pydantic_fields_set__.add("content")
         choice_data = ChatCompletionResponseChoice(
             index=0,
-            message=ChatMessage(role=role, content=content),
+            message=message,
             logprobs=None,
             finish_reason="stop",
             stop_reason=None,
@@ -1032,14 +1117,49 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # Add reference image if provided
             if pil_images:
-                gen_kwargs["pil_image"] = pil_images[0]
+                if len(pil_images) == 1:
+                    gen_kwargs["pil_image"] = pil_images[0]
+                else:
+                    od_config = getattr(self._diffusion_engine, "od_config", None)
+                    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
+                    if od_config is None:
+                        # TODO: entry is asyncOmni. We hack the od config here.
+                        supports_multimodal_inputs = True
+                    if supports_multimodal_inputs:
+                        gen_kwargs["pil_image"] = pil_images
+                    else:
+                        return self._create_error_response(
+                            "Multiple input images are not supported by the current diffusion model. "
+                            "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
+                            "and send multiple images in the user message content.",
+                            status_code=400,
+                        )
 
             # Generate image
-            result = await self._diffusion_engine.generate(**gen_kwargs)
+            # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
+            if hasattr(self._diffusion_engine, "stage_list"):
+                # AsyncOmni: iterate through async generator to get final output
+                result = None
+                async for output in self._diffusion_engine.generate(
+                    prompt=gen_kwargs["prompt"],
+                    request_id=gen_kwargs.get("request_id"),
+                    sampling_params_list=[gen_kwargs],  # Pass as single-stage params
+                ):
+                    result = output
+                if result is None:
+                    return self._create_error_response("No output generated from AsyncOmni")
+            else:
+                # AsyncOmniDiffusion: direct call
+                result = await self._diffusion_engine.generate(**gen_kwargs)
+            # Extract images from result
+            # Handle nested OmniRequestOutput structure where images might be in request_output
+            images: list[Image.Image] = []
+            if result.request_output["images"]:
+                images = result.request_output["images"]
 
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
-            for img in result.images:
+            for img in images:
                 with BytesIO() as buffer:
                     img.save(buffer, format="PNG")
                     img_bytes = buffer.getvalue()
@@ -1061,7 +1181,16 @@ class OmniOpenAIServingChat(OpenAIServingChat):
 
             # Use model_construct to bypass validation for multimodal content
             # (ChatMessage.content only accepts str, but we need list for images)
-            message = ChatMessage.model_construct(role="assistant", content=content)
+            # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
+            import warnings as warnings_module
+
+            with warnings_module.catch_warnings():
+                warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
+                message = ChatMessage.model_construct(role="assistant")
+                object.__setattr__(message, "content", content)
+                # Mark content as set in fields_set to ensure proper serialization
+                if hasattr(message, "__pydantic_fields_set__"):
+                    message.__pydantic_fields_set__.add("content")
             choice = ChatCompletionResponseChoice.model_construct(
                 index=0,
                 message=message,
@@ -1085,7 +1214,7 @@ class OmniOpenAIServingChat(OpenAIServingChat):
             logger.info(
                 "Diffusion chat completed for request %s: %d images",
                 request_id,
-                len(result.images),
+                len(images),
             )
 
             return response

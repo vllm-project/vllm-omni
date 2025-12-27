@@ -19,6 +19,10 @@ def is_npu() -> bool:
     return detect_device_type() == "npu"
 
 
+def is_rocm() -> bool:
+    return current_platform.is_rocm()
+
+
 def get_device_control_env_var() -> str:
     """Return the environment variable name for device visibility control."""
     if hasattr(current_platform, "device_control_env_var"):

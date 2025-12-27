@@ -29,6 +29,7 @@ class OmniNewRequestData(NewRequestData):
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
+        prefill_token_ids: list[int] | None = None,
     ) -> "OmniNewRequestData":
         """Create OmniNewRequestData from a Request object.
 
@@ -49,5 +50,6 @@ class OmniNewRequestData(NewRequestData):
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
+            prefill_token_ids=prefill_token_ids,
             additional_information=request.additional_information,
         )

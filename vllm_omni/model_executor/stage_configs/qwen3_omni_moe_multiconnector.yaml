@@ -6,6 +6,7 @@
 # The following config has been verified on 2x H100-80G GPUs.
 stage_args:
   - stage_id: 0
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "0,1"
       max_batch_size: 1
@@ -38,6 +39,7 @@ stage_args:
       to_stage_1: connector_of_mooncake
 
   - stage_id: 1
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
        devices: "1"
        max_batch_size: 1
@@ -73,6 +75,7 @@ stage_args:
       to_stage_2: connector_of_mooncake
 
   - stage_id: 2
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "0"
       max_batch_size: 1

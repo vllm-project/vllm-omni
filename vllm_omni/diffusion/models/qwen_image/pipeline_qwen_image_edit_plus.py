@@ -543,6 +543,8 @@ class QwenImageEditPlusPipeline(
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
+            self.transformer.do_true_cfg = do_true_cfg
+
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep / 1000,

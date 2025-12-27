@@ -12,7 +12,7 @@ from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
@@ -134,8 +134,17 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--num-gpus",
             type=int,
-            default=1,
+            default=None,
             help="Number of GPUs to use for diffusion model inference.",
+        )
+        serve_parser.add_argument(
+            "--usp",
+            "--ulysses-degree",
+            dest="ulysses_degree",
+            type=int,
+            default=None,
+            help="Ulysses Sequence Parallelism degree for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
         )
 
         # Cache optimization parameters

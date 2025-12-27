@@ -36,7 +36,7 @@ docker run --rm \
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.11.0rc1 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e .
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

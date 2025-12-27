@@ -183,6 +183,9 @@ The fraction of GPU memory to allocate for this stage within a single GPU chip. 
 
 Default: `0.8`
 
+!!! tip "Memory Configuration Guide"
+    For detailed information on how to calculate memory requirements and properly configure `gpu_memory_utilization`, see the [GPU Memory Calculation and Configuration Guide](./gpu_memory_utilization.md).
+
 #### `engine_args.enforce_eager`
 
 Whether to enforce eager execution mode. When set to `true`, the engine will run in eager mode without using CUDA graphs or other compilation optimizations. Currently, vLLM-Omni only supports eager mode.

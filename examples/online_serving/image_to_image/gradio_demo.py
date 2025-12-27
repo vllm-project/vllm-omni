@@ -15,8 +15,15 @@ import requests
 from PIL import Image
 
 
+def _pil_to_b64_png(img: Image.Image) -> str:
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
 def edit_image(
     input_image: Image.Image,
+    extra_images: list[str] | None,
     prompt: str,
     steps: int,
     guidance_scale: float,
@@ -28,19 +35,23 @@ def edit_image(
     if input_image is None:
         raise gr.Error("Please upload an image first")
 
-    # Convert image to base64
-    buffer = BytesIO()
-    input_image.save(buffer, format="PNG")
-    image_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    images: list[Image.Image] = [input_image]
+    if extra_images:
+        for p in extra_images:
+            try:
+                images.append(Image.open(p).convert("RGB"))
+            except Exception as e:
+                raise gr.Error(f"Failed to open image: {p}. Error: {e}") from e
 
     # Build user message with text and image
+    content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+    for img in images:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_pil_to_b64_png(img)}"}})
+
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-            ],
+            "content": content,
         }
     ]
 
@@ -87,13 +98,21 @@ def create_demo(server_url: str):
 
     with gr.Blocks(title="Qwen-Image-Edit Demo") as demo:
         gr.Markdown("# Qwen-Image-Edit Online Editing")
-        gr.Markdown("Upload an image and describe the editing effect you want")
+        gr.Markdown(
+            "Upload an image and describe the editing effect you want. "
+            "For multi-image editing, upload extra images (requires Qwen-Image-Edit-2509 server)."
+        )
 
         with gr.Row():
             with gr.Column(scale=1):
                 input_image = gr.Image(
                     label="Input Image",
                     type="pil",
+                )
+                extra_images = gr.File(
+                    label="Additional Images (Optional)",
+                    file_count="multiple",
+                    type="filepath",
                 )
                 prompt = gr.Textbox(
                     label="Edit Instruction",
@@ -152,13 +171,13 @@ def create_demo(server_url: str):
             inputs=[prompt],
         )
 
-        def process_edit(img, p, st, g, se, n):
+        def process_edit(img, imgs, p, st, g, se, n):
             actual_seed = se if se >= 0 else None
-            return edit_image(img, p, st, g, actual_seed, n, server_url)
+            return edit_image(img, imgs, p, st, g, actual_seed, n, server_url)
 
         edit_btn.click(
             fn=process_edit,
-            inputs=[input_image, prompt, steps, guidance_scale, seed, negative_prompt],
+            inputs=[input_image, extra_images, prompt, steps, guidance_scale, seed, negative_prompt],
             outputs=[output_image],
         )
 

@@ -3,11 +3,23 @@ from dataclasses import dataclass
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
+from vllm.transformers_utils.config import get_hf_text_config
 from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
 
 logger = init_logger(__name__)
+
+
+def register_omni_models_to_vllm():
+    from vllm.model_executor.models import ModelRegistry
+
+    from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+    supported_archs = ModelRegistry.get_supported_archs()
+    for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
+        if arch not in supported_archs:
+            ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
 
 @dataclass
@@ -36,13 +48,34 @@ class OmniEngineArgs(EngineArgs):
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
-        return getattr(config_dict["hf_config"], config_dict["hf_config_name"]).get_text_config()
+        hf_config = config_dict["hf_config"]
+        hf_config_name = config_dict["hf_config_name"]
+        try:
+            # Try to get the stage-specific config (e.g., thinker_config, talker_config)
+            stage_config = getattr(hf_config, hf_config_name)
+            return stage_config.get_text_config()
+        except AttributeError:
+            # Fallback: if the attribute doesn't exist, use the default get_hf_text_config
+            logger.warning(
+                f"Config attribute '{hf_config_name}' not found in hf_config, "
+                "falling back to default get_hf_text_config"
+            )
+            return get_hf_text_config(hf_config)
+
+    def _ensure_omni_models_registered(self):
+        if hasattr(self, "_omni_models_registered"):
+            return True
+        register_omni_models_to_vllm()
+        self._omni_models_registered = True
+        return True
 
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
+        # register omni models to avoid model not found error
+        self._ensure_omni_models_registered()
 
         # First, get the base ModelConfig from the parent class
         base_config = super().create_model_config()
@@ -97,9 +130,30 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
-        return getattr(config_dict["hf_config"], config_dict["hf_config_name"]).get_text_config()
+        hf_config = config_dict["hf_config"]
+        hf_config_name = config_dict["hf_config_name"]
+        try:
+            # Try to get the stage-specific config (e.g., thinker_config, talker_config)
+            stage_config = getattr(hf_config, hf_config_name)
+            return stage_config.get_text_config()
+        except AttributeError:
+            # Fallback: if the attribute doesn't exist, use the default get_hf_text_config
+            logger.warning(
+                f"Config attribute '{hf_config_name}' not found in hf_config, "
+                "falling back to default get_hf_text_config"
+            )
+            return get_hf_text_config(hf_config)
+
+    def _ensure_omni_models_registered(self):
+        if hasattr(self, "_omni_models_registered"):
+            return True
+        register_omni_models_to_vllm()
+        self._omni_models_registered = True
+        return True
 
     def create_model_config(self) -> OmniModelConfig:
+        # register omni models to avoid model not found error
+        self._ensure_omni_models_registered()
         # First, get the base ModelConfig from the parent class
         base_config = super().create_model_config()
 

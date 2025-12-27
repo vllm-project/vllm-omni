@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
         help="Diffusion model name or local path. Supported models: Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic results.")
+    parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
         "--cfg_scale",
         type=float,
@@ -127,7 +127,7 @@ def main():
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
-    images = omni.generate(
+    outputs = omni.generate(
         args.prompt,
         height=args.height,
         width=args.width,
@@ -142,11 +142,30 @@ def main():
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
+    # Extract images from OmniRequestOutput
+    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    if not outputs or len(outputs) == 0:
+        raise ValueError("No output generated from omni.generate()")
+    logger.info(f"Outputs: {outputs}")
+
+    # Extract images from request_output[0]['images']
+    first_output = outputs[0]
+    if not hasattr(first_output, "request_output") or not first_output.request_output:
+        raise ValueError("No request_output found in OmniRequestOutput")
+
+    req_out = first_output.request_output[0]
+    if not isinstance(req_out, dict) or "images" not in req_out:
+        raise ValueError("Invalid request_output structure or missing 'images' key")
+
+    images = req_out["images"]
+    if not images:
+        raise ValueError("No images found in request_output")
+
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".png"
     stem = output_path.stem or "qwen_image_output"
-    if args.num_images_per_prompt <= 1:
+    if len(images) <= 1:
         images[0].save(output_path)
         print(f"Saved generated image to {output_path}")
     else:
@@ -154,6 +173,8 @@ def main():
             save_path = output_path.parent / f"{stem}_{idx}{suffix}"
             img.save(save_path)
             print(f"Saved generated image to {save_path}")
+
+    omni.close()
 
 
 if __name__ == "__main__":

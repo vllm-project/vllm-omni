@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable
 
+import PIL.Image
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
@@ -18,6 +20,83 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+
+def retrieve_latents(
+    encoder_output: torch.Tensor,
+    generator: torch.Generator | None = None,
+    sample_mode: str = "sample",
+):
+    """Retrieve latents from VAE encoder output."""
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
+
+
+def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+    """Load transformer config from model directory or HF Hub."""
+    if local_files_only:
+        config_path = os.path.join(model_path, subfolder, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                return json.load(f)
+    else:
+        # Try to download config from HF Hub
+        try:
+            from huggingface_hub import hf_hub_download
+
+            config_path = hf_hub_download(
+                repo_id=model_path,
+                filename=f"{subfolder}/config.json",
+            )
+            with open(config_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
+    """Create WanTransformer3DModel from config dict."""
+    kwargs = {}
+
+    if "patch_size" in config:
+        kwargs["patch_size"] = tuple(config["patch_size"])
+    if "num_attention_heads" in config:
+        kwargs["num_attention_heads"] = config["num_attention_heads"]
+    if "attention_head_dim" in config:
+        kwargs["attention_head_dim"] = config["attention_head_dim"]
+    if "in_channels" in config:
+        kwargs["in_channels"] = config["in_channels"]
+    if "out_channels" in config:
+        kwargs["out_channels"] = config["out_channels"]
+    if "text_dim" in config:
+        kwargs["text_dim"] = config["text_dim"]
+    if "freq_dim" in config:
+        kwargs["freq_dim"] = config["freq_dim"]
+    if "ffn_dim" in config:
+        kwargs["ffn_dim"] = config["ffn_dim"]
+    if "num_layers" in config:
+        kwargs["num_layers"] = config["num_layers"]
+    if "cross_attn_norm" in config:
+        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
+    if "eps" in config:
+        kwargs["eps"] = config["eps"]
+    if "image_dim" in config:
+        kwargs["image_dim"] = config["image_dim"]
+    if "added_kv_proj_dim" in config:
+        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
+    if "rope_max_seq_len" in config:
+        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
+    if "pos_embed_seq_len" in config:
+        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
+
+    return WanTransformer3DModel(**kwargs)
 
 
 def get_wan22_post_process_func(
@@ -38,6 +117,52 @@ def get_wan22_post_process_func(
     return post_process_func
 
 
+def get_wan22_pre_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    """Pre-process function for Wan2.2: optionally load and resize input image for I2V mode."""
+    import numpy as np
+    from diffusers.video_processor import VideoProcessor
+
+    video_processor = VideoProcessor(vae_scale_factor=8)
+
+    def pre_process_func(requests: list[OmniDiffusionRequest]) -> list[OmniDiffusionRequest]:
+        for req in requests:
+            # Load image if path is provided
+            if req.image_path is not None and req.pil_image is None:
+                req.pil_image = PIL.Image.open(req.image_path).convert("RGB")
+
+            if req.pil_image is not None:
+                image = req.pil_image
+
+                # Calculate dimensions based on aspect ratio if not provided
+                if req.height is None or req.width is None:
+                    # Default max area for 720P
+                    max_area = 720 * 1280
+                    aspect_ratio = image.height / image.width
+
+                    # Calculate dimensions maintaining aspect ratio
+                    mod_value = 16  # Must be divisible by 16
+                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+
+                    if req.height is None:
+                        req.height = height
+                    if req.width is None:
+                        req.width = width
+
+                # Resize image to target dimensions
+                image = image.resize((req.width, req.height), PIL.Image.Resampling.LANCZOS)
+                req.pil_image = image
+
+                # Preprocess for VAE
+                req.preprocessed_image = video_processor.preprocess(image, height=req.height, width=req.width)
+
+        return requests
+
+    return pre_process_func
+
+
 class Wan22Pipeline(nn.Module):
     def __init__(
         self,
@@ -54,6 +179,19 @@ class Wan22Pipeline(nn.Module):
         model = od_config.model
         local_files_only = os.path.exists(model)
 
+        # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
+        self.expand_timesteps = False
+        if local_files_only:
+            model_index_path = os.path.join(model, "model_index.json")
+            if os.path.exists(model_index_path):
+                with open(model_index_path) as f:
+                    model_index = json.load(f)
+                    self.expand_timesteps = model_index.get("expand_timesteps", False)
+
+        # Check if this is a two-stage model (MoE with transformer_2)
+        transformer_2_path = os.path.join(model, "transformer_2") if local_files_only else None
+        self.has_transformer_2 = transformer_2_path is not None and os.path.exists(transformer_2_path)
+
         # Set up weights sources for transformer(s)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -63,14 +201,17 @@ class Wan22Pipeline(nn.Module):
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer_2",
-                revision=None,
-                prefix="transformer_2.",
-                fall_back_to_pt=True,
-            ),
         ]
+        if self.has_transformer_2:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer_2",
+                    revision=None,
+                    prefix="transformer_2.",
+                    fall_back_to_pt=True,
+                )
+            )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.text_encoder = UMT5EncoderModel.from_pretrained(
@@ -80,9 +221,18 @@ class Wan22Pipeline(nn.Module):
             model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
         ).to(self.device)
 
-        # Initialize transformers without from_pretrained (weights loaded via load_weights)
-        self.transformer = WanTransformer3DModel()
-        self.transformer_2 = WanTransformer3DModel()
+        # Initialize transformers with correct config (weights loaded via load_weights)
+        if local_files_only:
+            transformer_config = load_transformer_config(model, "transformer")
+            self.transformer = create_transformer_from_config(transformer_config)
+            if self.has_transformer_2:
+                transformer_2_config = load_transformer_config(model, "transformer_2")
+                self.transformer_2 = create_transformer_from_config(transformer_2_config)
+            else:
+                self.transformer_2 = None
+        else:
+            self.transformer = WanTransformer3DModel()
+            self.transformer_2 = WanTransformer3DModel() if self.has_transformer_2 else None
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
@@ -142,6 +292,13 @@ class Wan22Pipeline(nn.Module):
         height = req.height or height or 720
         width = req.width or width or 1280
         num_frames = req.num_frames if req.num_frames else frame_num or 81
+
+        # Ensure dimensions are compatible with VAE and patch size
+        # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
+        patch_size = self.transformer.config.patch_size
+        mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
+        height = (height // mod_value) * mod_value
+        width = (width // mod_value) * mod_value
         num_steps = req.num_inference_steps or num_inference_steps or 40
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
@@ -211,19 +368,82 @@ class Wan22Pipeline(nn.Module):
         if self.boundary_ratio is not None:
             boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
 
-        # Latents
-        num_channels_latents = self.transformer.config.in_channels
-        latents = self.prepare_latents(
-            batch_size=prompt_embeds.shape[0],
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-            latents=req.latents,
-        )
+        # Handle I2V mode when expand_timesteps=True and image is provided
+        image = req.pil_image
+        latent_condition = None
+        first_frame_mask = None
+
+        if self.expand_timesteps and image is not None:
+            # I2V mode: encode image and prepare condition
+            from diffusers.video_processor import VideoProcessor
+
+            video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+            # Preprocess image
+            if isinstance(image, PIL.Image.Image):
+                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+                image_tensor = video_processor.preprocess(image, height=height, width=width)
+            else:
+                image_tensor = image
+
+            # Use out_channels for noise latents (not in_channels which includes condition)
+            num_channels_latents = self.transformer.config.out_channels
+            batch_size = prompt_embeds.shape[0]
+
+            # Prepare noise latents
+            latents = self.prepare_latents(
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+                latents=req.latents,
+            )
+
+            # Encode image condition
+            num_latent_frames = latents.shape[2]
+            latent_height = latents.shape[3]
+            latent_width = latents.shape[4]
+
+            image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
+            image_tensor = image_tensor.to(device=device, dtype=self.vae.dtype)
+            latent_condition = retrieve_latents(self.vae.encode(image_tensor), sample_mode="argmax")
+            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+
+            # Normalize condition latents
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(latent_condition.device, latent_condition.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                latent_condition.device, latent_condition.dtype
+            )
+            latent_condition = (latent_condition - latents_mean) * latents_std
+            latent_condition = latent_condition.to(torch.float32)
+
+            # Create mask: 0 for first frame (condition), 1 for rest (to denoise)
+            first_frame_mask = torch.ones(
+                1, 1, num_latent_frames, latent_height, latent_width, dtype=torch.float32, device=device
+            )
+            first_frame_mask[:, :, 0] = 0
+        else:
+            # T2V mode: standard latent preparation
+            num_channels_latents = self.transformer.config.in_channels
+            latents = self.prepare_latents(
+                batch_size=prompt_embeds.shape[0],
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+                latents=req.latents,
+            )
 
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -233,12 +453,30 @@ class Wan22Pipeline(nn.Module):
             self._current_timestep = t
             current_model = self.transformer
             current_guidance_scale = guidance_low
-            if boundary_timestep is not None and t < boundary_timestep:
+            if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                 current_model = self.transformer_2
                 current_guidance_scale = guidance_high
 
-            latent_model_input = latents.to(dtype)
-            timestep = t.expand(latents.shape[0])
+            if self.expand_timesteps and latent_condition is not None:
+                # I2V mode: blend condition with latents using mask
+                latent_model_input = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+                latent_model_input = latent_model_input.to(dtype)
+
+                # Expand timesteps per patch - use floor division to match patch embedding
+                patch_size = self.transformer.config.patch_size
+                num_latent_frames = latents.shape[2]
+                patch_height = latents.shape[3] // patch_size[1]
+                patch_width = latents.shape[4] // patch_size[2]
+
+                # Create mask at patch resolution (same as hidden states sequence length)
+                patch_mask = first_frame_mask[:, :, :, :: patch_size[1], :: patch_size[2]]
+                patch_mask = patch_mask[:, :, :, :patch_height, :patch_width]  # Ensure correct dimensions
+                temp_ts = (patch_mask[0][0] * t).flatten()
+                timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+            else:
+                # T2V mode: standard forward
+                latent_model_input = latents.to(dtype)
+                timestep = t.expand(latents.shape[0])
 
             noise_pred = current_model(
                 hidden_states=latent_model_input,
@@ -261,6 +499,10 @@ class Wan22Pipeline(nn.Module):
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
         self._current_timestep = None
+
+        # For I2V mode: blend final latents with condition
+        if self.expand_timesteps and latent_condition is not None:
+            latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
         # Decode
         if output_type == "latent":

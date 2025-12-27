@@ -68,6 +68,7 @@ class AsyncOmniDiffusion:
         # Load model class name and transformer config
         config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
         od_config.model_class_name = config_dict.get("_class_name", None)
+        od_config.update_multimodal_support()
 
         tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
         od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
@@ -177,7 +178,14 @@ class AsyncOmniDiffusion:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
 
-        # Process results
+        # Check if result is already OmniRequestOutput
+        if isinstance(result, OmniRequestOutput):
+            # Update request_id if needed
+            if not result.request_id:
+                result.request_id = request_id
+            return result
+
+        # Process results if not OmniRequestOutput
         images: list[Image.Image] = []
         if result is not None:
             if isinstance(result, list):
@@ -186,12 +194,6 @@ class AsyncOmniDiffusion:
                         images.append(item)
             elif isinstance(result, Image.Image):
                 images.append(result)
-
-        logger.debug(
-            "Generation completed for request %s, produced %d images",
-            request_id,
-            len(images),
-        )
 
         return OmniRequestOutput.from_diffusion(
             request_id=request_id,

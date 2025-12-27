@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -9,14 +9,14 @@ from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine.processor import Processor
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.engine import (
     AdditionalInformationEntry,
@@ -29,7 +29,7 @@ from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 logger = init_logger(__name__)
 
 
-class OmniProcessor(Processor):
+class OmniInputProcessor(InputProcessor):
     """Processor for omni models, handling multimodal inputs and embeddings.
 
     Extends the base vLLM Processor with support for processing prompt
@@ -75,7 +75,7 @@ class OmniProcessor(Processor):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
         super().__init__(vllm_config, tokenizer, mm_registry)
@@ -127,8 +127,6 @@ class OmniProcessor(Processor):
             ValueError: If data_parallel_rank is out of range or prompt_embeds
                 has incorrect shape
         """
-        # TODO(woosuk): Support pooling models.
-        # TODO(woosuk): Support encoder-decoder models.
         self._validate_lora(lora_request)
         self._validate_params(params)
 
@@ -158,7 +156,7 @@ class OmniProcessor(Processor):
             # if provided.
             self._validate_multi_modal_uuids(prompt)
             if isinstance(prompt, dict):
-                mm_uuids = prompt.get("multi_modal_uuids")
+                mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
             else:
                 mm_uuids = None
 
@@ -171,11 +169,13 @@ class OmniProcessor(Processor):
             tokenization_kwargs=tokenization_kwargs,
             mm_uuids=mm_uuids,
         )
+
         current_platform.validate_request(
             prompt=prompt,
             params=params,
             processed_inputs=processed_inputs,
         )
+
         eos_token_id = self.input_preprocessor.get_eos_token_id()
 
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
@@ -185,7 +185,7 @@ class OmniProcessor(Processor):
         # discriminated unions of TypedDicts, because of how it handles
         # inheritance of TypedDict. If we explicitly extract the items we want
         # we can avoid type errors from using `dict.get` later in the method.
-        prompt_str: str | None = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
+        _prompt_str: str | None = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
         prompt_token_ids = decoder_inputs["prompt_token_ids"] if decoder_inputs["type"] != "embeds" else None
         prompt_embeds = decoder_inputs["prompt_embeds"] if decoder_inputs["type"] == "embeds" else None
 
@@ -266,7 +266,7 @@ class OmniProcessor(Processor):
                 entries[key] = entry
             additional_information_payload = AdditionalInformationPayload(entries=entries)
 
-        return prompt_str, OmniEngineCoreRequest(
+        return OmniEngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             mm_features=mm_features,

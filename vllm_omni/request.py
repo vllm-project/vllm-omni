@@ -2,7 +2,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from vllm.v1.request import Request
-from vllm.v1.structured_output.request import StructuredOutputRequest
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
@@ -57,19 +56,16 @@ class OmniRequest(Request):
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
+            prompt_embeds=request.prompt_embeds,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
             eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
-            structured_output_request=(
-                StructuredOutputRequest(sampling_params=request.sampling_params) if request.sampling_params else None
-            ),
             cache_salt=request.cache_salt,
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
-            prompt_embeds=request.prompt_embeds,
             additional_information=request.additional_information,
         )

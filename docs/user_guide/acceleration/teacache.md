@@ -39,6 +39,16 @@ omni = Omni(
 )
 ```
 
+## Online Serving (OpenAI-Compatible)
+
+Enable TeaCache for online serving by passing `--cache-backend tea_cache` when starting the server:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh": 0.2}'
+```
+
 ## Configuration Parameters
 
 ### `rel_l1_thresh` (float, default: `0.2`)
@@ -87,6 +97,8 @@ cache_config={"rel_l1_thresh": 0.1}  # More conservative caching
 
 ## Supported Models
 
+### ImageGen
+
 <style>
 th {
   white-space: nowrap;
@@ -98,6 +110,12 @@ th {
 |--------------|--------|-------------------|
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
+| `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
+| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
+
+### VideoGen
+
+No VideoGen models are supported by TeaCache yet.
 
 ### Coming Soon
 

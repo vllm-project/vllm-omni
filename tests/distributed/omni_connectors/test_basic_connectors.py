@@ -10,14 +10,36 @@ from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
 
 
-def test_pickle_serialization():
-    """Test basic pickle serialization."""
+def test_basic_serialization():
+    """Test basic msgpack serialization."""
     data = {"key": "value", "list": [1, 2, 3]}
-    serialized = OmniSerializer.serialize(data, method="cloudpickle")
+    serialized = OmniSerializer.serialize(data)
     assert isinstance(serialized, bytes)
 
-    deserialized = OmniSerializer.deserialize(serialized, method="cloudpickle")
+    deserialized = OmniSerializer.deserialize(serialized)
     assert data == deserialized
+
+
+def test_tensor_serialization():
+    """Test torch.Tensor serialization."""
+    import torch
+
+    tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    serialized = OmniSerializer.serialize(tensor)
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert torch.equal(tensor, deserialized)
+
+
+def test_ndarray_serialization():
+    """Test numpy.ndarray serialization."""
+    import numpy as np
+
+    arr = np.array([[1, 2, 3], [4, 5, 6]])
+    serialized = OmniSerializer.serialize(arr)
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert np.array_equal(arr, deserialized)
 
 
 def test_create_shm_connector():

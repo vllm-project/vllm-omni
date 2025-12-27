@@ -221,6 +221,7 @@ datasets/
 outputs/
 results/
 generated/
+output_*/
 
 # Configuration overrides
 configs/local.yaml

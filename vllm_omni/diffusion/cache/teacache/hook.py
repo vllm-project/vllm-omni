@@ -58,10 +58,11 @@ class TeaCacheHook(ModelHook):
         self.rescale_func = np.poly1d(config.coefficients)
         self.state_manager = StateManager(TeaCacheState)
         self.extractor_fn = None
+        self._forward_cnt = 0
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
-        Initialize hook with extractor from config model type.
+        Initialize hook with extractor from config transformer model type.
 
         Args:
             module: The module to initialize the hook for.
@@ -69,9 +70,9 @@ class TeaCacheHook(ModelHook):
         Returns:
             The initialized module.
         """
-        # Get extractor function based on model_type from config
-        # model_type should be the pipeline class name (e.g., "QwenImagePipeline")
-        self.extractor_fn = get_extractor(self.config.model_type)
+        # Get extractor function based on transformer_type from config
+        # transformer_type is the transformer class name (e.g., "QwenImageTransformer2DModel")
+        self.extractor_fn = get_extractor(self.config.transformer_type)
 
         # Set default context
         self.state_manager.set_context("teacache")
@@ -112,7 +113,11 @@ class TeaCacheHook(ModelHook):
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
         # Set context based on CFG branch for separate state tracking
-        cache_branch = kwargs.get("cache_branch", "default")
+        if module.do_true_cfg and self._forward_cnt % 2 == 1:
+            cache_branch = "negative"
+        else:
+            cache_branch = "positive"
+
         context_name = f"teacache_{cache_branch}"
         self.state_manager.set_context(context_name)
         state = self.state_manager.get_state()
@@ -155,6 +160,7 @@ class TeaCacheHook(ModelHook):
         # Update state
         state.previous_modulated_input = ctx.modulated_input.detach()
         state.cnt += 1
+        self._forward_cnt += 1
 
         # ============================================================================
         # POSTPROCESSING (model-specific, via callable)
@@ -221,6 +227,7 @@ class TeaCacheHook(ModelHook):
             The module with reset state.
         """
         self.state_manager.reset()
+        self._forward_cnt = 0
         return module
 
 
@@ -237,9 +244,13 @@ def apply_teacache_hook(module: torch.nn.Module, config: TeaCacheConfig) -> None
         config: TeaCacheConfig specifying caching parameters
 
     Example:
-        >>> config = TeaCacheConfig(rel_l1_thresh=0.2, model_type="Qwen")
+        >>> config = TeaCacheConfig(
+        ...     rel_l1_thresh=0.2,
+        ...     transformer_type="QwenImageTransformer2DModel"
+        ... )
         >>> apply_teacache_hook(transformer, config)
-        >>> # Model now uses TeaCache automatically, no code changes needed!
+        >>> # Transformer bound to the pipeline now uses TeaCache automatically,
+        ... # no code changes needed!
     """
     registry = HookRegistry.get_or_create(module)
     hook = TeaCacheHook(config)

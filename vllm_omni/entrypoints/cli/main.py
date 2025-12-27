@@ -16,7 +16,7 @@ def main():
         return
     else:
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
-        from vllm.utils import FlexibleArgumentParser
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
 
         import vllm_omni.entrypoints.cli.serve
 

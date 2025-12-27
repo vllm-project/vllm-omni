@@ -48,6 +48,14 @@ class AttentionBackend(ABC):
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
+    joint_query: torch.Tensor | None = None
+    # a replicated tensor among processes appended to the front or rear of query, depends the joint_strategy
+    joint_key: torch.Tensor | None = None
+    # a replicated tensor among processes appended to the front or rear of key, depends the joint_strategy
+    joint_value: torch.Tensor | None = None
+    # a replicated tensor among processes appended to the front or rear of value, depends the joint_strategy
+    joint_strategy: str = "front"
+    # the strategy to joint the query, key, and value, can be "front" or "rear"
 
 
 T = TypeVar("T", bound=AttentionMetadata)

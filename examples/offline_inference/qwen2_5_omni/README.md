@@ -1,9 +1,5 @@
 # Qwen2.5-Omni
 
-## 🛠️ Installation
-
-Please refer to [README.md](../../../README.md)
-
 ## Run examples (Qwen2.5-Omni)
 
 ### Multiple Prompts

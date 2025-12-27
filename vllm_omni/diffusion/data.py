@@ -75,6 +75,21 @@ class DiffusionParallelConfig:
             * self.cfg_parallel_size
         )
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DiffusionParallelConfig":
+        """
+        Create DiffusionParallelConfig from a dictionary.
+
+        Args:
+            data: Dictionary containing parallel configuration parameters
+
+        Returns:
+            DiffusionParallelConfig instance with parameters set from dict
+        """
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected parallel config dict, got {type(data)!r}")
+        return cls(**data)
+
 
 @dataclass
 class TransformerConfig:
@@ -221,7 +236,7 @@ class DiffusionCacheConfig:
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
-    model: str
+    model: str | None = None
 
     model_class_name: str | None = None
 
@@ -335,6 +350,9 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
+    # support multi images input
+    supports_multimodal_inputs: bool = False
+
     # Logging
     log_level: str = "info"
 
@@ -377,6 +395,15 @@ class OmniDiffusionConfig:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
+
+        # Convert parallel_config dict to DiffusionParallelConfig if needed
+        # This must be done before accessing parallel_config.world_size
+        if isinstance(self.parallel_config, dict):
+            self.parallel_config = DiffusionParallelConfig.from_dict(self.parallel_config)
+        elif not isinstance(self.parallel_config, DiffusionParallelConfig):
+            # If it's neither dict nor DiffusionParallelConfig, use default config
+            self.parallel_config = DiffusionParallelConfig()
+
         if self.num_gpus is None:
             if self.parallel_config is not None:
                 self.num_gpus = self.parallel_config.world_size
@@ -414,6 +441,9 @@ class OmniDiffusionConfig:
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+    def update_multimodal_support(self) -> None:
+        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

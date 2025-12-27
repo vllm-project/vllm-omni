@@ -23,6 +23,7 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeMLP
+from vllm.model_executor.models.qwen3_omni_moe_thinker import Qwen3Omni_VisionTransformer
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -31,14 +32,12 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
     Qwen3OmniMoeTalkerCodePredictor,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
-    Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeConditionalGenerationMixin,
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
@@ -49,7 +48,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
-from vllm_omni.model_executor.models.utils import safe_tensor_reshape
 
 logger = init_logger(__name__)
 
@@ -106,9 +104,11 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
+        talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
+        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
         self.quant_config = vllm_config.quant_config
         self.prefix = prefix
-
+        self.vllm_config = vllm_config
         self.config = talker_config
         self.vocab_size = talker_config.text_config.vocab_size
         self.router_aux_loss_coef = talker_config.text_config.router_aux_loss_coef
@@ -193,7 +193,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             pos_codes = [layer0_code]  # Start with layer 0: [batch, 1]
 
             # Initial input: [last_talker_hidden, layer0_embed]
-            layer0_embed = self.get_input_embeddings(layer0_code)
+            layer0_embed = self.embed_input_ids(layer0_code)
             prev_embed = layer0_embed  # Track previous layer embedding
             try:
                 current_input = torch.cat([last_talker_hidden, prev_embed], dim=1)  # [batch, 2, hidden_size]
@@ -260,7 +260,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         for pos in range(seq_len):
             # Layer 0 embedding
             layer0_code = result_codes[:, 0, pos : pos + 1]  # [batch, 1]
-            layer0_embed = self.get_input_embeddings(layer0_code)  # [batch, 1, hidden_size]
+            layer0_embed = self.embed_input_ids(layer0_code)  # [batch, 1, hidden_size]
 
             # mid layers hidden states (from CodePredictor)
             mid_residual_hiddens = middle_hidden_states[pos]  # [batch, num_code_groups-2, hidden_size]
@@ -367,80 +367,26 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
     def forward(
         self,
-        batched_talker_inputs: dict,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        """Forward pass through the talker model.
-
-        For inference, the talker receives inputs_embeds that should already be
-        projected to talker's hidden dimension. If receiving raw thinker outputs,
-        use project_thinker_outputs() first.
-        """
-        # If intermediate_tensors is provided (pipeline parallel),
-        # inputs_embeds should be None
-        batched_input_ids = []
-        batched_positions = []
-        batched_input_embeds = []
-        batched_code_predictor_codes = []
-        if intermediate_tensors is not None:
-            inputs_embeds = None
-        for rid in batched_talker_inputs:
-            input_ids = safe_tensor_reshape(batched_talker_inputs[rid]["input_ids"], (1, -1))
-            positions = batched_talker_inputs[rid]["positions"]
-            inputs_embeds = safe_tensor_reshape(
-                batched_talker_inputs[rid]["inputs_embeds"], (-1, self.config.text_config.hidden_size)
-            )
-            text_step = safe_tensor_reshape(batched_talker_inputs[rid]["text_step"], (1, -1))
-            last_talker_hidden = safe_tensor_reshape(
-                batched_talker_inputs[rid]["last_talker_hidden"], (1, 1, self.config.text_config.hidden_size)
-            )
-            # for profiling
-            if inputs_embeds.shape[-1] == 2048:
-                inputs_embeds = self.text_projection(inputs_embeds)
-            if inputs_embeds.shape[0] == 1:
-                code_predictor_codes, summed_embeddings = self.code_predictor_forward(
-                    input_ids, inputs_embeds.clone(), last_talker_hidden=last_talker_hidden
-                )
-                inputs_embeds = summed_embeddings.clone()
-            else:
-                code_predictor_codes = torch.zeros((0, self.num_code_groups), dtype=torch.long)
-            batched_input_ids.append(input_ids.reshape(-1))
-            batched_positions.append(positions)
-            batched_input_embeds.append((inputs_embeds + text_step).reshape(-1, self.config.text_config.hidden_size))
-            batched_code_predictor_codes.append(code_predictor_codes.squeeze(-1).detach().to("cpu").contiguous())
-        try:
-            talker_input_ids = torch.cat(batched_input_ids, dim=0)
-            talker_positions = torch.cat(batched_positions, dim=0)
-            talker_input_embeds = torch.cat(batched_input_embeds, dim=0)
-        except Exception as e:
-            print(f"Error in talker_input_embeds: {e}")
-            print(f"talker_input_embeds shape: {[tensor.shape for tensor in batched_input_embeds]}")
-            print(f"talker_input_ids shape: {[tensor.shape for tensor in batched_input_ids]}")
-            print(f"talker_positions shape: {[tensor.shape for tensor in batched_positions]}")
-            raise e
+        """Forward pass through the talker model."""
         talker_hidden_states, _ = self.language_model.model(
-            talker_input_ids,
-            talker_positions,
+            input_ids,
+            positions,
             intermediate_tensors,
-            inputs_embeds=talker_input_embeds,
+            inputs_embeds=inputs_embeds,
             **kwargs,
         )
 
-        # Pass talker hidden states to code predictor
-        # Returns: (residual_codes, summed_embeddings=sum of all layer embeddings at each position)
-
-        # Return both talker hidden states and code predictor results
-        # code_predictor_codes: [batch, num_code_groups, seq_len]
-        # summed_embeddings: [batch, seq_len, hidden_size]
-        #   - Sum of all layer embeddings at each position (like Transformers)
-
-        return talker_hidden_states, batched_code_predictor_codes
+        return talker_hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata = None,
     ) -> torch.Tensor | None:
         """Compute logits for audio codec codes (layer 0 of RVQ).
 
@@ -471,7 +417,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(**kwargs)
         return mm_input_by_modality
 
-    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings | None:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings | None:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return []
@@ -504,9 +450,14 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
-    def get_input_embeddings(self, input_ids: torch.Tensor, multimodal_embeddings: MultiModalEmbeddings | None = None):
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        is_multimodal: bool = False,
+    ):
         """Get the input embedding layer (for codec tokens)."""
-        return self.language_model.get_input_embeddings(input_ids, multimodal_embeddings)
+        return self.language_model.embed_input_ids(input_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for the talker model.
@@ -695,10 +646,9 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
 
         return forward_with_shared_expert
 
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        generation_steps=None,
+        **kwargs: object,
     ) -> torch.Tensor:
         return self.model.codec_embedding(input_ids)
