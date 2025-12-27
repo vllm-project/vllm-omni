@@ -130,6 +130,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
+                scheduler_output=scheduler_output,
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
