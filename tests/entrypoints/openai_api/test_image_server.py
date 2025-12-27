@@ -133,8 +133,12 @@ def test_client(mock_async_diffusion):
     app.include_router(router)
 
     # Set up app state with diffusion engine
+    # Note: Use diffusion_engine (not engine_client) to trigger diffusion mode in /health
+    app.state.diffusion_engine = mock_async_diffusion
     app.state.engine_client = mock_async_diffusion
     app.state.stage_configs = [{"stage_type": "diffusion"}]
+    # Set diffusion_model_name for /v1/models endpoint (diffusion mode)
+    app.state.diffusion_model_name = "Qwen/Qwen-Image"
     app.state.served_model_names = "Qwen/Qwen-Image"
 
     return TestClient(app)

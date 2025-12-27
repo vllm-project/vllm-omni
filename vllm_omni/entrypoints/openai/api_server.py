@@ -55,6 +55,12 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
+# Remove vllm's /v1/models route to allow vllm_omni's version to take precedence
+# This is necessary because vllm_omni needs different behavior for diffusion mode
+_routes_to_remove = [r for r in router.routes if hasattr(r, "path") and r.path == "/v1/models"]
+for _route in _routes_to_remove:
+    router.routes.remove(_route)
+
 logger = init_logger(__name__)
 
 
