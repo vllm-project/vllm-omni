@@ -48,6 +48,7 @@ _DIFFUSION_MODELS = {
         "stable_audio",
         "pipeline_stable_audio",
         "StableAudioPipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
