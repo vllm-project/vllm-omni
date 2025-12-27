@@ -178,7 +178,14 @@ class AsyncOmniDiffusion:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
 
-        # Process results
+        # Check if result is already OmniRequestOutput
+        if isinstance(result, OmniRequestOutput):
+            # Update request_id if needed
+            if not result.request_id:
+                result.request_id = request_id
+            return result
+
+        # Process results if not OmniRequestOutput
         images: list[Image.Image] = []
         if result is not None:
             if isinstance(result, list):
@@ -187,12 +194,6 @@ class AsyncOmniDiffusion:
                         images.append(item)
             elif isinstance(result, Image.Image):
                 images.append(result)
-
-        logger.debug(
-            "Generation completed for request %s, produced %d images",
-            request_id,
-            len(images),
-        )
 
         return OmniRequestOutput.from_diffusion(
             request_id=request_id,

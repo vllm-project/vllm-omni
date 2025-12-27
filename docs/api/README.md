@@ -4,8 +4,10 @@
 
 Main entry points for vLLM-Omni inference and serving.
 
+
+- [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
-- [vllm_omni.entrypoints.async_omni.AsyncOmniStageLLM][]
+- [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
 - [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
