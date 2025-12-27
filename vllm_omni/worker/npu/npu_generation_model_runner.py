@@ -751,7 +751,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
         )
 
         if hasattr(self.model, "forward"):
-            return self.model.forward(**kwargs)
+            return self._model_forward(**kwargs)
 
         raise RuntimeError(
             "The loaded model does not expose generation interfaces 'sample', "
