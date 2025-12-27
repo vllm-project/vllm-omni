@@ -67,7 +67,12 @@ class WanRotaryPosEmbed(nn.Module):
         # Split dimensions for temporal, height, width
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         t_dim = attention_head_dim - h_dim - w_dim
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+
+        # Use float32 for MPS and ROCm (HIP) to avoid precision issues
+        # ROCm may have different float64 handling characteristics on AMD GPUs
+        is_hip = hasattr(torch.version, "hip") and torch.version.hip is not None
+        use_float32 = torch.backends.mps.is_available() or is_hip
+        freqs_dtype = torch.float32 if use_float32 else torch.float64
 
         freqs_cos = []
         freqs_sin = []
@@ -453,10 +458,13 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        # Store original dtype for consistent casting back
+        orig_dtype = hidden_states.dtype
+
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb.float()
+                self.scale_shift_table.unsqueeze(0).float() + temb.float()
             ).chunk(6, dim=2)
             shift_msa = shift_msa.squeeze(2)
             scale_msa = scale_msa.squeeze(2)
@@ -467,25 +475,23 @@ class WanTransformerBlock(nn.Module):
         else:
             # temb: batch_size, 6, inner_dim (wan2.1/wan2.2 14B)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table + temb.float()
+                self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
         # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).to(orig_dtype)
         attn_output = self.attn1(norm_hidden_states, rotary_emb)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        hidden_states = (hidden_states.float() + attn_output.float() * gate_msa).to(orig_dtype)
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        norm_hidden_states = self.norm2(hidden_states.float()).to(orig_dtype)
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
-            hidden_states
-        )
+        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).to(orig_dtype)
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).to(orig_dtype)
 
         return hidden_states
 
@@ -636,17 +642,21 @@ class WanTransformer3DModel(nn.Module):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # Output norm, projection & unpatchify
+        # Use explicit float32 for modulation to ensure consistent precision across platforms
+        orig_dtype = hidden_states.dtype
         if temb.ndim == 3:
-            shift, scale = (self.scale_shift_table.unsqueeze(0).to(temb.device) + temb.unsqueeze(2)).chunk(2, dim=2)
+            shift, scale = (
+                self.scale_shift_table.unsqueeze(0).to(temb.device).float() + temb.unsqueeze(2).float()
+            ).chunk(2, dim=2)
             shift = shift.squeeze(2)
             scale = scale.squeeze(2)
         else:
-            shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+            shift, scale = (self.scale_shift_table.to(temb.device).float() + temb.unsqueeze(1).float()).chunk(2, dim=1)
 
         shift = shift.to(hidden_states.device)
         scale = scale.to(hidden_states.device)
 
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).to(orig_dtype)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
