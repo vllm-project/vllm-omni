@@ -13,13 +13,13 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.model_executor.models.mammoth_moda2.configuration_mammothmoda2 import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .mammothmoda2_dit import (
+from .mammothmoda2_dit_layer import (
     FlowMatchEulerDiscreteScheduler,
     RotaryPosEmbedReal,
     SimpleQFormerImageRefiner,
     Transformer2DModel,
 )
-from .mammothmoda2_dit.rmsnorm import Qwen2RMSNorm
+from .mammothmoda2_dit_layer.rmsnorm import Qwen2RMSNorm
 
 
 class MammothModa2DiTForConditionalGeneration(nn.Module):
