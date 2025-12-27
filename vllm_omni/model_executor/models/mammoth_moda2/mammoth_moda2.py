@@ -10,20 +10,20 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-
 from vllm.config import VllmConfig
-from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm.multimodal import MULTIMODAL_REGISTRY
+
 from .mammoth_moda2_ar import (
+    MammothModa2ARDummyInputsBuilder,
     MammothModa2ARMultiModalProcessor,
     MammothModa2ARProcessingInfo,
-    MammothModa2ARDummyInputsBuilder,
 )
-from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -31,10 +31,9 @@ from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VLForConditionalGenera
     info=MammothModa2ARProcessingInfo,
     dummy_inputs=MammothModa2ARDummyInputsBuilder,
 )
-class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
-                                           SupportsPP):
-    # Ensure vllm_omni/worker/gpu_model_runner.py's `extract_multimodal_outputs` follows 
-    # the OmniOutput branch to retrieve text_hidden_states as a pure torch.Tensor, 
+class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+    # Ensure vllm_omni/worker/gpu_model_runner.py's `extract_multimodal_outputs` follows
+    # the OmniOutput branch to retrieve text_hidden_states as a pure torch.Tensor,
     # preventing errors in `hidden_states[logit_indices]` due to type mismatch (list/tuple).
     have_multimodal_outputs = True
 
@@ -68,10 +67,10 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "dit"),
-                # NOTE: init_vllm_registered_model -> VllmConfig.with_hf_config requires a 
-                # transformers.PretrainedConfig; however, Mammothmoda2Config.gen_dit_config 
-                # is a dict (diffusers config). The DiT stage hf_config still uses the 
-                # top-level Mammothmoda2Config, and the DiT module reads its own 
+                # NOTE: init_vllm_registered_model -> VllmConfig.with_hf_config requires a
+                # transformers.PretrainedConfig; however, Mammothmoda2Config.gen_dit_config
+                # is a dict (diffusers config). The DiT stage hf_config still uses the
+                # top-level Mammothmoda2Config, and the DiT module reads its own
                 # gen_dit_config / gen_vae_config dicts.
                 hf_config=cfg,
                 architectures=["MammothModa2DiTForConditionalGeneration"],
@@ -84,14 +83,11 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
         # Expose intermediate tensor factory for PP if provided by the submodule.
-        self.make_empty_intermediate_tensors = getattr(
-            self.model, "make_empty_intermediate_tensors", lambda: None
-        )
+        self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int):  # noqa: ARG003
-        return Qwen2_5_VLForConditionalGeneration.get_placeholder_str(modality,
-                                                                      i)
+        return Qwen2_5_VLForConditionalGeneration.get_placeholder_str(modality, i)
 
     def get_language_model(self) -> nn.Module:
         if hasattr(self.model, "get_language_model"):
@@ -109,12 +105,9 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
             return self.model.get_multimodal_embeddings(**kwargs)
         return []
 
-    def get_input_embeddings(self,
-                             input_ids: torch.Tensor,
-                             multimodal_embeddings=None) -> torch.Tensor:
+    def get_input_embeddings(self, input_ids: torch.Tensor, multimodal_embeddings=None) -> torch.Tensor:
         if hasattr(self.model, "get_input_embeddings"):
-            return self.model.get_input_embeddings(
-                input_ids, multimodal_embeddings=multimodal_embeddings)
+            return self.model.get_input_embeddings(input_ids, multimodal_embeddings=multimodal_embeddings)
         # DiT stage does not consume token embeddings from `input_ids`; it uses
         # condition embeddings passed via additional_information.
         # However, vLLM's generation runner may still request token embeddings
@@ -150,7 +143,9 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal,
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
         if self.model_stage != "dit":
-            raise RuntimeError(f"get_dummy_runtime_additional_information only valid for dit stage, got {self.model_stage}")
+            raise RuntimeError(
+                f"get_dummy_runtime_additional_information only valid for dit stage, got {self.model_stage}"
+            )
         if self.dit is None:
             raise RuntimeError("dit stage model is not initialized")
         if not hasattr(self.dit, "get_dummy_runtime_additional_information"):

@@ -49,13 +49,16 @@ except Exception:  # pragma: no cover - best-effort compatibility
     def is_flash_attn_available() -> bool:  # type: ignore[override]
         return False
 
+
 from .rope_real import apply_real_rotary_emb
 
 index_first_axis = None
 if is_flash_attn_available():
     try:
         if is_torch_npu_available():
-            from transformers.integrations.npu_flash_attention import index_first_axis as _index_first_axis  # type: ignore
+            from transformers.integrations.npu_flash_attention import (
+                index_first_axis as _index_first_axis,  # type: ignore
+            )
         else:
             from flash_attn.bert_padding import index_first_axis as _index_first_axis  # type: ignore
         index_first_axis = _index_first_axis
@@ -79,7 +82,12 @@ class AttnProcessorFlash2Varlen:
 
     def __init__(self) -> None:
         """Initialize the attention processor."""
-        if (not is_flash_attn_available()) or flash_attn_varlen_func is None or pad_input is None or unpad_input is None:
+        if (
+            (not is_flash_attn_available())
+            or flash_attn_varlen_func is None
+            or pad_input is None
+            or unpad_input is None
+        ):
             raise ImportError("AttnProcessorFlash2Varlen requires flash_attn. Please install flash_attn.")
         if index_first_axis is None:
             raise ImportError("AttnProcessorFlash2Varlen requires index_first_axis from flash-attn/transformers.")
@@ -450,7 +458,9 @@ class AttnProcessor:
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        # explicitly repeat key and value to match query length, otherwise using enable_gqa=True results in MATH backend of sdpa in our test of pytorch2.6
+        # Explicitly repeat key and value to match query length; otherwise using
+        # enable_gqa=True can fall back to the MATH backend of SDPA in our
+        # PyTorch 2.6 tests.
         key = key.repeat_interleave(query.size(-3) // key.size(-3), -3)
         value = value.repeat_interleave(query.size(-3) // value.size(-3), -3)
 

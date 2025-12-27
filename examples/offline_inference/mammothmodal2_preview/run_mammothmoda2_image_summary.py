@@ -20,7 +20,6 @@ from vllm.multimodal.image import convert_image_mode
 
 from vllm_omni import Omni
 
-
 DEFAULT_SYSTEM = "You are a helpful assistant."
 DEFAULT_QUESTION = "Please summarize the content of this image."
 
@@ -146,4 +145,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

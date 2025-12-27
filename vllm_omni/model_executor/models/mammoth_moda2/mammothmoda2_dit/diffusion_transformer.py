@@ -40,8 +40,6 @@ from einops import rearrange
 from loguru import logger
 from torch import nn
 
-from .rmsnorm import Qwen2RMSNorm
-
 from .attention_processor import AttnProcessor, AttnProcessorFlash2Varlen
 from .block_lumina2 import (
     Lumina2CombinedTimestepCaptionEmbedding,
@@ -49,6 +47,7 @@ from .block_lumina2 import (
     LuminaLayerNormContinuous,
     LuminaRMSNormZero,
 )
+from .rmsnorm import Qwen2RMSNorm
 from .rope_real import RotaryPosEmbedReal
 
 
@@ -615,9 +614,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
 
         device = hidden_states[0].device
 
-        temb, text_hidden_states = self.time_caption_embed(
-            timestep, text_hidden_states, hidden_states[0].dtype
-        )
+        temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states[0].dtype)
 
         (
             hidden_states,

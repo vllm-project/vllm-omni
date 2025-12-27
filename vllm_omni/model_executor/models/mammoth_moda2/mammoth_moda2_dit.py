@@ -7,14 +7,11 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-
 from vllm.config import VllmConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.mammoth_moda2.configuration_mammothmoda2 import Mammothmoda2Config
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .mammothmoda2_dit import (
     FlowMatchEulerDiscreteScheduler,
@@ -33,9 +30,9 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
     and outputs image tensors via diffusion transformer + VAE decode.
 
     Notes:
-    - vLLM-Omni's `GPUGenerationModelRunner` calls `forward(...)` and passes the result 
+    - vLLM-Omni's `GPUGenerationModelRunner` calls `forward(...)` and passes the result
       as pooling_output to the upper layer.
-    - For compatibility with runner unpacking, we use `OmniOutput(multimodal_outputs=...)` 
+    - For compatibility with runner unpacking, we use `OmniOutput(multimodal_outputs=...)`
       to return results; `text_hidden_states` serves as a placeholder.
     """
 
@@ -104,7 +101,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         )
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
-        num_reqs = 1 # TODO: support num_reqs > 1
+        num_reqs = 1  # TODO: support num_reqs > 1
         if num_reqs <= 0:
             raise ValueError(f"num_reqs must be positive, got {num_reqs}")
         text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
@@ -142,7 +139,6 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,  # noqa: ARG002
     ) -> OmniOutput:
-        
         runtime_addi = kwargs.get("runtime_additional_information", None)
         info = runtime_addi[0]
         text_cond = info["text_prompt_embeds"]
@@ -199,16 +195,17 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
         prompt_attention_mask = torch.cat([text_attention_mask, image_attention_mask], dim=1)
 
-
         # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
         negative_prompt_embeds = None
         negative_prompt_attention_mask = None
         if text_guidance_scale > 1.0:
             if negative_cond is not None:
                 negative_cond = _ensure_2d(negative_cond, "negative_prompt_embeds")
-                negative_prompt_embeds = negative_cond.to(
-                    device=model_device, dtype=target_dtype, non_blocking=True
-                ).contiguous().unsqueeze(0)
+                negative_prompt_embeds = (
+                    negative_cond.to(device=model_device, dtype=target_dtype, non_blocking=True)
+                    .contiguous()
+                    .unsqueeze(0)
+                )
                 if isinstance(negative_attention_mask, torch.Tensor):
                     neg_mask = negative_attention_mask
                 elif isinstance(negative_attention_mask, list):
@@ -271,11 +268,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
                 ref_image_hidden_states=None,
                 freqs_cis=self.gen_freqs_cis,
             )
-            guidance_scale = (
-                text_guidance_scale
-                if cfg_range[0] <= i / total_steps <= cfg_range[1]
-                else 1.0
-            )
+            guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
                 model_pred_uncond = self.gen_transformer(
                     hidden_states=latents,

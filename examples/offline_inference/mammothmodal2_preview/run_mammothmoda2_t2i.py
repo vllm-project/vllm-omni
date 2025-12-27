@@ -4,7 +4,7 @@ This script uses the vllm_omni.Omni pipeline with a multi-stage configuration.
 
 Workflow:
 1. Stage 0 (AR): Generates visual tokens and their corresponding hidden states.
-2. Stage 1 (DiT): Consumes the hidden states as conditions to perform diffusion 
+2. Stage 1 (DiT): Consumes the hidden states as conditions to perform diffusion
    and VAE decoding to produce the final image.
 
 Example Usage:
@@ -21,7 +21,6 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import torch
 from PIL import Image
@@ -29,12 +28,11 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni import Omni
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def load_t2i_generation_config(model_dir: str) -> Tuple[int, int, int]:
+def load_t2i_generation_config(model_dir: str) -> tuple[int, int, int]:
     """Load T2I token ranges from t2i_generation_config.json."""
     cfg_path = Path(model_dir) / "t2i_generation_config.json"
     if not cfg_path.exists():
@@ -51,8 +49,7 @@ def load_t2i_generation_config(model_dir: str) -> Tuple[int, int, int]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Run MammothModa2 T2I (AR -> DiT) with vLLM-Omni.")
+    p = argparse.ArgumentParser(description="Run MammothModa2 T2I (AR -> DiT) with vLLM-Omni.")
     p.add_argument(
         "--model",
         type=str,
@@ -106,13 +103,8 @@ def parse_args() -> argparse.Namespace:
         default=(0.0, 1.0),
         help="Relative step range [start, end] where CFG is active.",
     )
-    p.add_argument("--out",
-                   type=str,
-                   default="output.png",
-                   help="Path to save the generated image.")
-    p.add_argument("--trust-remote-code",
-                   action="store_true",
-                   help="Trust remote code when loading the model.")
+    p.add_argument("--out", type=str, default="output.png", help="Path to save the generated image.")
+    p.add_argument("--trust-remote-code", action="store_true", help="Trust remote code when loading the model.")
     args = p.parse_args()
     if not args.prompt:
         args.prompt = ["A stylish woman with sunglasses riding a motorcycle in NYC."]
@@ -135,19 +127,14 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.height <= 0 or args.width <= 0:
-        raise ValueError(
-            f"Height and width must be positive, got {args.height}x{args.width}"
-        )
+        raise ValueError(f"Height and width must be positive, got {args.height}x{args.width}")
     if args.height % 16 != 0 or args.width % 16 != 0:
-        raise ValueError(
-            f"Height and width must be multiples of 16, got {args.height}x{args.width}"
-        )
+        raise ValueError(f"Height and width must be multiples of 16, got {args.height}x{args.width}")
 
     ar_height = args.height // 16
     ar_width = args.width // 16
 
-    eol_token_id, visual_start, visual_end = load_t2i_generation_config(
-        args.model)
+    eol_token_id, visual_start, visual_end = load_t2i_generation_config(args.model)
     expected_grid_tokens = ar_height * (ar_width + 1)
 
     def _format_prompt(user_prompt: str) -> str:
@@ -159,9 +146,7 @@ def main() -> None:
         )
 
     logger.info("Initializing Omni pipeline...")
-    omni = Omni(model=args.model,
-                stage_configs_path=args.stage_config,
-                trust_remote_code=args.trust_remote_code)
+    omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
 
     try:
         ar_sampling = SamplingParams(
@@ -227,15 +212,13 @@ def main() -> None:
             for sample_idx, ro_item in enumerate(ro_list):
                 mm = getattr(ro_item, "multimodal_output", None)
                 if not isinstance(mm, dict) or "image" not in mm:
-                    raise RuntimeError(
-                        f"Unexpected final output payload: {type(mm)} {mm}")
+                    raise RuntimeError(f"Unexpected final output payload: {type(mm)} {mm}")
 
                 img_payload = mm["image"]
                 img_list = img_payload if isinstance(img_payload, list) else [img_payload]
                 for img_idx, img_tensor in enumerate(img_list):
                     if not isinstance(img_tensor, torch.Tensor):
-                        raise TypeError(
-                            f"Expected image tensor, got {type(img_tensor)}")
+                        raise TypeError(f"Expected image tensor, got {type(img_tensor)}")
                     suffix_parts = [req_suffix]
                     if len(ro_list) > 1:
                         suffix_parts.append(f"_s{sample_idx}")
