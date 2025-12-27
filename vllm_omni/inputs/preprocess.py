@@ -52,6 +52,43 @@ class OmniInputPreprocessor(InputPreprocessor):
 
         return inputs
 
+    def _process_text(
+        self,
+        parsed_content: TextPrompt,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        mm_uuids: MultiModalUUIDDict | None = None,
+    ) -> OmniTokenInputs | MultiModalInputs:
+        prompt_text = parsed_content["prompt"]
+        additional_information = parsed_content.get("additional_information")
+
+        inputs: OmniTokenInputs | MultiModalInputs
+        if multi_modal_data := parsed_content.get("multi_modal_data"):
+            inputs = self._process_multimodal(
+                prompt_text,
+                multi_modal_data,
+                parsed_content.get("mm_processor_kwargs"),
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
+        else:
+            prompt_token_ids = self._tokenize_prompt(
+                prompt_text,
+                tokenization_kwargs=tokenization_kwargs,
+            )
+            inputs = token_inputs_omni(
+                prompt=prompt_text,
+                prompt_token_ids=prompt_token_ids,
+                additional_information=additional_information,
+            )
+
+        if cache_salt := parsed_content.get("cache_salt"):
+            inputs["cache_salt"] = cache_salt
+        if additional_information is not None and "additional_information" not in inputs:
+            inputs["additional_information"] = additional_information
+
+        return inputs
+
     def _prompt_to_llm_inputs(
         self,
         prompt: SingletonPrompt,

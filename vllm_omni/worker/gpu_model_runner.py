@@ -34,7 +34,6 @@ logger = init_logger(__name__)
 class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._omni_per_req_additional_information: dict[str, dict] | None = None
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
 
@@ -651,18 +650,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                     q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):
                         logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
+                info["generated_len"] = len(req_state.output_token_ids)
             else:
                 per_req_runtime_info.append({})
         return per_req_runtime_info
-
-    def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
-        """Compute (start, end) token spans for each request within the flattened step sequence."""
-        req_token_spans: list[tuple[int, int]] = []
-        for req_index in range(len(self.input_batch.req_ids)):
-            start_offset = int(self.query_start_loc.cpu[req_index])
-            sched_tokens = int(num_scheduled_tokens_np[req_index])
-            req_token_spans.append((start_offset, start_offset + sched_tokens))
-        return req_token_spans
 
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step, including:
@@ -686,21 +677,35 @@ class OmniGPUModelRunner(GPUModelRunner):
     ) -> None:
         """Process model-provided per-request additional_information updates and merge into request state."""
         try:
-            # execute the custom postprocess function
-            # TODO(Peiqi): do we have a more elegant way to do this?
-            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+            if isinstance(multimodal_outputs, dict):
+                updates_list = multimodal_outputs.get("additional_information_update")
+                if isinstance(updates_list, list):
+                    for idx, upd in enumerate(updates_list):
+                        if not isinstance(upd, dict) or idx >= len(self.input_batch.req_ids):
+                            continue
+                        req_id = self.input_batch.req_ids[idx]
+                        self._merge_additional_information_update(req_id, upd)
+
+                updates_map = multimodal_outputs.get("additional_information_update_by_req_id")
+                if isinstance(updates_map, dict):
+                    for req_id, upd in updates_map.items():
+                        if not isinstance(upd, dict) or req_id not in self.requests:
+                            continue
+                        self._merge_additional_information_update(req_id, upd)
+
+            if getattr(self.model, "has_postprocess", False):
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
                     req_state = self.requests.get(req_id)
-                    req_infos = (
-                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-                    )
+                    req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                    if not isinstance(req_infos, dict):
+                        req_infos = {}
                     start_offset = int(self.query_start_loc.cpu[req_index])
                     sched_tokens = int(num_scheduled_tokens_np[req_index])
                     s, e = start_offset, start_offset + sched_tokens
-                    # only consider to store data into update dict.
                     hidden_states_slice = hidden_states[s:e]
                     update_dict = self.model.postprocess(hidden_states_slice, **req_infos)
-                    self._merge_additional_information_update(req_id, update_dict)
+                    if isinstance(update_dict, dict) and update_dict:
+                        self._merge_additional_information_update(req_id, update_dict)
         except Exception as e:
             logger.error(
                 f"Error merging for requests:{self.input_batch.req_ids} "
@@ -708,15 +713,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                 f"as {multimodal_outputs}"
             )
             import traceback
-
             traceback.print_exc()
 
     def _collect_additional_information_for_prefill(
         self,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Overlay per-request prompt_embeds for the prefill portion and collect
-        additional_information slices for this step. Returns a map req_id -> dict."""
+    ) -> None:
+        """Overlay per-request prompt_embeds for the prefill portion."""
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
@@ -741,6 +744,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ):
         """Align with v0.12 preprocess and omni's additional information handling."""
+        # Decode payload first, ensure request state has prompt_embeds / additional_information
+        self._decode_and_store_request_payloads(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -851,6 +856,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests.get(req_id)
                 req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                if not isinstance(req_infos, dict):
+                    req_infos = {}
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
