@@ -1,0 +1,137 @@
+# Stage config for running Fun-Audio-Chat-8B Speech-to-Speech (S2S)
+#
+# This is the 3-stage pipeline configuration:
+# - Stage 0 (Main): Audio understanding → Text + Hidden States
+# - Stage 1 (CRQ Decoder): Hidden States → Speech Tokens (25Hz)
+# - Stage 2 (CosyVoice): Speech Tokens → Audio Waveform (24kHz)
+#
+# Models:
+# - Fun-Audio-Chat-8B: https://huggingface.co/FunAudioLLM/Fun-Audio-Chat-8B
+# - CosyVoice3: https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+#
+# GPU Requirements:
+# - Minimum: 1x 24GB GPU (all stages share GPU 0)
+# - Recommended: 2x 24GB GPUs (Stage 0 on GPU 0, Stages 1-2 on GPU 1)
+#
+# Tested on: 2x H100-80G GPU
+
+stage_args:
+  # ============================================================================
+  # Stage 0: Main (Audio Understanding + Text Generation)
+  # ============================================================================
+  # Input: Audio features + Text prompt
+  # Output: Text tokens + Hidden states for speech synthesis
+  - stage_id: 0
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: main
+      model_arch: FunAudioChatForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent # Output hidden states for CRQ decoder
+      enable_prefix_caching: false
+      max_num_batched_tokens: 16384
+      distributed_executor_backend: "mp"
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+
+  # ============================================================================
+  # Stage 1: CRQ Decoder (Speech Token Generation)
+  # ============================================================================
+  # Input: Hidden states from Stage 0
+  # Output: Speech tokens (25Hz discrete codes)
+  - stage_id: 1
+    runtime:
+      process: true
+      devices: "1" # Use GPU 1 for parallel processing
+      max_batch_size: 1
+    engine_args:
+      model_stage: crq_decoder
+      model_arch: FunAudioChatCRQDecoder
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.15 # CRQ decoder is ~1.5B params
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      max_num_batched_tokens: 65536
+      distributed_executor_backend: "mp"
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.fun_audio_chat.main2crq
+    final_output: false
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+
+  # ============================================================================
+  # Stage 2: CosyVoice (Token to Waveform)
+  # ============================================================================
+  # Input: Speech tokens from Stage 1
+  # Output: Audio waveform (24kHz)
+  - stage_id: 2
+    runtime:
+      process: true
+      devices: "1" # Share GPU with Stage 1 (sequential execution)
+      max_batch_size: 1
+    engine_args:
+      model_stage: cosyvoice
+      model_arch: FunAudioChatCosyVoice
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.1 # CosyVoice is ~0.5B params
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      max_num_batched_tokens: 1000000
+      distributed_executor_backend: "mp"
+      # CosyVoice model path (optional, defaults to auto-download)
+      # cosyvoice_model_path: path/to/Fun-CosyVoice3-0.5B-2512
+    engine_input_source: [1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.fun_audio_chat.crq2cosyvoice
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: false
+
+# ============================================================================
+# Runtime Configuration
+# ============================================================================
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1 # Wait for complete upstream output
+    max_inflight: 1 # Process one request at a time
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+    - from: 1
+      to: 2
+      window_size: -1

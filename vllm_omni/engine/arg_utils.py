@@ -12,6 +12,7 @@ logger = init_logger(__name__)
 
 
 def register_omni_models_to_vllm():
+    """Register vLLM-Omni models to vLLM's ModelRegistry and Transformers' CONFIG_MAPPING."""
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
@@ -20,6 +21,59 @@ def register_omni_models_to_vllm():
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         if arch not in supported_archs:
             ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
+
+    # Register custom model types to Transformers' CONFIG_MAPPING
+    # This is needed for models that have custom model_type in config.json
+    # but don't have auto_map to tell Transformers how to load them
+    _register_custom_configs_to_transformers()
+
+
+def _register_custom_configs_to_transformers():
+    """Register custom model configs and processors to Transformers' mappings.
+
+    This allows Transformers to recognize custom model types like 'funaudiochat'
+    that don't have auto_map in their config.json.
+    """
+    # Register FunAudioChatConfig
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        from vllm_omni.model_executor.models.fun_audio_chat.configuration_fun_audio_chat import (
+            FunAudioChatConfig,
+        )
+
+        try:
+            # Check if already registered
+            _ = CONFIG_MAPPING["funaudiochat"]
+        except KeyError:
+            # Not registered, register it
+            CONFIG_MAPPING.register("funaudiochat", FunAudioChatConfig, exist_ok=True)
+            logger.debug("Registered 'funaudiochat' to Transformers CONFIG_MAPPING")
+
+    except Exception as e:
+        logger.warning(f"Failed to register FunAudioChatConfig to Transformers: {e}")
+
+    # Register FunAudioChatProcessor
+    # PROCESSOR_MAPPING uses Config class as key, not string
+    try:
+        from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
+
+        from vllm_omni.model_executor.models.fun_audio_chat.configuration_fun_audio_chat import (
+            FunAudioChatConfig,
+        )
+        from vllm_omni.model_executor.models.fun_audio_chat.processing_fun_audio_chat import (
+            FunAudioChatProcessor,
+        )
+
+        # Check if already registered by trying to get processor for this config
+        if FunAudioChatConfig not in PROCESSOR_MAPPING._extra_content:
+            # Register: key=ConfigClass, value=(SlowProcessor, FastProcessor)
+            # We only have one processor, so use (FunAudioChatProcessor, None)
+            PROCESSOR_MAPPING.register(FunAudioChatConfig, (FunAudioChatProcessor, None), exist_ok=True)
+            logger.debug("Registered FunAudioChatProcessor to Transformers PROCESSOR_MAPPING")
+
+    except Exception as e:
+        logger.warning(f"Failed to register FunAudioChatProcessor to Transformers: {e}")
 
 
 @dataclass

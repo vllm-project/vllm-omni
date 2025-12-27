@@ -48,6 +48,22 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    # Fun-Audio-Chat models
+    "FunAudioChatForConditionalGeneration": (
+        "fun_audio_chat",
+        "fun_audio_chat",
+        "FunAudioChatForConditionalGeneration",
+    ),
+    "FunAudioChatCRQDecoder": (
+        "fun_audio_chat",
+        "crq_decoder",
+        "FunAudioChatCRQDecoder",
+    ),
+    "FunAudioChatCosyVoice": (
+        "fun_audio_chat",
+        "cosyvoice",
+        "FunAudioChatCosyVoice",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {
