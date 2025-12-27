@@ -1031,7 +1031,9 @@ async def _stage_worker_async(
                         od_config[key] = value
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
             stage_engine = AsyncOmniDiffusion(
-                model=model, od_config=od_config, **{k: v for k, v in engine_args.items() if k != "od_config"}
+                model=model,
+                od_config=od_config,
+                **{k: v for k, v in engine_args.items() if k not in {"od_config", "model"}},
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:
