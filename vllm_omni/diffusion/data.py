@@ -353,6 +353,8 @@ class OmniDiffusionConfig:
     # support multi images input
     supports_multimodal_inputs: bool = False
 
+    flow_shift: float | None = None
+
     # Logging
     log_level: str = "info"
 
@@ -444,6 +446,10 @@ class OmniDiffusionConfig:
 
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
+
+    def resolve_model_class_name(self, config_dict) -> None:
+        if self.model_class_name == "WanPipeline" and "transformer_2" not in config_dict:
+            self.model_class_name = "Wan21Pipeline"
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
