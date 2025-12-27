@@ -10,14 +10,19 @@ from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import ModelConfig, config
 from vllm.config.model import (
     _RUNNER_CONVERTS,
-    _RUNNER_TASKS,
     ConvertOption,
     ConvertType,
     RunnerOption,
-    TaskOption,
     _get_and_verify_dtype,
     get_served_model_name,
 )
+from vllm.tasks import POOLING_TASKS, SupportedTask
+
+# Define _RUNNER_TASKS for compatibility (maps runner type to valid tasks)
+_RUNNER_TASKS: dict[str, list[SupportedTask]] = {
+    "generate": ["generate", "draft"],
+    "pooling": list(POOLING_TASKS),
+}
 from vllm.config.multimodal import MMCacheType, MMEncoderTPMode, MultiModalConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.logger import init_logger
@@ -29,10 +34,10 @@ from vllm.transformers_utils.config import (
     get_pooling_config,
 )
 from vllm.transformers_utils.gguf_utils import (
+    is_gguf,
     maybe_patch_hf_config_from_gguf,
 )
 from vllm.transformers_utils.utils import (
-    is_gguf,
     maybe_model_redirect,
 )
 
@@ -202,7 +207,7 @@ class OmniModelConfig(ModelConfig):
         is_generative_model = registry.is_text_generation_model(architectures, self)
         is_pooling_model = registry.is_pooling_model(architectures, self)
 
-        def _task_to_convert(task: TaskOption) -> ConvertType:
+        def _task_to_convert(task: SupportedTask) -> ConvertType:
             if task == "embedding" or task == "embed":
                 return "embed"
             if task == "classify":
