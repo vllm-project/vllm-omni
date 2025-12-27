@@ -202,6 +202,12 @@ class OmniModelConfig(ModelConfig):
         is_generative_model = registry.is_text_generation_model(architectures, self)
         is_pooling_model = registry.is_pooling_model(architectures, self)
 
+        # DEBUG: Log model type detection
+        logger.info(f"[DEBUG] Architecture: {architectures}")
+        logger.info(f"[DEBUG] is_generative_model: {is_generative_model}")
+        logger.info(f"[DEBUG] is_pooling_model: {is_pooling_model}")
+        logger.info(f"[DEBUG] model_stage: {getattr(self, 'model_stage', 'NOT_SET')}")
+
         def _task_to_convert(task: TaskOption) -> ConvertType:
             if task == "embedding" or task == "embed":
                 return "embed"
@@ -291,8 +297,16 @@ class OmniModelConfig(ModelConfig):
         self.runner_type = self._get_runner_type(architectures, self.runner)
         self.convert_type = self._get_convert_type(architectures, self.runner_type, self.convert)
 
+        # DEBUG: Log runner validation
+        logger.info(f"[DEBUG] runner_type: {self.runner_type}")
+        logger.info(f"[DEBUG] convert_type: {self.convert_type}")
+
         if self.runner_type == "generate" and not is_generative_model:
             generate_converts = _RUNNER_CONVERTS["generate"]
+            logger.error("[DEBUG] ERROR: runner_type is 'generate' but is_generative_model is False!")
+            logger.error(f"[DEBUG] generate_converts: {generate_converts}")
+            logger.error(f"[DEBUG] convert_type: {self.convert_type}")
+            logger.error(f"[DEBUG] convert_type in generate_converts: {self.convert_type in generate_converts}")
             if self.convert_type not in generate_converts:
                 # Currently we don't have any converters for generative models
                 raise ValueError("This model does not support `--runner generate`.")
