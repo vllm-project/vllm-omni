@@ -34,10 +34,10 @@ from vllm.transformers_utils.config import (
     get_pooling_config,
 )
 from vllm.transformers_utils.gguf_utils import (
-    is_gguf,
     maybe_patch_hf_config_from_gguf,
 )
 from vllm.transformers_utils.utils import (
+    is_gguf,
     maybe_model_redirect,
 )
 

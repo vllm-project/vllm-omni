@@ -6,6 +6,7 @@ import importlib
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.offload import apply_cpu_offload
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
@@ -80,10 +81,15 @@ def initialize_model(
     if model_class is not None:
         model = model_class(od_config=od_config)
         # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
-            model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
-            model.vae.use_tiling = od_config.vae_use_tiling
+        if hasattr(model, "vae") and model.vae is not None:
+            if hasattr(model.vae, "use_slicing"):
+                model.vae.use_slicing = od_config.vae_use_slicing
+            if hasattr(model.vae, "use_tiling"):
+                model.vae.use_tiling = od_config.vae_use_tiling
+        
+        # Apply CPU offloading based on config flags
+        apply_cpu_offload(model, od_config)
+        
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
