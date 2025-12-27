@@ -74,6 +74,8 @@ def _maybe_materialize_bagel_config_py(model: str) -> str | None:
     except Exception:
         # Best-effort only; caller will handle the original exception path.
         return None
+
+
 def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     """Try to get class name from diffusers model configuration files.
 
