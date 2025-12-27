@@ -3,7 +3,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from vllm_omni.utils.platform_utils import detect_device_type, is_rocm
+from vllm_omni.utils.platform_utils import detect_device_type, is_npu, is_rocm
 
 
 class CustomOp(nn.Module):
@@ -22,6 +22,8 @@ class CustomOp(nn.Module):
             return self.forward_hip
         elif self.is_cuda:
             return self.forward_cuda
+        elif is_npu():
+            return self.forward_npu
         else:
             return self.forward_native
 
@@ -37,6 +39,9 @@ class CustomOp(nn.Module):
         raise NotImplementedError
 
     def forward_cuda(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward_npu(self, *args, **kwargs):
         raise NotImplementedError
 
     def forward_hip(self, *args, **kwargs):

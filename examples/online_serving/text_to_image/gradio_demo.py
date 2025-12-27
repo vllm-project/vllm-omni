@@ -24,6 +24,7 @@ def generate_image(
     seed: int | None,
     negative_prompt: str,
     server_url: str,
+    num_outputs_per_prompt: int = 1,
 ) -> Image.Image | None:
     """Generate an image using the chat completions API."""
     messages = [{"role": "user", "content": prompt}]
@@ -39,6 +40,8 @@ def generate_image(
         extra_body["seed"] = seed
     if negative_prompt:
         extra_body["negative_prompt"] = negative_prompt
+    # Keep consistent with run_curl_text_to_image.sh, always send num_outputs_per_prompt
+    extra_body["num_outputs_per_prompt"] = num_outputs_per_prompt
 
     # Build request payload
     payload = {"messages": messages, "extra_body": extra_body}
@@ -109,7 +112,8 @@ def create_demo(server_url: str):
                         label="Inference Steps",
                         minimum=10,
                         maximum=100,
-                        value=50,
+                        # Default steps aligned with run_curl_text_to_image.sh to 100
+                        value=100,
                         step=5,
                     )
                     cfg_scale = gr.Slider(
@@ -138,16 +142,26 @@ def create_demo(server_url: str):
         # Examples
         gr.Examples(
             examples=[
-                ["A beautiful landscape painting with misty mountains", "", 1024, 1024, 50, 4.0, 42],
-                ["A cute cat sitting on a windowsill with sunlight", "", 1024, 1024, 50, 4.0, 123],
-                ["Cyberpunk style futuristic city with neon lights", "blurry, low quality", 1024, 768, 50, 4.0, 456],
-                ["Chinese ink painting of bamboo forest with a house", "", 768, 1024, 50, 4.0, 789],
+                ["A beautiful landscape painting with misty mountains", "", 1024, 1024, 100, 4.0, 42],
+                ["A cute cat sitting on a windowsill with sunlight", "", 1024, 1024, 100, 4.0, 123],
+                ["Cyberpunk style futuristic city with neon lights", "blurry, low quality", 1024, 768, 100, 4.0, 456],
+                ["Chinese ink painting of bamboo forest with a house", "", 768, 1024, 100, 4.0, 789],
             ],
             inputs=[prompt, negative_prompt, height, width, steps, cfg_scale, seed],
         )
 
         generate_btn.click(
-            fn=lambda p, h, w, st, c, se, n: generate_image(p, h, w, st, c, se if se >= 0 else None, n, server_url),
+            fn=lambda p, h, w, st, c, se, n: generate_image(
+                p,
+                h,
+                w,
+                st,
+                c,
+                se if se >= 0 else None,
+                n,
+                server_url,
+                1,
+            ),
             inputs=[prompt, height, width, steps, cfg_scale, seed, negative_prompt],
             outputs=[output_image],
         )

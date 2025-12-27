@@ -5,7 +5,9 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
 import concurrent.futures
+import ctypes
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -65,11 +67,22 @@ class OmniServer:
             str(self.port),
         ] + self.serve_args
 
+        # Helper to ensure child process dies when parent dies
+        libc = ctypes.CDLL("libc.so.6")
+
+        def preexec_fn():
+            # Ensure the child process receives SIGTERM when the parent (this test runner) dies.
+            # This prevents orphaned processes if the test is killed unexpectedly.
+            PR_SET_PDEATHSIG = 1
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
+            start_new_session=True,
+            preexec_fn=preexec_fn,
         )
 
         # Wait for server to be ready
@@ -95,11 +108,18 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
-            self.proc.terminate()
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
             try:
                 self.proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.proc.wait()
 
 

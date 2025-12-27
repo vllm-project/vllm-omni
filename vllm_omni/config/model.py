@@ -87,7 +87,17 @@ class OmniModelConfig(ModelConfig):
         # we need to draw the text config from the corresponding model stage.
         if self.hf_config_name is None:
             return get_hf_text_config(self.hf_config)
-        return getattr(self.hf_config, self.hf_config_name).get_text_config()
+        try:
+            # Try to get the stage-specific config (e.g., thinker_config, talker_config)
+            stage_config = getattr(self.hf_config, self.hf_config_name)
+            return stage_config.get_text_config()
+        except AttributeError:
+            # Fallback: if the attribute doesn't exist, use the default get_hf_text_config
+            logger.warning(
+                f"Config attribute '{self.hf_config_name}' not found in hf_config, "
+                "falling back to default get_hf_text_config"
+            )
+            return get_hf_text_config(self.hf_config)
 
     def __post_init__(
         self,
@@ -173,9 +183,19 @@ class OmniModelConfig(ModelConfig):
         self.hf_text_config = self.draw_hf_text_config()
         self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
         self.encoder_config = self._get_encoder_config()
-        self.hf_image_processor_config = get_hf_image_processor_config(
-            self.model, hf_token=self.hf_token, revision=self.revision
-        )
+        # Try to load image processor config, but allow it to fail for stages that don't need it
+        try:
+            self.hf_image_processor_config = get_hf_image_processor_config(
+                self.model, hf_token=self.hf_token, revision=self.revision
+            )
+        except (OSError, ValueError, IndexError) as e:
+            # Some stages (e.g., code2wav, talker) don't need image processor
+            # Log warning but allow initialization to continue
+            logger.warning(
+                f"Failed to load image processor config for model '{self.model}': {e}. "
+                "This is expected for stages that don't require image processing."
+            )
+            self.hf_image_processor_config = None
 
         architectures = self.architectures
         registry = self.registry
