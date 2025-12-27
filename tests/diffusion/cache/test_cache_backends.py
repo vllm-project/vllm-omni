@@ -138,6 +138,7 @@ class TestTeaCacheBackend:
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
         config = DiffusionCacheConfig(rel_l1_thresh=0.3)
@@ -154,6 +155,7 @@ class TestTeaCacheBackend:
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
         config = DiffusionCacheConfig(rel_l1_thresh=0.3, coefficients=[1.0, 0.5, 0.2, 0.1, 0.05])
@@ -169,6 +171,7 @@ class TestTeaCacheBackend:
         mock_pipeline = Mock()
         mock_pipeline.__class__.__name__ = "QwenImagePipeline"
         mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "QwenImageTransformer2DModel"
         mock_pipeline.transformer = mock_transformer
 
         # Mock hook registry

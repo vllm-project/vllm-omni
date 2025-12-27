@@ -62,7 +62,7 @@ class TeaCacheHook(ModelHook):
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         """
-        Initialize hook with extractor from config model type.
+        Initialize hook with extractor from config transformer model type.
 
         Args:
             module: The module to initialize the hook for.
@@ -70,9 +70,9 @@ class TeaCacheHook(ModelHook):
         Returns:
             The initialized module.
         """
-        # Get extractor function based on model_type from config
-        # model_type should be the pipeline class name (e.g., "QwenImagePipeline")
-        self.extractor_fn = get_extractor(self.config.model_type)
+        # Get extractor function based on transformer_type from config
+        # transformer_type is the transformer class name (e.g., "QwenImageTransformer2DModel")
+        self.extractor_fn = get_extractor(self.config.transformer_type)
 
         # Set default context
         self.state_manager.set_context("teacache")
@@ -244,9 +244,13 @@ def apply_teacache_hook(module: torch.nn.Module, config: TeaCacheConfig) -> None
         config: TeaCacheConfig specifying caching parameters
 
     Example:
-        >>> config = TeaCacheConfig(rel_l1_thresh=0.2, model_type="Qwen")
+        >>> config = TeaCacheConfig(
+        ...     rel_l1_thresh=0.2,
+        ...     transformer_type="QwenImageTransformer2DModel"
+        ... )
         >>> apply_teacache_hook(transformer, config)
-        >>> # Model now uses TeaCache automatically, no code changes needed!
+        >>> # Transformer bound to the pipeline now uses TeaCache automatically,
+        ... # no code changes needed!
     """
     registry = HookRegistry.get_or_create(module)
     hook = TeaCacheHook(config)
