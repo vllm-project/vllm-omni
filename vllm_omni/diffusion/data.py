@@ -287,13 +287,13 @@ class OmniDiffusionConfig:
 
     output_type: str = "pil"
 
-    # CPU offload parameters
-    dit_cpu_offload: bool = True
+    # CPU offload parameters (opt-in for safety, enable for large models like Flux)
+    dit_cpu_offload: bool = False  # Keep main model on GPU for speed
     use_fsdp_inference: bool = False
-    text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
-    vae_cpu_offload: bool = True
-    pin_cpu_memory: bool = True
+    text_encoder_cpu_offload: bool = False  # Enable for large text encoders (T5-XXL)
+    image_encoder_cpu_offload: bool = False  # Enable for img2img with large encoders
+    vae_cpu_offload: bool = False  # Enable if GPU memory is tight
+    pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
