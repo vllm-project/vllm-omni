@@ -48,6 +48,11 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "CosyVoiceModel": (
+        "cosy_voice3",
+        "cosyvoice",
+        "CosyVoiceModel",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {

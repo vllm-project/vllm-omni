@@ -1,0 +1,78 @@
+# Stage config for running CosyVoice3 with 2 stage architecture
+# Stage 0: TextSpeech Language Model (text prompt → speech tokens)
+# Stage 1: Chunk aware flow matching (Chunk aware flow matching)
+# Stage 2: Acoustic Features to Waveform (acoustic features → audio waveform)
+# Right now I have coded up stage 2 in stage 1 only; might split it based on when e2e works correct audoi
+
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: 0
+      max_batch_size: 1
+    engine_args:
+      model_stage: text_speech_lm
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      model_arch: CosyVoiceModel
+      trust_remote_code: true
+      gpu_memory_utilization: 0.4
+      engine_output_type: latent  # Output speech tokens for chunk aware flow matching
+      tokenizer: /mnt/d/.cache/huggingface/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/5646a54a6bea9eb1ec64b3ded068fdcf5a65f9ae/CosyVoice-BlankEN
+      disable_hybrid_kv_cache_manager: true
+      enable_prefix_caching: false
+      enforce_eager: true
+      mm_processor_cache_gb: 0
+      # limit_mm_per_prompt:
+        # audio: 1
+      skip_mm_profiling: true
+      dtype: "float16"
+      # hf_config_path: /mnt/d/.cache/huggingface/hub/models--FunAudioLLM--CosyVoice2-0.5B/snapshots/7532de4ab5a24a119fbc93fdc27449a329649a4a/
+
+  - stage_id: 1
+    runtime:
+      devices: 0
+      max_batch_size: 1
+    engine_args:
+      model_stage: chunk_aware_flow_matching
+      model_arch: CosyVoiceModel
+      trust_remote_code: true
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: latent
+      gpu_memory_utilization: 0.2
+      # hf_config_path: "/mnt/d/vllm_models/local_cosyvoice/cosyvoice_config/"
+      tokenizer: /mnt/d/.cache/huggingface/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/5646a54a6bea9eb1ec64b3ded068fdcf5a65f9ae/CosyVoice-BlankEN
+      # hf_config_path: /mnt/d/.cache/huggingface/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/5646a54a6bea9eb1ec64b3ded068fdcf5a65f9ae
+      enforce_eager: true
+      disable_hybrid_kv_cache_manager: true
+      enable_prefix_caching: false
+      # limit_mm_per_prompt:
+        # audio: 1
+      skip_mm_profiling: true
+      dtype: "float16"
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.cosyvoice.text2flow
+    final_output: true
+    final_output_type: audio
+
+  # - stage_id: 2
+  #   runtime:
+  #     devices: 0
+  #     max_batch_size: 1
+  #   engine_args:
+  #     model_stage: acoustic_features_to_waveform
+  #     model_arch: CosyVoiceModel
+  #     worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+  #     scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+  #     trust_remote_code: true
+  #     engine_output_type: audio  # Final output: audio waveform
+  #     # skip_tokenizer_init: true
+  #     gpu_memory_utilization: 0.01
+  #     # hf_config_path: "/mnt/d/vllm_models/local_cosyvoice/cosyvoice_config/"
+  #     tokenizer: /mnt/d/.cache/huggingface/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/5646a54a6bea9eb1ec64b3ded068fdcf5a65f9ae/CosyVoice-BlankEN
+  #     hf_config_path: /mnt/d/.cache/huggingface/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512/snapshots/5646a54a6bea9eb1ec64b3ded068fdcf5a65f9ae
+  #     disable_hybrid_kv_cache_manager: true
+  #     enable_prefix_caching: false
+  #   engine_input_source: [1]
+  #   final_output: true
+  #   final_output_type: audio
