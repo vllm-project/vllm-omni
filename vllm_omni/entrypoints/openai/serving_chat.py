@@ -865,7 +865,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
-            
+
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
             sample_rate=24000,

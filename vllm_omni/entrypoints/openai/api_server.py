@@ -449,6 +449,7 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
 
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
