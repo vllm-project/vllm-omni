@@ -4,18 +4,14 @@ Stage manager for orchestrating multiple engines in vLLM-Omni.
 Enhanced to encapsulate per-stage process lifecycle and worker logic
 (device setup, LLM init, batching, shared-memory IPC), while preserving
 the original input processing utilities for cross-stage data wiring.
-
-Enhanced to encapsulate per-stage process lifecycle and worker logic
-(device setup, LLM init, batching, shared-memory IPC), while preserving
-the original input processing utilities for cross-stage data wiring.
 """
 
 import asyncio
 import fcntl
 import importlib
-import logging
 import multiprocessing as mp
 import os
+import queue
 import sys
 import traceback
 from typing import Any
@@ -30,16 +26,53 @@ from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 
+from vllm_omni.distributed.omni_connectors import build_stage_connectors
+from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
+from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
+from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
+from vllm_omni.entrypoints.log_utils import count_tokens_from_outputs
+from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
+from vllm_omni.entrypoints.omni_llm import OmniLLM
 from vllm_omni.entrypoints.stage_utils import (
     _to_dict,
     maybe_dump_to_shm,
     set_stage_devices,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.utils import detect_device_type
 
 logger = init_logger(__name__)
+
+
+def prepare_sampling_params(sampling_params: Any, stage_type: str) -> Any:
+    """Prepare sampling parameters for the given stage type.
+
+    Args:
+        sampling_params: Raw sampling parameters (dict or SamplingParams)
+        stage_type: Either "llm" or "diffusion"
+
+    Returns:
+        Processed sampling parameters ready for engine consumption
+    """
+    if stage_type == "diffusion":
+        # For diffusion stages: extract kwargs, handling different input types
+        if isinstance(sampling_params, dict):
+            diffusion_kwargs = dict(sampling_params)
+        else:
+            diffusion_kwargs = getattr(sampling_params, "__dict__", {}) or {}
+
+        # Remove 'prompt' and 'request_id' to avoid conflict with explicit arguments
+        diffusion_kwargs.pop("prompt", None)
+        diffusion_kwargs.pop("request_id", None)
+        return diffusion_kwargs
+
+    else:  # stage_type == "llm"
+        # For LLM stages: ensure we have a SamplingParams object
+        if isinstance(sampling_params, dict):
+            return SamplingParams(**sampling_params)
+        return sampling_params
 
 
 class OmniStage:
@@ -55,6 +88,7 @@ class OmniStage:
     """
 
     def __init__(self, stage_config: Any):
+        logger.info(f"[OmniStage] stage_config: {stage_config}")
         self.stage_config = stage_config
         self.engine = None
         self.async_engine = None
@@ -67,9 +101,11 @@ class OmniStage:
         self.model_stage = stage_config.engine_args.model_stage
         self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
         self.engine_input_source = getattr(stage_config, "engine_input_source", [])
-        self.engine_output_type = stage_config.engine_args.engine_output_type
+        self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
+        # Support for different stage types: "llm" (default) or "diffusion"
+        self.stage_type = getattr(stage_config, "stage_type", "llm")
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -81,14 +117,14 @@ class OmniStage:
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
-        self.default_sampling_params = SamplingParams(**_to_dict(default_sampling_params))
+        # For LLM stage, this can directly be a SamplingParams-compatible dict;
+        # For diffusion stage, this only serves as default values for diffusion kwargs.
+        self.default_sampling_params = _to_dict(default_sampling_params)
         # Runtime orchestration state (added)
         self._in_q: mp.Queue | None = None
         self._out_q: mp.Queue | None = None
         self._proc: mp.Process | None = None
-        self._log_file: str | None = None
         self._shm_threshold_bytes: int = 65536
-        self._logger = logging.getLogger(__name__)
 
     def set_engine(self, engine: LLMEngine) -> None:
         """Set the LLM engine for this stage.
@@ -162,7 +198,6 @@ class OmniStage:
         model: str,
         *,
         is_async: bool = False,
-        log_file: str | None = None,
         shm_threshold_bytes: int = 65536,
         ctx: mp.context.BaseContext | None = None,
         batch_timeout: int = 10,
@@ -178,7 +213,6 @@ class OmniStage:
         Args:
             model: Model name or path to load
             is_async: Whether to use async engine (default: False)
-            log_file: Optional log file path prefix for stage-specific logs
             shm_threshold_bytes: Threshold for using shared memory for IPC
             ctx: Optional multiprocessing context (default: spawn)
             batch_timeout: Timeout in seconds for batching requests
@@ -190,7 +224,6 @@ class OmniStage:
             AssertionError: If queues are not attached before calling this method
         """
         assert self._in_q is not None and self._out_q is not None, "Queues must be attached before start_process"
-        self._log_file = log_file
 
         if worker_backend == "ray":
             ray_placement_group = kwargs.get("ray_placement_group", None)
@@ -209,55 +242,62 @@ class OmniStage:
             "runtime": runtime_cfg,
             "shm_threshold_bytes": self._shm_threshold_bytes,
             "connectors_config": connectors_config or {},
+            "stage_type": self.stage_type,
         }
-
-        if worker_backend == "ray":
-            if is_async:
-                self._ray_actor = start_ray_actor(
-                    _stage_worker_async_entry,
-                    ray_placement_group,
-                    self.stage_id,
-                    self,
-                    model=model,
-                    stage_payload=stage_payload,
-                    batch_timeout=batch_timeout,
-                )
-            else:
-                self._ray_actor = start_ray_actor(
-                    _stage_worker,
-                    ray_placement_group,
-                    self.stage_id,
-                    model=model,
-                    stage_payload=stage_payload,
-                    in_q=self._in_q,
-                    out_q=self._out_q,
-                    log_file=self._log_file,
-                    batch_timeout=batch_timeout,
-                )
-        else:
-            if is_async:
-                self._proc = ctx.Process(
-                    target=_stage_worker_async_entry,
-                    args=(
+        try:
+            old_env = os.environ.get("VLLM_LOGGING_PREFIX")
+            new_env = f"[Stage-{self.stage_id}] {'' if old_env is None else old_env}"
+            os.environ["VLLM_LOGGING_PREFIX"] = new_env
+            if worker_backend == "ray":
+                if is_async:
+                    self._ray_actor = start_ray_actor(
+                        _stage_worker_async_entry,
+                        ray_placement_group,
+                        self.stage_id,
                         self,
-                        model,
-                        stage_payload,
-                        batch_timeout,
-                    ),
-                )
+                        model=model,
+                        stage_payload=stage_payload,
+                        batch_timeout=batch_timeout,
+                    )
+                else:
+                    self._ray_actor = start_ray_actor(
+                        _stage_worker,
+                        ray_placement_group,
+                        self.stage_id,
+                        model=model,
+                        stage_payload=stage_payload,
+                        in_q=self._in_q,
+                        out_q=self._out_q,
+                        batch_timeout=batch_timeout,
+                    )
             else:
-                self._proc = ctx.Process(
-                    target=_stage_worker,
-                    args=(
-                        model,
-                        stage_payload,
-                        self._in_q,
-                        self._out_q,
-                        self._log_file,
-                        batch_timeout,
-                    ),
-                )
-            self._proc.start()
+                if is_async:
+                    self._proc = ctx.Process(
+                        target=_stage_worker_async_entry,
+                        args=(
+                            self,
+                            model,
+                            stage_payload,
+                            batch_timeout,
+                        ),
+                    )
+                else:
+                    self._proc = ctx.Process(
+                        target=_stage_worker,
+                        args=(
+                            model,
+                            stage_payload,
+                            self._in_q,
+                            self._out_q,
+                            batch_timeout,
+                        ),
+                    )
+                self._proc.start()
+        finally:
+            if old_env is None:
+                os.environ.pop("VLLM_LOGGING_PREFIX", None)
+            else:
+                os.environ["VLLM_LOGGING_PREFIX"] = old_env
 
     def stop_stage_worker(self) -> None:
         """Stop the stage worker process gracefully.
@@ -270,7 +310,7 @@ class OmniStage:
             try:
                 self._in_q.put_nowait(None)
             except Exception as e:
-                self._logger.warning("[Stage-%s] Failed to send shutdown to in_q: %s", self.stage_id, e)
+                logger.warning("Failed to send shutdown to in_q: %s", e)
 
         if hasattr(self, "_ray_actor") and self._ray_actor:
             kill_ray_actor(self._ray_actor)
@@ -279,21 +319,12 @@ class OmniStage:
             try:
                 self._proc.join(timeout=5)
             except Exception as e:
-                self._logger.debug("[Stage-%s] join() failed: %s", self.stage_id, e, exc_info=True)
+                logger.debug("join() failed: %s", e)
             if self._proc.is_alive():
                 try:
                     self._proc.terminate()
                 except Exception as e:
-                    self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
-
-        # Cleanup temporary stage log if we created one (only when no log_file provided)
-        try:
-            if not self._log_file:
-                tmp_path = f"/tmp/omni_stage{self.stage_id}.log"
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-        except Exception:
-            pass
+                    logger.warning("terminate() failed: %s", e)
 
     def submit(self, payload: dict[str, Any]) -> None:
         """Submit a task to the stage worker.
@@ -374,101 +405,20 @@ def _stage_worker(
     stage_payload: dict[str, Any],
     in_q: mp.Queue,
     out_q: mp.Queue,
-    log_file: str | None = None,
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
-    import logging as _logging
+    # Use local aliases to avoid conflicts with global imports in worker process
+    logger.info(f"Starting stage worker with model: {model}")
     import os as _os
     import time as _time
-
-    from vllm_omni.distributed.omni_connectors import build_stage_connectors
-    from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
-    from vllm_omni.entrypoints.log_utils import (
-        compute_and_log_stage_request_stats,
-        count_tokens_from_outputs,
-        log_stage_batch_stats,
-        log_stage_running_avg,
-    )
-    from vllm_omni.entrypoints.omni_llm import OmniStageLLM
-    # no inline JSONL/serialization imports; logging handled by utilities
 
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
-
-    # Per-stage logger: clear inherited handlers to avoid broken parent streams
-    try:
-        stage_log = _logging.getLogger(__name__)
-        stage_log.setLevel(_logging.DEBUG)
-        for _h in list(stage_log.handlers):
-            try:
-                stage_log.removeHandler(_h)
-            except Exception:
-                pass
-        stage_log.propagate = False
-
-        class _StageFilter(_logging.Filter):
-            def filter(self, record: _logging.LogRecord) -> bool:
-                setattr(record, "stage", stage_id)
-                return True
-
-        # Prefer file logging even when log_file is not provided, to avoid invalid stdio in child procs
-        try:
-            if log_file:
-                _path = f"{log_file}.stage{stage_id}.log"
-            else:
-                _path = f"/tmp/omni_stage{stage_id}.log"
-            # Ensure dir exists
-            _os.makedirs(_os.path.dirname(_path), exist_ok=True)
-            fh = _logging.FileHandler(_path)
-            fh.setLevel(_logging.DEBUG)
-            fh.setFormatter(
-                _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
-            )
-
-            class _StageFilter(_logging.Filter):
-                def filter(self, record: _logging.LogRecord) -> bool:
-                    setattr(record, "stage", stage_id)
-                    return True
-
-            fh.addFilter(_StageFilter())
-            stage_log.addHandler(fh)
-            try:
-                # Also route vLLM internal logs to the same handler for this stage
-                _vllm_logger = _logging.getLogger("vllm")
-                _vllm_logger.setLevel(_logging.DEBUG)
-                for _vh in list(_vllm_logger.handlers):
-                    try:
-                        _vllm_logger.removeHandler(_vh)
-                    except Exception:
-                        pass
-                _vllm_logger.propagate = False
-                _vllm_logger.addHandler(fh)
-            except Exception:
-                pass
-        except Exception:
-            # Final fallback: attach NullHandler to avoid logging errors
-            stage_log.addHandler(_logging.NullHandler())
-    except Exception:
-        pass
-
-    try:
-        _logging.raiseExceptions = False
-        _root_logger = _logging.getLogger()
-        for _h in list(_root_logger.handlers):
-            try:
-                _root_logger.removeHandler(_h)
-            except Exception:
-                pass
-        _root_logger.addHandler(_logging.NullHandler())
-    except Exception:
-        pass
-
-    # Stage stats JSONL file
-    _stats_file = f"{log_file}.stage{stage_id}.stats.jsonl" if log_file else None
+    stage_type = stage_payload.get("stage_type", "llm")
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -479,12 +429,10 @@ def _stage_worker(
     # Device mapping
     device_type = None
     try:
-        from vllm_omni.utils import detect_device_type
-
         device_type = detect_device_type()
         set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
-        _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
+        logger.warning("Device setup failed: %s", e)
 
     # Sequential initialization on the same device to avoid memory calculation errors
     # when multiple instances start simultaneously
@@ -495,11 +443,20 @@ def _stage_worker(
             import torch
 
             if torch.cuda.is_available():
-                # Get all parallel sizes from engine_args (defaults to 1)
-                tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
-                pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
-                data_parallel_size = engine_args.get("data_parallel_size", 1)
-                prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+                # Get all parallel sizes from engine_args or parallel_config (defaults to 1)
+                if "parallel_config" in engine_args:
+                    parallel_config = engine_args["parallel_config"]
+                    tensor_parallel_size = parallel_config.get("tensor_parallel_size", 1)
+                    pipeline_parallel_size = parallel_config.get("pipeline_parallel_size", 1)
+                    data_parallel_size = parallel_config.get("data_parallel_size", 1)
+                    prefill_context_parallel_size = 1  # not used for diffusion
+                    sequence_parallel_size = parallel_config.get("sequence_parallel_size", 1)
+                else:
+                    tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
+                    pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
+                    data_parallel_size = engine_args.get("data_parallel_size", 1)
+                    prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
+                    sequence_parallel_size = 1  # not use in omni model
 
                 # Calculate total number of devices needed for this stage
                 # For a single stage worker:
@@ -507,10 +464,15 @@ def _stage_worker(
                 # - PP: splits layers across pipelinestages, but each stage uses TP devices
                 # - DP: replicates model, but each replica uses TP devices
                 # - PCP: context parallelism, typically uses TP devices
-                # The number of devices per stage is determined by TP * PP * DP * PCP size
+                # - SP: sequence parallelism, typically uses TP devices
+                # The number of devices per stage is determined by TP * PP * DP * PCP * SP size
                 # (PP/DP/PCP are higher-level parallelism that don't add devices per stage)
                 num_devices_per_stage = (
-                    tensor_parallel_size * pipeline_parallel_size * data_parallel_size * prefill_context_parallel_size
+                    tensor_parallel_size
+                    * pipeline_parallel_size
+                    * data_parallel_size
+                    * prefill_context_parallel_size
+                    * sequence_parallel_size
                 )
 
                 # Get physical device IDs from CUDA_VISIBLE_DEVICES
@@ -536,13 +498,13 @@ def _stage_worker(
                 # Sort devices_to_lock to prevent deadlock (all processes acquire locks in same order)
                 devices_to_lock = sorted(devices_to_lock)
 
-                _logging.getLogger(__name__).debug(
-                    "[Stage-%s] Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
-                    stage_id,
+                logger.debug(
+                    "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d, SP=%d; will lock %d devices: %s",
                     tensor_parallel_size,
                     pipeline_parallel_size,
                     data_parallel_size,
                     prefill_context_parallel_size,
+                    sequence_parallel_size,
                     num_devices_to_lock,
                     devices_to_lock,
                 )
@@ -571,19 +533,15 @@ def _stage_worker(
                                 _os.fsync(lock_fd)  # Ensure written to disk
                                 lock_acquired = True
                                 acquired_lock_fds.append(lock_fd)
-                                _logging.getLogger(__name__).debug(
-                                    "[Stage-%s] Acquired exclusive lock for device %s", stage_id, device_id
-                                )
+                                logger.debug("Acquired exclusive lock for device %s", device_id)
                             except BlockingIOError:
                                 # Lock is held by another process
                                 _os.close(lock_fd)
 
                                 # Check if we've been waiting too long
                                 if _time.time() - wait_start > max_wait_time:
-                                    _logging.getLogger(__name__).warning(
-                                        "[Stage-%s] Timeout waiting for device %s "
-                                        "initialization lock, proceeding anyway",
-                                        stage_id,
+                                    logger.warning(
+                                        "Timeout waiting for device %s initialization lock, proceeding anyway",
                                         device_id,
                                     )
                                     break
@@ -592,9 +550,8 @@ def _stage_worker(
                                 _time.sleep(0.1)
                         except OSError as e:
                             # Other error - log and continue without lock
-                            _logging.getLogger(__name__).debug(
-                                "[Stage-%s] Failed to acquire lock for device %s: %s, continuing anyway",
-                                stage_id,
+                            logger.debug(
+                                "Failed to acquire lock for device %s: %s, continuing anyway",
                                 device_id,
                                 e,
                             )
@@ -606,16 +563,16 @@ def _stage_worker(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            _logging.getLogger(__name__).debug(
-                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
-            )
-
-    # Init LLM
-    _logging.getLogger(__name__).debug(
-        "[Stage-%s] Initializing engine with args keys=%s", stage_id, list(engine_args.keys())
-    )
+            logger.debug("[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e)
+    # Init engine based on stage_type
+    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
     try:
-        stage_engine = OmniStageLLM(model=model, **engine_args)
+        if stage_type == "diffusion":
+            engine_args.pop("model_stage")
+            stage_engine = OmniDiffusion(**engine_args)
+        else:
+            # Default to LLM engine
+            stage_engine = OmniLLM(model=model, **engine_args)
     finally:
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
@@ -623,10 +580,10 @@ def _stage_worker(
         for lock_fd in lock_files:
             try:
                 _os.close(lock_fd)
-                _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
+                logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
-    _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
+    logger.debug("Engine initialized")
 
     # Initialize OmniConnectors if configured
     connectors = {}
@@ -645,16 +602,18 @@ def _stage_worker(
     except Exception:
         pass
 
+    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
+    logger.info(f"Max batch size: {max_batch_size}")
+
     # Batch processing loop
     while True:
         task = in_q.get()
+
         _recv_dequeue_ts = _time.time()
         if task is None:
-            _logging.getLogger(__name__).error("[Stage-%s] Received shutdown signal", stage_id)
+            logger.error("Received shutdown signal")
             break
 
-        max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-        print(f"[Stage-{stage_id}] Max batch size: {max_batch_size}")
         batch_tasks: list[dict[str, Any]] = [task]
         start_time = _time.time()
         if max_batch_size > 1:
@@ -710,46 +669,86 @@ def _stage_worker(
                     "Ensure connectors are configured for all incoming edges."
                 )
 
-            if _rx_metrics:
-                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
             if isinstance(ein, list):
                 batch_engine_inputs.extend(ein)
             elif isinstance(ein, dict):
                 batch_engine_inputs.append(ein)
+            elif isinstance(ein, str):
+                # For diffusion stage-0, ein might be a string prompt directly
+                batch_engine_inputs.append(ein)
             else:
-                _logging.getLogger(__name__).error("[Stage-%s] Invalid engine input type: %s", stage_id, type(ein))
+                # For other types (e.g., OmniTokensPrompt, TextPrompt), append as-is
+                batch_engine_inputs.append(ein)
         sampling_params = batch_tasks[0]["sampling_params"]
-        _logging.getLogger(__name__).debug(
-            "[Stage-%s] Received batch size=%d, request_ids=%s",
-            stage_id,
+        logger.debug(
+            "Received batch size=%d, request_ids=%s",
             len(batch_tasks),
             batch_request_ids,
         )
-        print("--------------------------------", flush=True)
-        print(
-            f"[Stage-{stage_id}] Received batch size={len(batch_tasks)}, request_ids={batch_request_ids}",
-            flush=True,
-        )
-        print("--------------------------------", flush=True)
         try:
             _batch_seq += 1
             gen_outputs: list[Any] = []
             _gen_t0 = _time.time()
-            for ro in stage_engine.generate(batch_engine_inputs, sampling_params, use_tqdm=False):
-                gen_outputs.append(ro)
+            if stage_type == "diffusion":
+                # For diffusion, batch_engine_inputs should be prompts (strings)
+                # Convert to list of strings if needed
+                prompts = []
+                for ein in batch_engine_inputs:
+                    if isinstance(ein, str):
+                        prompts.append(ein)
+                    elif isinstance(ein, dict) and "prompt" in ein:
+                        prompts.append(ein["prompt"])
+                    elif hasattr(ein, "prompt"):
+                        prompts.append(ein.prompt)
+                    else:
+                        prompts.append(str(ein))
+                # Prepare diffusion kwargs from sampling parameters
+                diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
+                # Diffusion generate returns results directly, not an iterator
+                diffusion_results = stage_engine.generate(prompts, **diffusion_kwargs)
+                # Convert to list format compatible with LLM outputs
+                # Ensure each result has a request_id for proper mapping
+                if isinstance(diffusion_results, list):
+                    gen_outputs = diffusion_results
+                    # Assign request_ids if not present
+                    for idx, result in enumerate(gen_outputs):
+                        if not hasattr(result, "request_id") or result.request_id is None:
+                            if idx < len(batch_request_ids):
+                                if hasattr(result, "request_id"):
+                                    result.request_id = batch_request_ids[idx]
+                                else:
+                                    # Create a wrapper object if result doesn't support request_id
+                                    from types import SimpleNamespace
+
+                                    wrapped = SimpleNamespace()
+                                    wrapped.request_id = batch_request_ids[idx]
+                                    wrapped.output = result
+                                    gen_outputs[idx] = wrapped
+                else:
+                    gen_outputs = [diffusion_results]
+                    # Assign request_id to single result
+                    if len(batch_request_ids) > 0:
+                        if hasattr(gen_outputs[0], "request_id"):
+                            gen_outputs[0].request_id = batch_request_ids[0]
+                        else:
+                            from types import SimpleNamespace
+
+                            wrapped = SimpleNamespace()
+                            wrapped.request_id = batch_request_ids[0]
+                            wrapped.output = gen_outputs[0]
+                            gen_outputs[0] = wrapped
+            else:
+                # LLM engine: use vLLM native SamplingParams
+                llm_sampling_params = prepare_sampling_params(sampling_params, "llm")
+                for ro in stage_engine.generate(batch_engine_inputs, llm_sampling_params, use_tqdm=False):
+                    gen_outputs.append(ro)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-            try:
-                print(
-                    f"[Stage-{stage_id}] Generate done: batch={len(batch_tasks)}, "
-                    f"req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}",
-                    flush=True,
-                )
-            except Exception:
-                pass
+            logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
 
             # Group outputs per request id with fallback
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -768,56 +767,27 @@ def _stage_worker(
                     req_to_outputs[target_rid].append(ro)
                     idx += 1
 
-            # Per-request stats logging and aggregates
-            for rid in batch_request_ids:
-                _r_outputs = req_to_outputs.get(rid, [])
-                _num_tokens = count_tokens_from_outputs(_r_outputs)
-                _agg_total_tokens += _num_tokens
-                _agg_total_gen_time_ms += _gen_ms
-
-            if _stats_file:
-                _avg_tokens_per_s = (
-                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
-                )
-                log_stage_running_avg(
-                    _stats_file,
-                    stage_id,
-                    int(_agg_total_tokens),
-                    float(_agg_total_gen_time_ms),
-                    float(_avg_tokens_per_s),
-                )
-                log_stage_batch_stats(
-                    _stats_file,
-                    stage_id,
-                    len(batch_tasks),
-                    float(_gen_ms),
-                    list(batch_request_ids),
-                )
+            _agg_total_gen_time_ms += _gen_ms
 
             # Emit per-request results
-            for rid in batch_request_ids:
+            for i, rid in enumerate(batch_request_ids):
                 r_outputs = req_to_outputs.get(rid, [])
+                _metrics = make_request_stats(
+                    r_outputs,
+                    _gen_ms,
+                    int(_batch_seq),
+                    int(len(batch_request_ids)),
+                    float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                    int(_rx_bytes_by_rid.get(rid, 0)),
+                    float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                )
+                _agg_total_tokens += _metrics.num_tokens_out
+                if i == len(batch_request_ids) - 1:
+                    _metrics.stage_stats = make_stage_stats(_agg_total_tokens, _agg_total_gen_time_ms)
+                else:
+                    _metrics.stage_stats = None
                 try:
                     use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
-                    _metrics = {
-                        "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                        "stage_gen_time_ms": _gen_ms,
-                        "batch_id": int(_batch_seq),
-                        "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                        "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                        "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                    }
-                    if _stats_file:
-                        compute_and_log_stage_request_stats(
-                            _stats_file,
-                            stage_id,
-                            rid,
-                            len(batch_tasks),
-                            r_outputs,
-                            float(_gen_ms),
-                            int(_metrics["rx_transfer_bytes"]),  # type: ignore[index]
-                            float(_metrics["rx_decode_time_ms"]),  # type: ignore[index]
-                        )
                     if use_shm:
                         out_q.put(
                             {
@@ -842,22 +812,15 @@ def _stage_worker(
                             "request_id": rid,
                             "stage_id": stage_id,
                             "engine_outputs": r_outputs,
-                            "metrics": {
-                                "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                                "stage_gen_time_ms": _gen_ms,
-                                "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                                "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                                "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                            },
+                            "metrics": _metrics,
                         }
                     )
-                _logging.getLogger(__name__).debug(
-                    "[Stage-%s] Enqueued result for request %s to downstream",
-                    stage_id,
+                logger.debug(
+                    "Enqueued result for request %s to downstream",
                     rid,
                 )
         except Exception as e:
-            _logging.getLogger(__name__).exception("[Stage-%s] Failed on batch %s: %s", stage_id, batch_request_ids, e)
+            logger.exception("Failed on batch %s: %s", batch_request_ids, e)
             _tb = traceback.format_exc()
             for rid in batch_request_ids:
                 out_q.put(
@@ -886,54 +849,19 @@ async def _stage_worker_async(
     batch_timeout: int = 10,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
-    import logging as _logging
+    # Use local aliases to avoid conflicts with global imports in worker process
     import os as _os
     import time as _time
-
-    from vllm_omni.distributed.omni_connectors import build_stage_connectors
-    from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
-    from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
-    from vllm_omni.entrypoints.log_utils import (
-        compute_and_log_stage_request_stats,
-        count_tokens_from_outputs,
-        log_stage_batch_stats,
-        log_stage_running_avg,
-    )
-
-    # no inline JSONL/serialization imports; logging handled by utilities
 
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
+    stage_type = stage_payload.get("stage_type", "llm")
 
-    log_file = omni_stage._log_file
     in_q = omni_stage._in_q
     out_q = omni_stage._out_q
-    # Per-stage file logger (optional)
-    try:
-        if log_file:
-            stage_log = _logging.getLogger(__name__)
-            stage_log.setLevel(_logging.DEBUG)
-            fh = _logging.FileHandler(f"{log_file}.stage{stage_id}.log")
-            fh.setLevel(_logging.DEBUG)
-            fh.setFormatter(
-                _logging.Formatter("%(asctime)s [PID:%(process)d] [Stage-%(stage)s] %(levelname)s: %(message)s")
-            )  # noqa: E501
-
-            class _StageFilter(_logging.Filter):
-                def filter(self, record: _logging.LogRecord) -> bool:
-                    setattr(record, "stage", stage_id)
-                    return True
-
-            fh.addFilter(_StageFilter())
-            stage_log.addHandler(fh)
-    except Exception:
-        pass
-
-    # Stage stats JSONL file
-    _stats_file = f"{log_file}.stage{stage_id}.stats.jsonl" if log_file else None
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -950,8 +878,10 @@ async def _stage_worker_async(
         device_type = detect_device_type()
         set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
-        _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
+        logger.warning("Device setup failed: %s", e)
 
+    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
+    engine_args["max_num_seqs"] = max_batch_size
     # Initialize OmniConnectors if configured to match sync worker behavior
     connectors: dict[Any, Any] = {}
     if connectors_config:
@@ -1013,9 +943,8 @@ async def _stage_worker_async(
                 # Sort devices_to_lock to prevent deadlock (all processes acquire locks in same order)
                 devices_to_lock = sorted(devices_to_lock)
 
-                _logging.getLogger(__name__).debug(
-                    "[Stage-%s] Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
-                    stage_id,
+                logger.debug(
+                    "Parallel config: TP=%d, PP=%d, DP=%d, PCP=%d; will lock %d devices: %s",
                     tensor_parallel_size,
                     pipeline_parallel_size,
                     data_parallel_size,
@@ -1048,19 +977,15 @@ async def _stage_worker_async(
                                 _os.fsync(lock_fd)  # Ensure written to disk
                                 lock_acquired = True
                                 acquired_lock_fds.append(lock_fd)
-                                _logging.getLogger(__name__).debug(
-                                    "[Stage-%s] Acquired exclusive lock for device %s", stage_id, device_id
-                                )
+                                logger.debug("Acquired exclusive lock for device %s", device_id)
                             except BlockingIOError:
                                 # Lock is held by another process
                                 _os.close(lock_fd)
 
                                 # Check if we've been waiting too long
                                 if _time.time() - wait_start > max_wait_time:
-                                    _logging.getLogger(__name__).warning(
-                                        "[Stage-%s] Timeout waiting for device %s "
-                                        "initialization lock, proceeding anyway",
-                                        stage_id,
+                                    logger.warning(
+                                        "Timeout waiting for device %s initialization lock, proceeding anyway",
                                         device_id,
                                     )
                                     break
@@ -1069,9 +994,8 @@ async def _stage_worker_async(
                                 _time.sleep(0.1)
                         except OSError as e:
                             # Other error - log and continue without lock
-                            _logging.getLogger(__name__).debug(
-                                "[Stage-%s] Failed to acquire lock for device %s: %s, continuing anyway",
-                                stage_id,
+                            logger.debug(
+                                "Failed to acquire lock for device %s: %s, continuing anyway",
                                 device_id,
                                 e,
                             )
@@ -1083,25 +1007,40 @@ async def _stage_worker_async(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            _logging.getLogger(__name__).debug(
-                "[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e
-            )
+            logger.debug("Failed to set up sequential initialization lock: %s", e)
 
-    # Init LLM
-    _logging.getLogger(__name__).debug(
-        "[Stage-%s] Initializing engine with args keys=%s",
+    # Init engine based on stage_type
+    logger.debug(
+        "[Stage-%s] Initializing %s engine with args keys=%s",
         stage_id,
+        stage_type,
         list(engine_args.keys()),
     )
     try:
-        omni_engine_args = AsyncOmniEngineArgs(**engine_args)
-        usage_context = UsageContext.OPENAI_API_SERVER
-        vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
-        stage_engine = AsyncOmniStageLLM.from_vllm_config(
-            vllm_config=vllm_config,
-            usage_context=usage_context,
-            engine_args=omni_engine_args,
-        )
+        if stage_type == "diffusion":
+            # For diffusion, we need to extract diffusion-specific config
+            od_config = engine_args.get("od_config", {})
+            if not od_config:
+                # Create default config from engine_args
+                od_config = {"model": model}
+                # Copy relevant diffusion args
+                for key in ["model", "device", "dtype", "enable_cpu_offload"]:
+                    if key in engine_args:
+                        od_config[key] = engine_args[key]
+            logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
+            stage_engine = AsyncOmniDiffusion(
+                model=model, od_config=od_config, **{k: v for k, v in engine_args.items() if k != "od_config"}
+            )
+            vllm_config = None  # Diffusion doesn't use vllm_config
+        else:
+            omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
+            usage_context = UsageContext.OPENAI_API_SERVER
+            vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
+            stage_engine = AsyncOmniLLM.from_vllm_config(
+                vllm_config=vllm_config,
+                usage_context=usage_context,
+                engine_args=omni_engine_args,
+            )
     finally:
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
@@ -1109,13 +1048,14 @@ async def _stage_worker_async(
         for lock_fd in lock_files:
             try:
                 _os.close(lock_fd)
-                _logging.getLogger(__name__).debug("[Stage-%s] Released initialization lock (fd=%s)", stage_id, lock_fd)
+                logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
     omni_stage.set_async_engine(stage_engine)
-    # Don't keep the dummy data in memory
-    await stage_engine.reset_mm_cache()
-    _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
+    # Don't keep the dummy data in memory (only for LLM engines)
+    if stage_type != "diffusion":
+        await stage_engine.reset_mm_cache()
+    logger.debug("[Stage-%s] Engine initialized", stage_id)
     # Signal readiness to orchestrator and send vllm_config back to main process
     try:
         # Send vllm_config back to main process so it can be accessed via
@@ -1123,31 +1063,27 @@ async def _stage_worker_async(
         # in the worker process
 
         # input_preprocessor = await stage_engine.get_input_preprocessor()
-        out_q.put(
-            {
-                "type": "stage_ready",
-                "stage_id": stage_id,
-                "vllm_config": vllm_config,
-                "tokenizer": getattr(stage_engine, "tokenizer", None),
-                "is_tracing_enabled": await stage_engine.is_tracing_enabled(),
-                # "input_preprocessor": input_preprocessor,
-            }
-        )
+        stage_ready_payload = {
+            "type": "stage_ready",
+            "stage_id": stage_id,
+            "vllm_config": vllm_config,
+            "tokenizer": getattr(stage_engine, "tokenizer", None),
+        }
+        # Only add is_tracing_enabled for LLM engines
+        if stage_type != "diffusion":
+            stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+        out_q.put(stage_ready_payload)
     except Exception as e:
-        _logging.getLogger(__name__).warning("[Stage-%s] Failed to send stage ready signal: %s", stage_id, e)
+        logger.warning("Failed to send stage ready signal: %s", e)
+    generation_out_q = asyncio.Queue()
 
     # Batch processing loop
-    while True:
-        task = in_q.get()
+    _rx_bytes_by_rid: dict[Any, int] = {}
+    _rx_decode_ms_by_rid: dict[Any, float] = {}
+    _in_flight_ms_by_rid: dict[Any, float] = {}
+
+    async def generation_single_request(task: dict[str, Any]):
         _recv_dequeue_ts = _time.time()
-        if task is None:
-            _logging.getLogger(__name__).debug("[Stage-%s] Received shutdown signal", stage_id)
-            break
-
-        _rx_bytes_by_rid: dict[Any, int] = {}
-        _rx_decode_ms_by_rid: dict[Any, float] = {}
-        _in_flight_ms_by_rid: dict[Any, float] = {}
-
         rid = task["request_id"]
         try:
             sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
@@ -1157,74 +1093,116 @@ async def _stage_worker_async(
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
-        ein, _rx_metrics = try_recv_via_connector(
-            task=task,
-            connectors=connectors,
-            stage_id=stage_id,
-        )
-        if ein is None or _rx_metrics is None:
-            raise RuntimeError(
-                f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                "Ensure connectors are configured for all incoming edges."
-            )
-        _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-        _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
-
-        sampling_params = task["sampling_params"]
-        _logging.getLogger(__name__).debug("[Stage-%s] Received batch size=1, request_ids=%s", stage_id, rid)
-        print("--------------------------------", flush=True)
-        print(f"[Stage-{stage_id}] Received batch size=1, request_ids={rid}", flush=True)
-        print("--------------------------------", flush=True)
         try:
-            _batch_seq += 1
+            ein, _rx_metrics = try_recv_via_connector(
+                task=task,
+                connectors=connectors,
+                stage_id=stage_id,
+            )
+            if ein is None or _rx_metrics is None:
+                raise RuntimeError(
+                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                    "Ensure connectors are configured for all incoming edges."
+                )
+            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
+            sampling_params = task["sampling_params"]
+            logger.debug("Received batch size=1, request_ids=%s", rid)
             _gen_t0 = _time.time()
             if isinstance(ein, list):
                 ein = ein[0]
 
-            async for res in stage_engine.generate(ein, sampling_params, rid):
-                gen_output = res
+            if stage_type == "diffusion":
+                # For diffusion, ein should be prompts (strings)
+                # Convert to string if needed
+                if isinstance(ein, str):
+                    prompt = ein
+                elif isinstance(ein, dict) and "prompt" in ein:
+                    prompt = ein["prompt"]
+                elif hasattr(ein, "prompt"):
+                    prompt = ein.prompt
+                else:
+                    prompt = str(ein)
+
+                # Prepare diffusion kwargs from sampling parameters
+                diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
+                # AsyncOmniDiffusion.generate returns a single result, not an async generator
+                gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **diffusion_kwargs)
+            else:
+                # LLM stages: ensure using SamplingParams
+                llm_sampling_params = prepare_sampling_params(sampling_params, "llm")
+                gen_output = None
+                async for res in stage_engine.generate(ein, llm_sampling_params, rid):
+                    gen_output = res
+
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-
-            r_outputs = [gen_output]
-            _num_tokens = count_tokens_from_outputs(r_outputs)
-            _agg_total_tokens += _num_tokens
-            _agg_total_gen_time_ms += _gen_ms
-
-            if _stats_file:
-                _avg_tokens_per_s = (
-                    (_agg_total_tokens * 1000.0 / _agg_total_gen_time_ms) if _agg_total_gen_time_ms > 0 else 0.0
-                )
-                log_stage_running_avg(
-                    _stats_file,
-                    stage_id,
-                    int(_agg_total_tokens),
-                    float(_agg_total_gen_time_ms),
-                    float(_avg_tokens_per_s),
-                )
-                log_stage_batch_stats(_stats_file, stage_id, 1, float(_gen_ms), [rid])
-
-            try:
-                use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
-                _metrics = {
-                    "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                    "stage_gen_time_ms": _gen_ms,
-                    "batch_id": int(_batch_seq),
-                    "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                    "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                    "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
+            await generation_out_q.put((rid, gen_output, _gen_ms))
+        except Exception as e:
+            logger.exception("Failed on request %s: %s", rid, e)
+            out_q.put(
+                {
+                    "request_id": rid,
+                    "stage_id": stage_id,
+                    "error": str(e),
                 }
-                if _stats_file:
-                    compute_and_log_stage_request_stats(
-                        _stats_file,
-                        stage_id,
-                        rid,
-                        1,
-                        r_outputs,
-                        float(_gen_ms),
-                        int(_metrics["rx_transfer_bytes"]),  # type: ignore[index]
-                        float(_metrics["rx_decode_time_ms"]),  # type: ignore[index]
-                    )
+            )
+
+    _batch_gen_t0 = _time.time()
+    while True:
+        try:
+            task = in_q.get_nowait()
+            if task is None:
+                logger.debug("Received shutdown signal")
+                break
+            asyncio.create_task(generation_single_request(task))
+        except queue.Empty:
+            await asyncio.sleep(0.001)
+        batch_request_outputs: list[Any] = []
+        batch_request_ids: list[Any] = []
+        _gen_ms_list = []
+        batch_metrics: list[Any] = []
+        while True:
+            try:
+                rid, gen_output, _gen_ms = generation_out_q.get_nowait()
+                _metrics = make_request_stats(
+                    [gen_output],
+                    _gen_ms,
+                    int(_batch_seq),
+                    1,  # temporarily set to 1
+                    float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                    int(_rx_bytes_by_rid.get(rid, 0)),
+                    float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                )
+                batch_metrics.append(_metrics)
+                batch_request_outputs.append(gen_output)
+                _gen_ms_list.append(_gen_ms)
+                batch_request_ids.append(rid)
+                _agg_total_tokens += _metrics.num_tokens_out
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.001)
+                break
+
+        if not batch_request_outputs:
+            continue
+        _batch_seq += 1
+
+        _batch_gen_t1 = _time.time()
+        _agg_total_gen_time_ms += (_batch_gen_t1 - _batch_gen_t0) * 1000
+        _batch_gen_t0 = _batch_gen_t1
+        for idx, metrics in enumerate(batch_metrics):
+            metrics.batch_size = len(batch_metrics)
+            if idx == len(batch_metrics) - 1:
+                metrics.stage_stats = make_stage_stats(_agg_total_tokens, _agg_total_gen_time_ms)
+
+        logger.debug("Sending outputs to main process")
+        for rid, output, _gen_ms, _metrics in zip(
+            batch_request_ids, batch_request_outputs, _gen_ms_list, batch_metrics
+        ):
+            try:
+                r_outputs = [output]
+                use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
                 if use_shm:
                     out_q.put(
                         {
@@ -1243,18 +1221,10 @@ async def _stage_worker_async(
                             "metrics": _metrics,
                         }
                     )
-                    try:
-                        print(
-                            f"[Stage-{stage_id}] Enqueued req={rid}, use_shm={use_shm}, "
-                            f"tokens_out={_metrics['num_tokens_out']}",
-                            flush=True,
-                        )
-                    except Exception:
-                        pass
+                    logger.debug(f"Enqueued req={rid}, use_shm={use_shm}, tokens_out={_metrics.num_tokens_out}")
             except Exception as e:
-                _logging.getLogger(__name__).exception(
-                    "[Stage-%s] Failed to enqueue result for request %s: %s",
-                    stage_id,
+                logger.exception(
+                    "Failed to enqueue result for request %s: %s",
                     rid,
                     e,
                 )
@@ -1263,26 +1233,41 @@ async def _stage_worker_async(
                         "request_id": rid,
                         "stage_id": stage_id,
                         "engine_outputs": r_outputs,
-                        "metrics": {
-                            "num_tokens_out": int(count_tokens_from_outputs(r_outputs)),
-                            "stage_gen_time_ms": _gen_ms,
-                            "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
-                            "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
-                            "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
-                        },
+                        "metrics": _metrics,
                     }
                 )
-            _logging.getLogger(__name__).debug("[Stage-%s] Enqueued result for request %s to downstream", stage_id, rid)
+            logger.debug("Enqueued result for request %s to downstream", rid)
 
-        except Exception as e:
-            _logging.getLogger(__name__).exception("[Stage-%s] Failed on request %s: %s", stage_id, rid, e)
-            out_q.put(
-                {
-                    "request_id": rid,
-                    "stage_id": stage_id,
-                    "error": str(e),
-                }
-            )
-    print("--------------------------------", flush=True)
-    print(f"[Stage-{stage_id}] Stage worker exiting", flush=True)
-    print("--------------------------------", flush=True)
+    logger.info("Stage worker exiting")
+
+
+def make_request_stats(
+    req_output: list[Any],
+    stage_gen_time_ms: float,
+    batch_id: int,
+    batch_size: int,
+    rx_decode_time_ms: float,
+    rx_transfer_bytes: int,
+    rx_in_flight_time_ms: float,
+):
+    from vllm_omni.entrypoints.log_utils import (
+        StageRequestMetrics,
+    )
+
+    num_tokens_out = count_tokens_from_outputs(req_output)
+    return StageRequestMetrics(
+        num_tokens_out=num_tokens_out,
+        stage_gen_time_ms=stage_gen_time_ms,
+        batch_id=batch_id,
+        batch_size=batch_size,
+        rx_decode_time_ms=rx_decode_time_ms,
+        rx_transfer_bytes=rx_transfer_bytes,
+        rx_in_flight_time_ms=rx_in_flight_time_ms,
+        stage_stats=None,
+    )
+
+
+def make_stage_stats(_agg_total_tokens: int, _agg_total_gen_time_ms: float):
+    from vllm_omni.entrypoints.log_utils import StageStats
+
+    return StageStats(total_token=_agg_total_tokens, total_gen_time=_agg_total_gen_time_ms)
