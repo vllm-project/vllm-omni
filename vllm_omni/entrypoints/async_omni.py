@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import json
 import multiprocessing as mp
 import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pprint import pformat
 from typing import Any
 
@@ -24,7 +25,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 # Internal imports (our code)
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
@@ -155,6 +156,39 @@ class AsyncOmni:
             self.config_path = resolve_model_config_path(model)
             self.stage_configs = load_stage_configs_from_model(model)
             if not self.stage_configs:
+                cache_config = kwargs.get("cache_config", None)
+                if isinstance(cache_config, str):
+                    try:
+                        cache_config = json.loads(cache_config)
+                    except json.JSONDecodeError:
+                        logger.warning("Invalid cache_config JSON, using defaults.")
+                        cache_config = None
+
+                ulysses_degree = kwargs.get("ulysses_degree") or 1
+                ring_degree = kwargs.get("ring_degree") or 1
+                sequence_parallel_size = kwargs.get("sequence_parallel_size")
+                if sequence_parallel_size is None:
+                    sequence_parallel_size = ulysses_degree * ring_degree
+
+                diffusion_engine_args: dict[str, Any] = {
+                    "parallel_config": DiffusionParallelConfig(
+                        pipeline_parallel_size=1,
+                        data_parallel_size=1,
+                        tensor_parallel_size=1,
+                        sequence_parallel_size=sequence_parallel_size,
+                        ulysses_degree=ulysses_degree,
+                        ring_degree=ring_degree,
+                        cfg_parallel_size=1,
+                    ),
+                    "vae_use_slicing": kwargs.get("vae_use_slicing", False),
+                    "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+                    "cache_backend": kwargs.get("cache_backend", "none"),
+                    "cache_config": cache_config,
+                }
+                od_field_names = {f.name for f in fields(OmniDiffusionConfig)}
+                for key in od_field_names:
+                    if key in kwargs and key not in diffusion_engine_args and kwargs[key] is not None:
+                        diffusion_engine_args[key] = kwargs[key]
                 default_stage_cfg = [
                     {
                         "stage_id": 0,
@@ -164,21 +198,7 @@ class AsyncOmni:
                             "devices": "0",
                             "max_batch_size": 1,
                         },
-                        "engine_args": {
-                            "parallel_config": DiffusionParallelConfig(
-                                pipeline_parallel_size=1,
-                                data_parallel_size=1,
-                                tensor_parallel_size=1,
-                                sequence_parallel_size=1,
-                                ulysses_degree=1,
-                                ring_degree=1,
-                                cfg_parallel_size=1,
-                            ),
-                            "vae_use_slicing": kwargs.get("vae_use_slicing", False),
-                            "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                            "cache_backend": kwargs.get("cache_backend", "none"),
-                            "cache_config": kwargs.get("cache_config", None),
-                        },
+                        "engine_args": diffusion_engine_args,
                         "final_output": True,
                         "final_output_type": "image",
                     }

@@ -647,7 +647,16 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
-        result = await engine_client.generate(**gen_params)
+        result = None
+        if hasattr(engine_client, "stage_list"):
+            async for output in engine_client.generate(
+                prompt=gen_params["prompt"],
+                request_id=gen_params["request_id"],
+                sampling_params_list=[gen_params],
+            ):
+                result = output
+        else:
+            result = await engine_client.generate(**gen_params)
 
         if result is None:
             raise HTTPException(
@@ -656,7 +665,15 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             )
 
         # Extract images from result
-        images = result.images if hasattr(result, "images") and result.images else []
+        images = []
+        if hasattr(result, "images") and result.images:
+            images = result.images
+        elif hasattr(result, "request_output"):
+            request_output = result.request_output
+            if isinstance(request_output, dict) and request_output.get("images"):
+                images = request_output["images"]
+            elif hasattr(request_output, "images") and request_output.images:
+                images = request_output.images
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
