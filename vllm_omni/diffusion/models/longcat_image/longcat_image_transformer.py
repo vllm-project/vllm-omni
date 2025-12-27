@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from vllm.logger import init_logger
@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.utils.platform_utils import is_npu
 
 logger = init_logger(__name__)
@@ -97,6 +98,7 @@ class LongCatImageAttention(nn.Module):
 
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
+        self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
             num_heads=heads,
             head_size=self.head_dim,
@@ -138,8 +140,11 @@ class LongCatImageAttention(nn.Module):
             value = torch.cat([encoder_value, value], dim=1)
 
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            cos, sin = image_rotary_emb  # [S, D/2]
+            cos = cos.to(query.dtype)
+            sin = sin.to(query.dtype)
+            query = self.rope(query, cos, sin)
+            key = self.rope(key, cos, sin)
 
         hidden_states = self.attn(
             query,
@@ -263,16 +268,15 @@ class LongCatImagePosEmbed(nn.Module):
         is_npu = ids.device.type == "npu"
         freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
         for i in range(n_axes):
-            cos, sin = get_1d_rotary_pos_embed(
+            freqs_cis = get_1d_rotary_pos_embed(
                 self.axes_dim[i],
                 pos[:, i],
                 theta=self.theta,
-                repeat_interleave_real=True,
-                use_real=True,
+                use_real=False,
                 freqs_dtype=freqs_dtype,
             )
-            cos_out.append(cos)
-            sin_out.append(sin)
+            cos_out.append(freqs_cis.real)
+            sin_out.append(freqs_cis.imag)
         freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
         freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
         return freqs_cos, freqs_sin
