@@ -36,15 +36,13 @@ class BackgroundResources:
 
     def __call__(self):
         """Clean up background resources."""
-        if self.scheduler is not None:
+        if scheduler is not None:
             try:
-                for _ in range(self.scheduler.num_workers):
-                    self.scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
-                self.scheduler.close()
+                for _ in range(scheduler.num_workers):
+                    scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
+                scheduler.close()
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
-        if not self.processes:
-            return
         for proc in self.processes:
             if not proc.is_alive():
                 continue
