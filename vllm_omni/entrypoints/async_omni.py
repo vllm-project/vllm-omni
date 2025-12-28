@@ -4,8 +4,7 @@ import asyncio
 import multiprocessing as mp
 import os
 import time
-import uuid
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
@@ -13,19 +12,17 @@ from typing import Any
 
 from omegaconf import OmegaConf
 from vllm.config import VllmConfig
-from vllm.inputs import PromptType
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
-from vllm.tokenizers import TokenizerLike, init_tokenizer_from_config
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine.exceptions import EngineDeadError
 
 # Internal imports (our code)
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
     initialize_orchestrator_connectors,
@@ -77,9 +74,9 @@ class AsyncOmni:
 
     Args:
         *args: Variable length argument list.
-            - args[0] (str): Model name or path to load.
+            - args[0]: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model (str): Model name or path to load (if not in args).
+            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -88,6 +85,8 @@ class AsyncOmni:
               each stage process during initialization
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
             - Additional keyword arguments passed to stage engines.
@@ -213,8 +212,8 @@ class AsyncOmni:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
-
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
+
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[AsyncOrchestrator] Loaded %d stages", len(self.stage_list))
 
@@ -364,281 +363,6 @@ class AsyncOmni:
                 self.io_processor = None
                 self.model_config = None
 
-    async def _run_generation_async(
-        self,
-        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
-        sampling_params_list: Any | Sequence[Any] | None = None,
-    ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Asynchronously run pipeline generation."""
-        logger.debug("[AsyncOrchestrator] generate() called")
-        if sampling_params_list is None:
-            raise ValueError("sampling_params_list is required for pipelined generation")
-
-        # Normalize sampling_params_list to a list
-        if not isinstance(sampling_params_list, (list, tuple)):
-            sampling_params_list = [sampling_params_list]
-        else:
-            sampling_params_list = list(sampling_params_list)
-
-        if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
-
-        # Normalize prompts to a list for per-request iteration
-        if not isinstance(prompts, (list, tuple)):
-            request_prompts: list[PromptType] = [prompts]
-        else:
-            request_prompts = list(prompts)
-
-        # Create async output queue monitors for each stage
-        stage_monitors = []
-        for stage_id, stage in enumerate(self.stage_list):
-            monitor = asyncio.create_task(self._monitor_stage_outputs_async(stage_id, stage))
-            stage_monitors.append(monitor)
-
-        # Orchestrator keeps stage objects for input derivation
-        num_stages = len(self.stage_list)
-
-        # Generate globally unique request IDs and map them to original prompts
-        request_ids: list[str] = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
-        request_id_to_prompt: dict[str, PromptType] = {rid: p for rid, p in zip(request_ids, request_prompts)}
-
-        # Track start time for each request for end-to-end timing
-        _req_start_ts: dict[str, float] = {}
-        _wall_start_ts: float = time.time()
-
-        # Determine final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
-        final_stage_id_to_prompt: dict[str, int] = {}
-        for rid, prompt in request_id_to_prompt.items():
-            if isinstance(prompt, dict):
-                prompt_modalities = prompt.get("modalities", None)
-            else:
-                prompt_modalities = None
-            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                prompt_modalities, self.output_modalities, self.stage_list
-            )
-            final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
-
-        # Metrics/aggregation helper
-        metrics = OrchestratorMetrics(
-            num_stages,
-            self._enable_stats,
-            self._stats_file,
-            self._overall_stats_file,
-            _wall_start_ts,
-        )
-
-        # Seed all requests into stage-0 queue
-        logger.debug("[AsyncOrchestrator] Seeding %d requests into stage-0", len(request_prompts))
-        # Mark first input time for stage-0
-        metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
-
-        for req_id, prompt in request_id_to_prompt.items():
-            sp0 = sampling_params_list[0]  # type: ignore[index]
-            task = {
-                "request_id": req_id,
-                "engine_inputs": prompt,
-                "sampling_params": sp0,
-            }
-            logger.info(f"task: {task}")
-            self.stage_list[0].submit(task)
-            _req_start_ts[req_id] = time.time()
-            logger.debug("[AsyncOrchestrator] Enqueued request %s to stage-0", req_id)
-
-        # For each stage, forward results in stage order; collect final results at the end
-        # We pipeline by continuously polling output queues
-        remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
-        completed_requests = 0
-        total_requests = len(request_prompts)
-
-        logger.debug(
-            "[AsyncOrchestrator] Entering scheduling loop: total_requests=%d, stages=%d",
-            total_requests,
-            num_stages,
-        )
-
-        while completed_requests < total_requests:
-            # Asynchronously wait for output from any stage
-            await asyncio.sleep(0.001)  # Brief sleep to avoid CPU overload
-
-            for stage_id, stage in enumerate(self.stage_list):
-                result = stage.try_collect()
-                if result is None:
-                    continue
-
-                req_id = result.get("request_id")
-                if "error" in result:
-                    logger.error(
-                        "Stage %s error on request %s: %s",
-                        stage_id,
-                        req_id,
-                        result["error"],
-                    )
-                    continue
-
-                if result.get("type") == "stage_ready":
-                    # If stage initialization is slower than expected, wait briefly and retry
-                    await asyncio.sleep(0.05)
-                    continue
-
-                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-                # Mark last output time for this stage whenever we receive outputs
-                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-
-                try:
-                    _m = result.get("metrics")
-                    if _m is not None:
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
-                except Exception as e:
-                    logger.exception(
-                        "[AsyncOrchestrator] Failed to process metrics for stage %s, req %s: %s",
-                        stage_id,
-                        req_id,
-                        e,
-                    )
-
-                logger.debug(
-                    "[AsyncOrchestrator] Stage-%s completed request %s; forwarding or finalizing",
-                    stage_id,
-                    req_id,
-                )
-                stage.set_engine_outputs(engine_outputs)
-
-                if getattr(stage, "final_output", False):
-                    # Handle diffusion outputs that already contain images
-                    if stage.final_output_type == "image":
-                        # Extract images from engine_outputs if it's an OmniRequestOutput
-                        images = []
-                        output_to_check = engine_outputs[0] if isinstance(engine_outputs, list) else engine_outputs
-                        if isinstance(output_to_check, OmniRequestOutput) and output_to_check.images:
-                            images = output_to_check.images
-                        elif hasattr(output_to_check, "images") and output_to_check.images:
-                            images = output_to_check.images
-                        final_output = OmniRequestOutput(
-                            stage_id=stage_id,
-                            final_output_type=stage.final_output_type,
-                            request_output=engine_outputs,
-                            images=images,
-                        )
-                    else:
-                        final_output = OmniRequestOutput(
-                            stage_id=stage_id,
-                            final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
-                            request_output=engine_outputs,
-                        )
-                    yield final_output
-                    logger.debug(
-                        "[AsyncOrchestrator] Request %s finalized at stage-%s",
-                        req_id,
-                        stage_id,
-                    )
-
-                    # End-to-end timing and time-per-token for final output
-                    # (only once per request at the designated final stage)
-                    try:
-                        rid_key = str(req_id)
-                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
-                            metrics.on_finalize_request(
-                                stage_id,
-                                req_id,
-                                engine_outputs,
-                                _req_start_ts.get(req_id, _wall_start_ts),
-                            )
-                    except Exception as e:
-                        logger.exception(
-                            "[AsyncOrchestrator] Finalize request handling error for req %s at stage %s: %s",
-                            req_id,
-                            stage_id,
-                            e,
-                        )
-
-                next_stage_id = stage_id + 1
-                if next_stage_id <= final_stage_id_to_prompt[req_id]:
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
-                    try:
-                        next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
-                    except Exception as e:
-                        logger.exception(
-                            "[AsyncOrchestrator] Process engine inputs error for req %s at stage %s: %s",
-                            req_id,
-                            next_stage_id,
-                            e,
-                        )
-                        continue
-                    sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
-
-                    # Check connector for this edge
-                    connector_key = (str(stage_id), str(next_stage_id))
-                    connector = self.connectors.get(connector_key)
-                    sent_via_connector = False
-                    if connector:
-                        sent_via_connector = try_send_via_connector(
-                            connector=connector,
-                            stage_id=stage_id,
-                            next_stage_id=next_stage_id,
-                            req_id=req_id,
-                            next_inputs=next_inputs,
-                            sampling_params=sp_next,
-                            original_prompt=request_id_to_prompt[req_id],
-                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                            metrics=metrics,
-                        )
-
-                    if not sent_via_connector:
-                        raise RuntimeError(
-                            f"[AsyncOrchestrator] Failed to send request {req_id} "
-                            f"to stage-{next_stage_id} via connector. Configure a connector "
-                            "for this edge or inspect connector logs for details."
-                        )
-                    logger.debug(
-                        "[AsyncOrchestrator] Forwarded request %s to stage-%s",
-                        req_id,
-                        next_stage_id,
-                    )
-                    remaining_by_stage[next_stage_id] += 1
-                else:
-                    completed_requests += 1
-                    logger.debug(
-                        "[AsyncOrchestrator] Request %s fully completed (%d/%d)",
-                        req_id,
-                        completed_requests,
-                        total_requests,
-                    )
-
-        logger.debug("[AsyncOrchestrator] All requests completed")
-
-        # Summarize and print statistics
-        try:
-            summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
-        except Exception as e:
-            logger.exception("[AsyncOrchestrator] Failed to build/log summary: %s", e)
-
-    async def _monitor_stage_outputs_async(self, stage_id: int, stage: OmniStage) -> None:
-        """Asynchronously monitor stage output queue."""
-        while True:
-            result = stage.try_collect()
-            if result is not None:
-                # Put result into async queue for main loop processing
-                pass
-            await asyncio.sleep(0.001)
-
-        # Here is a duplicated init for the first stage to get the tokenizer,
-        # input_processor, and io_processor
-        # TODO: Refactor the code to avoid the duplicated init, we need to pass
-        # the tokenizer, input_processor, and io_processor back here from the
-        # first stage.
-        vllm_config = self.stage_list[0].vllm_config
-        self.tokenizer = init_tokenizer_from_config(model_config=vllm_config.model_config)
-        self.input_processor = OmniInputProcessor(
-            vllm_config=vllm_config,
-            tokenizer=self.tokenizer,
-        )
-        self.model_config = vllm_config.model_config
-        self.io_processor = get_io_processor(
-            vllm_config,
-            self.model_config.io_processor_plugin,
-        )
-
     def _initialize_stages(
         self,
         model: str,
@@ -761,35 +485,31 @@ class AsyncOmni:
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
-    async def generate(
-        self,
-        prompt: PromptType,
-        request_id: str,
-        sampling_params_list: SamplingParams | Sequence[SamplingParams] | None = None,
-        output_modalities: list[str] | None = None,
-        lora_request: LoRARequest | None = None,
-        trace_headers: Mapping[str, str] | None = None,
-        priority: int = 0,
-        data_parallel_rank: int | None = None,
-    ) -> AsyncGenerator[OmniRequestOutput, None]:
+    async def generate(self, *args: Any, **kwargs: dict[str, Any]) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
+        Coordinates multi-stage pipeline through YAML configuration.
+        Each stage will use AsyncOmniLLM or AsyncOmniDiffusion based on stage_type.
         Processes the prompt through all stages in the pipeline and yields
         outputs as they become available. Each stage uses its corresponding
         sampling parameters from the sampling_params_list.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
-            request_id: Unique identifier for this request
-            sampling_params_list: List of SamplingParams, one for each stage.
-                Must have the same length as the number of stages.
-                If None, uses default sampling params for each stage.
-            lora_request: Optional LoRA adapter request for this generation
-            trace_headers: Optional tracing headers for observability
-            priority: Request priority (higher values processed first)
-            data_parallel_rank: Optional data parallel rank for distributed
-                inference
+            *args: Arguments for generation.
+                - prompt: Prompt to process. Can be a text string, token IDs,
+                    or multimodal prompt.
+                - request_id: Unique identifier for this request
+                - sampling_params_list: List of SamplingParams, one for each stage.
+                    Must have the same length as the number of stages.
+                    If None, uses default sampling params for each stage.
+            **kwargs: Additional arguments for generation.
+                - prompt: Prompt to process. Can be a text string, token IDs,
+                    or multimodal prompt.
+                - request_id: Unique identifier for this request
+                - sampling_params_list: List of SamplingParams, one for each stage.
+                    Must have the same length as the number of stages.
+                    If None, uses default sampling params for each stage.
+                - output_modalities: Optional list of output modalities.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -803,18 +523,41 @@ class AsyncOmni:
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
-        logger.debug("[Orchestrator] generate() called")
+        logger.debug("[AsyncOrchestrator] generate() called")
 
         # Start output handler on the first call to generate()
         self._run_output_handler()
 
+        prompt = args[0] if args else kwargs.get("prompt")
+        request_id = args[1] if len(args) > 1 else kwargs.get("request_id")
+        sampling_params_list = args[2] if len(args) > 2 else kwargs.get("sampling_params_list")
+        output_modalities = kwargs.get("output_modalities", None)
+        # TODO: lora_request, trace_headers, priority are not supported yet
+
         if sampling_params_list is None:
-            sampling_params_list = self.default_sampling_params_list
+            # For Omni LLM, the params are parsed via the yaml file. For the current version,
+            # diffusion params can parsed via the command line.
+            omni_params_kwargs = {
+                k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
+            }
+
+            per_stage_params: list[Any] = []
+            for stage_id, stage in enumerate(self.stage_list):
+                stage_type = getattr(stage, "stage_type", "llm")
+                if stage_type == "diffusion":
+                    default_dict = self.default_sampling_params_list[stage_id]
+                    # Merge user-provided kwargs
+                    merged = {**default_dict, **omni_params_kwargs}
+                    # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
+                    per_stage_params.append(merged)
+                else:
+                    # LLM directly constructs SamplingParams, don't use the merged params
+                    per_stage_params.append(self.default_sampling_params_list[stage_id])
+
+            sampling_params_list = per_stage_params
+
         if len(sampling_params_list) != len(self.stage_list):
-            raise ValueError(
-                f"Expected {len(self.stage_list)} sampling params, \
-                got {len(sampling_params_list)}"
-            )
+            raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
@@ -834,7 +577,7 @@ class AsyncOmni:
             _wall_start_ts,
         )
         # Seed stage-0 queue with all requests
-        logger.debug("[Orchestrator] Seeding request into stage-0")
+        logger.debug("[AsyncOrchestrator] Seeding request into stage-0")
         req_state = ClientRequestState(request_id)
         self.request_states[request_id] = req_state
 
@@ -849,9 +592,9 @@ class AsyncOmni:
         }
         self.stage_list[0].submit(task)
         _req_start_ts[request_id] = time.time()
-        logger.debug("[Orchestrator] Enqueued request %s to stage-0", request_id)
+        logger.debug("[AsyncOrchestrator] Enqueued request %s to stage-0", request_id)
 
-        logger.debug("[Orchestrator] Entering scheduling loop: stages=%d", num_stages)
+        logger.debug("[AsyncOrchestrator] Entering scheduling loop: stages=%d", num_stages)
         for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
             result = await req_state.queue.get()
             assert stage_id == req_state.stage_id
@@ -875,15 +618,13 @@ class AsyncOmni:
                     metrics.on_stage_metrics(stage_id, req_id, _m)
             except Exception as e:
                 logger.exception(
-                    "[Orchestrator] Failed to process metrics for stage %s, \
-                        req %s: %s",
+                    "[AsyncOrchestrator] Failed to process metrics for stage %s, req %s: %s",
                     stage_id,
                     req_id,
                     e,
                 )
             logger.debug(
-                "[Orchestrator] Stage-%s completed request %s; \
-                    forwarding or finalizing",
+                "[AsyncOrchestrator] Stage-%s completed request %s; forwarding or finalizing",
                 stage_id,
                 req_id,
             )
@@ -891,7 +632,7 @@ class AsyncOmni:
 
             if getattr(stage, "final_output", False):
                 logger.debug(
-                    "[Orchestrator] Request %s finalized at stage-%s",
+                    "[AsyncOrchestrator] Request %s finalized at stage-%s",
                     req_id,
                     stage_id,
                 )
@@ -909,8 +650,7 @@ class AsyncOmni:
                         )
                 except Exception as e:
                     logger.exception(
-                        "[Orchestrator] Finalize request handling error for \
-                            req %s at stage %s: %s",
+                        "[AsyncOrchestrator] Finalize request handling error for req %s at stage %s: %s",
                         req_id,
                         stage_id,
                         e,
@@ -969,27 +709,27 @@ class AsyncOmni:
                     # because continuing would cause the request to be silently dropped
                     # and the orchestrator to hang waiting for completion.
                     error_msg = (
-                        f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                        f"[AsyncOrchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                         "Configure a connector for this edge or inspect connector logs for details."
                     )
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
                 logger.debug(
-                    "[Orchestrator] Forwarded request %s to stage-%s",
+                    "[AsyncOrchestrator] Forwarded request %s to stage-%s",
                     req_id,
                     next_stage_id,
                 )
             else:
-                logger.debug("[Orchestrator] Request %s fully completed", req_id)
+                logger.debug("[AsyncOrchestrator] Request %s fully completed", req_id)
 
-        logger.debug("[Orchestrator] All requests completed")
+        logger.debug("[AsyncOrchestrator] All requests completed")
 
         # Summarize and print stats
         try:
             summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
             logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
-            logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
+            logger.exception("[AsyncOrchestrator] Failed to build/log summary: %s", e)
         finally:
             self.request_states.pop(request_id, None)
 

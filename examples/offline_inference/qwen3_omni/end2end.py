@@ -170,15 +170,9 @@ def main(args):
     else:
         query_result = query_func()
 
-    if not args.enable_stats:
-        log_file = None
-    else:
-        log_file = os.path.join(args.log_dir, f"omni_llm_pipeline_{args.query_type}")
-
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
-        log_file=log_file,
         log_stats=args.enable_stats,
     )
 
