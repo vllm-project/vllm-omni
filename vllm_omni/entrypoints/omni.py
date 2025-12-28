@@ -10,11 +10,9 @@ from dataclasses import asdict
 from pprint import pformat
 from typing import Any
 
-import msgspec
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
@@ -68,6 +66,15 @@ class Omni:
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
+            - init_sleep_seconds: Number of seconds to sleep between starting
+              each stage process during initialization
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+            - Additional keyword arguments passed to stage engines.
 
     Example:
         >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
@@ -173,6 +180,7 @@ class Omni:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
@@ -300,20 +308,24 @@ class Omni:
             prompts = kwargs.get("prompt")
 
         if sampling_params_list is None:
-            omni_params_kwargs = {k: v for k, v in kwargs.items() if k not in ["prompts", "sampling_params_list"]}
+            # For Omni LLM, the params are parsed via the yaml file. For the current version,
+            # diffusion params can parsed via the command line.
+            omni_params_kwargs = {
+                k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
+            }
 
             per_stage_params: list[Any] = []
-            for stage in self.stage_list:
+            for stage_id, stage in enumerate(self.stage_list):
                 stage_type = getattr(stage, "stage_type", "llm")
-                default_dict = msgspec.to_builtins(getattr(stage, "default_sampling_params", {}))
-                # Merge user-provided kwargs
-                merged = {**default_dict, **omni_params_kwargs}
                 if stage_type == "diffusion":
+                    default_dict = self.default_sampling_params_list[stage_id]
+                    # Merge user-provided kwargs
+                    merged = {**default_dict, **omni_params_kwargs}
                     # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
                     per_stage_params.append(merged)
                 else:
-                    # LLM directly constructs SamplingParams
-                    per_stage_params.append(SamplingParams(**merged))
+                    # LLM directly constructs SamplingParams, don't use the merged params
+                    per_stage_params.append(self.default_sampling_params_list[stage_id])
 
             sampling_params_list = per_stage_params
         return self._run_generation(prompts, sampling_params_list)

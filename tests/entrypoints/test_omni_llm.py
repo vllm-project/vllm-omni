@@ -109,7 +109,6 @@ class _FakeStage:
         model: str,
         *,
         is_async: bool = False,
-        log_file=None,
         shm_threshold_bytes: int = 65536,
         ctx=None,
         batch_timeout: int = 10,
@@ -295,18 +294,6 @@ def _setup_ipc_mocks(monkeypatch):
 
 def _setup_log_mocks(monkeypatch):
     """Helper function to set up logging and stats mocks."""
-    # Mock init_stats_paths to return None files (no stats logging)
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni.init_stats_paths",
-        lambda enable_stats, log_file: (None, None),
-        raising=False,
-    )
-    # Mock configure_orchestrator_logger to do nothing
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni.configure_orchestrator_logger",
-        lambda logger, log_file: None,
-        raising=False,
-    )
     # Mock OrchestratorMetrics to be a simple class that doesn't require file operations
 
     class _FakeOrchestratorMetrics:
@@ -473,7 +460,6 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -484,13 +470,6 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    # Mock remove_old_logs to avoid bug (called before stage_list is created)
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     # Mock load_stage_configs_from_model
     monkeypatch.setattr(
@@ -542,7 +521,6 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -552,12 +530,6 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
@@ -601,7 +573,6 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -611,12 +582,6 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
@@ -706,7 +671,6 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -716,12 +680,6 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
@@ -787,7 +745,6 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -797,12 +754,6 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
@@ -862,7 +813,6 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -872,12 +822,6 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
@@ -925,7 +869,6 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -935,12 +878,6 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
@@ -1008,7 +945,6 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     for module_name in [
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
-        "vllm_omni.entrypoints.log_utils",
         "vllm_omni.entrypoints.omni_stage",
     ]:
         if module_name in sys.modules:
@@ -1019,17 +955,6 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
 
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.log_utils.remove_old_logs",
-        lambda log_file, num_stages: None,
-        raising=False,
-    )
-
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
-        _fake_loader,
-        raising=False,
-    )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
         _fake_loader,
