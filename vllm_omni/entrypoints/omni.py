@@ -265,7 +265,7 @@ class OmniBase:
                     ]
                 )
                 logger.error(
-                    f"[{self._name}] Stage initialization failed, shutting down.Suggestions:\n- {suggestions}",
+                    f"[{self._name}] Stage initialization failed, shutting down. Suggestions:\n- {suggestions}",
                 )
             except Exception:
                 # Best-effort logging of suggestions
