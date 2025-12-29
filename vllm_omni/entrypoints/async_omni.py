@@ -577,7 +577,9 @@ class AsyncOmni:
 
             # Determine the final stage for E2E stats (highest stage_id with
             # final_output=True; fallback to last stage)
-            final_stage_id_for_e2e = get_final_stage_id_for_e2e(output_modalities, self.output_modalities, self.stage_list)
+            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
+                output_modalities, self.output_modalities, self.stage_list
+            )
 
             # Metrics/aggregation helper
             metrics = OrchestratorMetrics(
@@ -684,12 +686,12 @@ class AsyncOmni:
                             metrics.on_stage_metrics(stage_id, req_id, _m)
                     except Exception as e:
                         logger.exception(
-                        "[AsyncOrchestrator] Finalize request handling error for req %s at stage %s: %s",
-                        req_id,
-                        stage_id,
-                        req_id,
-                        e,
-                    )
+                            "[AsyncOrchestrator] Finalize request handling error for req %s at stage %s: %s",
+                            req_id,
+                            stage_id,
+                            req_id,
+                            e,
+                        )
 
                     if isinstance(engine_outputs, list):
                         engine_outputs = engine_outputs[0]
