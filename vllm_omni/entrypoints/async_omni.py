@@ -25,7 +25,7 @@ from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
     OrchestratorMetrics,
 )
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
@@ -36,7 +36,7 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
-class AsyncOmni(Omni):
+class AsyncOmni(OmniBase):
     """Asynchronous unified entry point supporting multi-stage pipelines for LLM and Diffusion models.
 
     Similar to the Omni class, but provides an asynchronous interface supporting
@@ -72,8 +72,6 @@ class AsyncOmni(Omni):
     """
 
     def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        self.is_async = True
-
         # Pause/resume control attributes
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
@@ -485,6 +483,10 @@ class AsyncOmni(Omni):
     @property
     def _name(self) -> str:
         return "AsyncOrchestrator"
+
+    @property
+    def is_async(self) -> bool:
+        return True
 
     @property
     def dead_error(self) -> BaseException:

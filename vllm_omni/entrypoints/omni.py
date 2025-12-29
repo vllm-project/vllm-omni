@@ -54,8 +54,8 @@ def omni_snapshot_download(model_id) -> str:
         return _dummy_snapshot_download(model_id)
 
 
-class Omni:
-    """Unified entrypoint for both LLM and Diffusion models for better usability.
+class OmniBase:
+    """Base class for serving Omni models.
 
     Args:
         *args: Variable length argument list.
@@ -75,11 +75,6 @@ class Omni:
             - batch_timeout: Timeout in seconds for batching requests within a stage
             - init_timeout: Timeout in seconds for waiting for all stages to initialize
             - Additional keyword arguments passed to stage engines.
-
-    Example:
-        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
-        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
-        >>> print(outputs)
     """
 
     def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
@@ -137,11 +132,7 @@ class Omni:
         return default_stage_cfg
 
     def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Initialize stage list management.
-
-        Each stage will create appropriate instance (OmniLLM or OmniDiffusion)
-        based on stage_type in YAML config (handled in omni_stage.py).
-        """
+        """Initialize stage list management."""
         init_sleep_seconds = kwargs.get("init_sleep_seconds", 20)
         shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
         init_timeout = kwargs.get("init_timeout", 300)
@@ -224,7 +215,7 @@ class Omni:
 
             stage.init_stage_worker(
                 model,
-                is_async=getattr(self, "is_async", False),
+                is_async=self.is_async,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
@@ -283,6 +274,71 @@ class Omni:
                 )
         elif len(self._stages_ready) == num_stages:
             logger.info(f"[{self._name}] All stages initialized successfully")
+
+    def close(self) -> None:
+        """Close all stage processes and clean up resources."""
+        # Close stages if they exist (for LLM models)
+        if self.stage_list:
+            for q in self._stage_in_queues:
+                try:
+                    q.put_nowait(None)
+                except Exception as e:
+                    logger.warning(
+                        f"[{self._name}] Failed to send shutdown signal to stage input queue: {e}",
+                    )
+            for stage in self.stage_list:
+                try:
+                    stage.stop_stage_worker()
+                except Exception as e:
+                    logger.warning(f"[{self._name}] Failed to stop stage worker: {e}")
+
+            try_close_ray(self._ray_pg)
+
+    def __del__(self):  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            logger.debug(f"[{self._name}] __del__ close() raised", exc_info=True)
+
+    @property
+    def _name(self) -> str:
+        return "OmniBase"
+
+    @property
+    def is_async(self) -> bool:
+        return False
+
+
+class Omni(OmniBase):
+    """Unified entrypoint for both LLM and Diffusion models for better usability.
+
+    Args:
+        *args: Variable length argument list.
+            - args[0]: Model name or path to load.
+        **kwargs: Arbitrary keyword arguments.
+            - model: Model name or path to load (if not in args).
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are loaded from the model.
+            - log_stats: Whether to enable statistics logging
+              be written to files with stage-specific suffixes.
+            - init_sleep_seconds: Number of seconds to sleep between starting
+              each stage process during initialization
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+            - Additional keyword arguments passed to stage engines.
+
+    Example:
+        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
+        >>> print(outputs)
+    """
+
+    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
+        super().__init__(*args, **kwargs)
 
     def generate(self, *args: Any, **kwargs: dict[str, Any]) -> list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
@@ -540,31 +596,6 @@ class Omni:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 
         return final_outputs
-
-    def close(self) -> None:
-        """Close all stage processes and clean up resources."""
-        # Close stages if they exist (for LLM models)
-        if self.stage_list:
-            for q in self._stage_in_queues:
-                try:
-                    q.put_nowait(None)
-                except Exception as e:
-                    logger.warning(
-                        f"[{self._name}] Failed to send shutdown signal to stage input queue: {e}",
-                    )
-            for stage in self.stage_list:
-                try:
-                    stage.stop_stage_worker()
-                except Exception as e:
-                    logger.warning(f"[{self._name}] Failed to stop stage worker: {e}")
-
-            try_close_ray(self._ray_pg)
-
-    def __del__(self):  # pragma: no cover - best effort cleanup
-        try:
-            self.close()
-        except Exception:
-            logger.debug(f"[{self._name}] __del__ close() raised", exc_info=True)
 
     @property
     def _name(self) -> str:
