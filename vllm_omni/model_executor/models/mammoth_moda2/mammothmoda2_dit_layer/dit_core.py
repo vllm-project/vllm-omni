@@ -118,14 +118,12 @@ class LuminaLayerNormContinuous(nn.Module):
     ):
         super().__init__()
 
-        # AdaLN
         self.silu = nn.SiLU()
         self.linear_1 = nn.Linear(conditioning_embedding_dim, embedding_dim, bias=bias)
 
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
         elif norm_type == "rms_norm":
-            # transformers 的 Qwen2RMSNorm 始终带 `weight`，这里忽略 `elementwise_affine` 以保持推理权重一致。
             self.norm = Qwen2RMSNorm(embedding_dim, eps=eps)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
@@ -139,8 +137,6 @@ class LuminaLayerNormContinuous(nn.Module):
         x: torch.Tensor,
         conditioning_embedding: torch.Tensor,
     ) -> torch.Tensor:
-        # Convert back to the original dtype in case `conditioning_embedding`
-        # is upcasted to float32 (needed for hunyuanDiT).
         scale = self.linear_1(self.silu(conditioning_embedding).to(x.dtype))
         x = self.norm(x) * (1 + scale)[:, None, :]
 
@@ -173,12 +169,6 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
             nn.Linear(text_feat_dim, hidden_size, bias=True),
         )
 
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        nn.init.trunc_normal_(self.caption_embedder[1].weight, std=0.02)
-        nn.init.zeros_(self.caption_embedder[1].bias)
-
     def forward(
         self,
         timestep: torch.Tensor,
@@ -191,13 +181,6 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
         return time_embed, caption_embed
 
 class SimpleQFormerImageRefiner(nn.Module):
-    """
-    A lightweight Q-Former-like module that maps a variable-length sequence of
-    input features to a fixed number of query tokens (default 128).
-    Inputs are first projected to `hidden_size`, then a stack of decoder blocks
-    performs self-attention over learnable queries and cross-attention to inputs.
-    Output shape: (batch, num_queries, hidden_size)
-    """
 
     def __init__(
         self,
@@ -416,7 +399,6 @@ class AttnProcessor:
         return hidden_states
 
 class TransformerBlock(nn.Module):
-    """MammothModa2 DiT transformer block（推理使用）。"""
 
     def __init__(
         self,

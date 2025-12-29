@@ -91,7 +91,6 @@ def get_1d_rotary_pos_embed_real(
     ntk_factor: float = 1.0,
     freqs_dtype: torch.dtype = torch.float32,
 ):
-    # 复用 diffusers 的实现，避免在仓库内维护重复代码。
     freqs_cos, freqs_sin = _get_1d_rotary_pos_embed(
         dim,
         pos,

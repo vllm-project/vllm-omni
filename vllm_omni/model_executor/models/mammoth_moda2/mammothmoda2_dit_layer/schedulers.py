@@ -38,13 +38,6 @@ class FlowMatchEulerDiscreteSchedulerOutput:
 
 
 class FlowMatchEulerDiscreteScheduler:
-    """
-    MammothModa2 推理使用的 Flow-Matching Euler 离散采样器。
-
-    说明：
-    - 该实现只保留项目实际用到的最小接口（`set_timesteps` / `step`）。
-    - time 值使用连续区间 [0, 1]，并在内部追加 terminal=1 以计算最后一步 dt。
-    """
 
     order = 1
 
