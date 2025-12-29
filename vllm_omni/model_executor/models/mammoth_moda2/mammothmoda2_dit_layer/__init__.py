@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .block_lumina2 import Lumina2CombinedTimestepCaptionEmbedding
-from .diffusion_transformer import Transformer2DModel
-from .image_embedder import SimpleQFormerImageRefiner
+from .dit_core import Lumina2CombinedTimestepCaptionEmbedding
+from .dit_core import Transformer2DModel
+from .dit_core import SimpleQFormerImageRefiner
 from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
