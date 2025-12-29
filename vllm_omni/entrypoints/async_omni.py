@@ -529,14 +529,6 @@ class AsyncOmni:
             # Start output handler on the first call to generate()
             self._run_output_handler()
 
-            if sampling_params_list is None:
-                sampling_params_list = self.default_sampling_params_list
-            if len(sampling_params_list) != len(self.stage_list):
-                raise ValueError(
-                    f"Expected {len(self.stage_list)} sampling params, \
-                    got {len(sampling_params_list)}"
-                )
-
             prompt = args[0] if args else kwargs.get("prompt")
             request_id = args[1] if len(args) > 1 else kwargs.get("request_id")
             sampling_params_list = args[2] if len(args) > 2 else kwargs.get("sampling_params_list")
@@ -597,6 +589,7 @@ class AsyncOmni:
 
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
             task = {
+                "type": OmniStageTaskType.GENERATE,
                 "request_id": request_id,
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
@@ -639,10 +632,7 @@ class AsyncOmni:
                     stage_id,
                     req_id,
                 )
-                # Seed stage-0 queue with all requests
-                logger.debug("[Orchestrator] Seeding request into stage-0")
-                req_state = ClientRequestState(request_id)
-                self.request_states[request_id] = req_state
+                stage.set_engine_outputs(engine_outputs)
 
                 if getattr(stage, "final_output", False):
                     logger.debug(
@@ -651,45 +641,22 @@ class AsyncOmni:
                         stage_id,
                     )
 
-                sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
-                task = {
-                    "type": OmniStageTaskType.GENERATE,
-                    "request_id": request_id,
-                    "engine_inputs": prompt,
-                    "sampling_params": sp0,
-                }
-                self.stage_list[0].submit(task)
-                _req_start_ts[request_id] = time.time()
-                logger.debug("[Orchestrator] Enqueued request %s to stage-0", request_id)
-
-                logger.debug("[Orchestrator] Entering scheduling loop: stages=%d", num_stages)
-                for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
-                    result = await req_state.queue.get()
-                    assert stage_id == req_state.stage_id
-
-                    req_id = result.get("request_id")
-                    if "error" in result:
-                        logger.error(
-                            "Stage %s error on request %s: %s",
-                            stage_id,
-                            req_id,
-                            result["error"],
-                        )
-                        raise RuntimeError(result)  # Request Finished due to error
-
-                    engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-                    # Mark last output time for this stage whenever we receive outputs
-                    metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+                    # End-to-end timing and time-per-token for final output
+                    # (only once per request at the designated final stage)
                     try:
-                        _m = asdict(result.get("metrics"))
-                        if _m is not None:
-                            metrics.on_stage_metrics(stage_id, req_id, _m)
+                        rid_key = str(req_id)
+                        if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done:
+                            metrics.on_finalize_request(
+                                stage_id,
+                                req_id,
+                                engine_outputs,
+                                _req_start_ts.get(req_id, _wall_start_ts),
+                            )
                     except Exception as e:
                         logger.exception(
                             "[AsyncOrchestrator] Finalize request handling error for req %s at stage %s: %s",
                             req_id,
                             stage_id,
-                            req_id,
                             e,
                         )
 
@@ -754,6 +721,7 @@ class AsyncOmni:
                     logger.debug(
                         "[AsyncOrchestrator] Forwarded request %s to stage-%s",
                         req_id,
+                        next_stage_id,
                     )
                 else:
                     logger.debug("[AsyncOrchestrator] Request %s fully completed", req_id)
@@ -770,7 +738,7 @@ class AsyncOmni:
                 self.request_states.pop(request_id, None)
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
-            print("Request %s aborted.", request_id)
+            logger.exception("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
