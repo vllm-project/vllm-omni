@@ -25,19 +25,13 @@
 # limitations under the License.
 
 import itertools
-from typing import Any
 
-import numpy as np
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import PeftAdapterMixin
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.attention_processor import Attention
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from einops import rearrange
-from loguru import logger
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
@@ -52,26 +46,7 @@ from .rope_real import RotaryPosEmbedReal
 
 
 class TransformerBlock(nn.Module):
-    """
-    Transformer block for  model.
-
-    This block implements a transformer layer with:
-    - Multi-head attention with flash attention
-    - Feed-forward network with SwiGLU activation
-    - RMS normalization
-    - Optional modulation for conditional generation
-
-    Args:
-        dim: Dimension of the input and output tensors
-        num_attention_heads: Number of attention heads
-        num_kv_heads: Number of key-value heads
-        multiple_of: Multiple of which the hidden dimension should be
-        ffn_dim_multiplier: Multiplier for the feed-forward network dimension
-        norm_eps: Epsilon value for normalization layers
-        modulation: Whether to use modulation for conditional generation
-        use_fused_rms_norm: Whether to use fused RMS normalization
-        use_fused_swiglu: Whether to use fused SwiGLU activation
-    """
+    """MammothModa2 DiT transformer block（推理使用）。"""
 
     def __init__(
         self,
@@ -122,27 +97,6 @@ class TransformerBlock(nn.Module):
         self.norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
         self.ffn_norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
 
-        self.initialize_weights()
-
-    def initialize_weights(self) -> None:
-        """
-        Initialize the weights of the transformer block.
-
-        Uses Xavier uniform initialization for linear layers and zero initialization for biases.
-        """
-        nn.init.xavier_uniform_(self.attn.to_q.weight)
-        nn.init.xavier_uniform_(self.attn.to_k.weight)
-        nn.init.xavier_uniform_(self.attn.to_v.weight)
-        nn.init.xavier_uniform_(self.attn.to_out[0].weight)
-
-        nn.init.xavier_uniform_(self.feed_forward.linear_1.weight)
-        nn.init.xavier_uniform_(self.feed_forward.linear_2.weight)
-        nn.init.xavier_uniform_(self.feed_forward.linear_3.weight)
-
-        if self.modulation:
-            nn.init.zeros_(self.norm1.linear.weight)
-            nn.init.zeros_(self.norm1.linear.bias)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -191,39 +145,8 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 
-class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
-    """
-     Transformer 2D Model.
-
-    A transformer-based diffusion model for image generation with:
-    - Patch-based image processing
-    - Rotary position embeddings
-    - Multi-head attention
-    - Conditional generation support
-
-    Args:
-        patch_size: Size of image patches
-        in_channels: Number of input channels
-        out_channels: Number of output channels (defaults to in_channels)
-        hidden_size: Size of hidden layers
-        num_layers: Number of transformer layers
-        num_refiner_layers: Number of refiner layers
-        num_attention_heads: Number of attention heads
-        num_kv_heads: Number of key-value heads
-        multiple_of: Multiple of which the hidden dimension should be
-        ffn_dim_multiplier: Multiplier for feed-forward network dimension
-        norm_eps: Epsilon value for normalization layers
-        axes_dim_rope: Dimensions for rotary position embeddings
-        axes_lens: Lengths for rotary position embeddings
-        text_feat_dim: Dimension of text features
-        timestep_scale: Scale factor for timestep embeddings
-        use_fused_rms_norm: Whether to use fused RMS normalization
-        use_fused_swiglu: Whether to use fused SwiGLU activation
-    """
-
-    _supports_gradient_checkpointing = True
-    _no_split_modules = ["TransformerBlock"]
-    _skip_layerwise_casting_patterns = ["x_embedder", "norm"]
+class Transformer2DModel(ModelMixin, ConfigMixin):
+    """MammothModa2 DiT transformer（推理使用）。"""
 
     @register_to_config
     def __init__(
@@ -355,36 +278,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
 
         # Add learnable embeddings to distinguish different images
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
-
-        self.gradient_checkpointing = True
-
-        self.initialize_weights()
-
-        # TeaCache settings
-        self.enable_teacache = False
-        self.teacache_rel_l1_thresh = 0.05
-
-        coefficients = [-5.48259225, 11.48772289, -4.47407401, 2.47730926, -0.03316487]
-        self.rescale_func = np.poly1d(coefficients)
-
-    def initialize_weights(self) -> None:
-        """
-        Initialize the weights of the model.
-
-        Uses Xavier uniform initialization for linear layers.
-        """
-        nn.init.xavier_uniform_(self.x_embedder.weight)
-        nn.init.constant_(self.x_embedder.bias, 0.0)
-
-        nn.init.xavier_uniform_(self.ref_image_patch_embedder.weight)
-        nn.init.constant_(self.ref_image_patch_embedder.bias, 0.0)
-
-        nn.init.zeros_(self.norm_out.linear_1.weight)
-        nn.init.zeros_(self.norm_out.linear_1.bias)
-        nn.init.zeros_(self.norm_out.linear_2.weight)
-        nn.init.zeros_(self.norm_out.linear_2.bias)
-
-        nn.init.normal_(self.image_index_embedding, std=0.02)
 
     def img_patch_embed_and_refine(
         self,
@@ -564,22 +457,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
         freqs_cis: torch.Tensor,
         text_attention_mask: torch.Tensor,
         ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
-        attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor | Transformer2DModelOutput:
-        if attention_kwargs is not None:
-            attention_kwargs = attention_kwargs.copy()
-            lora_scale = attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
-
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
-                logger.warning("Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective.")
-
         # 1. Condition, positional & patch embedding
         batch_size = len(hidden_states)
         is_hidden_states_tensor = isinstance(hidden_states, torch.Tensor)
@@ -647,51 +526,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
             joint_hidden_states[i, encoder_seq_len:seq_len] = combined_img_hidden_states[i, : seq_len - encoder_seq_len]
 
         hidden_states = joint_hidden_states
-
-        if self.enable_teacache:
-            teacache_hidden_states = hidden_states.clone()
-            teacache_temb = temb.clone()
-            modulated_inp, _, _, _ = self.layers[0].norm1(teacache_hidden_states, teacache_temb)
-            if self.teacache_params.is_first_or_last_step:
-                should_calc = True
-                self.teacache_params.accumulated_rel_l1_distance = 0
-            else:
-                self.teacache_params.accumulated_rel_l1_distance += self.rescale_func(
-                    (
-                        (modulated_inp - self.teacache_params.previous_modulated_inp).abs().mean()
-                        / self.teacache_params.previous_modulated_inp.abs().mean()
-                    )
-                    .cpu()
-                    .item()
-                )
-                if self.teacache_params.accumulated_rel_l1_distance < self.teacache_rel_l1_thresh:
-                    should_calc = False
-                else:
-                    should_calc = True
-                    self.teacache_params.accumulated_rel_l1_distance = 0
-            self.teacache_params.previous_modulated_inp = modulated_inp
-
-        if self.enable_teacache:
-            if not should_calc:
-                hidden_states += self.teacache_params.previous_residual
-            else:
-                ori_hidden_states = hidden_states.clone()
-                for layer_idx, layer in enumerate(self.layers):
-                    if torch.is_grad_enabled() and self.gradient_checkpointing:
-                        hidden_states = self._gradient_checkpointing_func(
-                            layer, hidden_states, attention_mask, rotary_emb, temb
-                        )
-                    else:
-                        hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
-                self.teacache_params.previous_residual = hidden_states - ori_hidden_states
-        else:
-            for layer_idx, layer in enumerate(self.layers):
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    hidden_states = self._gradient_checkpointing_func(
-                        layer, hidden_states, attention_mask, rotary_emb, temb
-                    )
-                else:
-                    hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
 
         # 4. Output norm & projection
         # print(f"hidden_states.shape: {hidden_states.shape}")
@@ -714,10 +550,6 @@ class Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
             )
         if is_hidden_states_tensor:
             output = torch.stack(output, dim=0)
-
-        if USE_PEFT_BACKEND:
-            # remove `lora_scale` from each PEFT layer
-            unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
             return output
