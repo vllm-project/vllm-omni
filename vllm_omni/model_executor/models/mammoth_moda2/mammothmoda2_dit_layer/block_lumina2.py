@@ -27,14 +27,13 @@
 
 import torch
 import torch.nn.functional as F
-from diffusers.models.embeddings import Timesteps
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 from transformers.modeling_flash_attention_utils import (
     is_flash_attn_available,
     is_torch_npu_available,
 )
 
-from .embeddings import TimestepEmbedding
 from .rmsnorm import Qwen2RMSNorm
 
 
