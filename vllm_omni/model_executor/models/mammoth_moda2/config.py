@@ -9,7 +9,7 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
-from .tokenization_mammothmoda2_qwen2_5_vl import MammothUTokenizer
+from .tokenizer import MammothUTokenizer
 
 __all__ = [
     "Mammothmoda2Config",

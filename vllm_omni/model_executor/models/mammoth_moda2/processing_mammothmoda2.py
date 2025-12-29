@@ -12,11 +12,11 @@ from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProce
 
 # Trigger AutoConfig/AutoTokenizer registration so ProcessorMixin can find
 # MammothUTokenizer in `TOKENIZER_MAPPING._extra_content`.
-from .configuration_mammothmoda2 import (  # noqa: F401
+from .config import (  # noqa: F401
     Mammothmoda2Config,
     Mammothmoda2Qwen2_5_VLConfig,
 )
-from .tokenization_mammothmoda2_qwen2_5_vl import MammothUTokenizer  # noqa: F401
+from .tokenizer import MammothUTokenizer  # noqa: F401
 
 
 class Mammothmoda2Processor(Qwen2_5_VLProcessor):

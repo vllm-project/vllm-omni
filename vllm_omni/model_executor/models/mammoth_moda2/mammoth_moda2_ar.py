@@ -44,7 +44,7 @@ from vllm.transformers_utils.config import (
     set_default_rope_theta,
 )
 
-from vllm_omni.model_executor.models.mammoth_moda2.configuration_mammothmoda2 import (
+from vllm_omni.model_executor.models.mammoth_moda2.config import (
     Mammothmoda2Config,
 )
 from vllm_omni.model_executor.models.mammoth_moda2.processing_mammothmoda2 import Mammothmoda2Processor
