@@ -524,7 +524,7 @@ class AsyncOmni:
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
-        logger.debug("[Orchestrator] generate() called")
+        logger.debug("[AsyncOrchestrator] generate() called")
         try:
             # Start output handler on the first call to generate()
             self._run_output_handler()
@@ -569,9 +569,7 @@ class AsyncOmni:
 
             # Determine the final stage for E2E stats (highest stage_id with
             # final_output=True; fallback to last stage)
-            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                output_modalities, self.output_modalities, self.stage_list
-            )
+            final_stage_id_for_e2e = get_final_stage_id_for_e2e(output_modalities, self.output_modalities, self.stage_list)
 
             # Metrics/aggregation helper
             metrics = OrchestratorMetrics(
