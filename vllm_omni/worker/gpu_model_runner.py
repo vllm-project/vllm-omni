@@ -311,7 +311,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
-        if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs and isinstance(hidden_states, OmniOutput):
+        if (
+            hasattr(self.model, "have_multimodal_outputs")
+            and self.model.have_multimodal_outputs
+            and isinstance(hidden_states, OmniOutput)
+        ):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 

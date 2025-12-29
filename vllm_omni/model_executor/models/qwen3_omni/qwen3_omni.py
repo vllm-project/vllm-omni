@@ -188,10 +188,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
         if self.model_stage == "thinker":
             self.tts_tokens = torch.tensor(
-                        [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
-                        device=self._module_device(self.thinker),
-                        dtype=torch.long,
-                    )
+                [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                device=self._module_device(self.thinker),
+                dtype=torch.long,
+            )
 
     # ==================== Device utilities ====================
 

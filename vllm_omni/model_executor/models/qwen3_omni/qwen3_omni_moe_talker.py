@@ -2,7 +2,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-import time
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
