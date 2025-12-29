@@ -121,7 +121,8 @@ class ZImageAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
         query, key, value = qkv.chunk(3, dim=-1)
@@ -133,8 +134,8 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        cos = freqs_cis.real.squeeze(0).to(query.dtype)
-        sin = freqs_cis.imag.squeeze(0).to(query.dtype)
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
         query = self.rope(query, cos, sin)
         key = self.rope(key, cos, sin)
         # Cast to correct dtype
@@ -226,7 +227,8 @@ class ZImageTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         adaln_input: torch.Tensor | None = None,
     ):
         if self.modulation:
@@ -239,7 +241,8 @@ class ZImageTransformerBlock(nn.Module):
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 attention_mask=attn_mask,
-                freqs_cis=freqs_cis,
+                cos=cos,
+                sin=sin,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
 
@@ -254,7 +257,8 @@ class ZImageTransformerBlock(nn.Module):
             attn_out = self.attention(
                 self.attention_norm1(x),
                 attention_mask=attn_mask,
-                freqs_cis=freqs_cis,
+                cos=cos,
+                sin=sin,
             )
             x = x + self.attention_norm2(attn_out)
 
@@ -297,39 +301,46 @@ class RopeEmbedder:
         self.axes_dims = axes_dims
         self.axes_lens = axes_lens
         assert len(axes_dims) == len(axes_lens), "axes_dims and axes_lens must have the same length"
-        self.freqs_cis = None
+        self.cos_cached = None
+        self.sin_cached = None
 
     @staticmethod
-    def precompute_freqs_cis(dim: list[int], end: list[int], theta: float = 256.0):
+    def precompute_freqs(dim: list[int], end: list[int], theta: float = 256.0):
         with torch.device("cpu"):
-            freqs_cis = []
+            cos_list = []
+            sin_list = []
             for i, (d, e) in enumerate(zip(dim, end)):
                 freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d))
                 timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
                 freqs = torch.outer(timestep, freqs).float()
-                freqs_cis_i = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)  # complex64
-                freqs_cis.append(freqs_cis_i)
+                cos_list.append(torch.cos(freqs))
+                sin_list.append(torch.sin(freqs))
 
-            return freqs_cis
+            return cos_list, sin_list
 
     def __call__(self, ids: torch.Tensor):
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
 
-        if self.freqs_cis is None:
-            self.freqs_cis = self.precompute_freqs_cis(self.axes_dims, self.axes_lens, theta=self.theta)
-            self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+        if self.cos_cached is None:
+            self.cos_cached, self.sin_cached = self.precompute_freqs(self.axes_dims, self.axes_lens, theta=self.theta)
+            self.cos_cached = [c.to(device) for c in self.cos_cached]
+            self.sin_cached = [s.to(device) for s in self.sin_cached]
         else:
-            # Ensure freqs_cis are on the same device as ids
-            if self.freqs_cis[0].device != device:
-                self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+            # Ensure cached tensors are on the same device as ids
+            if self.cos_cached[0].device != device:
+                self.cos_cached = [c.to(device) for c in self.cos_cached]
+                self.sin_cached = [s.to(device) for s in self.sin_cached]
 
-        result = []
+        cos_result = []
+        sin_result = []
         for i in range(len(self.axes_dims)):
             index = ids[:, i]
-            result.append(self.freqs_cis[i][index])
-        return torch.cat(result, dim=-1)
+            cos_result.append(self.cos_cached[i][index])
+            sin_result.append(self.sin_cached[i][index])
+
+        return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
 class ZImageTransformer2DModel(nn.Module):
@@ -588,16 +599,19 @@ class ZImageTransformer2DModel(nn.Module):
         adaln_input = t.type_as(x)
         x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
         x = list(x.split(x_item_seqlens, dim=0))
-        x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split(x_item_seqlens, dim=0))
+        x_cos, x_sin = self.rope_embedder(torch.cat(x_pos_ids, dim=0))
+        x_cos = list(x_cos.split(x_item_seqlens, dim=0))
+        x_sin = list(x_sin.split(x_item_seqlens, dim=0))
 
         x = pad_sequence(x, batch_first=True, padding_value=0.0)
-        x_freqs_cis = pad_sequence(x_freqs_cis, batch_first=True, padding_value=0.0)
+        x_cos = pad_sequence(x_cos, batch_first=True, padding_value=0.0)
+        x_sin = pad_sequence(x_sin, batch_first=True, padding_value=0.0)
         x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
 
         for layer in self.noise_refiner:
-            x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
 
         # cap embed & refine
         cap_item_seqlens = [len(_) for _ in cap_feats]
@@ -608,37 +622,43 @@ class ZImageTransformer2DModel(nn.Module):
         cap_feats = self.cap_embedder(cap_feats)
         cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
-        cap_freqs_cis = list(self.rope_embedder(torch.cat(cap_pos_ids, dim=0)).split(cap_item_seqlens, dim=0))
+        cap_cos, cap_sin = self.rope_embedder(torch.cat(cap_pos_ids, dim=0))
+        cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))
+        cap_sin = list(cap_sin.split(cap_item_seqlens, dim=0))
 
         cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
-        cap_freqs_cis = pad_sequence(cap_freqs_cis, batch_first=True, padding_value=0.0)
+        cap_cos = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
+        cap_sin = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
         cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(cap_item_seqlens):
             cap_attn_mask[i, :seq_len] = 1
 
         for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_attn_mask, cap_freqs_cis)
+            cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
 
         # unified
         unified = []
-        unified_freqs_cis = []
+        unified_cos = []
+        unified_sin = []
         for i in range(bsz):
             x_len = x_item_seqlens[i]
             cap_len = cap_item_seqlens[i]
             unified.append(torch.cat([x[i][:x_len], cap_feats[i][:cap_len]]))
-            unified_freqs_cis.append(torch.cat([x_freqs_cis[i][:x_len], cap_freqs_cis[i][:cap_len]]))
+            unified_cos.append(torch.cat([x_cos[i][:x_len], cap_cos[i][:cap_len]]))
+            unified_sin.append(torch.cat([x_sin[i][:x_len], cap_sin[i][:cap_len]]))
         unified_item_seqlens = [a + b for a, b in zip(cap_item_seqlens, x_item_seqlens)]
         assert unified_item_seqlens == [len(_) for _ in unified]
         unified_max_item_seqlen = max(unified_item_seqlens)
 
         unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
-        unified_freqs_cis = pad_sequence(unified_freqs_cis, batch_first=True, padding_value=0.0)
+        unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
+        unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
         unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(unified_item_seqlens):
             unified_attn_mask[i, :seq_len] = 1
 
         for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_freqs_cis, adaln_input)
+            unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
         unified = list(unified.unbind(dim=0))

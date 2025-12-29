@@ -2,6 +2,7 @@ import gc
 import os
 
 import torch
+from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
 from vllm.utils.mem_constants import GiB_bytes
@@ -11,6 +12,8 @@ from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+logger = init_logger(__name__)
 
 
 class GPUARWorker(GPUWorker):
