@@ -311,14 +311,14 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
-        if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
+        if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs and isinstance(hidden_states, OmniOutput):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 
         elif isinstance(hidden_states, torch.Tensor):
             text_hidden_states = hidden_states
             multimodal_outputs = {}
-        elif isinstance(hidden_states, list):
+        elif isinstance(hidden_states, list) or isinstance(hidden_states, tuple):
             text_hidden_states = hidden_states[0]
             multimodal_outputs = {}
         else:
@@ -538,6 +538,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
+                # print(f"inputs_embeds: {inputs_embeds.shape}")
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -550,6 +551,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
+            # print(f"hidden_states: {hidden_states}")
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
