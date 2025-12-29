@@ -17,7 +17,6 @@ from .diffusion_transformer import Transformer2DModel
 from .image_embedder import SimpleQFormerImageRefiner
 from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
-from .transport import create_transport
 
 __all__ = [
     "FlowMatchEulerDiscreteScheduler",
@@ -25,5 +24,4 @@ __all__ = [
     "RotaryPosEmbedReal",
     "SimpleQFormerImageRefiner",
     "Transformer2DModel",
-    "create_transport",
 ]

@@ -14,6 +14,7 @@
 
 import numpy as np
 import torch
+from diffusers.models.embeddings import get_1d_rotary_pos_embed as _get_1d_rotary_pos_embed
 from einops import repeat
 from torch import nn
 
@@ -90,67 +91,17 @@ def get_1d_rotary_pos_embed_real(
     ntk_factor: float = 1.0,
     freqs_dtype: torch.dtype = torch.float32,
 ):
-    """
-    Precompute the frequency tensor for real-valued rotary embeddings.
-
-    This function calculates frequency tensors using cosine and sine functions, avoiding complex numbers entirely.
-
-    Args:
-        dim (`int`): Dimension of the frequency tensor.
-        pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
-        theta (`float`, *optional*, defaults to 10000.0):
-            Scaling factor for frequency computation. Defaults to 10000.0.
-        linear_factor (`float`, *optional*, defaults to 1.0):
-            Scaling factor for the context extrapolation. Defaults to 1.0.
-        ntk_factor (`float`, *optional*, defaults to 1.0):
-            Scaling factor for the NTK-Aware RoPE. Defaults to 1.0.
-        freqs_dtype (`torch.float32` or `torch.float64`, *optional*, defaults to `torch.float32`):
-            the dtype of the frequency tensor.
-    Returns:
-        `Tuple[torch.Tensor, torch.Tensor]`: Precomputed cosine and sine frequency tensors. [S, D]
-    """
-    assert dim % 2 == 0
-
-    if isinstance(pos, int):
-        pos = torch.arange(pos)
-    if isinstance(pos, np.ndarray):
-        pos = torch.from_numpy(pos)  # type: ignore # [S]
-
-    theta = theta * ntk_factor
-    freqs = (
-        1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim)) / linear_factor
-    )  # [D/2]
-    freqs = torch.outer(pos, freqs)  # type: ignore # [S, D/2]
-
-    is_npu = freqs.device.type == "npu"
-    if is_npu:
-        freqs = freqs.float()
-
-    # Create interleaved cos and sin patterns for real rotation
-    freqs_cos = freqs.cos().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()  # [S, D]
-    freqs_sin = freqs.sin().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()  # [S, D]
-
-    return freqs_cos, freqs_sin
-
-
-def complex_to_real_equivalent(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert complex frequency embeddings to equivalent real cos/sin representation.
-
-    Args:
-        freqs_cis: Complex frequency tensor of shape [S, D/2]
-
-    Returns:
-        Tuple of (cos, sin) tensors of shape [S, D]
-    """
-    # Extract real and imaginary parts
-    cos_part = freqs_cis.real  # [S, D/2]
-    sin_part = freqs_cis.imag  # [S, D/2]
-
-    # Create interleaved cos and sin patterns
-    freqs_cos = cos_part.repeat_interleave(2, dim=1, output_size=cos_part.shape[1] * 2).float()  # [S, D]
-    freqs_sin = sin_part.repeat_interleave(2, dim=1, output_size=sin_part.shape[1] * 2).float()  # [S, D]
-
+    # 复用 diffusers 的实现，避免在仓库内维护重复代码。
+    freqs_cos, freqs_sin = _get_1d_rotary_pos_embed(
+        dim,
+        pos,
+        theta=theta,
+        use_real=True,
+        linear_factor=linear_factor,
+        ntk_factor=ntk_factor,
+        repeat_interleave_real=True,
+        freqs_dtype=freqs_dtype,
+    )
     return freqs_cos, freqs_sin
 
 
@@ -298,72 +249,3 @@ class RotaryPosEmbedReal(nn.Module):
             l_effective_cap_len,
             seq_lengths,
         )
-
-
-# For backward compatibility - wrapper that mimics the original interface
-class RotaryPosEmbed(RotaryPosEmbedReal):
-    """Backward compatible wrapper that returns the same interface as the original complex version"""
-
-    @staticmethod
-    def get_freqs_cis(
-        axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], theta: int
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        return RotaryPosEmbedReal.get_freqs_real(axes_dim, axes_lens, theta)
-
-    def forward(
-        self,
-        freqs_cis,  # This will actually be freqs_real (cos, sin tuples)
-        attention_mask,
-        l_effective_ref_img_len,
-        l_effective_img_len,
-        ref_img_sizes,
-        img_sizes,
-        device,
-    ):
-        # Call the real version implementation
-        return super().forward(
-            freqs_cis,  # freqs_real
-            attention_mask,
-            l_effective_ref_img_len,
-            l_effective_img_len,
-            ref_img_sizes,
-            img_sizes,
-            device,
-        )
-
-
-# Original function for compatibility with mixed approach
-def get_1d_rotary_pos_embed(
-    dim: int,
-    pos: np.ndarray | int,
-    theta: float = 10000.0,
-    use_real: bool = True,  # Default to real version
-    linear_factor: float = 1.0,
-    ntk_factor: float = 1.0,
-    repeat_interleave_real: bool = True,
-    freqs_dtype: torch.dtype = torch.float32,
-):
-    """
-    Enhanced version that defaults to real computation but can still produce complex if needed.
-    """
-    if use_real:
-        return get_1d_rotary_pos_embed_real(dim, pos, theta, linear_factor, ntk_factor, freqs_dtype)
-    else:
-        # Fallback to complex version for compatibility
-        assert dim % 2 == 0
-
-        if isinstance(pos, int):
-            pos = torch.arange(pos)
-        if isinstance(pos, np.ndarray):
-            pos = torch.from_numpy(pos)
-
-        theta = theta * ntk_factor
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim)) / linear_factor
-        freqs = torch.outer(pos, freqs)
-
-        is_npu = freqs.device.type == "npu"
-        if is_npu:
-            freqs = freqs.float()
-
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs_cis
