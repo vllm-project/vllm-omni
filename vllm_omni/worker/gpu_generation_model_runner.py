@@ -129,14 +129,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            model_kwargs_extra = self._build_model_kwargs_extra()
             outputs = self._run_generation_model(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 model_kwargs=model_kwargs,
-                model_kwargs_extra=model_kwargs_extra,
                 logits_indices=logits_indices,
             )
 
@@ -191,7 +189,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None,
         model_kwargs: dict,
-        model_kwargs_extra: dict[str, object] | None,
         logits_indices: torch.Tensor,
     ) -> torch.Tensor | list[torch.Tensor]:
         """Run generation from codec codes to waveforms.
@@ -214,8 +211,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             logits_index=logits_indices,
             sampler=self.sampler,
         )
-        if model_kwargs_extra:
-            kwargs.update(model_kwargs_extra)
 
         if hasattr(self.model, "forward"):
             return self._model_forward(**kwargs)

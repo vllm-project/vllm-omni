@@ -644,6 +644,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
+            generated_len = len(req_state.output_token_ids) if req_state is not None else 0
             info = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
             if info and isinstance(info, dict):
                 per_req_runtime_info.append(info)
@@ -651,6 +652,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):
                         logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
+                info["generated_len"] = generated_len
             else:
                 per_req_runtime_info.append({})
         return per_req_runtime_info
