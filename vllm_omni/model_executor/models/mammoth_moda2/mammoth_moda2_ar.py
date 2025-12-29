@@ -47,8 +47,8 @@ from vllm.transformers_utils.config import (
 from vllm_omni.model_executor.models.mammoth_moda2.config import (
     Mammothmoda2Config,
 )
-from vllm_omni.model_executor.models.mammoth_moda2.processing_mammothmoda2 import Mammothmoda2Processor
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 
 
 def moe_forward(
@@ -103,6 +103,11 @@ def moe_forward(
     if hidden_states.ndim == 2:
         return merged.view(total_tokens, out_dim).contiguous()
     return merged.view(*hidden_states.shape[:-1], out_dim).contiguous()
+
+class Mammothmoda2Processor(Qwen2_5_VLProcessor):
+    """Qwen2.5-VL Processor with MammothU tokenizer."""
+
+    tokenizer_class = ("MammothUTokenizer", None)
 
 
 class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
