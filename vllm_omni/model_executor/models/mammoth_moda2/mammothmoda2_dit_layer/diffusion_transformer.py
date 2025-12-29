@@ -39,39 +39,16 @@ from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_la
 from einops import rearrange
 from loguru import logger
 from torch import nn
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
-from .attention_processor import AttnProcessor, AttnProcessorFlash2Varlen
+from .attention_processor import AttnProcessor
 from .block_lumina2 import (
     Lumina2CombinedTimestepCaptionEmbedding,
     LuminaFeedForward,
     LuminaLayerNormContinuous,
     LuminaRMSNormZero,
 )
-from .rmsnorm import Qwen2RMSNorm
 from .rope_real import RotaryPosEmbedReal
-
-
-def replace_rmsnorm_with_custom(module):
-    """Replace RMSNorm with custom implementation recursively."""
-    for name, child in module.named_children():
-        # Import RMSNorm here to avoid circular import issues
-        if child.__class__.__name__ == "RMSNorm":
-            # 获取构造RMSNorm所需的参数
-            eps = getattr(child, "eps", 1e-5)
-            normalized_shape = getattr(child, "normalized_shape", None)
-            if normalized_shape is None and hasattr(child, "weight"):
-                normalized_shape = child.weight.shape
-
-            new_norm = Qwen2RMSNorm(normalized_shape, eps=eps)
-            # Copy weights and biases if they exist
-            if hasattr(child, "weight") and hasattr(new_norm, "weight"):
-                new_norm.weight.data.copy_(child.weight.data)
-            if hasattr(child, "bias") and hasattr(new_norm, "bias"):
-                new_norm.bias.data.copy_(child.bias.data)
-
-            setattr(module, name, new_norm)
-        else:
-            replace_rmsnorm_with_custom(child)
 
 
 class TransformerBlock(nn.Module):
@@ -111,17 +88,14 @@ class TransformerBlock(nn.Module):
         self.head_dim = dim // num_attention_heads
         self.modulation = modulation
 
-        try:
-            processor = AttnProcessorFlash2Varlen()
-        except ImportError:
-            processor = AttnProcessor()
+        processor = AttnProcessor()
 
         # Initialize attention layer
         self.attn = Attention(
             query_dim=dim,
             cross_attention_dim=None,
             dim_head=dim // num_attention_heads,
-            qk_norm="rms_norm",
+            qk_norm=None,
             heads=num_attention_heads,
             kv_heads=num_kv_heads,
             eps=1e-5,
@@ -129,6 +103,9 @@ class TransformerBlock(nn.Module):
             out_bias=False,
             processor=processor,
         )
+        # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
+        self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
+        self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
@@ -146,7 +123,6 @@ class TransformerBlock(nn.Module):
         self.ffn_norm2 = Qwen2RMSNorm(dim, eps=norm_eps)
 
         self.initialize_weights()
-        replace_rmsnorm_with_custom(self)
 
     def initialize_weights(self) -> None:
         """

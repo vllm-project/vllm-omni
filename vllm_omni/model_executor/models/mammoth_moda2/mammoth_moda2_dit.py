@@ -7,6 +7,7 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
@@ -19,7 +20,6 @@ from .mammothmoda2_dit_layer import (
     SimpleQFormerImageRefiner,
     Transformer2DModel,
 )
-from .mammothmoda2_dit_layer.rmsnorm import Qwen2RMSNorm
 
 
 class MammothModa2DiTForConditionalGeneration(nn.Module):

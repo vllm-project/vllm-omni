@@ -33,8 +33,7 @@ from transformers.modeling_flash_attention_utils import (
     is_flash_attn_available,
     is_torch_npu_available,
 )
-
-from .rmsnorm import Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 
 def _swiglu(x, y):
@@ -107,7 +106,8 @@ class LuminaLayerNormContinuous(nn.Module):
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
         elif norm_type == "rms_norm":
-            self.norm = Qwen2RMSNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
+            # transformers 的 Qwen2RMSNorm 始终带 `weight`，这里忽略 `elementwise_affine` 以保持推理权重一致。
+            self.norm = Qwen2RMSNorm(embedding_dim, eps=eps)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 

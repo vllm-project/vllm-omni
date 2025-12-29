@@ -20,8 +20,7 @@ from transformers.modeling_flash_attention_utils import (
     is_flash_attn_available,
     is_torch_npu_available,
 )
-
-from .rmsnorm import Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 
 def _swiglu(x, y):
