@@ -568,11 +568,7 @@ class AsyncOmni:
 
         # Determine the final stage for E2E stats (highest stage_id with
         # final_output=True; fallback to last stage)
-        final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-            output_modalities,
-            self.output_modalities,
-            self.stage_list,
-        )
+        final_stage_id_for_e2e = get_final_stage_id_for_e2e(output_modalities, self.output_modalities, self.stage_list)
 
         # Metrics/aggregation helper
         metrics = OrchestratorMetrics(
@@ -713,8 +709,7 @@ class AsyncOmni:
                     # because continuing would cause the request to be silently dropped
                     # and the orchestrator to hang waiting for completion.
                     error_msg = (
-                        "[AsyncOrchestrator] Failed to send request"
-                        f"{req_id} to stage-{next_stage_id} via connector. "
+                        f"[AsyncOrchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                         "Configure a connector for this edge or inspect connector logs for details."
                     )
                     logger.error(error_msg)
