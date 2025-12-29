@@ -24,12 +24,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
-
 import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_processor import Attention
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import nn
@@ -104,18 +101,6 @@ class TransformerBlock(nn.Module):
         image_rotary_emb: torch.Tensor,
         temb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Forward pass of the transformer block.
-
-        Args:
-            hidden_states: Input hidden states tensor
-            attention_mask: Attention mask tensor
-            image_rotary_emb: Rotary embeddings for image tokens
-            temb: Optional timestep embedding tensor
-
-        Returns:
-            torch.Tensor: Output hidden states after transformer block processing
-        """
         if self.modulation:
             if temb is None:
                 raise ValueError("temb must be provided when modulation is enabled")
@@ -279,212 +264,53 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         # Add learnable embeddings to distinguish different images
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
 
-    def img_patch_embed_and_refine(
-        self,
-        hidden_states,
-        ref_image_hidden_states,
-        padded_img_mask,
-        padded_ref_img_mask,
-        noise_rotary_emb,
-        ref_img_rotary_emb,
-        l_effective_ref_img_len,
-        l_effective_img_len,
-        temb,
-    ):
-        batch_size = len(hidden_states)
-        max_combined_img_len = max(
-            [img_len + sum(ref_img_len) for img_len, ref_img_len in zip(l_effective_img_len, l_effective_ref_img_len)]
-        )
-
-        hidden_states = self.x_embedder(hidden_states)
-        ref_image_hidden_states = self.ref_image_patch_embedder(ref_image_hidden_states)
-
-        for i in range(batch_size):
-            shift = 0
-            for j, ref_img_len in enumerate(l_effective_ref_img_len[i]):
-                ref_image_hidden_states[i, shift : shift + ref_img_len, :] = (
-                    ref_image_hidden_states[i, shift : shift + ref_img_len, :] + self.image_index_embedding[j]
-                )
-                shift += ref_img_len
-
-        for layer in self.noise_refiner:
-            hidden_states = layer(hidden_states, padded_img_mask, noise_rotary_emb, temb)
-
-        flat_l_effective_ref_img_len = list(itertools.chain(*l_effective_ref_img_len))
-        num_ref_images = len(flat_l_effective_ref_img_len)
-        max_ref_img_len = max(flat_l_effective_ref_img_len)
-
-        batch_ref_img_mask = ref_image_hidden_states.new_zeros(num_ref_images, max_ref_img_len, dtype=torch.bool)
-        batch_ref_image_hidden_states = ref_image_hidden_states.new_zeros(
-            num_ref_images, max_ref_img_len, self.config.hidden_size
-        )
-        # ref_img_rotary_emb is a tuple (cos, sin)
-        ref_img_rotary_emb_cos, ref_img_rotary_emb_sin = ref_img_rotary_emb
-        batch_ref_img_rotary_emb_cos = hidden_states.new_zeros(
-            num_ref_images, max_ref_img_len, ref_img_rotary_emb_cos.shape[-1], dtype=ref_img_rotary_emb_cos.dtype
-        )
-        batch_ref_img_rotary_emb_sin = hidden_states.new_zeros(
-            num_ref_images, max_ref_img_len, ref_img_rotary_emb_sin.shape[-1], dtype=ref_img_rotary_emb_sin.dtype
-        )
-        batch_temb = temb.new_zeros(num_ref_images, *temb.shape[1:], dtype=temb.dtype)
-        # sequence of ref imgs to batch
-        idx = 0
-        for i in range(batch_size):
-            shift = 0
-            for ref_img_len in l_effective_ref_img_len[i]:
-                batch_ref_img_mask[idx, :ref_img_len] = True
-                batch_ref_image_hidden_states[idx, :ref_img_len] = ref_image_hidden_states[
-                    i, shift : shift + ref_img_len
-                ]
-                batch_ref_img_rotary_emb_cos[idx, :ref_img_len] = ref_img_rotary_emb_cos[i, shift : shift + ref_img_len]
-                batch_ref_img_rotary_emb_sin[idx, :ref_img_len] = ref_img_rotary_emb_sin[i, shift : shift + ref_img_len]
-                batch_temb[idx] = temb[i]
-                shift += ref_img_len
-                idx += 1
-        batch_ref_img_rotary_emb = (batch_ref_img_rotary_emb_cos, batch_ref_img_rotary_emb_sin)
-
-        # refine ref imgs separately
-        for layer in self.ref_image_refiner:
-            batch_ref_image_hidden_states = layer(
-                batch_ref_image_hidden_states, batch_ref_img_mask, batch_ref_img_rotary_emb, batch_temb
-            )
-
-        # batch of ref imgs to sequence
-        idx = 0
-        for i in range(batch_size):
-            shift = 0
-            for ref_img_len in l_effective_ref_img_len[i]:
-                ref_image_hidden_states[i, shift : shift + ref_img_len] = batch_ref_image_hidden_states[
-                    idx, :ref_img_len
-                ]
-                shift += ref_img_len
-                idx += 1
-
-        combined_img_hidden_states = hidden_states.new_zeros(batch_size, max_combined_img_len, self.config.hidden_size)
-        for i, (ref_img_len, img_len) in enumerate(zip(l_effective_ref_img_len, l_effective_img_len)):
-            combined_img_hidden_states[i, : sum(ref_img_len)] = ref_image_hidden_states[i, : sum(ref_img_len)]
-            combined_img_hidden_states[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = hidden_states[i, :img_len]
-
-        return combined_img_hidden_states
-
-    def flat_and_pad_to_seq(self, hidden_states, ref_image_hidden_states):
-        batch_size = len(hidden_states)
-        p = self.config.patch_size
-        device = hidden_states[0].device
-
-        img_sizes = [(img.size(1), img.size(2)) for img in hidden_states]
-        l_effective_img_len = [(H // p) * (W // p) for (H, W) in img_sizes]
-
-        if ref_image_hidden_states is not None:
-            ref_img_sizes = [
-                [(img.size(1), img.size(2)) for img in imgs] if imgs is not None else None
-                for imgs in ref_image_hidden_states
-            ]
-            l_effective_ref_img_len = [
-                [(ref_img_size[0] // p) * (ref_img_size[1] // p) for ref_img_size in _ref_img_sizes]
-                if _ref_img_sizes is not None
-                else [0]
-                for _ref_img_sizes in ref_img_sizes
-            ]
-        else:
-            ref_img_sizes = [None for _ in range(batch_size)]
-            l_effective_ref_img_len = [[0] for _ in range(batch_size)]
-
-        max_ref_img_len = max([sum(ref_img_len) for ref_img_len in l_effective_ref_img_len])
-        max_img_len = max(l_effective_img_len)
-
-        # ref image patch embeddings
-        flat_ref_img_hidden_states = []
-        for i in range(batch_size):
-            if ref_img_sizes[i] is not None:
-                imgs = []
-                for ref_img in ref_image_hidden_states[i]:
-                    C, H, W = ref_img.size()
-                    ref_img = rearrange(ref_img, "c (h p1) (w p2) -> (h w) (p1 p2 c)", p1=p, p2=p)
-                    imgs.append(ref_img)
-
-                img = torch.cat(imgs, dim=0)
-                flat_ref_img_hidden_states.append(img)
-            else:
-                flat_ref_img_hidden_states.append(None)
-
-        # image patch embeddings
-        flat_hidden_states = []
-        for i in range(batch_size):
-            img = hidden_states[i]
-            C, H, W = img.size()
-
-            img = rearrange(img, "c (h p1) (w p2) -> (h w) (p1 p2 c)", p1=p, p2=p)
-            flat_hidden_states.append(img)
-
-        padded_ref_img_hidden_states = torch.zeros(
-            batch_size,
-            max_ref_img_len,
-            flat_hidden_states[0].shape[-1],
-            device=device,
-            dtype=flat_hidden_states[0].dtype,
-        )
-        padded_ref_img_mask = torch.zeros(batch_size, max_ref_img_len, dtype=torch.bool, device=device)
-        for i in range(batch_size):
-            if ref_img_sizes[i] is not None:
-                padded_ref_img_hidden_states[i, : sum(l_effective_ref_img_len[i])] = flat_ref_img_hidden_states[i]
-                padded_ref_img_mask[i, : sum(l_effective_ref_img_len[i])] = True
-
-        padded_hidden_states = torch.zeros(
-            batch_size, max_img_len, flat_hidden_states[0].shape[-1], device=device, dtype=flat_hidden_states[0].dtype
-        )
-        padded_img_mask = torch.zeros(batch_size, max_img_len, dtype=torch.bool, device=device)
-        for i in range(batch_size):
-            padded_hidden_states[i, : l_effective_img_len[i]] = flat_hidden_states[i]
-            padded_img_mask[i, : l_effective_img_len[i]] = True
-
-        return (
-            padded_hidden_states,
-            padded_ref_img_hidden_states,
-            padded_img_mask,
-            padded_ref_img_mask,
-            l_effective_ref_img_len,
-            l_effective_img_len,
-            ref_img_sizes,
-            img_sizes,
-        )
-
     def forward(
         self,
-        hidden_states: torch.Tensor | list[torch.Tensor],
+        hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         text_hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
         text_attention_mask: torch.Tensor,
         ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
         return_dict: bool = False,
-    ) -> torch.Tensor | Transformer2DModelOutput:
-        # 1. Condition, positional & patch embedding
-        batch_size = len(hidden_states)
-        is_hidden_states_tensor = isinstance(hidden_states, torch.Tensor)
+    ) -> torch.Tensor:
+        if return_dict:
+            raise ValueError("return_dict=True is not supported in vLLM inference.")
+        if ref_image_hidden_states is not None:
+            raise ValueError("ref_image_hidden_states is not supported in vLLM inference.")
+        if hidden_states.ndim != 4:
+            raise ValueError(f"Expected hidden_states to be 4D [B,C,H,W], got shape={tuple(hidden_states.shape)}")
 
-        if is_hidden_states_tensor:
-            assert hidden_states.ndim == 4
-            hidden_states = [_hidden_states for _hidden_states in hidden_states]
+        batch_size, _channels, height, width = hidden_states.shape
+        if batch_size != text_hidden_states.shape[0] or batch_size != text_attention_mask.shape[0]:
+            raise ValueError(
+                "Batch size mismatch: "
+                f"hidden_states={batch_size}, text_hidden_states={text_hidden_states.shape[0]}, "
+                f"text_attention_mask={text_attention_mask.shape[0]}"
+            )
 
-        device = hidden_states[0].device
+        p = self.config.patch_size
+        if height % p != 0 or width % p != 0:
+            raise ValueError(f"Input latent H/W must be divisible by patch_size={p}, got {height}x{width}")
 
-        temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states[0].dtype)
+        device = hidden_states.device
 
-        (
-            hidden_states,
-            ref_image_hidden_states,
-            img_mask,
-            ref_img_mask,
-            l_effective_ref_img_len,
-            l_effective_img_len,
-            ref_img_sizes,
-            img_sizes,
-        ) = self.flat_and_pad_to_seq(hidden_states, ref_image_hidden_states)
+        temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states.dtype)
+
+        img_tokens = rearrange(hidden_states, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=p, p2=p)
+        img_tokens = self.x_embedder(img_tokens)
+
+        img_len = (height // p) * (width // p)
+        img_mask = torch.ones((batch_size, img_len), dtype=torch.bool, device=device)
+        l_effective_img_len = [img_len for _ in range(batch_size)]
+        img_sizes = [(height, width) for _ in range(batch_size)]
+
+        l_effective_ref_img_len = [[] for _ in range(batch_size)]
+        ref_img_sizes = [None for _ in range(batch_size)]
 
         (
             context_rotary_emb,
-            ref_img_rotary_emb,
+            _ref_img_rotary_emb,
             noise_rotary_emb,
             rotary_emb,
             encoder_seq_lengths,
@@ -499,58 +325,39 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             device,
         )
 
-        # 2. Context refinement
         for layer in self.context_refiner:
             text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
 
-        combined_img_hidden_states = self.img_patch_embed_and_refine(
-            hidden_states,
-            ref_image_hidden_states,
-            img_mask,
-            ref_img_mask,
-            noise_rotary_emb,
-            ref_img_rotary_emb,
-            l_effective_ref_img_len,
-            l_effective_img_len,
-            temb,
-        )
+        for layer in self.noise_refiner:
+            img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
 
-        # 3. Joint Transformer blocks
         max_seq_len = max(seq_lengths)
-
         attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
         joint_hidden_states = hidden_states.new_zeros(batch_size, max_seq_len, self.config.hidden_size)
         for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
             attention_mask[i, :seq_len] = True
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
-            joint_hidden_states[i, encoder_seq_len:seq_len] = combined_img_hidden_states[i, : seq_len - encoder_seq_len]
+            joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
 
         hidden_states = joint_hidden_states
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
 
-        # 4. Output norm & projection
-        # print(f"hidden_states.shape: {hidden_states.shape}")
-        # print(f"temb.shape: {temb.shape}")
         hidden_states = self.norm_out(hidden_states, temb)
 
-        p = self.config.patch_size
-        output = []
-        for i, (img_size, img_len, seq_len) in enumerate(zip(img_sizes, l_effective_img_len, seq_lengths)):
-            height, width = img_size
-            output.append(
-                rearrange(
-                    hidden_states[i][seq_len - img_len : seq_len],
-                    "(h w) (p1 p2 c) -> c (h p1) (w p2)",
-                    h=height // p,
-                    w=width // p,
-                    p1=p,
-                    p2=p,
-                )
-            )
-        if is_hidden_states_tensor:
-            output = torch.stack(output, dim=0)
-
-        if not return_dict:
-            return output
-        return Transformer2DModelOutput(sample=output)
+        img_hidden_states = torch.stack(
+            [
+                hidden_states[i, encoder_seq_len : encoder_seq_len + img_len]
+                for i, encoder_seq_len in enumerate(encoder_seq_lengths)
+            ],
+            dim=0,
+        )
+        output = rearrange(
+            img_hidden_states,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=height // p,
+            w=width // p,
+            p1=p,
+            p2=p,
+        )
+        return output
