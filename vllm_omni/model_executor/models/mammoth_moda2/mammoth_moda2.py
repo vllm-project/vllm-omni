@@ -1,11 +1,3 @@
-"""Top-level entry: MammothModa2ForConditionalGeneration
-
-Modeled after Qwen2_5OmniForConditionalGeneration, selects submodules based on model_stage:
-- ar  : Custom MoE language model + Vision tower
-- dit : Generation DiT stage
-- vae : Reserved (not implemented)
-"""
-
 from __future__ import annotations
 
 import torch

@@ -5,6 +5,8 @@ from typing import Any
 import torch
 from torch import nn
 from transformers import Qwen2Config
+from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
+
 from vllm.attention.backends.abstract import AttentionType
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
@@ -44,11 +46,8 @@ from vllm.transformers_utils.config import (
     set_default_rope_theta,
 )
 
-from vllm_omni.model_executor.models.mammoth_moda2.config import (
-    Mammothmoda2Config,
-)
+from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
 
 
 def moe_forward(
@@ -116,10 +115,7 @@ class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
     def get_hf_config(self):
         mammoth_cfg: Mammothmoda2Config = self.ctx.get_hf_config(Mammothmoda2Config)
         llm_cfg = getattr(mammoth_cfg, "llm_config", None)
-        if llm_cfg is not None:
-            return llm_cfg
-        # Fallback: return directly if the config is already a sub-config.
-        return getattr(mammoth_cfg, "text_config", mammoth_cfg)
+        return llm_cfg
 
     def get_hf_processor(self, **kwargs: object) -> Mammothmoda2Processor:
         return self.ctx.get_hf_processor(
@@ -139,8 +135,6 @@ class MammothModa2ARDummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
 
 class MammothModa2ARMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
     """Reuse Qwen2.5-VL's multi-modal processing,"""
-
-    """only adjusting parser initialization entry. """
 
     def _get_data_parser(self) -> Qwen2VLMultiModalDataParser:
         return Qwen2VLMultiModalDataParser(
@@ -163,14 +157,7 @@ class Mammoth2DecoderLayer(nn.Module):
         set_default_rope_theta(config, default_theta=1000000)
         dual_chunk_attention_config = getattr(config, "dual_chunk_attention_config", None)
 
-        # By default, Qwen2 uses causal attention as it is a decoder-only model.
-        # You can override the HF config with `is_causal=False` to enable
-        # bidirectional attention, which is used in some embedding models
-        # (e.g. Alibaba-NLP/gte-Qwen2-7B-instruct)
-        if getattr(config, "is_causal", True):
-            attn_type = AttentionType.DECODER
-        else:
-            attn_type = AttentionType.ENCODER_ONLY
+        attn_type = AttentionType.DECODER
 
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
@@ -248,7 +235,6 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         quant_config = vllm_config.quant_config
         self.prefix = prefix
 
-        # TODO (@robertgshaw2): see if this can be moved out
         if is_interleaved(vllm_config.model_config.hf_text_config):
             assert config.max_window_layers == config.num_hidden_layers, (
                 "Sliding window for some but all layers is not supported. "
@@ -321,17 +307,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
         else:
             self.gen_head = None
 
-        # vLLM logits computation cannot directly call ParallelLMHead.forward (throws exception);
-        # it must use the weight matrix via LogitsProcessor.
         self.logits_processor = LogitsProcessor(self.base_vocab_size)
         self.gen_logits_processor = LogitsProcessor(self.gen_vocab_size) if self.extra_gen_vocab else None
 
-        # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Mammoth2DecoderLayer
 
         def _make_decoder_layer(*, prefix: str) -> nn.Module:
-            # vLLM make_layers only passes prefix, e.g., "{prefix}.layers.{idx}".
-            # Extract idx here to ensure layer_idx can be used for layer-wise MoE activation.
             try:
                 layer_idx = int(prefix.rsplit(".", 1)[-1])
             except Exception:
@@ -360,15 +341,12 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
 
     @property
     def model(self) -> "MammothModa2Qwen2ForCausalLM":
-        # vLLM 的 Qwen2.5-VL 路径会调用 `language_model.model(...)` 来拿到 hidden states。
-        # 这里用 property 避免把 self 注册成子模块从而形成 named_modules 的递归环。
         return self
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         if not self.extra_gen_vocab or self.gen_embed_tokens is None:
             return self.embed_tokens(input_ids)
 
-        # input_ids 可能同时包含 base token 与 gen token；分别走不同 embedding 再合并。
         gen_mask = input_ids >= int(self.gen_vocab_start_index)
         if not gen_mask.any():
             return self.embed_tokens(input_ids)

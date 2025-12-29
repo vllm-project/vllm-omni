@@ -1,5 +1,3 @@
-"""Configuration implementation for MammothModa2, replicating HF configuration and registering with AutoConfig."""
-
 from typing import ClassVar, Literal
 
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
@@ -20,11 +18,7 @@ __all__ = [
 
 
 class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
-    # NOTE: Must not conflict with `Mammothmoda2Qwen2_5_VLConfig.model_type`.
-    # Otherwise, `AutoConfig.for_model(model_type="mammothmoda2_qwen2_5_vl")` might be
-    # incorrectly parsed as a VisionConfig, causing `llm_config` to become a
-    # "vision sub-config" where `vision_config` is just a dict, leading to
-    # attribute access errors like `vision_config.patch_size` in vLLM.
+
     model_type = "mammothmoda2_qwen2_5_vl_vision"
     base_config_key = "vision_config"
 
@@ -66,7 +60,6 @@ class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
 
 
 class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
-    """Text sub-configuration, consistent with upstream mammothmoda2_qwen2_5_vl_text."""
 
     model_type = "mammothmoda2_qwen2_5_vl_text"
     base_config_key = "text_config"
@@ -147,7 +140,6 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
 
-
 class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
     """Combined configuration: text_config + vision_config."""
 
@@ -213,12 +205,10 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
         self.gen_vocab_size = getattr(self.text_config, "gen_vocab_size", gen_vocab_size)
         self.moe_type = getattr(self.text_config, "moe_type", moe_type)
         self.gen_vocab_start_index = getattr(self.text_config, "gen_vocab_start_index", gen_vocab_start_index)
-        # Inherit tokenizer_class to prevent AutoTokenizer from falling back to Qwen2.
         self.tokenizer_class = "MammothUTokenizer"
 
-
 class Mammothmoda2Config(PretrainedConfig):
-    """Top-level MammothModa2 composition configuration, consistent with upstream."""
+    """Top-level MammothModa2 composition configuration"""
 
     model_type = "mammothmoda2"
     is_composition = True
@@ -250,13 +240,8 @@ class Mammothmoda2Config(PretrainedConfig):
         self.gen_axes_lens = gen_axes_lens or [10000, 10000, 10000]
         self.gen_transport_config = gen_transport_config or {}
         self.initializer_range = initializer_range
-        # Ensure AutoTokenizer prioritizes MammothUTokenizer over the default Qwen2Tokenizer.
         self.tokenizer_class = "MammothUTokenizer"
-        # HF weights use architectures = ["Mammothmoda2Model"]; maintain this name by default.
-        if architectures is None:
-            self.architectures = ["Mammothmoda2Model"]
-        else:
-            self.architectures = ["Mammothmoda2Model" if a.lower() == "mammothmoda2model" else a for a in architectures]
+        self.architectures = ["Mammothmoda2Model"]
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.llm_config

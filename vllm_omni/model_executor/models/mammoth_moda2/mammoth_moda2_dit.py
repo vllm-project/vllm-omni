@@ -29,11 +29,6 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
     This stage expects "image condition token hidden states" from the upstream AR stage,
     and outputs image tensors via diffusion transformer + VAE decode.
 
-    Notes:
-    - vLLM-Omni's `GPUGenerationModelRunner` calls `forward(...)` and passes the result
-      as pooling_output to the upper layer.
-    - For compatibility with runner unpacking, we use `OmniOutput(multimodal_outputs=...)`
-      to return results; `text_hidden_states` serves as a placeholder.
     """
 
     have_multimodal_outputs = True
