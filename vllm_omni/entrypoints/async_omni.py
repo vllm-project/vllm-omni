@@ -428,7 +428,7 @@ class AsyncOmni(OmniBase):
                 self.request_states.pop(request_id, None)
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
-            logger.exception("[AsyncOrchestrator] Request %s aborted.", request_id)
+            logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
 
     def _run_output_handler(self) -> None:
