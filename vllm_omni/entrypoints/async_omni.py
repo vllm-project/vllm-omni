@@ -21,6 +21,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.log_utils import (
@@ -35,6 +36,7 @@ from vllm_omni.entrypoints.utils import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
 
 def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handler):
     """Weak reference cleanup function for AsyncOmni instances."""
@@ -53,6 +55,7 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handle
     # Cancel output handler
     if output_handler is not None:
         output_handler.cancel()
+
 
 class AsyncOmni(OmniBase):
     """Asynchronous unified entry point supporting multi-stage pipelines for LLM and Diffusion models.
