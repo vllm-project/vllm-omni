@@ -27,7 +27,7 @@ from vllm_omni.entrypoints.log_utils import (
 )
 from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
+from vllm_omni.entrypoints.stage_utils import OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -277,7 +277,9 @@ class AsyncOmni(OmniBase):
 
             # Determine the final stage for E2E stats (highest stage_id with
             # final_output=True; fallback to last stage)
-            final_stage_id_for_e2e = get_final_stage_id_for_e2e(output_modalities, self.output_modalities, self.stage_list)
+            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
+                output_modalities, self.output_modalities, self.stage_list
+            )
 
             # Metrics/aggregation helper
             metrics = OrchestratorMetrics(
@@ -428,6 +430,7 @@ class AsyncOmni(OmniBase):
             await self.abort(request_id)
             logger.exception("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
+
     def _run_output_handler(self) -> None:
         if self.output_handler is not None:
             return
