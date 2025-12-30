@@ -120,15 +120,6 @@ class OmniBase:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
-        # Register weak reference cleanup (called on garbage collection)
-        self._weak_finalizer = weakref.finalize(
-            self,
-            _weak_close_cleanup,
-            self.stage_list,
-            self._stage_in_queues,
-            self._ray_pg,
-        )
-
     def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
             return {
@@ -385,6 +376,15 @@ class Omni(OmniBase):
 
     def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
         super().__init__(*args, **kwargs)
+
+        # Register weak reference cleanup (called on garbage collection)
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_cleanup,
+            self.stage_list,
+            self._stage_in_queues,
+            self._ray_pg,
+        )
 
     def generate(self, *args: Any, **kwargs: dict[str, Any]) -> list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
