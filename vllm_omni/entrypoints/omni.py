@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import multiprocessing as mp
 import os
 import time
@@ -101,6 +102,36 @@ class OmniBase:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
+    def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
+        if cache_backend == "cache_dit":
+            return {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+                "enable_taylorseer": False,
+                "taylorseer_order": 1,
+                "scm_steps_mask_policy": None,
+                "scm_steps_policy": "dynamic",
+            }
+        if cache_backend == "tea_cache":
+            return {
+                "rel_l1_thresh": 0.2,
+            }
+        return None
+
+    def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = self._get_default_cache_config(cache_backend)
+        return cache_config
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # We temporally create a default config for diffusion stage.
@@ -108,6 +139,8 @@ class OmniBase:
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in kwargs:
             kwargs["dtype"] = str(kwargs["dtype"])
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
         # TODO: hack, calculate devices based on parallel config.
         devices = "0"
         if "parallel_config" in kwargs:
@@ -123,7 +156,13 @@ class OmniBase:
                     "devices": devices,
                     "max_batch_size": 1,
                 },
-                "engine_args": OmegaConf.create(kwargs),
+                "engine_args": OmegaConf.create(
+                    {
+                        **kwargs,
+                        "cache_backend": cache_backend,
+                        "cache_config": cache_config,
+                    }
+                ),
                 "final_output": True,
                 "final_output_type": "image",
             }

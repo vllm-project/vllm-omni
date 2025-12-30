@@ -85,6 +85,9 @@ class AsyncOmni(OmniBase):
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+
         devices = "0"
         if "parallel_config" in kwargs:
             parallel_config = kwargs["parallel_config"]
@@ -92,13 +95,21 @@ class AsyncOmni(OmniBase):
             for i in range(1, num_devices):
                 devices += f",{i}"
         else:
+            ulysses_degree = kwargs.get("ulysses_degree") or 1
+            ring_degree = kwargs.get("ring_degree") or 1
+            sequence_parallel_size = kwargs.get("sequence_parallel_size")
+            if sequence_parallel_size is None:
+                sequence_parallel_size = ulysses_degree * ring_degree
+            num_devices = sequence_parallel_size
+            for i in range(1, num_devices):
+                devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
                 tensor_parallel_size=1,
-                sequence_parallel_size=1,
-                ulysses_degree=1,
-                ring_degree=1,
+                sequence_parallel_size=sequence_parallel_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
                 cfg_parallel_size=1,
             )
         default_stage_cfg = [
@@ -114,8 +125,8 @@ class AsyncOmni(OmniBase):
                     "parallel_config": parallel_config,
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": kwargs.get("cache_backend", "none"),
-                    "cache_config": kwargs.get("cache_config", None),
+                    "cache_backend": cache_backend,
+                    "cache_config": cache_config,
                 },
                 "final_output": True,
                 "final_output_type": "image",

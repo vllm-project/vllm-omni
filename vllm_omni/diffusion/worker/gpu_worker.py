@@ -44,6 +44,7 @@ class GPUWorker:
         self.rank = rank
         self.od_config = od_config
         self.pipeline = None
+        self.device = None
 
         self.init_device_and_model()
 
@@ -58,8 +59,8 @@ class GPUWorker:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        self.device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(self.device)
 
         # hack
         vllm_config = VllmConfig()
@@ -89,7 +90,7 @@ class GPUWorker:
             with DeviceMemoryProfiler() as m:
                 self.pipeline = model_loader.load_model(
                     od_config=self.od_config,
-                    load_device=f"cuda:{rank}",
+                    load_device=str(self.device),
                 )
             time_after_load = time.perf_counter()
 
@@ -128,6 +129,9 @@ class GPUWorker:
             raise ValueError("Cannot execute model with empty request list")
         # TODO: dealing with first req for now
         req = reqs[0]
+
+        if req.generator is None and req.seed is not None:
+            req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():

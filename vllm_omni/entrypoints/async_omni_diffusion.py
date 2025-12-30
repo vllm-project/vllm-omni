@@ -119,7 +119,7 @@ class AsyncOmniDiffusion:
         prompt: str,
         request_id: str | None = None,
         num_inference_steps: int = 50,
-        guidance_scale: float = 7.5,
+        guidance_scale: float | None = None,
         height: int | None = None,
         width: int | None = None,
         negative_prompt: str | None = None,
@@ -133,7 +133,7 @@ class AsyncOmniDiffusion:
             prompt: Text prompt describing the desired image
             request_id: Optional unique identifier for tracking the request
             num_inference_steps: Number of denoising steps (default: 50)
-            guidance_scale: Classifier-free guidance scale (default: 7.5)
+            guidance_scale: Classifier-free guidance scale (optional, uses model defaults if omitted)
             height: Optional image height in pixels
             width: Optional image width in pixels
             negative_prompt: Optional negative prompt for guidance
@@ -151,18 +151,21 @@ class AsyncOmniDiffusion:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
 
         # Prepare request
-        request = self._prepare_request(
-            prompt=prompt,
-            request_id=request_id,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            height=height,
-            width=width,
-            negative_prompt=negative_prompt,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-            seed=seed,
+        request_kwargs = {
+            "prompt": prompt,
+            "request_id": request_id,
+            "num_inference_steps": num_inference_steps,
+            "height": height,
+            "width": width,
+            "negative_prompt": negative_prompt,
+            "num_outputs_per_prompt": num_outputs_per_prompt,
+            "seed": seed,
             **kwargs,
-        )
+        }
+        if guidance_scale is not None:
+            request_kwargs["guidance_scale"] = guidance_scale
+
+        request = self._prepare_request(**request_kwargs)
 
         logger.debug("Starting generation for request %s", request_id)
 
@@ -201,7 +204,7 @@ class AsyncOmniDiffusion:
             prompt=prompt,
             metrics={
                 "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
+                "guidance_scale": request.guidance_scale,
             },
         )
 
