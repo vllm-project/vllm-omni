@@ -35,27 +35,12 @@ python openai_chat_completion_client_for_multimodal_generation.py --query-type u
 
 The Python client supports the following command-line arguments:
 
-- `--query-type` (or `-q`): Query type (default: `use_video`)
-  - Options: `text`, `use_audio`, `use_image`, `use_video`
+- `--query-type` (or `-q`): Query type (default: `use_video`). Options: `text`, `use_audio`, `use_image`, `use_video`
 - `--model` (or `-m`): Model name/path (default: `Qwen/Qwen3-Omni-30B-A3B-Instruct`)
-- `--video-path` (or `-v`): Path to local video file or URL
-  - If not provided and query-type is `use_video`, uses default video URL
-  - Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs
-  - Example: `--video-path /path/to/video.mp4` or `--video-path https://example.com/video.mp4`
-- `--image-path` (or `-i`): Path to local image file or URL
-  - If not provided and query-type is `use_image`, uses default image URL
-  - Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs
-  - Supports common image formats: JPEG, PNG, GIF, WebP
-  - Example: `--image-path /path/to/image.jpg` or `--image-path https://example.com/image.png`
-- `--audio-path` (or `-a`): Path to local audio file or URL
-  - If not provided and query-type is `use_audio`, uses default audio URL
-  - Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs
-  - Supports common audio formats: MP3, WAV, OGG, FLAC, M4A
-  - Example: `--audio-path /path/to/audio.wav` or `--audio-path https://example.com/audio.mp3`
-- `--prompt` (or `-p`): Custom text prompt/question
-  - If not provided, uses default prompt for the selected query type
-  - Example: `--prompt "What are the main activities shown in this video?"`
-
+- `--video-path` (or `-v`): Path to local video file or URL. If not provided and query-type is `use_video`, uses default video URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs. Example: `--video-path /path/to/video.mp4` or `--video-path https://example.com/video.mp4`
+- `--image-path` (or `-i`): Path to local image file or URL. If not provided and query-type is `use_image`, uses default image URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common image formats: JPEG, PNG, GIF. Example: `--image-path /path/to/image.jpg` or `--image-path https://example.com/image.png`.
+- `--audio-path` (or `-a`): Path to local audio file or URL. If not provided and query-type is `use_audio`, uses default audio URL. Supports local file paths (automatically encoded to base64) or HTTP/HTTPS URLs and common audio formats: MP3, WAV, OGG, FLAC, M4A. Example: `--audio-path /path/to/audio.wav` or `--audio-path https://example.com/audio.mp3`
+- `--prompt` (or `-p`): Custom text prompt/question. If not provided, uses default prompt for the selected query type. Example: `--prompt "What are the main activities shown in this video?"`
 
 For example, to use a local video file with custom prompt:
 

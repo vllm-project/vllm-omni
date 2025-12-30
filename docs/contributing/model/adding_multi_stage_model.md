@@ -1,6 +1,6 @@
-# Adding a New Multi-Stage Model to vLLM-Omni
+# Adding a Multi-Stage Model
 
-This guide walks through the process of adding a new model to vLLM-Omni, using **Qwen3-Omni** as a comprehensive example. Qwen3-Omni is a multi-stage omni-modality model that demonstrates the full capabilities of vLLM-Omni's architecture.
+This guide walks through the process of adding a new multi-stage model to vLLM-Omni, using **Qwen3-Omni** as a comprehensive example. Qwen3-Omni is a multi-stage omni-modality model that demonstrates the full capabilities of vLLM-Omni's architecture.
 
 ## Table of Contents
 
