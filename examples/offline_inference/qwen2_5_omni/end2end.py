@@ -322,7 +322,7 @@ def main(args):
     omni_llm = Omni(
         model=model_name,
         log_stats=args.enable_stats,
-        init_sleep_seconds=args.init_sleep_seconds,
+        stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
@@ -426,10 +426,10 @@ def parse_args():
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(
-        "--init-sleep-seconds",
+        "--stage-init-timeout",
         type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300)",
     )
     parser.add_argument(
         "--batch-timeout",
