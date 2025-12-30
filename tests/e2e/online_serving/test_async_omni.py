@@ -12,6 +12,7 @@ SEED = 42
 stage_config = str(Path(__file__).parent / "stage_configs" / "qwen3_omni_thinker_ci.yaml")
 model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
+
 async def generate(
     engine: AsyncOmni,
     request_id: str,
