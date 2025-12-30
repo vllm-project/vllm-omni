@@ -10,7 +10,7 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 SEED = 42
 
 stage_config = str(Path(__file__).parent / "stage_configs" / "qwen3_omni_thinker_ci.yaml")
-
+model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 async def generate(
     engine: AsyncOmni,
@@ -54,7 +54,7 @@ async def generate(
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:
-        engine = AsyncOmni(model="/mnt/data/models/Qwen3-Omni-30B-A3B-Instruct", stage_configs_path=stage_config)
+        engine = AsyncOmni(model=model, stage_configs_path=stage_config)
         after.callback(engine.shutdown)
 
         NUM_REQUESTS = 5
@@ -70,7 +70,7 @@ async def test_abort():
         tasks: list[asyncio.Task] = []
         for idx, request_id in enumerate(request_ids):
             max_tokens = NUM_EXPECTED_TOKENS_LONG if (idx in REQUEST_IDS_TO_ABORT) else NUM_EXPECTED_TOKENS
-            tasks.append(asyncio.create_task(generate(engine, request_id, prompt, NUM_EXPECTED_TOKENS)))
+            tasks.append(asyncio.create_task(generate(engine, request_id, prompt, max_tokens)))
 
         # API server cancels requests when they disconnect.
         for idx in REQUEST_IDS_TO_ABORT:
