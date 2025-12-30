@@ -26,4 +26,4 @@ The guide covers:
 
 ## Quick Start
 
-For a quick reference, see the [Adding a New Omni Model Guide](adding_multi_stage_model.md) and [Adding a New Diffusion Model Guide](adding_diffusion_model.md).
+For a quick reference, see the [Adding a New Multi-Stage Model Guide](adding_multi_stage_model.md) and [Adding a New Diffusion Model Guide](adding_diffusion_model.md).
