@@ -38,7 +38,6 @@ class FlowMatchEulerDiscreteSchedulerOutput:
 
 
 class FlowMatchEulerDiscreteScheduler:
-
     order = 1
 
     def __init__(self, num_train_timesteps: int = 1000, dynamic_time_shift: bool = True):

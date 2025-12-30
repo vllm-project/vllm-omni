@@ -1,16 +1,16 @@
 import math
+
 import torch
-from torch import nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_processor import Attention
-from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_utils import ModelMixin
+from einops import rearrange, repeat
+from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from .rope_real import RotaryPosEmbedReal
-
 
 try:
     from transformers.modeling_flash_attention_utils import (  # type: ignore
@@ -23,9 +23,11 @@ except Exception:  # pragma: no cover - best-effort compatibility
     def is_flash_attn_available() -> bool:  # type: ignore[override]
         return False
 
+
 from .rope_real import apply_real_rotary_emb
 
 _HAS_FLASH_ATTN_VARLEN = bool(is_flash_attn_available()) and flash_attn_varlen_func is not None
+
 
 class LuminaRMSNormZero(nn.Module):
     """
@@ -61,8 +63,8 @@ class LuminaRMSNormZero(nn.Module):
         x = self.norm(x) * (1 + scale_msa[:, None])
         return x, gate_msa, scale_mlp, gate_mlp
 
-class LuminaFeedForward(nn.Module):
 
+class LuminaFeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -92,13 +94,14 @@ class LuminaFeedForward(nn.Module):
             inner_dim,
             bias=False,
         )
-    
+
     def swiglu(self, x, y):
         return F.silu(x.float(), inplace=False).to(x.dtype) * y
 
     def forward(self, x):
         h1, h2 = self.linear_1(x), self.linear_3(x)
         return self.linear_2(self.swiglu(h1, h2))
+
 
 class LuminaLayerNormContinuous(nn.Module):
     def __init__(
@@ -145,6 +148,7 @@ class LuminaLayerNormContinuous(nn.Module):
 
         return x
 
+
 class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
     def __init__(
         self,
@@ -180,8 +184,8 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
         caption_embed = self.caption_embedder(text_hidden_states)
         return time_embed, caption_embed
 
-class SimpleQFormerImageRefiner(nn.Module):
 
+class SimpleQFormerImageRefiner(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -268,6 +272,7 @@ class SimpleQFormerImageRefiner(nn.Module):
             q = q + layer["ffn"](layer["ln_ffn"](q))
 
         return q
+
 
 class AttnProcessor:
     def __init__(self) -> None:
@@ -398,8 +403,8 @@ class AttnProcessor:
 
         return hidden_states
 
-class TransformerBlock(nn.Module):
 
+class TransformerBlock(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -483,6 +488,7 @@ class TransformerBlock(nn.Module):
             hidden_states = hidden_states + self.ffn_norm2(mlp_output)
 
         return hidden_states
+
 
 class Transformer2DModel(ModelMixin, ConfigMixin):
     """MammothModa2 DiT transformer（推理使用）。"""

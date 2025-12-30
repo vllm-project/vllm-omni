@@ -6,7 +6,6 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
-
 from vllm.attention.backends.abstract import AttentionType
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
@@ -102,6 +101,7 @@ def moe_forward(
     if hidden_states.ndim == 2:
         return merged.view(total_tokens, out_dim).contiguous()
     return merged.view(*hidden_states.shape[:-1], out_dim).contiguous()
+
 
 class Mammothmoda2Processor(Qwen2_5_VLProcessor):
     """Qwen2.5-VL Processor with MammothU tokenizer."""

@@ -18,7 +18,6 @@ __all__ = [
 
 
 class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
-
     model_type = "mammothmoda2_qwen2_5_vl_vision"
     base_config_key = "vision_config"
 
@@ -60,7 +59,6 @@ class Mammothmoda2Qwen2_5_VLVisionConfig(Qwen2_5_VLVisionConfig):
 
 
 class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
-
     model_type = "mammothmoda2_qwen2_5_vl_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -140,6 +138,7 @@ class Mammothmoda2Qwen2_5_VLTextConfig(Qwen2_5_VLTextConfig):
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
 
+
 class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
     """Combined configuration: text_config + vision_config."""
 
@@ -206,6 +205,7 @@ class Mammothmoda2Qwen2_5_VLConfig(Qwen2_5_VLConfig):
         self.moe_type = getattr(self.text_config, "moe_type", moe_type)
         self.gen_vocab_start_index = getattr(self.text_config, "gen_vocab_start_index", gen_vocab_start_index)
         self.tokenizer_class = "MammothUTokenizer"
+
 
 class Mammothmoda2Config(PretrainedConfig):
     """Top-level MammothModa2 composition configuration"""
