@@ -382,7 +382,7 @@ class MammothUTokenizer(PreTrainedTokenizer):
 
         return self.tokenizer.decode(token_ids, errors=errors or self.errors)
 
-    def bytes_to_str(self, byte_tokens) -> str:
+    def bytes_to_str(self, byte_tokens: dict) -> str:
         """Convert byte tokens to string representation.
 
         Args:
