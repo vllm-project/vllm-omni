@@ -130,7 +130,7 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     model, stage_config_path = request.param
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--init-sleep-seconds", "90"]) as server:
+    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
         yield server
 
 

@@ -67,8 +67,9 @@ class OmniBase:
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-            - init_sleep_seconds: Number of seconds to sleep between starting
-              each stage process during initialization
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
@@ -172,7 +173,7 @@ class OmniBase:
 
     def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
         """Initialize stage list management."""
-        init_sleep_seconds = kwargs.get("init_sleep_seconds", 20)
+        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
         shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
         init_timeout = kwargs.get("init_timeout", 300)
         worker_backend = kwargs.get("worker_backend", "multi_process")
@@ -207,7 +208,7 @@ class OmniBase:
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
             idx, cfg = idx_cfg
-            return idx, OmniStage(cfg)
+            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
 
         with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
             futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
@@ -226,7 +227,7 @@ class OmniBase:
             self._ctx = mp.get_context("spawn")
             self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
 
-        self._init_sleep_seconds = max(0, int(init_sleep_seconds))
+        self._stage_init_timeout = max(0, int(stage_init_timeout))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
         # Wait for all stages to report readiness before seeding
@@ -264,7 +265,6 @@ class OmniBase:
             )
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
-            time.sleep(self._init_sleep_seconds)
 
     def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
         self._stages_ready.add(stage_id)
@@ -300,7 +300,7 @@ class OmniBase:
                         "Verify GPU/device assignment in config (runtime.devices) is correct.",
                         "Check GPU/host memory availability; reduce model or batch size if needed.",
                         "Check model weights path and network reachability (if loading remotely).",
-                        "Increase initialization wait time (init_sleep_seconds or call-site timeout).",
+                        "Increase initialization wait time (stage_init_timeout or call-site timeout).",
                     ]
                 )
                 logger.error(
@@ -360,8 +360,9 @@ class Omni(OmniBase):
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-            - init_sleep_seconds: Number of seconds to sleep between starting
-              each stage process during initialization
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
             - shm_threshold_bytes: Threshold in bytes for using shared memory
               for IPC. Objects larger than this threshold will use shared memory.
             - worker_backend: Backend for worker processes. Default is "multi_process".
