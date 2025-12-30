@@ -542,7 +542,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
-                # print(f"inputs_embeds: {inputs_embeds.shape}")
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -555,7 +554,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
-            # print(f"hidden_states: {hidden_states}")
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
