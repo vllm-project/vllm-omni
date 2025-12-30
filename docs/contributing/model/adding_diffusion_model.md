@@ -119,7 +119,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
 }
 ```
 
-## Step 4: And an Example Script
+## Step 4: Add an Example Script
 For each newly integrated model, we need to provide examples script under the examples/ to demonstrate how to initialize the pipeline with Omni, pass in user inputs, and generate outputs.
 Key point for writing the example:
 
