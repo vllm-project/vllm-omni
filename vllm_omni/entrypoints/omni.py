@@ -430,7 +430,13 @@ class Omni(OmniBase):
                     per_stage_params.append(self.default_sampling_params_list[stage_id])
 
             sampling_params_list = per_stage_params
-        return self._run_generation(prompts, sampling_params_list)
+        try:
+            return self._run_generation(prompts, sampling_params_list)
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to run generation: %s", e)
+            raise e
+        finally:
+            self.close()
 
     def _run_generation(
         self,
