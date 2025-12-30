@@ -100,6 +100,9 @@ class AsyncOmni(OmniBase):
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
+            num_devices = sequence_parallel_size
+            for i in range(1, num_devices):
+                devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
