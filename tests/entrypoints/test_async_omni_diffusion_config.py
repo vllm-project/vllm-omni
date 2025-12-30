@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm_omni.entrypoints import async_omni as async_omni_module
+from vllm_omni.entrypoints import omni as omni_module
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 
 def test_default_stage_config_includes_cache_backend(monkeypatch):
     """Ensure cache_backend/cache_config are preserved in default diffusion stage."""
-    monkeypatch.setattr(async_omni_module, "load_stage_configs_from_model", lambda model: [])
-    monkeypatch.setattr(async_omni_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", lambda model: [])
+    monkeypatch.setattr(omni_module, "resolve_model_config_path", lambda model: None)
     monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
     monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
 
@@ -37,8 +37,8 @@ def test_default_stage_config_includes_cache_backend(monkeypatch):
 
 def test_default_cache_config_used_when_missing(monkeypatch):
     """Ensure default cache_config is applied when cache_backend is set."""
-    monkeypatch.setattr(async_omni_module, "load_stage_configs_from_model", lambda model: [])
-    monkeypatch.setattr(async_omni_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", lambda model: [])
+    monkeypatch.setattr(omni_module, "resolve_model_config_path", lambda model: None)
     monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
     monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
 

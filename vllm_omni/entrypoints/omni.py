@@ -118,7 +118,7 @@ class OmniBase:
         if cache_backend == "tea_cache":
             return {
                 "rel_l1_thresh": 0.2,
-        }
+            }
         return None
 
     def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:
