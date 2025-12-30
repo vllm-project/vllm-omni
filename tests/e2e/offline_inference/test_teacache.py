@@ -74,5 +74,3 @@ def test_teacache(model_name: str):
     # Check image size
     assert images[0].width == width
     assert images[0].height == height
-    # manually close the Omni instance
-    m.close()

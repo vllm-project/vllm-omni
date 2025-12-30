@@ -56,5 +56,3 @@ def test_video_diffusion_model(model_name: str):
     assert frames.shape[1] == num_frames
     assert frames.shape[2] == height
     assert frames.shape[3] == width
-    # manually close the Omni instance
-    m.close()
