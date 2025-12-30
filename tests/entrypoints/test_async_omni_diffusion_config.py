@@ -51,3 +51,25 @@ def test_default_cache_config_used_when_missing(monkeypatch):
     cache_config = engine_args.get("cache_config")
     assert cache_config is not None
     assert cache_config["Fn_compute_blocks"] == 1
+
+
+def test_default_stage_devices_from_sequence_parallel(monkeypatch):
+    """Ensure devices list reflects sequence parallel size when no parallel_config is provided."""
+    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", lambda model: [])
+    monkeypatch.setattr(omni_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
+    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+
+    omni = AsyncOmni(
+        model="dummy-model",
+        ulysses_degree=2,
+        ring_degree=2,
+    )
+
+    stage_cfg = omni.stage_configs[0]
+    runtime = stage_cfg.runtime
+    if hasattr(runtime, "get"):
+        devices = runtime.get("devices")
+    else:
+        devices = getattr(runtime, "devices", None)
+    assert devices == "0,1,2,3"
