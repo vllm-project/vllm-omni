@@ -102,8 +102,7 @@ class OmniBase:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
-    @staticmethod
-    def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
+    def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
         if cache_backend == "cache_dit":
             return {
                 "Fn_compute_blocks": 1,
@@ -119,11 +118,10 @@ class OmniBase:
         if cache_backend == "tea_cache":
             return {
                 "rel_l1_thresh": 0.2,
-            }
+        }
         return None
 
-    @classmethod
-    def _normalize_cache_config(cls, cache_backend: str | None, cache_config: Any | None) -> Any | None:
+    def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:
         if isinstance(cache_config, str):
             try:
                 cache_config = json.loads(cache_config)
@@ -131,7 +129,7 @@ class OmniBase:
                 logger.warning("Invalid cache_config JSON, using defaults.")
                 cache_config = None
         if cache_config is None and cache_backend not in (None, "", "none"):
-            cache_config = cls._get_default_cache_config(cache_backend)
+            cache_config = self._get_default_cache_config(cache_backend)
         return cache_config
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
