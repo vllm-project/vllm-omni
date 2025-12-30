@@ -77,6 +77,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if supports_mrope(self.model):
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
+                mm_features=req_state.mm_features,
                 hf_config=self.model_config.hf_config,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
@@ -311,14 +312,18 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
-        if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
+        if (
+            hasattr(self.model, "have_multimodal_outputs")
+            and self.model.have_multimodal_outputs
+            and isinstance(hidden_states, OmniOutput)
+        ):
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 
         elif isinstance(hidden_states, torch.Tensor):
             text_hidden_states = hidden_states
             multimodal_outputs = {}
-        elif isinstance(hidden_states, list):
+        elif isinstance(hidden_states, list) or isinstance(hidden_states, tuple):
             text_hidden_states = hidden_states[0]
             multimodal_outputs = {}
         else:

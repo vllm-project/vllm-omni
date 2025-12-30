@@ -254,11 +254,64 @@ def get_audio_query(audio_path: str | None = None, custom_prompt: str | None = N
     return prompt
 
 
+def get_mixed_modalities_query(
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    custom_prompt: str | None = None,
+):
+    """
+    Online-friendly multimodal user message:
+    - Uses URLs (or base64 data URLs) for audio / image / video.
+    - Returns the OpenAI-style message dict directly (not the offline QueryResult).
+    """
+    question = (
+        custom_prompt or "What is recited in the audio? What is the content of this image? Why is this video funny?"
+    )
+
+    audio_url = get_audio_url_from_path(audio_path)
+    image_url = get_image_url_from_path(image_path)
+    video_url = get_video_url_from_path(video_path)
+
+    return {
+        "role": "user",
+        "content": [
+            {"type": "audio_url", "audio_url": {"url": audio_url}},
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "video_url", "video_url": {"url": video_url}},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
+def get_multi_audios_query(custom_prompt: str | None = None):
+    """
+    Online-friendly two-audio comparison request.
+    - Encodes both audio clips as URLs (or data URLs).
+    - Returns the OpenAI-style message dict.
+    """
+    question = custom_prompt or "Are these two audio clips the same?"
+    # Use default demo clips; you can point to your own via --audio-path if needed.
+    audio_url_1 = get_audio_url_from_path(AudioAsset("winning_call").url)
+    audio_url_2 = get_audio_url_from_path(AudioAsset("mary_had_lamb").url)
+
+    return {
+        "role": "user",
+        "content": [
+            {"type": "audio_url", "audio_url": {"url": audio_url_1}},
+            {"type": "audio_url", "audio_url": {"url": audio_url_2}},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
 query_map = {
     "text": get_text_query,
     "use_audio": get_audio_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
+    "use_mixed_modalities": get_mixed_modalities_query,
+    "use_multi_audios": get_multi_audios_query,
 }
 
 
@@ -363,7 +416,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="use_video",
+        default="use_mixed_modalities",
         choices=query_map.keys(),
         help="Query type.",
     )

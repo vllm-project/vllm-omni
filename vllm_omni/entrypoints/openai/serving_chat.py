@@ -1062,7 +1062,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Get request parameters from extra_body
             # Text-to-image parameters (ref: text_to_image.py)
             num_inference_steps = extra_body.get("num_inference_steps", 50)
-            guidance_scale = extra_body.get("guidance_scale", 7.5)
+            guidance_scale = extra_body.get("guidance_scale")
             true_cfg_scale = extra_body.get("true_cfg_scale")  # Qwen-Image specific
             seed = extra_body.get("seed")
             negative_prompt = extra_body.get("negative_prompt")
@@ -1094,13 +1094,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "prompt": prompt,
                 "request_id": request_id,
                 "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
                 "height": height,
                 "width": width,
                 "negative_prompt": negative_prompt,
                 "num_outputs_per_prompt": num_outputs_per_prompt,
                 "seed": seed,
             }
+
+            if guidance_scale is not None:
+                gen_kwargs["guidance_scale"] = guidance_scale
 
             # Add Qwen-Image specific parameter
             if true_cfg_scale is not None:

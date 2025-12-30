@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_p
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -338,6 +339,8 @@ class Qwen2_5OmniForConditionalGeneration(
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        *,
         hf_config: PretrainedConfig,
         image_grid_thw: list[list[int]] | torch.Tensor,
         video_grid_thw: list[list[int]] | torch.Tensor,
