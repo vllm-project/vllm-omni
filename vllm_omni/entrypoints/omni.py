@@ -122,6 +122,18 @@ class OmniBase:
             }
         return None
 
+    @classmethod
+    def _normalize_cache_config(cls, cache_backend: str | None, cache_config: Any | None) -> Any | None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = cls._get_default_cache_config(cache_backend)
+        return cache_config
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # We temporally create a default config for diffusion stage.
@@ -130,15 +142,7 @@ class OmniBase:
         if "dtype" in kwargs:
             kwargs["dtype"] = str(kwargs["dtype"])
         cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = kwargs.get("cache_config", None)
-        if isinstance(cache_config, str):
-            try:
-                cache_config = json.loads(cache_config)
-            except json.JSONDecodeError:
-                logger.warning("Invalid cache_config JSON, using defaults.")
-                cache_config = None
-        if cache_config is None and cache_backend not in (None, "", "none"):
-            cache_config = self._get_default_cache_config(cache_backend)
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
         # TODO: hack, calculate devices based on parallel config.
         devices = "0"
         if "parallel_config" in kwargs:

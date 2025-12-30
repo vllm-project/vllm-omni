@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import json
 import time
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import asdict
@@ -87,15 +86,7 @@ class AsyncOmni(OmniBase):
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
         cache_backend = kwargs.get("cache_backend", "none")
-        cache_config = kwargs.get("cache_config", None)
-        if isinstance(cache_config, str):
-            try:
-                cache_config = json.loads(cache_config)
-            except json.JSONDecodeError:
-                logger.warning("Invalid cache_config JSON, using defaults.")
-                cache_config = None
-        if cache_config is None and cache_backend not in (None, "", "none"):
-            cache_config = self._get_default_cache_config(cache_backend)
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
 
         devices = "0"
         if "parallel_config" in kwargs:
