@@ -6,13 +6,14 @@ import os
 import time
 import uuid
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
 from typing import Any
 
 from omegaconf import OmegaConf
+from tqdm.auto import tqdm
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 
@@ -448,6 +449,7 @@ class Omni(OmniBase):
         self,
         prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
         sampling_params_list: Any | Sequence[Any] | None = None,
+        use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> list[OmniRequestOutput]:
         """Run generation through all stages in the pipeline."""
         logger.debug(f"[{self._name}] generate() called")
@@ -501,6 +503,11 @@ class Omni(OmniBase):
             _wall_start_ts,
         )
 
+        it = request_id_to_prompt.items()
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            it = tqdm_func(it, desc="Adding requests")
+
         # Seed stage-0 queue with all requests
         logger.debug(f"[{self._name}] Seeding {len(request_prompts)} requests into stage-0")
         # Mark first input time for stage-0
@@ -517,6 +524,15 @@ class Omni(OmniBase):
             _req_start_ts[req_id] = time.time()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
+        pbar = None
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            pbar = tqdm_func(
+                total=len(request_prompts),
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} unit/s, output: {0:.2f} unit/s"),
+            )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
         remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
@@ -554,6 +570,25 @@ class Omni(OmniBase):
                     _m = asdict(result.get("metrics"))
                     if _m is not None:
                         metrics.on_stage_metrics(stage_id, req_id, _m)
+                        if pbar:
+                            elapsed = pbar.format_dict["elapsed"] or 1e-6
+                            # Aggregate total tokens/images across all stages
+                            total_out = sum(metrics.stage_total_tokens)
+                            out_spd = total_out / elapsed
+
+                            modality = self.output_modalities[stage_id]
+                            unit = "img" if modality == "image" else "tok"
+
+                            # Pre-calculate for cleaner string formatting
+                            if metrics.e2e_count > 0:
+                                avg_lat = metrics.e2e_total_ms / metrics.e2e_count
+                            else:
+                                avg_lat = 0
+
+                            # Align with vLLM's wording "est. speed" using multi-line parentheses
+                            pbar.postfix = (
+                                f"est. speed stage-{stage_id} {unit}/s: {out_spd:.2f}, avg e2e_lat: {avg_lat:.1f}ms"
+                            )
                 except Exception as e:
                     logger.exception(
                         f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
@@ -632,6 +667,10 @@ class Omni(OmniBase):
                     remaining_by_stage[next_stage_id] += 1
                 else:
                     completed_requests += 1
+                    if pbar:
+                        final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]
+                        pbar.unit = "img" if final_mod == "image" else "req"
+                        pbar.update(1)
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
@@ -639,6 +678,9 @@ class Omni(OmniBase):
             if not made_progress:
                 time.sleep(0.005)
         logger.debug(f"[{self._name}] All requests completed")
+
+        if pbar:
+            pbar.close()
 
         # Summarize and print stats
         try:
