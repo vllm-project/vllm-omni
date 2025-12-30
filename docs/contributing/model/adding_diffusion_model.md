@@ -1,4 +1,4 @@
-# Adding a New Diffusion Model to vLLM-Omni
+# Adding a Diffusion Model
 This guide walks through the process of adding a new Diffusion model to vLLM-Omni, using Qwen/Qwen-Image-Edit as a comprehensive example.
 
 # Table of Contents
