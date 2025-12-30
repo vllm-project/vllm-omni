@@ -630,7 +630,7 @@ def _stage_worker(
 
         _recv_dequeue_ts = _time.time()
         if task is None:
-            logger.error("Received shutdown signal")
+            logger.info("Received shutdown signal")
             break
 
         batch_tasks: list[dict[str, Any]] = [task]
