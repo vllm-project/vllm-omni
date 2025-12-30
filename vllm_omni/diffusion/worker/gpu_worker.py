@@ -131,8 +131,7 @@ class GPUWorker:
         req = reqs[0]
 
         if req.generator is None and req.seed is not None:
-            device = self.device or torch.device(f"cuda:{self.rank}")
-            req.generator = torch.Generator(device=device).manual_seed(req.seed)
+            req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
