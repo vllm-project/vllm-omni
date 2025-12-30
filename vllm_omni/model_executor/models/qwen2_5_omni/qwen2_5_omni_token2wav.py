@@ -1264,10 +1264,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         sway_coefficient=-1.0,
         max_mel_frames: int | None = None,
     ):
-        # NOTE: `quantized_code` is expanded by `self.repeats` to the mel time axis.
-        # When applying a mel-frame cap, we MUST apply it consistently to the
-        # codec (code) length as well to avoid shape mismatches in DiTInputEmbedding.
-        max_mel_frames = resolve_max_mel_frames(max_mel_frames, default=6000)
+        max_mel_frames = resolve_max_mel_frames(max_mel_frames, default=30000)
         target_code_len, target_duration = cap_and_align_mel_length(
             code_len=int(quantized_code.shape[1]),
             repeats=int(self.repeats),
