@@ -106,6 +106,20 @@ class MockGenerationResult:
         self.images = images
 
 
+class FakeAsyncOmni:
+    """Fake AsyncOmni that yields a single diffusion output."""
+
+    def __init__(self):
+        self.stage_list = ["llm", "diffusion"]
+        self.default_sampling_params_list = [{"temperature": 0.1}, {"top_p": 0.9}]
+        self.captured_sampling_params_list = None
+
+    async def generate(self, prompt, request_id, sampling_params_list):
+        self.captured_sampling_params_list = sampling_params_list
+        images = [Image.new("RGB", (64, 64), color="green")]
+        yield MockGenerationResult(images)
+
+
 @pytest.fixture
 def mock_async_diffusion():
     """Mock AsyncOmniDiffusion instance that returns fake images"""
@@ -135,6 +149,22 @@ def test_client(mock_async_diffusion):
     app.state.engine_client = mock_async_diffusion
     app.state.stage_configs = [{"stage_type": "diffusion"}]
     app.state.served_model_names = "Qwen/Qwen-Image"
+
+    return TestClient(app)
+
+
+@pytest.fixture
+def async_omni_test_client():
+    """Create test client with mocked AsyncOmni engine."""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    app.state.engine_client = FakeAsyncOmni()
+    app.state.stage_configs = [{"stage_type": "llm"}, {"stage_type": "diffusion"}]
 
     return TestClient(app)
 
@@ -169,6 +199,29 @@ def test_generate_single_image(test_client):
     img_bytes = base64.b64decode(data["data"][0]["b64_json"])
     img = Image.open(io.BytesIO(img_bytes))
     assert img.size == (64, 64)  # Our mock returns 64x64 images
+
+
+def test_generate_images_async_omni_sampling_params(async_omni_test_client):
+    """Test AsyncOmni path uses per-stage sampling params."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 2,
+            "size": "256x256",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    assert captured[0] == {"temperature": 0.1}
+    assert captured[1]["num_outputs_per_prompt"] == 2
+    assert captured[1]["height"] == 256
+    assert captured[1]["width"] == 256
+    assert captured[1]["seed"] == 7
 
 
 def test_generate_multiple_images(test_client):

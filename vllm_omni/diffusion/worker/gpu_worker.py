@@ -129,6 +129,11 @@ class GPUWorker:
         # TODO: dealing with first req for now
         req = reqs[0]
 
+        if req.generator is None and req.seed is not None:
+            torch.cuda.is_available()
+            device = torch.device(f"cuda:{self.rank}")
+            req.generator = torch.Generator(device=device).manual_seed(req.seed)
+
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
             self.cache_backend.refresh(self.pipeline, req.num_inference_steps)

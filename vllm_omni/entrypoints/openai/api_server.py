@@ -573,8 +573,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             detail="Stage configs not found. Start server with a multi-stage omni model.",
         )
 
-    # Check for diffusion stage
+    # Check for diffusion stage and collect stage types
     has_diffusion_stage = False
+    stage_types: list[str] = []
     for stage in stage_configs:
         # Handle both dict and OmegaConf objects
         stage_type = None
@@ -593,7 +594,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         if stage_type == "diffusion":
             has_diffusion_stage = True
-            break
+        stage_types.append(stage_type)
 
     if not has_diffusion_stage:
         raise HTTPException(
@@ -647,7 +648,33 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
-        result = await engine_client.generate(**gen_params)
+        result = None
+        stage_list = getattr(engine_client, "stage_list", None)
+        if isinstance(stage_list, list):
+            default_params_list = getattr(engine_client, "default_sampling_params_list", None)
+            if not isinstance(default_params_list, list):
+                default_params_list = [{} for _ in stage_types]
+            else:
+                default_params_list = list(default_params_list)
+            if len(default_params_list) != len(stage_types):
+                default_params_list = (default_params_list + [{} for _ in stage_types])[: len(stage_types)]
+
+            sampling_params_list: list[dict[str, Any]] = []
+            for idx, stage_type in enumerate(stage_types):
+                if stage_type == "diffusion":
+                    sampling_params_list.append(gen_params)
+                else:
+                    base_params = default_params_list[idx]
+                    sampling_params_list.append(dict(base_params) if isinstance(base_params, dict) else base_params)
+
+            async for output in engine_client.generate(
+                prompt=gen_params["prompt"],
+                request_id=gen_params["request_id"],
+                sampling_params_list=sampling_params_list,
+            ):
+                result = output
+        else:
+            result = await engine_client.generate(**gen_params)
 
         if result is None:
             raise HTTPException(
@@ -656,7 +683,15 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             )
 
         # Extract images from result
-        images = result.images if hasattr(result, "images") and result.images else []
+        images = []
+        if hasattr(result, "images") and result.images:
+            images = result.images
+        elif hasattr(result, "request_output"):
+            request_output = result.request_output
+            if isinstance(request_output, dict) and request_output.get("images"):
+                images = request_output["images"]
+            elif hasattr(request_output, "images") and request_output.images:
+                images = request_output.images
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import json
 import time
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import asdict
@@ -34,6 +35,26 @@ from vllm_omni.entrypoints.utils import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
+    if cache_backend == "cache_dit":
+        return {
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "enable_taylorseer": False,
+            "taylorseer_order": 1,
+            "scm_steps_mask_policy": None,
+            "scm_steps_policy": "dynamic",
+        }
+    if cache_backend == "tea_cache":
+        return {
+            "rel_l1_thresh": 0.2,
+        }
+    return None
 
 
 class AsyncOmni(OmniBase):
@@ -85,6 +106,17 @@ class AsyncOmni(OmniBase):
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # TODO: here is different from the Omni class. We should merge the two in the future.
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = kwargs.get("cache_config", None)
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = _get_default_cache_config(cache_backend)
+
         devices = "0"
         if "parallel_config" in kwargs:
             parallel_config = kwargs["parallel_config"]
@@ -92,13 +124,18 @@ class AsyncOmni(OmniBase):
             for i in range(1, num_devices):
                 devices += f",{i}"
         else:
+            ulysses_degree = kwargs.get("ulysses_degree") or 1
+            ring_degree = kwargs.get("ring_degree") or 1
+            sequence_parallel_size = kwargs.get("sequence_parallel_size")
+            if sequence_parallel_size is None:
+                sequence_parallel_size = ulysses_degree * ring_degree
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
                 tensor_parallel_size=1,
-                sequence_parallel_size=1,
-                ulysses_degree=1,
-                ring_degree=1,
+                sequence_parallel_size=sequence_parallel_size,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
                 cfg_parallel_size=1,
             )
         default_stage_cfg = [
@@ -114,8 +151,8 @@ class AsyncOmni(OmniBase):
                     "parallel_config": parallel_config,
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
-                    "cache_backend": kwargs.get("cache_backend", "none"),
-                    "cache_config": kwargs.get("cache_config", None),
+                    "cache_backend": cache_backend,
+                    "cache_config": cache_config,
                 },
                 "final_output": True,
                 "final_output_type": "image",
