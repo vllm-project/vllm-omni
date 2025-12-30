@@ -16,7 +16,8 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
+from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
     Qwen3OmniMoeThinkerDummyInputsBuilder,
@@ -25,6 +26,7 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -66,7 +68,7 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen3OmniMoeThinkerDummyInputsBuilder,
 )
 class Qwen3OmniMoeForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, Qwen3OmniMoeConditionalGenerationMixin, CustomProcessMixin
+    nn.Module, SupportsMultiModal, SupportsPP, Qwen3OmniMoeConditionalGenerationMixin, CustomProcessMixin, SupportsMRoPE
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -186,6 +188,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
+        if self.model_stage == "thinker":
+            self.tts_tokens = torch.tensor(
+                [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                device=self._module_device(self.thinker),
+                dtype=torch.long,
+            )
 
     # ==================== Device utilities ====================
 
@@ -259,6 +267,19 @@ class Qwen3OmniMoeForConditionalGeneration(
             if i != self.config.talker_config.codec_eos_token_id
         ]
 
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, int]:
+        if self.model_stage == "thinker":
+            if mm_features is None:
+                msg = "Qwen3 Omni thinker get_mrope_input_positions requires mm_features"
+                raise ValueError(msg)
+            return self.thinker.get_mrope_input_positions(input_tokens, mm_features)
+        return MRotaryEmbedding.get_input_positions_tensor(input_tokens, **kwargs)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -287,28 +308,28 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
-            # Normalize to batched inputs if needed
-            _added_batch_dim = False
-            if input_ids is not None and input_ids.ndim == 1:
-                input_ids = input_ids.unsqueeze(0)
-                _added_batch_dim = True
-            if positions is not None and positions.ndim == 1:
-                positions = positions.unsqueeze(0)
-                _added_batch_dim = True
-            if inputs_embeds is not None and inputs_embeds.ndim == 2:
-                inputs_embeds = inputs_embeds.unsqueeze(0)
-                _added_batch_dim = True
-
             thinker_dev = self._module_device(self.thinker)
+            if is_npu():
+                # Normalize to batched inputs if needed
+                _added_batch_dim = False
+                if input_ids is not None and input_ids.ndim == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                    _added_batch_dim = True
+                if positions is not None and positions.ndim == 1:
+                    positions = positions.unsqueeze(0)
+                    _added_batch_dim = True
+                if inputs_embeds is not None and inputs_embeds.ndim == 2:
+                    inputs_embeds = inputs_embeds.unsqueeze(0)
+                    _added_batch_dim = True
 
-            # Handle None input_ids
-            if input_ids is None:
-                input_ids = torch.zeros(
-                    inputs_embeds.shape[1],
-                    dtype=torch.long,
-                    device=thinker_dev,
-                ).unsqueeze(0)
-                _added_batch_dim = True
+                # Handle None input_ids
+                if input_ids is None:
+                    input_ids = torch.zeros(
+                        inputs_embeds.shape[1],
+                        dtype=torch.long,
+                        device=thinker_dev,
+                    ).unsqueeze(0)
+                    _added_batch_dim = True
 
             # Move to thinker device
             if input_ids is not None and input_ids.device != thinker_dev:
@@ -330,22 +351,17 @@ class Qwen3OmniMoeForConditionalGeneration(
             if is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and _added_batch_dim else input_ids
-                thinker_positions = positions[0] if positions.ndim > 1 else positions
                 thinker_inputs_embeds = (
                     inputs_embeds[0] if inputs_embeds is not None and _added_batch_dim else inputs_embeds
                 )
             else:
                 thinker_input_ids = input_ids
-                thinker_positions = positions[0] if positions.ndim > 1 else positions
                 thinker_inputs_embeds = inputs_embeds
-            # thinker_input_ids = input_ids
-            # thinker_positions = positions[0] if positions.ndim > 1 else positions
-            # thinker_inputs_embeds = inputs_embeds
 
             # Run thinker
             text_hidden_states, captured_layer_dict = self.thinker(
                 input_ids=thinker_input_ids,
-                positions=thinker_positions,
+                positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=thinker_inputs_embeds,
                 **capture_kwargs,
@@ -355,12 +371,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # These will later be projected into talker text space by the talker stage.
             multimodal_outputs = captured_layer_dict if captured_layer_dict is not None else {}
             try:
-                tts_tokens = torch.tensor(
-                    [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
-                    device=self._module_device(self.thinker),
-                    dtype=torch.long,
-                )
-                thinker_tts_embeds = self.thinker.embed_input_ids(tts_tokens)  # [1,3,thinker_hidden]
+                thinker_tts_embeds = self.thinker.embed_input_ids(self.tts_tokens)  # [1,3,thinker_hidden]
                 if (
                     isinstance(thinker_tts_embeds, torch.Tensor)
                     and thinker_tts_embeds.ndim == 3

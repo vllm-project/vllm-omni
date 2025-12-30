@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -184,6 +185,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+            if isinstance(model_output, tuple):
+                model_output = OmniOutput(*model_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
