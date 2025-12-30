@@ -23,7 +23,7 @@ cd vllm-omni
 uv pip install -e .
 ```
 
-For additional details—including alternative installation methods, installation on NPU and other platforms — please see the installation guide in [installation](installation/README.md)
+For additional installation methods — please see the [installation guide](installation/README.md).
 
 ## Offline Inference
 

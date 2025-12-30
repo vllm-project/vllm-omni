@@ -13,24 +13,17 @@ vLLM-Omni uses `uv` as the environment manager, to create and manage Python envi
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
-### Development Environment for vLLM
 
-vLLM-Omni is built on top of the stable release 0.12.0 of vLLM. You may install `vllm==0.12.0` directly or install the library from source if you need to check, modify or debug with source code of vLLM.
+### Development Environment for vLLM and vLLM-Omni
 
-The release 0.12.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
-
-### Development Environment for vLLM-Omni
-
-Install vLLM-Omni from source with development dependencies:
-
-```bash
-git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm-omni
-uv pip install -e ".[dev]"
-```
+vLLM-Omni is quickly evolving, please see the [installation guide](../getting_started/installation/README.md) for details. It's recommended to build from source to provide the latest development environment.
 
 !!! tip
     vLLM-Omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
+
+### Adding a new model to vLLM-Omni
+
+Please check [model implementation](model/README.md) for how to add diffusion and omni-modality models to vLLM-Omni.
 
 ### Linting
 
