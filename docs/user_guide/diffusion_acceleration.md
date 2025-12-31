@@ -17,6 +17,7 @@ Both methods can provide significant speedups (typically **1.5x-2.0x**) while ma
 vLLM-Omni also supports the sequence parallelism (SP) for the diffusion model, that includes:
 
 1. [Ulysses-SP](acceleration/parallelism_acceleration.md#ulysses-sp) - splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
+2. [Ring-Attention](acceleration/parallelism_acceleration.md#ring-attention) - splits the input along the sequence dimension and uses ring-based P2P communication to accumulate attention results, keeping the sequence dimension sharded.
 
 ## Quick Comparison
 
@@ -33,6 +34,14 @@ The following table shows which models are currently supported by each accelerat
 
 ### ImageGen
 
+<<<<<<< HEAD
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |
+|-------|-----------------|----------|-----------|-----------|----------------|
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ | ❌ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ |✅ | - |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ❌ | ✅ |✅ | - |
+=======
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
 |-------|------------------|----------|-----------|-----------|
 | **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ |
@@ -149,6 +158,22 @@ omni = Omni(
 
 outputs = omni.generate(prompt="turn this cat to a dog",
         pil_image=input_image, num_inference_steps=50)
+```
+
+### Using Ring-Attention
+
+Run text-to-image:
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+ring_degree = 2
+
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    parallel_config=DiffusionParallelConfig(ring_degree=2)
+)
+
+outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
 ```
 
 ## Documentation

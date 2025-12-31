@@ -245,7 +245,7 @@ class OmniDiffusionConfig:
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
-    # attention_backend: str = None
+    attention_backend: str | None = None
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE

@@ -146,6 +146,14 @@ class OmniServeCommand(CLISubcommand):
             help="Ulysses Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
         )
+        serve_parser.add_argument(
+            "--ring",
+            dest="ring_degree",
+            type=int,
+            default=None,
+            help="Ring Sequence Parallelism degree for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.ring_degree.",
+        )
 
         # Cache optimization parameters
         serve_parser.add_argument(

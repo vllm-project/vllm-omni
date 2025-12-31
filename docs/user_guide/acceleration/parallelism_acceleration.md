@@ -8,27 +8,29 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 1. DeepSpeed Ulysses Sequence Parallel (DeepSpeed Ulysses-SP) ([arxiv paper](https://arxiv.org/pdf/2309.14509)): Ulysses-SP splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
 
+2. [Ring-Attention](#ring-attention) - splits the input along the sequence dimension and uses ring-based P2P communication to accumulate attention results, keeping the sequence dimension sharded
+
 
 The following table shows which models are currently supported by parallelism method:
 
 ### ImageGen
 
-| Model | Model Identifier | Ulysses-SP |
-|-------|------------------|-----------|
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ |
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ |
+| Model | Model Identifier | Ulysses-SP | Ring-SP |
+|-------|------------------|-----------|---------|
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ❌ |
+| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ❌ |
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ❌ |
 
 ### VideoGen
 
-| Model | Model Identifier | Ulysses-SP |
-|-------|------------------|-----------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ |
+| Model | Model Identifier | Ulysses-SP | Ring-SP |
+|-------|------------------|-----------|---------|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ❌ |
 
 ### Sequence Parallelism
 
@@ -79,6 +81,101 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 | Ulysses-SP  |  2  |  65.2s | 1.73x |
 | Ulysses-SP  |  4  | 39.6s | 2.84x |
 | Ulysses-SP  |  8  | 30.8s | 3.65x |
+
+#### Ring-Attention
+
+Ring-Attention ([arxiv paper](https://arxiv.org/abs/2310.01889)) splits the input along the sequence dimension and uses ring-based P2P communication to accumulate attention results. Unlike Ulysses-SP which uses all-to-all communication, Ring-Attention keeps the sequence dimension sharded throughout the computation and circulates Key/Value blocks through a ring topology.
+
+##### Offline Inference
+
+An example of offline inference script using Ring-Attention is shown below:
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+ring_degree = 2
+
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    parallel_config=DiffusionParallelConfig(ring_degree=2)
+)
+
+outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+```
+
+See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
+
+
+##### Online Serving
+
+You can enable Ring-Attention in online serving for diffusion models via `--ring`:
+
+```bash
+# Text-to-image (requires >= 2 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
+```
+
+##### Benchmarks
+!!! note "Benchmark Disclaimer"
+    These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
+
+    - Specific model and use case
+    - Hardware configuration
+    - Careful parameter tuning
+    - Different inference settings (e.g., number of steps, image resolution)
+
+
+To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** model generating images (**1024x1024** as long sequence input) with 50 inference steps. The hardware devices are NVIDIA A100 GPUs. `flash_attn` is the attention backends.
+
+| Configuration | Ring degree |Generation Time | Speedup |
+|---------------|----------------|---------|---------|
+| **Baseline (diffusers)** | - | 45.2s | 1.0x |
+| Ring-Attention  |  2  |  29.9s | 1.51x |
+| Ring-Attention  |  4  | 23.3s | 1.94x |
+
+
+#### Hybrid Ulysses + Ring
+
+You can combine both Ulysses-SP and Ring-Attention for larger scale parallelism. The total sequence parallel size equals `ulysses_degree × ring_degree`.
+
+##### Offline Inference
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+# Hybrid: 2 Ulysses × 2 Ring = 4 GPUs total
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)
+)
+
+outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+```
+
+##### Online Serving
+
+```bash
+# Text-to-image (requires >= 4 GPUs)
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+```
+
+##### Benchmarks
+!!! note "Benchmark Disclaimer"
+    These benchmarks are provided for **general reference only**. The configurations shown use default or common parameter settings and have not been exhaustively optimized for maximum performance. Actual performance may vary based on:
+
+    - Specific model and use case
+    - Hardware configuration
+    - Careful parameter tuning
+    - Different inference settings (e.g., number of steps, image resolution)
+
+
+To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** model generating images (**1024x1024** as long sequence input) with 50 inference steps. The hardware devices are NVIDIA A100 GPUs. `flash_attn` is the attention backends.
+
+| Configuration | Ulysses degree | Ring degree | Generation Time | Speedup |
+|---------------|----------------|-------------|-----------------|---------|
+| **Baseline (diffusers)** | - | - | 45.2s | 1.0x |
+| Hybrid Ulysses + Ring  |  2  |  2  |  24.3s | 1.87x |
+
 
 ##### How to parallelize a new model
 

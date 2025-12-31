@@ -66,7 +66,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
-
+    parser.add_argument(
+        "--ring_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
     return parser.parse_args()
 
 
@@ -108,7 +113,8 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
+    # assert args.ring_degree == 1, "Ring attention is not supported yet"
+    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
@@ -124,7 +130,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
