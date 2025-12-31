@@ -319,12 +319,12 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    omni_outputs = omni_llm.generate(prompts, sampling_params_list)
+    omni_generator = omni_llm.generate(prompts, sampling_params_list)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
 
-    for stage_outputs in omni_outputs:
+    for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
                 request_id = output.request_id

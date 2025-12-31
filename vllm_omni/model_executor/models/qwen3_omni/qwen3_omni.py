@@ -449,10 +449,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                     )
                 )
 
-            # # Remove EOS token if present
-            # if code[-1] == TALKER_CODEC_EOS_TOKEN_ID:
-            #     code = code[:-1]
-
             # Generate audio from codec codes
             audio_tensors = []
             for code in codes:

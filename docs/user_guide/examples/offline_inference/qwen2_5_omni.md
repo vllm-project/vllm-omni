@@ -70,6 +70,13 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `use_audio_in_video`: Extract audio from video
 - `text`: Text-only query
 
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
+```
 
 ## Example materials
 

@@ -19,8 +19,25 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output[0]["images"]
+    images = list(outputs)[0].request_output[0].images
     images[0].save("coffee.png")
+```
+
+Or put more than one prompt in a request, processing them sequentially.
+
+```python
+from vllm_omni.entrypoints.omni import Omni
+
+if __name__ == "__main__":
+    omni = Omni(model="Qwen/Qwen-Image")
+    prompts = [
+      "a cup of coffee on a table",
+      "a toy dinosaur on a sandy beach",
+      "a fox waking up in bed and yawning",
+    ]
+    outputs = omni.generate(prompts)
+    for i, output in enumerate(outputs):
+      image = output.request_output[0].images[0].save(f"{i}.jpg")
 ```
 
 ## Local CLI Usage

@@ -71,6 +71,7 @@ steps:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
+          shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
           volumes:

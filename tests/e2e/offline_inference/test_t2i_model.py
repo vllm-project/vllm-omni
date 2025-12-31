@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import is_npu, is_rocm
 
 # ruff: noqa: E402
@@ -47,16 +48,16 @@ def test_diffusion_model(model_name: str):
         num_outputs_per_prompt=2,
     )
     # Extract images from request_output[0]['images']
-    first_output = outputs[0]
+    first_output = list(outputs)[0]
     assert first_output.final_output_type == "image"
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
     req_out = first_output.request_output[0]
-    if not isinstance(req_out, dict) or "images" not in req_out:
+    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
-    images = req_out["images"]
+    images = req_out.images
 
     assert len(images) == 2
     # check image size
