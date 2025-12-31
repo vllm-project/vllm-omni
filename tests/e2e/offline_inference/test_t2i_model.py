@@ -63,5 +63,3 @@ def test_diffusion_model(model_name: str):
     assert images[0].width == width
     assert images[0].height == height
     images[0].save("image_output.png")
-    # manually close the Omni instance
-    m.close()
