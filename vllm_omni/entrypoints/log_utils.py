@@ -170,10 +170,14 @@ def record_stage_metrics(
         rid_key = str(req_id)
         pr = per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         pr_stages = pr["stages"]  # type: ignore[index]
-        pr_stages[stage_id] = {
+        stage_data: dict[str, Any] = {
             "stage_gen_time_ms": float(metrics.get("stage_gen_time_ms", 0.0)),
             "num_tokens_out": int(metrics.get("num_tokens_out", 0)),
         }
+        # Only record num_tokens_in for stage 0 (initial prompt)
+        if stage_id == 0:
+            stage_data["num_tokens_in"] = int(metrics.get("num_tokens_in", 0))
+        pr_stages[stage_id] = stage_data
     except Exception:
         pass
 
@@ -352,6 +356,7 @@ class StageStats:
 
 @dataclass
 class StageRequestMetrics:
+    num_tokens_in: int
     num_tokens_out: int
     stage_gen_time_ms: float
     batch_id: int
@@ -500,7 +505,12 @@ class OrchestratorMetrics:
             float(tx_ms),
         )
 
-    def on_finalize_request(self, stage_id: int, req_id: Any, engine_outputs: list[Any], req_start_ts: float) -> None:
+    def on_finalize_request(
+        self,
+        stage_id: int,
+        req_id: Any,
+        req_start_ts: float,
+    ) -> None:
         rid_key = str(req_id)
         _t0 = float(req_start_ts)
         _t1 = time.time()
@@ -509,21 +519,31 @@ class OrchestratorMetrics:
         self.stage_last_ts[stage_id] = _t1 if prev_last is None else max(prev_last, _t1)
         self.last_finish_ts = max(self.last_finish_ts, _t1)
         e2e_ms = (_t1 - _t0) * 1000.0
-        num_tokens = count_tokens_from_outputs(engine_outputs)
+
+        # Sum tokens from all stages for this request
+        # Include input tokens from stage 0 + output tokens from all stages
+        pr = self.per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
+        total_tokens = 0
+        stages_info = pr.get("stages", {})
+        for sid, stage_data in stages_info.items():
+            # Add input tokens only from stage 0 (initial prompt)
+            if sid == 0:
+                total_tokens += int(stage_data.get("num_tokens_in", 0))
+            total_tokens += int(stage_data.get("num_tokens_out", 0))
+
         self.e2e_total_ms += e2e_ms
-        self.e2e_total_tokens += int(num_tokens)
+        self.e2e_total_tokens += total_tokens
         self.e2e_count += 1
         self.e2e_done.add(rid_key)
-        pr = self.per_request.setdefault(rid_key, {"stages": {}, "transfers_ms": 0.0, "transfers_bytes": 0})
         per_req_record = {
             "type": "request_level_metrics",
             "request_id": rid_key,
             "e2e_time_ms": e2e_ms,
-            "e2e_tpt": (e2e_ms / num_tokens) if num_tokens > 0 else 0.0,
-            "num_tokens_out": int(num_tokens),
+            "e2e_tpt": (e2e_ms / total_tokens) if total_tokens > 0 else 0.0,
+            "e2e_total_tokens": total_tokens,
             "transfers_total_time_ms": float(pr.get("transfers_ms", 0.0)),
             "transfers_total_bytes": int(pr.get("transfers_bytes", 0)),
-            "stages": pr.get("stages", {}),
+            "stages": stages_info,
         }
         self.sum_per_request_transfer_ms += float(pr.get("transfers_ms", 0.0))
         logger.info(pformat(per_req_record, sort_dicts=False))

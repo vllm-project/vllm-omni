@@ -304,7 +304,7 @@ def _setup_log_mocks(monkeypatch):
         def on_stage_metrics(self, stage_id, req_id, metrics):
             pass
 
-        def on_finalize_request(self, stage_id, req_id, engine_outputs, start_ts):
+        def on_finalize_request(self, stage_id, req_id, start_ts):
             self.e2e_done.add(req_id)
 
         def on_forward(self, from_stage, to_stage, req_id, size_bytes, tx_ms, use_shm):
