@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
+
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
     "ignore",
@@ -127,7 +129,7 @@ class _FakeStage:
         """Mock stop_stage_worker: clean up queue references."""
         if self._in_q is not None:
             try:
-                self._in_q.put_nowait(None)
+                self._in_q.put_nowait(SHUTDOWN_TASK)
             except Exception:
                 pass
 
@@ -977,7 +979,7 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     # Use get_nowait to avoid blocking (close() uses put_nowait, so should be safe)
     try:
         shutdown_signal = omni.stage_list[0]._in_q.get_nowait()
-        assert shutdown_signal is None
+        assert shutdown_signal == SHUTDOWN_TASK
     except Empty:
         # If queue was already empty or only had stage_ready, that's also acceptable
         # The important thing is that close() was called without error
