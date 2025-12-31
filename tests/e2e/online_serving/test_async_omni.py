@@ -97,3 +97,4 @@ async def test_abort():
         task = asyncio.create_task(generate(engine, request_id, prompt, NUM_EXPECTED_TOKENS))
         num_generated_tokens, request_id = await task
         assert num_generated_tokens == NUM_EXPECTED_TOKENS
+    await asyncio.sleep(5)

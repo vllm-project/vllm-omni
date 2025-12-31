@@ -1176,6 +1176,7 @@ async def _stage_worker_async(
             task_type = task.get("type", OmniStageTaskType.GENERATE)
             if task_type == OmniStageTaskType.SHUTDOWN:
                 logger.debug("Received shutdown signal")
+                stage_engine.shutdown()
                 break
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
