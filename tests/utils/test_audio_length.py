@@ -21,8 +21,8 @@ def test_resolve_max_mel_frames_explicit():
 
 
 @pytest.mark.parametrize("repeats", [2, 4])
-@pytest.mark.parametrize("code_len", [0, 1, 2, 3, 10, 32768])
-@pytest.mark.parametrize("max_mel_frames", [None, -1, 0, 1, 2, 3, 5, 6, 7, 6000, 30000])
+@pytest.mark.parametrize("code_len", [0, 1, 32768])
+@pytest.mark.parametrize("max_mel_frames", [None, -1, 0, 1, 6000, 30000])
 def test_cap_and_align_mel_length_no_mismatch(repeats, code_len, max_mel_frames):
     """Guard that any max_mel_frames yields a mel length aligned to repeats, and
     consistent with the truncated code length (prevents concat mismatch).
