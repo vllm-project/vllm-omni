@@ -16,7 +16,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = outputs[0].request_output[0]["images"]
+    images = list(outputs)[0].request_output[0].images
     images[0].save("coffee.png")
 ```
 
@@ -34,7 +34,7 @@ if __name__ == "__main__":
     ]
     outputs = omni.generate(prompts)
     for i, output in enumerate(outputs):
-      image = output.request_output[0]["images"][0].save(f"{i}.jpg")
+      image = output.request_output[0].images[0].save(f"{i}.jpg")
 ```
 
 ## Local CLI Usage

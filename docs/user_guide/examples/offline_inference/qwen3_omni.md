@@ -49,6 +49,12 @@ python end2end.py --query-type use_image --image-path /path/to/image.jpg
 
 # Use local audio file
 python end2end.py --query-type use_audio --audio-path /path/to/audio.wav
+
+# Combine multiple local media files
+python end2end.py --query-type mixed_modalities \
+    --video-path /path/to/video.mp4 \
+    --image-path /path/to/image.jpg \
+    --audio-path /path/to/audio.wav
 ```
 
 If media file paths are not provided, the script will use default assets. Supported query types:
@@ -56,7 +62,16 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `use_image`: Image input
 - `use_audio`: Audio input
 - `text`: Text-only query
+- `multi_audios`: Multiple audio inputs
+- `mixed_modalities`: Combination of video, image, and audio inputs
 
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
+```
 
 ## Example materials
 

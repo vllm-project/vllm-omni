@@ -4,6 +4,7 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
+import base64
 import concurrent.futures
 import ctypes
 import os
@@ -146,8 +147,6 @@ def client(omni_server):
 @pytest.fixture(scope="session")
 def base64_encoded_video() -> str:
     """Base64 encoded video for testing."""
-    import base64
-
     video = VideoAsset(name="baby_reading", num_frames=4)
     with open(video.video_path, "rb") as f:
         content = f.read()
@@ -240,3 +239,40 @@ def test_video_to_audio_concurrent(
         if hasattr(audio_message, "audio") and audio_message.audio:
             assert audio_message.audio.data is not None
             assert len(audio_message.audio.data) > 0
+
+    # Test streaming completion
+    chat_completion = client.chat.completions.create(
+        model=omni_server.model,
+        messages=messages,
+        stream=True,
+    )
+
+    # Collect text and audio data from stream
+    text_content = ""
+    audio_data = None
+
+    for chunk in chat_completion:
+        for choice in chunk.choices:
+            if hasattr(choice, "delta"):
+                content = getattr(choice.delta, "content", None)
+            else:
+                content = None
+
+            modality = getattr(chunk, "modality", None)
+
+            if modality == "audio" and content:
+                # Audio chunk - decode base64 content
+                if audio_data is None:
+                    audio_data = base64.b64decode(content)
+                else:
+                    audio_data += base64.b64decode(content)
+            elif modality == "text" and content:
+                # Text chunk - accumulate text content
+                text_content += content if content else ""
+
+    # Verify text output
+    assert text_content is not None and len(text_content) >= 2
+
+    # Verify audio output
+    assert audio_data is not None
+    assert len(audio_data) > 0
