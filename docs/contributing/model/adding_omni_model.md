@@ -361,6 +361,7 @@ Stage transitions happen automatically in the orchestrator (`OmniLLM` class) dur
 
            # Submit to next stage
            task = {
+               "type": OmniStageTaskType.GENERATE,
                "request_id": req_id,
                "engine_inputs": next_inputs[0],
                "sampling_params": sampling_params_list[next_stage_id],
