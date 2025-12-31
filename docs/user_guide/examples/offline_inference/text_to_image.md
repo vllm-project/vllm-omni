@@ -19,7 +19,6 @@ if __name__ == "__main__":
     outputs = omni.generate(prompt)
     images = outputs[0].request_output[0]["images"]
     images[0].save("coffee.png")
-    omni.close()
 ```
 
 ## Local CLI Usage
