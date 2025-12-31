@@ -8,6 +8,8 @@ This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
 
+Note that when you pass in multiple independent prompts, they will be processed sequentially. Batching requests is currently not supported.
+
 ## Basic Usage
 
 ```python
