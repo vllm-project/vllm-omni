@@ -113,11 +113,9 @@ vllm_omni/                          tests/
 
 ### Naming Conventions
 
-- **Unit/System Tests**: Use `test_<module_name>.py` format
-  - Example: `omni_llm.py` → `test_omni_llm.py`
+- **Unit/System Tests**: Use `test_<module_name>.py` format. Example: `omni_llm.py` → `test_omni_llm.py`
 
-- **E2E Tests**: Place in `tests/e2e/offline_inference/` or `tests/e2e/online_serving/` with descriptive names
-  - Example: `tests/e2e/offline_inference/test_qwen3_omni.py`, `tests/e2e/offline_inference/test_diffusion_model.py`
+- **E2E Tests**: Place in `tests/e2e/offline_inference/` or `tests/e2e/online_serving/` with descriptive names. Example: `tests/e2e/offline_inference/test_qwen3_omni.py`, `tests/e2e/offline_inference/test_diffusion_model.py`
 
 ### Best Practices
 

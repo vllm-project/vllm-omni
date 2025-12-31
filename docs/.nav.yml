@@ -40,7 +40,7 @@ nav:
       flatten_single_child_sections: true
   - Model Implementation:
     - contributing/model/README.md
-    - contributing/model/adding_multi_stage_model.md
+    - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
   - CI: contributing/ci
   - Tests: contributing/tests
