@@ -4,20 +4,20 @@
 import pytest
 
 
-def test_resolve_max_mel_frames_default(monkeypatch):
-    from vllm_omni.utils.audio_length import VLLM_OMNI_MAX_MEL_FRAMES_ENV, resolve_max_mel_frames
+def test_resolve_max_mel_frames_default():
+    from vllm_omni.utils.audio_length import resolve_max_mel_frames
 
-    monkeypatch.delenv(VLLM_OMNI_MAX_MEL_FRAMES_ENV, raising=False)
     assert resolve_max_mel_frames(None, default=30000) == 30000
+    assert resolve_max_mel_frames(None, default=6000) == 6000
 
 
-def test_resolve_max_mel_frames_env_override(monkeypatch):
-    from vllm_omni.utils.audio_length import VLLM_OMNI_MAX_MEL_FRAMES_ENV, resolve_max_mel_frames
+def test_resolve_max_mel_frames_explicit():
+    from vllm_omni.utils.audio_length import resolve_max_mel_frames
 
-    monkeypatch.setenv(VLLM_OMNI_MAX_MEL_FRAMES_ENV, "6000")
-    assert resolve_max_mel_frames(None, default=30000) == 6000
-    # Explicit argument always wins
+    # Explicit argument always wins over default
     assert resolve_max_mel_frames(123, default=30000) == 123
+    assert resolve_max_mel_frames(6000, default=30000) == 6000
+    assert resolve_max_mel_frames(0, default=30000) == 0
 
 
 @pytest.mark.parametrize("repeats", [2, 4])

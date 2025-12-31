@@ -6,28 +6,20 @@ when applying a mel-frame cap.
 
 from __future__ import annotations
 
-import os
-
-VLLM_OMNI_MAX_MEL_FRAMES_ENV = "VLLM_OMNI_MAX_MEL_FRAMES"
-
 
 def resolve_max_mel_frames(max_mel_frames: int | None, *, default: int = 30000) -> int:
-    """Resolve max mel frames from an explicit value or environment variable.
+    """Resolve max mel frames from an explicit value or default.
 
-    Precedence:
-    1) explicit `max_mel_frames` argument (if not None)
-    2) env var `VLLM_OMNI_MAX_MEL_FRAMES` (if set and parseable)
-    3) `default`
+    Args:
+        max_mel_frames: Explicit value to use. If None, uses `default`.
+        default: Default value to use when `max_mel_frames` is None.
+
+    Returns:
+        The resolved max mel frames value.
     """
     if max_mel_frames is not None:
         return int(max_mel_frames)
-    raw = os.environ.get(VLLM_OMNI_MAX_MEL_FRAMES_ENV)
-    if raw is None or raw == "":
-        return int(default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return int(default)
+    return int(default)
 
 
 def cap_and_align_mel_length(
