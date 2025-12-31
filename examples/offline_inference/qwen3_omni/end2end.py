@@ -143,7 +143,13 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     )
 
 
-def get_mixed_modalities_query() -> QueryResult:
+def get_mixed_modalities_query(
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    num_frames: int = 16,
+    sampling_rate: int = 16000,
+) -> QueryResult:
     question = "What is recited in the audio? What is the content of this image? Why is this video funny?"
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
@@ -153,13 +159,40 @@ def get_mixed_modalities_query() -> QueryResult:
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
+
+    # Load video
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+
+    # Load image
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+
+    # Load audio
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+
     return QueryResult(
         inputs={
             "prompt": prompt,
             "multi_modal_data": {
-                "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
-                "image": convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB"),
-                "video": VideoAsset(name="baby_reading", num_frames=16).np_ndarrays,
+                "audio": audio_data,
+                "image": image_data,
+                "video": video_frames,
             },
         },
         limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
@@ -196,8 +229,8 @@ query_map = {
     "use_audio": get_audio_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
-    "use_mixed_modalities": get_mixed_modalities_query,
-    "use_multi_audios": get_multi_audios_query,
+    "multi_audios": get_multi_audios_query,
+    "mixed_modalities": get_mixed_modalities_query,
 }
 
 
@@ -217,6 +250,14 @@ def main(args):
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_audio":
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
+    elif args.query_type == "mixed_modalities":
+        query_result = query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            num_frames=getattr(args, "num_frames", 16),
+            sampling_rate=getattr(args, "sampling_rate", 16000),
+        )
     else:
         query_result = query_func()
 
@@ -327,7 +368,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="use_mixed_modalities",
+        default="mixed_modalities",
         choices=query_map.keys(),
         help="Query type.",
     )
