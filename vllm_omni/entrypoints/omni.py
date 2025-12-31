@@ -37,6 +37,7 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -47,7 +48,7 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
     if stage_list:
         for q in stage_in_queues:
             try:
-                q.put_nowait(None)
+                q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
         for stage in stage_list:
