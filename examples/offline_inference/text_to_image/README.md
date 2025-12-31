@@ -13,7 +13,8 @@ from vllm_omni.entrypoints.omni import Omni
 if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
-    images = omni.generate(prompt)
+    outputs = omni.generate(prompt)
+    images = outputs[0].request_output[0]["images"]
     images[0].save("coffee.png")
 ```
 
