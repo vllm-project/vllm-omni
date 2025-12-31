@@ -566,8 +566,10 @@ class Omni(OmniBase):
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = asdict(result.get("metrics"))
+                    _m = result.get("metrics")
                     if _m is not None:
+                        if not isinstance(_m, dict):
+                            _m = asdict(_m)
                         metrics.on_stage_metrics(stage_id, req_id, _m)
                         if pbar:
                             elapsed = pbar.format_dict["elapsed"] or 1e-6
@@ -610,7 +612,6 @@ class Omni(OmniBase):
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
-                                engine_outputs,
                                 _req_start_ts.get(req_id, _wall_start_ts),
                             )
                     except Exception as e:
