@@ -30,6 +30,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -37,7 +38,6 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
