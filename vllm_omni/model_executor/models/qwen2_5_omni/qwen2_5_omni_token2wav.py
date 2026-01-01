@@ -32,7 +32,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.utils.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
+from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 from vllm_omni.utils.platform_utils import is_npu
 
 
