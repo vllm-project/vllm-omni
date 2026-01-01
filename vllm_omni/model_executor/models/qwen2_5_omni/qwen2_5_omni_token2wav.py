@@ -32,6 +32,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 from vllm_omni.utils.platform_utils import is_npu
 
 
@@ -1261,12 +1262,24 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         num_steps=10,
         guidance_scale=0.5,
         sway_coefficient=-1.0,
+        max_mel_frames: int | None = None,
     ):
-        noise_initialization = torch.randn([1, 30000, self.mel_dim], dtype=reference_mel_spectrogram.dtype)
-        maximum_duration = quantized_code.shape[1] * self.repeats
-        initial_state = noise_initialization[:, :maximum_duration].to(quantized_code.device)
+        max_mel_frames = resolve_max_mel_frames(max_mel_frames, default=30000)
+        target_code_len, target_duration = cap_and_align_mel_length(
+            code_len=int(quantized_code.shape[1]),
+            repeats=int(self.repeats),
+            max_mel_frames=max_mel_frames,
+        )
+        if int(quantized_code.shape[1]) != target_code_len:
+            quantized_code = quantized_code[:, :target_code_len]
+
+        initial_state = torch.randn(
+            [1, target_duration, self.mel_dim],
+            dtype=reference_mel_spectrogram.dtype,
+            device=quantized_code.device,
+        )
         batch_size = reference_mel_spectrogram.shape[0]
-        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(1, maximum_duration, 1)
+        conditioning_vector = conditioning_vector.unsqueeze(1).repeat(1, target_duration, 1)
 
         if batch_size != 1:
             raise ValueError("Only batch size = 1 is currently supported")
@@ -1281,6 +1294,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                     time_step=time_step,
                     drop_audio_conditioning=False,
                     drop_code=False,
+                    apply_cfg=False,
                 )
                 return prediction
 
@@ -1461,6 +1475,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         num_steps=10,
         guidance_scale=0.5,
         sway_coefficient=-1.0,
+        max_mel_frames: int | None = None,
         **kwargs,
     ):
         """Generates a waveform from input code and conditioning parameters."""
@@ -1472,6 +1487,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             sway_coefficient=sway_coefficient,
+            max_mel_frames=max_mel_frames,
         ).to(self.code2wav_bigvgan_model.dtype)
 
         waveform = self.code2wav_bigvgan_model(mel_spectrogram).to(self.dtype)

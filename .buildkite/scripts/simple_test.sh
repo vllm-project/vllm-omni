@@ -51,3 +51,4 @@ VENV_PYTHON="${VENV_DIR}/bin/python"
 "${UV_BIN}" pip install --python "${VENV_PYTHON}" -e ".[dev]"
 "${VENV_PYTHON}" -m pytest -v -s tests/entrypoints/
 "${VENV_PYTHON}" -m pytest -v -s tests/diffusion/cache/
+"${VENV_PYTHON}" -m pytest -v -s tests/model_executor/models/qwen2_5_omni/test_audio_length.py
