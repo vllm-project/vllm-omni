@@ -82,10 +82,10 @@ class OmniServeCommand(CLISubcommand):
             help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
         )
         serve_parser.add_argument(
-            "--init-sleep-seconds",
+            "--stage-init-timeout",
             type=int,
-            default=30,
-            help="The number of seconds to sleep before initializing the stages.",
+            default=300,
+            help="The timeout for initializing a single stage in seconds (default: 300)",
         )
         serve_parser.add_argument(
             "--init-timeout",
@@ -145,6 +145,14 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Ulysses Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ulysses_degree.",
+        )
+        serve_parser.add_argument(
+            "--ring",
+            dest="ring_degree",
+            type=int,
+            default=None,
+            help="Ring Sequence Parallelism degree for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
 
         # Cache optimization parameters

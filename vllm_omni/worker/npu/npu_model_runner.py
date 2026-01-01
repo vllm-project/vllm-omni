@@ -67,6 +67,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         if supports_mrope(self.model):
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
+                mm_features=req_state.mm_features,
                 hf_config=self.model_config.hf_config,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,

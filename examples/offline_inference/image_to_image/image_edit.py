@@ -63,6 +63,7 @@ from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 
@@ -158,7 +159,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
-
+    parser.add_argument(
+        "--ring_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
     parser.add_argument("--layers", type=int, default=4, help="Number of layers to decompose the input image into.")
     parser.add_argument(
         "--resolution",
@@ -267,8 +273,7 @@ def main():
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
-
-    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree)
+    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     # Configure cache based on backend type
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -314,7 +319,7 @@ def main():
             print(f"    Image {idx + 1} size: {img.size}")
     else:
         print(f"  Input image size: {input_image.size}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
     print(f"{'=' * 60}\n")
 
     try:
@@ -340,21 +345,23 @@ def main():
         # Print profiling results
         print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
+        # omni.generate() returns Generator[OmniRequestOutput, None, None], convert to list
+        outputs = list(outputs)
         if not outputs:
             raise ValueError("No output generated from omni.generate()")
         logger.info("Outputs: %s", outputs)
 
         # Extract images from OmniRequestOutput
-        # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0]['images']
+        # omni.generate() returns Generator[OmniRequestOutput, None, None], extract images from request_output[0].images
         first_output = outputs[0]
         if not hasattr(first_output, "request_output") or not first_output.request_output:
             raise ValueError("No request_output found in OmniRequestOutput")
 
         req_out = first_output.request_output[0]
-        if not isinstance(req_out, dict) or "images" not in req_out:
+        if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
             raise ValueError("Invalid request_output structure or missing 'images' key")
 
-        images = req_out["images"]
+        images = req_out.images
         if not images:
             raise ValueError("No images found in request_output")
 

@@ -113,7 +113,8 @@ plugins:
           - https://docs.aiohttp.org/en/stable/objects.inv
           - https://pillow.readthedocs.io/en/stable/objects.inv
           - https://numpy.org/doc/stable/objects.inv
-          - https://pytorch.org/docs/stable/objects.inv
+          # Temporarily disabled due to decompression errors
+          # - https://pytorch.org/docs/stable/objects.inv
           - https://psutil.readthedocs.io/en/stable/objects.inv
 
 markdown_extensions:

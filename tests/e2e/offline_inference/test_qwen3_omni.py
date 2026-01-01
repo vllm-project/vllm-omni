@@ -27,7 +27,7 @@ test_params = [(model, stage_config) for model in models for stage_config in sta
 def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
     """Test processing video, generating audio output."""
     model, stage_config_path = test_config
-    with omni_runner(model, seed=42, stage_configs_path=stage_config_path, init_sleep_seconds=90) as runner:
+    with omni_runner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
         # Prepare inputs
         question = "Describe the video briefly."
         video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
@@ -37,16 +37,16 @@ def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
             videos=video,
         )
 
-        # Verify we got outputs from multiple stages
-        assert len(outputs) > 0
-
         # Find and verify text output (thinker stage)
         text_output = None
+        output_count = 0
         for stage_output in outputs:
             if stage_output.final_output_type == "text":
                 text_output = stage_output
+                output_count += 1
                 break
 
+        assert output_count > 0
         assert text_output is not None
         assert len(text_output.request_output) > 0
         text_content = text_output.request_output[0].outputs[0].text
@@ -55,11 +55,14 @@ def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
 
         # Find and verify audio output (code2wav stage)
         audio_output = None
+        output_count = 0
         for stage_output in outputs:
             if stage_output.final_output_type == "audio":
                 audio_output = stage_output
+                output_count += 1
                 break
 
+        assert output_count > 0
         assert audio_output is not None
         assert len(audio_output.request_output) > 0
 

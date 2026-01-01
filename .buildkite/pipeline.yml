@@ -71,6 +71,7 @@ steps:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
+          shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
@@ -96,11 +97,11 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test with H100"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 30
     depends_on: image-build
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py
+      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_async_omni.py
     agents:
       queue: "mithril-h100-pool"
     plugins:

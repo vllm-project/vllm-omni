@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -9,6 +10,15 @@ from typing import Any
 from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
+
+
+class OmniStageTaskType(enum.Enum):
+    GENERATE = "generate"
+    ABORT = "abort"
+    SHUTDOWN = "shutdown"
+
+
+SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
 
 
 def set_stage_devices(

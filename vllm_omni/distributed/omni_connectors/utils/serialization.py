@@ -22,6 +22,11 @@ _REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "o
 # Keys that identify a CompletionOutput dict (for reconstruction)
 _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reason"})
 
+# Keys that identify an OmniRequestOutput dict (for reconstruction)
+# OmniRequestOutput has 'final_output_type' which is unique, or can be identified by
+# having 'finished' and ('images' or 'final_output_type')
+_OMNI_REQUEST_OUTPUT_KEYS = frozenset({"finished", "final_output_type"})
+
 
 class OmniMsgpackEncoder:
     """
@@ -173,7 +178,7 @@ class OmniMsgpackDecoder:
         return self._post_process(result)
 
     def _post_process(self, obj: Any) -> Any:
-        """Recursively restore tensor/ndarray/image/RequestOutput from their dict representations."""
+        """Recursively restore tensor/ndarray/image/RequestOutput/OmniRequestOutput from their dict representations."""
         if isinstance(obj, dict):
             # Check for type markers first
             if obj.get(_TENSOR_MARKER):
@@ -185,6 +190,11 @@ class OmniMsgpackDecoder:
 
             # Process values recursively first
             processed = {k: self._post_process(v) for k, v in obj.items()}
+
+            # Check if this looks like an OmniRequestOutput (check before RequestOutput
+            # since OmniRequestOutput may also have some RequestOutput-like fields)
+            if self._is_omni_request_output(processed):
+                return self._decode_omni_request_output(processed)
 
             # Check if this looks like a RequestOutput
             if _REQUEST_OUTPUT_KEYS.issubset(processed.keys()):
@@ -203,6 +213,48 @@ class OmniMsgpackDecoder:
             return tuple(self._post_process(item) for item in obj)
 
         return obj
+
+    def _is_omni_request_output(self, obj: dict[str, Any]) -> bool:
+        """Check if a dict looks like an OmniRequestOutput.
+
+        OmniRequestOutput can be identified by:
+        - Having 'finished' and 'final_output_type' fields (unique to OmniRequestOutput)
+        - OR having 'finished' and 'images' fields (diffusion mode)
+        """
+        # Must have 'finished' field
+        if "finished" not in obj:
+            return False
+
+        # Check for unique identifier: 'final_output_type'
+        if "final_output_type" in obj:
+            return True
+
+        # Alternative: check for 'images' field (diffusion mode)
+        if "images" in obj:
+            return True
+
+        return False
+
+    def _decode_omni_request_output(self, obj: dict[str, Any]) -> Any:
+        """Decode dict to OmniRequestOutput.
+
+        OmniRequestOutput is a dataclass, so we can use msgspec.convert
+        or construct it directly.
+        """
+        from vllm_omni.outputs import OmniRequestOutput
+
+        try:
+            # Use msgspec.convert for dataclass reconstruction
+            return msgspec.convert(obj, OmniRequestOutput)
+        except Exception:
+            try:
+                # Fallback: construct directly if msgspec.convert fails
+                # (e.g., if some fields are missing or have wrong types)
+                return OmniRequestOutput(**obj)
+            except Exception:
+                # If both attempts fail, return dict as-is (defensive fallback)
+                # This should rarely happen if _is_omni_request_output is correct
+                return obj
 
     def _decode_tensor(self, obj: dict[str, Any]) -> torch.Tensor:
         """Decode dict to torch.Tensor."""
