@@ -260,7 +260,7 @@ class OmniBase:
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
 
-        for stage_id, stage in enumerate(self.stage_list):
+        for stage_id, stage in enumerate[OmniStage](self.stage_list):
             in_q = self._queue_cls()
             out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
@@ -290,48 +290,49 @@ class OmniBase:
         logger.info(f"[{self._name}] Stage-{stage_id} reported ready")
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        """Wait for all stages to report readiness."""
-        deadline = time.time() + max(0, int(timeout))
+        """Wait for all stages to report readiness with optimized polling."""
         num_stages = len(self.stage_list)
+        deadline = time.time() + max(0, int(timeout))
+
+        logger.info(f"[{self._name}] Waiting for {num_stages} stages to initialize (timeout: {timeout}s)")
+
         while len(self._stages_ready) < num_stages and time.time() < deadline:
             progressed = False
             for stage_id, stage in enumerate(self.stage_list):
                 if stage_id in self._stages_ready:
                     continue
-                result = stage.try_collect()
-                if result is None:
-                    continue
-                progressed = True
-                if result.get("type") == "stage_ready":
-                    self._process_stage_ready(stage, stage_id, result)
+
+                # Check if the stage has reported status
+                if result := stage.try_collect():
+                    progressed = True
+                    if result.get("type") == "stage_ready":
+                        self._process_stage_ready(stage, stage_id, result)
+
             if not progressed:
-                time.sleep(0.01)
-        if len(self._stages_ready) < num_stages:
-            not_ready = sorted(set(range(num_stages)) - set(self._stages_ready))
-            logger.warning(
-                f"[{self._name}] Initialization timeout: only {len(self._stages_ready)}/{num_stages}"
-                f" stages are ready; not ready: {not_ready}.",
-            )
-            # Provide actionable suggestions before shutdown
-            try:
-                suggestions = "".join(
-                    [
-                        "Verify GPU/device assignment in config (runtime.devices) is correct.",
-                        "Check GPU/host memory availability; reduce model or batch size if needed.",
-                        "Check model weights path and network reachability (if loading remotely).",
-                        "Increase initialization wait time (stage_init_timeout or call-site timeout).",
-                    ]
-                )
-                logger.error(
-                    f"[{self._name}] Stage initialization failed, shutting down. Suggestions:\n- {suggestions}",
-                )
-            except Exception:
-                # Best-effort logging of suggestions
-                logger.error(
-                    f"[{self._name}] Stage initialization failed and an error occurred while logging suggestions",
-                )
-        elif len(self._stages_ready) == num_stages:
+                time.sleep(0.05)
+
+        # Handle Final State
+        if len(self._stages_ready) == num_stages:
             logger.info(f"[{self._name}] All stages initialized successfully")
+            return
+
+        # Handle Timeout/Failure
+        not_ready = sorted(set(range(num_stages)) - set(self._stages_ready))
+        logger.warning(
+            f"[{self._name}] Initialization timeout: {len(self._stages_ready)}/{num_stages} "
+            f"stages ready. Missing stages: {not_ready}"
+        )
+
+        suggestions = [
+            "Verify GPU/device assignment in config (runtime.devices) is correct.",
+            "Check GPU/host memory availability; reduce model or batch size if needed.",
+            "Check model weights path and network reachability (if loading remotely).",
+            "Increase initialization wait time (stage_init_timeout or call-site timeout).",
+        ]
+
+        formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
+
+        logger.error(f"[{self._name}] Stage initialization failed. Troubleshooting Steps:\n{formatted_suggestions}")
 
     def close(self) -> None:
         """Close all stage processes and clean up resources."""
