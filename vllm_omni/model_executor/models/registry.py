@@ -48,6 +48,16 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "HyperCLOVAXSeedOmniForConditionalGeneration": (
+        "hyperclovax_seed_omni",
+        "hyperclovax_seed_omni",
+        "HyperCLOVAXSeedOmniForConditionalGeneration",
+    ),
+    "HyperCLOVAXSeedOmniThinkerForConditionalGeneration": (
+        "hyperclovax_seed_omni",
+        "hyperclovax_seed_omni_thinker",
+        "HyperCLOVAXSeedOmniThinkerForConditionalGeneration",
+    ),
 }
 
 _VLLM_OMNI_MODELS = {

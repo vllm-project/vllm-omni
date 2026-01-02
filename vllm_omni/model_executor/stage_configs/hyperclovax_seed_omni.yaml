@@ -1,0 +1,61 @@
+# Stage config for HyperCLOVAX-SEED-Omni-8B
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: HyperCLOVAXSeedOmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      max_tokens: 2048
+      detokenize: True
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0" 
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      model_arch: HyperCLOVAXSeedOmniForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.15
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: audio
+    engine_input_source: [0]
+    # Input processor to convert Thinker output (tokens) to Code2Wav input
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2code2wav
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
