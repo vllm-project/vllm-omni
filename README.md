@@ -10,7 +10,8 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 <p align="center">
 | <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+<[3,5],[2,4],[1,6],/p>
+
 
 ---
 
