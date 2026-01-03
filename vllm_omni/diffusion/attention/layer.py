@@ -46,6 +46,7 @@ class Attention(nn.Module):
             causal=causal,
             num_kv_heads=num_kv_heads,
         )
+        self.backend_pref = None
 
         self.softmax_scale = softmax_scale
         self.scatter_idx = scatter_idx
@@ -59,6 +60,7 @@ class Attention(nn.Module):
 
         try:
             config = get_current_omni_diffusion_config()
+            self.backend_pref = config.attention_backend
             if config.parallel_config.ring_degree > 1:
                 self.use_ring = True
                 try:
@@ -103,19 +105,12 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
-        # Check backend preference from config
-        try:
-            config = get_current_omni_diffusion_config()
-            backend_pref = config.attention_backend
-        except Exception:
-            backend_pref = None
-
-        if backend_pref == "flash_attn" and query.dtype == torch.float32:
+        if self.backend_pref == "flash_attn" and query.dtype == torch.float32:
             logger.warning(
                 "Flash Attention does not support float32. Overriding user config "
-                f"attention_backend='{backend_pref}' to 'sdpa' for dtype={query.dtype}."
+                f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
             )
-            backend_pref = "sdpa"
+            self.backend_pref = "sdpa"
 
         if is_npu():
             return self.attention(
