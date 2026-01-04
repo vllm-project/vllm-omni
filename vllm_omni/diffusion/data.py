@@ -500,7 +500,7 @@ def get_cached_compilation_config():
 
 def get_current_omni_diffusion_config() -> OmniDiffusionConfig:
     if _current_omni_diffusion_config is None:
-        logger.warning("Current OmniDiffusionConfig is not set.")
+        logger.warning_once("Current OmniDiffusionConfig is not set.")
         return OmniDiffusionConfig()
     return _current_omni_diffusion_config
 

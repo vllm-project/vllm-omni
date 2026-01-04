@@ -120,7 +120,7 @@ class RingParallelAttention:
         if query.dtype == torch.float32 or not HAS_FLASH_ATTN:
             if not HAS_FLASH_ATTN and backend_pref != "sdpa":
                 logger = init_logger(__name__)
-                logger.warning("Flash Attention is not available! Force enabling SDPA.")
+                logger.warning_once("Flash Attention is not available! Force enabling SDPA.")
             backend_pref = "sdpa"
 
         # Extract joint tensors
