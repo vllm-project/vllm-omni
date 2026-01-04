@@ -192,6 +192,8 @@ class UlyssesParallelAttention:
             # 2. Process Joint part: AllGather on Heads
             # Input: (B, JointLen, H/P, D). Output: (B, JointLen, H, D).
             # AllGather along dim 2.
+            # Ensure tensor is contiguous for all_gather (slicing may create non-contiguous views)
+            output_joint = output_joint.contiguous()
             gathered_joint = [torch.zeros_like(output_joint) for _ in range(dist.get_world_size(ctx.ulysses_pg))]
             dist.all_gather(gathered_joint, output_joint, group=ctx.ulysses_pg)
             output_joint = torch.cat(gathered_joint, dim=2)
