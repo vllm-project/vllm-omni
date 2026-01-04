@@ -1,9 +1,11 @@
 # Qwen3-Omni
 
-## Run examples (Qwen3-Omni)
+## Setup
+Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+
+## Run examples
 
 ### Multiple Prompts
-Download dataset from [seed_tts](https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP/edit). For processing dataset please refer to [Qwen2.5-Omni README.md](../qwen2_5_omni/README.md)
 Get into the example folder
 ```bash
 cd examples/offline_inference/qwen3_omni
