@@ -19,6 +19,7 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
+from vllm_omni.diffusion.config.batching import DiTBatchingConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -53,6 +54,7 @@ class AsyncOmniDiffusion:
         self,
         model: str,
         od_config: OmniDiffusionConfig | None = None,
+        batching_config: DiTBatchingConfig | None = None,
         **kwargs: Any,
     ):
         self.model = model
@@ -65,6 +67,21 @@ class AsyncOmniDiffusion:
 
         self.od_config = od_config
 
+        # Handle batching configuration
+        if batching_config is None:
+            # Check if batching config is in kwargs
+            batching_kwargs = {}
+            for key in list(kwargs.keys()):
+                if key.startswith('batching_') or key in ['enable_batching', 'max_batch_size', 'min_batch_size']:
+                    batching_kwargs[key] = kwargs.pop(key)
+
+            if batching_kwargs:
+                batching_config = DiTBatchingConfig.from_dict(batching_kwargs)
+            else:
+                batching_config = DiTBatchingConfig(enable_batching=False)  # Default to disabled
+
+        self.batching_config = batching_config
+
         # Load model class name and transformer config
         config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
         od_config.model_class_name = config_dict.get("_class_name", None)
@@ -73,14 +90,15 @@ class AsyncOmniDiffusion:
         tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
         od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
 
-        # Initialize engine
-        self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+        # Initialize engine with batching support
+        self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config, batching_config)
 
         # Thread pool for running sync engine in async context
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
 
-        logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+        batching_status = "enabled" if batching_config.enable_batching else "disabled"
+        logger.info("AsyncOmniDiffusion initialized with model: %s (batching: %s)", model, batching_status)
 
     def _prepare_request(
         self,
@@ -169,12 +187,12 @@ class AsyncOmniDiffusion:
 
         logger.debug("Starting generation for request %s", request_id)
 
-        # Run engine in thread pool
+        # Run engine in thread pool (use step_sync for batching compatibility)
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
                 self._executor,
-                self.engine.step,
+                self.engine.step_sync,
                 [request],
             )
         except Exception as e:
@@ -272,3 +290,69 @@ class AsyncOmniDiffusion:
     def is_stopped(self) -> bool:
         """Check if the engine is stopped."""
         return self._closed
+
+    def is_batching_enabled(self) -> bool:
+        """Check if batching is enabled."""
+        return self.engine.is_batching_enabled()
+
+    def get_batching_stats(self) -> dict[str, Any] | None:
+        """Get batching performance statistics."""
+        return self.engine.get_batching_stats()
+
+    async def generate_batch(
+        self,
+        prompts: list[str],
+        request_ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OmniRequestOutput]:
+        """Generate images for multiple prompts in batch.
+
+        Args:
+            prompts: List of text prompts for image generation
+            request_ids: Optional list of unique identifiers for the requests
+            **kwargs: Additional generation parameters applied to all prompts
+
+        Returns:
+            List of OmniRequestOutput containing generated images
+        """
+        if request_ids is None:
+            request_ids = [f"diff-{uuid.uuid4().hex[:16]}" for _ in range(len(prompts))]
+
+        if len(request_ids) != len(prompts):
+            raise ValueError("request_ids must have same length as prompts")
+
+        # Prepare requests
+        requests = []
+        for prompt, request_id in zip(prompts, request_ids):
+            request_kwargs = {
+                "prompt": prompt,
+                "request_id": request_id,
+                **kwargs,
+            }
+            request = self._prepare_request(**request_kwargs)
+            requests.append(request)
+
+        logger.debug("Starting batch generation for %d requests", len(requests))
+
+        # Run engine in thread pool
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                self._executor,
+                self.engine.step_sync,
+                requests,
+            )
+        except Exception as e:
+            logger.error("Batch generation failed: %s", e)
+            raise RuntimeError(f"Diffusion batch generation failed: {e}") from e
+
+        # Ensure result is a list
+        if not isinstance(result, list):
+            result = [result] if result is not None else []
+
+        # Update request_ids if needed
+        for i, output in enumerate(result):
+            if isinstance(output, OmniRequestOutput) and not output.request_id:
+                output.request_id = request_ids[i]
+
+        return result

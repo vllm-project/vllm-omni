@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import multiprocessing as mp
 import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, List
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.config.batching import DiTBatchingConfig
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import get_diffusion_post_process_func, get_diffusion_pre_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler, scheduler
+from vllm_omni.diffusion.scheduler.dit_batching_scheduler import DiTBatchingScheduler, BatchingConfig
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
@@ -56,13 +59,33 @@ class BackgroundResources:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(self, od_config: OmniDiffusionConfig, batching_config: Optional[DiTBatchingConfig] = None):
         """Initialize the diffusion engine.
 
         Args:
-            config: The configuration for the diffusion engine.
+            od_config: The configuration for the diffusion engine.
+            batching_config: Optional batching configuration. If None, batching is disabled.
         """
         self.od_config = od_config
+
+        # Initialize batching configuration
+        self.batching_config = batching_config or DiTBatchingConfig(enable_batching=False)
+        self.batching_enabled = self.batching_config.enable_batching
+
+        # Initialize batching scheduler if enabled
+        self.batching_scheduler: Optional[DiTBatchingScheduler] = None
+        if self.batching_enabled:
+            batch_config = BatchingConfig(
+                max_batch_size=self.batching_config.max_batch_size,
+                min_batch_size=self.batching_config.min_batch_size,
+                max_wait_time_ms=self.batching_config.max_wait_time_ms,
+                max_memory_mb=self.batching_config.max_memory_mb,
+                enable_priority_queuing=self.batching_config.enable_priority_queuing,
+                enable_starvation_prevention=self.batching_config.enable_starvation_prevention,
+                batch_timeout_strategy=self.batching_config.batch_timeout_strategy,
+            )
+            self.batching_scheduler = DiTBatchingScheduler(batch_config)
+            logger.info("DiT batching scheduler initialized")
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
@@ -72,6 +95,14 @@ class DiffusionEngine:
         self._make_client()
 
     def step(self, requests: list[OmniDiffusionRequest]):
+        """Process diffusion requests with optional batching."""
+        if self.batching_enabled and self.batching_scheduler:
+            return self._step_with_batching(requests)
+        else:
+            return self._step_without_batching(requests)
+
+    def _step_without_batching(self, requests: list[OmniDiffusionRequest]):
+        """Process requests without batching (original behavior)."""
         try:
             # Apply pre-processing if available
             if self.pre_process_func is not None:
@@ -169,17 +200,92 @@ class DiffusionEngine:
             logger.error(f"Generation failed: {e}")
             return None
 
+    async def _step_with_batching(self, requests: list[OmniDiffusionRequest]):
+        """Process requests with batching enabled."""
+        if not self.batching_scheduler:
+            raise RuntimeError("Batching scheduler not initialized")
+
+        try:
+            # Apply pre-processing if available
+            if self.pre_process_func is not None:
+                preprocess_start_time = time.time()
+                requests = self.pre_process_func(requests)
+                preprocess_time = time.time() - preprocess_start_time
+                logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+
+            # Add requests to batching scheduler
+            request_ids = []
+            for request in requests:
+                request_id = await self.batching_scheduler.add_request(request)
+                request_ids.append(request_id)
+
+            # Process batches until all requests are completed
+            completed_outputs = []
+            while len(completed_outputs) < len(requests):
+                # Get next batch to process
+                batch = await self.batching_scheduler.get_next_batch()
+                if batch is None:
+                    # No batch ready, wait a bit
+                    await asyncio.sleep(0.01)
+                    continue
+
+                # Process the batch
+                logger.info(f"Processing batch of {len(batch)} requests")
+                output = self.add_req_and_wait_for_response(batch)
+                if output.error:
+                    raise Exception(f"Batch processing failed: {output.error}")
+
+                # Process completed batch output
+                batch_outputs = await self.batching_scheduler.process_completed_batch(batch, output)
+                completed_outputs.extend(batch_outputs)
+
+            # Post-process all outputs
+            if self.post_process_func is not None:
+                postprocess_start_time = time.time()
+                for output in completed_outputs:
+                    if output.images:
+                        output.images = self.post_process_func(output.images)
+                postprocess_time = time.time() - postprocess_start_time
+                logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+            logger.info("Batched generation completed successfully.")
+            return completed_outputs
+
+        except Exception as e:
+            logger.error(f"Batched generation failed: {e}")
+            return None
+
+    def step_sync(self, requests: list[OmniDiffusionRequest]):
+        """Synchronous wrapper for step method."""
+        if self.batching_enabled:
+            # For batching, we need to run in an event loop
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If there's already a running loop, we need to handle this differently
+                    # For now, fall back to non-batching mode
+                    logger.warning("Cannot use batching in already running event loop, falling back to non-batching")
+                    return self._step_without_batching(requests)
+                else:
+                    return loop.run_until_complete(self._step_with_batching(requests))
+            except RuntimeError:
+                # No event loop, create one
+                return asyncio.run(self._step_with_batching(requests))
+        else:
+            return self._step_without_batching(requests)
+
     @staticmethod
-    def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
+    def make_engine(config: OmniDiffusionConfig, batching_config: Optional[DiTBatchingConfig] = None) -> "DiffusionEngine":
         """Factory method to create a DiffusionEngine instance.
 
         Args:
             config: The configuration for the diffusion engine.
+            batching_config: Optional batching configuration. If None, batching is disabled.
 
         Returns:
             An instance of DiffusionEngine.
         """
-        return DiffusionEngine(config)
+        return DiffusionEngine(config, batching_config)
 
     def _make_client(self):
         # TODO rename it
@@ -360,4 +466,21 @@ class DiffusionEngine:
         self.add_req_and_wait_for_response([req])
 
     def close(self) -> None:
+        """Close the diffusion engine and clean up resources."""
+        # Clean up batching scheduler
+        if self.batching_scheduler:
+            logger.info("Shutting down DiT batching scheduler")
+            # Reset stats and cleanup
+            self.batching_scheduler.reset_stats()
+
         self._finalizer()
+
+    def get_batching_stats(self) -> Optional[Dict[str, Any]]:
+        """Get batching performance statistics."""
+        if self.batching_scheduler:
+            return self.batching_scheduler.get_stats()
+        return None
+
+    def is_batching_enabled(self) -> bool:
+        """Check if batching is enabled."""
+        return self.batching_enabled
