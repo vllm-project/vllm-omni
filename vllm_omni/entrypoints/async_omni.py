@@ -392,7 +392,6 @@ class AsyncOmni(OmniBase):
                                 metrics.on_finalize_request(
                                     stage_id,
                                     req_id,
-                                    [engine_outputs],
                                     _req_start_ts.get(req_id, _wall_start_ts),
                                 )
                         except Exception as e:
