@@ -44,30 +44,16 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
-    "WanImageToVideoPipeline": (
-        "wan2_2",
-        "pipeline_wan2_2_i2v",
-        "Wan22I2VPipeline",
-    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
         "LongCatImagePipeline",
     ),
-    "BagelPipeline": (
-        "bagel",
-        "pipeline_bagel",
-        "BagelPipeline",
-    ),
-    "LongCatImageEditPipeline": (
-        "longcat_image",
-        "pipeline_longcat_image_edit",
-        "LongcatImageEditPipeline",
-    ),
-    "StableDiffusion3Pipeline": (
-        "sd3",
-        "pipeline_sd3",
-        "StableDiffusion3Pipeline",
+    #UltraFlux
+    "FluxPipeline": (
+        "ultraflux-v1_image",
+        "pipeline_ultraflux",
+        "UltraFluxPipeline",
     ),
 }
 
@@ -87,6 +73,7 @@ def initialize_model(
     od_config: OmniDiffusionConfig,
 ):
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    print("DEBUG model_class_name =", od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
         # Configure VAE memory optimization settings from config
@@ -109,11 +96,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
-    "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
-    "BagelPipeline": "get_bagel_post_process_func",
-    "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
-    "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -122,10 +105,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
-    "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
-    "WanPipeline": "get_wan22_pre_process_func",
-    "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
 }
 
 
