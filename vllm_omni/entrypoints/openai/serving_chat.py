@@ -1926,7 +1926,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         lora_int_id = (
                             lora_body.get("int_id")
                             or lora_body.get("lora_int_id")
-                            or abs(hash((lora_name or \"\") + (lora_path or \"\"))) % (2**30)
+                            or abs(hash((lora_name or "") + (lora_path or ""))) % (2**30)
                         )
                         if lora_name and lora_path:
                             lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))

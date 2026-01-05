@@ -20,8 +20,8 @@ from __future__ import annotations
 import os
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 import torch
 from safetensors.torch import load_file
@@ -35,8 +35,8 @@ logger = init_logger(__name__)
 class _PatchedModule:
     module: torch.nn.Module
     orig_forward: torch.nn.Module
-    lora_A: torch.nn.Parameter
-    lora_B: torch.nn.Parameter
+    lora_a: torch.nn.Parameter
+    lora_b: torch.nn.Parameter
     scaling: float
 
 
@@ -68,7 +68,7 @@ class DiffusionLoRAManager:
         dtype: torch.dtype,
         max_vram_gb: float = 4.0,
         max_cpu_gb: float = 8.0,
-        allowed_dirs: Optional[list[str]] = None,
+        allowed_dirs: list[str] | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.device = device
@@ -79,7 +79,7 @@ class DiffusionLoRAManager:
         self.cache: OrderedDict[str, _AdapterHandle] = OrderedDict()
 
     # Public API -----------------------------------------------------
-    def set_active_adapter(self, lora_req: Optional[LoRARequest]) -> None:
+    def set_active_adapter(self, lora_req: LoRARequest | None) -> None:
         if lora_req is None:
             return
         name, path, scale = self._normalize_request(lora_req)
@@ -92,7 +92,7 @@ class DiffusionLoRAManager:
         self._activate(handle)
 
     # Internal helpers ----------------------------------------------
-    def _normalize_request(self, lora_req: LoRARequest) -> tuple[str, Optional[str], float]:
+    def _normalize_request(self, lora_req: LoRARequest) -> tuple[str, str | None, float]:
         name = _get_attr(lora_req, ["name", "lora_name", "adapter_name", "lora_nickname"], None)
         int_id = _get_attr(lora_req, ["lora_int_id", "int_id"], None)
         if name is None and int_id is not None:
@@ -108,7 +108,7 @@ class DiffusionLoRAManager:
                     return name or "unnamed", None, scale
         return name or "unnamed", path, scale
 
-    def _ensure_loaded(self, name: str, path: str, scale: float) -> Optional[_AdapterHandle]:
+    def _ensure_loaded(self, name: str, path: str, scale: float) -> _AdapterHandle | None:
         # Hit
         if name in self.cache:
             handle = self.cache.pop(name)
@@ -215,8 +215,8 @@ class DiffusionLoRAManager:
             _PatchedModule(
                 module=module,
                 orig_forward=orig_forward,
-                lora_A=module._omni_lora_down,
-                lora_B=module._omni_lora_up,
+                lora_a=module._omni_lora_down,
+                lora_b=module._omni_lora_up,
                 scaling=base_scaling,
             )
         )
