@@ -31,8 +31,11 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import retrieve_latents
-from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    create_transformer_from_config,
+    load_transformer_config,
+    retrieve_latents,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 
@@ -149,7 +152,9 @@ class Wan22TI2VPipeline(nn.Module):
         ).to(self.device)
 
         # Single transformer (TI2V uses dense 5B model, not MoE)
-        self.transformer = WanTransformer3DModel()
+        # Load config from model to get correct dimensions
+        transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        self.transformer = create_transformer_from_config(transformer_config)
 
         # Scheduler
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
