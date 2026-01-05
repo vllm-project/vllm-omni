@@ -1,3 +1,7 @@
+---
+toc_depth: 4
+---
+
 # Diffusion Module Architecture Design
 
 The vLLM-Omni diffusion module (`vllm_omni/diffusion`) is a high-performance inference engine for diffusion models, designed with a modular architecture that separates concerns across multiple components. It provides efficient execution for non-autoregressive generation tasks such as image and video generation.
@@ -5,7 +9,7 @@ The vLLM-Omni diffusion module (`vllm_omni/diffusion`) is a high-performance inf
 This document describes the architecture design of the diffusion module, including the diffusion engine, scheduler, worker, diffusion pipeline, and acceleration components.
 
 <p align="center">
-   <img src="https://github.com/user-attachments/assets/cde1ebea-4006-4d30-8283-15a5721a09d2" alt="vLLM-Omni Diffusion Module Components" width="60%">
+   <img src="https://github.com/user-attachments/assets/cde1ebea-4006-4d30-8283-15a5721a09d2" alt="vLLM-Omni Diffusion Module Components" width="80%">
 </p>
 <p align="center">
   <em> Main Components of the Diffusion Module </em>
@@ -20,10 +24,10 @@ This document describes the architecture design of the diffusion module, includi
 - [Worker](#3-worker)
 - [Diffusion Pipeline](#4-diffusion-pipeline)
 - [Acceleration Components](#5-acceleration-components)
-   - [Attention Backends](#51-attention-backends)
-   - [Parallel Attention](#52-parallel-attention)
-   - [Cache Backends](#53-cache-backends)
-   - [Parallel Strategies](#54-parallel-strategies)
+    - [Attention Backends](#51-attention-backends)
+    - [Parallel Attention](#52-parallel-attention)
+    - [Cache Backends](#53-cache-backends)
+    - [Parallel Strategies](#54-parallel-strategies)
 - [Data Flow](#6-data-flow)
 
 ---
@@ -65,8 +69,11 @@ class DiffusionEngine:
 ```
 
 **Key Features**:
+
 - **Pre/Post Processing**: Registers model-specific pre-processing and post-processing functions via registry pattern
+
 - **Worker Management**: Launches and manages multiple worker processes (one per GPU)
+
 - **Process Isolation**: Uses multiprocessing for true parallelism
 
 #### 1.2 Worker Launch Process
@@ -86,8 +93,11 @@ def _launch_workers(self, broadcast_handle):
 ```
 
 **Design Decisions**:
+
 - **Spawn Method**: Ensures clean state for each worker (no shared memory issues)
+
 - **Pipe Communication**: Uses `mp.Pipe` for initialization handshake
+
 - **Device Selection**: Each worker is assigned a specific GPU (`cuda:{rank}`)
 
 #### 1.3 Request Processing Flow
@@ -106,8 +116,11 @@ def step(self, requests: list[OmniDiffusionRequest]):
 ```
 
 **Flow**:
+
 1. **Pre-processing**: Applies model-specific transformations
+
 2. **Scheduling**: Delegates to scheduler for distribution
+
 3. **Post-processing**: Converts raw outputs to final format (e.g., PIL images)
 
 ---
@@ -139,8 +152,11 @@ class Scheduler:
 ```
 
 **Communication Pattern**:
+
 - **Broadcast Queue**: One-to-many communication (scheduler → all workers)
+
 - **Result Queue**: One-to-one communication (rank 0 → scheduler)
+
 - **Shared Memory**: Uses `MessageQueue` (ZMQ-based) for efficient IPC
 
 #### 2.2 Request Distribution
@@ -156,8 +172,11 @@ def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
 ```
 
 **Design Features**:
+
 - **Broadcast Model**: All workers receive the same request (for tensor parallelism)
+
 - **Single Response**: Only rank 0 sends results back (avoids duplicate outputs)
+
 - **Synchronous**: Blocks until result is received (can be made async)
 
 #### 2.3 Singleton Pattern
@@ -176,8 +195,11 @@ scheduler = Scheduler()
 ```
 
 **Benefits**:
+
 - **Single Point of Control**: Ensures consistent state
+
 - **Easy Access**: Global `scheduler` instance accessible everywhere
+
 - **Resource Management**: Centralized queue management
 
 ---
@@ -212,12 +234,19 @@ class WorkerProc:
 ```
 
 **Initialization Steps**:
+
 1. **IPC Setup**: Creates ZMQ context and message queues
+
 2. **Distributed Environment Setup**: Initializes PyTorch distributed communication
-     - For CUDA GPUs: Uses NCCL (fast GPU communication)
-     - For NPU: Uses HCCL (Huawei Collective Communications Library)
-     - For other devices: Uses appropriate backend (GLOO, MCCL, etc.)
+
+    - For CUDA GPUs: Uses NCCL (fast GPU communication)
+
+    - For NPU: Uses HCCL (Huawei Collective Communications Library)
+
+    - For other devices: Uses appropriate backend (GLOO, MCCL, etc.)
+
 3. **Model Loading**: Loads diffusion pipeline on assigned GPU
+
 4. **Cache Setup**: Enables cache backend if configured.
 
 #### 3.2 GPU Worker
@@ -253,8 +282,11 @@ class GPUWorker:
 ```
 
 **Key Features**:
+
 - **Tensor Parallelism**: Supports multi-GPU tensor parallelism via PyTorch distributed
+
 - **Model Loading**: Uses `DiffusersPipelineLoader` for efficient weight loading
+
 - **Cache Integration**: Enables cache backends (TeaCache, cache-dit, etc.) transparently
 
 #### 3.3 Worker Busy Loop
@@ -283,9 +315,13 @@ def worker_busy_loop(self):
 ```
 
 **Execution Flow**:
+
 1. **Receive**: Dequeues unified messages from shared memory queue
+
 2. **Route**: Handles different message types (generation, RPC, shutdown)
+
 3. **Execute**: Runs forward pass through pipeline for generation requests
+
 4. **Respond**: Sends results back (rank 0 for generation, specified rank for RPC)
 
 #### 3.4 Model Execution
@@ -315,10 +351,14 @@ The model execution leverages multiple parallelism strategies that are transpare
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group, get_dp_group, get_cfg_group, get_pp_group
 )
+```
 
 **Optimizations**:
+
 - **Cache Refresh**: Clears cache state before each generation for clean state
+
 - **Context Management**: Forward context ensures parallel groups are available during execution
+
 - **Single Request**: Currently processes one request at a time (batching TODO)
 
 ---
@@ -327,66 +367,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 
 **Location**: `vllm_omni/diffusion/models/*/pipeline_*.py`
 
-### Architecture
-
 The pipeline is the **model-specific implementation** that orchestrates the diffusion process. Different models (QwenImage, Wan2.2, Z-Image) have their own pipeline implementations.
 
-### Key Components (QwenImage Example)
-
-#### 4.1 Pipeline Structure
-
-```python
-class QwenImagePipeline(nn.Module):
-    def __init__(self, od_config: OmniDiffusionConfig):
-        # Core components
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(...)
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(...)
-        self.vae = AutoencoderKLQwenImage.from_pretrained(...)
-        self.transformer = QwenImageTransformer2DModel(od_config=od_config)
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(...)
-
-        # Cache backend (set by worker)
-        self._cache_backend = None
-```
-
-**Component Responsibilities**:
-- **Text Encoder**: Encodes prompts into embeddings
-- **Transformer**: Main denoising network (DiT-style)
-- **VAE**: Encodes/decodes between pixel and latent space
-- **Scheduler**: Manages timestep scheduling
-
-#### 4.2 Forward Pass
-
-```python
-def forward(self, req: OmniDiffusionRequest, ...) -> DiffusionOutput:
-    # 1. Encode prompts
-    prompt_embeds, prompt_embeds_mask = self.encode_prompt(prompt)
-
-    # 2. Prepare latents
-    latents = self.prepare_latents(batch_size, num_channels, height, width, ...)
-
-    # 3. Prepare timesteps
-    timesteps, num_inference_steps = self.prepare_timesteps(...)
-
-    # 4. Diffusion loop
-    latents = self.diffuse(
-        prompt_embeds, prompt_embeds_mask,
-        negative_prompt_embeds, negative_prompt_embeds_mask,
-        latents, img_shapes, txt_seq_lens,
-        timesteps, do_true_cfg, guidance, true_cfg_scale,
-    )
-
-    # 5. Decode latents
-    image = self.vae.decode(latents)
-
-    return DiffusionOutput(output=image)
-```
-
-The main steps of the forward pass are referred from `diffusers`.
-
-#### 4.3 Diffusion Loop
-
-The multi-step diffusion loop is usually the most time-consuming part during the overall inference process.
+Most pipeline implementation are referred from `diffusers`. The multi-step diffusion loop is usually the most time-consuming part during the overall inference process, which is defined by the `diffuse` function in the pipeline class. An example is as follows:
 
 ```python
 def diffuse(self, ...):
@@ -416,11 +399,14 @@ def diffuse(self, ...):
 ```
 
 **Key Features**:
+
 - **CFG Support**: Handles classifier-free guidance with separate forward passes
+
 - **Cache Branching**: Uses `cache_branch` parameter for cache-aware execution
+
 - **True CFG**: Implements advanced CFG with norm preservation
 
-To learn how to add a new diffusion pipeline, please view [Adding Diffusion Model](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/model/adding_diffusion_model)
+To learn more about the diffusion pipeline and how to add a new diffusion pipeline, please view [Adding Diffusion Model](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/model/adding_diffusion_model)
 
 ---
 
@@ -448,9 +434,13 @@ class Attention(nn.Module):
 ```
 
 **Available Backends**:
+
 - **FlashAttention**: Optimized CUDA kernel (FA2/FA3) - memory efficient via tiling
+
 - **SDPA**: PyTorch's scaled dot-product attention - default, cross-platform
+
 - **SageAttention**: Sparse attention implementation from SageAttention library
+
 - **AscendAttention**: NPU-optimized attention for Ascend hardware
 
 These backends provide the **kernel implementations** for attention computation. For attention-level sequence parallelism strategies (Ring Attention, Ulysses), see [Parallel Attention](#52-parallel-attention).
@@ -470,16 +460,25 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
 ```
 
 **Selection Priority**:
+
 1. **Environment Variable**: `DIFFUSION_ATTENTION_BACKEND` for manual override
-   - Valid values: `FLASH_ATTN`, `TORCH_SDPA`, `SAGE_ATTN`, `ASCEND`
-   - Example: `export DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN`
+
+    - Valid values: `FLASH_ATTN`, `TORCH_SDPA`, `SAGE_ATTN`, `ASCEND`
+
+    - Example: `export DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN`
+
 2. **Automatic Fallback**: Falls back to SDPA if selected backend unavailable
+
 3. **Hardware Detection**: Can select based on device type (NPU, CUDA, etc.)
 
 **Backend Availability**:
+
 - **SDPA**: Always available (PyTorch built-in)
+
 - **FlashAttention**: Requires `flash-attn` package installed
+
 - **SageAttention**: Requires `sage-attention` package (from THU-ML GitHub)
+
 - **AscendAttention**: Only available on Ascend NPU hardware
 
 #### Attention Backend Registry
@@ -563,8 +562,11 @@ Parallel attention strategies implement **Sequence Parallelism (SP) at the atten
 **Key Distinction**: Unlike AttentionBackend (which provides kernel implementations), ParallelAttentionStrategy provides communication patterns for multi-GPU attention parallelism. These strategies implement the `ParallelAttentionStrategy` interface and use AttentionBackend implementations internally.
 
 Both Ring Attention and Ulysses are forms of Sequence Parallelism (SP) that:
+
 - Split the sequence dimension across GPUs
+
 - Contribute to `sequence_parallel_size` (via `ring_degree` and `ulysses_degree`)
+
 - Work at the attention layer level (not model/pipeline level)
 
 #### Ulysses Sequence Parallelism (USP)
@@ -574,7 +576,9 @@ Both Ring Attention and Ulysses are forms of Sequence Parallelism (SP) that:
 USP is a sequence-parallel attention strategy that splits attention computation across multiple GPUs by distributing both the sequence dimension and attention heads. It uses **all-to-all communication** to efficiently parallelize attention for very long sequences. Specifically, it uses **all-to-all** collective operations to redistribute Q/K/V tensors before attention computation and gather results afterward.
 
 Ulysses splits attention computation in two dimensions:
+
 1. **Sequence Dimension**: Splits the sequence length across GPUs
+
 2. **Head Dimension**: Splits attention heads across GPUs
 
 **Configuration**: `ulysses_degree` contributes to `sequence_parallel_size`
@@ -601,9 +605,13 @@ class RingParallelAttention:
 ```
 
 **Integration**:
+
 - Ring Attention is activated when `ring_degree > 1` in parallel config
+
 - It's selected by `build_parallel_attention_strategy()` in the attention layer
+
 - The `Attention` layer routes to `_run_ring_attention()` when Ring is enabled
+
 - Works alongside attention backends: Ring handles communication, backends handle computation
 
 **Configuration**: `ring_degree` contributes to `sequence_parallel_size`
@@ -611,8 +619,11 @@ class RingParallelAttention:
 #### Relationship with AttentionBackend
 
 Parallel attention strategies (Ring, Ulysses) work **on top of** AttentionBackend implementations:
+
 - They use AttentionBackend for the actual attention computation (FlashAttention, SDPA, etc.)
+
 - They handle the multi-GPU communication/parallelization layer
+
 - They implement `ParallelAttentionStrategy` interface (not `AttentionBackend`)
 
 For general parallelism strategies (Data Parallelism, Tensor Parallelism, Pipeline Parallelism), see [Parallel Strategies](#54-parallel-strategies).
@@ -651,8 +662,11 @@ class CacheBackend(ABC):
 ```
 
 **Design Pattern**:
+
 - **Abstract Base Class**: Defines contract for all cache backends
+
 - **Pipeline-based**: Works with pipeline instances (not just transformers)
+
 - **State Management**: Provides refresh mechanism for clean state between generations
 
 #### Available Backends
@@ -686,9 +700,13 @@ class TeaCacheBackend(CacheBackend):
 ```
 
 **TeaCache Features**:
+
 - **Timestep-aware**: Caches based on timestep embedding similarity
+
 - **Adaptive**: Dynamically decides when to reuse cached computations
+
 - **CFG-aware**: Handles positive/negative branches separately
+
 - **Custom Hook System**: Uses a custom forward interception mechanism (via `HookRegistry`) that wraps the module's `forward` method, allowing transparent integration without modifying model code
 
 **2. Cache-DiT Backend**
@@ -710,9 +728,13 @@ class CacheDiTBackend(CacheBackend):
 ```
 
 **Cache-DiT Features**:
+
 - **DBCache**: Dynamic block caching with configurable compute blocks
+
 - **SCM**: Step Computation Masking for additional speedup
+
 - **TaylorSeer**: Advanced calibration for cache accuracy
+
 - **Dual-transformer Support**: Handles models like Wan2.2 with two transformers
 
 #### Cache Backend Selector
@@ -748,9 +770,13 @@ def get_cache_backend(
 ```
 
 **Usage Flow**:
+
 1. **Selection**: `get_cache_backend()` returns appropriate backend instance
+
 2. **Enable**: `backend.enable(pipeline)` called during worker initialization
+
 3. **Refresh**: `backend.refresh(pipeline, num_inference_steps)` called before each generation
+
 4. **Check**: `backend.is_enabled()` verifies cache is active
 
 ### 5.4 Parallel Strategies
@@ -762,23 +788,35 @@ def get_cache_backend(
 The system supports multiple orthogonal parallelism strategies:
 
 **Sequence Parallelism (SP)**
+
 - **Purpose**: Split sequence dimension across GPUs
+
 - **Attention-level SP**: Ring Attention and Ulysses (USP) implement SP at the attention layer level
-  - See [Parallel Attention](#52-parallel-attention) for details
-  - Configuration: `ulysses_degree` × `ring_degree` = `sequence_parallel_size`
+
+    - See [Parallel Attention](#52-parallel-attention) for details
+
+    - Configuration: `ulysses_degree` × `ring_degree` = `sequence_parallel_size`
+
 - **Use Case**: Very long sequences (e.g., high-resolution images)
 
 **Data Parallelism (DP)**
+
 - **Purpose**: Replicate model across GPUs, split batch
+
 - **Use Case**: Batch processing, throughput optimization
 
 **Tensor Parallelism (TP)** (Experimental)
+
 - **Purpose**: Split model weights across GPUs
+
 - **Implementation**: Uses vLLM's tensor parallel groups
+
 - **Use Case**: Large models that don't fit on single GPU
 
 **CFG Parallelism**  (under development)
+
 - **Purpose**: Parallelize Classifier-Free Guidance (positive/negative prompts)
+
 - **Infrastructure**: CFG parallel groups are initialized and available via `get_cfg_group()`
 
 #### Parallel Group Management
