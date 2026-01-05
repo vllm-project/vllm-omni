@@ -12,10 +12,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from math import isqrt
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch import nn
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -89,6 +91,12 @@ class _VaeCfg:
     downsample: int = 8
 
 
+@dataclass
+class _VitCfg:
+    patch_size: int = 14
+    hidden_size: int = 1152
+
+
 def default_ae_params() -> AutoEncoderParams:
     return AutoEncoderParams(
         resolution=256,
@@ -102,6 +110,37 @@ def default_ae_params() -> AutoEncoderParams:
         scale_factor=0.3611,
         shift_factor=0.1159,
     )
+
+
+class SiglipNaViTWrapper(nn.Module):
+    def __init__(self, vision_model):
+        super().__init__()
+        # If input is SiglipVisionModel, unwrap it to get SiglipVisionTransformer
+        if hasattr(vision_model, "vision_model"):
+            self.vision_model = vision_model.vision_model
+        else:
+            self.vision_model = vision_model
+
+        # Configure weights for linear equivalent of patch embedding
+        self.patch_embed_weight = self.vision_model.embeddings.patch_embedding.weight
+        self.patch_embed_bias = self.vision_model.embeddings.patch_embedding.bias
+
+    def forward(self, packed_pixel_values, packed_flattened_position_ids, cu_seqlens, max_seqlen):
+        w = self.patch_embed_weight.view(self.patch_embed_weight.shape[0], -1)
+        x = F.linear(packed_pixel_values, w, self.patch_embed_bias)
+        pos = self.vision_model.embeddings.position_embedding(packed_flattened_position_ids)
+        x = x + pos
+        hidden_states = x.unsqueeze(0)
+        seq_len = x.shape[0]
+        mask = torch.full((1, 1, seq_len, seq_len), torch.finfo(x.dtype).min, device=x.device, dtype=x.dtype)
+        cu_seqlens_list = cu_seqlens.tolist()
+        for i in range(len(cu_seqlens_list) - 1):
+            start = cu_seqlens_list[i]
+            end = cu_seqlens_list[i + 1]
+            mask[..., start:end, start:end] = 0.0
+
+        outputs = self.vision_model.encoder(inputs_embeds=hidden_states, attention_mask=mask)
+        return outputs.last_hidden_state.squeeze(0)
 
 
 class BagelPipeline(nn.Module):
@@ -150,12 +189,26 @@ class BagelPipeline(nn.Module):
             local_files_only=True,
             trust_remote_code=True,
         )
+
+        # Try finding vision_config or interpolate from top-level config
+        vit_cfg_dict = bagel_cfg.get("vit_config") or {}
+        vit_cfg = _VitCfg(
+            patch_size=int(vit_cfg_dict.get("patch_size", 14)),
+            hidden_size=int(vit_cfg_dict.get("hidden_size", 1152)),
+        )
+        vit_config_path = os.path.join(model_path, "vit_config.json")
+        vit_conf = SiglipVisionConfig.from_json_file(vit_config_path)
+        self.vit_model = SiglipVisionModel(vit_conf)
+        self.image_processor = SiglipImageProcessor.from_pretrained(model_path, local_files_only=True)
+
+        if self.vit_model:
+            self.vit_model = SiglipNaViTWrapper(self.vit_model)
+            vit_cfg.hidden_size = self.vit_model.vision_model.config.hidden_size
+            vit_cfg.patch_size = self.vit_model.vision_model.config.patch_size
+
         self.tokenizer, self.new_token_ids, _ = add_special_tokens(self.tokenizer)
 
-        try:
-            tok_len = len(self.tokenizer)
-        except Exception:  # pragma: no cover - very old tokenizers
-            tok_len = getattr(self.tokenizer, "vocab_size", llm_config.vocab_size)
+        tok_len = len(self.tokenizer)
         required_max_id = max(int(v) for v in self.new_token_ids.values())
         llm_config.vocab_size = max(
             int(getattr(llm_config, "vocab_size", tok_len)),
@@ -169,9 +222,14 @@ class BagelPipeline(nn.Module):
 
         self.bagel = Bagel(
             language_model=self.language_model,
+            vit_model=self.vit_model,
             config=BagelConfig(
                 llm_config=llm_config,
                 vae_config=vae_cfg,
+                vit_config=vit_cfg,
+                vit_max_num_patch_per_side=int(bagel_cfg.get("vit_max_num_patch_per_side", 70)),
+                connector_act=str(bagel_cfg.get("connector_act", "gelu_pytorch_tanh")),
+                interpolate_pos=bool(bagel_cfg.get("interpolate_pos", False)),
                 latent_patch_size=int(bagel_cfg.get("latent_patch_size", 2)),
                 max_latent_size=int(bagel_cfg.get("max_latent_size", 32)),
                 timestep_shift=float(bagel_cfg.get("timestep_shift", 1.0)),
@@ -247,6 +305,69 @@ class BagelPipeline(nn.Module):
         # [Omni] Check for injected KV Cache from remote transfer
         injected_kv = getattr(req, "past_key_values", None)
         injected_metadata = getattr(req, "kv_metadata", None)
+
+        # Image input handling
+        image_input = getattr(req, "pil_image", None)
+        if image_input and not isinstance(image_input, list):
+            image_input = [image_input]
+
+        if image_input:
+            # If we have an image, we prefill with it
+            if self.image_processor and self.vae:
+
+                def vit_transforms(img):
+                    # SigLIP processor returns dict with pixel_values; we want the tensor
+                    return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
+
+                def vae_transforms(img):
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
+                    arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
+                    return arr.permute(2, 0, 1)
+
+                # 1. Update VAE
+                gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
+                    curr_kvlens=gen_context["kv_lens"],
+                    curr_rope=gen_context["ropes"],
+                    images=image_input,
+                    transforms=vae_transforms,
+                    new_token_ids=self.new_token_ids,
+                )
+
+                for k, v in gen_input_vae.items():
+                    if torch.is_tensor(v):
+                        gen_input_vae[k] = v.to(self.device)
+
+                # VAE needs bfloat16 to match model strings usually, specifically encode
+                with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                        self.vae, gen_context["past_key_values"], **gen_input_vae
+                    )
+                gen_context["kv_lens"] = newlens_vae
+                gen_context["ropes"] = new_rope_vae
+
+                # 2. Update ViT
+                gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
+                    curr_kvlens=gen_context["kv_lens"],
+                    curr_rope=gen_context["ropes"],
+                    images=image_input,
+                    transforms=vit_transforms,
+                    new_token_ids=self.new_token_ids,
+                )
+
+                for k, v in gen_input_img.items():
+                    if torch.is_tensor(v):
+                        gen_input_img[k] = v.to(self.device)
+
+                with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                        gen_context["past_key_values"], **gen_input_img
+                    )
+                gen_context["kv_lens"] = newlens_img
+                gen_context["ropes"] = new_rope_img
+            else:
+                logger.warning("Image provided but no image processor available.")
 
         if injected_kv is not None and injected_metadata is not None:
             logger.info("Using injected KV Cache from remote transfer")
@@ -409,6 +530,19 @@ class BagelPipeline(nn.Module):
                     yield "bagel." + n
                     break
 
+            # Map connector and vit_pos_embed to `bagel.*`
+            for pfx in ("connector.", "vit_pos_embed."):
+                if n.startswith(pfx):
+                    yield "bagel." + n
+                    break
+
+            if n.startswith("vit_model."):
+                yield "bagel." + n  # matches self.bagel.vit_model
+            elif n.startswith("vision_model."):
+                yield "bagel.vit_model." + n
+            elif n.startswith("model.vision_model."):
+                yield "bagel.vit_model." + n[len("model.") :]
+
         def _filtered_weights():
             total = 0
             kept = 0
@@ -439,6 +573,17 @@ class BagelPipeline(nn.Module):
                                     shapes[cand] = (npos, hdim)
                                     picked = cand
                                     break
+                            # Handle flattened patch embedding for SigLIP
+                            if cand.endswith("embeddings.patch_embedding.weight") and tensor.ndim == 2:
+                                # Checkpoint has (Hidden, C*P*P), model expects (Hidden, C, P, P)
+                                if shapes.get(cand) is not None:
+                                    target_shape = shapes[cand]
+                                    if tensor.numel() == torch.prod(torch.tensor(target_shape)):
+                                        # Reshape tensor to match target
+                                        tensor = tensor.view(target_shape)
+                                        picked = cand
+                                        break
+
                             shape_mismatch += 1
                             # Keep this quiet; shape mismatches are expected for ignored modules.
                 if picked is not None:
