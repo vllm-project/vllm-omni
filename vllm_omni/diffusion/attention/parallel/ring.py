@@ -16,10 +16,10 @@ from vllm_omni.diffusion.attention.parallel.base import (
     ParallelAttentionContext,
     # ParallelAttentionStrategy, # Not used in type hint below currently
 )
+from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 
 # from vllm_omni.diffusion.attention.backends.ring_selector import AttnType # Already imported above
-from vllm_omni.diffusion.data import get_current_omni_diffusion_config
-from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -110,7 +110,7 @@ class RingParallelAttention:
         backend_pref = self.attn_backend_pref
         if backend_pref is None:
             try:
-                config = get_current_omni_diffusion_config()
+                config = get_forward_context().omni_diffusion_config
                 # config might not have attention_backend attribute if not updated
                 backend_pref = getattr(config, "attention_backend", None)
             except Exception:

@@ -24,7 +24,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
-from vllm_omni.diffusion.data import OmniDiffusionConfig, get_current_omni_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -362,7 +362,7 @@ class QwenImageCrossAttention(nn.Module):
         self.rope = RotaryEmbedding(is_neox_style=False)
 
         try:
-            config = get_current_omni_diffusion_config()
+            config = get_forward_context().omni_diffusion_config
             self.parallel_config = config.parallel_config
         except Exception:
             self.parallel_config = None
