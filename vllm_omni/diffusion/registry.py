@@ -62,7 +62,7 @@ _DIFFUSION_MODELS = {
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
-        "LongcatImageEditPipeline",
+        "LongCatImageEditPipeline",
     ),
     "StableDiffusion3Pipeline": (
         "sd3",
