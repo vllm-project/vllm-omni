@@ -307,6 +307,9 @@ class OmniDiffusionConfig:
     # Compilation
     enable_torch_compile: bool = False
 
+    # Enable sleep mode
+    enable_sleep_mode: bool = False
+
     disable_autocast: bool = False
 
     # VSA parameters
