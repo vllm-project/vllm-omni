@@ -160,6 +160,10 @@ class AsyncOmni(OmniBase):
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
+                    # LoRA dynamic serving knobs
+                    "lora_dirs": kwargs.get("lora_dirs", None),
+                    "max_lora_cache_vram": kwargs.get("max_lora_cache_vram", None),
+                    "max_lora_cache_cpu": kwargs.get("max_lora_cache_cpu", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",

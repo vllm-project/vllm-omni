@@ -204,13 +204,29 @@ class OmniBase:
         # Load stage configurations from YAML
         if stage_configs_path is None:
             self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model)
+            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)
             if not self.stage_configs:
                 default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
                 self.stage_configs = OmegaConf.create(default_stage_cfg)
         else:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+
+        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        for cfg in self.stage_configs:
+            try:
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = {}
+                if kwargs.get("lora_dirs") is not None:
+                    cfg.engine_args["lora_dirs"] = kwargs.get("lora_dirs")
+                if kwargs.get("max_lora_cache_vram") is not None:
+                    cfg.engine_args["max_lora_cache_vram"] = kwargs.get("max_lora_cache_vram")
+                if kwargs.get("max_lora_cache_cpu") is not None:
+                    cfg.engine_args["max_lora_cache_cpu"] = kwargs.get("max_lora_cache_cpu")
+            except Exception:
+                pass
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(

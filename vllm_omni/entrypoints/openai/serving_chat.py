@@ -1834,6 +1834,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
             guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+            lora_body = extra_body.get("lora")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -1912,6 +1913,29 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     return self._create_error_response("No output generated from AsyncOmni")
             else:
                 # AsyncOmniDiffusion: direct call
+                if lora_body and isinstance(lora_body, dict):
+                    try:
+                        lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
+                        lora_path = (
+                            lora_body.get("local_path")
+                            or lora_body.get("path")
+                            or lora_body.get("lora_path")
+                            or lora_body.get("lora_local_path")
+                        )
+                        lora_scale = lora_body.get("scale") or lora_body.get("lora_scale")
+                        lora_int_id = (
+                            lora_body.get("int_id")
+                            or lora_body.get("lora_int_id")
+                            or abs(hash((lora_name or \"\") + (lora_path or \"\"))) % (2**30)
+                        )
+                        if lora_name and lora_path:
+                            lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                            if lora_scale is not None:
+                                setattr(lora_req, "scale", float(lora_scale))
+                            gen_kwargs["lora_request"] = lora_req
+                    except Exception as exc:  # pragma: no cover - safeguard
+                        logger.warning("Failed to parse LoRA request: %s", exc)
+
                 result = await self._diffusion_engine.generate(**gen_kwargs)
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output

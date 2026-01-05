@@ -125,6 +125,7 @@ class AsyncOmniDiffusion:
         negative_prompt: str | None = None,
         num_outputs_per_prompt: int = 1,
         seed: int | None = None,
+        lora_request=None,
         **kwargs: Any,
     ) -> OmniRequestOutput:
         """Generate images asynchronously from a text prompt.
@@ -160,6 +161,7 @@ class AsyncOmniDiffusion:
             "negative_prompt": negative_prompt,
             "num_outputs_per_prompt": num_outputs_per_prompt,
             "seed": seed,
+            "lora_request": lora_request,
             **kwargs,
         }
         if guidance_scale is not None:
