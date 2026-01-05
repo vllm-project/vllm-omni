@@ -406,8 +406,8 @@ CUSTOM_DIT_ENABLERS.update(
     {
         "WanPipeline": enable_cache_for_wan22,
         "FluxPipeline": enable_cache_for_flux,
-        "LongcatImagePipeline": enable_cache_for_longcat_image,
-        "LongcatImageEditPipeline": enable_cache_for_longcat_image,
+        "LongCatImagePipeline": enable_cache_for_longcat_image,
+        "LongCatImageEditPipeline": enable_cache_for_longcat_image,
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
     }
 )
