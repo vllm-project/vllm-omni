@@ -49,7 +49,6 @@ nav:
     - design/architecture_overview.md
     - Feature Design:
       - design/feature/disaggregated_inference.md
-      - design/feature/multi_request_streaming.md
       - design/feature/ray_based_execution.md
     - Module Design:
       - design/module/ar_module.md

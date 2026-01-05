@@ -9,7 +9,6 @@ This section contains design documents and architecture specifications for vLLM-
 ## Feature Design Documents
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
-- [Multi-Request Streaming](feature/multi_request_streaming.md)
 - [Ray-based Execution](feature/ray_based_execution.md)
 
 ## Module Design Documents
