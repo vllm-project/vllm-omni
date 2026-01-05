@@ -361,6 +361,7 @@ class DiffusionEngine:
 
     def close(self) -> None:
         self._finalizer()
+
     def abort(self) -> None:
-        #TODO implement it
+        # TODO implement it
         pass
