@@ -6,6 +6,7 @@ with the correct prompt format on Qwen2.5-Omni
 """
 
 import os
+import time
 from typing import NamedTuple
 
 import librosa
@@ -376,11 +377,17 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    if profiler_enabled:
+        omni_llm.start_profile(stages=[0])
     omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
+
+    total_requests = len(prompts)
+    processed_count = 0
     for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
@@ -407,6 +414,18 @@ def main(args):
                 output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+
+        processed_count += len(stage_outputs.request_output)
+        if profiler_enabled and processed_count >= total_requests:
+            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+            # Stop the profiler while workers are still alive
+            omni_llm.stop_profile()
+
+            print("[Info] Waiting 30s for workers to write massive trace files to disk...")
+            time.sleep(30)
+            print("[Info] Trace export wait finished.")
+
+    omni_llm.close()
 
 
 def parse_args():

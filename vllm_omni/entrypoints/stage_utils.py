@@ -16,9 +16,15 @@ class OmniStageTaskType(enum.Enum):
     GENERATE = "generate"
     ABORT = "abort"
     SHUTDOWN = "shutdown"
+    PROFILER_START = "profiler_start"
+    PROFILER_STOP = "profiler_stop"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
+
+
+def is_profiler_task(task_type: OmniStageTaskType) -> bool:
+    return task_type in (OmniStageTaskType.PROFILER_START, OmniStageTaskType.PROFILER_STOP)
 
 
 def set_stage_devices(

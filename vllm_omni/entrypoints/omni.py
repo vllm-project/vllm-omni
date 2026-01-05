@@ -30,7 +30,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
-from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -333,6 +333,72 @@ class OmniBase:
         formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
 
         logger.error(f"[{self._name}] Stage initialization failed. Troubleshooting Steps:\n{formatted_suggestions}")
+
+    def start_profile(self, stages: list[int] | None = None) -> None:
+        """Start profiling for specified stages.
+
+        Sends start_profile command to stage workers. Profiling must be enabled
+        via VLLM_TORCH_PROFILER_DIR environment variable.
+
+        Args:
+            stages: List of stage IDs to start profiling. If None, starts
+                profiling for all stages that have profiling enabled.
+
+        Example:
+            >>> # Profile all stages
+            >>> omni.start_profile()
+            >>> outputs = omni.generate(prompts, sampling_params)
+            >>> omni.stop_profile()
+
+            >>> # Profile only stage 0 and 2
+            >>> omni.start_profile(stages=[0, 2])
+        """
+        if stages is None:
+            stages = list(range(len(self.stage_list)))
+
+        for stage_id in stages:
+            if stage_id < len(self.stage_list):
+                try:
+                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
+                    logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Failed to send start_profile to stage-%s: %s",
+                        self._name,
+                        stage_id,
+                        e,
+                    )
+
+    def stop_profile(self, stages: list[int] | None = None) -> None:
+        """Stop profiling for specified stages.
+
+        Sends stop_profile command to stage workers to finalize and save traces.
+
+        Args:
+            stages: List of stage IDs to stop profiling. If None, stops
+                profiling for all stages.
+
+        Example:
+            >>> omni.start_profile()
+            >>> outputs = omni.generate(prompts, sampling_params)
+            >>> omni.stop_profile()
+            >>> # Traces saved to VLLM_TORCH_PROFILER_DIR/stage_X_<model_stage>/
+        """
+        if stages is None:
+            stages = list(range(len(self.stage_list)))
+
+        for stage_id in stages:
+            if stage_id < len(self.stage_list):
+                try:
+                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_STOP})
+                    logger.info("[%s] Sent stop_profile to stage-%s", self._name, stage_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Failed to send stop_profile to stage-%s: %s",
+                        self._name,
+                        stage_id,
+                        e,
+                    )
 
     def close(self) -> None:
         """Close all stage processes and clean up resources."""

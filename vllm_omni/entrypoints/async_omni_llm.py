@@ -165,19 +165,21 @@ class AsyncOmniLLM(AsyncLLM):
         except RuntimeError:
             pass
 
-        if envs.VLLM_TORCH_PROFILER_DIR:
+        if envs.VLLM_TORCH_PROFILER_DIR and not envs.VLLM_TORCH_PROFILER_DISABLE_ASYNC_LLM:
             logger.info(
-                "Torch profiler enabled. AsyncLLM CPU traces will be collected under %s",  # noqa: E501
+                "Torch profiler enabled. AsyncOmniLLM CPU traces will be collected under %s",
                 envs.VLLM_TORCH_PROFILER_DIR,
             )
-            worker_name = f"{socket.gethostname()}_{os.getpid()}.async_llm"
+            worker_name = f"{socket.gethostname()}_{os.getpid()}.async_omni_llm"
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                 ],
                 with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    envs.VLLM_TORCH_PROFILER_DIR, worker_name=worker_name, use_gzip=True
+                    envs.VLLM_TORCH_PROFILER_DIR,
+                    worker_name=worker_name,
+                    use_gzip=envs.VLLM_TORCH_PROFILER_USE_GZIP,
                 ),
             )
         else:

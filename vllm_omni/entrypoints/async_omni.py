@@ -614,11 +614,39 @@ class AsyncOmni(OmniBase):
         """Generate outputs for a request from a pooling model."""
         raise NotImplementedError("encode() is not implemented for AsyncOmni")
 
-    async def start_profile(self) -> None:
-        raise NotImplementedError("start_profile() is not implemented for AsyncOmni")
+    async def start_profile(self, stages: list[int] | None = None) -> None:
+        """Start profiling for specified stages.
 
-    async def stop_profile(self) -> None:
-        raise NotImplementedError("stop_profile() is not implemented for AsyncOmni")
+        Async wrapper around the base implementation for API consistency.
+
+        Args:
+            stages: List of stage IDs to start profiling. If None, starts
+                profiling for all stages that have profiling enabled.
+
+        Example:
+            >>> await async_omni.start_profile()
+            >>> async for output in async_omni.generate(...):
+            ...     pass
+            >>> await async_omni.stop_profile()
+        """
+        super().start_profile(stages)
+
+    async def stop_profile(self, stages: list[int] | None = None) -> None:
+        """Stop profiling for specified stages.
+
+        Async wrapper around the base implementation for API consistency.
+
+        Args:
+            stages: List of stage IDs to stop profiling. If None, stops
+                profiling for all stages.
+
+        Example:
+            >>> await async_omni.start_profile()
+            >>> async for output in async_omni.generate(...):
+            ...     pass
+            >>> await async_omni.stop_profile()
+        """
+        super().stop_profile(stages)
 
     async def pause_generation(
         self,
