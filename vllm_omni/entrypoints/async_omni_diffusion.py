@@ -263,7 +263,7 @@ class AsyncOmniDiffusion:
         except Exception:
             pass
 
-    def abort(self, request_id: str | Iterable[str]) -> None:
+    async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request."""
         self.engine.abort(request_id)
 
