@@ -553,7 +553,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
 
     omni = Omni(model="any", init_timeout=1)
     with pytest.raises(ValueError):
-        list(omni.generate(prompts=["hi"], sampling_params_list=[]))
+        omni.generate(prompts=["hi"], sampling_params_list=[])
 
 
 def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
@@ -640,7 +640,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     # Use dicts instead of object() for serializable sampling params
     sampling_params_list = [{"temperature": 0.7}, {"temperature": 0.8}]
     prompts = ["hi"]
-    outputs = list(omni.generate(prompts=prompts, sampling_params_list=sampling_params_list))
+    outputs = omni.generate(prompts=prompts, sampling_params_list=sampling_params_list)
 
     # Both stages have final_output=True, so should aggregate two OmniRequestOutput
     assert len(outputs) == 2
@@ -723,7 +723,7 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     )
 
     # Use dicts instead of object() for serializable sampling params
-    outputs = list(omni.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}]))
+    outputs = omni.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}])
     assert outputs == []
 
 
@@ -796,7 +796,7 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
         }
     )
     # Use the default sampling params
-    list(omni.generate(prompts=["p"], sampling_params_list=None))
+    omni.generate(prompts=["p"], sampling_params_list=None)
 
 
 def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
@@ -924,7 +924,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     # Generate should handle error gracefully (log but continue)
     # Use dict instead of object() for serializable sampling params
     sampling_params_list = [{"temperature": 0.7}]
-    outputs = list(omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list))
+    outputs = omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
     # Should return final output (error was logged but didn't stop processing)
     assert isinstance(outputs, list)
     # Since final_output=True, should have one output

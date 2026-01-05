@@ -376,7 +376,7 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    omni_generator = omni_llm.generate(prompts, sampling_params_list)
+    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
@@ -513,6 +513,12 @@ def parse_args():
         type=str,
         default=None,
         help="Modalities to use for the prompts.",
+    )
+    parser.add_argument(
+        "--py-generator",
+        action="store_true",
+        default=False,
+        help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     return parser.parse_args()
 

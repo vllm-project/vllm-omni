@@ -133,7 +133,7 @@ def test_sequence_parallel(
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
-        baseline_images = list(outputs)[0].request_output[0].images
+        baseline_images = outputs[0].request_output[0].images
     finally:
         baseline.close()
         if dist.is_initialized():
@@ -165,7 +165,7 @@ def test_sequence_parallel(
             generator=torch.Generator(get_device_name()).manual_seed(seed),
             num_outputs_per_prompt=1,
         )
-        sp_images = list(outputs)[0].request_output[0].images
+        sp_images = outputs[0].request_output[0].images
     finally:
         sp.close()
         if dist.is_initialized():

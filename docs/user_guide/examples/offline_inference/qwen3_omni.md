@@ -12,7 +12,7 @@ Get into the example folder
 ```bash
 cd examples/offline_inference/qwen3_omni
 ```
-Then run the command below.
+Then run the command below. Note: for processing large volume data, it uses py_generator mode, which will return a python generator from Omni class.
 ```bash
 bash run_multiple_prompts.sh
 ```
@@ -91,4 +91,8 @@ sudo apt install ffmpeg
 ??? abstract "run_single_prompt_tp.sh"
     ``````sh
     --8<-- "examples/offline_inference/qwen3_omni/run_single_prompt_tp.sh"
+    ``````
+??? abstract "text_prompts_10.txt"
+    ``````txt
+    --8<-- "examples/offline_inference/qwen3_omni/text_prompts_10.txt"
     ``````

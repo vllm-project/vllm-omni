@@ -4,7 +4,6 @@
 Pytest configuration and fixtures for vllm-omni tests.
 """
 
-from collections.abc import Generator
 from typing import Any
 
 import pytest
@@ -12,6 +11,7 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -190,7 +190,7 @@ class OmniRunner:
         self,
         prompts: list[dict[str, Any]],
         sampling_params_list: list[SamplingParams] | None = None,
-    ) -> Generator[Any, None, None]:
+    ) -> list[OmniRequestOutput]:
         """
         Generate outputs for the given prompts.
 
@@ -206,7 +206,7 @@ class OmniRunner:
         if sampling_params_list is None:
             sampling_params_list = self.get_default_sampling_params_list()
 
-        yield from self.omni.generate(prompts, sampling_params_list)
+        return self.omni.generate(prompts, sampling_params_list)
 
     def generate_multimodal(
         self,
@@ -218,7 +218,7 @@ class OmniRunner:
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
         modalities: list[str] | None = None,
-    ) -> Generator[Any, None, None]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
 
@@ -243,7 +243,7 @@ class OmniRunner:
             mm_processor_kwargs=mm_processor_kwargs,
             modalities=modalities,
         )
-        yield from self.generate(omni_inputs, sampling_params_list)
+        return self.generate(omni_inputs, sampling_params_list)
 
     def generate_audio(
         self,
@@ -252,7 +252,7 @@ class OmniRunner:
         system_prompt: str | None = None,
         audios: PromptAudioInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> Generator[Any, None, None]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
         Args:
@@ -270,7 +270,7 @@ class OmniRunner:
             audios=audios,
             mm_processor_kwargs=mm_processor_kwargs,
         )
-        yield from self.generate(omni_inputs, sampling_params_list)
+        return self.generate(omni_inputs, sampling_params_list)
 
     def generate_video(
         self,
@@ -279,7 +279,7 @@ class OmniRunner:
         system_prompt: str | None = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> Generator[Any, None, None]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
         Args:
@@ -297,7 +297,7 @@ class OmniRunner:
             videos=videos,
             mm_processor_kwargs=mm_processor_kwargs,
         )
-        yield from self.generate(omni_inputs, sampling_params_list)
+        return self.generate(omni_inputs, sampling_params_list)
 
     def generate_image(
         self,
@@ -306,7 +306,7 @@ class OmniRunner:
         system_prompt: str | None = None,
         images: PromptImageInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> Generator[Any, None, None]:
+    ) -> list[OmniRequestOutput]:
         """
         Convenience method to generate with multimodal inputs.
         Args:
@@ -324,7 +324,7 @@ class OmniRunner:
             images=images,
             mm_processor_kwargs=mm_processor_kwargs,
         )
-        yield from self.generate(omni_inputs, sampling_params_list)
+        return self.generate(omni_inputs, sampling_params_list)
 
     def __enter__(self):
         """Context manager entry."""

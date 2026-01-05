@@ -162,9 +162,8 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns Generator[OmniRequestOutput, None, None], convert to list
-    outputs = list(outputs)
-    if not outputs:
+    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 

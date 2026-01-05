@@ -322,81 +322,76 @@ def main():
     print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
     print(f"{'=' * 60}\n")
 
-    try:
-        generation_start = time.perf_counter()
-        # Generate edited image
-        generate_kwargs = {
-            "prompt": args.prompt,
-            "pil_image": input_image,
-            "negative_prompt": args.negative_prompt,
-            "generator": generator,
-            "true_cfg_scale": args.cfg_scale,
-            "guidance_scale": args.guidance_scale,
-            "num_inference_steps": args.num_inference_steps,
-            "num_outputs_per_prompt": args.num_outputs_per_prompt,
-            "layers": args.layers,
-            "resolution": args.resolution,
-        }
+    generation_start = time.perf_counter()
+    # Generate edited image
+    generate_kwargs = {
+        "prompt": args.prompt,
+        "pil_image": input_image,
+        "negative_prompt": args.negative_prompt,
+        "generator": generator,
+        "true_cfg_scale": args.cfg_scale,
+        "guidance_scale": args.guidance_scale,
+        "num_inference_steps": args.num_inference_steps,
+        "num_outputs_per_prompt": args.num_outputs_per_prompt,
+        "layers": args.layers,
+        "resolution": args.resolution,
+    }
 
-        outputs = omni.generate(**generate_kwargs)
-        generation_end = time.perf_counter()
-        generation_time = generation_end - generation_start
+    outputs = omni.generate(**generate_kwargs)
+    generation_end = time.perf_counter()
+    generation_time = generation_end - generation_start
 
-        # Print profiling results
-        print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+    # Print profiling results
+    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
-        # omni.generate() returns Generator[OmniRequestOutput, None, None], convert to list
-        outputs = list(outputs)
-        if not outputs:
-            raise ValueError("No output generated from omni.generate()")
-        logger.info("Outputs: %s", outputs)
+    if not outputs:
+        raise ValueError("No output generated from omni.generate()")
+    logger.info("Outputs: %s", outputs)
 
-        # Extract images from OmniRequestOutput
-        # omni.generate() returns Generator[OmniRequestOutput, None, None], extract images from request_output[0].images
-        first_output = outputs[0]
-        if not hasattr(first_output, "request_output") or not first_output.request_output:
-            raise ValueError("No request_output found in OmniRequestOutput")
+    # Extract images from OmniRequestOutput
+    # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images
+    first_output = outputs[0]
+    if not hasattr(first_output, "request_output") or not first_output.request_output:
+        raise ValueError("No request_output found in OmniRequestOutput")
 
-        req_out = first_output.request_output[0]
-        if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-            raise ValueError("Invalid request_output structure or missing 'images' key")
+    req_out = first_output.request_output[0]
+    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
+        raise ValueError("Invalid request_output structure or missing 'images' key")
 
-        images = req_out.images
-        if not images:
-            raise ValueError("No images found in request_output")
+    images = req_out.images
+    if not images:
+        raise ValueError("No images found in request_output")
 
-        # Save output image(s)
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        suffix = output_path.suffix or ".png"
-        stem = output_path.stem or "output_image_edit"
+    # Save output image(s)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = output_path.suffix or ".png"
+    stem = output_path.stem or "output_image_edit"
 
-        # Handle layered output (each image may be a list of layers)
-        if args.num_outputs_per_prompt <= 1:
-            img = images[0]
+    # Handle layered output (each image may be a list of layers)
+    if args.num_outputs_per_prompt <= 1:
+        img = images[0]
+        # Check if this is a layered output (list of images)
+        if isinstance(img, list):
+            for sub_idx, sub_img in enumerate(img):
+                save_path = output_path.parent / f"{stem}_{sub_idx}{suffix}"
+                sub_img.save(save_path)
+                print(f"Saved edited image to {os.path.abspath(save_path)}")
+        else:
+            img.save(output_path)
+            print(f"Saved edited image to {os.path.abspath(output_path)}")
+    else:
+        for idx, img in enumerate(images):
             # Check if this is a layered output (list of images)
             if isinstance(img, list):
                 for sub_idx, sub_img in enumerate(img):
-                    save_path = output_path.parent / f"{stem}_{sub_idx}{suffix}"
+                    save_path = output_path.parent / f"{stem}_{idx}_{sub_idx}{suffix}"
                     sub_img.save(save_path)
                     print(f"Saved edited image to {os.path.abspath(save_path)}")
             else:
-                img.save(output_path)
-                print(f"Saved edited image to {os.path.abspath(output_path)}")
-        else:
-            for idx, img in enumerate(images):
-                # Check if this is a layered output (list of images)
-                if isinstance(img, list):
-                    for sub_idx, sub_img in enumerate(img):
-                        save_path = output_path.parent / f"{stem}_{idx}_{sub_idx}{suffix}"
-                        sub_img.save(save_path)
-                        print(f"Saved edited image to {os.path.abspath(save_path)}")
-                else:
-                    save_path = output_path.parent / f"{stem}_{idx}{suffix}"
-                    img.save(save_path)
-                    print(f"Saved edited image to {os.path.abspath(save_path)}")
-    finally:
-        omni.close()
+                save_path = output_path.parent / f"{stem}_{idx}{suffix}"
+                img.save(save_path)
+                print(f"Saved edited image to {os.path.abspath(save_path)}")
 
 
 if __name__ == "__main__":

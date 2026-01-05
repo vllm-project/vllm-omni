@@ -389,7 +389,9 @@ class Omni(OmniBase):
             self._ray_pg,
         )
 
-    def generate(self, *args: Any, **kwargs: dict[str, Any]) -> Generator[OmniRequestOutput, None, None]:
+    def generate(
+        self, *args: Any, **kwargs: dict[str, Any]
+    ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
         Orchestrates the multi-stage pipeline based on YAML configuration.
@@ -413,6 +415,7 @@ class Omni(OmniBase):
         """
         prompts = args[0] if args else kwargs.get("prompts")
         sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
+        py_generator = kwargs.get("py_generator", False)
         if prompts is None:
             if kwargs.get("prompt") is None:
                 raise ValueError("prompts is required for generation")
@@ -440,11 +443,32 @@ class Omni(OmniBase):
 
             sampling_params_list = per_stage_params
         try:
-            yield from self._run_generation(prompts, sampling_params_list)
+            if py_generator:
+                return self._run_generation_with_generator(prompts, sampling_params_list)
+            else:
+                outputs = list(self._run_generation(prompts, sampling_params_list))
+                self.close()
+                return outputs
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to run generation: %s", e)
+            # Always close on exception to ensure cleanup
+            self.close()
+            raise e
+
+    def _run_generation_with_generator(
+        self,
+        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
+        sampling_params_list: Any | Sequence[Any] | None,
+    ) -> Generator[OmniRequestOutput, None, None]:
+        """Run generation through all stages in the pipeline and return a generator."""
+        gen = self._run_generation(prompts, sampling_params_list)
+        try:
+            yield from gen
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
             raise e
         finally:
+            # Cleanup when generator is exhausted or closed
             self.close()
 
     def _run_generation(
