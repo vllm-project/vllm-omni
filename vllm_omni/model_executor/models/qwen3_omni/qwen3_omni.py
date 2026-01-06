@@ -638,13 +638,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
                 input_ids, input_embeds, **info_dict
             )
-            print(f"{last_talker_hidden.shape=}")
-            print(f"{text_step.shape=}")
-        update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
-        # # execute talker MTP
-        # input_embeds, code_predictor_codes = self.talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
-        # update_dict["code_predictor_codes"] = code_predictor_codes
+        update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
         return input_ids, input_embeds, update_dict
 
