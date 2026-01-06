@@ -35,13 +35,14 @@ The following table shows which models are currently supported by each accelerat
 ### ImageGen
 
 | Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |
-|-------|------------------|----------|-----------|-----------|----------------|
+|-------|------------------|:----------:|:-----------:|:-----------:|:----------------:|
 | **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ |
 | **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ | ❌ |
 | **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ | ❌ |
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ | ✅ | ✅ |
 | **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ❌ | ✅ | ✅ | ✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ |
 | **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ | ❌ |
 | **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ |
@@ -51,9 +52,9 @@ The following table shows which models are currently supported by each accelerat
 
 ### VideoGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
-|-------|------------------|----------|-----------|-----------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |
+|-------|------------------|:--------:|:---------:|:----------:|:--------------:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ | ❌ |
 
 
 ## Performance Benchmarks
