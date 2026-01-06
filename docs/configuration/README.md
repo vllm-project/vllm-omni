@@ -2,7 +2,7 @@
 
 This section lists the most common options for running vLLM-Omni.
 
-For options within a vLLM Engine. Please refer to [vLLM Configuration](https://docs.vllm.ai/en/v0.11.0/configuration/index.html)
+For options within a vLLM Engine. Please refer to [vLLM Configuration](https://docs.vllm.ai/en/v0.12.0/configuration/index.html)
 
 Currently, the main options are maintained by stage configs for each model.
 
