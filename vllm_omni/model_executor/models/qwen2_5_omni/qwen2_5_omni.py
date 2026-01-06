@@ -101,6 +101,12 @@ class Qwen2_5OmniForConditionalGeneration(
             self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.token2wav = None
+            # set suppress start id according to token2wav
+            t2w_token_end_id = getattr(
+                getattr(getattr(config, "token2wav_config", None), "dit_config", None), "num_embeds", None
+            )
+            if t2w_token_end_id:
+                self.model.set_suppress_start_id(t2w_token_end_id + 1)
 
         elif self.model_stage == "code2wav":
             self.thinker = None
