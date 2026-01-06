@@ -230,6 +230,10 @@ Provide multiple images in `content` (order matters):
     ``````py
     --8<-- "examples/online_serving/image_to_image/openai_chat_client.py"
     ``````
+??? abstract "run_curl_image_edit.sh"
+    ``````sh
+    --8<-- "examples/online_serving/image_to_image/run_curl_image_edit.sh"
+    ``````
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/image_to_image/run_server.sh"
