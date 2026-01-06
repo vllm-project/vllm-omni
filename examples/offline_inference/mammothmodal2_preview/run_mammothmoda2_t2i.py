@@ -53,13 +53,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model",
         type=str,
-        default="/data/datasets/models-hf/MammothModa2-Preview",
+        required=True,
         help="Path to the model directory.",
     )
     p.add_argument(
         "--stage-config",
         type=str,
-        default="vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml",
+        required=True,
         help="Path to the multi-stage YAML configuration.",
     )
     p.add_argument(
@@ -188,11 +188,9 @@ def main() -> None:
             for p in args.prompt
         ]
 
-        outputs = omni.generate(inputs, [ar_sampling, dit_sampling])
-
-        # `outputs` may contain one or multiple request results.
-        if not isinstance(outputs, list):
-            outputs = [outputs]
+        # NOTE: omni.generate() returns a Generator[OmniRequestOutput, None, None].
+        # Consume it to actually run the pipeline and obtain final outputs.
+        outputs = list(omni.generate(inputs, [ar_sampling, dit_sampling]))
 
         logger.info("Post-processing and saving image(s)...")
         out_base, out_ext = os.path.splitext(args.out)

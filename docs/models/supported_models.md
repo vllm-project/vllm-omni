@@ -31,6 +31,7 @@ th {
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 |`LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` |
 |`StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` |
+|`MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` |
 
 
 ## List of Supported Models for NPU

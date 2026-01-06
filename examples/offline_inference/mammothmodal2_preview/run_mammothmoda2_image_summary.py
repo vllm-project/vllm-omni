@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 
 from PIL import Image
 from vllm import SamplingParams
@@ -29,13 +28,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="/data/datasets/models-hf/MammothModa2-Preview",
+        required=True,
         help="Path to model directory or model id.",
     )
     parser.add_argument(
         "--stage-config",
         type=str,
-        default=str(Path(__file__).with_name("mammoth_moda2_image_summary.yaml")),
+        required=True,
         help="Path to stage config yaml (single-stage AR->text).",
     )
     parser.add_argument(
@@ -66,12 +65,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument(
-        "--out",
-        type=str,
-        default="image_summary.txt",
-        help="Path to save output text.",
-    )
     return parser.parse_args()
 
 
@@ -91,8 +84,6 @@ def main() -> None:
     if not os.path.exists(args.image):
         raise FileNotFoundError(f"Image file not found: {args.image}")
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-
     pil_image = Image.open(args.image)
     image_data = convert_image_mode(pil_image, "RGB")
     prompt = build_prompt(args.system, args.question)
@@ -111,20 +102,22 @@ def main() -> None:
             seed=int(args.seed),
             detokenize=True,
         )
-        outputs = omni.generate(
-            [
-                {
-                    "prompt": prompt,
-                    "multi_modal_data": {"image": image_data},
-                }
-            ],
-            [sp],
+        # NOTE: omni.generate() returns a Generator[OmniRequestOutput, None, None].
+        # Consume it inside the try block so the worker isn't closed early.
+        outputs = list(
+            omni.generate(
+                [
+                    {
+                        "prompt": prompt,
+                        "multi_modal_data": {"image": image_data},
+                        "additional_information": {"omni_task": ["chat"]},
+                    }
+                ],
+                [sp],
+            )
         )
     finally:
         omni.close()
-
-    if not isinstance(outputs, list):
-        outputs = [outputs]
 
     lines: list[str] = []
     for stage_outputs in outputs:
@@ -137,10 +130,7 @@ def main() -> None:
             lines.append(text.strip() + "\n")
             lines.append("\n")
 
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    print(f"[OK] Saved summary to: {args.out}")
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":
