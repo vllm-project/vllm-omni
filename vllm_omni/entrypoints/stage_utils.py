@@ -66,28 +66,8 @@ def set_stage_devices(
 
     # Select device-specific torch functions
     if device_type == "npu":
-        try:
-            import torch.npu  # type: ignore[import-untyped]
-        except ImportError:
-            logger.debug("[Stage-%s] torch.npu not available, skipping NPU device setup", stage_id)
-            return
-
-        is_available_fn = torch.npu.is_available
-        set_device_fn = torch.npu.set_device
-        device_count_fn = torch.npu.device_count
-        get_device_properties_fn = torch.npu.get_device_properties
-        mem_get_info_fn = torch.npu.mem_get_info
-        get_device_name_fn = torch.npu.get_device_name
         device_type_label = "NPU"
     elif device_type == "cuda":
-        import torch
-
-        is_available_fn = torch.cuda.is_available
-        set_device_fn = torch.cuda.set_device
-        device_count_fn = torch.cuda.device_count
-        get_device_properties_fn = torch.cuda.get_device_properties
-        mem_get_info_fn = torch.cuda.mem_get_info
-        get_device_name_fn = torch.cuda.get_device_name
         device_type_label = "CUDA"
     else:
         logger.debug("[Stage-%s] Unsupported device type: %s", stage_id, device_type)

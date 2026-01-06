@@ -55,4 +55,3 @@ def test_set_stage_devices_respects_logical_ids(monkeypatch):
     set_stage_devices(stage_id=0, devices="0,1")
 
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
-    assert call_log and call_log[0] == 0  # current device set after remap
