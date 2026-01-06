@@ -64,15 +64,6 @@ def set_stage_devices(
 
     env_var = get_device_control_env_var()
 
-    # Select device-specific torch functions
-    if device_type == "npu":
-        device_type_label = "NPU"
-    elif device_type == "cuda":
-        device_type_label = "CUDA"
-    else:
-        logger.debug("[Stage-%s] Unsupported device type: %s", stage_id, device_type)
-        return
-
     try:
         selected_physical: int | None = None
         logical_idx: int | None = None
@@ -110,7 +101,7 @@ def set_stage_devices(
                         selected_physical,
                     )
                 except Exception as e:
-                    logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type_label, e)
+                    logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type, e)
                     selected_physical = None
         elif isinstance(devices, (int, str)) and (isinstance(devices, int) or str(devices).isdigit()):
             logical_idx = max(0, int(devices))
