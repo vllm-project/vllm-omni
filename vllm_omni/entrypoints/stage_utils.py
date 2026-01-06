@@ -159,33 +159,6 @@ def set_stage_devices(
             selected_physical = int(str(devices))
             os.environ[env_var] = str(selected_physical)
             logger.debug("[Stage-%s] Set %s to single device %s (fallback)", stage_id, env_var, selected_physical)
-
-        try:
-            import torch
-
-            if is_available_fn():
-                try:
-                    set_device_fn(0)
-                except Exception as e:
-                    logger.debug(
-                        "[Stage-%s] %s set_device(0) failed: %s", stage_id, device_type_label, e, exc_info=True
-                    )
-                num = device_count_fn()
-                info = []
-                for i in range(num):
-                    total = get_device_properties_fn(i).total_memory
-                    free, _ = mem_get_info_fn(i)
-                    info.append(
-                        {
-                            "idx": i,
-                            "name": get_device_name_fn(i),
-                            "total": int(total),
-                            "free": int(free),
-                        }
-                    )
-                logger.debug("[Stage-%s] %s devices visible=%s info=%s", stage_id, device_type_label, num, info)
-        except Exception as e:
-            logger.debug("[Stage-%s] Failed to query %s devices: %s", stage_id, device_type_label, e, exc_info=True)
     except Exception as e:
         logger.warning("Failed to interpret devices for stage %s: %s", stage_id, e)
 
