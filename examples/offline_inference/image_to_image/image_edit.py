@@ -49,6 +49,14 @@ Usage (layered):
         --layers 4 \
         --color-format "RGBA"
 
+Usage (with CFG Parallel):
+    python image_edit.py \
+        --image input.png \
+        --prompt "Edit description" \
+        --cfg_parallel_size 2 \
+        --num_inference_steps 50 \
+        --cfg_scale 4.0 \
+
 For more options, run:
     python image_edit.py --help
 """
@@ -245,7 +253,13 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="[tea_cache] Threshold for accumulated relative L1 distance.",
     )
-
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
     return parser.parse_args()
 
 
@@ -273,7 +287,10 @@ def main():
     # Enable VAE memory optimizations on NPU
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
-    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree, cfg_parallel_size=args.cfg_parallel_size
+    )
+
     # Configure cache based on backend type
     cache_config = None
     if args.cache_backend == "cache_dit":
@@ -319,7 +336,9 @@ def main():
             print(f"    Image {idx + 1} size: {img.size}")
     else:
         print(f"  Input image size: {input_image.size}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
+    print(
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+    )
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()

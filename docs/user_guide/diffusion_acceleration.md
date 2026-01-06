@@ -14,10 +14,13 @@ vLLM-Omni currently supports two main cache acceleration backends:
 
 Both methods can provide significant speedups (typically **1.5x-2.0x**) while maintaining high output quality.
 
-vLLM-Omni also supports the sequence parallelism (SP) for the diffusion model, that includes:
+vLLM-Omni also supports parallelism methods for diffusion models, including:
 
 1. [Ulysses-SP](acceleration/parallelism_acceleration.md#ulysses-sp) - splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
+
 2. [Ring-Attention](acceleration/parallelism_acceleration.md#ring-attention) - splits the input along the sequence dimension and uses ring-based P2P communication to accumulate attention results, keeping the sequence dimension sharded.
+
+3. [CFG-Parallel](acceleration/parallelism_acceleration.md#cfg-parallel) - runs the positive/negative prompts of classifier-free guidance (CFG) on different devices, then merges on a single device to perform the scheduler step.
 
 ## Quick Comparison
 
@@ -34,26 +37,24 @@ The following table shows which models are currently supported by each accelerat
 
 ### ImageGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |
-|-------|------------------|----------|-----------|-----------|----------------|
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ | ❌ |
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ❌ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ | ❌ |
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ | ❌ |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ❌ | ❌ |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
+|-------|------------------|:----------:|:-----------:|:-----------:|:----------------:|:----------------:|
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ | ❌ |
+| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ | ❌ | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ | ❌ | ❌ |
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ✅ |❌ | ❌ | ❌ |
+| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ❌ | ❌ | ❌ |
 
 ### VideoGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP |
-|-------|------------------|----------|-----------|-----------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |
+|-------|------------------|:--------:|:---------:|:----------:|:--------------:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ❌ | ❌ |
 
 
 ## Performance Benchmarks
@@ -134,7 +135,7 @@ ulysses_degree = 2
 
 omni = Omni(
     model="Qwen/Qwen-Image",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
+    parallel_config=DiffusionParallelConfig(ulysses_degree=ulysses_degree)
 )
 
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
@@ -149,7 +150,7 @@ ulysses_degree = 2
 
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
-    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
+    parallel_config=DiffusionParallelConfig(ulysses_degree=ulysses_degree)
 )
 
 outputs = omni.generate(prompt="turn this cat to a dog",
@@ -172,6 +173,26 @@ omni = Omni(
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
 ```
 
+### Using CFG-Parallel
+
+Run image-to-image:
+
+CFG-Parallel splits the CFG positive/negative branches across GPUs. Use it when you set a non-trivial `true_cfg_scale`.
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+cfg_parallel_size = 2
+
+omni = Omni(
+    model="Qwen/Qwen-Image-Edit",
+    parallel_config=DiffusionParallelConfig(cfg_parallel_size=cfg_parallel_size)
+)
+
+outputs = omni.generate(prompt="turn this cat to a dog",
+        pil_image=input_image, num_inference_steps=50, true_cfg_scale=4.0)
+```
+
 ## Documentation
 
 For detailed information on each acceleration method:
@@ -179,3 +200,4 @@ For detailed information on each acceleration method:
 - **[TeaCache Guide](acceleration/teacache.md)** - Complete TeaCache documentation, configuration options, and best practices
 - **[Cache-DiT Acceleration Guide](acceleration/cache_dit_acceleration.md)** - Comprehensive Cache-DiT guide covering DBCache, TaylorSeer, SCM, and configuration parameters
 - **[Sequence Parallelism](acceleration/parallelism_acceleration.md#sequence-parallelism)** - Guidance on how to set sequence parallelism with configuration.
+- **[CFG-Parallel](acceleration/parallelism_acceleration.md#cfg-parallel)** - Guidance on how to set CFG-Parallel to run positive/negative branches across ranks.

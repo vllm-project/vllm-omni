@@ -33,6 +33,8 @@ nav:
       - Parallelism Acceleration: user_guide/acceleration/parallelism_acceleration.md
   - Models:
     - models/supported_models.md
+  - Features:
+    - Sleep Mode: features/sleep_mode.md
 - Developer Guide:
   - General:
     - contributing/README.md
