@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
 
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -7,7 +8,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def regionally_compile(model: nn.Module, *args, **kwargs) -> nn.Module:
+def regionally_compile(model: nn.Module, *args: Any, **kwargs: dict[str, Any]) -> nn.Module:
     """
     Apply regional compilation to a PyTorch model.
 
