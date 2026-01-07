@@ -373,7 +373,6 @@ class AsyncOmni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
                     )
-                    stage.set_engine_outputs(engine_outputs)
 
                     if isinstance(engine_outputs, list):
                         engine_outputs = engine_outputs[0]
@@ -419,7 +418,9 @@ class AsyncOmni(OmniBase):
                                 final_output_type=stage.final_output_type,
                                 request_output=engine_outputs,
                             )
-
+                if not isinstance(engine_outputs, list):
+                    engine_outputs = [engine_outputs]
+                stage.set_engine_outputs(engine_outputs)
                 # Forward to next stage if there is one
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_for_e2e and finished:
