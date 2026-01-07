@@ -41,6 +41,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        # TODO move this model specific logic to a separate class
         if hasattr(self.model, "talker_mtp") and self.model.talker is not None:
             self.talker_mtp = self.model.talker_mtp
             cudagraph_mode = self.compilation_config.cudagraph_mode

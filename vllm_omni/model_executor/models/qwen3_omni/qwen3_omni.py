@@ -194,10 +194,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 device=self._module_device(self.thinker),
                 dtype=torch.long,
             )
-        elif self.model_stage == "talker":
-            self.dummy_code_predictor_codes = torch.zeros((0, self.talker.num_code_groups), dtype=torch.long).squeeze(
-                -1
-            )
 
     # ==================== Device utilities ====================
 
@@ -668,7 +664,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 (0, self.talker.num_code_groups), device=self._module_device(self.talker), dtype=torch.long
             )
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
-        return inputs_embeds, code_predictor_codes
+        return inputs_embeds, code_predictor_codes.squeeze(-1)
 
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
