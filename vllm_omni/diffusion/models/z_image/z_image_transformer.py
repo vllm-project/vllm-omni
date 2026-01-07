@@ -186,7 +186,6 @@ class FeedForward(nn.Module):
         return self.w2(self.act(self.w13(x)))
 
 
-@torch.compile(dynamic=True)
 class ZImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -345,6 +344,8 @@ class RopeEmbedder:
 
 
 class ZImageTransformer2DModel(nn.Module):
+    _repeated_blocks = ["ZImageTransformerBlock"]
+
     def __init__(
         self,
         all_patch_size=(2,),

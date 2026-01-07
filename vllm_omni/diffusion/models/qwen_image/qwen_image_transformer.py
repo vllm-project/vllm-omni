@@ -458,7 +458,6 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-@torch.compile(dynamic=True)
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -632,6 +631,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         axes_dims_rope (`tuple[int]`, defaults to `(16, 56, 56)`):
             The dimensions to use for the rotary positional embeddings.
     """
+
+    _repeated_blocks = ["QwenImageTransformerBlock"]
 
     def __init__(
         self,

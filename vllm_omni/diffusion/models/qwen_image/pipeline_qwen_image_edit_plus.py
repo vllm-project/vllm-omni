@@ -30,6 +30,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     calculate_dimensions,
@@ -156,9 +157,7 @@ def get_qwen_image_edit_plus_post_process_func(
     return post_process_func
 
 
-class QwenImageEditPlusPipeline(
-    nn.Module,
-):
+class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
     def __init__(
         self,
         *,

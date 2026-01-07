@@ -365,6 +365,8 @@ class OvisImageTransformer2DModel(nn.Module):
             The dimensions to use for the rotary positional embeddings.
     """
 
+    _repeated_blocks = ["OvisImageTransformerBlock", "OvisImageSingleTransformerBlock"]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
