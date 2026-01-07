@@ -202,3 +202,114 @@ def test_sequence_parallel(
         f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}); "
         f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
     )
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_sequence_parallel_ulysses_sp_only(
+    model_name: str,
+    dtype: torch.dtype,
+    attn_backend: str,
+):
+    """Test sequence parallel with ulysses_degree=4, ring_degree=1, and the image size (332x332) where the sequence length is NOT divisible by sp_size."""
+    ulysses_degree = 4
+    ring_degree = 1
+
+    # Skip if not enough GPUs available for SP run
+    if device_count() < ulysses_degree * ring_degree:
+        pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
+
+    # (272/8) * (272/8) = 17 * 17 = 289 Not divisible by sp_size=4
+    height = 272
+    width = 272
+    num_inference_steps = 4  # Minimal steps for fast test
+    seed = 42
+
+    # Step 1: Baseline (no Ulysses sequence parallel)
+    baseline_parallel_config = DiffusionParallelConfig(ulysses_degree=1, ring_degree=1)
+    baseline = Omni(
+        model=model_name,
+        parallel_config=baseline_parallel_config,
+        dtype=dtype,
+        attention_backend=attn_backend,
+    )
+    try:
+        outputs = baseline.generate(
+            PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=0.0,
+            generator=torch.Generator(get_device_name()).manual_seed(seed),
+            num_outputs_per_prompt=1,
+        )
+        baseline_images = outputs[0].request_output[0].images
+    finally:
+        baseline.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+            os.environ.pop(key, None)
+        time.sleep(2)  # Wait for resources to release
+
+    assert baseline_images is not None
+    assert len(baseline_images) == 1
+    assert baseline_images[0].width == width
+    assert baseline_images[0].height == height
+
+    # Step 2: SP (Ulysses-SP + Ring-SP)
+    sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    sp = Omni(
+        model=model_name,
+        parallel_config=sp_parallel_config,
+        dtype=dtype,
+        attention_backend=attn_backend,
+    )
+    try:
+        outputs = sp.generate(
+            PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=0.0,
+            generator=torch.Generator(get_device_name()).manual_seed(seed),
+            num_outputs_per_prompt=1,
+        )
+        sp_images = outputs[0].request_output[0].images
+    finally:
+        sp.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+            os.environ.pop(key, None)
+        time.sleep(2)
+
+    assert sp_images is not None
+    assert len(sp_images) == 1
+    assert sp_images[0].width == width
+    assert sp_images[0].height == height
+
+    # Step 3: Compare outputs
+    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
+
+    # FP16/BF16 may differ slightly due to different computation order under parallelism.
+    if dtype in (torch.float16, torch.bfloat16):
+        mean_threshold = 2e-2
+        max_threshold = 2e-1
+    else:
+        mean_threshold = 1e-2
+        max_threshold = 1e-1
+
+    print(
+        "Image diff stats (baseline ulysses_degree*ring_degree=1 vs SP): "
+        f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
+        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
+        f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
+    )
+
+    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
+        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
+        f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}); "
+        f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
+    )
