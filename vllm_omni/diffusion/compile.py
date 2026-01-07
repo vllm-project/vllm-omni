@@ -8,13 +8,14 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def regionally_compile(model: nn.Module, *args: Any, **kwargs: dict[str, Any]) -> nn.Module:
+def regionally_compile(model: nn.Module, *compile_args: Any, **compile_kwargs: Any) -> nn.Module:
     """
     Apply regional compilation to a PyTorch model.
 
     Args:
         model: The PyTorch model instance to compile
-        *args, **kwargs: Arguments passed to torch.compile
+        *compile_args: Positional arguments forwarded to torch.compile
+        **compile_kwargs: Keyword arguments forwarded to torch.compile
 
     Returns:
         The same model instance (modified in-place)
@@ -31,7 +32,7 @@ def regionally_compile(model: nn.Module, *args: Any, **kwargs: dict[str, Any]) -
     for submod in model.modules():
         if submod.__class__.__name__ in repeated_blocks:
             # Compile this submodule
-            submod.compile(*args, **kwargs)
+            submod.compile(*compile_args, **compile_kwargs)
             has_compiled_region = True
 
     if not has_compiled_region:
