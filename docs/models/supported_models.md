@@ -19,7 +19,9 @@ th {
 |--------------|--------|-------------------|
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` |
+| `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
+| `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
@@ -29,6 +31,7 @@ th {
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 |`LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` |
+|`StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` |
 
 
 ## List of Supported Models for NPU
@@ -44,6 +47,7 @@ th {
 |--------------|--------|-------------------|
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B`|
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` |
+| `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |

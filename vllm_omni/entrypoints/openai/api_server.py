@@ -46,12 +46,14 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 logger = init_logger(__name__)
 
@@ -432,12 +434,20 @@ async def omni_init_app_state(
         log_error_stack=args.log_error_stack,
     )
 
+    state.openai_serving_speech = OmniOpenAIServingSpeech(
+        engine_client, state.openai_serving_models, request_logger=request_logger
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
 
 
 def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
     return request.app.state.openai_serving_chat
+
+
+def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
+    return request.app.state.openai_serving_speech
 
 
 @router.post(
@@ -496,6 +506,28 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
+@router.post(
+    "/v1/audio/speech",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support Speech API")
+    try:
+        return await handler.create_speech(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
 # Image generation API endpoints
 
 
@@ -541,8 +573,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             detail="Stage configs not found. Start server with a multi-stage omni model.",
         )
 
-    # Check for diffusion stage
+    # Check for diffusion stage and collect stage types
     has_diffusion_stage = False
+    stage_types: list[str] = []
     for stage in stage_configs:
         # Handle both dict and OmegaConf objects
         stage_type = None
@@ -561,7 +594,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         if stage_type == "diffusion":
             has_diffusion_stage = True
-            break
+        stage_types.append(stage_type)
 
     if not has_diffusion_stage:
         raise HTTPException(
@@ -615,7 +648,33 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
-        result = await engine_client.generate(**gen_params)
+        result = None
+        stage_list = getattr(engine_client, "stage_list", None)
+        if isinstance(stage_list, list):
+            default_params_list = getattr(engine_client, "default_sampling_params_list", None)
+            if not isinstance(default_params_list, list):
+                default_params_list = [{} for _ in stage_types]
+            else:
+                default_params_list = list(default_params_list)
+            if len(default_params_list) != len(stage_types):
+                default_params_list = (default_params_list + [{} for _ in stage_types])[: len(stage_types)]
+
+            sampling_params_list: list[dict[str, Any]] = []
+            for idx, stage_type in enumerate(stage_types):
+                if stage_type == "diffusion":
+                    sampling_params_list.append(gen_params)
+                else:
+                    base_params = default_params_list[idx]
+                    sampling_params_list.append(dict(base_params) if isinstance(base_params, dict) else base_params)
+
+            async for output in engine_client.generate(
+                prompt=gen_params["prompt"],
+                request_id=gen_params["request_id"],
+                sampling_params_list=sampling_params_list,
+            ):
+                result = output
+        else:
+            result = await engine_client.generate(**gen_params)
 
         if result is None:
             raise HTTPException(
@@ -624,7 +683,15 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             )
 
         # Extract images from result
-        images = result.images if hasattr(result, "images") and result.images else []
+        images = []
+        if hasattr(result, "images") and result.images:
+            images = result.images
+        elif hasattr(result, "request_output"):
+            request_output = result.request_output
+            if isinstance(request_output, dict) and request_output.get("images"):
+                images = request_output["images"]
+            elif hasattr(request_output, "images") and request_output.images:
+                images = request_output.images
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 

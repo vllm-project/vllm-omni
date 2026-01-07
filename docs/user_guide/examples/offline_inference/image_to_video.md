@@ -1,0 +1,66 @@
+# Image-To-Video
+
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video>.
+
+
+This example demonstrates how to generate videos from images using Wan2.2 Image-to-Video models with vLLM-Omni's offline inference API.
+
+## Local CLI Usage
+
+### Wan2.2-I2V-A14B-Diffusers (MoE)
+```bash
+python image_to_video.py \
+  --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --image input.png \
+  --prompt "A cat playing with yarn, smooth motion" \
+  --negative_prompt "<optional quality filter>" \
+  --height 480 \
+  --width 832 \
+  --num_frames 48 \
+  --guidance_scale 5.0 \
+  --guidance_scale_high 6.0 \
+  --num_inference_steps 40 \
+  --boundary_ratio 0.875 \
+  --flow_shift 12.0 \
+  --fps 16 \
+  --output i2v_output.mp4
+```
+
+### Wan2.2-TI2V-5B-Diffusers (Unified)
+```bash
+python image_to_video.py \
+  --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --image input.png \
+  --prompt "A cat playing with yarn, smooth motion" \
+  --negative_prompt "<optional quality filter>" \
+  --height 480 \
+  --width 832 \
+  --num_frames 48 \
+  --guidance_scale 4.0 \
+  --num_inference_steps 40 \
+  --flow_shift 12.0 \
+  --fps 16 \
+  --output i2v_output.mp4
+```
+
+Key arguments:
+
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V).
+- `--image`: Path to input image (required).
+- `--prompt`: Text description of desired motion/animation.
+- `--height/--width`: Output resolution (auto-calculated from image if not set). Dimensions should be multiples of 16.
+- `--num_frames`: Number of frames (default 81).
+- `--guidance_scale` and `--guidance_scale_high`: CFG scale (applied to low/high-noise stages for MoE).
+- `--negative_prompt`: Optional list of artifacts to suppress.
+- `--boundary_ratio`: Boundary split ratio for two-stage MoE models.
+- `--flow_shift`: Scheduler flow shift (5.0 for 720p, 12.0 for 480p).
+- `--num_inference_steps`: Number of denoising steps (default 50).
+- `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).
+- `--output`: Path to save the generated video.
+
+## Example materials
+
+??? abstract "image_to_video.py"
+    ``````py
+    --8<-- "examples/offline_inference/image_to_video/image_to_video.py"
+    ``````

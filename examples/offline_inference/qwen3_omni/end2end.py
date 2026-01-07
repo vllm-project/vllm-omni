@@ -6,6 +6,7 @@ with the correct prompt format on Qwen3-Omni (thinker only).
 """
 
 import os
+import time
 from typing import NamedTuple
 
 import librosa
@@ -143,11 +144,94 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     )
 
 
+def get_mixed_modalities_query(
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    num_frames: int = 16,
+    sampling_rate: int = 16000,
+) -> QueryResult:
+    question = "What is recited in the audio? What is the content of this image? Why is this video funny?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "<|vision_start|><|video_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    # Load video
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+
+    # Load image
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+
+    # Load audio
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "audio": audio_data,
+                "image": image_data,
+                "video": video_frames,
+            },
+        },
+        limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
+    )
+
+
+def get_multi_audios_query() -> QueryResult:
+    question = "Are these two audio clips the same?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+        "<|audio_start|><|audio_pad|><|audio_end|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "audio": [
+                    AudioAsset("winning_call").audio_and_sample_rate,
+                    AudioAsset("mary_had_lamb").audio_and_sample_rate,
+                ],
+            },
+        },
+        limit_mm_per_prompt={
+            "audio": 2,
+        },
+    )
+
+
 query_map = {
     "text": get_text_query,
     "use_audio": get_audio_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
+    "multi_audios": get_multi_audios_query,
+    "mixed_modalities": get_mixed_modalities_query,
 }
 
 
@@ -167,19 +251,22 @@ def main(args):
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_audio":
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
+    elif args.query_type == "mixed_modalities":
+        query_result = query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            num_frames=getattr(args, "num_frames", 16),
+            sampling_rate=getattr(args, "sampling_rate", 16000),
+        )
     else:
         query_result = query_func()
-
-    if not args.enable_stats:
-        log_file = None
-    else:
-        log_file = os.path.join(args.log_dir, f"omni_llm_pipeline_{args.query_type}")
 
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
-        log_file=log_file,
         log_stats=args.enable_stats,
+        stage_init_timeout=args.stage_init_timeout,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -233,12 +320,18 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    omni_outputs = omni_llm.generate(prompts, sampling_params_list)
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    if profiler_enabled:
+        omni_llm.start_profile(stages=[0])
+    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
 
-    for stage_outputs in omni_outputs:
+    total_requests = len(prompts)
+    processed_count = 0
+
+    for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
                 request_id = output.request_id
@@ -273,6 +366,16 @@ def main(args):
                 # Save audio file with explicit WAV format
                 sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+
+        processed_count += len(stage_outputs.request_output)
+        if profiler_enabled and processed_count >= total_requests:
+            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+            # Stop the profiler while workers are still alive
+            omni_llm.stop_profile()
+
+            print("[Info] Waiting 30s for workers to write trace files to disk...")
+            time.sleep(30)
+            print("[Info] Trace export wait time finished.")
     omni_llm.close()
 
 
@@ -282,7 +385,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="use_video",
+        default="mixed_modalities",
         choices=query_map.keys(),
         help="Query type.",
     )
@@ -293,10 +396,10 @@ def parse_args():
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(
-        "--init-sleep-seconds",
+        "--stage-init-timeout",
         type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300)",
     )
     parser.add_argument(
         "--batch-timeout",
@@ -383,6 +486,12 @@ def parse_args():
         type=str,
         default=None,
         help="Output modalities to use for the prompts.",
+    )
+    parser.add_argument(
+        "--py-generator",
+        action="store_true",
+        default=False,
+        help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
 
     return parser.parse_args()

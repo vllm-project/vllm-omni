@@ -5,19 +5,19 @@ import os
 import time
 
 import torch
-from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
+from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
-    set_current_omni_diffusion_config,
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.worker.gpu_worker import GPUWorker, WorkerProc
 
@@ -49,10 +49,7 @@ class NPUWorker(GPUWorker):
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
-        with (
-            set_current_omni_diffusion_config(self.od_config),
-            set_current_vllm_config(vllm_config),
-        ):
+        with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
             parallel_config = self.od_config.parallel_config

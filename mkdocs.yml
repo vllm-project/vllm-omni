@@ -113,7 +113,8 @@ plugins:
           - https://docs.aiohttp.org/en/stable/objects.inv
           - https://pillow.readthedocs.io/en/stable/objects.inv
           - https://numpy.org/doc/stable/objects.inv
-          - https://pytorch.org/docs/stable/objects.inv
+          # Temporarily disabled due to decompression errors
+          # - https://pytorch.org/docs/stable/objects.inv
           - https://psutil.readthedocs.io/en/stable/objects.inv
 
 markdown_extensions:
@@ -122,7 +123,11 @@ markdown_extensions:
   - admonition
   - pymdownx.details
   # For content tabs
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       slugify: !!python/object/apply:pymdownx.slugs.slugify
         kwds:
@@ -152,5 +157,7 @@ extra_css:
 extra_javascript:
   - mkdocs/javascript/mathjax.js
   - https://unpkg.com/mathjax@3.2.2/es5/tex-mml-chtml.js
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+  - mkdocs/javascript/mermaid.js
   - mkdocs/javascript/edit_and_feedback.js
   - mkdocs/javascript/slack_and_forum.js

@@ -23,16 +23,18 @@ SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
                 "top_p": 1.0,
                 "top_k": -1,
                 "max_tokens": 2048,
+                "seed": SEED,
                 "detokenize": True,
                 "repetition_penalty": 1.1,
             },
             "talker": {
-                "temperature": 0.0,
-                "top_p": 1.0,
-                "top_k": -1,
+                "temperature": 0.9,
+                "top_p": 0.8,
+                "top_k": 40,
                 "max_tokens": 2048,
+                "seed": SEED,
                 "detokenize": True,
-                "repetition_penalty": 1.1,
+                "repetition_penalty": 1.05,
                 "stop_token_ids": [8294],
             },
             "code2wav": {
@@ -40,6 +42,7 @@ SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
                 "top_p": 1.0,
                 "top_k": -1,
                 "max_tokens": 2048,
+                "seed": SEED,
                 "detokenize": True,
                 "repetition_penalty": 1.1,
             },
@@ -241,10 +244,12 @@ def run_inference_api(
     video_file: str | None = None,
     use_audio_in_video: bool = False,
     output_modalities: str | None = None,
+    stream: bool = False,
 ):
     """Run inference using OpenAI API client with multimodal support."""
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
-        return "Please provide at least a text prompt or multimodal input.", None
+        yield "Please provide at least a text prompt or multimodal input.", None
+        return
 
     try:
         # Build message content list
@@ -324,7 +329,7 @@ def run_inference_api(
             extra_body["mm_processor_kwargs"] = mm_processor_kwargs
 
         # Parse output modalities
-        if output_modalities is not None:
+        if output_modalities and output_modalities.strip():
             output_modalities_list = [m.strip() for m in output_modalities.split(",")]
         else:
             output_modalities_list = None
@@ -335,29 +340,71 @@ def run_inference_api(
             model=model,
             modalities=output_modalities_list,
             extra_body=extra_body,
+            stream=stream,
         )
 
-        # Extract outputs
-        text_outputs: list[str] = []
-        audio_output = None
+        if not stream:
+            # Non-streaming mode: extract outputs and yield once
+            text_outputs: list[str] = []
+            audio_output = None
 
-        for choice in chat_completion.choices:
-            if choice.message.content:
-                text_outputs.append(choice.message.content)
-            if choice.message.audio:
-                # Decode base64 audio
-                audio_data = base64.b64decode(choice.message.audio.data)
-                # Load audio from bytes
-                audio_np, sample_rate = sf.read(io.BytesIO(audio_data))
-                # Convert to mono if needed
-                if audio_np.ndim > 1:
-                    audio_np = audio_np[:, 0]
-                audio_output = (int(sample_rate), audio_np.astype(np.float32))
+            for choice in chat_completion.choices:
+                if choice.message.content:
+                    text_outputs.append(choice.message.content)
+                if choice.message.audio:
+                    # Decode base64 audio
+                    audio_data = base64.b64decode(choice.message.audio.data)
+                    # Load audio from bytes
+                    audio_np, sample_rate = sf.read(io.BytesIO(audio_data))
+                    # Convert to mono if needed
+                    if audio_np.ndim > 1:
+                        audio_np = audio_np[:, 0]
+                    audio_output = (int(sample_rate), audio_np.astype(np.float32))
 
-        text_response = "\n\n".join(text_outputs) if text_outputs else "No text output."
-        return text_response, audio_output
+            text_response = "\n\n".join(text_outputs) if text_outputs else "No text output."
+            yield text_response, audio_output
+        else:
+            # Streaming mode: yield incremental updates
+            text_content = ""
+            audio_output = None
+
+            for chunk in chat_completion:
+                for choice in chunk.choices:
+                    if hasattr(choice, "delta"):
+                        content = getattr(choice.delta, "content", None)
+                    else:
+                        content = None
+
+                    # Handle audio modality
+                    if getattr(chunk, "modality", None) == "audio" and content:
+                        try:
+                            # Decode base64 audio
+                            audio_data = base64.b64decode(content)
+                            # Load audio from bytes
+                            audio_np, sample_rate = sf.read(io.BytesIO(audio_data))
+                            # Convert to mono if needed
+                            if audio_np.ndim > 1:
+                                audio_np = audio_np[:, 0]
+                            audio_output = (int(sample_rate), audio_np.astype(np.float32))
+                            # Yield current text and audio
+                            yield text_content if text_content else "", audio_output
+                        except Exception:  # pylint: disable=broad-except
+                            # If audio processing fails, just yield text
+                            yield text_content if text_content else "", None
+
+                    # Handle text modality
+                    elif getattr(chunk, "modality", None) == "text":
+                        if content:
+                            text_content += content
+                            # Yield updated text content (keep existing audio if any)
+                            yield text_content, audio_output
+
+            # Final yield with accumulated text and last audio (if any)
+            yield text_content if text_content else "No text output.", audio_output
+
     except Exception as exc:  # pylint: disable=broad-except
-        return f"Inference failed: {exc}", None
+        error_msg = f"Inference failed: {exc}"
+        yield error_msg, None
 
 
 def build_interface(
@@ -374,8 +421,10 @@ def build_interface(
         video_file: str | None,
         use_audio_in_video: bool,
         output_modalities: str | None = None,
+        stream: bool = False,
     ):
-        return run_inference_api(
+        # Always yield from the API function to maintain consistent generator behavior
+        yield from run_inference_api(
             client,
             model,
             sampling_params_dict,
@@ -385,6 +434,7 @@ def build_interface(
             video_file,
             use_audio_in_video,
             output_modalities,
+            stream,
         )
 
     css = """
@@ -455,8 +505,15 @@ def build_interface(
         with gr.Row():
             output_modalities = gr.Textbox(
                 label="Output Modalities",
+                value=None,
                 placeholder="For example: text, image, video. Use comma to separate multiple modalities.",
                 lines=1,
+                scale=2,
+            )
+            stream_checkbox = gr.Checkbox(
+                label="Stream output",
+                value=False,
+                info="Enable streaming to see output as it's generated.",
                 scale=1,
             )
 
@@ -474,7 +531,15 @@ def build_interface(
 
         generate_btn.click(
             fn=run_inference,
-            inputs=[input_box, audio_input, image_input, video_input, use_audio_in_video_checkbox, output_modalities],
+            inputs=[
+                input_box,
+                audio_input,
+                image_input,
+                video_input,
+                use_audio_in_video_checkbox,
+                output_modalities,
+                stream_checkbox,
+            ],
             outputs=[text_output, audio_output],
         )
         demo.queue()

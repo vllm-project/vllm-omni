@@ -110,10 +110,10 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
                         ):
                             exc_info = cloudpickle.load(f)
 
-                    if (original_exception := exc_info.get("pickled_exception")) is not None:
+                    original_exception = exc_info.get("pickled_exception")
+                    if original_exception is not None and isinstance(original_exception, Exception):
                         # Re-raise the actual exception object if it was
                         # successfully pickled.
-                        assert isinstance(original_exception, Exception)
                         raise original_exception
 
                     if (original_tb := exc_info.get("traceback")) is not None:

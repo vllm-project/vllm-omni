@@ -113,6 +113,17 @@ def resolve_model_config_path(model: str) -> str:
                     f"Could not determine model_type for diffusers model: {model}. "
                     f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
                 )
+        elif file_or_path_exists(model, "config.json", revision=None):
+            # Try to read config.json manually for custom models like Bagel that fail get_config
+            # but have a valid config.json with model_type
+            try:
+                config_dict = get_hf_file_to_dict("config.json", model, revision=None)
+                if config_dict and "model_type" in config_dict:
+                    model_type = config_dict["model_type"]
+                else:
+                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+            except Exception as e:
+                raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
             raise ValueError(
                 f"Could not determine model_type for model: {model}. "

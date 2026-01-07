@@ -7,7 +7,7 @@ import os
 import pytest
 import torch
 
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, SeqAllToAll5D
+from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     get_sp_group,
@@ -290,3 +290,110 @@ def _test_5d_identity_worker(
 
     # Cleanup distributed environment
     destroy_distributed_env()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("num_heads", [8])
+@pytest.mark.parametrize("head_size", [128])
+def test_ring_p2p(
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    num_heads: int,
+    head_size: int,
+):
+    """Test Ring P2P communication (send_recv)."""
+    torch.multiprocessing.spawn(
+        _test_ring_p2p_worker,
+        args=(world_size, dtype, batch_size, num_heads, head_size),
+        nprocs=world_size,
+    )
+
+
+def _test_ring_p2p_worker(
+    local_rank: int,
+    world_size: int,
+    dtype: torch.dtype,
+    batch_size: int,
+    num_heads: int,
+    head_size: int,
+):
+    """Worker for Ring P2P test."""
+    import sys
+
+    # Set device
+    device = torch.device(f"{device_type}:{local_rank}")
+    torch_device.set_device(device)
+
+    # Set env vars
+    # Use a different port to avoid conflict with other tests if run in parallel
+    update_environment_variables(
+        {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "29501",
+        }
+    )
+
+    # Init distributed
+    try:
+        init_distributed_environment()
+        # Ring degree = world_size to test ring group
+        initialize_model_parallel(ring_degree=world_size)
+        sp_group = get_sp_group()
+
+        print(f"[Rank {local_rank}] Initialized. Ring group size: {sp_group.ring_group.size()}")
+        sys.stdout.flush()
+
+        # Create RingComm
+        comm = RingComm(sp_group.ring_group)
+
+        # Create tensor: rank-specific data
+        # (batch, num_heads, head_size)
+        # Fill with rank value + 1 to avoid 0 and make verification easy
+        input_tensor = torch.full(
+            (batch_size, num_heads, head_size), fill_value=float(local_rank + 1), dtype=dtype, device=device
+        )
+
+        print(f"[Rank {local_rank}] Input sum: {input_tensor.sum().item()}")
+        sys.stdout.flush()
+
+        # Send input, receive from prev
+        # RingComm.send_recv sends to next, receives from prev
+        t0 = __import__("time").time()
+        recv_tensor = comm.send_recv(input_tensor)
+        comm.commit()
+        comm.wait()
+        t1 = __import__("time").time()
+
+        print(f"[Rank {local_rank}] Communication done in {t1 - t0:.4f}s")
+
+        # Verify
+        # Expected value: from (rank - 1) % world_size
+        prev_rank = (local_rank - 1 + world_size) % world_size
+        expected_value = float(prev_rank + 1)
+
+        recv_sum = recv_tensor.sum().item()
+        print(f"[Rank {local_rank}] Received sum: {recv_sum}, Expected value: {expected_value}")
+        sys.stdout.flush()
+
+        expected_tensor = torch.full_like(recv_tensor, fill_value=expected_value)
+
+        # Use a slightly loose tolerance for bfloat16
+        torch.testing.assert_close(
+            recv_tensor, expected_tensor, rtol=1e-3, atol=1e-3, msg=f"[Rank {local_rank}] Data mismatch!"
+        )
+        print(f"[Rank {local_rank}] Verification PASSED")
+
+    except Exception as e:
+        print(f"[Rank {local_rank}] FAILED with error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise e
+    finally:
+        destroy_distributed_env()

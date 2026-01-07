@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import multiprocessing as mp
 import os
 import time
 import uuid
-from collections.abc import Sequence
+import weakref
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
 from typing import Any
 
-import msgspec
 from omegaconf import OmegaConf
+from tqdm.auto import tqdm
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
@@ -29,6 +30,7 @@ from vllm_omni.distributed.ray_utils.utils import (
 )
 from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
+from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
@@ -39,6 +41,22 @@ from vllm_omni.entrypoints.utils import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
+    """Weak reference cleanup function for OmniBase instances."""
+    if stage_list:
+        for q in stage_in_queues:
+            try:
+                q.put_nowait(SHUTDOWN_TASK)
+            except Exception as e:
+                logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+        for stage in stage_list:
+            try:
+                stage.stop_stage_worker()
+            except Exception as e:
+                logger.warning(f"Failed to stop stage worker: {e}")
+    try_close_ray(ray_pg)
 
 
 def _dummy_snapshot_download(model_id):
@@ -56,8 +74,8 @@ def omni_snapshot_download(model_id) -> str:
         return _dummy_snapshot_download(model_id)
 
 
-class Omni:
-    """Unified entrypoint for both LLM and Diffusion models for better usability.
+class OmniBase:
+    """Base class for serving Omni models.
 
     Args:
         *args: Variable length argument list.
@@ -68,11 +86,16 @@ class Omni:
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
               be written to files with stage-specific suffixes.
-
-    Example:
-        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
-        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
-        >>> print(outputs)
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+            - Additional keyword arguments passed to stage engines.
     """
 
     def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
@@ -99,13 +122,77 @@ class Omni:
         logger.info(f"Initializing stages for model: {model}")
         self._initialize_stages(model, kwargs)
 
-    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Initialize stage list management.
+    def _get_default_cache_config(self, cache_backend: str | None) -> dict[str, Any] | None:
+        if cache_backend == "cache_dit":
+            return {
+                "Fn_compute_blocks": 1,
+                "Bn_compute_blocks": 0,
+                "max_warmup_steps": 4,
+                "residual_diff_threshold": 0.24,
+                "max_continuous_cached_steps": 3,
+                "enable_taylorseer": False,
+                "taylorseer_order": 1,
+                "scm_steps_mask_policy": None,
+                "scm_steps_policy": "dynamic",
+            }
+        if cache_backend == "tea_cache":
+            return {
+                "rel_l1_thresh": 0.2,
+            }
+        return None
 
-        Each stage will create appropriate instance (OmniLLM or OmniDiffusion)
-        based on stage_type in YAML config (handled in omni_stage.py).
-        """
-        init_sleep_seconds = kwargs.get("init_sleep_seconds", 20)
+    def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:
+        if isinstance(cache_config, str):
+            try:
+                cache_config = json.loads(cache_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid cache_config JSON, using defaults.")
+                cache_config = None
+        if cache_config is None and cache_backend not in (None, "", "none"):
+            cache_config = self._get_default_cache_config(cache_backend)
+        return cache_config
+
+    def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Create default diffusion stage configuration."""
+        # We temporally create a default config for diffusion stage.
+        # In the future, we should merge the default config with the user-provided config.
+        # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
+        if "dtype" in kwargs:
+            kwargs["dtype"] = str(kwargs["dtype"])
+        cache_backend = kwargs.get("cache_backend", "none")
+        cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+        # TODO: hack, calculate devices based on parallel config.
+        devices = "0"
+        if "parallel_config" in kwargs:
+            num_devices = kwargs["parallel_config"].world_size
+            for i in range(1, num_devices):
+                devices += f",{i}"
+        default_stage_cfg = [
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {
+                    "process": True,
+                    "devices": devices,
+                    "max_batch_size": 1,
+                },
+                "engine_args": OmegaConf.create(
+                    {
+                        **kwargs,
+                        "cache_backend": cache_backend,
+                        "cache_config": cache_config,
+                    }
+                ),
+                "final_output": True,
+                "final_output_type": "image",
+            }
+        ]
+        default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
+        return default_stage_cfg
+
+    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
+        """Initialize stage list management."""
+        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
         shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
         init_timeout = kwargs.get("init_timeout", 300)
         worker_backend = kwargs.get("worker_backend", "multi_process")
@@ -119,31 +206,7 @@ class Omni:
             self.config_path = resolve_model_config_path(model)
             self.stage_configs = load_stage_configs_from_model(model)
             if not self.stage_configs:
-                # TODO: hack here, convert dtype to string to avoid non-premitive omegaconf create error.
-                if "dtype" in kwargs:
-                    kwargs["dtype"] = str(kwargs["dtype"])
-                # TODO: hack, calculate devices based on parallel config.
-                devices = "0"
-                if "parallel_config" in kwargs:
-                    num_devices = kwargs["parallel_config"].world_size
-                    for i in range(1, num_devices):
-                        devices += f",{i}"
-                logger.info(f"model: {model}, kwargs: {kwargs}")
-                default_stage_cfg = [
-                    {
-                        "stage_id": 0,
-                        "stage_type": "diffusion",
-                        "runtime": {
-                            "process": True,
-                            "devices": devices,
-                            "max_batch_size": 1,
-                        },
-                        "engine_args": OmegaConf.create(kwargs),
-                        "final_output": True,
-                        "final_output_type": "image",
-                    }
-                ]
-                default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
+                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
                 self.stage_configs = OmegaConf.create(default_stage_cfg)
         else:
             self.config_path = stage_configs_path
@@ -164,7 +227,7 @@ class Omni:
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
             idx, cfg = idx_cfg
-            return idx, OmniStage(cfg)
+            return idx, OmniStage(cfg, stage_init_timeout=stage_init_timeout)
 
         with ThreadPoolExecutor(max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))) as executor:
             futures = [executor.submit(_build_stage, (idx, cfg)) for idx, cfg in enumerate(self.stage_configs)]
@@ -173,8 +236,9 @@ class Omni:
                 results.append(fut.result())
         results.sort(key=lambda x: x[0])
         self.stage_list = [st for _, st in results]
+        self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
-        logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
+        logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
 
         if self.worker_backend == "ray":
             self._queue_cls = get_ray_queue_class()
@@ -182,7 +246,7 @@ class Omni:
             self._ctx = mp.get_context("spawn")
             self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
 
-        self._init_sleep_seconds = max(0, int(init_sleep_seconds))
+        self._stage_init_timeout = max(0, int(stage_init_timeout))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
         # Wait for all stages to report readiness before seeding
@@ -196,7 +260,7 @@ class Omni:
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
 
-        for stage_id, stage in enumerate(self.stage_list):
+        for stage_id, stage in enumerate[OmniStage](self.stage_list):
             in_q = self._queue_cls()
             out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
@@ -210,6 +274,7 @@ class Omni:
 
             stage.init_stage_worker(
                 model,
+                is_async=self.is_async,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx if self.worker_backend != "ray" else None,
                 batch_timeout=self.batch_timeout,
@@ -218,59 +283,181 @@ class Omni:
                 ray_placement_group=self._ray_pg,
             )
 
-            logger.debug("[Orchestrator] Stage-%s process started", stage_id)
-            time.sleep(self._init_sleep_seconds)
+            logger.debug(f"[{self._name}] Stage-{stage_id} process started")
+
+    def _process_stage_ready(self, stage: OmniStage, stage_id: int, result: dict[str, Any]) -> None:
+        self._stages_ready.add(stage_id)
+        logger.info(f"[{self._name}] Stage-{stage_id} reported ready")
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        """Wait for all stages to report readiness."""
-        deadline = time.time() + max(0, int(timeout))
+        """Wait for all stages to report readiness with optimized polling."""
         num_stages = len(self.stage_list)
+        deadline = time.time() + max(0, int(timeout))
+
+        logger.info(f"[{self._name}] Waiting for {num_stages} stages to initialize (timeout: {timeout}s)")
+
         while len(self._stages_ready) < num_stages and time.time() < deadline:
             progressed = False
             for stage_id, stage in enumerate(self.stage_list):
                 if stage_id in self._stages_ready:
                     continue
-                result = stage.try_collect()
-                if result is None:
-                    continue
-                progressed = True
-                if result.get("type") == "stage_ready":
-                    self._stages_ready.add(stage_id)
-                    logger.info("[Orchestrator] Stage-%s reported ready", stage_id)
-                else:
-                    # No user data should arrive before seeding; ignore other messages
-                    pass
-            if not progressed:
-                time.sleep(0.01)
-        if len(self._stages_ready) < num_stages:
-            not_ready = sorted(set(range(num_stages)) - set(self._stages_ready))
-            logger.warning(
-                "[Orchestrator] Initialization timeout: only %s/%s stages are ready; not ready: %s",
-                len(self._stages_ready),
-                num_stages,
-                not_ready,
-            )
-            # Provide actionable suggestions before shutdown
-            try:
-                suggestions = [
-                    "Verify GPU/device assignment in config (runtime.devices) is correct.",
-                    "Check GPU/host memory availability; reduce model or batch size if needed.",
-                    "Check model weights path and network reachability (if loading remotely).",
-                    "Increase initialization wait time (init_sleep_seconds or call-site timeout).",
-                ]
-                logger.error(
-                    "[Orchestrator] Stage initialization failed, shutting down. Suggestions:\n- %s",
-                    "\n- ".join(suggestions),
-                )
-            except Exception:
-                # Best-effort logging of suggestions
-                logger.error(
-                    "[Orchestrator] Stage initialization failed and an error occurred while logging suggestions",
-                )
-        elif len(self._stages_ready) == num_stages:
-            logger.info("[Orchestrator] All stages initialized successfully")
 
-    def generate(self, *args: Any, **kwargs: dict[str, Any]) -> list[OmniRequestOutput]:
+                # Check if the stage has reported status
+                if result := stage.try_collect():
+                    progressed = True
+                    if result.get("type") == "stage_ready":
+                        self._process_stage_ready(stage, stage_id, result)
+
+            if not progressed:
+                time.sleep(0.05)
+
+        # Handle Final State
+        if len(self._stages_ready) == num_stages:
+            logger.info(f"[{self._name}] All stages initialized successfully")
+            return
+
+        # Handle Timeout/Failure
+        not_ready = sorted(set(range(num_stages)) - set(self._stages_ready))
+        logger.warning(
+            f"[{self._name}] Initialization timeout: {len(self._stages_ready)}/{num_stages} "
+            f"stages ready. Missing stages: {not_ready}"
+        )
+
+        suggestions = [
+            "Verify GPU/device assignment in config (runtime.devices) is correct.",
+            "Check GPU/host memory availability; reduce model or batch size if needed.",
+            "Check model weights path and network reachability (if loading remotely).",
+            "Increase initialization wait time (stage_init_timeout or call-site timeout).",
+        ]
+
+        formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
+
+        logger.error(f"[{self._name}] Stage initialization failed. Troubleshooting Steps:\n{formatted_suggestions}")
+
+    def start_profile(self, stages: list[int] | None = None) -> None:
+        """Start profiling for specified stages.
+
+        Sends start_profile command to stage workers. Profiling must be enabled
+        via VLLM_TORCH_PROFILER_DIR environment variable.
+
+        Args:
+            stages: List of stage IDs to start profiling. If None, starts
+                profiling for all stages that have profiling enabled.
+
+        Example:
+            >>> # Profile all stages
+            >>> omni.start_profile()
+            >>> outputs = omni.generate(prompts, sampling_params)
+            >>> omni.stop_profile()
+
+            >>> # Profile only stage 0 and 2
+            >>> omni.start_profile(stages=[0, 2])
+        """
+        if stages is None:
+            stages = list(range(len(self.stage_list)))
+
+        for stage_id in stages:
+            if stage_id < len(self.stage_list):
+                try:
+                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
+                    logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Failed to send start_profile to stage-%s: %s",
+                        self._name,
+                        stage_id,
+                        e,
+                    )
+
+    def stop_profile(self, stages: list[int] | None = None) -> None:
+        """Stop profiling for specified stages.
+
+        Sends stop_profile command to stage workers to finalize and save traces.
+
+        Args:
+            stages: List of stage IDs to stop profiling. If None, stops
+                profiling for all stages.
+
+        Example:
+            >>> omni.start_profile()
+            >>> outputs = omni.generate(prompts, sampling_params)
+            >>> omni.stop_profile()
+            >>> # Traces saved to VLLM_TORCH_PROFILER_DIR/stage_X_<model_stage>/
+        """
+        if stages is None:
+            stages = list(range(len(self.stage_list)))
+
+        for stage_id in stages:
+            if stage_id < len(self.stage_list):
+                try:
+                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_STOP})
+                    logger.info("[%s] Sent stop_profile to stage-%s", self._name, stage_id)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Failed to send stop_profile to stage-%s: %s",
+                        self._name,
+                        stage_id,
+                        e,
+                    )
+
+    def close(self) -> None:
+        """Close all stage processes and clean up resources."""
+        if hasattr(self, "_weak_finalizer"):
+            self._weak_finalizer()
+
+    @property
+    def _name(self) -> str:
+        return "OmniBase"
+
+    @property
+    def is_async(self) -> bool:
+        return False
+
+
+class Omni(OmniBase):
+    """Unified entrypoint for both LLM and Diffusion models for better usability.
+
+    Args:
+        *args: Variable length argument list.
+            - args[0]: Model name or path to load.
+        **kwargs: Arbitrary keyword arguments.
+            - model: Model name or path to load (if not in args).
+            - stage_configs_path: Optional path to YAML file containing stage
+              configurations. If None, configurations are loaded from the model.
+            - log_stats: Whether to enable statistics logging
+              be written to files with stage-specific suffixes.
+            - stage_init_timeout: Per-stage init watchdog (seconds). Measured from
+              when the previous stage finished (possibly a prior Omni run with GPU
+              reuse/overlap) to when the current stage starts to initialize.
+            - shm_threshold_bytes: Threshold in bytes for using shared memory
+              for IPC. Objects larger than this threshold will use shared memory.
+            - worker_backend: Backend for worker processes. Default is "multi_process".
+            - ray_address: Address of Ray cluster for Ray backend, if using Ray backend.
+            - batch_timeout: Timeout in seconds for batching requests within a stage
+            - init_timeout: Timeout in seconds for waiting for all stages to initialize
+            - Additional keyword arguments passed to stage engines.
+
+    Example:
+        >>> omni = Omni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> outputs = omni.generate(prompts="Hello, world!", sampling_params_list=[SamplingParams()])
+        >>> print(outputs)
+    """
+
+    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
+        super().__init__(*args, **kwargs)
+
+        # Register weak reference cleanup (called on garbage collection)
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_cleanup,
+            self.stage_list,
+            self._stage_in_queues,
+            self._ray_pg,
+        )
+
+    def generate(
+        self, *args: Any, **kwargs: dict[str, Any]
+    ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
         Orchestrates the multi-stage pipeline based on YAML configuration.
@@ -294,37 +481,70 @@ class Omni:
         """
         prompts = args[0] if args else kwargs.get("prompts")
         sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
+        py_generator = kwargs.get("py_generator", False)
         if prompts is None:
             if kwargs.get("prompt") is None:
                 raise ValueError("prompts is required for generation")
             prompts = kwargs.get("prompt")
 
         if sampling_params_list is None:
-            omni_params_kwargs = {k: v for k, v in kwargs.items() if k not in ["prompts", "sampling_params_list"]}
+            # For Omni LLM, the params are parsed via the yaml file. For the current version,
+            # diffusion params can parsed via the command line.
+            omni_params_kwargs = {
+                k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
+            }
 
             per_stage_params: list[Any] = []
-            for stage in self.stage_list:
+            for stage_id, stage in enumerate(self.stage_list):
                 stage_type = getattr(stage, "stage_type", "llm")
-                default_dict = msgspec.to_builtins(getattr(stage, "default_sampling_params", {}))
-                # Merge user-provided kwargs
-                merged = {**default_dict, **omni_params_kwargs}
                 if stage_type == "diffusion":
+                    default_dict = self.default_sampling_params_list[stage_id]
+                    # Merge user-provided kwargs
+                    merged = {**default_dict, **omni_params_kwargs}
                     # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
                     per_stage_params.append(merged)
                 else:
-                    # LLM directly constructs SamplingParams
-                    per_stage_params.append(SamplingParams(**merged))
+                    # LLM directly constructs SamplingParams, don't use the merged params
+                    per_stage_params.append(self.default_sampling_params_list[stage_id])
 
             sampling_params_list = per_stage_params
-        return self._run_generation(prompts, sampling_params_list)
+        try:
+            if py_generator:
+                return self._run_generation_with_generator(prompts, sampling_params_list)
+            else:
+                outputs = list(self._run_generation(prompts, sampling_params_list))
+                self.close()
+                return outputs
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to run generation: %s", e)
+            # Always close on exception to ensure cleanup
+            self.close()
+            raise e
+
+    def _run_generation_with_generator(
+        self,
+        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
+        sampling_params_list: Any | Sequence[Any] | None,
+    ) -> Generator[OmniRequestOutput, None, None]:
+        """Run generation through all stages in the pipeline and return a generator."""
+        gen = self._run_generation(prompts, sampling_params_list)
+        try:
+            yield from gen
+        except Exception as e:
+            logger.exception("[Orchestrator] Failed to run generation: %s", e)
+            raise e
+        finally:
+            # Cleanup when generator is exhausted or closed
+            self.close()
 
     def _run_generation(
         self,
         prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
         sampling_params_list: Any | Sequence[Any] | None = None,
-    ) -> list[OmniRequestOutput]:
+        use_tqdm: bool | Callable[..., tqdm] = True,
+    ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline."""
-        logger.debug("[Orchestrator] generate() called")
+        logger.debug(f"[{self._name}] generate() called")
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
@@ -342,8 +562,6 @@ class Omni:
             request_prompts: list[PromptType] = [prompts]
         else:
             request_prompts = list(prompts)
-
-        final_outputs: list[OmniRequestOutput] = []
 
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
@@ -375,8 +593,13 @@ class Omni:
             _wall_start_ts,
         )
 
+        it = request_id_to_prompt.items()
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            it = tqdm_func(it, desc="Adding requests")
+
         # Seed stage-0 queue with all requests
-        logger.debug("[Orchestrator] Seeding %d requests into stage-0", len(request_prompts))
+        logger.debug(f"[{self._name}] Seeding {len(request_prompts)} requests into stage-0")
         # Mark first input time for stage-0
         metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
@@ -389,8 +612,17 @@ class Omni:
             }
             self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
-            logger.debug("[Orchestrator] Enqueued request %s to stage-0", req_id)
+            logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
+        pbar = None
+        if use_tqdm:
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            pbar = tqdm_func(
+                total=len(request_prompts),
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} unit/s, output: {0:.2f} unit/s"),
+            )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
         remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
@@ -398,9 +630,7 @@ class Omni:
         total_requests = len(request_prompts)
 
         logger.debug(
-            "[Orchestrator] Entering scheduling loop: total_requests=%d, stages=%d",
-            total_requests,
-            num_stages,
+            f"[{self._name}] Entering scheduling loop: total_requests={total_requests}, stages={num_stages}",
         )
         while completed_requests < total_requests:
             made_progress = False
@@ -413,10 +643,7 @@ class Omni:
                 req_id = result.get("request_id")
                 if "error" in result:
                     logger.error(
-                        "Stage %s error on request %s: %s",
-                        stage_id,
-                        req_id,
-                        result["error"],
+                        f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
                     continue
 
@@ -430,35 +657,42 @@ class Omni:
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = asdict(result.get("metrics"))
+                    _m = result.get("metrics")
                     if _m is not None:
+                        if not isinstance(_m, dict):
+                            _m = asdict(_m)
                         metrics.on_stage_metrics(stage_id, req_id, _m)
+                        if pbar:
+                            elapsed = pbar.format_dict["elapsed"] or 1e-6
+                            # Aggregate total tokens/images across all stages
+                            total_out = sum(metrics.stage_total_tokens)
+                            out_spd = total_out / elapsed
+
+                            modality = self.output_modalities[stage_id]
+                            unit = "img" if modality == "image" else "tok"
+
+                            # Pre-calculate for cleaner string formatting
+                            if metrics.e2e_count > 0:
+                                avg_lat = metrics.e2e_total_ms / metrics.e2e_count
+                            else:
+                                avg_lat = 0
+
+                            # Align with vLLM's wording "est. speed" using multi-line parentheses
+                            pbar.postfix = (
+                                f"est. speed stage-{stage_id} {unit}/s: {out_spd:.2f}, avg e2e_lat: {avg_lat:.1f}ms"
+                            )
                 except Exception as e:
                     logger.exception(
-                        "[Orchestrator] Failed to process metrics for stage %s, req %s: %s",
-                        stage_id,
-                        req_id,
-                        e,
+                        f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
                     )
                 logger.debug(
-                    "[Orchestrator] Stage-%s completed request %s; forwarding or finalizing",
-                    stage_id,
-                    req_id,
+                    f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
                 )
                 stage.set_engine_outputs(engine_outputs)
 
                 if getattr(stage, "final_output", False):
-                    final_outputs.append(
-                        OmniRequestOutput(
-                            stage_id=stage_id,
-                            final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
-                            request_output=engine_outputs,
-                        )
-                    )
                     logger.debug(
-                        "[Orchestrator] Request %s finalized at stage-%s",
-                        req_id,
-                        stage_id,
+                        f"[{self._name}] Request {req_id} finalized at stage-{stage_id}",
                     )
 
                     # End-to-end timing and time-per-token for final output
@@ -469,16 +703,17 @@ class Omni:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
-                                engine_outputs,
                                 _req_start_ts.get(req_id, _wall_start_ts),
                             )
                     except Exception as e:
                         logger.exception(
-                            "[Orchestrator] Finalize request handling error for req %s at stage %s: %s",
-                            req_id,
-                            stage_id,
-                            e,
+                            f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
                         )
+                    yield OmniRequestOutput(
+                        stage_id=stage_id,
+                        final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
+                        request_output=engine_outputs,
+                    )
 
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
@@ -487,10 +722,8 @@ class Omni:
                         next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
                     except Exception as e:
                         logger.exception(
-                            "[Orchestrator] Process engine inputs error for req %s at stage %s: %s",
-                            req_id,
-                            next_stage_id,
-                            e,
+                            f"[{self._name}] Process engine inputs error for req {req_id}"
+                            f" at stage {next_stage_id}: {e}",
                         )
                         continue
                     sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
@@ -514,59 +747,37 @@ class Omni:
 
                     if not sent_via_connector:
                         raise RuntimeError(
-                            f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                            f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                             "Configure a connector for this edge or inspect connector logs for details."
                         )
                     logger.debug(
-                        "[Orchestrator] Forwarded request %s to stage-%s",
-                        req_id,
-                        next_stage_id,
+                        f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )
                     remaining_by_stage[next_stage_id] += 1
                 else:
                     completed_requests += 1
+                    if pbar:
+                        final_mod = self.output_modalities[final_stage_id_to_prompt[req_id]]
+                        pbar.unit = "img" if final_mod == "image" else "req"
+                        pbar.update(1)
                     logger.debug(
-                        "[Orchestrator] Request %s fully completed (%d/%d)",
-                        req_id,
-                        completed_requests,
-                        total_requests,
+                        f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
 
             if not made_progress:
                 time.sleep(0.005)
-        logger.debug("[Orchestrator] All requests completed")
+        logger.debug(f"[{self._name}] All requests completed")
+
+        if pbar:
+            pbar.close()
 
         # Summarize and print stats
         try:
             summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
             logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
-            logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
+            logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 
-        return final_outputs
-
-    def close(self) -> None:
-        """Close all stage processes and clean up resources."""
-        # Close stages if they exist (for LLM models)
-        if self.stage_list:
-            for q in self._stage_in_queues:
-                try:
-                    q.put_nowait(None)
-                except Exception as e:
-                    logger.warning(
-                        "[Orchestrator] Failed to send shutdown signal to stage input queue: %s",
-                        e,
-                    )
-            for stage in self.stage_list:
-                try:
-                    stage.stop_stage_worker()
-                except Exception as e:
-                    logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
-
-            try_close_ray(self._ray_pg)
-
-    def __del__(self):  # pragma: no cover - best effort cleanup
-        try:
-            self.close()
-        except Exception:
-            logger.debug("[Orchestrator] __del__ close() raised", exc_info=True)
+    @property
+    def _name(self) -> str:
+        return "Orchestrator"

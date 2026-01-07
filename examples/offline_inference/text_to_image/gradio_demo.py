@@ -5,6 +5,7 @@ import gradio as gr
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
@@ -98,7 +99,7 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         if num_images not in {1, 2, 3, 4}:
             raise gr.Error("Number of images must be 1, 2, 3, or 4.")
         generator = torch.Generator(device=device).manual_seed(seed)
-        images = omni.generate(
+        outputs = omni.generate(
             prompt.strip(),
             height=height,
             width=width,
@@ -107,7 +108,20 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
             num_inference_steps=num_steps,
             num_outputs_per_prompt=num_images,
         )
-        return [img for img in images[:num_images]]
+        images_outputs = []
+        for output in outputs:
+            req_out = output.request_output[0]
+            if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
+                raise ValueError("Invalid request_output structure or missing 'images' key")
+            images = req_out.images
+            if not images:
+                raise ValueError("No images found in request_output")
+            # Extend the list with individual images (not append the entire list)
+            images_outputs.extend(images)
+            if len(images_outputs) >= num_images:
+                break
+        # Return only the requested number of images
+        return images_outputs[:num_images]
 
     with gr.Blocks(
         title="vLLM-Omni Web Serving Demo",

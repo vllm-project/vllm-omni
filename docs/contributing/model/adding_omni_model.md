@@ -1,6 +1,6 @@
-# Adding a New Multi-Stage Model to vLLM-Omni
+# Adding an Omni-Modality Model
 
-This guide walks through the process of adding a new model to vLLM-Omni, using **Qwen3-Omni** as a comprehensive example. Qwen3-Omni is a multi-stage omni-modality model that demonstrates the full capabilities of vLLM-Omni's architecture.
+This guide walks through the process of adding a new multi-stage model to vLLM-Omni, using **Qwen3-Omni** as a comprehensive example. Qwen3-Omni is a multi-stage omni-modality model that demonstrates the full capabilities of vLLM-Omni's architecture.
 
 ## Table of Contents
 
@@ -361,6 +361,7 @@ Stage transitions happen automatically in the orchestrator (`OmniLLM` class) dur
 
            # Submit to next stage
            task = {
+               "type": OmniStageTaskType.GENERATE,
                "request_id": req_id,
                "engine_inputs": next_inputs[0],
                "sampling_params": sampling_params_list[next_stage_id],

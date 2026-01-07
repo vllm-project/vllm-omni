@@ -196,7 +196,7 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongcatImageEditPipeline(nn.Module):
+class LongCatImageEditPipeline(nn.Module):
     def __init__(
         self,
         *,

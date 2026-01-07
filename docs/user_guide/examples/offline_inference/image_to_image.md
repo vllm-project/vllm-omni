@@ -19,11 +19,11 @@ Then run:
 
 ```bash
 python image_edit.py \
-  --image qwen_bear.png \
+  --image qwen-bear.png \
   --prompt "Let this mascot dance under the moon, surrounded by floating stars and poetic bubbles such as 'Be Kind'" \
   --output output_image_edit.png \
   --num_inference_steps 50 \
-  --cfg_scale 4.0 \
+  --cfg_scale 4.0
 ```
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)

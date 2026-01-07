@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
@@ -67,10 +68,10 @@ def test_cache_dit(model_name: str):
         raise ValueError("No request_output found in OmniRequestOutput")
 
     req_out = first_output.request_output[0]
-    if not isinstance(req_out, dict) or "images" not in req_out:
+    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
-    images = req_out["images"]
+    images = req_out.images
 
     # Verify generation succeeded
     assert images is not None
@@ -78,5 +79,3 @@ def test_cache_dit(model_name: str):
     # Check image size
     assert images[0].width == width
     assert images[0].height == height
-    # manually close the Omni instance
-    m.close()
