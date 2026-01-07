@@ -21,6 +21,8 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -81,12 +83,14 @@ def _run_baseline(model_name: str, dtype: torch.dtype, attn_backend: str, height
     try:
         outputs = baseline.generate(
             PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=4,
-            guidance_scale=0.0,
-            generator=torch.Generator(get_device_name()).manual_seed(seed),
-            num_outputs_per_prompt=1,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=4,
+                guidance_scale=0.0,
+                generator=torch.Generator(get_device_name()).manual_seed(seed),
+                num_outputs_per_prompt=1,
+            ),
         )
         return outputs[0].request_output[0].images
     finally:
@@ -116,12 +120,14 @@ def _run_sp(
     try:
         outputs = sp.generate(
             PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=4,
-            guidance_scale=0.0,
-            generator=torch.Generator(get_device_name()).manual_seed(seed),
-            num_outputs_per_prompt=1,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=4,
+                guidance_scale=0.0,
+                generator=torch.Generator(get_device_name()).manual_seed(seed),
+                num_outputs_per_prompt=1,
+            ),
         )
         return outputs[0].request_output[0].images
     finally:

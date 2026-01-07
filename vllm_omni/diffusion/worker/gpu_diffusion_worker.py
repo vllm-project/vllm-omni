@@ -124,9 +124,9 @@ class GPUDiffusionWorker:
         )
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
-    def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+    def generate(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Generate output for the given requests."""
-        return self.execute_model(requests, self.od_config)
+        return self.execute_model(request, self.od_config)
 
     @classmethod
     def start_profile(cls, trace_path_template: str) -> str:
@@ -138,37 +138,17 @@ class GPUDiffusionWorker:
         """Stop profiling and return the result dictionary."""
         return CurrentProfiler.stop()
 
-    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        if self.lora_manager is not None and reqs:
-            req = reqs[0]
-
-            if len(reqs) > 1:
-                # This worker (and the current diffusion model runner) applies
-                # a single LoRA to the whole batch. Reject inconsistent LoRA
-                # settings to avoid silently applying the wrong adapter.
-                def _lora_key(r: OmniDiffusionRequest):
-                    if r.lora_request is None:
-                        return None
-                    lr = r.lora_request
-                    return (lr.lora_name, lr.lora_int_id, lr.lora_path, lr.tensorizer_config_dict)
-
-                key0 = _lora_key(req)
-                scale0 = req.lora_scale if key0 is not None else None
-                for other in reqs[1:]:
-                    if _lora_key(other) != key0:
-                        raise ValueError("All requests in a diffusion batch must share the same LoRARequest.")
-                    if key0 is not None and other.lora_scale != scale0:
-                        raise ValueError("All requests in a diffusion batch must share the same lora_scale.")
-
+        if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(req.lora_request, req.lora_scale)
+                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
             except Exception as exc:
-                if req.lora_request is not None:
+                if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        return self.model_runner.execute_model(reqs)
+        return self.model_runner.execute_model(req)
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
@@ -360,7 +340,7 @@ class WorkerProc:
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result({"status": "error", "error": str(e)})
+                        self.return_result(DiffusionOutput(error=str(e)))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

@@ -27,6 +27,7 @@ import PIL.Image
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -119,16 +120,20 @@ def main():
 
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(
-        args.prompt,
-        negative_prompt=args.negative_prompt,
-        pil_image=image,
-        height=height,
-        width=width,
-        generator=generator,
-        guidance_scale=args.guidance_scale,
-        guidance_scale_2=args.guidance_scale_high,
-        num_inference_steps=args.num_inference_steps,
-        num_frames=args.num_frames,
+        {
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "multi_modal_data": {"image": image},
+        },
+        OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            generator=generator,
+            guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_high,
+            num_inference_steps=args.num_inference_steps,
+            num_frames=args.num_frames,
+        ),
     )
 
     # Extract video frames from OmniRequestOutput

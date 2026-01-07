@@ -5,6 +5,7 @@ import gradio as gr
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -101,12 +102,14 @@ def build_demo(args: argparse.Namespace) -> gr.Blocks:
         generator = torch.Generator(device=device).manual_seed(seed)
         outputs = omni.generate(
             prompt.strip(),
-            height=height,
-            width=width,
-            generator=generator,
-            true_cfg_scale=float(cfg_scale_value),
-            num_inference_steps=num_steps,
-            num_outputs_per_prompt=num_images,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                generator=generator,
+                true_cfg_scale=float(cfg_scale_value),
+                num_inference_steps=num_steps,
+                num_outputs_per_prompt=num_images,
+            ),
         )
         images_outputs = []
         for output in outputs:

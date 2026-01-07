@@ -5,9 +5,9 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from vllm import SamplingParams
 
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
@@ -83,9 +83,9 @@ class _FakeStage:
         self.stage_id = getattr(config, "stage_id", 0)
         self.engine_args = config.engine_args
         self.model_stage = getattr(config.engine_args, "model_stage", None)
-        self.stage_type = "llm"
+        self.stage_type = "diffusion"
         # set default sampling params
-        self.default_sampling_params = SamplingParams(temperature=1.0)
+        self.default_sampling_params = OmniDiffusionSamplingParams(num_inference_steps=1)
         # Allow configuring final_output and final_output_type
         self.final_output = config.final_output if hasattr(config, "final_output") else False
         self.final_output_type = getattr(config, "final_output_type", None)
@@ -640,8 +640,8 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     )
 
     sampling_params_list = [
-        SamplingParams(temperature=0.7),
-        SamplingParams(temperature=0.8),
+        OmniDiffusionSamplingParams(num_inference_steps=1),
+        OmniDiffusionSamplingParams(num_inference_steps=1, max_sequence_length=10),
     ]
     prompts = ["hi"]
     outputs = omni.generate(prompts=prompts, sampling_params_list=sampling_params_list)
@@ -655,6 +655,112 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     assert not omni.stage_list[0]._in_q.empty()
     # Verify stage 1 received forwarded task (process_engine_inputs was called)
     assert omni.stage_list[1].process_engine_inputs([], []) is not None
+
+
+def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
+    """Test single-stage generation pipeline with multiple inputs in one batch."""
+    stage_cfg0 = dict(fake_stage_config)
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["final_output"] = False
+
+    def _fake_loader(model: str, base_engine_args=None):
+        return [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
+
+    import sys
+
+    for module_name in [
+        "vllm_omni.entrypoints.utils",
+        "vllm_omni.entrypoints.omni",
+        "vllm_omni.entrypoints.omni_stage",
+    ]:
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+
+    _setup_engine_mocks(monkeypatch)
+    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_ipc_mocks(monkeypatch)
+    _setup_log_mocks(monkeypatch)
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        _fake_loader,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni_stage.OmniStage",
+        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        raising=False,
+    )
+
+    import vllm_omni.entrypoints.omni as omni_module
+
+    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+
+    # Mock uuid.uuid4() to return a predictable value for request ID generation
+    test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
+    monkeypatch.setattr(uuid, "uuid4", lambda: test_uuid)
+    monkeypatch.setattr(omni_module, "uuid", uuid)
+
+    from vllm_omni.entrypoints.omni import Omni
+
+    omni = Omni(model="any", init_timeout=1)
+
+    # Generate the expected request ID format: "0_<uuid>"
+    expected_request_id = f"0_{test_uuid}"
+
+    # Simulate worker behavior: manually put results into output queues
+    # Note: We put results before calling generate, which simulates worker processes
+    # that have already completed. The polling loop will collect them in stage order.
+    omni.stage_list[0]._out_q.put_nowait(
+        {
+            "request_id": expected_request_id,
+            "engine_outputs": [{"stage": 0, "text": "s0"}],
+            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+        }
+    )
+    omni.stage_list[0]._out_q.put_nowait(
+        {
+            "request_id": expected_request_id,
+            "engine_outputs": [{"stage": 0, "text": "s0"}],
+            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+        }
+    )
+    omni.stage_list[1]._out_q.put_nowait(
+        {
+            "request_id": expected_request_id,
+            "engine_outputs": [{"stage": 1}],
+            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+        }
+    )
+    omni.stage_list[1]._out_q.put_nowait(
+        {
+            "request_id": expected_request_id,
+            "engine_outputs": [{"stage": 1}],
+            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+        }
+    )
+
+    outputs = omni.generate(
+        prompts=[
+            {
+                "prompt": "hi",
+                "negative_prompt": "hi",
+                "multi_modal_data": {"image": ["dog.jpg", "cat.jpg"]},
+            },
+            {
+                "prompt": "hi",
+                "negative_prompt": "hi",
+                "multi_modal_data": {"image": ["dog.jpg", "cat.jpg"]},
+            },
+        ],
+        sampling_params_list=[
+            OmniDiffusionSamplingParams(num_inference_steps=1),
+            OmniDiffusionSamplingParams(num_inference_steps=1),
+        ],
+    )
+
+    assert len(outputs) == 2
 
 
 def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
@@ -729,8 +835,8 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     outputs = omni.generate(
         prompts=["p"],
         sampling_params_list=[
-            SamplingParams(temperature=0.7),
-            SamplingParams(temperature=0.8),
+            OmniDiffusionSamplingParams(num_inference_steps=1),
+            OmniDiffusionSamplingParams(num_inference_steps=1, max_sequence_length=10),
         ],
     )
     assert outputs == []
@@ -931,7 +1037,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     )
 
     # Generate should handle error gracefully (log but continue)
-    sampling_params_list = [SamplingParams(temperature=0.7)]
+    sampling_params_list = [OmniDiffusionSamplingParams(num_inference_steps=1)]
     outputs = omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
     # Should return final output (error was logged but didn't stop processing)
     assert isinstance(outputs, list)
