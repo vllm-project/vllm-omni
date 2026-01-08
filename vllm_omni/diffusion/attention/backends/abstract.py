@@ -48,6 +48,8 @@ class AttentionBackend(ABC):
 @dataclass
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
+    joint_attn_mask: torch.Tensor | None = None
+    # a joint mask for the joint query, key, and value, depends the joint_strategy
     joint_query: torch.Tensor | None = None
     # a replicated tensor among processes appended to the front or rear of query, depends the joint_strategy
     joint_key: torch.Tensor | None = None

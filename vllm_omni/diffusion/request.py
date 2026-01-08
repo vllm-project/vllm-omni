@@ -109,6 +109,7 @@ class OmniDiffusionRequest:
     # Scheduler parameters
     num_inference_steps: int = 50
     guidance_scale: float = 1.0
+    guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
     eta: float = 0.0

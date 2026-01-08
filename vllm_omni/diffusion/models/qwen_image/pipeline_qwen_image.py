@@ -308,7 +308,7 @@ class QwenImagePipeline(
         if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
             logger.warning(
                 f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} "
-                "but are {height} and {width}. Dimensions will be resized accordingly"
+                f"but are {height} and {width}. Dimensions will be resized accordingly"
             )
 
         # if callback_on_step_end_tensor_inputs is not None and not all(

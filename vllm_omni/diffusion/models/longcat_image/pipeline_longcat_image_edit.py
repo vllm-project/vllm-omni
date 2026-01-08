@@ -467,7 +467,7 @@ class LongCatImageEditPipeline(nn.Module, SupportImageInput):
         if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
             logger.warning(
                 "`height` and `width` have to be divisible by "
-                "{self.vae_scale_factor * 2} but are {height} and {width}. "
+                f"{self.vae_scale_factor * 2} but are {height} and {width}. "
                 "Dimensions will be resized accordingly"
             )
 
