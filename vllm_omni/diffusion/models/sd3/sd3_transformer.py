@@ -321,6 +321,8 @@ class SD3Transformer2DModel(nn.Module):
     The Transformer model introduced in [Stable Diffusion 3](https://huggingface.co/papers/2403.03206).
     """
 
+    _repeated_blocks = ["SD3TransformerBlock"]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
