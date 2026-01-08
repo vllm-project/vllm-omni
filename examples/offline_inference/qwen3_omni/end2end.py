@@ -267,6 +267,7 @@ def main(args):
         stage_configs_path=args.stage_configs_path,
         log_stats=args.enable_stats,
         stage_init_timeout=args.stage_init_timeout,
+        init_timeout=args.init_timeout,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -320,10 +321,22 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
+    # warmup
+    if args.num_warmup_prompts > 0 and args.num_warmup_prompts <= len(prompts):
+        omni_warmup_generator = omni_llm.generate(
+            prompts[: args.num_warmup_prompts], sampling_params_list, py_generator=args.py_generator
+        )
+        for stage_outputs in omni_warmup_generator:
+            pass
+    else:
+        print("[Info] Skipping warmup.")
+
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
     if profiler_enabled:
         omni_llm.start_profile(stages=[0])
-    omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
+    omni_generator = omni_llm.generate(
+        prompts[args.num_warmup_prompts :], sampling_params_list, py_generator=args.py_generator
+    )
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
@@ -429,6 +442,12 @@ def parse_args():
         type=int,
         default=1,
         help="Number of prompts to generate.",
+    )
+    parser.add_argument(
+        "--num-warmup-prompts",
+        type=int,
+        default=0,
+        help="Number of prompts used for warmup.",
     )
     parser.add_argument(
         "--txt-prompts",
