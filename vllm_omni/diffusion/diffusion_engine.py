@@ -8,16 +8,28 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
+import PIL.Image
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
-from vllm_omni.diffusion.registry import get_diffusion_post_process_func, get_diffusion_pre_process_func
+from vllm_omni.diffusion.registry import (
+    DiffusionModelRegistry,
+    get_diffusion_post_process_func,
+    get_diffusion_pre_process_func,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler, scheduler
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
 logger = init_logger(__name__)
+
+
+def supports_image_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_image_input", False))
 
 
 @dataclass
@@ -70,6 +82,12 @@ class DiffusionEngine:
         self._processes: list[mp.Process] = []
         self._closed = False
         self._make_client()
+        try:
+            self._dummy_run()
+        except Exception as e:
+            logger.error(f"Dummy run failed: {e}")
+            self.close()
+            raise e
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
@@ -272,6 +290,30 @@ class DiffusionEngine:
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
 
+    def _dummy_run(self):
+        """A dummy run to warm up the model."""
+        prompt = "dummy run"
+        num_inference_steps = 1
+        height = 1024
+        width = 1024
+        if supports_image_input(self.od_config.model_class_name):
+            # Provide a dummy image input if the model supports it
+
+            dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
+        else:
+            dummy_image = None
+        req = OmniDiffusionRequest(
+            prompt=prompt,
+            height=height,
+            width=width,
+            pil_image=dummy_image,
+            num_inference_steps=num_inference_steps,
+            num_outputs_per_prompt=1,
+        )
+        logger.info("dummy run to warm up the model")
+        requests = self.pre_process_func([req]) if self.pre_process_func is not None else [req]
+        self.add_req_and_wait_for_response(requests)
+
     def collective_rpc(
         self,
         method: str | Callable,
@@ -342,22 +384,6 @@ class DiffusionEngine:
         except Exception as e:
             logger.error(f"RPC call failed: {e}")
             raise
-
-    def _dummy_run(self):
-        """A dummy run to warm up the model."""
-        prompt = "dummy run"
-        num_inference_steps = 1
-        height = 1024
-        width = 1024
-        req = OmniDiffusionRequest(
-            prompt=prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            num_outputs_per_prompt=1,
-        )
-        logger.info("dummy run to warm up the model")
-        self.add_req_and_wait_for_response([req])
 
     def close(self) -> None:
         self._finalizer()
