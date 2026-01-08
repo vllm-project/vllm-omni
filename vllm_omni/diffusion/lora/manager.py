@@ -45,7 +45,6 @@ class _AdapterHandle:
     name: str
     path: str
     scale: float
-    bytes_vram: int
     patched: list[_PatchedModule]
     last_used: float
 
@@ -66,16 +65,14 @@ class DiffusionLoRAManager:
         device: torch.device,
         *,
         dtype: torch.dtype,
-        max_vram_gb: float = 4.0,
-        max_cpu_gb: float = 8.0,
+        max_cache_size: int = 4,
         allowed_dirs: list[str] | None = None,
     ) -> None:
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
         self.allowed_dirs = [os.path.realpath(d) for d in allowed_dirs] if allowed_dirs else []
-        self.max_vram_bytes = int(max_vram_gb * 1024**3)
-        self.max_cpu_bytes = int(max_cpu_gb * 1024**3)
+        self.max_cache_size = max(1, int(max_cache_size))
         self.cache: OrderedDict[str, _AdapterHandle] = OrderedDict()
 
     # Public API -----------------------------------------------------
@@ -148,7 +145,6 @@ class DiffusionLoRAManager:
                 pairs.setdefault(base, {})["alpha"] = state_dict[k]
 
         patched: list[_PatchedModule] = []
-        bytes_vram = 0
         modules = dict(self.pipeline.named_modules())
 
         for base, parts in pairs.items():
@@ -167,17 +163,15 @@ class DiffusionLoRAManager:
             scaling = scale * base_scaling
 
             self._apply_lora_to_linear(mod, down, up, scaling, base_scaling, patched)
-            bytes_vram += down.numel() * down.element_size() + up.numel() * up.element_size()
 
         handle = _AdapterHandle(
             name=name,
             path=path,
             scale=scale,
-            bytes_vram=bytes_vram,
             patched=patched,
             last_used=time.time(),
         )
-        logger.info("LoRA %s loaded; patched %d modules (%.2f MiB)", name, len(patched), bytes_vram / 1024**2)
+        logger.info("LoRA %s loaded; patched %d modules", name, len(patched))
         return handle
 
     def _apply_lora_to_linear(
@@ -228,12 +222,10 @@ class DiffusionLoRAManager:
         handle.last_used = time.time()
 
     def _evict_if_needed(self) -> None:
-        cur_vram = sum(h.bytes_vram for h in self.cache.values())
-        while cur_vram > self.max_vram_bytes and len(self.cache) > 0:
+        while len(self.cache) > self.max_cache_size and len(self.cache) > 0:
             name, handle = self.cache.popitem(last=False)
             self._unload(handle)
-            cur_vram = sum(h.bytes_vram for h in self.cache.values())
-            logger.info("Evicted LoRA %s to keep within %.2f GiB budget", name, self.max_vram_bytes / 1024**3)
+            logger.info("Evicted LoRA %s to keep cache size <= %d", name, self.max_cache_size)
 
     def _unload(self, handle: _AdapterHandle) -> None:
         for entry in handle.patched:

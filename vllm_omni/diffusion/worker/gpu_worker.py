@@ -114,8 +114,7 @@ class GPUWorker:
             pipeline=self.pipeline,
             device=self.device,
             dtype=self.od_config.dtype,
-            max_vram_gb=self.od_config.max_lora_cache_vram,
-            max_cpu_gb=self.od_config.max_lora_cache_cpu,
+            max_cache_size=getattr(self.od_config, "max_lora_cache_size", 4),
             allowed_dirs=self.od_config.lora_dirs,
         )
 

@@ -221,10 +221,8 @@ class OmniBase:
                     cfg.engine_args = {}
                 if kwargs.get("lora_dirs") is not None:
                     cfg.engine_args["lora_dirs"] = kwargs.get("lora_dirs")
-                if kwargs.get("max_lora_cache_vram") is not None:
-                    cfg.engine_args["max_lora_cache_vram"] = kwargs.get("max_lora_cache_vram")
-                if kwargs.get("max_lora_cache_cpu") is not None:
-                    cfg.engine_args["max_lora_cache_cpu"] = kwargs.get("max_lora_cache_cpu")
+                if kwargs.get("max_lora_cache_size") is not None:
+                    cfg.engine_args["max_lora_cache_size"] = kwargs.get("max_lora_cache_size")
             except Exception:
                 pass
 
