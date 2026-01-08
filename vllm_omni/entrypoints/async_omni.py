@@ -360,7 +360,6 @@ class AsyncOmni(OmniBase):
                         raise RuntimeError(result)  # Request Finished due to error
 
                     engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
-                    stage.set_engine_outputs(engine_outputs)
                     if isinstance(engine_outputs, list):
                         engine_outputs = engine_outputs[0]
                     finished = engine_outputs.finished
@@ -419,7 +418,9 @@ class AsyncOmni(OmniBase):
                                 final_output_type=stage.final_output_type,
                                 request_output=engine_outputs,
                             )
-
+                if not isinstance(engine_outputs, list):
+                    engine_outputs = [engine_outputs]
+                stage.set_engine_outputs(engine_outputs)
                 # Forward to next stage if there is one
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_for_e2e and finished:
