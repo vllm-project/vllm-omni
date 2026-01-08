@@ -5,7 +5,9 @@ import enum
 import os
 import random
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -282,11 +284,9 @@ class OmniDiffusionConfig:
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
-    # Dynamic LoRA serving
+    # Dynamic LoRA serving (count-based eviction like vLLM)
     lora_dirs: list[str] | None = None  # whitelist roots for request-specified LoRA paths
-    max_lora_cache_vram: float = 4.0  # GiB per worker
-    max_lora_cache_cpu: float = 8.0  # GiB per worker (placeholder for future CPU caching)
-    lora_evict_interval: int = 300  # seconds between background evictions (not yet scheduled)
+    max_lora_cache_size: int = 4  # number of adapters per worker (LRU by count)
 
     output_type: str = "pil"
 
@@ -309,9 +309,6 @@ class OmniDiffusionConfig:
 
     # Compilation
     enable_torch_compile: bool = False
-
-    # Enable sleep mode
-    enable_sleep_mode: bool = False
 
     disable_autocast: bool = False
 
@@ -469,6 +466,56 @@ class OmniDiffusionConfig:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
         return cls(**kwargs)
+
+
+_current_omni_diffusion_config: OmniDiffusionConfig | None = None
+_current_prefix: str | None = None
+
+
+@contextmanager
+def set_current_omni_diffusion_config(
+    omni_diffusion_config: OmniDiffusionConfig, check_compile=False, prefix: str | None = None
+):
+    """
+    Temporarily set the current vLLM-Omni config.
+    Used during model initialization.
+    We save the current vLLM-Omni config in a global variable,
+    so that all modules can access it, e.g. custom ops
+    can access the vLLM-Omni config to determine how to dispatch.
+    """
+    global _current_omni_diffusion_config, _current_prefix
+    old_omni_diffusion_config = _current_omni_diffusion_config
+    old_prefix = _current_prefix
+    # from vllm.compilation.counter import compilation_counter
+
+    # num_models_seen = compilation_counter.num_models_seen
+    try:
+        _current_omni_diffusion_config = omni_diffusion_config
+        _current_prefix = prefix
+        yield
+    except Exception:
+        raise
+    else:
+        if check_compile:
+            raise RuntimeError("Compilation is not yet supported for OmniDiffusion")
+    finally:
+        _current_omni_diffusion_config = old_omni_diffusion_config
+        _current_prefix = old_prefix
+        # Clear the compilation config cache when context changes
+        get_cached_compilation_config.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def get_cached_compilation_config():
+    """Cache config to avoid repeated calls to get_current_omni_diffusion_config()"""
+    return get_current_omni_diffusion_config().compilation_config
+
+
+def get_current_omni_diffusion_config() -> OmniDiffusionConfig:
+    if _current_omni_diffusion_config is None:
+        logger.warning("Current OmniDiffusionConfig is not set.")
+        return OmniDiffusionConfig()
+    return _current_omni_diffusion_config
 
 
 @dataclass
