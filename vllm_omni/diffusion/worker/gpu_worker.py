@@ -101,7 +101,7 @@ class GPUWorker:
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
-        if not self.od_config.dit_enforce_eager:
+        if not self.od_config.enforce_eager:
             try:
                 self.pipeline.transformer = regionally_compile(
                     self.pipeline.transformer,
