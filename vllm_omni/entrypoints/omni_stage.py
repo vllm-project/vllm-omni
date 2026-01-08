@@ -601,6 +601,7 @@ def _stage_worker(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
@@ -1104,6 +1105,7 @@ async def _stage_worker_async(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):

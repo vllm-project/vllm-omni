@@ -663,7 +663,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             inputs_embeds = summed_embeddings.clone()
         else:
             code_predictor_codes = torch.zeros(
-                (0, self.talker.num_code_groups), device=self._module_device(self.talker), dtype=torch.long
+                (inputs_embeds.shape[0], self.talker.num_code_groups),
+                device=self._module_device(self.talker),
+                dtype=torch.long,
             )
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
         return inputs_embeds, code_predictor_codes.squeeze(-1)
