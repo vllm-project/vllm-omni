@@ -155,6 +155,13 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
 
+        # compile option for diffusion models
+        serve_parser.add_argument(
+            "--dit-enforce-eager",
+            action="store_true",
+            help="Enable torch.compile for diffusion model transformer components.",
+        )
+
         # Cache optimization parameters
         serve_parser.add_argument(
             "--cache-backend",
