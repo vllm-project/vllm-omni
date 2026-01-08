@@ -1,6 +1,6 @@
 # --8<-- [start:requirements]
 
-- GPU: Validated on gfx942 (It should be supported on the AMD GPUs that are supported by vLLM.)
+- GPU: Validated on gfx942, gfx950, gfx1151 (Strix Halo). Should work on AMD GPUs supported by vLLM.
 
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
@@ -28,7 +28,7 @@ If you want to specify which GPU Arch to build for to cutdown build time:
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.rocm \
-  --build-arg PYTORCH_ROCM_ARCH="gfx942;gfx950" \
+  --build-arg PYTORCH_ROCM_ARCH="gfx942;gfx950;gfx1151" \
   -t vllm-omni-rocm .
 ```
 

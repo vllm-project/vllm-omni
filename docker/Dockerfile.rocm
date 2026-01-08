@@ -1,9 +1,9 @@
-ARG BASE_IMAGE=rocm/vllm-dev:nightly_main_20251205
+ARG BASE_IMAGE=docker.io/rocm/vllm-dev:nightly_main_20251205
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
 ARG VLLM_VERSION=v0.12.0
-ARG PYTORCH_ROCM_ARCH="gfx942;gfx950"
+ARG PYTORCH_ROCM_ARCH="gfx942;gfx950;gfx1151"
 
 WORKDIR ${COMMON_WORKDIR}
 
@@ -35,8 +35,9 @@ RUN cd ${COMMON_WORKDIR}/vllm-omni && python3 -m pip install --no-cache-dir ".[d
 # This is needed to prevent the AITER automatic GPU arch detection from failing on MI325X.
 # The AITER version used in this dockerfile has issues with handling
 # the GPU archs of MI325X (CI machine) correctly. So we manually set the GPU archs here.
-# We reuse AITER_ROCM_ARCH from the base image to avoid duplication.
-ENV GPU_ARCHS=${AITER_ROCM_ARCH}
+# We add gfx1151 (Strix Halo) support in addition to datacenter GPUs.
+ARG GPU_ARCHS_ARG="gfx942;gfx950;gfx1151"
+ENV GPU_ARCHS=${GPU_ARCHS_ARG}
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
