@@ -60,5 +60,5 @@ vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, in
 
 For more information, checkout the following:
 
-- [vllm-omni architecture design and recent roadmaps](https://docs.google.com/presentation/d/1Y7t2Zm3BIISPN-_X_sDpxZMNCWir2rAx/edit?usp=drive_link&ouid=110473603432222024453&rtpof=true&sd=true)
+- [vllm-omni architecture design and recent roadmaps](https://docs.google.com/presentation/d/1qv4qMW1rKAqDREMXiUDLIgqqHQe7TDPj/edit?usp=sharing&ouid=110473603432222024453&rtpof=true&sd=true)
 - [vllm-omni announcement blogpost](https://blog.vllm.ai/2025/11/30/vllm-omni.html)
