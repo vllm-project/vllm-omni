@@ -4,6 +4,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.generation.logits_process import (
+    LogitsProcessorList,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
@@ -134,6 +139,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.code_predictor = Qwen3OmniMoeTalkerCodePredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "code_predictor")
         )
+        self.empty_code = torch.empty((1, 0), dtype=torch.long)
 
     def code_predictor_forward(
         self,
@@ -185,6 +191,12 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         all_codes_per_position = []
         middle_hidden_states = []  # Collect hidden states for each position
 
+        logits_processors = LogitsProcessorList(
+            [
+                TopKLogitsWarper(top_k=top_k),
+                TopPLogitsWarper(top_p=top_p),
+            ]
+        )
         # Generate residual layers for each position
         for pos in range(seq_len):
             layer0_code = input_ids[:, pos : pos + 1]  # [batch, 1]
@@ -220,19 +232,13 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
                 # Use the corresponding lm_head for this layer
                 logits = self.code_predictor.lm_head[layer_idx](hidden_state[:, -1:, :])  # [batch, 1, vocab_size]
-                from transformers.generation.logits_process import (
-                    LogitsProcessorList,
-                    TopKLogitsWarper,
-                    TopPLogitsWarper,
-                )
 
-                logits_processors = LogitsProcessorList(
-                    [
-                        TopKLogitsWarper(top_k=top_k),
-                        TopPLogitsWarper(top_p=top_p),
-                    ]
-                )
-                input_ids_for_logits_processors = torch.tensor([pos_codes[1:]]).to(logits.device, dtype=torch.long)
+                if len(pos_codes) > 1:
+                    input_ids_for_logits_processors = torch.cat(pos_codes[1:], dim=1).to(
+                        device=logits.device, dtype=torch.long
+                    )
+                else:
+                    input_ids_for_logits_processors = self.empty_code
                 logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(0)).unsqueeze(0)
 
                 # Sample from the filtered distribution
