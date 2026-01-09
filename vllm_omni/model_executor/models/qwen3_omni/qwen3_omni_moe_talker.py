@@ -238,8 +238,8 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                         device=logits.device, dtype=torch.long
                     )
                 else:
-                    input_ids_for_logits_processors = self.empty_code
-                logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(0)).unsqueeze(0)
+                    input_ids_for_logits_processors = self.empty_code.expand(hidden_state.shape[0], 0)
+                logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(1)).unsqueeze(1)
 
                 # Sample from the filtered distribution
                 probs = F.softmax(logits, dim=-1)
