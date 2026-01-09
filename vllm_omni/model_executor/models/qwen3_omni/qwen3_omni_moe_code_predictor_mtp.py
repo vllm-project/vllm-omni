@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Cache, PretrainedConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeRotaryEmbedding
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -463,6 +464,7 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
         return self.codec_embedding
 
 
+@support_torch_compile
 class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     """
     Code predictor wrapper matching HF structure.
