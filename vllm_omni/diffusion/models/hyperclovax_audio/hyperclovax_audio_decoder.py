@@ -323,9 +323,9 @@ class AMPBlock1(torch.nn.Module):
             remove_weight_norm(l)
 
 
-class HyperCLOVAXAudioTransformerModel(nn.Module):
+class HyperCLOVAXAudioDecoderModel(nn.Module):
     """
-    HyperCLOVAXAudioTransformerModel is a neural vocoder model that applies anti-aliased periodic activation for residual blocks (resblocks).
+    HyperCLOVAXAudioDecoderModel is a neural vocoder model that applies anti-aliased periodic activation for residual blocks (resblocks).
 
     Args:
         h (AttrDict): Hyperparameters.
