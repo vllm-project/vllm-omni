@@ -117,8 +117,8 @@ class ZImageAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
@@ -126,7 +126,7 @@ class ZImageAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
-            disable_tp=True,
+            total_num_kv_heads=num_kv_heads,
             bias=False,
         )
 
@@ -134,13 +134,27 @@ class ZImageAttention(nn.Module):
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
         self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
-        self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+        # NOTE: QKV is column-parallel on heads, so attention output is sharded
+        # on the last dim (dim / tp). Use row-parallel output projection to
+        # all-reduce back to full dim.
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    bias=False,
+                    input_is_parallel=True,
+                    return_bias=False,
+                )
+            ]
+        )
 
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            num_kv_heads=self.to_qkv.num_kv_heads,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
 
@@ -152,11 +166,13 @@ class ZImageAttention(nn.Module):
         sin: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
-        query, key, value = qkv.chunk(3, dim=-1)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = query.unflatten(-1, (self.num_heads, -1))
-        key = key.unflatten(-1, (self.num_heads, -1))
-        value = value.unflatten(-1, (self.num_heads, -1))
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -197,7 +213,6 @@ class FeedForward(nn.Module):
             dim,
             [hidden_dim] * 2,
             bias=False,
-            disable_tp=True,
             return_bias=False,
         )
         self.act = SiluAndMul()
@@ -205,7 +220,7 @@ class FeedForward(nn.Module):
             hidden_dim,
             dim,
             bias=False,
-            disable_tp=True,
+            input_is_parallel=True,
             return_bias=False,
         )
 
@@ -445,25 +460,8 @@ class ZImageTransformer2DModel(nn.Module):
                 f"Supported tp candidates by final_out_dims gcd: {supported}"
             )
 
-        # NOTE: Phase 2 safeguard: we validate TP constraints early, but TP sharding
-        # is not enabled yet (many layers still force disable_tp=True).
-        if tp_size > 1:
-            supported_tp = sorted(
-                _positive_divisors(n_heads)
-                & _positive_divisors(n_kv_heads)
-                & _positive_divisors(dim)
-                & _positive_divisors(ffn_hidden_dim)
-                & _positive_divisors(math.gcd(*final_out_dims))
-            )
-            raise NotImplementedError(
-                "Z-Image tensor parallelism is not enabled yet in vLLM-Omni (Z-Image layers still set "
-                f"disable_tp=True). Requested tensor_parallel_size={tp_size}. "
-                f"TP candidates passing basic divisibility checks: {supported_tp}. "
-                "Please follow Phase 3 in ZIMAGE_TP_ROADMAP.md."
-            )
-
         logger.info_once(
-            "Z-Image init (TP disabled): dim=%d n_heads=%d n_kv_heads=%d ffn_hidden_dim=%d final_out_dims=%s tp=%d",
+            "Z-Image init: dim=%d n_heads=%d n_kv_heads=%d ffn_hidden_dim=%d final_out_dims=%s tp=%d",
             dim,
             n_heads,
             n_kv_heads,

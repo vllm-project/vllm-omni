@@ -88,6 +88,17 @@ def parse_args() -> argparse.Namespace:
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
+    parser.add_argument(
+        "--enforce_eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution (recommended when debugging TP).",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
     return parser.parse_args()
 
 
@@ -131,7 +142,10 @@ def main():
 
     # assert args.ring_degree == 1, "Ring attention is not supported yet"
     parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree, cfg_parallel_size=args.cfg_parallel_size
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
     )
 
     omni = Omni(
@@ -141,6 +155,7 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         parallel_config=parallel_config,
+        enforce_eager=args.enforce_eager,
     )
 
     # Time profiling for generation
