@@ -64,6 +64,76 @@ def _get_tensor_parallel_size_from_context() -> int:
         return 1
 
 
+def validate_zimage_tp_constraints(
+    *,
+    dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    in_channels: int,
+    all_patch_size: tuple[int, ...],
+    all_f_patch_size: tuple[int, ...],
+    tensor_parallel_size: int,
+) -> tuple[int, list[int], list[int]]:
+    """Validate Z-Image TP constraints without requiring a distributed context.
+
+    Returns:
+        (ffn_hidden_dim, final_out_dims, supported_tp_candidates)
+    """
+    tp_size = int(tensor_parallel_size)
+    if tp_size <= 0:
+        raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
+    if dim % n_heads != 0:
+        raise ValueError(f"dim must be divisible by n_heads, got dim={dim}, n_heads={n_heads}")
+    if dim % tp_size != 0:
+        supported = sorted(_positive_divisors(dim))
+        raise ValueError(
+            f"Z-Image requires dim % tensor_parallel_size == 0, but got dim={dim}, tp={tp_size}. "
+            f"Supported tp candidates by dim: {supported}"
+        )
+    if n_heads % tp_size != 0:
+        supported = sorted(_positive_divisors(n_heads))
+        raise ValueError(
+            f"Z-Image requires n_heads % tensor_parallel_size == 0, but got n_heads={n_heads}, tp={tp_size}. "
+            f"Supported tp candidates by n_heads: {supported}"
+        )
+    if n_kv_heads % tp_size != 0:
+        supported = sorted(_positive_divisors(n_kv_heads))
+        raise ValueError(
+            f"Z-Image requires n_kv_heads % tensor_parallel_size == 0, but got n_kv_heads={n_kv_heads}, "
+            f"tp={tp_size}. Supported tp candidates by n_kv_heads: {supported}"
+        )
+
+    ffn_hidden_dim = int(dim / 3 * 8)
+    if ffn_hidden_dim % tp_size != 0:
+        supported = sorted(_positive_divisors(ffn_hidden_dim))
+        raise ValueError(
+            "Z-Image requires ffn_hidden_dim % tensor_parallel_size == 0 (for TP-sharded MLP), but got "
+            f"ffn_hidden_dim={ffn_hidden_dim}, tp={tp_size}. Supported tp candidates by ffn_hidden_dim: {supported}"
+        )
+
+    final_out_dims = [
+        int(patch_size) * int(patch_size) * int(f_patch_size) * int(in_channels)
+        for patch_size, f_patch_size in zip(all_patch_size, all_f_patch_size)
+    ]
+    bad_final_out_dims = [d for d in final_out_dims if d % tp_size != 0]
+    if bad_final_out_dims:
+        supported = sorted(_positive_divisors(math.gcd(*final_out_dims)))
+        raise ValueError(
+            "Z-Image requires final projection out_features divisible by tensor_parallel_size, but got "
+            f"final_out_dims={final_out_dims}, tp={tp_size}. "
+            f"Supported tp candidates by final_out_dims gcd: {supported}"
+        )
+
+    supported_tp_candidates = sorted(
+        _positive_divisors(n_heads)
+        & _positive_divisors(n_kv_heads)
+        & _positive_divisors(dim)
+        & _positive_divisors(ffn_hidden_dim)
+        & _positive_divisors(math.gcd(*final_out_dims))
+    )
+    return ffn_hidden_dim, final_out_dims, supported_tp_candidates
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(self, out_size, mid_size=None, frequency_embedding_size=256):
         super().__init__()
@@ -422,52 +492,25 @@ class ZImageTransformer2DModel(nn.Module):
         assert len(all_patch_size) == len(all_f_patch_size)
 
         tp_size = _get_tensor_parallel_size_from_context()
-        if tp_size <= 0:
-            raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
-        if dim % n_heads != 0:
-            raise ValueError(f"dim must be divisible by n_heads, got dim={dim}, n_heads={n_heads}")
-        if n_heads % tp_size != 0:
-            supported = sorted(_positive_divisors(n_heads))
-            raise ValueError(
-                f"Z-Image requires n_heads % tensor_parallel_size == 0, but got n_heads={n_heads}, tp={tp_size}. "
-                f"Supported tp candidates by n_heads: {supported}"
-            )
-        if n_kv_heads % tp_size != 0:
-            supported = sorted(_positive_divisors(n_kv_heads))
-            raise ValueError(
-                f"Z-Image requires n_kv_heads % tensor_parallel_size == 0, but got n_kv_heads={n_kv_heads}, "
-                f"tp={tp_size}. Supported tp candidates by n_kv_heads: {supported}"
-            )
-
-        ffn_hidden_dim = int(dim / 3 * 8)
-        if ffn_hidden_dim % tp_size != 0:
-            supported = sorted(_positive_divisors(ffn_hidden_dim))
-            raise ValueError(
-                "Z-Image requires ffn_hidden_dim % tensor_parallel_size == 0 (for TP-sharded MLP), but got "
-                f"ffn_hidden_dim={ffn_hidden_dim}, tp={tp_size}. Supported tp candidates by ffn_hidden_dim: {supported}"
-            )
-
-        final_out_dims = [
-            int(patch_size) * int(patch_size) * int(f_patch_size) * int(self.out_channels)
-            for patch_size, f_patch_size in zip(all_patch_size, all_f_patch_size)
-        ]
-        bad_final_out_dims = [d for d in final_out_dims if d % tp_size != 0]
-        if bad_final_out_dims:
-            supported = sorted(_positive_divisors(math.gcd(*final_out_dims)))
-            raise ValueError(
-                "Z-Image requires final projection out_features divisible by tensor_parallel_size, but got "
-                f"final_out_dims={final_out_dims}, tp={tp_size}. "
-                f"Supported tp candidates by final_out_dims gcd: {supported}"
-            )
+        ffn_hidden_dim, final_out_dims, supported_tp_candidates = validate_zimage_tp_constraints(
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            in_channels=self.out_channels,
+            all_patch_size=tuple(all_patch_size),
+            all_f_patch_size=tuple(all_f_patch_size),
+            tensor_parallel_size=tp_size,
+        )
 
         logger.info_once(
-            "Z-Image init: dim=%d n_heads=%d n_kv_heads=%d ffn_hidden_dim=%d final_out_dims=%s tp=%d",
+            "Z-Image init: dim=%d n_heads=%d n_kv_heads=%d ffn_hidden_dim=%d final_out_dims=%s tp=%d (supported_tp=%s)",
             dim,
             n_heads,
             n_kv_heads,
             ffn_hidden_dim,
             tuple(final_out_dims),
             tp_size,
+            tuple(supported_tp_candidates),
         )
 
         all_x_embedder = {}
