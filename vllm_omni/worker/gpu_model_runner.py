@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
@@ -37,6 +38,25 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_per_req_additional_information: dict[str, dict] | None = None
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        # TODO move this model specific logic to a separate class
+        if hasattr(self.model, "talker_mtp") and self.model.talker is not None:
+            self.talker_mtp = self.model.talker_mtp
+            cudagraph_mode = self.compilation_config.cudagraph_mode
+            assert cudagraph_mode is not None
+            if cudagraph_mode.has_full_cudagraphs():
+                self.talker_mtp = CUDAGraphWrapper(
+                    self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+                )
+            hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
+            self.talker_mtp_input_ids = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            self.talker_mtp_inputs_embeds = self._make_buffer(
+                self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False
+            )
+            self.last_talker_hidden = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
+            self.text_step = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -543,6 +563,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
+                if self.model.talker is not None and hasattr(self.model, "talker_mtp") and num_tokens_padded == 1:
+                    outputs = self.talker_mtp(
+                        self.talker_mtp_input_ids.gpu[:num_tokens_padded],
+                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
+                        self.last_talker_hidden.gpu[:num_tokens_padded],
+                        self.text_step.gpu[:num_tokens_padded],
+                    )
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -866,6 +893,34 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
                 )
+                # run talker mtp decode
+                if hasattr(self.model, "talker_mtp"):
+                    _cudagraph_mode, batch_desc, _, _ = self._determine_batch_execution_and_padding(
+                        num_tokens=span_len,
+                        num_reqs=1,
+                        num_scheduled_tokens_np=num_scheduled_tokens_np[req_index],
+                        max_num_scheduled_tokens=1,
+                        force_eager=span_len > 1,
+                        use_cascade_attn=False,
+                    )
+                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                    if _cudagraph_mode != CUDAGraphMode.NONE:
+                        self.talker_mtp_input_ids.gpu[:span_len].copy_(req_input_ids)
+                        self.talker_mtp_inputs_embeds.gpu[:span_len].copy_(req_embeds)
+                        self.last_talker_hidden.gpu[:span_len].copy_(last_talker_hidden)
+                        self.text_step.gpu[:span_len].copy_(text_step)
+                        req_input_ids = self.talker_mtp_input_ids.gpu[:span_len]
+                        req_embeds = self.talker_mtp_inputs_embeds.gpu[:span_len]
+                        last_talker_hidden = self.last_talker_hidden.gpu[:span_len]
+                        text_step = self.text_step.gpu[:span_len]
+                    with set_forward_context(
+                        None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
+                    ):
+                        req_embeds, code_predictor_codes = self.talker_mtp(
+                            req_input_ids, req_embeds, last_talker_hidden, text_step
+                        )
+                        update_dict["code_predictor_codes"] = code_predictor_codes
+
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
 
@@ -909,6 +964,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
+        if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
+            model_output = self.model.make_omni_output(model_output, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
         return model_output

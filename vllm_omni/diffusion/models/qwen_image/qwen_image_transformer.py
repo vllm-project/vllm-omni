@@ -23,9 +23,11 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_ring_parallel_world_size,
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
@@ -373,7 +375,14 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states: torch.Tensor,
         vid_freqs: torch.Tensor,
         txt_freqs: torch.Tensor,
+        hidden_states_mask: torch.Tensor | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
     ):
+        # if mask is all true, set it to None
+        if hidden_states_mask is not None and hidden_states_mask.all():
+            hidden_states_mask = None
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
         seq_len_txt = encoder_hidden_states.shape[1]
 
         # Compute QKV for image stream (sample projections)
@@ -416,7 +425,6 @@ class QwenImageCrossAttention(nn.Module):
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
-
         if (
             self.parallel_config is not None
             and self.parallel_config.sequence_parallel_size > 1
@@ -424,22 +432,56 @@ class QwenImageCrossAttention(nn.Module):
         ):
             # if using sequence parallel, but not splitting text embed,
             #  we need to pass text embedding to attention layer as joint qkv
+            attn_metadata = AttentionMetadata(
+                joint_query=txt_query,
+                joint_key=txt_key,
+                joint_value=txt_value,
+                joint_strategy="front",
+            )
+            if hidden_states_mask is not None:
+                attn_metadata.attn_mask = hidden_states_mask
+            if encoder_hidden_states_mask is not None:
+                attn_metadata.joint_attn_mask = encoder_hidden_states_mask
+
             joint_hidden_states = self.attn(
                 img_query,
                 img_key,
                 img_value,
-                AttentionMetadata(
-                    joint_query=txt_query,
-                    joint_key=txt_key,
-                    joint_value=txt_value,
-                    joint_strategy="front",
-                ),
+                attn_metadata,
             )
         else:
+            attn_metadata = None
+            if hidden_states_mask is not None or encoder_hidden_states_mask is not None:
+                mask_list = []
+                if encoder_hidden_states_mask is not None:
+                    mask_list.append(encoder_hidden_states_mask)
+                else:
+                    mask_list.append(
+                        torch.ones(
+                            [encoder_hidden_states.shape[0], encoder_hidden_states.shape[1]],
+                            dtype=torch.bool,
+                            device=encoder_hidden_states.device,
+                        )
+                    )
+                if hidden_states_mask is not None:
+                    mask_list.append(hidden_states_mask)
+                else:
+                    mask_list.append(
+                        torch.ones(
+                            [hidden_states.shape[0], hidden_states.shape[1]],
+                            dtype=torch.bool,
+                            device=hidden_states.device,
+                        )
+                    )
+                joint_mask = (
+                    None if len(mask_list) == 0 else torch.cat(mask_list, dim=1) if len(mask_list) > 1 else mask_list[0]
+                )
+                attn_metadata = AttentionMetadata(attn_mask=joint_mask)
             joint_hidden_states = self.attn(
                 joint_query,
                 joint_key,
                 joint_value,
+                attn_metadata,
             )
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
@@ -547,6 +589,7 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
+        hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
@@ -577,6 +620,8 @@ class QwenImageTransformerBlock(nn.Module):
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
             vid_freqs=image_rotary_emb[0],
             txt_freqs=image_rotary_emb[1],
+            hidden_states_mask=hidden_states_mask,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
@@ -631,6 +676,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         axes_dims_rope (`tuple[int]`, defaults to `(16, 56, 56)`):
             The dimensions to use for the rotary positional embeddings.
     """
+
+    # the small and frequently-repeated block(s) of a model
+    # -- typically a transformer layer
+    # used for torch compile optimizations
+    _repeated_blocks = ["QwenImageTransformerBlock"]
 
     def __init__(
         self,
@@ -732,14 +782,48 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # else:
         #     lora_scale = 1.0
 
+        original_seq_len = None
+        seq_padding = 0
+        hidden_states_mask = None
+
         if self.parallel_config.sequence_parallel_size > 1:
-            hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=-2)[
-                get_sequence_parallel_rank()
-            ]
+            batch_size, seq_len, channels = hidden_states.shape
+            sp_size = get_sequence_parallel_world_size()
+
+            if seq_len % sp_size != 0:
+                #  flash_attn, ring_attn, sage_attn do not support attention_mask
+                if get_attn_backend(-1).get_name() != "SDPA" and get_attn_backend(-1).get_name() != "ASCEND":
+                    raise ValueError(
+                        f"When generating image shape that the sequence length is NOT divisible by sp_size={sp_size},"
+                        f"cannot use {get_attn_backend(-1).get_name()} which does not support attention_mask."
+                        f"Please switch to SDPA or Ascend attention backend."
+                    )
+                # ring attention does not support attention_mask
+                if get_ring_parallel_world_size() > 1:
+                    raise ValueError(
+                        f"When generating image shape that the sequence length is NOT divisible by sp_size={sp_size},"
+                        f"cannot use ring attention which does not support attention_mask."
+                        f"Please switch to Ulysses SP only."
+                    )
+
+                seq_padding = sp_size - (seq_len % sp_size)
+                original_seq_len = seq_len
+
+                hidden_states_mask = torch.ones(
+                    batch_size, seq_len + seq_padding, dtype=torch.bool, device=hidden_states.device
+                )
+                hidden_states_mask[:, seq_len:] = False
+                padding_tensor = torch.zeros(
+                    batch_size, seq_padding, channels, dtype=hidden_states.dtype, device=hidden_states.device
+                )
+                hidden_states = torch.cat([hidden_states, padding_tensor], dim=1)
+
+            hidden_states = torch.chunk(hidden_states, sp_size, dim=-2)[get_sequence_parallel_rank()]
             # NOTE:
             # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
             # text embeddings to be replicated across SP ranks for correctness.
             get_forward_context().split_text_embed_in_sp = False
+
         hidden_states = self.img_in(hidden_states)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
@@ -769,13 +853,17 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
-        def get_rotary_emb_chunk(freqs):
+        def get_rotary_emb_chunk(freqs, padding=0):
+            # Pad rotary embeddings if needed
+            if padding > 0:
+                padding_tensor = torch.zeros(padding, freqs.shape[-1], dtype=freqs.dtype, device=freqs.device)
+                freqs = torch.cat([freqs, padding_tensor], dim=0)
             freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[get_sequence_parallel_rank()]
             return freqs
 
         if self.parallel_config.sequence_parallel_size > 1:
             img_freqs, txt_freqs = image_rotary_emb
-            img_freqs = get_rotary_emb_chunk(img_freqs)
+            img_freqs = get_rotary_emb_chunk(img_freqs, seq_padding)
             if get_forward_context().split_text_embed_in_sp:
                 txt_freqs = get_rotary_emb_chunk(txt_freqs)
             image_rotary_emb = (img_freqs, txt_freqs)
@@ -789,6 +877,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
+                hidden_states_mask=hidden_states_mask,
             )
 
         if self.zero_cond_t:
@@ -799,6 +888,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         if self.parallel_config.sequence_parallel_size > 1:
             output = get_sp_group().all_gather(output, dim=-2)
+
+            # Remove padding if it was added
+            if original_seq_len is not None:
+                output = output[:, :original_seq_len, :]
+
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

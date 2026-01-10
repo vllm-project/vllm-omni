@@ -14,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
@@ -103,6 +104,16 @@ class GPUWorker:
             time_after_load - time_before_load,
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
+
+        if not self.od_config.enforce_eager:
+            try:
+                self.pipeline.transformer = regionally_compile(
+                    self.pipeline.transformer,
+                    dynamic=True,
+                )
+                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
+            except Exception as e:
+                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
 
         # Setup cache backend based on type (both backends use enable()/reset() interface)
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)

@@ -353,6 +353,11 @@ class LongCatImageTransformer2DModel(nn.Module):
     The Transformer model introduced in Flux.
     """
 
+    _repeated_blocks = [
+        "LongCatImageTransformerBlock",
+        "LongCatImageSingleTransformerBlock",
+    ]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,

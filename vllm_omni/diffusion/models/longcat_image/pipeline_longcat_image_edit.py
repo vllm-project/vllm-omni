@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
 )
@@ -196,7 +197,7 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongCatImageEditPipeline(nn.Module):
+class LongCatImageEditPipeline(nn.Module, SupportImageInput):
     def __init__(
         self,
         *,
@@ -466,7 +467,7 @@ class LongCatImageEditPipeline(nn.Module):
         if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
             logger.warning(
                 "`height` and `width` have to be divisible by "
-                "{self.vae_scale_factor * 2} but are {height} and {width}. "
+                f"{self.vae_scale_factor * 2} but are {height} and {width}. "
                 "Dimensions will be resized accordingly"
             )
 

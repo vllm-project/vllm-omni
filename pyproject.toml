@@ -38,6 +38,7 @@ dependencies = [
     "soundfile>=0.13.1",
     "cache-dit==1.1.8",
     "tqdm>=4.66.0",
+    "torchsde>=0.2.6",  # Required for Stable Audio scheduler
     # "vllm==0.12.0",  # TODO: fix the entrypoints overwrite problem
 ]
 

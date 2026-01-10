@@ -160,11 +160,11 @@ def talker2code2wav(
     # Process each talker output
     for i, talker_output in enumerate(talker_outputs):
         output = talker_output.outputs[0]
-
+        seq_len = len(output.token_ids)
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (
-            output.multimodal_output["code_predictor_codes"]
+            output.multimodal_output["code_predictor_codes"][-seq_len:]
             .to(torch.long)
             .transpose(0, 1)
             .cpu()

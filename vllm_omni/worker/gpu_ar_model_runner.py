@@ -190,8 +190,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
-            if isinstance(model_output, tuple):
-                model_output = OmniOutput(*model_output)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
