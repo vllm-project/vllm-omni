@@ -21,6 +21,12 @@ from vllm_omni.utils.platform_utils import is_npu, is_rocm
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 
+def _get_zimage_model() -> str:
+    # Allow overriding the model for local/offline environments.
+    # Can be either a HuggingFace repo id or a local path.
+    return os.environ.get("VLLM_TEST_ZIMAGE_MODEL", "Tongyi-MAI/Z-Image-Turbo")
+
+
 @pytest.mark.integration
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if is_npu() or is_rocm():
@@ -29,7 +35,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
     m = Omni(
-        model="Tongyi-MAI/Z-Image-Turbo",
+        model=_get_zimage_model(),
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
         enforce_eager=True,
     )
@@ -61,4 +67,3 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     assert images[0].width == width
     assert images[0].height == height
     images[0].save(tmp_path / "zimage_tp2.png")
-
