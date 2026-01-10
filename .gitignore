@@ -223,9 +223,6 @@ results/
 generated/
 output_*/
 
-# Local-only docs
-ZIMAGE_TP_ROADMAP.md
-
 # Configuration overrides
 configs/local.yaml
 configs/production.yaml
