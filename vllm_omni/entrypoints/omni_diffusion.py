@@ -116,7 +116,7 @@ class OmniDiffusion:
         # Check if request_id is provided in kwargs
         request_id = kwargs.get("request_id")
         request_ids = kwargs.pop("request_ids", None)
-        assert (request_ids or request_id) is not None, "request_ids or request_id must be provided"
+        # assert (request_ids or request_id) is not None, "request_ids or request_id must be provided"
 
         for i, p in enumerate(prompts):
             req_kwargs = kwargs.copy()
