@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enforce_eager",
         action="store_true",
-        help="Disable torch.compile and force eager execution (recommended when debugging TP).",
+        help="Disable torch.compile and force eager execution.",
     )
     parser.add_argument(
         "--tensor_parallel_size",

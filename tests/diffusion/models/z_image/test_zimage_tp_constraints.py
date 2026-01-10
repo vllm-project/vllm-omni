@@ -42,4 +42,3 @@ def test_validate_zimage_tp_constraints_tp3_fails_on_ffn_hidden_dim():
             all_f_patch_size=(1,),
             tensor_parallel_size=3,
         )
-

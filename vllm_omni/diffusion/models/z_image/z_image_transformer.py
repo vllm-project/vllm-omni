@@ -16,7 +16,6 @@
 # limitations under the License.
 
 import math
-import os
 from collections.abc import Iterable
 
 import torch
@@ -40,31 +39,6 @@ ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
 logger = init_logger(__name__)
-
-_ZIMAGE_TP_DEBUG_ENV = "VLLM_OMNI_ZIMAGE_TP_DEBUG"
-
-
-def _zimage_tp_debug_enabled() -> bool:
-    return os.environ.get(_ZIMAGE_TP_DEBUG_ENV, "0").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _get_tp_rank_world_size() -> tuple[int, int]:
-    try:
-        from vllm.distributed.parallel_state import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-        )
-
-        return int(get_tensor_model_parallel_rank()), int(get_tensor_model_parallel_world_size())
-    except Exception:
-        return 0, 1
-
-
-def _maybe_log_tp_shapes(tag: str, shapes: dict[str, object]) -> None:
-    if not _zimage_tp_debug_enabled():
-        return
-    tp_rank, tp_world = _get_tp_rank_world_size()
-    logger.info("Z-Image TP debug[%s]: tp_rank=%s tp_world=%s shapes=%s", tag, tp_rank, tp_world, shapes)
 
 
 def _positive_divisors(n: int) -> set[int]:
@@ -225,17 +199,13 @@ class ZImageAttention(nn.Module):
             total_num_kv_heads=num_kv_heads,
             bias=False,
         )
-        _maybe_log_tp_shapes(
-            "attn.to_qkv",
-            {
-                "dim": dim,
-                "total_num_heads": num_heads,
-                "total_num_kv_heads": num_kv_heads,
-                "local_num_heads": getattr(self.to_qkv, "num_heads", None),
-                "local_num_kv_heads": getattr(self.to_qkv, "num_kv_heads", None),
-                "head_dim": self.head_dim,
-                "weight": tuple(getattr(self.to_qkv, "weight").shape) if hasattr(self.to_qkv, "weight") else None,
-            },
+        logger.debug(
+            "Z-Image TP attn.to_qkv: total_heads=%d local_heads=%s total_kv_heads=%d local_kv_heads=%s weight_shape=%s",
+            num_heads,
+            getattr(self.to_qkv, "num_heads", None),
+            num_kv_heads,
+            getattr(self.to_qkv, "num_kv_heads", None),
+            tuple(getattr(self.to_qkv, "weight").shape) if hasattr(self.to_qkv, "weight") else None,
         )
 
         assert qk_norm is True
@@ -256,13 +226,9 @@ class ZImageAttention(nn.Module):
                 )
             ]
         )
-        _maybe_log_tp_shapes(
-            "attn.to_out",
-            {
-                "weight": (
-                    tuple(getattr(self.to_out[0], "weight").shape) if hasattr(self.to_out[0], "weight") else None
-                ),
-            },
+        logger.debug(
+            "Z-Image TP attn.to_out: weight_shape=%s",
+            tuple(getattr(self.to_out[0], "weight").shape) if hasattr(self.to_out[0], "weight") else None,
         )
 
         self.attn = Attention(
@@ -339,14 +305,12 @@ class FeedForward(nn.Module):
             input_is_parallel=True,
             return_bias=False,
         )
-        _maybe_log_tp_shapes(
-            "mlp",
-            {
-                "dim": dim,
-                "hidden_dim": hidden_dim,
-                "w13_weight": tuple(getattr(self.w13, "weight").shape) if hasattr(self.w13, "weight") else None,
-                "w2_weight": tuple(getattr(self.w2, "weight").shape) if hasattr(self.w2, "weight") else None,
-            },
+        logger.debug(
+            "Z-Image TP mlp: dim=%d hidden_dim=%d w13.weight=%s w2.weight=%s",
+            dim,
+            hidden_dim,
+            tuple(getattr(self.w13, "weight").shape) if hasattr(self.w13, "weight") else None,
+            tuple(getattr(self.w2, "weight").shape) if hasattr(self.w2, "weight") else None,
         )
 
     def forward(self, x):
