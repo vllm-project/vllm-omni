@@ -165,7 +165,8 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
     )
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
