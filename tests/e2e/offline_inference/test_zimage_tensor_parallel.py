@@ -64,7 +64,9 @@ def _extract_single_image(outputs) -> Image.Image:
     return images[0]
 
 
-def _run_zimage_generate(*, tp_size: int, height: int, width: int, num_inference_steps: int, seed: int) -> tuple[Image.Image, float]:
+def _run_zimage_generate(
+    *, tp_size: int, height: int, width: int, num_inference_steps: int, seed: int
+) -> tuple[Image.Image, float]:
     m = Omni(
         model=_get_zimage_model(),
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=tp_size),
