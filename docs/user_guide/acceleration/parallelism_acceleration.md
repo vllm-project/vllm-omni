@@ -53,7 +53,7 @@ omni = Omni(
 
 outputs = omni.generate(
     prompt="a cat reading a book",
-    num_inference_steps=6,
+    num_inference_steps=9,
     width=512,
     height=512,
 )
