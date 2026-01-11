@@ -30,6 +30,10 @@ The following table shows which models are currently supported by parallelism me
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ❌ | ❌ | ✅ (TP=2 only) |
 | **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
 
+!!! note "Why Z-Image is TP=2 only"
+    Z-Image Turbo is currently limited to `tensor_parallel_size` of **1 or 2** due to model shape divisibility constraints.
+    For example, the model has `n_heads=30` and a final projection out dimension of `64`, so valid TP sizes must divide both 30 and 64; the only common divisors are **1 and 2**.
+
 ### VideoGen
 
 | Model | Model Identifier | Ulysses-SP | Ring-SP | Tensor-Parallel |
