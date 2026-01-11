@@ -37,7 +37,6 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     m = Omni(
         model=_get_zimage_model(),
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
-        enforce_eager=True,
     )
 
     height = 256
