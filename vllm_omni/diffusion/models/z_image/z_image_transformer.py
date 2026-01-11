@@ -199,14 +199,6 @@ class ZImageAttention(nn.Module):
             total_num_kv_heads=num_kv_heads,
             bias=False,
         )
-        logger.debug(
-            "Z-Image TP attn.to_qkv: total_heads=%d local_heads=%s total_kv_heads=%d local_kv_heads=%s weight_shape=%s",
-            num_heads,
-            getattr(self.to_qkv, "num_heads", None),
-            num_kv_heads,
-            getattr(self.to_qkv, "num_kv_heads", None),
-            tuple(getattr(self.to_qkv, "weight").shape) if hasattr(self.to_qkv, "weight") else None,
-        )
 
         assert qk_norm is True
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -225,10 +217,6 @@ class ZImageAttention(nn.Module):
                     return_bias=False,
                 )
             ]
-        )
-        logger.debug(
-            "Z-Image TP attn.to_out: weight_shape=%s",
-            tuple(getattr(self.to_out[0], "weight").shape) if hasattr(self.to_out[0], "weight") else None,
         )
 
         self.attn = Attention(
@@ -304,13 +292,6 @@ class FeedForward(nn.Module):
             bias=False,
             input_is_parallel=True,
             return_bias=False,
-        )
-        logger.debug(
-            "Z-Image TP mlp: dim=%d hidden_dim=%d w13.weight=%s w2.weight=%s",
-            dim,
-            hidden_dim,
-            tuple(getattr(self.w13, "weight").shape) if hasattr(self.w13, "weight") else None,
-            tuple(getattr(self.w2, "weight").shape) if hasattr(self.w2, "weight") else None,
         )
 
     def forward(self, x):
