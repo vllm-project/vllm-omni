@@ -8,7 +8,7 @@ CPU offload lets the diffusion worker move large model components between GPU an
 2. Before denoising, weights are prefetched back to GPU, honoring pinned-memory copies for speed.
 3. After the diffusion step, the transformer returns to CPU and the process repeats as needed.
 
-Transfers use pinned host buffers when `pin_cpu_memory` is enabled, and the worker coordinates swaps via mutex-style hooks so components never compete for memory.
+Transfers use pinned host buffers, and the worker coordinates swaps via mutex-style hooks so components never compete for memory.
 
 ## Configuration
 You can enable CPU offload in two ways:
