@@ -70,14 +70,13 @@ class OmniServeCommand(CLISubcommand):
 
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
-        
+
         # Create OmniConfig argument group for omni-related parameters
         # This ensures the parameters appear in --help output
         omni_group = serve_parser.add_argument_group(
-            title="OmniConfig",
-            description="Configuration for vLLM-Omni multi-stage and diffusion models."
+            title="OmniConfig", description="Configuration for vLLM-Omni multi-stage and diffusion models."
         )
-        
+
         omni_group.add_argument(
             "--omni",
             action="store_true",
