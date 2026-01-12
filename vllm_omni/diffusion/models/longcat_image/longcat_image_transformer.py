@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -562,55 +561,6 @@ class LongCatImageTransformer2DModel(nn.Module):
         self.use_checkpoint = [True] * num_layers
         self.use_single_checkpoint = [True] * num_single_layers
 
-        # Timing statistics for profiling
-        self._timing_enabled = False
-        self._timing_stats = {
-            "embedding": [],
-            "rope": [],
-            "transformer_blocks": [],
-            "single_transformer_blocks": [],
-            "norm_out": [],
-            "total": [],
-        }
-
-    def enable_timing(self, enabled: bool = True):
-        """Enable or disable timing profiling."""
-        self._timing_enabled = enabled
-        if enabled:
-            # Reset timing stats
-            for key in self._timing_stats:
-                self._timing_stats[key] = []
-
-    def get_timing_stats(self) -> dict[str, dict[str, float]]:
-        """Get timing statistics as a dictionary with mean/std/min/max."""
-        import numpy as np
-
-        result = {}
-        for key, values in self._timing_stats.items():
-            if values:
-                arr = np.array(values)
-                result[key] = {
-                    "mean_ms": float(np.mean(arr) * 1000),
-                    "std_ms": float(np.std(arr) * 1000),
-                    "min_ms": float(np.min(arr) * 1000),
-                    "max_ms": float(np.max(arr) * 1000),
-                    "count": len(values),
-                }
-        return result
-
-    def print_timing_stats(self):
-        """Print timing statistics in a formatted way."""
-        stats = self.get_timing_stats()
-        logger.info("=" * 60)
-        logger.info("LongCatImageTransformer2DModel Timing Statistics")
-        logger.info("=" * 60)
-        for key, values in stats.items():
-            logger.info(
-                f"  {key:30s}: {values['mean_ms']:8.2f} ms (± {values['std_ms']:.2f}) "
-                f"[{values['min_ms']:.2f} - {values['max_ms']:.2f}] x{values['count']}"
-            )
-        logger.info("=" * 60)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -621,11 +571,6 @@ class LongCatImageTransformer2DModel(nn.Module):
         guidance: torch.Tensor = None,
         return_dict: bool = True,
     ) -> torch.FloatTensor | Transformer2DModelOutput:
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            total_start = time.perf_counter()
-            embed_start = time.perf_counter()
-
         # Before: hidden_states shape = (B, img_seq_len, in_channels)
         # After:  hidden_states shape = (B, img_seq_len // SP, in_channels)
         sp_size = self.parallel_config.sequence_parallel_size
@@ -657,11 +602,6 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         temb = self.time_embed(timestep, hidden_states.dtype)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            self._timing_stats["embedding"].append(time.perf_counter() - embed_start)
-            rope_start = time.perf_counter()
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
 
@@ -704,11 +644,6 @@ class LongCatImageTransformer2DModel(nn.Module):
                 torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
             )
 
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            self._timing_stats["rope"].append(time.perf_counter() - rope_start)
-            transformer_start = time.perf_counter()
-
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_checkpoint[index_block]:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -725,11 +660,6 @@ class LongCatImageTransformer2DModel(nn.Module):
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                 )
-
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            self._timing_stats["transformer_blocks"].append(time.perf_counter() - transformer_start)
-            single_start = time.perf_counter()
 
         for index_block, block in enumerate(self.single_transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing and self.use_single_checkpoint[index_block]:
@@ -748,25 +678,12 @@ class LongCatImageTransformer2DModel(nn.Module):
                     image_rotary_emb=image_rotary_emb,
                 )
 
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            self._timing_stats["single_transformer_blocks"].append(time.perf_counter() - single_start)
-            norm_start = time.perf_counter()
-
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
-
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            self._timing_stats["norm_out"].append(time.perf_counter() - norm_start)
 
         # SP: All-gather output to reconstruct full sequence
         if self.parallel_config.sequence_parallel_size > 1:
             output = get_sp_group().all_gather(output, dim=1)
-
-        if self._timing_enabled:
-            torch.cuda.synchronize()
-            self._timing_stats["total"].append(time.perf_counter() - total_start)
 
         if not return_dict:
             return (output,)
