@@ -185,7 +185,7 @@ class OmniServeCommand(CLISubcommand):
         serve_parser.add_argument(
             "--enable-cpu-offload",
             action="store_true",
-            help="Enable CPU offloading for DiT/transformer/unet in diffusion models.",
+            help="Enable CPU offloading for diffusion models.",
         )
 
         # Video model parameters (e.g., Wan2.2) - engine-level
