@@ -1,4 +1,4 @@
-# CPU Offloading
+# CPU Offloading for Diffusion Model
 
 ## Overview
 CPU offload lets the diffusion worker move large model components between GPU and CPU memory on demand. It keeps the DiT transformer resident on GPU only while it is actively running, and swaps it out when encoders modules need the device. This reduces peak VRAM usage so bigger checkpoints run on smaller GPUs, or multiple requests can share the same GPU.
