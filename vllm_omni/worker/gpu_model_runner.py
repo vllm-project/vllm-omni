@@ -895,13 +895,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
                 )
                 if hasattr(self.model, "talker_mtp") and span_len == 1:
-                    decode_req_ids.append(req_id)
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
                     self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
                     self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
                     self.text_step.gpu[decode_slice].copy_(text_step)
+                    decode_req_ids.append(req_id)
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
