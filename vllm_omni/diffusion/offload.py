@@ -36,16 +36,14 @@ class SequentialOffloader:
 
     def __init__(
         self,
-        dits: nn.Module | list[nn.Module],
+        dits: list[nn.Module],
         encoders: list[nn.Module],
         device: torch.device,
         pin_memory: bool = True,
     ):
-        if isinstance(dits, nn.Module):
-            self.dits = [dits]
-        else:
-            # Filter out any None values just in case
-            self.dits = [mod for mod in dits if isinstance(mod, nn.Module)]
+        assert all(isinstance(m, nn.Module) for m in dits), "All dits must be nn.Module"
+        assert all(isinstance(m, nn.Module) for m in encoders), "All encoders must be nn.Module"
+        self.dits = dits
         self.encoders = encoders
         self.device = device
         self.pin_memory = pin_memory
@@ -88,9 +86,6 @@ class SequentialOffloader:
         """Before DiT forward: offload encoders, load DiT."""
         for enc in self.encoders:
             self._to_cpu(enc)
-        for dit_mod in self.dits:
-            if dit_mod is not module:
-                self._to_cpu(dit_mod)
         self._to_gpu(module)
         torch.cuda.synchronize()
         logger.debug("Swapped: encoders -> CPU, DiT -> GPU")
@@ -174,8 +169,8 @@ def apply_offload_hooks(
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Collect all encoders
-    encoders = []
-    encoder_names = []
+    encoders: list[nn.Module] = []
+    encoder_names: list[str] = []
     for attr in ["text_encoder", "text_encoder_2", "text_encoder_3", "image_encoder"]:
         if hasattr(model, attr) and getattr(model, attr) is not None:
             encoders.append(getattr(model, attr))
