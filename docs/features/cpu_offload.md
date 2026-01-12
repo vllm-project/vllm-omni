@@ -13,14 +13,14 @@ Transfers use pinned host buffers when `pin_cpu_memory` is enabled, and the work
 ## Configuration
 You can enable CPU offload in two ways:
 
-- **Python API**: set `dit_cpu_offload=True`.
+- **Python API**: set `enable_cpu_offload=True`.
 
 ```python
 from vllm_omni import Omni
 
 if __name__ == "__main__":
 
-    m = Omni(model="Qwen/Qwen-Image",dit_cpu_offload=True)
+    m = Omni(model="Qwen/Qwen-Image",enable_cpu_offload=True)
 ```
 
 - **CLI**: pass `--dit-cpu-offload` to the diffusion service entrypoint.

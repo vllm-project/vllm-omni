@@ -289,7 +289,7 @@ class OmniDiffusionConfig:
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
-    dit_cpu_offload: bool = False
+    enable_cpu_offload: bool = False
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

@@ -70,7 +70,7 @@ class GPUWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
-        load_device = "cpu" if self.od_config.dit_cpu_offload else str(self.device)
+        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
 
         with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
@@ -105,7 +105,7 @@ class GPUWorker:
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
         # Apply CPU offloading (DiT <-> encoders mutual exclusion)
-        if self.od_config.dit_cpu_offload:
+        if self.od_config.enable_cpu_offload:
             for name in ["vae"]:
                 module = getattr(self.pipeline, name, None)
                 if module is None:

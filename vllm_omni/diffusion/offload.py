@@ -3,7 +3,7 @@
 """CPU offloading utilities for diffusion models.
 
 This module provides mutual-exclusion CPU offloading between DiT and encoders.
-When dit_cpu_offload is enabled:
+When enable_cpu_offload is enabled:
 - Text encoders run on GPU while DiT is on CPU
 - DiT runs on GPU while encoders are offloaded to CPU
 
@@ -132,7 +132,7 @@ def apply_offload_hooks(
 ) -> None:
     """Apply mutual-exclusion offload hooks based on config.
 
-    When dit_cpu_offload is enabled, DiT and encoders swap GPU access:
+    When enable_cpu_offload is enabled, DiT and encoders swap GPU access:
     - Encoders (text_encoder, text_encoder_2, text_encoder_3, image_encoder)
       run on GPU while DiT is on CPU
     - DiT runs on GPU while encoders are on CPU
@@ -141,7 +141,7 @@ def apply_offload_hooks(
         model: Diffusion pipeline model
         od_config: OmniDiffusionConfig with offload settings
     """
-    if not getattr(od_config, "dit_cpu_offload", False):
+    if not getattr(od_config, "enable_cpu_offload", False):
         return
 
     # Find DiT/transformer modules
@@ -164,7 +164,7 @@ def apply_offload_hooks(
         dit_names.append(attr)
 
     if not dit_modules:
-        logger.warning("dit_cpu_offload enabled but no transformer/dit/unet found")
+        logger.warning("enable_cpu_offload enabled but no transformer/dit/unet found")
         return
 
     if device is None:
@@ -182,7 +182,7 @@ def apply_offload_hooks(
             encoder_names.append(attr)
 
     if not encoders:
-        logger.warning("dit_cpu_offload enabled but no encoders found")
+        logger.warning("enable_cpu_offload enabled but no encoders found")
         return
 
     # Initial state: keep DiT modules on CPU (encoders typically run first)

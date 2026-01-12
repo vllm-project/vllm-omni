@@ -59,7 +59,7 @@ def test_cpu_offload_diffusion_model(model_name: str):
         device_index = torch.cuda.current_device()
         monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
         monitor.start()
-        m = Omni(model=model_name, dit_cpu_offload=offload)
+        m = Omni(model=model_name, enable_cpu_offload=offload)
         torch.cuda.reset_peak_memory_stats(device=device_index)
         height = 256
         width = 256

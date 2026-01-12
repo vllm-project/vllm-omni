@@ -183,7 +183,7 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         serve_parser.add_argument(
-            "--dit-cpu-offload",
+            "--enable-cpu-offload",
             action="store_true",
             help="Enable CPU offloading for DiT/transformer/unet in diffusion models.",
         )
