@@ -48,7 +48,7 @@ class GPUMemoryMonitor:
         self._thread.join(timeout=2.0)
 
 
-models = ["Tongyi-MAI/Z-Image-Turbo"]
+models = ["riverclouds/qwen_image_random"]
 
 
 @pytest.mark.skipif(is_npu() or is_rocm(), reason="Hardware not supported")
@@ -85,6 +85,6 @@ def test_cpu_offload_diffusion_model(model_name: str):
     no_offload_peak_memory = inference(offload=False)
     print(f"Offload peak memory: {offload_peak_memory} MB")
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
-    assert offload_peak_memory + 7000 < no_offload_peak_memory, (
+    assert offload_peak_memory + 2500 < no_offload_peak_memory, (
         f"Offload peak memory {offload_peak_memory} MB should be less than no offload peak memory {no_offload_peak_memory} MB"
     )
