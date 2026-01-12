@@ -569,6 +569,45 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 
 
 class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixin):
+    def _parse_and_validate_audio_input(self, **kwargs: object) -> Qwen2_5OmniAudioFeatureInputs | None:
+        input_audio_features = kwargs.pop("input_audio_features", None)
+        audio_feature_lengths = kwargs.pop("audio_feature_lengths", None)
+        feature_attention_mask = kwargs.pop("feature_attention_mask", None)
+        if input_audio_features is None:
+            return None
+        if (
+            input_audio_features is not None
+            and isinstance(input_audio_features, torch.Tensor)
+            and input_audio_features.ndim == 3
+        ):
+            # (batch_size, feature_dim, chunk_size) -> (feature_dim, batch_size * chunk_size)
+            input_audio_features = input_audio_features.permute(1, 0, 2).flatten(1)
+        elif input_audio_features is not None and isinstance(input_audio_features, list):
+            input_audio_features = torch.cat(input_audio_features, dim=-1)
+        if (
+            audio_feature_lengths is not None
+            and isinstance(audio_feature_lengths, torch.Tensor)
+            and audio_feature_lengths.ndim == 2
+        ):
+            audio_feature_lengths = audio_feature_lengths.reshape(-1)
+        elif audio_feature_lengths is not None and isinstance(audio_feature_lengths, list):
+            audio_feature_lengths = torch.cat(audio_feature_lengths, dim=-1)
+        if (
+            feature_attention_mask is not None
+            and isinstance(feature_attention_mask, torch.Tensor)
+            and feature_attention_mask.ndim == 3
+        ):
+            feature_attention_mask = feature_attention_mask.reshape(-1, feature_attention_mask.shape[-1])
+        elif feature_attention_mask is not None and isinstance(feature_attention_mask, list):
+            for i in range(len(feature_attention_mask)):
+                feature_attention_mask[i] = feature_attention_mask[i].reshape(-1)
+        return Qwen2_5OmniAudioFeatureInputs(
+            type="audio_features",
+            input_features=input_audio_features,
+            audio_feature_lengths=audio_feature_lengths,
+            feature_attention_mask=feature_attention_mask,
+        )
+
     def _process_audio_input(
         self,
         audio_input: Qwen2_5OmniAudioFeatureInputs,
@@ -583,7 +622,6 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         audio_outputs = self.audio_tower(
             input_features.to(self.audio_tower.dtype),
             feature_lens=audio_feature_lengths,
-            aftercnn_lens=audio_feat_lengths,
         )
         audio_features = audio_outputs.last_hidden_state
         return audio_features.split(audio_output_lengths.tolist())
