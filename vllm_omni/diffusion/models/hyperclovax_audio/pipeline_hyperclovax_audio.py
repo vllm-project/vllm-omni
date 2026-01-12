@@ -186,11 +186,12 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         if len(audio_tokens) != len(ref_audio_tokens):
             return DiffusionOutput(output=None, error="length of ref_audio_tokens and audio_tokens must be the same")
 
+        # 2. Construct batch from given request inputs
         batch = self._prepare_batch(audio_tokens, speakers, formats, ref_audio_tokens)
         results: List[Tuple[torch.Tensor, str]] = []
         
         for units, speaker, fmt in batch:
-            # 2. Convert to tensor if needed
+            # 3. Convert to tensor if needed
             if isinstance(units, list):
                 units = torch.tensor(units, dtype=torch.long)
             elif isinstance(units, np.ndarray):
@@ -206,15 +207,15 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             units = units.to(self.device)
             padded_unit, original_portion = self.pad(units)
 
-            # 3. Generate speaker embedding
+            # 4. Generate speaker embedding
             spk_emb = self.spk_emb(speaker)
 
-            # 4. Decode audio
+            # 5. Decode audio
             padded_out, hidden = self.bigvgan(padded_unit, spk_emb=spk_emb)
             del hidden
             out = self.unpad(padded_out, original_portion)
 
-            # 5. Append decoded audio to result
+            # 6. Append decoded audio to result
             results.append((out.to(torch.float32), fmt))
 
         return DiffusionOutput(output=results)
