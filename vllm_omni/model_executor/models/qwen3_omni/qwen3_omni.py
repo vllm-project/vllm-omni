@@ -8,13 +8,6 @@ from functools import cached_property
 
 import torch
 import torch.nn as nn
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    RepetitionPenaltyLogitsProcessor,
-    SuppressTokensLogitsProcessor,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-)
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavConfig,
     Qwen3OmniMoeConfig,
@@ -132,6 +125,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
+            self.tts_tokens = torch.tensor(
+                [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
+                device=self._module_device(self.thinker),
+                dtype=torch.long,
+            )
         elif self.model_stage == "talker":
             self.has_preprocess = True
             self.has_postprocess = True
@@ -153,15 +151,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.code2wav = None
-
-            self.logits_processors = LogitsProcessorList(
-                [
-                    RepetitionPenaltyLogitsProcessor(penalty=1.05),
-                    TemperatureLogitsWarper(temperature=0.9),
-                    SuppressTokensLogitsProcessor(suppress_tokens=self._get_talker_suppressed_tokens()),
-                    TopKLogitsWarper(top_k=50),
-                ]
-            )
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
             self._init_special_tokens_embeddings()
@@ -188,12 +177,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
-        if self.model_stage == "thinker":
-            self.tts_tokens = torch.tensor(
-                [[self.config.tts_bos_token_id, self.config.tts_eos_token_id, self.config.tts_pad_token_id]],
-                device=self._module_device(self.thinker),
-                dtype=torch.long,
-            )
 
     # ==================== Device utilities ====================
 
@@ -207,31 +190,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             for _, buf in module.named_buffers(recurse=True):
                 return buf.device
             return torch.device("cpu")
-
-    def move_submodules_to_devices(
-        self,
-        *,
-        thinker_device: str | torch.device | None = None,
-        talker_device: str | torch.device | None = None,
-        code_predictor_device: str | torch.device | None = None,
-        code2wav_device: str | torch.device | None = None,
-    ) -> None:
-        """
-        Optionally move thinker/talker/code2wav to different devices.
-
-        Example:
-            model.move_submodules_to_devices(
-                thinker_device='cuda:0',
-                talker_device='cuda:1',
-                code2wav_device='cuda:2',
-            )
-        """
-        if thinker_device is not None and self.thinker is not None:
-            self.thinker.to(thinker_device)
-        if talker_device is not None and self.talker is not None:
-            self.talker.to(talker_device)
-        if code2wav_device is not None and self.code2wav is not None:
-            self.code2wav.to(code2wav_device)
 
     @cached_property
     def sampler(self):
@@ -372,6 +330,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 2.1: Talker ==========
         elif self.model_stage == "talker":
             if input_ids is None:
+                # special case for profile run
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
 
             # Ensure we have base embeddings when only ids are provided
@@ -1017,6 +976,29 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     # ==================== Logits and Sampling ====================
 
+    def _warn_talker_sampling_temperature(self, sampling_metadata: SamplingMetadata):
+        warning_parts = []
+        if sampling_metadata.temperature is None:
+            warning_parts.append(
+                "Temperature is set to None, as all requests are greedy. "
+                "This is equivalent to setting temperature to 0.0."
+                "Please consider setting a higher temperature i.e. 0.4."
+            )
+        else:
+            warning_parts.append(
+                "Temperature is set to: "
+                f"{sampling_metadata.temperature}, where temperature as 0.0 may "
+                "cause repetitive output. Please consider setting a higher "
+                "temperature i.e. 0.4."
+            )
+        warning_parts.append(
+            "This warning will be shown only once, for the first request where "
+            "temperature is 0.0. Later requests will not show this warning but "
+            "still be affected by the temperature."
+        )
+        warning_info = "\n".join(warning_parts)
+        logger.warning_once(warning_info)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor | OmniOutput,
@@ -1024,35 +1006,16 @@ class Qwen3OmniMoeForConditionalGeneration(
     ) -> torch.Tensor | None:
         """Compute logits from hidden states."""
         # Handle OmniOutput type
-        from vllm.v1.sample.logits_processor import LogitsProcessors
-
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
-        num_reqs = hidden_states.shape[0]
-        top_k = hidden_states.size(1) - 1
 
-        def dummy_tensors(v):
-            return torch.full((num_reqs,), v, device=hidden_states.device)
+        if (
+            getattr(self, "model_stage", None) == "talker"
+            and sampling_metadata is not None
+            and (sampling_metadata.temperature is None or (sampling_metadata.temperature <= 0).any())
+        ):
+            self._warn_talker_sampling_temperature(sampling_metadata)
 
-        if sampling_metadata is None:
-            sampling_metadata = SamplingMetadata(
-                temperature=dummy_tensors(0.5),
-                all_greedy=False,
-                all_random=False,
-                top_p=dummy_tensors(0.9),
-                top_k=dummy_tensors(top_k),
-                generators={},
-                max_num_logprobs=None,
-                no_penalties=True,
-                prompt_token_ids=None,
-                frequency_penalties=dummy_tensors(0.1),
-                presence_penalties=dummy_tensors(0.1),
-                repetition_penalties=dummy_tensors(0.1),
-                output_token_ids=[[] for _ in range(num_reqs)],
-                allowed_token_ids_mask=None,
-                bad_words_token_ids={},
-                logitsprocs=LogitsProcessors(),
-            )
         # Use active model for logits computation
         logits = self.model.compute_logits(hidden_states)  # V, d
         # Talker: suppress tokens by setting their probability to ~1e-9 (finite very small),
