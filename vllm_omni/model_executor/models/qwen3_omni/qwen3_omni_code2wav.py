@@ -219,6 +219,6 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 str(device),
             )
         except Exception:
-            pass
+            logger.error("Error logging model load summary")
 
         return loaded

@@ -771,7 +771,7 @@ class Qwen2_5OmniForConditionalGeneration(
         )  # for decode
         return output_token_ids, processed_output_token_embeds
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, **kwargs: object) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
