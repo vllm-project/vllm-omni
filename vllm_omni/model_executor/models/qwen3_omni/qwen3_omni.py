@@ -644,7 +644,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_ids = safe_tensor_reshape(input_ids, (input_ids.shape[0], -1))
         inputs_embeds = safe_tensor_reshape(input_embeds, (-1, self.talker_config.text_config.hidden_size))
         text_step = safe_tensor_reshape(text_step, (-1, self.talker_config.text_config.hidden_size))
-        last_talker_hidden = safe_tensor_reshape(last_talker_hidden, (-1, 1, self.talker_config.text_config.hidden_size))
+        last_talker_hidden = safe_tensor_reshape(
+            last_talker_hidden, (-1, 1, self.talker_config.text_config.hidden_size)
+        )
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
