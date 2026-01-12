@@ -40,6 +40,31 @@ body:
       </details>
   validations:
     required: true
+
+- type: textarea
+  attributes:
+    label: Your code version
+    description: |
+      Please provide a description of which commit id or version the code is.
+
+    value: |
+      <details>
+      <summary>The commit id or version of vllm</summary>
+
+      ```text
+
+      ```
+      </details>
+      <details>
+      <summary>The commit id or version of vllm-omni</summary>
+
+      ```text
+
+      ```
+      </details>
+  validations:
+    required: true
+
 - type: textarea
   attributes:
     label: 🐛 Describe the bug
