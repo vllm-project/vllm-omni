@@ -286,12 +286,12 @@ class OmniDiffusionConfig:
     output_type: str = "pil"
 
     # CPU offload parameters
-    dit_cpu_offload: bool = True
+    # When enabled, DiT and encoders swap GPU access (mutual exclusion):
+    # - Text encoders run on GPU while DiT is on CPU
+    # - DiT runs on GPU while encoders are on CPU
+    enable_cpu_offload: bool = False
     use_fsdp_inference: bool = False
-    text_encoder_cpu_offload: bool = True
-    image_encoder_cpu_offload: bool = True
-    vae_cpu_offload: bool = True
-    pin_cpu_memory: bool = True
+    pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
     # VAE memory optimization parameters
     vae_use_slicing: bool = False

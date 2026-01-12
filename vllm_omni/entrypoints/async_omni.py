@@ -160,6 +160,7 @@ class AsyncOmni(OmniBase):
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
+                    "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                 },
                 "final_output": True,
                 "final_output_type": "image",
