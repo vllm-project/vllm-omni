@@ -91,50 +91,50 @@ def select_flash_attn_impl(
     elif impl_type == AttnType.SAGE_AUTO:
         if not HAS_SAGE_ATTENTION:
             raise ImportError("SageAttention is not available!")
-            return partial(
-                sageattention.sageattn,
-                tensor_layout="NHD",
-                return_lse=True,
-            )
+        return partial(
+            sageattention.sageattn,
+            tensor_layout="NHD",
+            return_lse=True,
+        )
 
     elif impl_type == AttnType.SAGE_FP16:
         if not HAS_SAGE_ATTENTION:
             raise ImportError("SageAttention is not available!")
-            return partial(
-                sageattention.sageattn_qk_int8_pv_fp16_cuda,
-                pv_accum_dtype="fp32",
-                tensor_layout="NHD",
-                return_lse=True,
-            )
+        return partial(
+            sageattention.sageattn_qk_int8_pv_fp16_cuda,
+            pv_accum_dtype="fp32",
+            tensor_layout="NHD",
+            return_lse=True,
+        )
 
     elif impl_type == AttnType.SAGE_FP16_TRITON:
         if not HAS_SAGE_ATTENTION:
             raise ImportError("SageAttention is not available!")
-            return partial(
-                sageattention.sageattn_qk_int8_pv_fp16_triton,
-                tensor_layout="NHD",
-                return_lse=True,
-            )
+        return partial(
+            sageattention.sageattn_qk_int8_pv_fp16_triton,
+            tensor_layout="NHD",
+            return_lse=True,
+        )
 
     elif impl_type == AttnType.SAGE_FP8:
         if not HAS_SAGE_ATTENTION:
             raise ImportError("SageAttention is not available!")
-            return partial(
-                sageattention.sageattn_qk_int8_pv_fp8_cuda,
-                pv_accum_dtype="fp32+fp32",
-                tensor_layout="NHD",
-                return_lse=True,
-            )
+        return partial(
+            sageattention.sageattn_qk_int8_pv_fp8_cuda,
+            pv_accum_dtype="fp32+fp32",
+            tensor_layout="NHD",
+            return_lse=True,
+        )
 
     elif impl_type == AttnType.SAGE_FP8_SM90:
         if not HAS_SAGE_ATTENTION:
             raise ImportError("SageAttention is not available!")
-            return partial(
-                sageattention.sageattn_qk_int8_pv_fp8_cuda_sm90,
-                pv_accum_dtype="fp32+fp32",
-                tensor_layout="NHD",
-                return_lse=True,
-            )
+        return partial(
+            sageattention.sageattn_qk_int8_pv_fp8_cuda_sm90,
+            pv_accum_dtype="fp32+fp32",
+            tensor_layout="NHD",
+            return_lse=True,
+        )
 
     elif impl_type == AttnType.SPARSE_SAGE:
         if not HAS_SPARSE_SAGE_ATTENTION:
@@ -142,25 +142,25 @@ def select_flash_attn_impl(
         if not isinstance(attn_processor, SparseAttentionMeansim):
             raise ImportError("SparseSageAttention is only available with a SparseAttentionProcessor class passed in")
 
-            def fn(q, k, v, causal=False, softmax_scale=None, *args, **kwargs):
-                return (
-                    attn_processor(
-                        q,
-                        k,
-                        v,
-                        is_causal=causal,
-                        scale=softmax_scale,
-                        tensor_layout="NHD",
-                    ),
-                    None,
-                )
+        def fn(q, k, v, causal=False, softmax_scale=None, *args, **kwargs):
+            return (
+                attn_processor(
+                    q,
+                    k,
+                    v,
+                    is_causal=causal,
+                    scale=softmax_scale,
+                    tensor_layout="NHD",
+                ),
+                None,
+            )
 
-            return fn
+        return fn
 
     elif impl_type == AttnType.NPU:
         if not HAS_NPU:
             raise ImportError("torch_npu is not available!")
-            return npu_fused_infer_attention_score
+        return npu_fused_infer_attention_score
 
     elif attn_processor is not None:
         return attn_processor
