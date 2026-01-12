@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, cast, List
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -563,7 +563,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
-                if self.model.talker is not None and hasattr(self.model, "talker_mtp"):
+                if (
+                    getattr(self.model, "talker", None) is not None
+                    and hasattr(self.model, "talker_mtp")
+                    and num_tokens_padded == 1
+                ):
                     outputs = self.talker_mtp(
                         self.talker_mtp_input_ids.gpu[:num_tokens_padded],
                         self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
@@ -914,7 +918,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # run talker mtp decode
             if hasattr(self.model, "talker_mtp"):
-                self._talker_mtp_forward(decode_req_ids, inputs_embeds)       
+                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (
             input_ids,
@@ -925,7 +929,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             ec_connector_output,
         )
 
-    def _talker_mtp_forward(self, decode_req_ids: List[str], inputs_embeds: torch.Tensor) -> None:
+    def _talker_mtp_forward(self, decode_req_ids: list[str], inputs_embeds: torch.Tensor) -> None:
         decode_batch_size = len(decode_req_ids)
         _cudagraph_mode, batch_desc, _, _ = self._determine_batch_execution_and_padding(
             num_tokens=decode_batch_size,
@@ -941,9 +945,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
-                req_input_ids, req_embeds, last_talker_hidden, text_step
-            )
+            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
         # update the inputs_embeds and code_predictor_codes
         code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
         for idx, req_id in enumerate(decode_req_ids):
