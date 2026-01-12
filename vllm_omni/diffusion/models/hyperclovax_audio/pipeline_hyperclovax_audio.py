@@ -14,13 +14,16 @@ import numpy as np
 from typing import Any, Dict, List, Iterable, Tuple, Optional
 from librosa.filters import mel as librosa_mel_fn
 
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
-from .hyperclovax_audio_decoder import HyperCLOVAXAudioTransformer
+from .hyperclovax_audio_decoder import HyperCLOVAXAudioDecoderModel
+
+logger = init_logger(__name__)
 
 FORMAT_MIME_MAP = {
     "mp3": "audio/mpeg",
@@ -72,60 +75,53 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         self.od_config = od_config
         self.device = get_local_device()
 
-        model = self.od_config.model
+        self.model = self.od_config.model
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
-                subfolder="transformer",
+                subfolder="bigvgan",
                 revision=None,
                 prefix="transformer.",
                 fall_back_to_pt=True
             )
         ]
-        self.transformer = HyperCLOVAXAudioTransformer(
-            od_config=od_config
+        self.bigvgan = HyperCLOVAXAudioDecoderModel(
+            od_config=od_config,
+            ## TODO:
+            ##  이 부분 나중에 config 통해서 받도록 수정 필요
+            h={}
         )
-        self.spk_emb = self.transformer.spk_emb
-        self._vocab = int(getattr(self.transformer.model.h, "num_units", 0))
+        self.spk_emb = self.bigvgan.spk_emb
+        self._vocab = int(getattr(self.bigvgan.model.h, "num_units", 0))
 
-    def _extract(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], List[int], str]:
+        with open(self._speaker_list_path, "r") as f:
+            speakers = [line.strip() for line in f]
+
+        self.speaker_map = {spk: i for i, spk in enumerate(speakers)}
+
+    def _prepare_batch(
+        self,
+        audio_tokens: List[List[int]],
+        speakers: List[str],
+        formats: List[str],
+        ref_audio_tokens: List[str]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor, str]]:
         """
-        Decode and parse the incoming request record to a JSON payload.
+        Construct batch to forward through the model.
+
+        Args:
+            - audio_tokens: List[List[int]]: discrete audio tokens to decode.
+            - speakers: List[str]: speaker IDs for output audio.
+            - formats: List[str]: output audio formats.
+            - ref_audio_tokens: List[str]:
+                List of base64 encoded reference audio.
+                If provided, speaker and format will be ignored.
+
+        Returns:
+            batch: List of tuples of (audio_tokens, speaker_id or ref_mel, format)
         """
-        data = record.get("data") or record.get("body")
-        if isinstance(data, (bytes, bytearray)):
-            data = data.decode("utf-8")
-        elif isinstance(data, str):
-            data = json.loads(data)
-
-        units_list = data.get("unit")
-        
-        if not isinstance(units_list, list) or not all(
-            isinstance(unit, int) for unit in units_list
-        ):
-            raise ValueError("Missing or invalid 'unit' field; must be a list of ints.")
-
-        ref_audio = data.get("ref_audio", None)
-        if ref_audio is None:
-            return data, units_list, None
-
-        if not isinstance(ref_audio, str):
-            raise ValueError("Missing 'ref_audio' field; must be a base64 string.")
-
-        try:
-            ref_audio_bytes = base64.b64decode(ref_audio.encode("ascii"), validate=True)
-        except binascii.Error:
-            raise ValueError("Invalid 'ref_audio' fields; must be a base64 string.")
-
-        return data, units_list, ref_audio_bytes
-
-
-    def _prepare_batch(self, audio_tokens: List[Dict[str, Any]]) -> List[Tuple[torch.Tensor, torch.Tensor, str]]:
         batch = []
-        for record in audio_tokens:
-            payload, units, ref_audio = self._extract(record)
-            units = torch.tensor(units, dtype=torch.long, device=self.device)
-
+        for units, speaker, fmt, ref_audio in zip(audio_tokens, speakers, formats, ref_audio_tokens):
             if self._vocab > 0:
                 mask = (units < 0) | (units >= self._vocab)
                 if mask.any():
@@ -135,20 +131,22 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                     )
             
             if ref_audio is not None:
+                ref_audio_bytes = base64.b64decode(ref_audio.encode("ascii"), validate=True)
                 ref_mel = (
-                    self._get_reference_mel_spectrogram(ref_audio, self.model.model.h)
+                    self._get_reference_mel_spectrogram(ref_audio_bytes, self.model.model.h)
                     .to(self.device)
                     .to(self._dtype)
                 )
                 batch.append((units, ref_mel, None))
             else:
-                speaker = str(payload.get("speaker", "fkms"))
-                fmt = str(payload.get("format", DEFAULT_FORMAT)).lower()
+                speaker = "fkms" if speaker is None else speaker
+                fmt = DEFAULT_FORMAT.lower() if fmt is None else fmt.lower()
                 if fmt not in FORMAT_MIME_MAP:
                     raise ValueError(
                         f"Unsupported format '{fmt}'. Choose from {list(FORMAT_MIME_MAP)}"
                     )
-                batch.append((units, speaker, fmt))
+                speaker_id = torch.tensor([self.speaker_map[speaker]], dtype=torch.long)
+                batch.append((units, speaker_id, fmt))
 
         return batch
 
@@ -158,45 +156,65 @@ class HyperCLOVAXAudioPipeline(nn.Module):
 
         Args:
             req: OmniDiffusionRequest must containing:
-                - extra["audio_tokens"]: List[Dict[str, Any]]
+                - extra["audio_tokens"]: List[List[int]]: [B, L] or [L, ] audio token ids.
+                - extra["speakers"]: List[str]: speaker for each audio sample.
+                - extra["formats"]: List[str]: output audio format for each audio sample.
+                - extra["ref_audio_tokens"]: List[str]: base64 encoded reference audio for each audio sample.
 
         Returns:
             OmniDiffusionResponse: The diffusion response.
         """
+
+        # 1. Validate inputs exist in request
         audio_tokens = req.extra.get("audio_tokens")
         if audio_tokens is None:
             return DiffusionOutput(output=None, error="audio_tokens required in req.extra")
         
+        speakers = req.extra.get("speakers")
+        if speakers is None:
+            return DiffusionOutput(output=None, error="speakers required in req.extra")
+
+        if len(audio_tokens) != len(speakers):
+            return DiffusionOutput(output=None, error="length of speakers and audio_tokens must be the same")
+
+        # Optional: audio format. If not provided, use wav format as default.
+        formats = req.extra.get("formats", [DEFAULT_FORMAT.lower()] * len(audio_tokens))
+        if len(audio_tokens) != len(formats):
+            return DiffusionOutput(output=None, error="length of formats and audio_tokens must be the same")
+
+        ref_audio_tokens = req.extra.get("ref_audio_tokens")
+        if len(audio_tokens) != len(ref_audio_tokens):
+            return DiffusionOutput(output=None, error="length of ref_audio_tokens and audio_tokens must be the same")
+
+        batch = self._prepare_batch(audio_tokens, speakers, formats, ref_audio_tokens)
         results: List[Tuple[torch.Tensor, str]] = []
-        batch = self._prepare_batch(audio_tokens)
         
         for units, speaker, fmt in batch:
-            # Convert to tensor if needed
+            # 2. Convert to tensor if needed
             if isinstance(units, list):
                 units = torch.tensor(units, dtype=torch.long)
             elif isinstance(units, np.ndarray):
                 units = torch.from_numpy(units).long()
 
             if len(units.size()) == 2 and units.size(0) == 1:
-                return DiffusionOutput(output=None, error="the underlying decoder does not support batch inference yet")
+                return DiffusionOutput(
+                    output=None,
+                    error="the underlying decoder does not support batch inference yet"
+                )
             
             units = units.unsqueeze(0)
             units = units.to(self.device)
             padded_unit, original_portion = self.pad(units)
 
-            if speaker is None:
-                return DiffusionOutput(output=None, error="speaker required in req.extra.audio_tokens")
-            else:
-                if isinstance(speaker, list):
-                    speaker = torch.tensor(speaker, dtype=torch.long)
-                elif isinstance(speaker, np.ndarray):
-                    speaker = torch.from_numpy(speaker).to(self.device)
-
+            # 3. Generate speaker embedding
             spk_emb = self.spk_emb(speaker)
-            padded_out, hidden = self.transformer(padded_unit, spk_emb=spk_emb)
+
+            # 4. Decode audio
+            padded_out, hidden = self.bigvgan(padded_unit, spk_emb=spk_emb)
             del hidden
-            
             out = self.unpad(padded_out, original_portion)
+
+            # 5. Append decoded audio to result
             results.append((out.to(torch.float32), fmt))
 
         return DiffusionOutput(output=results)
@@ -249,15 +267,15 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         try:
             pad_multiple = int(pad_multiple_str)
         except ValueError:
-            #logger.warning(
-            #    "AUDIOLLM_PAD_MULTIPLE environment variable is not a valid int. Skipping padding..."
-            #)
+            logger.warning(
+                "AUDIOLLM_PAD_MULTIPLE environment variable is not a valid int. Skipping padding..."
+            )
             return None
 
         if pad_multiple <= 0:
-            #logger.warning(
-            #    "AUDIOLLM_PAD_MULTIPLE environment variable is not a positive int. Skipping padding..."
-            #)
+            logger.warning(
+                "AUDIOLLM_PAD_MULTIPLE environment variable is not a positive int. Skipping padding..."
+            )
             return None
 
         return pad_multiple
@@ -265,23 +283,23 @@ class HyperCLOVAXAudioPipeline(nn.Module):
     def _get_pad_token_id(self) -> Optional[int]:
         pad_token_id_str = os.getenv("AUDIOLLM_PAD_TOKEN_ID", 3894)
         if not pad_token_id_str:
-            #logger.warning(
-            #    "AUDIOLLM_PAD_TOKEN_ID environment variable is not set. Skipping padding..."
-            #)
+            logger.warning(
+                "AUDIOLLM_PAD_TOKEN_ID environment variable is not set. Skipping padding..."
+            )
             return None
 
         try:
             pad_token_id = int(pad_token_id_str)
         except ValueError:
-            #logger.warning(
-            #    "AUDIOLLM_PAD_TOKEN_ID environment variable is not a valid int. Skipping padding..."
-            #)
+            logger.warning(
+                "AUDIOLLM_PAD_TOKEN_ID environment variable is not a valid int. Skipping padding..."
+            )
             return None
 
         if pad_token_id < 0:
-            #logger.warning(
-            #    "AUDIOLLM_PAD_TOKEN_ID environment variable is a negative int. Skipping padding..."
-            #)
+            logger.warning(
+                "AUDIOLLM_PAD_TOKEN_ID environment variable is a negative int. Skipping padding..."
+            )
             return None
 
         return pad_token_id
@@ -294,15 +312,15 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         try:
             down_sample_rate = float(down_sample_rate_str)
         except ValueError:
-            #logger.warning(
-            #    "AUDIOLLM_DOWN_SAMPLE_RATE environment variable is not a valid float. Skipping down-sampling..."
-            #)
+            logger.warning(
+                "AUDIOLLM_DOWN_SAMPLE_RATE environment variable is not a valid float. Skipping down-sampling..."
+            )
             return None
 
         if down_sample_rate <= 0:
-            #logger.warning(
-            #    "AUDIOLLM_DOWN_SAMPLE_RATE environment variable is not a positive float. Skipping down-sampling..."
-            #)
+            logger.warning(
+                "AUDIOLLM_DOWN_SAMPLE_RATE environment variable is not a positive float. Skipping down-sampling..."
+            )
             return None
 
         return down_sample_rate
