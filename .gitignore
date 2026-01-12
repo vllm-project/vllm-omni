@@ -233,3 +233,4 @@ configs/development.yaml
 Dockerfile.dev
 discussion
 tmp_test
+vllm_omni/version.py

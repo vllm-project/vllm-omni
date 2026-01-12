@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni"
-version = "0.12.0rc1"
+dynamic = ["version"]
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -170,3 +170,6 @@ extend-ignore-identifiers-re = [
     ".*NOTHINK.*",
     ".*nin.*",
 ]
+
+[tool.setuptools_scm]
+write_to = "vllm_omni/version.py"
