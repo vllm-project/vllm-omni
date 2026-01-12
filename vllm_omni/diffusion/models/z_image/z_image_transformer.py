@@ -21,6 +21,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -31,10 +32,106 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
+
+logger = init_logger(__name__)
+
+
+def _positive_divisors(n: int) -> set[int]:
+    if n <= 0:
+        return set()
+    divs: set[int] = set()
+    for d in range(1, int(math.isqrt(n)) + 1):
+        if n % d == 0:
+            divs.add(d)
+            divs.add(n // d)
+    return divs
+
+
+def _get_tensor_parallel_size_from_context() -> int:
+    if not is_forward_context_available():
+        return 1
+    try:
+        od_config = get_forward_context().omni_diffusion_config
+        if od_config is None:
+            return 1
+        return int(od_config.parallel_config.tensor_parallel_size)
+    except Exception:
+        return 1
+
+
+def validate_zimage_tp_constraints(
+    *,
+    dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    in_channels: int,
+    all_patch_size: tuple[int, ...],
+    all_f_patch_size: tuple[int, ...],
+    tensor_parallel_size: int,
+) -> tuple[int, list[int], list[int]]:
+    """Validate Z-Image TP constraints without requiring a distributed context.
+
+    Returns:
+        (ffn_hidden_dim, final_out_dims, supported_tp_candidates)
+    """
+    tp_size = int(tensor_parallel_size)
+    if tp_size <= 0:
+        raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
+    if dim % n_heads != 0:
+        raise ValueError(f"dim must be divisible by n_heads, got dim={dim}, n_heads={n_heads}")
+    if dim % tp_size != 0:
+        supported = sorted(_positive_divisors(dim))
+        raise ValueError(
+            f"Z-Image requires dim % tensor_parallel_size == 0, but got dim={dim}, tp={tp_size}. "
+            f"Supported tp candidates by dim: {supported}"
+        )
+    if n_heads % tp_size != 0:
+        supported = sorted(_positive_divisors(n_heads))
+        raise ValueError(
+            f"Z-Image requires n_heads % tensor_parallel_size == 0, but got n_heads={n_heads}, tp={tp_size}. "
+            f"Supported tp candidates by n_heads: {supported}"
+        )
+    if n_kv_heads % tp_size != 0:
+        supported = sorted(_positive_divisors(n_kv_heads))
+        raise ValueError(
+            f"Z-Image requires n_kv_heads % tensor_parallel_size == 0, but got n_kv_heads={n_kv_heads}, "
+            f"tp={tp_size}. Supported tp candidates by n_kv_heads: {supported}"
+        )
+
+    ffn_hidden_dim = int(dim / 3 * 8)
+    if ffn_hidden_dim % tp_size != 0:
+        supported = sorted(_positive_divisors(ffn_hidden_dim))
+        raise ValueError(
+            "Z-Image requires ffn_hidden_dim % tensor_parallel_size == 0 (for TP-sharded MLP), but got "
+            f"ffn_hidden_dim={ffn_hidden_dim}, tp={tp_size}. Supported tp candidates by ffn_hidden_dim: {supported}"
+        )
+
+    final_out_dims = [
+        int(patch_size) * int(patch_size) * int(f_patch_size) * int(in_channels)
+        for patch_size, f_patch_size in zip(all_patch_size, all_f_patch_size)
+    ]
+    bad_final_out_dims = [d for d in final_out_dims if d % tp_size != 0]
+    if bad_final_out_dims:
+        supported = sorted(_positive_divisors(math.gcd(*final_out_dims)))
+        raise ValueError(
+            "Z-Image requires final projection out_features divisible by tensor_parallel_size, but got "
+            f"final_out_dims={final_out_dims}, tp={tp_size}. "
+            f"Supported tp candidates by final_out_dims gcd: {supported}"
+        )
+
+    supported_tp_candidates = sorted(
+        _positive_divisors(n_heads)
+        & _positive_divisors(n_kv_heads)
+        & _positive_divisors(dim)
+        & _positive_divisors(ffn_hidden_dim)
+        & _positive_divisors(math.gcd(*final_out_dims))
+    )
+    return ffn_hidden_dim, final_out_dims, supported_tp_candidates
 
 
 class TimestepEmbedder(nn.Module):
@@ -90,8 +187,8 @@ class ZImageAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.dim = dim
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
@@ -99,7 +196,7 @@ class ZImageAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
-            disable_tp=True,
+            total_num_kv_heads=num_kv_heads,
             bias=False,
         )
 
@@ -107,13 +204,27 @@ class ZImageAttention(nn.Module):
         self.norm_q = RMSNorm(self.head_dim, eps=eps)
         self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
-        self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+        # NOTE: QKV is column-parallel on heads, so attention output is sharded
+        # on the last dim (dim / tp). Use row-parallel output projection to
+        # all-reduce back to full dim.
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    bias=False,
+                    input_is_parallel=True,
+                    return_bias=False,
+                )
+            ]
+        )
 
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            num_kv_heads=self.to_qkv.num_kv_heads,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
 
@@ -125,11 +236,13 @@ class ZImageAttention(nn.Module):
         sin: torch.Tensor,
     ):
         qkv, _ = self.to_qkv(hidden_states)
-        query, key, value = qkv.chunk(3, dim=-1)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = query.unflatten(-1, (self.num_heads, -1))
-        key = key.unflatten(-1, (self.num_heads, -1))
-        value = value.unflatten(-1, (self.num_heads, -1))
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -170,7 +283,6 @@ class FeedForward(nn.Module):
             dim,
             [hidden_dim] * 2,
             bias=False,
-            disable_tp=True,
             return_bias=False,
         )
         self.act = SiluAndMul()
@@ -178,7 +290,7 @@ class FeedForward(nn.Module):
             hidden_dim,
             dim,
             bias=False,
-            disable_tp=True,
+            input_is_parallel=True,
             return_bias=False,
         )
 
@@ -378,6 +490,28 @@ class ZImageTransformer2DModel(nn.Module):
         self.gradient_checkpointing = False
 
         assert len(all_patch_size) == len(all_f_patch_size)
+
+        tp_size = _get_tensor_parallel_size_from_context()
+        ffn_hidden_dim, final_out_dims, supported_tp_candidates = validate_zimage_tp_constraints(
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            in_channels=self.out_channels,
+            all_patch_size=tuple(all_patch_size),
+            all_f_patch_size=tuple(all_f_patch_size),
+            tensor_parallel_size=tp_size,
+        )
+
+        logger.info_once(
+            "Z-Image init: dim=%d n_heads=%d n_kv_heads=%d ffn_hidden_dim=%d final_out_dims=%s tp=%d (supported_tp=%s)",
+            dim,
+            n_heads,
+            n_kv_heads,
+            ffn_hidden_dim,
+            tuple(final_out_dims),
+            tp_size,
+            tuple(supported_tp_candidates),
+        )
 
         all_x_embedder = {}
         all_final_layer = {}

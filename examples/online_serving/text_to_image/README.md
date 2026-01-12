@@ -9,6 +9,8 @@ This example demonstrates how to deploy Qwen-Image model for online image genera
 ```bash
 vllm serve Qwen/Qwen-Image --omni --port 8091
 ```
+!!! note
+    If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
 
 ### Start with Parameters
 
@@ -40,7 +42,7 @@ curl -s http://localhost:8091/v1/chat/completions \
       "true_cfg_scale": 4.0,
       "seed": 42
     }
-  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
+  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
 ```
 
 ### Method 2: Using Python Client
@@ -143,7 +145,7 @@ Use `extra_body` to pass generation parameters:
 
 ```bash
 # Extract base64 from response and decode to image
-cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
+cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
 ```
 
 ## File Description
