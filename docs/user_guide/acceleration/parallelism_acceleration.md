@@ -12,27 +12,56 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 3. Classifier-Free-Guidance Parallel (CFG-Parallel): CFG-Parallel runs the positive/negative prompts of classifier-free guidance (CFG) on different devices, then merges on a single device to perform the scheduler step.
 
+4. [Tensor Parallelism](#tensor-parallelism): Tensor parallelism shards model weights across devices. This can reduce per-GPU memory usage. Note that for diffusion models we currently shard the majority of layers within the DiT.
+
 The following table shows which models are currently supported by parallelism method:
 
 ### ImageGen
 
-| Model | Model Identifier | Ulysses-SP |  Ring-SP |CFG-Parallel |
-|-------|------------------|-----------|-------------|-------------|
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ❌ | ❌ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ❌ | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ❌ | ❌ |
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ❌ | ❌ |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ |
+| Model | Model Identifier | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel |
+|-------|------------------|------------|---------|--------------|--------------------------|
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ✅ | ✅ | ❌ | ❌ |
+| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ✅ | ✅ | ❌ | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ❌ | ❌ | ❌ |
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ | ❌ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ❌ | ❌ | ✅ (TP=2 only) |
+| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
+
+!!! note "Why Z-Image is TP=2 only"
+    Z-Image Turbo is currently limited to `tensor_parallel_size` of **1 or 2** due to model shape divisibility constraints.
+    For example, the model has `n_heads=30` and a final projection out dimension of `64`, so valid TP sizes must divide both 30 and 64; the only common divisors are **1 and 2**.
 
 ### VideoGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-SP |
-|-------|------------------|-----------|---------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ❌ |
+| Model | Model Identifier | Ulysses-SP | Ring-SP | Tensor-Parallel |
+|-------|------------------|------------|---------|--------------------------|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ❌ | ❌ |
+
+### Tensor Parallelism
+
+Tensor parallelism splits model parameters across GPUs. In vLLM-Omni, tensor parallelism is configured via `DiffusionParallelConfig.tensor_parallel_size`.
+
+#### Offline Inference
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+)
+
+outputs = omni.generate(
+    prompt="a cat reading a book",
+    num_inference_steps=9,
+    width=512,
+    height=512,
+)
+```
 
 ### Sequence Parallelism
 
