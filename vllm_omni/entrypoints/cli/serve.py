@@ -33,7 +33,7 @@ Examples:
   vllm serve Qwen/Qwen-Image --omni --port 8091
 
 Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
---help=ModelConfig, --help=Frontend)
+--help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
 
