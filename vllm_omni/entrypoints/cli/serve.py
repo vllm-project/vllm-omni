@@ -181,6 +181,13 @@ class OmniServeCommand(CLISubcommand):
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
 
+        # diffusion model offload parameters
+        serve_parser.add_argument(
+            "--enable-cpu-offload",
+            action="store_true",
+            help="Enable CPU offloading for diffusion models.",
+        )
+
         # Video model parameters (e.g., Wan2.2) - engine-level
         serve_parser.add_argument(
             "--boundary-ratio",

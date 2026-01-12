@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -69,6 +70,8 @@ class GPUWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
+        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+
         with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
@@ -90,7 +93,7 @@ class GPUWorker:
                 with DeviceMemoryProfiler() as m:
                     self.pipeline = model_loader.load_model(
                         od_config=self.od_config,
-                        load_device=str(self.device),
+                        load_device=load_device,
                     )
             time_after_load = time.perf_counter()
 
@@ -100,6 +103,19 @@ class GPUWorker:
             time_after_load - time_before_load,
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
+
+        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
+        if self.od_config.enable_cpu_offload:
+            for name in ["vae"]:
+                module = getattr(self.pipeline, name, None)
+                if module is None:
+                    continue
+                try:
+                    module.to(self.device, non_blocking=True)
+                except Exception as exc:
+                    logger.debug("Failed to move %s to GPU: %s", name, exc)
+
+            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
 
         if not self.od_config.enforce_eager:
             try:
