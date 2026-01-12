@@ -24,7 +24,6 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
-    SupportsMultiModal,
     SupportsPP,
 )
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
@@ -68,7 +67,7 @@ Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
 )
 class Qwen3OmniMoeTalkerForConditionalGeneration(
     nn.Module,
-    SupportsMultiModal,
+    # SupportsMultiModal,
     SupportsPP,
     Qwen3OmniMoeConditionalGenerationMixin,
 ):
@@ -430,9 +429,16 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         if not mm_input_by_modality:
             return []
 
+        logger.warning(
+            "\n\n\n"
+            "THIS FUNCTION RETURNS DUMMY MULTIMODAL EMBEDDINGS FOR PROFILE RUN, "
+            "SHOULD NOT BE CALLED IN INFERENCE."
+            "\n\n\n"
+        )
+
         # The result multimodal_embeddings is tuple of tensors, with each
         # tensor correspoending to a multimodal data item (image or video).
-        multimodal_embeddings: tuple[torch.Tensor, ...] = ()
+        dummy_multimodal_embeddings: tuple[torch.Tensor, ...] = ()
 
         # NOTE: It is important to iterate over the keys in this dictionary
         # to preserve the order of the modalities.
@@ -441,22 +447,44 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             multimodal_input = mm_input_by_modality[modality]
             if modality == "image":
                 image_embeddings = self._process_image_input(multimodal_input)
-                image_embeddings = self.hidden_projection(image_embeddings)
-                multimodal_embeddings += tuple(image_embeddings)
+                dummy_image_embeddings = ()
+                for image_embed in image_embeddings:
+                    dummy_image_embeddings += (
+                        torch.zeros(
+                            image_embed.shape[0],
+                            self.config.text_config.hidden_size,
+                            device=image_embed.device,
+                            dtype=torch.bfloat16,
+                        ),
+                    )
+                dummy_multimodal_embeddings += tuple(image_embeddings)
             if modality == "video":
                 video_embeddings = self._process_video_input(multimodal_input)
-                video_video_embeddings_project = ()
+                dummy_video_video_embeddings = ()
                 for video_embed in video_embeddings:
-                    proj = nn.Linear(8192, 2048).to(device=video_embed.device, dtype=torch.bfloat16)
-                    video_embed = proj(video_embed)
-                    video_embed_project = self.hidden_projection(video_embed)
-                    video_video_embeddings_project += (video_embed_project,)
-                multimodal_embeddings += tuple(video_video_embeddings_project)
+                    dummy_video_video_embeddings += (
+                        torch.zeros(
+                            video_embed.shape[0],
+                            self.config.text_config.hidden_size,
+                            device=video_embed.device,
+                            dtype=torch.bfloat16,
+                        ),
+                    )
+                dummy_multimodal_embeddings += tuple(dummy_video_video_embeddings)
             if modality == "audio":
                 audio_embeddings = self._process_audio_input(multimodal_input)
-                audio_embeddings = self.hidden_projection(audio_embeddings)
-                multimodal_embeddings += tuple(audio_embeddings)
-        return multimodal_embeddings
+                dummy_audio_embeddings = ()
+                for audio_embed in audio_embeddings:
+                    dummy_audio_embeddings += (
+                        torch.zeros(
+                            audio_embed.shape[0],
+                            self.config.text_config.hidden_size,
+                            device=audio_embed.device,
+                            dtype=torch.bfloat16,
+                        ),
+                    )
+                dummy_multimodal_embeddings += tuple(dummy_audio_embeddings)
+        return dummy_multimodal_embeddings
 
     def embed_input_ids(
         self,
@@ -497,7 +525,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 str(device),
             )
         except Exception:
-            pass
+            logger.error("Error logging model load summary")
 
         multi_model_weights = set()
         for name, param in self.visual.named_parameters():
