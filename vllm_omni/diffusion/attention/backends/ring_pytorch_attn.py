@@ -62,6 +62,20 @@ class RingAttentionFunc(torch.autograd.Function):
         joint_tensor_value=None,
         joint_strategy="front",
     ):
+        # Validate causal + joint_strategy combination
+        # When causal=True and joint_strategy="rear", the causal mask would incorrectly
+        # prevent local query tokens from attending to joint key tokens (which are
+        # concatenated at the end). This breaks the semantics where joint tokens
+        # (e.g., text conditioning) should be visible to all local tokens.
+        if is_causal and joint_tensor_key is not None and joint_strategy == "rear":
+            raise ValueError(
+                "joint_strategy='rear' is not compatible with causal=True in Ring Attention. "
+                "When using causal attention with joint tokens, use joint_strategy='front' "
+                "to ensure joint tokens act as a visible prefix for all local tokens. "
+                "With 'rear' strategy, the causal mask would incorrectly block local tokens "
+                "from seeing the joint tokens."
+            )
+
         comm = RingComm(group)
         # Ensure tensors are contiguous for P2P communication
         q = q.contiguous()
