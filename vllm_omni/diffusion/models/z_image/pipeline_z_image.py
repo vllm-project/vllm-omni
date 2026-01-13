@@ -248,11 +248,9 @@ class ZImagePipeline(nn.Module):
             if should_tile:
                 return self._distributed_tiled_decode(latents, vae_patch_parallel_size=vae_pp_size)
 
-            # For the boundary size where tiling wouldn't kick in, decode one spatial block per rank.
-            if (latents.shape[-1] >= tile_latent_min_size) and (latents.shape[-2] >= tile_latent_min_size):
-                return self._distributed_patch_decode(latents, vae_patch_parallel_size=vae_pp_size)
-
-            return self.vae.decode(latents, return_dict=False)[0]
+            # For cases where diffusers tiling would not kick in, decode overlapped
+            # spatial patches per rank and blend/stitch on rank0.
+            return self._distributed_patch_decode(latents, vae_patch_parallel_size=vae_pp_size)
         except Exception as exc:
             vllm_logger.warning("VAE patch parallel decode failed; falling back to vae.decode. %s", exc, exc_info=True)
             return self.vae.decode(latents, return_dict=False)[0]
@@ -303,7 +301,9 @@ class ZImagePipeline(nn.Module):
         tile_id = 0
         for i in h_starts:
             for j in w_starts:
-                if active and (tile_id % pp_size == rank):
+                # Offset assignment by 1 so rank0 avoids decoding the largest (tile_id=0) tile.
+                tile_rank = (tile_id + 1) % pp_size
+                if active and (tile_rank == rank):
                     tile = z[:, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size]
                     if getattr(self.vae.config, "use_post_quant_conv", False):
                         tile = self.vae.post_quant_conv(tile)
@@ -401,13 +401,10 @@ class ZImagePipeline(nn.Module):
     def _distributed_patch_decode(self, z: torch.Tensor, *, vae_patch_parallel_size: int) -> torch.Tensor:
         """Decode one spatial block per rank, then stitch RGB blocks on rank0.
 
-        This is a DistVAE-style variant intended for cases where diffusers tiling would
-        not kick in (e.g., `tile_latent_min_size >= z.shape[-2/-1]`) but we still want
-        to reduce the per-rank VAE decode activation peak.
-
-        Each active rank decodes exactly one core block with an optional latent-space
-        halo. The halo is cropped away before gathering, so rank0 only stitches the
-        final RGB blocks.
+        Intended for sizes where diffusers tiling would not kick in, so we can still
+        reduce the per-rank VAE decode activation peak. Each rank decodes a core
+        block with a small latent-space halo, then crops to the core and gathers the
+        RGB blocks to rank0 for final stitching.
         """
         group = get_dit_group()
         world_size = dist.get_world_size(group)
@@ -416,6 +413,14 @@ class ZImagePipeline(nn.Module):
         pp_size = min(int(vae_patch_parallel_size), int(world_size))
         if pp_size <= 1:
             return self.vae.decode(z, return_dict=False)[0]
+
+        tile_latent_min_size = getattr(self.vae, "tile_latent_min_size", None)
+        tile_overlap_factor = getattr(self.vae, "tile_overlap_factor", None)
+        if tile_latent_min_size is None or tile_overlap_factor is None:
+            return self.vae.decode(z, return_dict=False)[0]
+
+        overlap_latent = int(tile_latent_min_size * float(tile_overlap_factor))
+        halo_base = max(0, overlap_latent // 2)
 
         # Only ranks < pp_size participate in decoding. Others send empty tensors.
         active = rank < pp_size
@@ -429,8 +434,9 @@ class ZImagePipeline(nn.Module):
         local_h = 0
         local_w = 0
 
+        grid_rows, grid_cols = self._factor_pp_grid(pp_size)
+
         if active:
-            grid_rows, grid_cols = self._factor_pp_grid(pp_size)
             patch_idx = rank
             patch_row = patch_idx // grid_cols
             patch_col = patch_idx % grid_cols
@@ -445,10 +451,7 @@ class ZImagePipeline(nn.Module):
             if core_h == 0 or core_w == 0:
                 local_core = torch.empty(0, device=z.device, dtype=z.dtype)
             else:
-                overlap_factor = float(getattr(self.vae, "tile_overlap_factor", 0.25))
-                halo = int(min(core_h, core_w) * overlap_factor)
-                halo = max(0, halo)
-
+                halo = max(halo_base, min(core_h, core_w) // 2)
                 ph0 = max(0, h0 - halo)
                 ph1 = min(latent_h, h1 + halo)
                 pw0 = max(0, w0 - halo)
@@ -463,7 +466,6 @@ class ZImagePipeline(nn.Module):
                 cw0 = (w0 - pw0) * scale
                 ch1 = ch0 + core_h * scale
                 cw1 = cw0 + core_w * scale
-
                 local_core = decoded[:, :, ch0:ch1, cw0:cw1]
 
             local_h = int(local_core.shape[-2]) if local_core.numel() else 0
@@ -509,11 +511,11 @@ class ZImagePipeline(nn.Module):
         # Stitch on rank0.
         out = torch.empty((bsz, 3, out_h, out_w), device=z.device, dtype=z.dtype)
 
-        grid_rows, grid_cols = self._factor_pp_grid(pp_size)
         for patch_idx in range(pp_size):
             src_rank = patch_idx
             patch_row = patch_idx // grid_cols
             patch_col = patch_idx % grid_cols
+
             h0 = (patch_row * latent_h) // grid_rows
             h1 = ((patch_row + 1) * latent_h) // grid_rows
             w0 = (patch_col * latent_w) // grid_cols

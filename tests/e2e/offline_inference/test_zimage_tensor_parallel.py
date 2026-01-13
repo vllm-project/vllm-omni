@@ -216,8 +216,10 @@ def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     enforce_eager = _get_enforce_eager_for_cuda()
 
     # Use a larger image to ensure there are multiple VAE tiles.
-    height = 768
-    width = 768
+    # For Z-Image-Turbo, VAE tiling kicks in when latent_h/latent_w > 128.
+    # 1152x1152 -> latent 144x144.
+    height = 1152
+    width = 1152
     num_inference_steps = 2
     seed = 42
 
