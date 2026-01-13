@@ -132,7 +132,7 @@ def main():
     generator = torch.Generator(device=device).manual_seed(args.seed)
 
     # Enable VAE memory optimizations on NPU
-    vae_use_slicing = args.vae_use_slicing or device == "npu"
+    vae_use_slicing = args.vae_use_slicing
     vae_use_tiling = args.vae_use_tiling or device == "npu"
 
     # Configure cache based on backend type
