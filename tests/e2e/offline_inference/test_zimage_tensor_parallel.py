@@ -66,17 +66,38 @@ def _extract_single_image(outputs) -> Image.Image:
     return images[0]
 
 
+def _get_enforce_eager_for_cuda() -> bool:
+    cc_major, _cc_minor = torch.cuda.get_device_capability(0)
+    return cc_major < 8
+
+
 def _run_zimage_generate(
-    *, tp_size: int, height: int, width: int, num_inference_steps: int, seed: int
+    *,
+    tp_size: int,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    seed: int,
+    enforce_eager: bool,
+    vae_use_tiling: bool = False,
+    vae_patch_parallel_size: int = 1,
+    num_requests: int = 4,
 ) -> tuple[Image.Image, float, float]:
+    if num_requests < 2:
+        raise ValueError("num_requests must be >= 2 (1 warmup + >=1 timed)")
+
     torch.cuda.empty_cache()
     device_index = torch.cuda.current_device()
     monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
-
     m = Omni(
         model=_get_zimage_model(),
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=tp_size),
+        parallel_config=DiffusionParallelConfig(
+            tensor_parallel_size=tp_size,
+            vae_patch_parallel_size=vae_patch_parallel_size,
+        ),
+        enforce_eager=enforce_eager,
+        vae_use_tiling=vae_use_tiling,
     )
     try:
         # NOTE: Omni closes itself when a generate() call is exhausted.
@@ -87,7 +108,6 @@ def _run_zimage_generate(
         # This also serves as a warmup: the first output may include extra
         # compilation/caching overhead, while later outputs are closer to
         # steady-state inference.
-        num_requests = 4  # 1 warmup + 3 timed
         gen = m.generate(
             [PROMPT] * num_requests,
             height=height,
@@ -120,6 +140,7 @@ def _run_zimage_generate(
         return _extract_single_image([last_output]), median_time_s, peak_memory_mb
     finally:
         monitor.stop()
+        m.close()
         cleanup_dist_env_and_memory()
 
 
@@ -130,8 +151,10 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
-    height = 512
-    width = 512
+    enforce_eager = _get_enforce_eager_for_cuda()
+
+    height = 256
+    width = 256
     num_inference_steps = 2
     seed = 42
 
@@ -141,6 +164,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
         width=width,
         num_inference_steps=num_inference_steps,
         seed=seed,
+        enforce_eager=enforce_eager,
     )
     tp2_img, tp2_time_s, tp2_peak_mem = _run_zimage_generate(
         tp_size=2,
@@ -148,6 +172,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
         width=width,
         num_inference_steps=num_inference_steps,
         seed=seed,
+        enforce_eager=enforce_eager,
     )
 
     tp1_path = tmp_path / "zimage_tp1.png"
@@ -178,4 +203,62 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     print(f"Z-Image TP peak memory (MB): tp1_peak_mem={tp1_peak_mem:.2f}, tp2_peak_mem={tp2_peak_mem:.2f}")
     assert tp2_peak_mem < tp1_peak_mem, (
         f"Expected TP=2 to use less peak memory than TP=1 (tp1={tp1_peak_mem}, tp2={tp2_peak_mem})"
+    )
+
+
+@pytest.mark.integration
+def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
+    if is_npu() or is_rocm():
+        pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 CUDA devices.")
+
+    enforce_eager = _get_enforce_eager_for_cuda()
+
+    # Use a larger image to ensure there are multiple VAE tiles.
+    height = 768
+    width = 768
+    num_inference_steps = 2
+    seed = 42
+
+    baseline_img, _baseline_time_s, _baseline_peak_mem = _run_zimage_generate(
+        tp_size=2,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        seed=seed,
+        enforce_eager=enforce_eager,
+        vae_use_tiling=True,
+        vae_patch_parallel_size=1,
+        num_requests=2,
+    )
+    pp2_img, _pp2_time_s, _pp2_peak_mem = _run_zimage_generate(
+        tp_size=2,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        seed=seed,
+        enforce_eager=enforce_eager,
+        vae_use_tiling=True,
+        vae_patch_parallel_size=2,
+        num_requests=2,
+    )
+
+    baseline_path = tmp_path / "zimage_tp2_vae_pp1.png"
+    pp2_path = tmp_path / "zimage_tp2_vae_pp2.png"
+    baseline_img.save(baseline_path)
+    pp2_img.save(pp2_path)
+
+    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_img, pp2_img)
+    mean_threshold = 5e-3
+    max_threshold = 1e-1
+    print(
+        "Z-Image VAE patch parallel image diff stats (TP=2, pp=1 vs pp=2): "
+        f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
+        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
+        f"pp1_img={baseline_path}, pp2_img={pp2_path}"
+    )
+    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
+        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
+        f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e})"
     )
