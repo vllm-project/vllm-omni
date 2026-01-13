@@ -17,6 +17,7 @@
 
 import inspect
 import json
+import math
 import os
 import time
 from collections.abc import Callable, Iterable
@@ -238,7 +239,20 @@ class ZImagePipeline(nn.Module):
             return self.vae.decode(latents, return_dict=False)[0]
 
         try:
-            return self._distributed_tiled_decode(latents, vae_patch_parallel_size=vae_pp_size)
+            tile_latent_min_size = getattr(self.vae, "tile_latent_min_size", None)
+            if tile_latent_min_size is None:
+                return self._distributed_tiled_decode(latents, vae_patch_parallel_size=vae_pp_size)
+
+            # Match diffusers' condition for when VAE tiling would be used.
+            should_tile = (latents.shape[-1] > tile_latent_min_size) or (latents.shape[-2] > tile_latent_min_size)
+            if should_tile:
+                return self._distributed_tiled_decode(latents, vae_patch_parallel_size=vae_pp_size)
+
+            # For the boundary size where tiling wouldn't kick in, decode one spatial block per rank.
+            if (latents.shape[-1] >= tile_latent_min_size) and (latents.shape[-2] >= tile_latent_min_size):
+                return self._distributed_patch_decode(latents, vae_patch_parallel_size=vae_pp_size)
+
+            return self.vae.decode(latents, return_dict=False)[0]
         except Exception as exc:
             vllm_logger.warning("VAE patch parallel decode failed; falling back to vae.decode. %s", exc, exc_info=True)
             return self.vae.decode(latents, return_dict=False)[0]
@@ -372,6 +386,148 @@ class ZImagePipeline(nn.Module):
             result_rows.append(torch.cat(result_row, dim=3))
 
         return torch.cat(result_rows, dim=2)
+
+    @staticmethod
+    def _factor_pp_grid(pp_size: int) -> tuple[int, int]:
+        """Pick a (rows, cols) grid whose product equals `pp_size`."""
+        if pp_size <= 1:
+            return (1, 1)
+        root = int(math.sqrt(pp_size))
+        for rows in range(root, 0, -1):
+            if pp_size % rows == 0:
+                return (rows, pp_size // rows)
+        return (1, pp_size)
+
+    def _distributed_patch_decode(self, z: torch.Tensor, *, vae_patch_parallel_size: int) -> torch.Tensor:
+        """Decode one spatial block per rank, then stitch RGB blocks on rank0.
+
+        This is a DistVAE-style variant intended for cases where diffusers tiling would
+        not kick in (e.g., `tile_latent_min_size >= z.shape[-2/-1]`) but we still want
+        to reduce the per-rank VAE decode activation peak.
+
+        Each active rank decodes exactly one core block with an optional latent-space
+        halo. The halo is cropped away before gathering, so rank0 only stitches the
+        final RGB blocks.
+        """
+        group = get_dit_group()
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+
+        pp_size = min(int(vae_patch_parallel_size), int(world_size))
+        if pp_size <= 1:
+            return self.vae.decode(z, return_dict=False)[0]
+
+        # Only ranks < pp_size participate in decoding. Others send empty tensors.
+        active = rank < pp_size
+
+        bsz, _, latent_h, latent_w = z.shape
+        scale = int(self.vae_scale_factor)
+        out_h = latent_h * scale
+        out_w = latent_w * scale
+
+        local_core = torch.empty(0, device=z.device, dtype=z.dtype)
+        local_h = 0
+        local_w = 0
+
+        if active:
+            grid_rows, grid_cols = self._factor_pp_grid(pp_size)
+            patch_idx = rank
+            patch_row = patch_idx // grid_cols
+            patch_col = patch_idx % grid_cols
+
+            h0 = (patch_row * latent_h) // grid_rows
+            h1 = ((patch_row + 1) * latent_h) // grid_rows
+            w0 = (patch_col * latent_w) // grid_cols
+            w1 = ((patch_col + 1) * latent_w) // grid_cols
+
+            core_h = max(0, h1 - h0)
+            core_w = max(0, w1 - w0)
+            if core_h == 0 or core_w == 0:
+                local_core = torch.empty(0, device=z.device, dtype=z.dtype)
+            else:
+                overlap_factor = float(getattr(self.vae, "tile_overlap_factor", 0.25))
+                halo = int(min(core_h, core_w) * overlap_factor)
+                halo = max(0, halo)
+
+                ph0 = max(0, h0 - halo)
+                ph1 = min(latent_h, h1 + halo)
+                pw0 = max(0, w0 - halo)
+                pw1 = min(latent_w, w1 + halo)
+
+                tile = z[:, :, ph0:ph1, pw0:pw1]
+                if getattr(self.vae.config, "use_post_quant_conv", False):
+                    tile = self.vae.post_quant_conv(tile)
+                decoded = self.vae.decoder(tile)
+
+                ch0 = (h0 - ph0) * scale
+                cw0 = (w0 - pw0) * scale
+                ch1 = ch0 + core_h * scale
+                cw1 = cw0 + core_w * scale
+
+                local_core = decoded[:, :, ch0:ch1, cw0:cw1]
+
+            local_h = int(local_core.shape[-2]) if local_core.numel() else 0
+            local_w = int(local_core.shape[-1]) if local_core.numel() else 0
+
+        # Gather block shapes.
+        shape_tensor = torch.tensor([local_h, local_w], device=z.device, dtype=torch.int64)
+        if rank == 0:
+            shape_gather = [torch.empty_like(shape_tensor) for _ in range(world_size)]
+        else:
+            shape_gather = None
+        dist.gather(shape_tensor, gather_list=shape_gather, dst=0, group=group)
+
+        max_h = 0
+        max_w = 0
+        if rank == 0:
+            shapes = [tuple(int(x.item()) for x in t) for t in shape_gather]  # type: ignore[arg-type]
+            max_h = max((h for h, _ in shapes), default=0)
+            max_w = max((w for _, w in shapes), default=0)
+
+        max_hw_tensor = torch.tensor([max_h, max_w], device=z.device, dtype=torch.int64)
+        dist.broadcast(max_hw_tensor, src=0, group=group)
+        max_h = int(max_hw_tensor[0].item())
+        max_w = int(max_hw_tensor[1].item())
+
+        # Pad local block for gather.
+        if max_h == 0 or max_w == 0:
+            padded = torch.empty(0, device=z.device, dtype=z.dtype)
+        else:
+            padded = torch.zeros((bsz, 3, max_h, max_w), device=z.device, dtype=z.dtype)
+            if local_h and local_w:
+                padded[:, :, :local_h, :local_w] = local_core
+
+        if rank == 0:
+            block_gather = [torch.empty_like(padded) for _ in range(world_size)]
+        else:
+            block_gather = None
+        dist.gather(padded, gather_list=block_gather, dst=0, group=group)
+
+        if rank != 0:
+            return torch.empty(0, device=z.device, dtype=z.dtype)
+
+        # Stitch on rank0.
+        out = torch.empty((bsz, 3, out_h, out_w), device=z.device, dtype=z.dtype)
+
+        grid_rows, grid_cols = self._factor_pp_grid(pp_size)
+        for patch_idx in range(pp_size):
+            src_rank = patch_idx
+            patch_row = patch_idx // grid_cols
+            patch_col = patch_idx % grid_cols
+            h0 = (patch_row * latent_h) // grid_rows
+            h1 = ((patch_row + 1) * latent_h) // grid_rows
+            w0 = (patch_col * latent_w) // grid_cols
+            w1 = ((patch_col + 1) * latent_w) // grid_cols
+
+            ph = (h1 - h0) * scale
+            pw = (w1 - w0) * scale
+            if ph <= 0 or pw <= 0:
+                continue
+
+            tile = block_gather[src_rank]  # type: ignore[index]
+            out[:, :, h0 * scale : h1 * scale, w0 * scale : w1 * scale] = tile[:, :, :ph, :pw]
+
+        return out
 
     def _encode_prompt(
         self,
