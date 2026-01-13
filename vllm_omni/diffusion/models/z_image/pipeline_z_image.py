@@ -248,8 +248,8 @@ class ZImagePipeline(nn.Module):
             if should_tile:
                 return self._distributed_tiled_decode(latents, vae_patch_parallel_size=vae_pp_size)
 
-            # For cases where diffusers tiling would not kick in, decode overlapped
-            # spatial patches per rank and blend/stitch on rank0.
+            # For cases where diffusers tiling would not kick in, decode spatial
+            # patches per rank and stitch on rank0.
             return self._distributed_patch_decode(latents, vae_patch_parallel_size=vae_pp_size)
         except Exception as exc:
             vllm_logger.warning("VAE patch parallel decode failed; falling back to vae.decode. %s", exc, exc_info=True)
