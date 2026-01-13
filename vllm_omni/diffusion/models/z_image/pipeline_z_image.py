@@ -18,10 +18,12 @@
 import inspect
 import json
 import os
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders import AutoencoderKL
@@ -29,9 +31,11 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoModel, AutoTokenizer
+from vllm.logger import init_logger as init_vllm_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
@@ -43,6 +47,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+vllm_logger = init_vllm_logger(__name__)
 
 
 def get_post_process_func(
@@ -216,6 +221,157 @@ class ZImagePipeline(nn.Module):
         else:
             negative_prompt_embeds = []
         return prompt_embeds, negative_prompt_embeds
+
+    def _decode_latents_with_vae_patch_parallelism(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents with optional VAE patch/tile parallelism.
+
+        - Only enabled when torch.distributed is initialized and VAE tiling is enabled.
+        - Falls back to the original `vae.decode` on any unsupported condition or error.
+        """
+        vae_pp_size = getattr(self.od_config.parallel_config, "vae_patch_parallel_size", 1)
+
+        if vae_pp_size <= 1 or not dist.is_initialized():
+            return self.vae.decode(latents, return_dict=False)[0]
+
+        # Only parallelize when the baseline already uses tiled_decode semantics.
+        if not getattr(self.vae, "use_tiling", False):
+            return self.vae.decode(latents, return_dict=False)[0]
+
+        try:
+            return self._distributed_tiled_decode(latents, vae_patch_parallel_size=vae_pp_size)
+        except Exception as exc:
+            vllm_logger.warning("VAE patch parallel decode failed; falling back to vae.decode. %s", exc, exc_info=True)
+            return self.vae.decode(latents, return_dict=False)[0]
+
+    def _distributed_tiled_decode(self, z: torch.Tensor, *, vae_patch_parallel_size: int) -> torch.Tensor:
+        """Distributed version of diffusers AutoencoderKL.tiled_decode (decode only).
+
+        Each rank decodes a subset of tiles; rank0 gathers all tiles and performs the
+        original blend + stitch logic. Non-rank0 ranks return an empty tensor (their
+        output is ignored by the scheduler).
+        """
+        group = get_dit_group()
+        world_size = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+
+        pp_size = min(int(vae_patch_parallel_size), int(world_size))
+        if pp_size <= 1:
+            return self.vae.decode(z, return_dict=False)[0]
+
+        tile_latent_min_size = getattr(self.vae, "tile_latent_min_size", None)
+        tile_overlap_factor = getattr(self.vae, "tile_overlap_factor", None)
+        tile_sample_min_size = getattr(self.vae, "tile_sample_min_size", None)
+        if tile_latent_min_size is None or tile_overlap_factor is None or tile_sample_min_size is None:
+            return self.vae.decode(z, return_dict=False)[0]
+
+        overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))
+        if overlap_size <= 0:
+            return self.vae.decode(z, return_dict=False)[0]
+
+        h_starts = list(range(0, z.shape[2], overlap_size))
+        w_starts = list(range(0, z.shape[3], overlap_size))
+        num_rows = len(h_starts)
+        num_cols = len(w_starts)
+        num_tiles = num_rows * num_cols
+
+        if num_tiles < 2:
+            return self.vae.decode(z, return_dict=False)[0]
+
+        blend_extent = int(tile_sample_min_size * tile_overlap_factor)
+        row_limit = int(tile_sample_min_size - blend_extent)
+
+        # Decide which ranks actively decode tiles.
+        active = rank < pp_size
+
+        local_tiles: list[torch.Tensor] = []
+        local_meta: list[tuple[int, int, int]] = []
+
+        tile_id = 0
+        for i in h_starts:
+            for j in w_starts:
+                if active and (tile_id % pp_size == rank):
+                    tile = z[:, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size]
+                    if getattr(self.vae.config, "use_post_quant_conv", False):
+                        tile = self.vae.post_quant_conv(tile)
+                    decoded = self.vae.decoder(tile)
+                    local_tiles.append(decoded)
+                    local_meta.append((tile_id, int(decoded.shape[-2]), int(decoded.shape[-1])))
+                tile_id += 1
+
+        # Gather per-rank tile counts.
+        count_tensor = torch.tensor([len(local_tiles)], device=z.device, dtype=torch.int64)
+        if rank == 0:
+            count_gather = [torch.empty_like(count_tensor) for _ in range(world_size)]
+        else:
+            count_gather = None
+        dist.gather(count_tensor, gather_list=count_gather, dst=0, group=group)
+        max_count = 0
+        if rank == 0:
+            counts = [int(t.item()) for t in count_gather]  # type: ignore[arg-type]
+            max_count = max(counts) if counts else 0
+        max_count_tensor = torch.tensor([max_count], device=z.device, dtype=torch.int64)
+        dist.broadcast(max_count_tensor, src=0, group=group)
+        max_count = int(max_count_tensor.item())
+
+        # Prepare padded metadata + tiles for gather.
+        meta_tensor = torch.full((max_count, 3), -1, device=z.device, dtype=torch.int64)
+        tile_tensor = torch.zeros(
+            (max_count, z.shape[0], 3, tile_sample_min_size, tile_sample_min_size),
+            device=z.device,
+            dtype=z.dtype,
+        )
+        for idx, (tile_id, h, w) in enumerate(local_meta):
+            meta_tensor[idx, 0] = tile_id
+            meta_tensor[idx, 1] = h
+            meta_tensor[idx, 2] = w
+            tile_tensor[idx, :, :, :h, :w] = local_tiles[idx]
+
+        if rank == 0:
+            meta_gather = [torch.empty_like(meta_tensor) for _ in range(world_size)]
+            tile_gather = [torch.empty_like(tile_tensor) for _ in range(world_size)]
+        else:
+            meta_gather = None
+            tile_gather = None
+
+        dist.gather(meta_tensor, gather_list=meta_gather, dst=0, group=group)
+        dist.gather(tile_tensor, gather_list=tile_gather, dst=0, group=group)
+
+        if rank != 0:
+            return torch.empty(0, device=z.device, dtype=z.dtype)
+
+        # Reconstruct the full tile grid on rank0.
+        tile_map: dict[int, torch.Tensor] = {}
+        for src_rank in range(world_size):
+            meta_src = meta_gather[src_rank]  # type: ignore[index]
+            tiles_src = tile_gather[src_rank]  # type: ignore[index]
+            for idx in range(max_count):
+                tid = int(meta_src[idx, 0].item())
+                if tid < 0:
+                    continue
+                h = int(meta_src[idx, 1].item())
+                w = int(meta_src[idx, 2].item())
+                tile_map[tid] = tiles_src[idx, :, :, :h, :w]
+
+        rows: list[list[torch.Tensor]] = []
+        for r in range(num_rows):
+            row: list[torch.Tensor] = []
+            for c in range(num_cols):
+                tid = r * num_cols + c
+                row.append(tile_map[tid])
+            rows.append(row)
+
+        result_rows: list[torch.Tensor] = []
+        for i, row in enumerate(rows):
+            result_row: list[torch.Tensor] = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = self.vae.blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self.vae.blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=3))
+
+        return torch.cat(result_rows, dim=2)
 
     def _encode_prompt(
         self,
@@ -607,7 +763,47 @@ class ZImagePipeline(nn.Module):
             latents = latents.to(self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
-            image = self.vae.decode(latents, return_dict=False)[0]
+            profile_vae = self.od_config.enable_vae_profiling
+            if profile_vae:
+                device = latents.device
+                dist_rank = None
+                dist_world_size = None
+                if dist.is_initialized():
+                    try:
+                        dist_rank = dist.get_rank()
+                        dist_world_size = dist.get_world_size()
+                    except Exception:
+                        dist_rank = None
+                        dist_world_size = None
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                    torch.cuda.synchronize(device)
+                t0 = time.perf_counter()
+                image = self._decode_latents_with_vae_patch_parallelism(latents)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                t1 = time.perf_counter()
+                if device.type == "cuda":
+                    peak_alloc_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
+                    peak_resv_gib = torch.cuda.max_memory_reserved(device) / (1024**3)
+                    vllm_logger.debug(
+                        "Z-Image VAE decode profile: rank=%s/%s time_ms=%.3f "
+                        "peak_alloc_gib=%.3f peak_reserved_gib=%.3f",
+                        dist_rank if dist_rank is not None else "na",
+                        dist_world_size if dist_world_size is not None else "na",
+                        (t1 - t0) * 1000,
+                        peak_alloc_gib,
+                        peak_resv_gib,
+                    )
+                else:
+                    vllm_logger.debug(
+                        "Z-Image VAE decode profile: rank=%s/%s time_ms=%.3f",
+                        dist_rank if dist_rank is not None else "na",
+                        dist_world_size if dist_world_size is not None else "na",
+                        (t1 - t0) * 1000,
+                    )
+            else:
+                image = self._decode_latents_with_vae_patch_parallelism(latents)
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(output=image)

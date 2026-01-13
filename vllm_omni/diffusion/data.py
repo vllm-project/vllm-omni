@@ -45,6 +45,9 @@ class DiffusionParallelConfig:
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
+    vae_patch_parallel_size: int = 1
+    """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -55,6 +58,7 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -64,6 +68,21 @@ class DiffusionParallelConfig:
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+
+        env_override = os.environ.get("VLLM_DIFFUSION_VAE_PATCH_PARALLEL_SIZE")
+        if env_override is not None and self.vae_patch_parallel_size == 1:
+            try:
+                env_value = int(env_override)
+                if env_value > 0:
+                    self.vae_patch_parallel_size = env_value
+                else:
+                    logger.warning(
+                        "Ignoring invalid VLLM_DIFFUSION_VAE_PATCH_PARALLEL_SIZE=%r (must be > 0).",
+                        env_override,
+                    )
+            except ValueError:
+                logger.warning("Ignoring invalid VLLM_DIFFUSION_VAE_PATCH_PARALLEL_SIZE=%r.", env_override)
+
         self.world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
@@ -352,6 +371,9 @@ class OmniDiffusionConfig:
     supports_multimodal_inputs: bool = False
 
     # Logging
+    enable_vae_profiling: bool = False
+    """Enable lightweight VAE decode profiling logs."""
+
     log_level: str = "info"
 
     # Omni configuration (injected from stage config)
@@ -447,6 +469,12 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        if not self.enable_vae_profiling:
+            # Optional backdoor for quick experimentation without changing code/config.
+            env_override = os.getenv("VLLM_DIFFUSION_PROFILE_VAE")
+            if env_override is not None and env_override.strip().lower() not in ("0", "false", "off", "no"):
+                self.enable_vae_profiling = True
 
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
