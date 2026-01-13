@@ -36,6 +36,7 @@ nav:
     - models/supported_models.md
   - Features:
     - Sleep Mode: features/sleep_mode.md
+    - CPU Offloading for Diffusion Model: features/cpu_offload_diffusion.md
 - Developer Guide:
   - General:
     - contributing/README.md

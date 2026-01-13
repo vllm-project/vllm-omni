@@ -66,6 +66,14 @@ done
 echo "--- Pulling container"
 image_name="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-rocm-omni"
 container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
+
+# Install AWS CLI to authenticate to ECR Public Gallery to get higher rate limit for pulling images
+sudo apt-get update && sudo apt-get install -y awscli
+# Use safe docker login helper to prevent race conditions
+source "$(dirname "${BASH_SOURCE[0]}")/../docker_login_ecr_public.sh"
+safe_docker_login_ecr_public
+# Pull the container from ECR Public Gallery
+
 docker pull "${image_name}"
 
 remove_docker_container() {
