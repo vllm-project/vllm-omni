@@ -1,0 +1,41 @@
+# stage config for running hunyuan image 3.0 with architecture of OmniLLM.
+
+# The following config has been verified on 8x L40S-48G GPU.
+stage_args:
+  - stage_id: 0
+    stage_type: llm  # Use llm stage type to launch OmniLLM
+    runtime:
+      process: true               # Run this stage in a separate process
+      devices: "0,1,2,3,4,5,6,7"  # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      max_batch_size: 1
+    engine_args:
+      model_stage: AR
+      model_arch: HunyuanImage3ForCausalMM
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true  # Now we only support eager mode
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+# Top-level runtime config (concise): default windows and stage edges
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1             # Simplified: trigger downstream only after full upstream completion
+    max_inflight: 1             # Simplified: process serially within each stage
