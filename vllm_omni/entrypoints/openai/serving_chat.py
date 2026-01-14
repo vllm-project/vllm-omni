@@ -638,6 +638,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
+                # Get role for all modalities (text, audio, image)
+                role = self.get_chat_request_role(request)
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
@@ -645,7 +648,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     num_cached_tokens = res.num_cached_tokens
                     # Send first response for each request.n (index) with
                     # the role
-                    role = self.get_chat_request_role(request)
 
                     # NOTE num_choices defaults to 1 so this usually executes
                     # once per request
