@@ -53,12 +53,12 @@ class AsyncOmniDiffusion:
         self,
         model: str,
         od_config: OmniDiffusionConfig | None = None,
+        stage_id: int = 0,
         **kwargs: Any,
     ):
         self.model = model
 
         # Capture stage info from kwargs before they might be filtered out
-        stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
         cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 

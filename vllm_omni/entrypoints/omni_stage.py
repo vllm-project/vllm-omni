@@ -897,7 +897,7 @@ def _stage_worker(
             engine_args = filter_dataclass_kwargs(OmniEngineArgs, engine_args)
             engine_args.pop("model", None)
             # Default to LLM engine
-            stage_engine = OmniLLM(model=model, **engine_args)
+            stage_engine = OmniLLM(model=model, stage_id=stage_id, **engine_args)
 
     logger.debug("Engine initialized")
     # Initialize OmniConnectors if configured
@@ -1338,7 +1338,6 @@ async def _stage_worker_async(
                 stage_connector_spec = dict(v.get("spec", {}))
                 break
             engine_args["stage_connector_spec"] = stage_connector_spec
-            engine_args["stage_id"] = stage_id
         if stage_type == "diffusion":
             # For diffusion, we need to extract diffusion-specific config
             engine_args = filter_dataclass_kwargs(OmniDiffusionConfig, engine_args)
@@ -1357,13 +1356,14 @@ async def _stage_worker_async(
             stage_engine = AsyncOmniDiffusion(
                 model=model,
                 od_config=od_config,
+                stage_id=stage_id,
                 **_diffusion_kwargs,
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:
             engine_args = filter_dataclass_kwargs(AsyncOmniEngineArgs, engine_args)
             engine_args.pop("model", None)
-            omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
+            omni_engine_args = AsyncOmniEngineArgs(model=model, stage_id=stage_id, **engine_args)
             usage_context = UsageContext.OPENAI_API_SERVER
             vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)
             stage_engine = AsyncOmniLLM.from_vllm_config(
