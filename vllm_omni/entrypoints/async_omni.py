@@ -355,12 +355,6 @@ class AsyncOmni(OmniBase):
                             f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                         )
                         raise RuntimeError(result)  # Request Finished due to error
-                    req_id = result.get("request_id")
-                    if "error" in result:
-                        logger.error(
-                            f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
-                        )
-                        raise RuntimeError(result)  # Request Finished due to error
 
                     engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
                     if isinstance(engine_outputs, list):
