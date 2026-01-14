@@ -5,12 +5,14 @@ import importlib
 import os
 from functools import cache
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.utils.platform_utils import detect_device_type
 
 logger = init_logger(__name__)
 
@@ -61,7 +63,15 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
         The selected attention backend class
     """
     # Check environment variable
-    backend_name: str | None = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+
+    if detect_device_type() == "cuda":
+        compute_capability = torch.cuda.get_device_capability()
+        major, minor = compute_capability
+        if 80 <= major * 10 + minor < 100:
+            backend_name = "FLASH_ATTN"
+
+    if os.environ.get("DIFFUSION_ATTENTION_BACKEND") is not None:
+        backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
 
     if backend_name is not None:
         backend_name_upper = backend_name.upper()
