@@ -132,6 +132,15 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+        if hasattr(model, "vae") and hasattr(od_config, "parallel_config"):
+            from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+            from vllm_omni.diffusion.vae.patch_parallelism import maybe_install_vae_patch_parallelism
+
+            maybe_install_vae_patch_parallelism(
+                model,
+                vae_patch_parallel_size=od_config.parallel_config.vae_patch_parallel_size,
+                group_getter=get_dit_group,
+            )
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
