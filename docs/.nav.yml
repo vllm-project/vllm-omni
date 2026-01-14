@@ -46,7 +46,6 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
   - CI: contributing/ci
-  - Tests: contributing/tests
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md
