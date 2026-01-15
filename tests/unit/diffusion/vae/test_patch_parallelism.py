@@ -102,4 +102,3 @@ def test_get_vae_tiling_params_returns_none_if_missing():
 def test_get_vae_tiling_params_parses_types():
     vae = _DummyVae(tile_latent_min_size="128", tile_overlap_factor="0.25", tile_sample_min_size="1024")
     assert pp._get_vae_tiling_params(vae) == (128, 0.25, 1024)
-

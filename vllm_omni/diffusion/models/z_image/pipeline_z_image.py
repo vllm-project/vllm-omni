@@ -18,12 +18,10 @@
 import inspect
 import json
 import os
-import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders import AutoencoderKL
@@ -31,7 +29,6 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoModel, AutoTokenizer
-from vllm.logger import init_logger as init_vllm_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -46,7 +43,6 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-vllm_logger = init_vllm_logger(__name__)
 
 
 def get_post_process_func(
@@ -611,47 +607,7 @@ class ZImagePipeline(nn.Module):
             latents = latents.to(self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
-            profile_vae = self.od_config.enable_vae_profiling
-            if profile_vae:
-                device = latents.device
-                dist_rank = None
-                dist_world_size = None
-                if dist.is_initialized():
-                    try:
-                        dist_rank = dist.get_rank()
-                        dist_world_size = dist.get_world_size()
-                    except Exception:
-                        dist_rank = None
-                        dist_world_size = None
-                if device.type == "cuda":
-                    torch.cuda.reset_peak_memory_stats(device)
-                    torch.cuda.synchronize(device)
-                t0 = time.perf_counter()
-                image = self.vae.decode(latents, return_dict=False)[0]
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                t1 = time.perf_counter()
-                if device.type == "cuda":
-                    peak_alloc_gib = torch.cuda.max_memory_allocated(device) / (1024**3)
-                    peak_resv_gib = torch.cuda.max_memory_reserved(device) / (1024**3)
-                    vllm_logger.debug(
-                        "Z-Image VAE decode profile: rank=%s/%s time_ms=%.3f "
-                        "peak_alloc_gib=%.3f peak_reserved_gib=%.3f",
-                        dist_rank if dist_rank is not None else "na",
-                        dist_world_size if dist_world_size is not None else "na",
-                        (t1 - t0) * 1000,
-                        peak_alloc_gib,
-                        peak_resv_gib,
-                    )
-                else:
-                    vllm_logger.debug(
-                        "Z-Image VAE decode profile: rank=%s/%s time_ms=%.3f",
-                        dist_rank if dist_rank is not None else "na",
-                        dist_world_size if dist_world_size is not None else "na",
-                        (t1 - t0) * 1000,
-                    )
-            else:
-                image = self.vae.decode(latents, return_dict=False)[0]
+            image = self.vae.decode(latents, return_dict=False)[0]
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(output=image)
