@@ -951,8 +951,6 @@ async def _stage_worker_async(
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
-    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-    engine_args["max_num_seqs"] = max_batch_size
     # Initialize OmniConnectors if configured to match sync worker behavior
     connectors: dict[Any, Any] = {}
     if connectors_config:

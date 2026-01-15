@@ -195,6 +195,10 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
             base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
+        if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None:
+            runtime_cfg = stage_arg.runtime
+            max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
+            base_engine_args_tmp["max_num_seqs"] = max_batch_size
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
 

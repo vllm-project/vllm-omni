@@ -604,7 +604,7 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1)
+        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1, modulate_index)
 
         # Process text stream - norm1 + modulation
         txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
@@ -632,7 +632,8 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2)
+        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2, modulate_index)
+
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
@@ -692,15 +693,13 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_head_dim: int = 128,
         num_attention_heads: int = 24,
         joint_attention_dim: int = 3584,
-        guidance_embeds: bool = False,  # TODO: this should probably be removed
+        guidance_embeds: bool = False,
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
         zero_cond_t: bool = False,
         use_additional_t_cond: bool = False,
         use_layer3d_rope: bool = False,
     ):
         super().__init__()
-        model_config = od_config.tf_model_config
-        num_layers = model_config.num_layers
         self.parallel_config = od_config.parallel_config
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels

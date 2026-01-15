@@ -55,7 +55,15 @@ Usage (with CFG Parallel):
         --prompt "Edit description" \
         --cfg_parallel_size 2 \
         --num_inference_steps 50 \
-        --cfg_scale 4.0 \
+        --cfg_scale 4.0
+
+Usage (disable torch.compile):
+    python image_edit.py \
+        --image input.png \
+        --prompt "Edit description" \
+        --enforce_eager \
+        --num_inference_steps 50 \
+        --cfg_scale 4.0
 
 For more options, run:
     python image_edit.py --help
@@ -260,6 +268,11 @@ def parse_args() -> argparse.Namespace:
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
+    parser.add_argument(
+        "--enforce_eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
     return parser.parse_args()
 
 
@@ -321,6 +334,7 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         parallel_config=parallel_config,
+        enforce_eager=args.enforce_eager,
     )
     print("Pipeline loaded")
 
