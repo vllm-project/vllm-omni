@@ -35,6 +35,37 @@ def _factor_pp_grid(pp_size: int) -> tuple[int, int]:
     return (1, pp_size)
 
 
+def _get_world_rank_pp_size(
+    group: dist.ProcessGroup,
+    vae_patch_parallel_size: int,
+) -> tuple[int, int, int]:
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    pp_size = min(int(vae_patch_parallel_size), int(world_size))
+    return world_size, rank, pp_size
+
+
+def _get_vae_out_channels(vae: Any) -> int:
+    return int(getattr(getattr(vae, "config", None), "out_channels", 3))
+
+
+def _get_vae_tile_params(vae: Any) -> tuple[int, float] | None:
+    tile_latent_min_size = getattr(vae, "tile_latent_min_size", None)
+    tile_overlap_factor = getattr(vae, "tile_overlap_factor", None)
+    if tile_latent_min_size is None or tile_overlap_factor is None:
+        return None
+    return int(tile_latent_min_size), float(tile_overlap_factor)
+
+
+def _get_vae_tiling_params(vae: Any) -> tuple[int, float, int] | None:
+    tile_sample_min_size = getattr(vae, "tile_sample_min_size", None)
+    tile_params = _get_vae_tile_params(vae)
+    if tile_params is None or tile_sample_min_size is None:
+        return None
+    tile_latent_min_size, tile_overlap_factor = tile_params
+    return tile_latent_min_size, tile_overlap_factor, int(tile_sample_min_size)
+
+
 def _distributed_tiled_decode(
     *,
     vae: Any,
@@ -49,18 +80,14 @@ def _distributed_tiled_decode(
     original blend + stitch logic. Non-rank0 ranks return an empty tensor; callers
     can broadcast the stitched result if needed.
     """
-    world_size = dist.get_world_size(group)
-    rank = dist.get_rank(group)
-
-    pp_size = min(int(vae_patch_parallel_size), int(world_size))
+    world_size, rank, pp_size = _get_world_rank_pp_size(group, vae_patch_parallel_size)
     if pp_size <= 1:
         return orig_decode(z, return_dict=False)[0]
 
-    tile_latent_min_size = getattr(vae, "tile_latent_min_size", None)
-    tile_overlap_factor = getattr(vae, "tile_overlap_factor", None)
-    tile_sample_min_size = getattr(vae, "tile_sample_min_size", None)
-    if tile_latent_min_size is None or tile_overlap_factor is None or tile_sample_min_size is None:
+    tiling_params = _get_vae_tiling_params(vae)
+    if tiling_params is None:
         return orig_decode(z, return_dict=False)[0]
+    tile_latent_min_size, tile_overlap_factor, tile_sample_min_size = tiling_params
 
     overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))
     if overlap_size <= 0:
@@ -113,7 +140,7 @@ def _distributed_tiled_decode(
     dist.broadcast(max_count_tensor, src=0, group=group)
     max_count = int(max_count_tensor.item())
 
-    out_channels = int(getattr(getattr(vae, "config", None), "out_channels", 3))
+    out_channels = _get_vae_out_channels(vae)
 
     # Prepare padded metadata + tiles for gather.
     meta_tensor = torch.full((max_count, 3), -1, device=z.device, dtype=torch.int64)
@@ -192,17 +219,14 @@ def _distributed_patch_decode(
     block with a small latent-space halo, then crops to the core and gathers the
     RGB blocks to rank0 for final stitching.
     """
-    world_size = dist.get_world_size(group)
-    rank = dist.get_rank(group)
-
-    pp_size = min(int(vae_patch_parallel_size), int(world_size))
+    world_size, rank, pp_size = _get_world_rank_pp_size(group, vae_patch_parallel_size)
     if pp_size <= 1:
         return orig_decode(z, return_dict=False)[0]
 
-    tile_latent_min_size = getattr(vae, "tile_latent_min_size", None)
-    tile_overlap_factor = getattr(vae, "tile_overlap_factor", None)
-    if tile_latent_min_size is None or tile_overlap_factor is None:
+    tile_params = _get_vae_tile_params(vae)
+    if tile_params is None:
         return orig_decode(z, return_dict=False)[0]
+    tile_latent_min_size, tile_overlap_factor = tile_params
 
     overlap_latent = int(tile_latent_min_size * float(tile_overlap_factor))
     halo_base = max(0, overlap_latent // 2)
@@ -215,7 +239,7 @@ def _distributed_patch_decode(
     out_h = latent_h * scale
     out_w = latent_w * scale
 
-    out_channels = int(getattr(getattr(vae, "config", None), "out_channels", 3))
+    out_channels = _get_vae_out_channels(vae)
 
     local_core = torch.empty(0, device=z.device, dtype=z.dtype)
     local_h = 0
