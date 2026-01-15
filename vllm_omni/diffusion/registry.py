@@ -103,6 +103,11 @@ DiffusionModelRegistry = _ModelRegistry(
     }
 )
 
+_VAE_PATCH_PARALLEL_ALLOWLIST = {
+    # Only enable for models we have validated end-to-end.
+    "ZImagePipeline",
+}
+
 
 def initialize_model(
     od_config: OmniDiffusionConfig,
@@ -132,7 +137,11 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
-        if hasattr(model, "vae") and hasattr(od_config, "parallel_config"):
+        if (
+            hasattr(model, "vae")
+            and hasattr(od_config, "parallel_config")
+            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+        ):
             from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
             from vllm_omni.diffusion.vae.patch_parallelism import maybe_install_vae_patch_parallelism
 
