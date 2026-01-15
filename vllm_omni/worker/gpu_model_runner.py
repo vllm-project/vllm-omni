@@ -19,8 +19,8 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
-from vllm_omni.model_executor.custom_process_mixin import has_postprocess, has_preprocess
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.omni_process_mixin import has_postprocess, has_preprocess
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
