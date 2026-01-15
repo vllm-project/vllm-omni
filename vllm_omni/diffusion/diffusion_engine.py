@@ -293,6 +293,7 @@ class DiffusionEngine:
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         prompt = "dummy run"
+        # note that num_inference_steps=1 will cause timestep and temb None in the pipeline
         num_inference_steps = 1
         height = 1024
         width = 1024
