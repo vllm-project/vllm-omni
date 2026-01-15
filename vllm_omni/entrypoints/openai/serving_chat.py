@@ -638,7 +638,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
-                # Get role for all modalities (text, audio, image)
+                # Initialize role before conditional blocks to avoid UnboundLocalError
+                # when handling audio/image responses
                 role = self.get_chat_request_role(request)
 
                 # We need to do it here, because if there are exceptions in
@@ -646,11 +647,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
                     num_cached_tokens = res.num_cached_tokens
-                    # Send first response for each request.n (index) with
-                    # the role
-
-                    # NOTE num_choices defaults to 1 so this usually executes
-                    # once per request
+                    # Send first response for each choice with role
+                    # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
