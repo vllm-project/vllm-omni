@@ -3,7 +3,7 @@ nav:
 - User Guide:
   - Getting Started:
     - getting_started/quickstart.md
-    - getting_started/installation
+    - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
       - Image Generation: serving/image_generation_api.md
