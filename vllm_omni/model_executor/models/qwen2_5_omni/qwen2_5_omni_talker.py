@@ -155,7 +155,18 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     def bad_word_processor(self, logits: torch.Tensor) -> torch.Tensor:
         # suppress token IDs unsupported by token2wav
         if self.suppress_start_id and self.suppress_start_id < logits.size(-1):
-            logits[..., self.suppress_start_id : logits.size(-1)] = -1e9
+            # skip the end token id.
+            if hasattr(self.config, "tts_codec_end_token_id"):
+                end_id = int(getattr(self.config, "tts_codec_end_token_id"))
+                if self.suppress_start_id == end_id:
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                elif self.suppress_start_id < end_id:
+                    logits[..., self.suppress_start_id : end_id] = -1e9
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                else:
+                    logits[..., self.suppress_start_id : logits.size(-1)] = -1e9
+            else:
+                raise ValueError("config must have tts_codec_end_token_id attribute")
 
         if hasattr(self.config, "tts_codec_start_token_id"):
             bos_id = int(getattr(self.config, "tts_codec_start_token_id"))
