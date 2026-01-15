@@ -370,10 +370,6 @@ class OmniDiffusionConfig:
     # support multi images input
     supports_multimodal_inputs: bool = False
 
-    # Logging
-    enable_vae_profiling: bool = False
-    """Enable lightweight VAE decode profiling logs."""
-
     log_level: str = "info"
 
     # Omni configuration (injected from stage config)
@@ -469,13 +465,6 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
-
-        if not self.enable_vae_profiling:
-            # Optional backdoor for quick experimentation without changing code/config.
-            env_override = os.getenv("VLLM_DIFFUSION_PROFILE_VAE")
-            if env_override is not None and env_override.strip().lower() not in ("0", "false", "off", "no"):
-                self.enable_vae_profiling = True
-
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
