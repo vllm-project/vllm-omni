@@ -9,7 +9,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
 from vllm_omni.diffusion.models.glm_image.pipeline_glm_image import (
     GlmImagePipeline,
     get_glm_image_post_process_func,
-    # get_glm_image_pre_process_func,
+    get_glm_image_pre_process_func,
 )
 
 __all__ = [
@@ -17,5 +17,5 @@ __all__ = [
     "GlmImagePipeline",
     "GlmImageTransformer2DModel",
     "get_glm_image_post_process_func",
-    # "get_glm_image_pre_process_func",
+    "get_glm_image_pre_process_func",
 ]
