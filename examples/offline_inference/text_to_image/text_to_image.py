@@ -150,6 +150,8 @@ def main():
 
     omni = Omni(
         model=args.model,
+        enable_cpu_offload=True,
+        enable_overlap = True
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,

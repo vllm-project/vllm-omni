@@ -7,7 +7,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-
+from vllm_omni.diffusion.overlap import OverlapContext
 
 @dataclass
 class ForwardContext:
@@ -45,12 +45,14 @@ def create_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
+    overlap_ctx: "OverlapContext | None" = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
+        overlap_ctx=overlap_ctx,
     )
 
 
@@ -75,6 +77,7 @@ def set_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
+    overlap_ctx: "OverlapContext | None" = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -85,6 +88,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
+        overlap_ctx=overlap_ctx,
     )
     with override_forward_context(forward_context):
         yield

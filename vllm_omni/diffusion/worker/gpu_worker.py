@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offload import apply_offload_hooks
+from vllm_omni.diffusion.overlap import apply_overlap_wrapper, OverlapContext
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -117,6 +118,16 @@ class GPUWorker:
 
             apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
 
+        # Apply overlap if enabled
+        if self.od_config.enable_overlap:
+            self.overlap_ctx = OverlapContext(self.device)
+            apply_overlap_wrapper(
+                self.pipeline,
+                device=self.device,
+            )
+        else:
+            self.overlap_ctx = None
+
         if not self.od_config.enforce_eager:
             try:
                 self.pipeline.transformer = regionally_compile(
@@ -155,14 +166,14 @@ class GPUWorker:
             raise ValueError("Cannot execute model with empty request list")
         # TODO: dealing with first req for now
         req = reqs[0]
-
+        print(req)
         if req.generator is None and req.seed is not None:
             req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
             self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config, overlap_context=self.overlap_ctx):
             output = self.pipeline.forward(req)
         return output
 
