@@ -34,7 +34,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
+from vllm_omni.model_executor.custom_process_mixin import OmniProcessingMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
@@ -53,7 +53,7 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen2_5OmniThinkerDummyInputsBuilder,
 )
 class Qwen2_5OmniForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, Qwen2_5OmniConditionalGenerationMixin, CustomProcessMixin
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, Qwen2_5OmniConditionalGenerationMixin, OmniProcessingMixin
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
