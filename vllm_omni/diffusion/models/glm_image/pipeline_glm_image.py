@@ -138,7 +138,7 @@ def get_glm_image_post_process_func(od_config: OmniDiffusionConfig):
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
-    def post_process_func(images: PIL.Image.Image):
+    def post_process_func(images: torch.Tensor) -> list[PIL.Image.Image]:
         return image_processor.postprocess(images, output_type="pil")
 
     return post_process_func
@@ -488,11 +488,7 @@ class GlmImagePipeline(nn.Module):
                 grid_t, grid_h, grid_w = condition_grid[i].tolist()
                 token_ids = token_ids.view(1, -1)
                 # Upsample 2x (from d32 to d64)
-                token_ids_2d = token_ids.view(1, 1, grid_h, grid_w)
-                token_ids_upsampled = torch.nn.functional.interpolate(
-                    token_ids_2d.float(), scale_factor=2, mode="nearest"
-                ).to(dtype=torch.long)
-                token_ids_upsampled = token_ids_upsampled.view(1, -1)
+                token_ids_upsampled = self._upsample_token_ids(token_ids, grid_h, grid_w)
                 prior_token_image_ids.append(token_ids_upsampled)
 
         # Generate with AR model
@@ -835,7 +831,7 @@ class GlmImagePipeline(nn.Module):
         # Get condition images for Image Edit mode
         # Use pre-processed images from pre_process_func
         preprocessed_images = req.preprocessed_image
-        condition_images = req.prompt_image if hasattr(req, "prompt_image") else req.pil_image
+        condition_images = getattr(req, "prompt_image", None)
         img_height = req.height
         img_width = req.width
 
