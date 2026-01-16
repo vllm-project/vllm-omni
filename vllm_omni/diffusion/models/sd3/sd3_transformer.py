@@ -102,8 +102,8 @@ class SD3CrossAttention(nn.Module):
         else:
             self.to_out = None
 
-        self.norm_added_q = RMSNorm(head_dim, eps=eps)
-        self.norm_added_k = RMSNorm(head_dim, eps=eps)
+        self.norm_added_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_added_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.attn = Attention(
             num_heads=num_heads,
@@ -341,8 +341,10 @@ class SD3Transformer2DModel(nn.Module):
         self.pooled_projection_dim = model_config.pooled_projection_dim
         self.joint_attention_dim = model_config.joint_attention_dim
         self.patch_size = model_config.patch_size
-        self.dual_attention_layers = model_config.dual_attention_layers
-        self.qk_norm = model_config.qk_norm
+        self.dual_attention_layers = (
+            model_config.dual_attention_layers if hasattr(model_config, "dual_attention_layers") else ()
+        )
+        self.qk_norm = model_config.qk_norm if hasattr(model_config, "qk_norm") else ""
         self.pos_embed_max_size = model_config.pos_embed_max_size
 
         self.pos_embed = PatchEmbed(

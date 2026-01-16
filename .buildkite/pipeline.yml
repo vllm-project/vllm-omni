@@ -42,6 +42,23 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "Diffusion Model CPU offloading Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Audio Generation Model Test"
     timeout_in_minutes: 20
     depends_on: image-build
@@ -77,10 +94,11 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Parallelism Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+      - pytest -s -v tests/e2e/offline_inference/test_zimage_tensor_parallel.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:

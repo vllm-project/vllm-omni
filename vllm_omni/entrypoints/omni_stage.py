@@ -585,9 +585,18 @@ def _stage_worker(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            logger.debug("[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e)
+            logger.debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s",
+                stage_id,
+                e,
+            )
     # Init engine based on stage_type
-    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
+    logger.debug(
+        "[Stage-%s] Initializing %s engine with args keys=%s",
+        stage_id,
+        stage_type,
+        list(engine_args.keys()),
+    )
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage")
@@ -942,8 +951,6 @@ async def _stage_worker_async(
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
-    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-    engine_args["max_num_seqs"] = max_batch_size
     # Initialize OmniConnectors if configured to match sync worker behavior
     connectors: dict[Any, Any] = {}
     if connectors_config:
@@ -1111,6 +1118,20 @@ async def _stage_worker_async(
             except (OSError, ValueError):
                 pass
     omni_stage.set_async_engine(stage_engine)
+    if hasattr(omni_stage.async_engine, "log_stats") and omni_stage.async_engine.log_stats:
+
+        async def _force_log():
+            try:
+                while True:
+                    await asyncio.sleep(10.0)
+                    await omni_stage.async_engine.do_log_stats()
+            except asyncio.CancelledError:
+                pass
+
+        log_stats_task = asyncio.create_task(_force_log())
+    else:
+        log_stats_task = None
+
     # Don't keep the dummy data in memory (only for LLM engines)
     if stage_type != "diffusion":
         await stage_engine.reset_mm_cache()
@@ -1335,7 +1356,8 @@ async def _stage_worker_async(
                     }
                 )
             logger.debug("Enqueued result for request %s to downstream", rid)
-
+    if log_stats_task is not None:
+        log_stats_task.cancel()
     logger.info("Stage worker exiting")
 
 

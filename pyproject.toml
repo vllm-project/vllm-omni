@@ -151,11 +151,34 @@ addopts = [
     "--cov-report=xml",
 ]
 markers = [
-    "unit: Unit tests",
-    "integration: Integration tests",
+    # ci/cd required
+    "core_model: Core model tests (run in each PR)",
+    # function module markers
+    "diffusion: Diffusion model tests",
+    "omni: Omni model tests",
+    "cache: Cache backend tests",
+    "parallel: Parallelism/distributed tests",
+    # platform markers
+    "cpu: Tests that run on CPU",
+    "gpu: Tests that run on GPU (auto-added)",
+    "cuda: Tests that run on CUDA (auto-added)",
+    "rocm: Tests that run on AMD/ROCm (auto-added)",
+    "npu: Tests that run on NPU/Ascend (auto-added)",
+    # specified computation resources marks (auto-added)
+    "H100: Tests that require H100 GPU",
+    "L4: Tests that require L4 GPU",
+    "MI325: Tests that require MI325 GPU (AMD/ROCm)",
+    "A2: Tests that require A2 NPU",
+    "A3: Tests that require A3 NPU",
+    "distributed_cuda: Tests that require multi cards on CUDA platform",
+    "distributed_rocm: Tests that require multi cards on ROCm platform",
+    "distributed_npu: Tests that require multi cards on NPU platform",
+    "skipif_cuda: Skip if the num of CUDA cards is less than the required",
+    "skipif_rocm: Skip if the num of ROCm cards is less than the required",
+    "skipif_npu: Skip if the num of NPU cards is less than the required",
+    # more detailed markers
+    "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
-    "slow: Slow tests",
-    "core_model: enable this model test in each PR instead of only nightly",
 ]
 
 [tool.typos.default]
