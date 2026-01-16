@@ -69,20 +69,6 @@ class DiffusionParallelConfig:
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
 
-        env_override = os.environ.get("VLLM_DIFFUSION_VAE_PATCH_PARALLEL_SIZE")
-        if env_override is not None and self.vae_patch_parallel_size == 1:
-            try:
-                env_value = int(env_override)
-                if env_value > 0:
-                    self.vae_patch_parallel_size = env_value
-                else:
-                    logger.warning(
-                        "Ignoring invalid VLLM_DIFFUSION_VAE_PATCH_PARALLEL_SIZE=%r (must be > 0).",
-                        env_override,
-                    )
-            except ValueError:
-                logger.warning("Ignoring invalid VLLM_DIFFUSION_VAE_PATCH_PARALLEL_SIZE=%r.", env_override)
-
         self.world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
