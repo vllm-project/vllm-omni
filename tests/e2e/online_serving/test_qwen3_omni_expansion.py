@@ -55,14 +55,25 @@ def get_system_prompt():
     }
 
 
+def get_prompt(prompt_type="text_only"):
+    prompts = {
+        "text_only": "What is the capital of China?",
+        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+    }
+    return prompts.get(prompt_type, prompts["text_only"])
+
+
+def get_max_batch_size(size_type="few"):
+    batch_sizes = {"few": 5, "medium": 100, "large": 256}
+    return batch_sizes.get(size_type, 5)
+
+
 @pytest.mark.parametrize("test_config", test_params)
 def test_text_to_text_001(test_config: tuple[str, str]) -> None:
     """Test processing text, generating text output via OpenAI API."""
     model, stage_config_path = test_config
     with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        messages = dummy_messages_from_mix_data(
-            system_prompt=get_system_prompt(), content_text="What is the capital of China?"
-        )
+        messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
         # Test single completion
         api_client = client(server)
@@ -89,7 +100,7 @@ def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
     """Test processing text, generating text and audio output via OpenAI API."""
 
     model, stage_config_path = test_config
-    num_concurrent_requests = 5
+    num_concurrent_requests = get_max_batch_size()
     stage_config_path = modify_stage_config(
         stage_config_path,
         {
