@@ -9,7 +9,7 @@ from collections.abc import Iterable
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -19,6 +19,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
@@ -199,12 +200,13 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput):
         else:
             self.transformer_2 = None
 
-        # Scheduler
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        # Initialize UniPC scheduler
+        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
+        self.scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=flow_shift,
+            prediction_type="flow_prediction",
         )
-        if od_config.flow_shift is not None:
-            self.scheduler.config.flow_shift = od_config.flow_shift
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
