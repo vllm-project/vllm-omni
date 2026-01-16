@@ -163,6 +163,36 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
         )
+
+        if attn_metadata is not None:
+            if is_joint:
+                if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
+                    attn_metadata.attn_mask = None
+                else:
+                    if attn_metadata.attn_mask is None:
+                        attn_metadata.attn_mask = torch.ones(
+                            [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
+                            dtype=torch.bool,
+                            device=query.device,
+                        )
+                    elif attn_metadata.joint_attn_mask is None:
+                        attn_metadata.joint_attn_mask = torch.ones(
+                            [query.shape[0], query.shape[1] - attn_metadata.attn_mask.shape[1]],
+                            dtype=torch.bool,
+                            device=query.device,
+                        )
+                    attn_metadata.attn_mask = (
+                        torch.cat([attn_metadata.joint_attn_mask, attn_metadata.attn_mask], dim=1)
+                        if joint_strategy == "front"
+                        else torch.cat([attn_metadata.attn_mask, attn_metadata.joint_attn_mask], dim=1)
+                    )
+
+            if attn_metadata.attn_mask is not None:
+                # the final attn_mask is ready, the length should be aligedn with query length
+                assert attn_metadata.attn_mask.shape[1] == query.shape[1], (
+                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
+                )
+                attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
         return query, key, value, attn_metadata, ctx
 
     def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
@@ -192,6 +222,8 @@ class UlyssesParallelAttention:
             # 2. Process Joint part: AllGather on Heads
             # Input: (B, JointLen, H/P, D). Output: (B, JointLen, H, D).
             # AllGather along dim 2.
+            # Ensure tensor is contiguous for all_gather (slicing may create non-contiguous views)
+            output_joint = output_joint.contiguous()
             gathered_joint = [torch.zeros_like(output_joint) for _ in range(dist.get_world_size(ctx.ulysses_pg))]
             dist.all_gather(gathered_joint, output_joint, group=ctx.ulysses_pg)
             output_joint = torch.cat(gathered_joint, dim=2)

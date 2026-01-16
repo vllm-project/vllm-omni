@@ -569,7 +569,6 @@ class StableDiffusion3Pipeline(
         negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
         height = req.height or self.default_sample_size * self.vae_scale_factor
         width = req.width or self.default_sample_size * self.vae_scale_factor
-        width = req.width or self.default_sample_size * self.vae_scale_factor
         sigmas = req.sigmas or sigmas
         num_inference_steps = req.num_inference_steps or num_inference_steps
         generator = req.generator or generator

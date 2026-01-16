@@ -19,7 +19,7 @@ if __name__ == "__main__":
     omni = Omni(model="Qwen/Qwen-Image")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
-    images = list(outputs)[0].request_output[0].images
+    images = outputs[0].request_output[0].images
     images[0].save("coffee.png")
 ```
 

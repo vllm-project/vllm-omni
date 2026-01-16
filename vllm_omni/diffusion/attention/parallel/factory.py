@@ -6,8 +6,8 @@ from __future__ import annotations
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention, ParallelAttentionStrategy
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
-from vllm_omni.diffusion.data import get_current_omni_diffusion_config
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size, get_sp_group
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 
 def build_parallel_attention_strategy(
@@ -24,7 +24,7 @@ def build_parallel_attention_strategy(
       and initialized process groups.
     """
     try:
-        cfg = get_current_omni_diffusion_config()
+        cfg = get_forward_context().omni_diffusion_config
         p = cfg.parallel_config
     except Exception:
         return NoParallelAttention()

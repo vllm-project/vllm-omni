@@ -14,9 +14,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Cache, PretrainedConfig
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeRotaryEmbedding
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
@@ -101,7 +107,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class Qwen3OmniCodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor with vLLM optimization."""
 
-    def __init__(self, config, layer_idx: int, vllm_config: VllmConfig = None):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        vllm_config: VllmConfig = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
 
         self.num_heads = config.code_predictor_config.num_attention_heads
@@ -118,11 +131,27 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
 
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        # Projection layers
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            total_num_kv_heads=self.num_key_value_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+            disable_tp=True,
+        )
+        self.o_proj = RowParallelLinear(
+            input_size=self.num_heads * self.head_dim,
+            output_size=self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+            disable_tp=True,
+        )
+
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_key_value_heads * self.head_dim
 
         # Query/Key normalization
         self.q_norm = RMSNorm(self.head_dim, eps=config.code_predictor_config.rms_norm_eps)
@@ -143,10 +172,13 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
 
-        # Project to Q, K, V
-        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # Reshape for attention
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = k.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         # Apply normalization
         q = self.q_norm(q)
@@ -209,7 +241,7 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
             )
         attn_output = attn_output.reshape(*(hidden_states.shape[:-1]), -1).contiguous()
 
-        attn_output = self.o_proj(attn_output)
+        attn_output, _ = self.o_proj(attn_output)
         return attn_output
 
 
@@ -219,24 +251,41 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
 
 
 class Qwen3OmniCodePredictorMLP(nn.Module):
-    """Feed-forward network for code predictor."""
+    """Feed-forward network for code predictor with fused gate/up projection."""
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            config.code_predictor_config.hidden_size, config.code_predictor_config.intermediate_size, bias=False
+        hidden_size = config.code_predictor_config.hidden_size
+        intermediate_size = config.code_predictor_config.intermediate_size
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size, intermediate_size],
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+            disable_tp=True,
         )
-        self.up_proj = nn.Linear(
-            config.code_predictor_config.hidden_size, config.code_predictor_config.intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(
-            config.code_predictor_config.intermediate_size, config.code_predictor_config.hidden_size, bias=False
+
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+            disable_tp=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate = F.silu(self.gate_proj(hidden_states))
-        up = self.up_proj(hidden_states)
-        return self.down_proj(gate * up)
+        gate_up, _ = self.gate_up_proj(hidden_states)
+        gate, up = gate_up.chunk(2, dim=-1)
+        down, _ = self.down_proj(F.silu(gate) * up)
+        return down
 
 
 # ============================================================================
@@ -260,7 +309,6 @@ class Qwen3OmniCodePredictorMTPLayer(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
 
-        # Qwen3OmniCodePredictorDecoderLayer
         self.self_attn = Qwen3OmniCodePredictorAttention(
             config,
             layer_idx,
@@ -269,8 +317,14 @@ class Qwen3OmniCodePredictorMTPLayer(nn.Module):
                 (),
                 {"cache_config": cache_config, "quant_config": quant_config, "model_config": model_config},
             )(),
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
-        self.mlp = Qwen3OmniCodePredictorMLP(config)
+        self.mlp = Qwen3OmniCodePredictorMLP(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
         self.input_layernorm = RMSNorm(
             config.code_predictor_config.hidden_size, eps=config.code_predictor_config.rms_norm_eps
         )
@@ -463,6 +517,7 @@ class Qwen3OmniCodePredictorBaseModel(nn.Module):
         return self.codec_embedding
 
 
+@support_torch_compile
 class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     """
     Code predictor wrapper matching HF structure.
@@ -521,3 +576,61 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         logits = self.lm_head[layer_idx](hidden_states)
 
         return logits, hidden_states
+
+    def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights with mapping for fused QKV and gate_up projections.
+
+        Maps original HF weights (q_proj, k_proj, v_proj, gate_proj, up_proj)
+        to fused vLLM weights (qkv_proj, gate_up_proj).
+        """
+        # Mapping for fused projections
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # Skip rotary embeddings
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            # Handle stacked/fused parameters
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                name = name.replace(weight_name, param_name)
+                # Skip if parameter doesn't exist (e.g., bias)
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Non-stacked parameters - use default loading
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader is not None:
+                    weight_loader(param, loaded_weight)
+                else:
+                    param.data.copy_(loaded_weight)
+
+            loaded_params.add(name)
+
+        return loaded_params

@@ -328,7 +328,7 @@ class OvisImagePipeline(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError("`prompt` has to be of type `str` or `list[str]` but is {type(prompt)}")
+            raise ValueError(f"`prompt` has to be of type `str` or `list[str]` but is {type(prompt)}")
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(

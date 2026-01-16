@@ -62,7 +62,7 @@ def test_cache_dit(model_name: str):
         num_outputs_per_prompt=1,  # Single output for speed
     )
     # Extract images from request_output[0]['images']
-    first_output = list(outputs)[0]
+    first_output = outputs[0]
     assert first_output.final_output_type == "image"
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")

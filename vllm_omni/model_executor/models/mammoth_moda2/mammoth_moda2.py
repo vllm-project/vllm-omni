@@ -126,7 +126,7 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             out = out[0]
         return OmniOutput(text_hidden_states=out, multimodal_outputs={}, intermediate_tensors=None)
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput):
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, *args, **kwargs):
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if hasattr(self.model, "compute_logits"):

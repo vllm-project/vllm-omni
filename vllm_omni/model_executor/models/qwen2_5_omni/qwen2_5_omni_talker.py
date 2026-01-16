@@ -84,6 +84,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         )
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
+        # suppress start id
+        self.suppress_start_id = None
+
     def init_multi_modal(self, thinker_config):
         self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
         self.visual = Qwen2_5_VisionTransformer(
@@ -150,6 +153,21 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         return hidden_states
 
     def bad_word_processor(self, logits: torch.Tensor) -> torch.Tensor:
+        # suppress token IDs unsupported by token2wav
+        if self.suppress_start_id and self.suppress_start_id < logits.size(-1):
+            # skip the end token id.
+            if hasattr(self.config, "tts_codec_end_token_id"):
+                end_id = int(getattr(self.config, "tts_codec_end_token_id"))
+                if self.suppress_start_id == end_id:
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                elif self.suppress_start_id < end_id:
+                    logits[..., self.suppress_start_id : end_id] = -1e9
+                    logits[..., end_id + 1 : logits.size(-1)] = -1e9
+                else:
+                    logits[..., self.suppress_start_id : logits.size(-1)] = -1e9
+            else:
+                raise ValueError("config must have tts_codec_end_token_id attribute")
+
         if hasattr(self.config, "tts_codec_start_token_id"):
             bos_id = int(getattr(self.config, "tts_codec_start_token_id"))
             logits[..., bos_id] = -1e9
@@ -234,3 +252,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
                 audio_embeddings = self._process_audio_input(multimodal_input)
                 multimodal_embeddings += audio_embeddings
         return multimodal_embeddings
+
+    def set_suppress_start_id(self, start_id: int):
+        self.suppress_start_id = start_id
+        self.logger.debug(f"Set suppress start id to {self.suppress_start_id}")

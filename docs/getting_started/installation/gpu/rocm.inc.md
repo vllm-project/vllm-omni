@@ -52,4 +52,42 @@ bash
 
 # --8<-- [start:pre-built-images]
 
+vLLM-Omni offers an official docker image for deployment. These images are built on top of vLLM docker images and available on Docker Hub as [vllm/vllm-omni-rocm](https://hub.docker.com/r/vllm/vllm-omni-rocm/tags). The version of vLLM-Omni indicates which release of vLLM it is based on.
+
+#### Launch vLLM-Omni Server
+Here's an example deployment command that has been verified on 2 x MI300's:
+```bash
+docker run -it \
+  --network=host \
+  --group-add=video \
+  --ipc=host \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --device /dev/kfd \
+  --device /dev/dri \
+  -v <path/to/model>:/app/model \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  vllm/vllm-omni-rocm:v0.12.0rc1 \
+  vllm serve --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+#### Launch an interactive terminal with prebuilt docker image.
+If you want to run in dev environment you can launch the docker image as follows:
+```bash
+docker run -it \
+  --network=host \
+  --group-add=video \
+  --ipc=host \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --device /dev/kfd \
+  --device /dev/dri \
+  -v <path/to/model>:/app/model \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  vllm/vllm-omni-rocm:v0.12.0rc1 \
+  bash
+```
+
 # --8<-- [end:pre-built-images]

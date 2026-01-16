@@ -515,6 +515,8 @@ class WanTransformer3DModel(nn.Module):
         pos_embed_seq_len: Optional position embedding sequence length
     """
 
+    _repeated_blocks = ["WanTransformerBlock"]
+
     def __init__(
         self,
         patch_size: tuple[int, int, int] = (1, 2, 2),

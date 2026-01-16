@@ -181,16 +181,30 @@ class Wan22Pipeline(nn.Module):
 
         # Read model_index.json to detect expand_timesteps mode (for TI2V-5B)
         self.expand_timesteps = False
+        self.has_transformer_2 = False
         if local_files_only:
             model_index_path = os.path.join(model, "model_index.json")
             if os.path.exists(model_index_path):
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
+            # Check if this is a two-stage model (MoE with transformer_2)
+            transformer_2_path = os.path.join(model, "transformer_2")
+            self.has_transformer_2 = os.path.exists(transformer_2_path)
+        else:
+            # For remote models, download and read model_index.json
+            try:
+                from huggingface_hub import hf_hub_download
 
-        # Check if this is a two-stage model (MoE with transformer_2)
-        transformer_2_path = os.path.join(model, "transformer_2") if local_files_only else None
-        self.has_transformer_2 = transformer_2_path is not None and os.path.exists(transformer_2_path)
+                model_index_path = hf_hub_download(repo_id=model, filename="model_index.json")
+                with open(model_index_path) as f:
+                    model_index = json.load(f)
+                    self.expand_timesteps = model_index.get("expand_timesteps", False)
+                    # Check transformer_2 from model_index
+                    transformer_2_info = model_index.get("transformer_2", [None, None])
+                    self.has_transformer_2 = transformer_2_info[0] is not None
+            except Exception:
+                pass
 
         # Set up weights sources for transformer(s)
         self.weights_sources = [
@@ -222,17 +236,13 @@ class Wan22Pipeline(nn.Module):
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
-        if local_files_only:
-            transformer_config = load_transformer_config(model, "transformer")
-            self.transformer = create_transformer_from_config(transformer_config)
-            if self.has_transformer_2:
-                transformer_2_config = load_transformer_config(model, "transformer_2")
-                self.transformer_2 = create_transformer_from_config(transformer_2_config)
-            else:
-                self.transformer_2 = None
+        transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        self.transformer = create_transformer_from_config(transformer_config)
+        if self.has_transformer_2:
+            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
+            self.transformer_2 = create_transformer_from_config(transformer_2_config)
         else:
-            self.transformer = WanTransformer3DModel()
-            self.transformer_2 = WanTransformer3DModel() if self.has_transformer_2 else None
+            self.transformer_2 = None
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only

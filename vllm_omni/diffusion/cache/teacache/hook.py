@@ -20,6 +20,10 @@ import torch
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
 from vllm_omni.diffusion.cache.teacache.state import TeaCacheState
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, StateManager
 
 
@@ -34,6 +38,7 @@ class TeaCacheHook(ModelHook):
     Key features:
     - Zero changes to model code
     - CFG-aware with separate states for positive/negative branches
+    - CFG-parallel compatible: properly detects branch identity across ranks
     - Model-specific polynomial rescaling
     - Auto-detection of model types
 
@@ -113,8 +118,18 @@ class TeaCacheHook(ModelHook):
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================
         # Set context based on CFG branch for separate state tracking
-        if module.do_true_cfg and self._forward_cnt % 2 == 1:
-            cache_branch = "negative"
+        # With CFG-parallel, each rank processes only one branch:
+        #   - cfg_rank 0: positive branch
+        #   - cfg_rank > 0: negative branch
+        # Without CFG-parallel, branches alternate within a single rank
+        if module.do_true_cfg:
+            cfg_parallel_size = get_classifier_free_guidance_world_size()
+            if cfg_parallel_size > 1:
+                cfg_rank = get_classifier_free_guidance_rank()
+                cache_branch = "negative" if cfg_rank > 0 else "positive"
+            else:
+                # No CFG-parallel: use forward counter to alternate branches
+                cache_branch = "negative" if self._forward_cnt % 2 == 1 else "positive"
         else:
             cache_branch = "positive"
 

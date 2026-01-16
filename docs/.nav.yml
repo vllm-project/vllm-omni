@@ -3,7 +3,7 @@ nav:
 - User Guide:
   - Getting Started:
     - getting_started/quickstart.md
-    - getting_started/installation
+    - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
       - Image Generation: serving/image_generation_api.md
@@ -11,6 +11,7 @@ nav:
     - examples/README.md
     - Offline Inference:
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
+      - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
@@ -25,14 +26,16 @@ nav:
   - Configuration:
     - configuration/README.md
     - configuration/*
-  - Diffusion Acceleration:
-    - Overview: user_guide/diffusion_acceleration.md
-    - Acceleration Methods:
-      - TeaCache: user_guide/acceleration/teacache.md
-      - Cache-DiT: user_guide/acceleration/cache_dit_acceleration.md
-      - Parallelism Acceleration: user_guide/acceleration/parallelism_acceleration.md
   - Models:
     - models/supported_models.md
+  - Features:
+    - Sleep Mode: features/sleep_mode.md
+    - Diffusion Features:
+      - Overview: user_guide/diffusion_acceleration.md
+      - TeaCache: user_guide/diffusion/teacache.md
+      - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
+      - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
+      - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
 - Developer Guide:
   - General:
     - contributing/README.md
@@ -43,13 +46,11 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
   - CI: contributing/ci
-  - Tests: contributing/tests
   - Design Documents:
     - design/index.md
     - design/architecture_overview.md
     - Feature Design:
       - design/feature/disaggregated_inference.md
-      - design/feature/multi_request_streaming.md
       - design/feature/ray_based_execution.md
     - Module Design:
       - design/module/ar_module.md

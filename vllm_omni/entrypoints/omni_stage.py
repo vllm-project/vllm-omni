@@ -41,6 +41,7 @@ from vllm_omni.entrypoints.stage_utils import (
     SHUTDOWN_TASK,
     OmniStageTaskType,
     _to_dict,
+    is_profiler_task,
     maybe_dump_to_shm,
     set_stage_devices,
 )
@@ -584,9 +585,18 @@ def _stage_worker(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            logger.debug("[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e)
+            logger.debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s",
+                stage_id,
+                e,
+            )
     # Init engine based on stage_type
-    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
+    logger.debug(
+        "[Stage-%s] Initializing %s engine with args keys=%s",
+        stage_id,
+        stage_type,
+        list(engine_args.keys()),
+    )
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage")
@@ -600,11 +610,38 @@ def _stage_worker(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
     logger.debug("Engine initialized")
+
+    # Check if stage engine supports profiling (via vLLM's built-in profiler)
+    has_profiler = hasattr(stage_engine, "start_profile") and hasattr(stage_engine, "stop_profile")
+    if has_profiler:
+        logger.info(
+            "[Stage-%s] vLLM profiler support detected (model_stage=%s)",
+            stage_id,
+            engine_args.get("model_stage", None),
+        )
+
+    def handle_profiler_task(task_type: OmniStageTaskType) -> None:
+        """Handle profiler task."""
+        if task_type == OmniStageTaskType.PROFILER_START:
+            if has_profiler:
+                try:
+                    stage_engine.start_profile()
+                    logger.info("[Stage-%s] Profiler started via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to start profiler: %s", stage_id, e)
+        elif task_type == OmniStageTaskType.PROFILER_STOP:
+            if has_profiler:
+                try:
+                    stage_engine.stop_profile()
+                    logger.info("[Stage-%s] Profiler stopped via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to stop profiler: %s", stage_id, e)
 
     # Initialize OmniConnectors if configured
     connectors = {}
@@ -633,8 +670,13 @@ def _stage_worker(
         _recv_dequeue_ts = _time.time()
         task_type = task.get("type", OmniStageTaskType.GENERATE)
         if task_type == OmniStageTaskType.SHUTDOWN:
-            logger.error("Received shutdown signal")
+            logger.info("Received shutdown signal")
             break
+
+        # Handle profiler control commands
+        if is_profiler_task(task_type):
+            handle_profiler_task(task_type)
+            continue
 
         batch_tasks: list[dict[str, Any]] = [task]
         start_time = _time.time()
@@ -645,6 +687,11 @@ def _stage_worker(
                     if extra == SHUTDOWN_TASK:
                         in_q.put(SHUTDOWN_TASK)
                         break
+                    # Handle profiler commands that arrive during batching
+                    extra_type = extra.get("type") if isinstance(extra, dict) else None
+                    if is_profiler_task(extra_type):
+                        handle_profiler_task(extra_type)
+                        continue  # Don't add to batch_tasks
                     batch_tasks.append(extra)
                     end_time = _time.time()
                     duration = end_time - start_time
@@ -904,8 +951,6 @@ async def _stage_worker_async(
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
-    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-    engine_args["max_num_seqs"] = max_batch_size
     # Initialize OmniConnectors if configured to match sync worker behavior
     connectors: dict[Any, Any] = {}
     if connectors_config:
@@ -1067,15 +1112,57 @@ async def _stage_worker_async(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
     omni_stage.set_async_engine(stage_engine)
+    if hasattr(omni_stage.async_engine, "log_stats") and omni_stage.async_engine.log_stats:
+
+        async def _force_log():
+            try:
+                while True:
+                    await asyncio.sleep(10.0)
+                    await omni_stage.async_engine.do_log_stats()
+            except asyncio.CancelledError:
+                pass
+
+        log_stats_task = asyncio.create_task(_force_log())
+    else:
+        log_stats_task = None
+
     # Don't keep the dummy data in memory (only for LLM engines)
     if stage_type != "diffusion":
         await stage_engine.reset_mm_cache()
     logger.debug("[Stage-%s] Engine initialized", stage_id)
+
+    # Check if stage engine supports profiling (via vLLM's built-in profiler)
+    has_profiler = hasattr(stage_engine, "start_profile") and hasattr(stage_engine, "stop_profile")
+    if has_profiler:
+        logger.info(
+            "[Stage-%s] vLLM profiler support detected for async stage (model_stage=%s)",
+            stage_id,
+            engine_args.get("model_stage", None),
+        )
+
+    async def handle_profiler_task_async(task_type: OmniStageTaskType) -> None:
+        """Handle profiler task asynchronously."""
+        if task_type == OmniStageTaskType.PROFILER_START:
+            if has_profiler:
+                try:
+                    await stage_engine.start_profile()
+                    logger.info("[Stage-%s] Profiler started via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to start profiler: %s", stage_id, e)
+        elif task_type == OmniStageTaskType.PROFILER_STOP:
+            if has_profiler:
+                try:
+                    await stage_engine.stop_profile()
+                    logger.info("[Stage-%s] Profiler stopped via vLLM engine", stage_id)
+                except Exception as e:
+                    logger.warning("[Stage-%s] Failed to stop profiler: %s", stage_id, e)
+
     # Signal readiness to orchestrator and send vllm_config back to main process
     try:
         # Send vllm_config back to main process so it can be accessed via
@@ -1160,6 +1247,7 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                    _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
@@ -1183,8 +1271,11 @@ async def _stage_worker_async(
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
+            elif is_profiler_task(task_type):
+                await handle_profiler_task_async(task_type)
             else:
                 asyncio.create_task(generation_single_request(task))
+
         except queue.Empty:
             await asyncio.sleep(0.001)
         batch_request_outputs: list[Any] = []
@@ -1265,7 +1356,8 @@ async def _stage_worker_async(
                     }
                 )
             logger.debug("Enqueued result for request %s to downstream", rid)
-
+    if log_stats_task is not None:
+        log_stats_task.cancel()
     logger.info("Stage worker exiting")
 
 

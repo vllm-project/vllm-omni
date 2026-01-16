@@ -3,19 +3,21 @@
 import multiprocessing as mp
 import os
 import time
+from collections.abc import Iterable
+from contextlib import AbstractContextManager, nullcontext
 
 import torch
 import zmq
-from vllm.config import LoadConfig, VllmConfig, set_current_vllm_config
+from vllm.config import LoadConfig, VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
-    set_current_omni_diffusion_config,
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -24,6 +26,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -45,7 +48,7 @@ class GPUWorker:
         self.od_config = od_config
         self.pipeline = None
         self.device = None
-
+        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.init_device_and_model()
 
     def init_device_and_model(self) -> None:
@@ -67,10 +70,9 @@ class GPUWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
-        with (
-            set_current_omni_diffusion_config(self.od_config),
-            set_current_vllm_config(vllm_config),
-        ):
+        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+
+        with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
             parallel_config = self.od_config.parallel_config
@@ -87,11 +89,12 @@ class GPUWorker:
             load_config = LoadConfig()
             model_loader = DiffusersPipelineLoader(load_config)
             time_before_load = time.perf_counter()
-            with DeviceMemoryProfiler() as m:
-                self.pipeline = model_loader.load_model(
-                    od_config=self.od_config,
-                    load_device=str(self.device),
-                )
+            with self._maybe_get_memory_pool_context(tag="weights"):
+                with DeviceMemoryProfiler() as m:
+                    self.pipeline = model_loader.load_model(
+                        od_config=self.od_config,
+                        load_device=load_device,
+                    )
             time_after_load = time.perf_counter()
 
         logger.info(
@@ -100,6 +103,29 @@ class GPUWorker:
             time_after_load - time_before_load,
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
+
+        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
+        if self.od_config.enable_cpu_offload:
+            for name in ["vae"]:
+                module = getattr(self.pipeline, name, None)
+                if module is None:
+                    continue
+                try:
+                    module.to(self.device, non_blocking=True)
+                except Exception as exc:
+                    logger.debug("Failed to move %s to GPU: %s", name, exc)
+
+            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
+
+        if not self.od_config.enforce_eager:
+            try:
+                self.pipeline.transformer = regionally_compile(
+                    self.pipeline.transformer,
+                    dynamic=True,
+                )
+                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
+            except Exception as e:
+                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
 
         # Setup cache backend based on type (both backends use enable()/reset() interface)
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
@@ -139,6 +165,79 @@ class GPUWorker:
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             output = self.pipeline.forward(req)
         return output
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return self.pipeline.load_weights(weights)
+
+    def sleep(self, level: int = 1) -> bool:
+        """
+        Put the worker to sleep. The worker should not process any requests.
+        The caller should guarantee that no requests are being processed
+        during the sleep period, before `wake_up` is called.
+
+        Args:
+            level: The sleep level. Level 1 sleep will offload the model
+                weights and discard the kv cache.
+                Currently only support level 1.
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+
+        # Save the buffers before level 2 sleep
+        if level == 2:
+            model = self.pipeline
+            self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+
+        allocator = CuMemAllocator.get_instance()
+        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        free_bytes_after_sleep, total = torch.cuda.mem_get_info()
+        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        used_bytes = total - free_bytes_after_sleep
+        assert freed_bytes >= 0, "Memory usage increased after sleeping."
+        logger.info(
+            "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
+            freed_bytes / GiB_bytes,
+            used_bytes / GiB_bytes,
+        )
+        return True
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        """
+        Wake up the worker from sleep mode. See the sleep function
+        method for more details.
+
+        Args:
+            tags: An optional list of tags to reallocate the worker memory
+                for specific memory allocations. Values must be in
+                `("weights")`. If None, all memory is reallocated.
+                wake_up should be called with all tags (or None) before the
+                worker is used again.
+        """
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        allocator = CuMemAllocator.get_instance()
+        allocator.wake_up(tags)
+
+        # Restore the buffers after level 2 sleep
+        if len(self._sleep_saved_buffers):
+            model = self.pipeline
+            for name, buffer in model.named_buffers():
+                if name in self._sleep_saved_buffers:
+                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
+            self._sleep_saved_buffers = {}
+        return True
+
+    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        if self.od_config.enable_sleep_mode:
+            from vllm.device_allocator.cumem import CuMemAllocator
+
+            allocator = CuMemAllocator.get_instance()
+            if tag == "weights":
+                assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+            return allocator.use_memory_pool(tag=tag)
+        else:
+            return nullcontext()
 
     def shutdown(self) -> None:
         destroy_distributed_env()
