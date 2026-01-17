@@ -116,7 +116,7 @@ steps:
     timeout_in_minutes: 20
     depends_on: image-build
     commands:
-      - pytest -s -v tests/diffusion/test_gpu_worker.py
+      - pytest -s -v tests/diffusion/test_gpu_diffusion_worker.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:

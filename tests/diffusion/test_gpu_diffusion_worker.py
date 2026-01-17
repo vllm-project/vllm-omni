@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Unit tests for GPUWorker class.
+Unit tests for GPUDiffusionWorker class.
 
-This module tests the GPUWorker implementation:
+This module tests the GPUDiffusionWorker implementation:
 - load_weights: Loading model weights
 - sleep: Putting worker into sleep mode (levels 1 and 2)
 - wake_up: Waking worker from sleep mode
@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from vllm_omni.diffusion.worker.gpu_worker import GPUWorker
+from vllm_omni.diffusion.worker.gpu_diffusion_worker import GPUDiffusionWorker
 
 
 @pytest.fixture
@@ -33,20 +33,21 @@ def mock_od_config():
 
 @pytest.fixture
 def mock_gpu_worker(mock_od_config):
-    """Create a GPUWorker with mocked initialization."""
-    with patch.object(GPUWorker, "init_device_and_model"):
-        worker = GPUWorker(local_rank=0, rank=0, od_config=mock_od_config)
-        # Mock the pipeline
-        worker.pipeline = Mock()
-        worker.cache_backend = None
+    """Create a GPUDiffusionWorker with mocked initialization."""
+    with patch.object(GPUDiffusionWorker, "init_device"):
+        worker = GPUDiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
+        # Mock the model_runner with pipeline
+        worker.model_runner = Mock()
+        worker.model_runner.pipeline = Mock()
+        worker._sleep_saved_buffers = {}
         return worker
 
 
-class TestGPUWorkerLoadWeights:
-    """Test GPUWorker.load_weights method."""
+class TestGPUDiffusionWorkerLoadWeights:
+    """Test GPUDiffusionWorker.load_weights method."""
 
     def test_load_weights_calls_pipeline(self, mock_gpu_worker):
-        """Test that load_weights delegates to pipeline.load_weights."""
+        """Test that load_weights delegates to model_runner.load_weights."""
         # Setup mock weights
         mock_weights = [
             ("layer1.weight", torch.randn(10, 10)),
@@ -54,30 +55,30 @@ class TestGPUWorkerLoadWeights:
         ]
         expected_loaded = {"layer1.weight", "layer2.weight"}
 
-        # Configure pipeline mock
-        mock_gpu_worker.pipeline.load_weights = Mock(return_value=expected_loaded)
+        # Configure model_runner mock
+        mock_gpu_worker.model_runner.load_weights = Mock(return_value=expected_loaded)
 
         # Call load_weights
         result = mock_gpu_worker.load_weights(mock_weights)
 
-        # Verify pipeline.load_weights was called with the weights
-        mock_gpu_worker.pipeline.load_weights.assert_called_once_with(mock_weights)
+        # Verify model_runner.load_weights was called with the weights
+        mock_gpu_worker.model_runner.load_weights.assert_called_once_with(mock_weights)
         assert result == expected_loaded
 
     def test_load_weights_empty_iterable(self, mock_gpu_worker):
         """Test load_weights with empty weights iterable."""
-        mock_gpu_worker.pipeline.load_weights = Mock(return_value=set())
+        mock_gpu_worker.model_runner.load_weights = Mock(return_value=set())
 
         result = mock_gpu_worker.load_weights([])
 
-        mock_gpu_worker.pipeline.load_weights.assert_called_once_with([])
+        mock_gpu_worker.model_runner.load_weights.assert_called_once_with([])
         assert result == set()
 
 
-class TestGPUWorkerSleep:
-    """Test GPUWorker.sleep method."""
+class TestGPUDiffusionWorkerSleep:
+    """Test GPUDiffusionWorker.sleep method."""
 
-    @patch("vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info")
+    @patch("vllm_omni.diffusion.worker.gpu_diffusion_worker.torch.cuda.mem_get_info")
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
     def test_sleep_level_1(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
@@ -103,7 +104,7 @@ class TestGPUWorkerSleep:
         # Verify buffers were NOT saved (level 1 doesn't save buffers)
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
 
-    @patch("vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info")
+    @patch("vllm_omni.diffusion.worker.gpu_diffusion_worker.torch.cuda.mem_get_info")
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
     def test_sleep_level_2(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test sleep mode level 2 (offload all, save buffers)."""
@@ -121,7 +122,7 @@ class TestGPUWorkerSleep:
         # Mock pipeline buffers
         mock_buffer1 = torch.randn(10, 10)
         mock_buffer2 = torch.randn(20, 20)
-        mock_gpu_worker.pipeline.named_buffers = Mock(
+        mock_gpu_worker.model_runner.pipeline.named_buffers = Mock(
             return_value=[
                 ("buffer1", mock_buffer1),
                 ("buffer2", mock_buffer2),
@@ -140,7 +141,7 @@ class TestGPUWorkerSleep:
         assert "buffer1" in mock_gpu_worker._sleep_saved_buffers
         assert "buffer2" in mock_gpu_worker._sleep_saved_buffers
 
-    @patch("vllm_omni.diffusion.worker.gpu_worker.torch.cuda.mem_get_info")
+    @patch("vllm_omni.diffusion.worker.gpu_diffusion_worker.torch.cuda.mem_get_info")
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
     def test_sleep_memory_freed_validation(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
         """Test that sleep validates memory was actually freed."""
@@ -159,8 +160,8 @@ class TestGPUWorkerSleep:
             mock_gpu_worker.sleep(level=1)
 
 
-class TestGPUWorkerWakeUp:
-    """Test GPUWorker.wake_up method."""
+class TestGPUDiffusionWorkerWakeUp:
+    """Test GPUDiffusionWorker.wake_up method."""
 
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
     def test_wake_up_without_buffers(self, mock_allocator_class, mock_gpu_worker):
@@ -202,7 +203,7 @@ class TestGPUWorkerWakeUp:
         mock_buffer2 = Mock()
         mock_buffer2.data = Mock()
 
-        mock_gpu_worker.pipeline.named_buffers = Mock(
+        mock_gpu_worker.model_runner.pipeline.named_buffers = Mock(
             return_value=[
                 ("buffer1", mock_buffer1),
                 ("buffer2", mock_buffer2),
@@ -243,7 +244,7 @@ class TestGPUWorkerWakeUp:
         mock_buffer2 = Mock()
         mock_buffer2.data = Mock()
 
-        mock_gpu_worker.pipeline.named_buffers = Mock(
+        mock_gpu_worker.model_runner.pipeline.named_buffers = Mock(
             return_value=[
                 ("buffer1", mock_buffer1),
                 ("buffer2", mock_buffer2),
