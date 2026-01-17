@@ -94,7 +94,7 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Parallelism Test"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 25
     depends_on: image-build
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
@@ -116,7 +116,7 @@ steps:
     timeout_in_minutes: 20
     depends_on: image-build
     commands:
-      - pytest -s -v tests/diffusion/test_gpu_worker.py
+      - pytest -s -v tests/diffusion/test_gpu_diffusion_worker.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
