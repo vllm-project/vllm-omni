@@ -277,7 +277,7 @@ def test_image_to_text_001(test_config: tuple[str, str]) -> None:
     stage_config_path = modify_stage_config(stage_config_path, deploy_config)
 
     with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(16, 16)}"
+        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(64, 64)}"
         messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
         # Test single completion
         api_client = client(server)
