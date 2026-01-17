@@ -6,20 +6,21 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 
 import base64
 import concurrent.futures
-import ctypes
 import os
-import signal
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import openai
 import pytest
 from vllm.assets.video import VideoAsset
-from vllm.utils import get_open_port
 
+from tests.conftest import (
+    OmniServer,
+    convert_audio_to_text,
+    cosine_similarity_text,
+    dummy_messages_from_mix_data,
+    modify_stage_config,
+)
 from vllm_omni.utils import is_rocm
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -35,99 +36,6 @@ else:
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
-
-
-class OmniServer:
-    """Omniserver for vLLM-Omni tests."""
-
-    def __init__(
-        self,
-        model: str,
-        serve_args: list[str],
-        *,
-        env_dict: dict[str, str] | None = None,
-    ) -> None:
-        self.model = model
-        self.serve_args = serve_args
-        self.env_dict = env_dict
-        self.proc: subprocess.Popen | None = None
-        self.host = "127.0.0.1"
-        self.port = get_open_port()
-
-    def _start_server(self) -> None:
-        """Start the vLLM-Omni server subprocess."""
-        env = os.environ.copy()
-        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        if self.env_dict is not None:
-            env.update(self.env_dict)
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "vllm_omni.entrypoints.cli.main",
-            "serve",
-            self.model,
-            "--omni",
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
-        ] + self.serve_args
-
-        # Helper to ensure child process dies when parent dies
-        libc = ctypes.CDLL("libc.so.6")
-
-        def preexec_fn():
-            # Ensure the child process receives SIGTERM when the parent (this test runner) dies.
-            # This prevents orphaned processes if the test is killed unexpectedly.
-            PR_SET_PDEATHSIG = 1
-            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
-
-        print(f"Launching OmniServer with: {' '.join(cmd)}")
-        self.proc = subprocess.Popen(
-            cmd,
-            env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
-            start_new_session=True,
-            preexec_fn=preexec_fn,
-        )
-
-        # Wait for server to be ready
-        max_wait = 600  # 10 minutes
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex((self.host, self.port))
-                    if result == 0:
-                        print(f"Server ready on {self.host}:{self.port}")
-                        return
-            except Exception:
-                pass
-            time.sleep(2)
-
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
-
-    def __enter__(self):
-        self._start_server()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.proc:
-            try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.proc.wait()
 
 
 @pytest.fixture
@@ -190,6 +98,19 @@ def dummy_messages_from_video_data(
             ],
         },
     ]
+
+
+def get_prompt(prompt_type="text_only"):
+    prompts = {
+        "text_only": "What is the capital of China?",
+        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+    }
+    return prompts.get(prompt_type, prompts["text_only"])
+
+
+def get_max_batch_size(size_type="few"):
+    batch_sizes = {"few": 5, "medium": 100, "large": 256}
+    return batch_sizes.get(size_type, 5)
 
 
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -282,3 +203,67 @@ def test_video_to_audio_concurrent(
     # Verify audio output
     assert audio_data is not None
     assert len(audio_data) > 0
+
+
+stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+
+
+@pytest.mark.parametrize("test_config", test_params)
+def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
+    """Test processing text, generating text and audio output via OpenAI API."""
+
+    model, stage_config_path = test_config
+    num_concurrent_requests = get_max_batch_size()
+    stage_config_path = modify_stage_config(
+        stage_config_path,
+        {
+            0: {"runtime.max_batch_size": num_concurrent_requests},
+            1: {"runtime.max_batch_size": num_concurrent_requests},
+        },
+    )
+    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
+        messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+
+        # Test single completion
+        api_client = client(server)
+        e2e_list = list()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+            # Submit multiple completion requests concurrently
+            futures = [
+                executor.submit(api_client.chat.completions.create, model=server.model, messages=messages)
+                for _ in range(num_concurrent_requests)
+            ]
+            start_time = time.perf_counter()
+            # Wait for all requests to complete and collect results
+            chat_completions = list()
+            for future in concurrent.futures.as_completed(futures):
+                chat_completions.append(future.result())
+                # Verify E2E
+                current_e2e = time.perf_counter() - start_time
+                print(f"the request e2e is: {current_e2e}")
+                # TODO: Verify the E2E latency after confirmation baseline.
+                e2e_list.append(current_e2e)
+
+        print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
+        # Verify all completions succeeded
+        assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
+        for chat_completion in chat_completions:
+            # Verify audio output success
+            audio_message = chat_completion.choices[1].message
+            audio_data = audio_message.audio.data
+            assert audio_data is not None, "No audio output is generated"
+            assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
+
+            # Verify text output success
+            text_choice = chat_completion.choices[0]
+            text_content = text_choice.message.content
+            assert text_choice.message.content is not None, "No text output is generated"
+            assert "beijing" in text_choice.message.content.lower(), "The output do not contain keywords."
+
+            # Verify text output same as audio output
+            audio_content = convert_audio_to_text(audio_data)
+            print(f"text content is: {text_content}")
+            print(f"audio content is: {audio_content}")
+            assert cosine_similarity_text(audio_content.lower(), text_content.lower()) > 0.9, (
+                "The audio content is not same as the text"
+            )
