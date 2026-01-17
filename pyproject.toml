@@ -50,6 +50,8 @@ dev = [
     "pytest-cov>=4.0.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
+    "openai-whisper>=20250625",
+    "psutil>=7.2.0"
 ]
 
 docs = [
