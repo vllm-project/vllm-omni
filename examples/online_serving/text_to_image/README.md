@@ -20,14 +20,6 @@ Or use the startup script:
 bash run_server.sh
 ```
 
-### Start with CFG Parallelism
-
-For faster generation with more than 1 GPUs, enable CFG parallelism:
-
-```bash
-CFG_PARALLEL_SIZE=2 bash run_server.sh
-```
-
 ## API Calls
 
 ### Method 1: Using curl
