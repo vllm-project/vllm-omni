@@ -54,7 +54,7 @@ steps:
   commands:
     - export MIOPEN_DEBUG_CONV_DIRECT=0
     - export MIOPEN_DEBUG_CONV_GEMM=0
-    - pytest -s -v tests/diffusion/test_gpu_worker.py
+    - pytest -s -v tests/diffusion/test_gpu_diffusion_worker.py
 
 - label: "Omni Model Test Qwen2-5-Omni"
   timeout_in_minutes: 15
