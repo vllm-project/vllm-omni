@@ -9,7 +9,6 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniAu
 # from vllm.attention import AttentionMetadata  # unused import
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
@@ -68,13 +67,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         else:
             self.config = config
 
-        self.thinker_to_talker_proj = ColumnParallelLinear(
+        self.thinker_to_talker_proj = nn.Linear(
             self.config.embedding_size,
             self.config.hidden_size,
-            bias=True,
-            gather_output=True,
-            skip_bias_add=False,
-            quant_config=quant_config,
         )
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
@@ -145,7 +140,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         input_ids = None
 
         # projection
-        inputs_embeds, _ = self.thinker_to_talker_proj(inputs_embeds)
+        inputs_embeds = self.thinker_to_talker_proj(inputs_embeds)
 
         hidden_states = self.language_model.model(
             input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
