@@ -58,6 +58,14 @@ def client(omni_server):
     )
 
 
+def omni_client(omni_server):
+    """OpenAI client for the running vLLM-Omni server."""
+    return openai.OpenAI(
+        base_url=f"http://{omni_server.host}:{omni_server.port}/v1",
+        api_key="EMPTY",
+    )
+
+
 @pytest.fixture(scope="session")
 def base64_encoded_video() -> str:
     """Base64 encoded video for testing."""
@@ -205,14 +213,13 @@ def test_video_to_audio_concurrent(
     assert len(audio_data) > 0
 
 
-stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")]
-
-
 @pytest.mark.parametrize("test_config", test_params)
 def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
     """Test processing text, generating text and audio output via OpenAI API."""
 
     model, stage_config_path = test_config
+    # TODO: Use this stage_config_path uniformly after modifying existing test cases.
+    stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
     num_concurrent_requests = get_max_batch_size()
     stage_config_path = modify_stage_config(
         stage_config_path,
@@ -225,7 +232,7 @@ def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
         messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
         # Test single completion
-        api_client = client(server)
+        api_client = omni_client(server)
         e2e_list = list()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
             # Submit multiple completion requests concurrently
