@@ -219,7 +219,8 @@ def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
 
     model, stage_config_path = test_config
     # TODO: Use this stage_config_path uniformly after modifying existing test cases.
-    stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+    if not is_rocm():
+        stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
     num_concurrent_requests = get_max_batch_size()
     stage_config_path = modify_stage_config(
         stage_config_path,
