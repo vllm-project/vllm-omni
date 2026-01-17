@@ -20,6 +20,14 @@ Or use the startup script:
 bash run_server.sh
 ```
 
+### Start with CFG Parallelism
+
+For faster generation with more than 1 GPUs, enable CFG parallelism:
+
+```bash
+CFG_PARALLEL_SIZE=2 bash run_server.sh
+```
+
 ## API Calls
 
 ### Method 1: Using curl
@@ -116,6 +124,7 @@ Use `extra_body` to pass generation parameters:
 | `seed`                   | int   | None    | Random seed (reproducible)     |
 | `negative_prompt`        | str   | None    | Negative prompt                |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
+| `--cfg-parallel-size`.   | int   | 1       | Number of GPUs for CFG parallelism |
 
 ## Response Format
 

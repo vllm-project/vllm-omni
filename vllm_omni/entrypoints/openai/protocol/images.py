@@ -86,11 +86,6 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
-    cfg_parallel_size: int | None = Field(
-        default=None,
-        ge=1,
-        description="Number of GPUs for CFG parallel computation"
-    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
 
     # VAE memory optimizations (set at model init, included for completeness)

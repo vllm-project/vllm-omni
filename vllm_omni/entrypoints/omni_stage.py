@@ -474,12 +474,14 @@ def _stage_worker(
                     data_parallel_size = parallel_config.get("data_parallel_size", 1)
                     prefill_context_parallel_size = 1  # not used for diffusion
                     sequence_parallel_size = parallel_config.get("sequence_parallel_size", 1)
+                    cfg_parallel_size = parallel_config.get("cfg_parallel_size", 1)
                 else:
                     tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
                     pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
                     data_parallel_size = engine_args.get("data_parallel_size", 1)
                     prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
                     sequence_parallel_size = 1  # not use in omni model
+                    cfg_parallel_size = 1  # not used in omni model
 
                 # Calculate total number of devices needed for this stage
                 # For a single stage worker:
@@ -488,7 +490,8 @@ def _stage_worker(
                 # - DP: replicates model, but each replica uses TP devices
                 # - PCP: context parallelism, typically uses TP devices
                 # - SP: sequence parallelism, typically uses TP devices
-                # The number of devices per stage is determined by TP * PP * DP * PCP * SP size
+                # - CFG: Classifier-Free Guidance parallelism for diffusion models
+                # The number of devices per stage is determined by TP * PP * DP * PCP * SP * CFG size
                 # (PP/DP/PCP are higher-level parallelism that don't add devices per stage)
                 num_devices_per_stage = (
                     tensor_parallel_size
@@ -496,6 +499,7 @@ def _stage_worker(
                     * data_parallel_size
                     * prefill_context_parallel_size
                     * sequence_parallel_size
+                    * cfg_parallel_size
                 )
 
                 # Get physical device IDs from CUDA_VISIBLE_DEVICES
