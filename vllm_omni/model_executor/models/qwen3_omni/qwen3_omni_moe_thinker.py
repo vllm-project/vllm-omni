@@ -22,7 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-Omni-Moe model (thinker part)."""
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any
 
@@ -56,10 +56,13 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
 )
+
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerMultiModalDataParser,
     Qwen2_5OmniThinkerMultiModalProcessor,
+    create_qwen2_5_omni_thinker_field_factory,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo,
@@ -81,9 +84,22 @@ from vllm.model_executor.models.vision import (
     get_llm_pos_ids_for_vision,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
-from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+    MultiModalUUIDDict,
+)
+from vllm.multimodal.parse import (
+    AudioProcessorItems,
+    DictEmbeddingItems,
+    ModalityDataItems,
+    MultiModalDataItems,
+    MultiModalDataParser,
+)
+from vllm.multimodal.inputs import AudioItem, ModalityData, ImageItem, VideoItem
 from vllm.multimodal.processing import (
+    MultiModalHashes,
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
     PromptReplacement,
@@ -208,10 +224,210 @@ class Qwen3OmniMoeThinkerProcessingInfo(Qwen2AudioProcessingInfo, Qwen2_5_VLProc
 
 Qwen3OmniMoeThinkerDummyInputsBuilder = Qwen2_5OmniThinkerDummyInputsBuilder
 
+# NOTE: this is a dummy field config factory for bypassing HF processor.
+# It is only for development/testing 
+def _create_qwen3_omni_moe_dummy_field_factory(
+    spatial_merge_size: int,
+) -> Callable[[Mapping[str, torch.Tensor]], Mapping[str, MultiModalFieldConfig]]:
+    
+    def _qwen3_omni_moe_dummy_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+        # Detect modality from input fields
+        has_image = "pixel_values" in hf_inputs or "image_grid_thw" in hf_inputs
+        has_video = "pixel_values_videos" in hf_inputs or "video_grid_thw" in hf_inputs
+        has_audio = "input_audio_features" in hf_inputs or "audio_feature_lengths" in hf_inputs
+        
+        config = {}
+        
+        # Image fields - simple batched passthrough
+        if has_image:
+            image_grid_thw = hf_inputs.get("image_grid_thw", torch.empty((0, 3)))
+            image_grid_sizes = image_grid_thw.prod(-1)
+            config.update(
+                pixel_values=MultiModalFieldConfig.flat_from_sizes("image", image_grid_sizes),
+                image_embeds=MultiModalFieldConfig.flat_from_sizes(
+                    "image", image_grid_sizes // spatial_merge_size // spatial_merge_size
+                ),
+                image_grid_thw=MultiModalFieldConfig.batched("image"),
+                mm_placeholder_prompt_ids=MultiModalFieldConfig.batched("image"),
+                attention_mask=MultiModalFieldConfig.batched("image"),
+                use_audio_in_video=MultiModalFieldConfig.batched("image"),
+            )
+        
+        # Video fields - simple batched passthrough
+        if has_video:
+            video_grid_thw = hf_inputs.get("video_grid_thw", torch.empty((0, 3)))
+            video_grid_sizes = video_grid_thw.prod(-1)
+            num_videos = len(video_grid_sizes)
+            config.update(
+                pixel_values_videos=MultiModalFieldConfig.flat_from_sizes("video", video_grid_sizes),
+                video_embeds=MultiModalFieldConfig.flat_from_sizes(
+                    "video", video_grid_sizes // spatial_merge_size // spatial_merge_size
+                ),
+                video_grid_thw=MultiModalFieldConfig.batched("video"),
+                video_second_per_grid=MultiModalFieldConfig.batched("video"),
+                second_per_grid_ts=MultiModalFieldConfig.batched("video"),
+                use_audio_in_video=MultiModalFieldConfig.shared("video", num_videos),
+                mm_placeholder_prompt_ids=MultiModalFieldConfig.batched("video"),
+                attention_mask=MultiModalFieldConfig.batched("video"),
+            )
+        
+        # Audio fields - simple batched passthrough
+        if has_audio:
+            audio_feature_lengths = hf_inputs.get("audio_feature_lengths", torch.empty((0,)))
+            config.update(
+                input_audio_features=MultiModalFieldConfig.flat_from_sizes(
+                    "audio", audio_feature_lengths, dim=1
+                ),
+                feature_attention_mask=MultiModalFieldConfig.batched("audio"),
+                audio_feature_lengths=MultiModalFieldConfig.batched("audio"),
+                use_audio_in_video=MultiModalFieldConfig.batched("audio"),
+                mm_placeholder_prompt_ids=MultiModalFieldConfig.batched("audio"),
+                attention_mask=MultiModalFieldConfig.batched("audio"),
+            )
+        
+        return config
+    
+    return _qwen3_omni_moe_dummy_field_config
+
+
+# NOTE: this MultiModalDataParser supports pre-processed tensor inputs that bypass HF processor CPU preprocessing.
+# this can work with the _create_qwen3_omni_moe_dummy_field_factory for testing
+# and it still keeps the original logic for offical deployment.
+class Qwen3OmniMoeThinkerMultiModalDataParser(Qwen2_5OmniThinkerMultiModalDataParser):
+    """
+    Custom MultiModalDataParser for Qwen3-Omni that supports:
+    - Pre-processed pixel_values tensor (skips HF processor CPU preprocessing)
+    - Pre-processed pixel_values_videos tensor (skips HF processor CPU preprocessing)
+    - Original image_embeds/video_embeds formats (encoder output, skips encoder forward)
+    - Original raw data formats (PIL Image, np.array, etc.)
+    """
+
+    def _parse_image_data(
+        self,
+        data: dict[str, torch.Tensor] | ModalityData[ImageItem],
+    ) -> ModalityDataItems[Any, Any] | None:
+        if isinstance(data, dict):
+            # Support pre-processed pixel_values format (skip HF processor, keep encoder)
+            if "pixel_values" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="image",
+                    required_fields={"pixel_values", "image_grid_thw","mm_placeholder_prompt_ids"},
+                    fields_factory=_create_qwen3_omni_moe_dummy_field_factory(
+                        self._spatial_merge_size
+                    ),
+                )
+                
+            # Support image_embeds format (skip both HF processor and encoder)
+            elif "image_embeds" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="image",
+                    required_fields={"image_embeds", "image_grid_thw"},
+                    fields_factory=_create_qwen2vl_field_factory(self._spatial_merge_size),
+                )
+        # Fall back to parent class for raw data (PIL Image, np.array, etc.)
+        return super()._parse_image_data(data)
+
+    def _parse_video_data(
+        self,
+        data: dict[str, torch.Tensor] | ModalityData[VideoItem],
+    ) -> ModalityDataItems[Any, Any] | None:
+        if isinstance(data, dict):
+            if "pixel_values_videos" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="video",
+                    required_fields={"pixel_values_videos", "video_grid_thw","mm_placeholder_prompt_ids"},
+                    fields_factory=_create_qwen3_omni_moe_dummy_field_factory(
+                        self._spatial_merge_size
+                    ),
+                )
+            # Support video_embeds format (skip both HF processor and encoder)
+            elif "video_embeds" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="video",
+                    required_fields={"video_embeds", "video_grid_thw"},
+                    fields_factory=_create_qwen2vl_field_factory(self._spatial_merge_size),
+                )
+        # Fall back to parent class for raw data (list of PIL Images, np.array, etc.)
+        return super()._parse_video_data(data)
+
+    def _parse_audio_data(
+        self,
+        data: dict[str, torch.Tensor] | ModalityData[AudioItem],
+    ) -> ModalityDataItems[Any, Any] | None:
+        if isinstance(data, dict):
+            if "mm_placeholder_prompt_ids" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="audio",
+                    required_fields={"input_audio_features", "audio_feature_lengths","mm_placeholder_prompt_ids"},
+                    fields_factory=_create_qwen3_omni_moe_dummy_field_factory(
+                        self._spatial_merge_size
+                    ),
+                )
+            elif "input_audio_features" in data:
+                return DictEmbeddingItems(
+                    data,
+                    modality="audio",
+                    required_fields={"input_audio_features", "audio_feature_lengths"},
+                    fields_factory=create_qwen2_5_omni_thinker_field_factory(
+                        self._spatial_merge_size
+                    ),
+                )
+        # Fall back to parent class for raw audio data
+        return super()._parse_audio_data(data)
+
+
 
 class Qwen3OmniMoeThinkerMultiModalProcessor(
     Qwen2_5OmniThinkerMultiModalProcessor,
 ):
+    def _get_data_parser(self) -> MultiModalDataParser:
+        """
+        Override to use Qwen3OmniMoeThinkerMultiModalDataParser which supports:
+        - Pre-processed pixel_values/pixel_values_videos tensor inputs
+        - Skipping HF processor CPU preprocessing while keeping encoder forward pass
+        """
+        feature_extractor = self.info.get_feature_extractor()
+        return Qwen3OmniMoeThinkerMultiModalDataParser(
+            spatial_merge_size=self.info.get_hf_config().vision_config.spatial_merge_size,
+            target_sr=feature_extractor.sampling_rate,
+        )
+
+    def _hash_mm_items(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+        *,
+        mm_uuids: MultiModalUUIDDict | None = None,
+    ) -> MultiModalHashes:
+        """
+        Override to handle DictEmbeddingItems with dummy hash.
+        DictEmbeddingItems contains complex tensor dicts that can't be hashed normally.
+        """
+        # Check if any item is DictEmbeddingItems
+        has_dict_embedding = any(
+            isinstance(items, DictEmbeddingItems) and "mm_placeholder_prompt_ids" in items.data
+            for items in mm_items.values()
+        )
+        
+        if has_dict_embedding:
+            # Generate dummy hashes for DictEmbeddingItems
+            import uuid
+            hashes: MultiModalHashes = {}
+            for modality, items in mm_items.items():
+                hashes[modality] = [str(uuid.uuid4()) for _ in range(len(items))]
+            return hashes
+        
+        # Fall back to parent implementation for normal items
+        return super()._hash_mm_items(
+            mm_items, hf_processor_mm_kwargs, tokenization_kwargs, mm_uuids=mm_uuids
+        )
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -277,7 +493,54 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 audio_num_frames.append(num_frame)
             hf_inputs["feature_attention_mask"] = [torch.ones(num_frame) for num_frame in audio_num_frames]
             hf_inputs["audio_feature_lengths"] = torch.tensor(audio_num_frames)
+        
         return hf_inputs
+    
+    def _apply_hf_processor_text_mm(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> tuple[list[int], BatchFeature, bool]:
+
+        # mm_items.data={'video': DictEmbeddingItems(modality='video', len=1)}
+        if isinstance(list(mm_items.data.values())[0], DictEmbeddingItems):
+            target_data = list(mm_items.data.values())[0].data
+            if "mm_placeholder_prompt_ids" in target_data:
+
+                data_dict = dict(target_data)
+                tokenizer = self.info.get_tokenizer()
+                raw_prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+                mm_placeholder_prompt_ids = data_dict.pop("mm_placeholder_prompt_ids", None)[0]
+                
+
+                processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+                vocab = tokenizer.get_vocab()
+                modality = list(mm_items.data.keys())[0]
+                
+                # Replace the single placeholder in raw_prompt_ids with the full list of placeholders.
+                placeholder_token_id = mm_placeholder_prompt_ids[0]
+                prompt_ids = []
+                for tid in raw_prompt_ids:
+                    if tid == placeholder_token_id:
+                        prompt_ids.extend(mm_placeholder_prompt_ids)
+                    else:
+                        prompt_ids.append(tid)
+
+                processed_data = BatchFeature(data_dict)
+                is_update_applied = True
+                
+                return prompt_ids, processed_data, is_update_applied
+        
+        # Normal path: use parent class implementation
+        prompt_ids, processed_data, is_update_applied = super()._apply_hf_processor_text_mm(
+            prompt_text=prompt_text,
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+        return prompt_ids, processed_data, is_update_applied
 
     def _maybe_apply_prompt_updates(
         self,

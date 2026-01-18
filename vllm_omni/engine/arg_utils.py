@@ -161,6 +161,12 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         # and adding the new omni-specific fields
         config_dict = base_config.__dict__.copy()
 
+        # [BUGFIX]: enable_mm_embeds: true need this to be correctly passed to OmniModelConfig
+        config_dict = {
+            **(getattr(mm := config_dict.pop("multimodal_config", None), "__dict__", mm or {})),
+            **config_dict,
+        }
+
         # Add the new omni-specific fields
         config_dict["stage_id"] = self.stage_id
         config_dict["model_stage"] = self.model_stage
@@ -175,3 +181,17 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         omni_config.hf_config.architectures = omni_config.architectures
 
         return omni_config
+    
+    def create_engine_config(
+        self,
+        usage_context: Optional[UsageContext] = None,
+        headless: bool = False,
+    ) -> VllmConfig:
+        if self.scheduling_policy not in ["fcfs", "priority"]:
+             # temporily set the scheduling_policy to fcfs to bypass the check in SchedulerConfig
+            logger.debug(
+                "temporily set the scheduling_policy to fcfs to bypass the check in SchedulerConfig. "
+                "the policy will be changed back to omni_modality_aware inside OmniModalityAwareScheduler"
+            )
+            self.scheduling_policy = "fcfs"
+        return super().create_engine_config(usage_context, headless)

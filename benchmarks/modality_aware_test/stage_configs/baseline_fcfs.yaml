@@ -1,0 +1,40 @@
+# Stage config for running Qwen3-Omni-MoE with 1-stage architecture
+# Stage 0: Thinker (multimodal understanding + text generation)
+
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0,1"
+      max_batch_size: 256
+    engine_args:
+      model_stage: thinker
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      trust_remote_code: true
+      allowed_local_media_path: "/root/data"  # Allow loading local media files from PVC
+      engine_output_type: latent  # Output hidden states for talker
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      max_model_len: 2048
+      max_num_seqs:  256
+      hf_config_name: thinker_config
+      tensor_parallel_size: 2
+      enable_mm_embeds: true 
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 10
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+      ignore_eos: true
+      stop_token_ids: []
+      stop: []

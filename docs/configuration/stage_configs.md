@@ -157,6 +157,38 @@ The maximum batch size for offline inference in this stage. This limits how many
 
 Default: `1`
 
+
+#### `runtime.scheduling_policy`
+
+Specifies the scheduling strategy used by the stage's runtime to manage incoming requests.
+
+"fcfs"/"priority": Standard vllm scheduling policy.
+
+"omni_modality_aware": Enables the Modality-Aware Scheduler. This policy optimizes throughput for multi-modal workloads (e.g., mixed streams of video, audio, and text) by grouping requests of the same modality to maximize encoder batching efficiency and minimize context switching overhead.
+
+Default: "fcfs" 
+
+#### `runtime.omni_modality_aware_config`
+
+Configuration parameters for the Modality-Aware Scheduler. This configuration is active only when scheduling_policy is set to "omni_modality_aware".
+
+#### `runtime.omni_modality_aware_config.encoder_gain_threshold`
+
+The minimum accumulated token threshold required to trigger a modality-specific encoder batch.
+
+The scheduler uses this threshold to decide whether to "wait for more requests" or "execute immediately." If the total number of pending tokens for a specific modality (e.g., image patches or audio features) is below this threshold, the scheduler may delay execution briefly to accumulate a larger, more efficient batch. Higher values favor throughput; lower values favor latency.
+
+Default: 1024 (tokens)
+
+#### `runtime.omni_modality_aware_config.starve_threshold`
+
+The maximum wait time (in seconds) before starvation rescue is triggered.
+
+To prevent requests from waiting indefinitely while the scheduler attempts to satisfy the encoder_gain_threshold, this parameter sets a hard latency limit. If any request in the queue has waited longer than this threshold, the scheduler will bypass optimization logic and schedule it immediately (falling back to FCFS behavior for that request).
+
+Default: 0.1 (100ms)
+
+
 ### `engine_args`
 
 Engine arguments for configuring the LLM engine, diffusion engine, or other engine types used by this stage.

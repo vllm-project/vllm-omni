@@ -152,6 +152,48 @@ class OmniRequestOutput:
 
         return result
 
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        """Proxy to request_output.prompt_token_ids for vllm compatibility."""
+        if self.request_output is not None:
+            return getattr(self.request_output, 'prompt_token_ids', None)
+        return None
+
+    @property
+    def encoder_prompt_token_ids(self) -> list[int] | None:
+        """Proxy to request_output.encoder_prompt_token_ids."""
+        if self.request_output is not None:
+            return getattr(self.request_output, 'encoder_prompt_token_ids', None)
+        return None
+
+    @property
+    def outputs(self) -> list:
+        """Proxy to request_output.outputs."""
+        if self.request_output is not None:
+            return getattr(self.request_output, 'outputs', [])
+        return []
+
+    @property
+    def prompt_logprobs(self):
+        """Proxy to request_output.prompt_logprobs."""
+        if self.request_output is not None:
+            return getattr(self.request_output, 'prompt_logprobs', None)
+        return None
+
+    @property
+    def num_cached_tokens(self):
+        """Proxy to request_output.num_cached_tokens."""
+        if self.request_output is not None:
+            return getattr(self.request_output, 'num_cached_tokens', None)
+        return None
+
+    @property
+    def kv_transfer_params(self):
+        """Proxy to request_output.kv_transfer_params."""
+        if self.request_output is not None:
+            return getattr(self.request_output, 'kv_transfer_params', None)
+        return None
+    
     def __repr__(self) -> str:
         """Custom repr to properly show image count instead of image objects."""
         # For images, show count instead of full list

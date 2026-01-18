@@ -5,7 +5,13 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
-from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
+from vllm.v1.core.sched.scheduler import (
+    Request,
+    RequestStatus,
+    SchedulerOutput,
+    SpecDecodingStats,
+)
+from .omni_base_scheduler import BaseOmniScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.request import Request, RequestStatus
@@ -15,7 +21,18 @@ from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.outputs import OmniModelRunnerOutput
 
 
-class OmniGenerationScheduler(VLLMScheduler):
+class OmniGenerationScheduler(BaseOmniScheduler):
+    
+    @classmethod
+    def validate_stage_config(cls, global_policy, stage_id, is_comprehension, is_dit):
+        if not is_dit:
+            raise ValueError(
+                f"Stage {stage_id} Configuration Error: {cls.__name__} is designed for "
+                "non-AR generation (like DiT) and cannot handle Auto-Regressive stages. "
+                "Use OmniARScheduler or OmniModalityAwareScheduler instead."
+            )
+    
+    
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
         - Feed all input tokens of the request at once
