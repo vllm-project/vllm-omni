@@ -79,6 +79,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "GLMTTSPipeline": (
+        "glm_tts",
+        "pipeline_glm_tts",
+        "GLMTTSPipeline",
+    ),
 }
 
 
@@ -127,6 +132,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "GLMTTSPipeline": "get_glm_tts_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
