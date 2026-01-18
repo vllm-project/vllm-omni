@@ -32,7 +32,7 @@ The following table shows which models are currently supported by parallelism me
 
 
 !!! note "TP Limitations for Diffusion Models"
-    We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the text_encoder component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
+    We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
 
     - Good news: The text_encoder typically has minimal impact on overall inference performance.
     - Bad news: When TP is enabled, every TP process retains a full copy of the text_encoder weights, leading to significant GPU memory waste.
