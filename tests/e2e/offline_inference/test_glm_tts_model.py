@@ -106,9 +106,9 @@ def test_glm_tts_dit_model():
 def test_glm_tts_stage_input_processor():
     """Test GLM-TTS stage input processor."""
     from vllm_omni.model_executor.stage_input_processors.glm_tts import (
-        extract_speech_tokens,
-        GLM_TTS_AUDIO_TOKEN_START,
         GLM_TTS_AUDIO_TOKEN_END,
+        GLM_TTS_AUDIO_TOKEN_START,
+        extract_speech_tokens,
     )
 
     # Test speech token extraction
