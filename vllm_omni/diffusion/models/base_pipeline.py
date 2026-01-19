@@ -23,6 +23,13 @@ class BasePipeline(nn.Module):
     classifier-free guidance logic.
     """
 
+    def __init__(
+        self,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg,

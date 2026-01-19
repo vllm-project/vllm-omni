@@ -18,7 +18,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -164,7 +163,7 @@ def get_qwen_image_edit_plus_post_process_func(
     return post_process_func
 
 
-class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, BaseQwenImagePipeline):
+class QwenImageEditPlusPipeline(SupportImageInput, BaseQwenImagePipeline):
     def __init__(
         self,
         *,

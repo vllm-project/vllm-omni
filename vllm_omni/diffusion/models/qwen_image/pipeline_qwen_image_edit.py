@@ -20,7 +20,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -209,7 +208,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageEditPipeline(nn.Module, SupportImageInput, BaseQwenImagePipeline):
+class QwenImageEditPipeline(SupportImageInput, BaseQwenImagePipeline):
     def __init__(
         self,
         *,
