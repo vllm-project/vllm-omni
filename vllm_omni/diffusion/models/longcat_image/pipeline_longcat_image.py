@@ -8,6 +8,7 @@ import json
 import os
 import re
 from collections.abc import Iterable
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -17,14 +18,19 @@ from diffusers.models import AutoencoderKL
 from diffusers.pipelines.longcat_image.system_messages import SYSTEM_PROMPT_EN, SYSTEM_PROMPT_ZH
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler, SchedulerMixin
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.base_pipeline import BasePipeline
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -197,9 +203,7 @@ def get_prompt_language(prompt):
     return "en"
 
 
-class LongCatImagePipeline(
-    nn.Module,
-):
+class LongCatImagePipeline(BasePipeline):
     def __init__(
         self,
         *,
@@ -391,6 +395,105 @@ class LongCatImagePipeline(
     @property
     def do_classifier_free_guidance(self):
         return self._guidance_scale > 1
+
+    def cfg_normalize_function(self, noise_pred, comb_pred, cfg_renorm_min=0.0):
+        """
+        Normalize the combined noise prediction.
+        """
+        cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+        noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+        scale = (cond_norm / (noise_norm + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+        noise_pred = comb_pred * scale
+        return noise_pred
+
+    def diffuse(
+        self,
+        latents,
+        latent_image_ids,
+        prompt_embeds,
+        text_ids,
+        negative_prompt_embeds,
+        negative_text_ids,
+        timesteps,
+        do_true_cfg,
+        guidance_scale,
+        cfg_normalize=True,
+        cfg_renorm_min=0.0,
+    ):
+        """
+        Diffusion loop with optional classifier-free guidance.
+
+        Args:
+            latents: Noise latents to denoise
+            latent_image_ids: Position IDs for latents
+            prompt_embeds: Positive prompt embeddings
+            text_ids: Position IDs for positive text
+            negative_prompt_embeds: Negative prompt embeddings
+            negative_text_ids: Position IDs for negative text
+            timesteps: Diffusion timesteps
+            do_true_cfg: Whether to apply CFG
+            guidance_scale: CFG scale factor
+            cfg_normalize: Whether to normalize CFG output with custom renorm (default: True)
+            cfg_renorm_min: Minimum value for CFG renormalization (default: 0.0)
+
+        Returns:
+            Denoised latents
+        """
+        guidance = None
+
+        self.cfg_normalize_function = partial(self.cfg_normalize_function, cfg_renorm_min=cfg_renorm_min)
+
+        for i, t in enumerate(timesteps):
+            if self.interrupt:
+                continue
+
+            self._current_timestep = t
+            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+            # Enable CFG-parallel: rank0 computes positive, rank1 computes negative
+            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+            cfg_group = get_cfg_group() if cfg_parallel_ready else None
+            cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel_ready else None
+
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_image_ids,
+            }
+            negative_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states": negative_prompt_embeds,
+                "txt_ids": negative_text_ids,
+                "img_ids": latent_image_ids,
+            }
+
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg,
+                guidance_scale,
+                positive_kwargs,
+                negative_kwargs,
+                cfg_group,
+                cfg_rank,
+                cfg_normalize=True,
+            )
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents_dtype = latents.dtype
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if latents.dtype != latents_dtype:
+                if torch.backends.mps.is_available():
+                    latents = latents.to(latents_dtype)
+
+            if cfg_group is not None:
+                cfg_group.broadcast(latents, src=0)
+
+        return latents
 
     def prepare_latents(
         self,
@@ -594,9 +697,6 @@ class LongCatImagePipeline(
 
         self._num_timesteps = len(timesteps)
 
-        # handle guidance
-        guidance = None
-
         if self._joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
 
@@ -604,51 +704,20 @@ class LongCatImagePipeline(
         if self.do_classifier_free_guidance:
             negative_prompt_embeds = negative_prompt_embeds.to(device)
 
-        # 6. Denoising loop
-        for i, t in enumerate(timesteps):
-            if self._interrupt:
-                continue
-
-            self._current_timestep = t
-            timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-            noise_pred_text = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                return_dict=False,
-            )[0]
-
-            if self.do_classifier_free_guidance:
-                noise_pred_uncond = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_pred_uncond + self._guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                if enable_cfg_renorm:
-                    cond_norm = torch.norm(noise_pred_text, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    scale = (cond_norm / (noise_norm + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                    noise_pred = noise_pred * scale
-            else:
-                noise_pred = noise_pred_text
-
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                    latents = latents.to(latents_dtype)
+        # 6. Denoising loop using diffuse method
+        latents = self.diffuse(
+            latents=latents,
+            latent_image_ids=latent_image_ids,
+            prompt_embeds=prompt_embeds,
+            text_ids=text_ids,
+            negative_prompt_embeds=negative_prompt_embeds if self.do_classifier_free_guidance else None,
+            negative_text_ids=negative_text_ids if self.do_classifier_free_guidance else None,
+            timesteps=timesteps,
+            do_true_cfg=self.do_classifier_free_guidance,
+            guidance_scale=self._guidance_scale,
+            cfg_normalize=enable_cfg_renorm,
+            cfg_renorm_min=cfg_renorm_min,
+        )
 
         self._current_timestep = None
 

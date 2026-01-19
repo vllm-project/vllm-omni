@@ -90,6 +90,22 @@ class BasePipeline(nn.Module):
                 pred = pred[:, :output_slice]
             return pred
 
+    def cfg_normalize_function(self, noise_pred, comb_pred):
+        """
+        Normalize the combined noise prediction.
+
+        Args:
+            noise_pred: positive noise prediction
+            comb_pred: combined noise prediction after CFG
+
+        Returns:
+            Normalized noise prediction tensor
+        """
+        cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+        noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+        noise_pred = comb_pred * (cond_norm / noise_norm)
+        return noise_pred
+
     def combine_cfg_noise(self, noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize=True):
         """
         Combine conditional and unconditional noise predictions with CFG.
@@ -106,9 +122,7 @@ class BasePipeline(nn.Module):
         comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
         if cfg_normalize:
-            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)
+            noise_pred = self.cfg_normalize_function(noise_pred, comb_pred)
         else:
             noise_pred = comb_pred
 
