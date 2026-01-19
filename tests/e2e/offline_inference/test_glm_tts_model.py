@@ -30,7 +30,6 @@ def test_glm_tts_model(model_name: str):
 
     # GLM-TTS parameters
     audio_duration_s = 5.0  # 5 second audio
-    sample_rate = 22050  # GLM-TTS default sample rate
 
     # Generate speech tokens placeholder (in production, LLM generates these)
     # For testing, we provide mock tokens

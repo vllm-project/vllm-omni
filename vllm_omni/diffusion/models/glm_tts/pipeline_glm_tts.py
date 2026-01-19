@@ -19,7 +19,6 @@ import os
 from collections.abc import Iterable
 
 import torch
-import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from vllm.logger import init_logger
@@ -153,10 +152,7 @@ class GLMTTSPipeline(nn.Module):
             logger.debug(f"Vocoder loading failed: {e}")
 
         if self.vocoder is None:
-            logger.warning(
-                "No vocoder loaded. Output will be mel-spectrograms. "
-                "Install vocos for waveform generation."
-            )
+            logger.warning("No vocoder loaded. Output will be mel-spectrograms. Install vocos for waveform generation.")
 
     @property
     def guidance_scale(self):
@@ -187,10 +183,7 @@ class GLMTTSPipeline(nn.Module):
 
         # When receiving from stage processor, speech_tokens will be provided
         if not from_stage_processor and prompt is None and speech_tokens is None:
-            raise ValueError(
-                "Provide either `prompt` or `speech_tokens` in extra params. "
-                "Cannot leave both undefined."
-            )
+            raise ValueError("Provide either `prompt` or `speech_tokens` in extra params. Cannot leave both undefined.")
 
     def encode_text_to_tokens(
         self,

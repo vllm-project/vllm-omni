@@ -269,9 +269,7 @@ class GLMTTSDiTBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self-attention with adaptive norm
-        norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(
-            hidden_states, timestep_emb
-        )
+        norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(hidden_states, timestep_emb)
         attn_out = self.attn(norm_hidden, rotary_emb=rotary_embedding, attention_mask=attention_mask)
         hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_out
 
