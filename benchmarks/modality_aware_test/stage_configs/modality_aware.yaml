@@ -11,13 +11,15 @@ runtime:
   scheduling_policy: "omni_modality_aware"
   omni_modality_aware_config:
     # encoder_gain_alpha: Minimum encoder utilization threshold
-    # e.q. if waiting image tokens is greater than 1024, we can open image encoder forwarding for image requests
+    # e.q. if waiting image tokens is greater than 768, we can open image encoder forwarding for image requests
     # otherwise wait for a while to see if there will be more image request for batching.
-    encoder_gain_threshold: 1024
+    encoder_gain_threshold: 768
     # starve_threshold: Maximum wait time before starvation rescue (in seconds)
-    # 1 means when a request waits for more than 1s, it should be scheduled 
+    # 10 means when a request waits for more than 10s, it should be scheduled 
     # regardless of its modality (to prevent starvation)
-    starve_threshold: 1
+    # for a alpha system + small tp number testing, it is recommended to use a large number to ban starvation rescue.
+    # in an optimized on-line serving setting, it should match the time of one encoder+decoder forwarding.
+    starve_threshold: 10
 
 stage_args:
   - stage_id: 0
@@ -37,7 +39,7 @@ stage_args:
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       max_num_batched_tokens: 8192
-      max_model_len: 2048
+      max_model_len: 4096
       max_num_seqs:  256
       hf_config_name: thinker_config
       tensor_parallel_size: 2

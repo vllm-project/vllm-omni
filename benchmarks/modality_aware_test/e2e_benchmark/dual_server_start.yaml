@@ -1,0 +1,241 @@
+# ==========================================
+# 1. Baseline Service (OmniARScheduler)
+# ==========================================
+# 1.1) Kubernetes Service file for the baseline server
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-baseline-service # client use this to match the server frontend
+spec:
+  selector:
+    app: vllm-baseline-backend # server frontend use this to match the deployment backend
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+# 1.2) Kubernetes Deployment file for the baseline server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-baseline-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-baseline-backend
+  template:
+    metadata:
+      labels:
+        app: vllm-baseline-backend
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: "${GPU_LABEL_KEY}"
+                operator: In
+                values:
+                - "${GPU_LABEL}"   
+              - key: "${GPU_DRIVER_KEY}"
+                operator: In
+                values:
+                - "${GPU_DRIVER}" 
+      volumes:
+      - name: shared-data
+        persistentVolumeClaim:
+          claimName: "${PVC_CLAIME_NAME}"
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "32Gi"
+      containers:
+      - name: vllm-container
+        image: '${SERVER_IMAGE_NAME}'
+        env:
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: "spawn"
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          echo "================ DEBUG INFO START ================"
+          echo "Old CWD: $(pwd)"
+          echo "Changing directory to mounted volume to avoid loading /workspace code..."
+          cd ${VLLM_OMNI_PATH}
+          echo "New CWD: $(pwd)"
+          pip uninstall -y vllm-omni || true
+          pip install -e . --no-deps --no-build-isolation
+
+          export PYTHONPATH=${VLLM_OMNI_PATH}
+          echo "Running with PYTHONPATH=$PYTHONPATH"
+          echo "Checking vllm_omni path:"
+          ls -ld $VLLM_OMNI_PATH/vllm_omni
+          echo "Checking scheduler file:"
+          ls -l $VLLM_OMNI_PATH/vllm_omni/core/sched/omni_ar_scheduler.py
+          echo "Checking imports (Simulation):"
+          python3 -c "import sys; sys.path.insert(0, '$VLLM_OMNI_PATH'); import vllm_omni; print(f'Loaded vllm_omni from: {vllm_omni.__file__}')"
+
+          echo "================ DEBUG INFO END =================="
+        
+          python3 -m vllm_omni.entrypoints.cli.main serve \
+          ${HF_CACHE_PATH}/Qwen3-Omni-30B-A3B-Instruct \
+          --omni \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --served-model-name "Qwen/Qwen3-Omni-30B-A3B-Instruct" \
+          --stage-configs-path ${VLLM_OMNI_PATH}/benchmarks/modality_aware_test/stage_configs/baseline_fcfs.yaml \
+          > ${PVC_DIR}/vllm_baseline_debug_$(date +%s).log 2>&1
+
+        ports:
+        - containerPort: 8000
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 60      
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5    
+          periodSeconds: 5          
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "20"
+            memory: "200Gi"
+            nvidia.com/gpu: 2
+          limits:
+            cpu: "20"        
+            memory: "200Gi"
+            nvidia.com/gpu: 2
+        volumeMounts:
+        - name: shared-data
+          mountPath: '${PVC_DIR}' 
+        - name: shm
+          mountPath: /dev/shm
+---
+
+# ==========================================
+# 2.  Optimized Service
+# ==========================================
+
+# 2.1) Kubernetes Service file for the optimized server
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-opt-service # client use this to match the server frontend
+spec:
+  selector:
+    app: vllm-opt-backend # server frontend use this to match the deployment backend
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+# 2.2) Kubernetes Deployment file for the optimized server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-opt-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-opt-backend
+  template:
+    metadata:
+      labels:
+        app: vllm-opt-backend
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: "${GPU_LABEL_KEY}"
+                operator: In
+                values:
+                - "${GPU_LABEL}"   
+              - key: "${GPU_DRIVER_KEY}"
+                operator: In
+                values:
+                - "${GPU_DRIVER}" 
+      volumes:
+      - name: shared-data
+        persistentVolumeClaim:
+          claimName: '${PVC_CLAIME_NAME}'
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "32Gi"
+      containers:
+      - name: vllm-container
+        image: '${SERVER_IMAGE_NAME}'
+        env:
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: "spawn"
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          echo "================ DEBUG INFO START ================"
+          echo "Old CWD: $(pwd)"
+          echo "Changing directory to mounted volume to avoid loading /workspace code..."
+          cd ${VLLM_OMNI_PATH}
+          echo "New CWD: $(pwd)"
+          pip uninstall -y vllm-omni || true
+          pip install -e . --no-deps --no-build-isolation
+
+          export PYTHONPATH=${VLLM_OMNI_PATH}
+          echo "Running with PYTHONPATH=$PYTHONPATH"
+          echo "Checking vllm_omni path:"
+          ls -ld $VLLM_OMNI_PATH/vllm_omni
+          echo "Checking scheduler file:"
+          ls -l $VLLM_OMNI_PATH/vllm_omni/core/sched/omni_modality_aware_scheduler.py
+          echo "Checking imports (Simulation):"
+          python3 -c "import sys; sys.path.insert(0, '$VLLM_OMNI_PATH'); import vllm_omni; print(f'Loaded vllm_omni from: {vllm_omni.__file__}')"
+          echo "================ DEBUG INFO END =================="
+        
+          python3 -m vllm_omni.entrypoints.cli.main serve \
+          ${HF_CACHE_PATH}/Qwen3-Omni-30B-A3B-Instruct \
+          --omni \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --served-model-name "Qwen/Qwen3-Omni-30B-A3B-Instruct" \
+          --stage-configs-path ${VLLM_OMNI_PATH}/benchmarks/modality_aware_test/stage_configs/modality_aware.yaml \
+          > ${PVC_DIR}/vllm_opt_debug_$(date +%s).log 2>&1
+ 
+        ports:
+        - containerPort: 8000
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 60      
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5    
+          periodSeconds: 5          
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "20"
+            memory: "200Gi"
+            nvidia.com/gpu: 2
+          limits:
+            cpu: "20"        
+            memory: "200Gi"
+            nvidia.com/gpu: 2
+        volumeMounts:
+        - name: shared-data
+          mountPath: '${PVC_DIR}'
+        - name: shm
+          mountPath: /dev/shm
+---

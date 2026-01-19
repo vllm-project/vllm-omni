@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-benchmark-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-benchmark-client
+  template:
+    metadata:
+      labels:
+        app: vllm-benchmark-client
+    spec:
+      containers:
+      - name: tester
+        image: '${CLIENT_IMAGE_NAME}' 
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            $CLIENT_PYTHON_CMD -m pip install aiohttp==3.9.5 numpy && \
+            touch /tmp/ready && \
+            sleep infinity
+        volumeMounts:
+        - name: shared-data
+          mountPath: '${PVC_DIR}'
+        resources:
+          requests:
+            cpu: "4"       
+            memory: "10Gi"
+          limits:
+            cpu: "4"
+            memory: "10Gi"
+      volumes:
+      - name: shared-data
+        persistentVolumeClaim:
+          claimName: '${PVC_CLAIME_NAME}'
+       
+

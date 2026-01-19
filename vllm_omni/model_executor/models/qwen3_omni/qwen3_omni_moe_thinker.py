@@ -22,6 +22,7 @@
 # limitations under the License.
 """Inference-only Qwen3-Omni-Moe model (thinker part)."""
 
+
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any

@@ -1,3 +1,22 @@
+"""
+[BENCHMARK REFERENCE SCRIPT]
+
+NOTE TO REVIEWERS:
+This script was used to benchmark the optimized scheduler performance (achieving ~40% speedup).
+It uses dummy tensors to isolate scheduler performance from HF CPU preprocessing bottleneck.
+
+IMPORTANT:
+Due to recent upstream changes in the multimodal data processing pipeline,
+this script is currently OUTDATED and may not execute successfully against the current master branch without modification.
+
+It is included in this PR solely for:
+1. Transparency regarding the benchmarking methodology.
+2. Reference for the logic used to bypass the CPU bottleneck.
+
+Please do not run this as part of the standard CI/CD pipeline.
+"""
+
+
 import asyncio
 import time
 import torch
@@ -103,10 +122,7 @@ def load_engine_args_from_stage_config(
 
 
 def prepare_dataset(total_requests: int, seed: int) -> List[tuple]:
-    """
-    基于固定种子生成请求数据，确保 Baseline 和 Optimized 跑的是完全相同的请求内容。
-    """
-    # 设定random和torch的局部随机种子
+
     rng = random.Random(seed)
     torch.manual_seed(seed)
     
@@ -119,7 +135,6 @@ def prepare_dataset(total_requests: int, seed: int) -> List[tuple]:
     for i in range(total_requests):
         rid = f"req_{i}"
         
-        # 1. 确定模态
         rand_val = rng.random()
         if rand_val < 0.5:
             mod_type = "text"
@@ -228,7 +243,6 @@ def prepare_dataset(total_requests: int, seed: int) -> List[tuple]:
                 }
             }
 
-        # 为了可复现，SamplingParams 的 seed 也要固定
         sp = SamplingParams(max_tokens=20, temperature=0.0, ignore_eos=True, seed=seed)
         dataset.append((rid, ein, sp))
 

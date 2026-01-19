@@ -4,7 +4,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf,DictConfig
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists

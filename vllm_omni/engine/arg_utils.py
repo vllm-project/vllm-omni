@@ -8,6 +8,13 @@ from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
 
+from vllm.config import VllmConfig
+from typing import TYPE_CHECKING, Optional, Any
+if TYPE_CHECKING:
+    from vllm.usage.usage_lib import UsageContext
+else:
+    UsageContext = Any
+
 logger = init_logger(__name__)
 
 
