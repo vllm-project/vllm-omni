@@ -2,6 +2,13 @@
 # Stage 0: LLM (Llama-based) - Text → Speech tokens
 # Stage 1: DiT (Flow matching) - Speech tokens → Audio
 
+# Model structure on HuggingFace (zai-org/GLM-TTS):
+#   llm/           - LLM for speech token generation
+#   flow/          - DiT/Flow matching model for mel generation
+#   hift/          - HiFi-GAN vocoder
+#   vocos2d/       - Vocos vocoder
+#   speech_tokenizer/ - Speech tokenizer
+
 # The following config is designed for single GPU usage.
 stage_args:
   - stage_id: 0
@@ -11,7 +18,8 @@ stage_args:
       devices: "0"
       max_batch_size: 1
     engine_args:
-      model_stage: llm
+      model: zai-org/GLM-TTS
+      model_stage: llm  # Load from llm/ subdirectory
       model_arch: LlamaForCausalLM  # GLM-TTS uses Llama architecture
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -41,11 +49,10 @@ stage_args:
       devices: "0"
       max_batch_size: 1
     engine_args:
-      model_stage: dit
+      model: zai-org/GLM-TTS
+      model_stage: flow  # Load from flow/ subdirectory
       model_class_name: GLMTTSPipeline
-      gpu_memory_utilization: 0.4
       enforce_eager: true
-      engine_output_type: audio
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.glm_tts.llm2dit
     final_output: true
