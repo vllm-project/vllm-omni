@@ -179,12 +179,14 @@ class GLMTTSPipeline(nn.Module):
         prompt: str | list[str] | None,
         speech_tokens: torch.Tensor | None,
         audio_duration_s: float,
+        from_stage_processor: bool = False,
     ):
         """Validate input parameters."""
         if audio_duration_s <= 0:
             raise ValueError(f"`audio_duration_s` must be positive, got {audio_duration_s}")
 
-        if prompt is None and speech_tokens is None:
+        # When receiving from stage processor, speech_tokens will be provided
+        if not from_stage_processor and prompt is None and speech_tokens is None:
             raise ValueError(
                 "Provide either `prompt` or `speech_tokens` in extra params. "
                 "Cannot leave both undefined."
@@ -374,21 +376,33 @@ class GLMTTSPipeline(nn.Module):
         if generator is None and req.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
-        # Get extra parameters
-        speech_tokens = req.extra.get("speech_tokens", None)
-        speaker_embedding = req.extra.get("speaker_embedding", None)
+        # Check if input comes from stage processor (two-stage pipeline)
+        # Stage processor provides speech_tokens in additional_information
+        additional_info = req.extra.get("additional_information", {})
+        from_stage_processor = bool(additional_info)
+
+        # Get speech tokens - priority: additional_information > extra > generate
+        speech_tokens = additional_info.get("speech_tokens", None)
+        if speech_tokens is None:
+            speech_tokens = req.extra.get("speech_tokens", None)
+
+        # Get speaker embedding - priority: additional_information > extra > generate
+        speaker_embedding = additional_info.get("speaker_embedding", None)
+        if speaker_embedding is None:
+            speaker_embedding = req.extra.get("speaker_embedding", None)
+
         audio_duration_s = req.extra.get("audio_duration_s", audio_duration_s)
 
         # Validate inputs
-        self.check_inputs(prompt, speech_tokens, audio_duration_s)
+        self.check_inputs(prompt, speech_tokens, audio_duration_s, from_stage_processor)
 
         # Determine batch size
-        if prompt is not None and isinstance(prompt, str):
+        if speech_tokens is not None and isinstance(speech_tokens, torch.Tensor):
+            batch_size = speech_tokens.shape[0]
+        elif prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
-        elif speech_tokens is not None:
-            batch_size = speech_tokens.shape[0]
         else:
             batch_size = 1
 
@@ -399,7 +413,12 @@ class GLMTTSPipeline(nn.Module):
         if speech_tokens is None:
             speech_tokens = self.encode_text_to_tokens(prompt, batch_size, audio_duration_s)
         else:
+            if from_stage_processor:
+                logger.info("Using speech tokens from LLM stage (two-stage pipeline)")
             speech_tokens = speech_tokens.to(device)
+            # Ensure speech_tokens has batch dimension [B, T]
+            if speech_tokens.dim() == 1:
+                speech_tokens = speech_tokens.unsqueeze(0)
 
         # Get speaker embedding
         speaker_embedding = self.get_speaker_embedding(batch_size, speaker_embedding)

@@ -1,0 +1,67 @@
+# Stage config for running GLM-TTS with two-stage architecture.
+# Stage 0: LLM (Llama-based) - Text → Speech tokens
+# Stage 1: DiT (Flow matching) - Speech tokens → Audio
+
+# The following config is designed for single GPU usage.
+stage_args:
+  - stage_id: 0
+    stage_type: llm  # Use llm stage type for speech token generation
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: llm
+      model_arch: LlamaForCausalLM  # GLM-TTS uses Llama architecture
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 4096
+    is_comprehension: false
+    final_output: false  # Speech tokens are intermediate, not returned to user
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 2048
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [151330]  # GLM_TTS_EOA_TOKEN_ID
+
+  - stage_id: 1
+    stage_type: diffusion  # Use diffusion stage type for DiT/flow matching
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      model_class_name: GLMTTSPipeline
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      engine_output_type: audio
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.glm_tts.llm2dit
+    final_output: true
+    final_output_type: audio
+    default_generation_params:
+      num_inference_steps: 32
+      guidance_scale: 1.0
+
+# Runtime config: stage edges define data flow
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1  # Trigger downstream only after full upstream completion
+    max_inflight: 1  # Process serially within each stage
+
+  edges:
+    - from: 0  # LLM → DiT: trigger after full speech token generation
+      to: 1
+      window_size: -1

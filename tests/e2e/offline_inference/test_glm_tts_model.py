@@ -103,40 +103,61 @@ def test_glm_tts_dit_model():
     assert output.shape == (batch_size, seq_len, 80)
 
 
-@pytest.mark.skip(reason="Unit test for flow sampler")
-def test_glm_tts_flow_sampler():
-    """Test GLM-TTS flow matching sampler."""
-    from vllm_omni.diffusion.models.glm_tts.glm_tts_dit import GLMTTSDiTModel
-    from vllm_omni.diffusion.models.glm_tts.pipeline_glm_tts import GLMTTSFlowSampler
-
-    # Create small model for testing
-    model = GLMTTSDiTModel(
-        hidden_size=256,
-        num_attention_heads=4,
-        num_hidden_layers=2,
-        head_dim=64,
-        mel_dim=80,
-        speech_token_dim=128,
-        speech_token_vocab_size=1000,
-        speaker_embed_dim=64,
-    ).cuda()
-
-    sampler = GLMTTSFlowSampler(num_steps=4, cfg_scale=1.0)
-
-    batch_size = 1
-    seq_len = 50
-    token_len = 25
-
-    speech_tokens = torch.randint(0, 1000, (batch_size, token_len)).cuda()
-    speaker_embedding = torch.randn(batch_size, 64).cuda()
-
-    mel = sampler.sample(
-        model=model,
-        shape=(batch_size, seq_len, 80),
-        speech_tokens=speech_tokens,
-        speaker_embedding=speaker_embedding,
-        device=torch.device("cuda"),
-        dtype=torch.float32,
+@pytest.mark.skip(reason="Unit test for stage input processor")
+def test_glm_tts_stage_input_processor():
+    """Test GLM-TTS stage input processor."""
+    from vllm_omni.model_executor.stage_input_processors.glm_tts import (
+        extract_speech_tokens,
+        GLM_TTS_AUDIO_TOKEN_START,
+        GLM_TTS_AUDIO_TOKEN_END,
     )
 
-    assert mel.shape == (batch_size, seq_len, 80)
+    # Test speech token extraction
+    # Create mock token IDs with some audio tokens
+    token_ids = [
+        100,  # Non-audio token
+        GLM_TTS_AUDIO_TOKEN_START,  # First audio token (should become 0)
+        GLM_TTS_AUDIO_TOKEN_START + 100,  # Audio token (should become 100)
+        200,  # Non-audio token
+        GLM_TTS_AUDIO_TOKEN_END,  # Last audio token
+    ]
+
+    speech_tokens = extract_speech_tokens(token_ids)
+
+    # Should have 3 audio tokens (normalized to 0-based)
+    assert len(speech_tokens) == 3
+    assert speech_tokens[0] == 0  # First audio token
+    assert speech_tokens[1] == 100
+    assert speech_tokens[2] == GLM_TTS_AUDIO_TOKEN_END - GLM_TTS_AUDIO_TOKEN_START
+
+
+@pytest.mark.skip(reason="Integration test for two-stage pipeline")
+def test_glm_tts_two_stage_pipeline():
+    """Test GLM-TTS two-stage pipeline (LLM + DiT)."""
+    # This test requires:
+    # 1. GLM-TTS LLM model weights
+    # 2. GLM-TTS DiT model weights
+    # 3. Stage config file
+
+    from vllm_omni import Omni
+
+    # Load with two-stage config
+    m = Omni(
+        model="zai-org/GLM-TTS",
+        stage_config="vllm_omni/model_executor/stage_configs/glm_tts.yaml",
+    )
+
+    outputs = m.generate(
+        "Hello, this is a test of GLM-TTS.",
+        num_inference_steps=8,
+        seed=42,
+    )
+
+    assert outputs is not None
+    first_output = outputs[0]
+    assert hasattr(first_output, "request_output")
+
+    # Audio should be in images field (X2S pattern)
+    req_out = first_output.request_output[0]
+    audio = req_out.images[0]
+    assert isinstance(audio, np.ndarray)
