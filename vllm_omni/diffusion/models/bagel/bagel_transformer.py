@@ -314,10 +314,12 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
     def forward(
         self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_embeddings: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        packed_query_sequence: torch.Tensor | None = None,
+        query_lens: torch.Tensor = None,
+        packed_query_position_embeddings: torch.Tensor = None,
+        packed_query_indexes: torch.Tensor = None,
         past_key_values: NaiveCache | None = None,
         key_values_lens: torch.Tensor | None = None,
         packed_key_value_indexes: torch.Tensor | None = None,
@@ -327,6 +329,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
     ) -> BaseNavitOutputWithPast:
+        if packed_query_sequence is None:
+            packed_query_sequence = hidden_states
         residual = packed_query_sequence
         if mode == "und":
             packed_query_sequence = self.input_layernorm(packed_query_sequence)
@@ -437,7 +441,8 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             packed_query_sequence, past_key_values = decoder_layer(
-                packed_query_sequence=packed_query_sequence,
+                hidden_states=packed_query_sequence,
+                encoder_hidden_states=None,
                 query_lens=query_lens,
                 packed_query_position_embeddings=packed_query_position_embeddings,
                 packed_query_indexes=packed_query_indexes,

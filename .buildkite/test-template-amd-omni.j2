@@ -13,7 +13,7 @@
         depends_on: ~
         soft_fail: false
         commands:
-          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - "source .buildkite/scripts/docker_login_ecr_public.sh && safe_docker_login_ecr_public"
           - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --progress plain ."
           - "docker push {{ docker_image_amd }}"
         key: "amd-build"

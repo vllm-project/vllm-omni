@@ -74,6 +74,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "Flux2KleinPipeline": (
+        "flux2_klein",
+        "pipeline_flux2_klein",
+        "Flux2KleinPipeline",
+    ),
 }
 
 
@@ -99,6 +104,7 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
@@ -120,6 +126,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

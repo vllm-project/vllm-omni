@@ -474,12 +474,14 @@ def _stage_worker(
                     data_parallel_size = parallel_config.get("data_parallel_size", 1)
                     prefill_context_parallel_size = 1  # not used for diffusion
                     sequence_parallel_size = parallel_config.get("sequence_parallel_size", 1)
+                    cfg_parallel_size = parallel_config.get("cfg_parallel_size", 1)
                 else:
                     tensor_parallel_size = engine_args.get("tensor_parallel_size", 1)
                     pipeline_parallel_size = engine_args.get("pipeline_parallel_size", 1)
                     data_parallel_size = engine_args.get("data_parallel_size", 1)
                     prefill_context_parallel_size = engine_args.get("prefill_context_parallel_size", 1)
                     sequence_parallel_size = 1  # not use in omni model
+                    cfg_parallel_size = 1  # not used in omni model
 
                 # Calculate total number of devices needed for this stage
                 # For a single stage worker:
@@ -488,7 +490,8 @@ def _stage_worker(
                 # - DP: replicates model, but each replica uses TP devices
                 # - PCP: context parallelism, typically uses TP devices
                 # - SP: sequence parallelism, typically uses TP devices
-                # The number of devices per stage is determined by TP * PP * DP * PCP * SP size
+                # - CFG: Classifier-Free Guidance parallelism for diffusion models
+                # The number of devices per stage is determined by TP * PP * DP * PCP * SP * CFG size
                 # (PP/DP/PCP are higher-level parallelism that don't add devices per stage)
                 num_devices_per_stage = (
                     tensor_parallel_size
@@ -496,6 +499,7 @@ def _stage_worker(
                     * data_parallel_size
                     * prefill_context_parallel_size
                     * sequence_parallel_size
+                    * cfg_parallel_size
                 )
 
                 # Get physical device IDs from CUDA_VISIBLE_DEVICES
@@ -585,9 +589,18 @@ def _stage_worker(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            logger.debug("[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e)
+            logger.debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s",
+                stage_id,
+                e,
+            )
     # Init engine based on stage_type
-    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
+    logger.debug(
+        "[Stage-%s] Initializing %s engine with args keys=%s",
+        stage_id,
+        stage_type,
+        list(engine_args.keys()),
+    )
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage")
@@ -942,8 +955,6 @@ async def _stage_worker_async(
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
-    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-    engine_args["max_num_seqs"] = max_batch_size
     # Initialize OmniConnectors if configured to match sync worker behavior
     connectors: dict[Any, Any] = {}
     if connectors_config:
@@ -1111,6 +1122,20 @@ async def _stage_worker_async(
             except (OSError, ValueError):
                 pass
     omni_stage.set_async_engine(stage_engine)
+    if hasattr(omni_stage.async_engine, "log_stats") and omni_stage.async_engine.log_stats:
+
+        async def _force_log():
+            try:
+                while True:
+                    await asyncio.sleep(10.0)
+                    await omni_stage.async_engine.do_log_stats()
+            except asyncio.CancelledError:
+                pass
+
+        log_stats_task = asyncio.create_task(_force_log())
+    else:
+        log_stats_task = None
+
     # Don't keep the dummy data in memory (only for LLM engines)
     if stage_type != "diffusion":
         await stage_engine.reset_mm_cache()
@@ -1335,7 +1360,8 @@ async def _stage_worker_async(
                     }
                 )
             logger.debug("Enqueued result for request %s to downstream", rid)
-
+    if log_stats_task is not None:
+        log_stats_task.cancel()
     logger.info("Stage worker exiting")
 
 

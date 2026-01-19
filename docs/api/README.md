@@ -82,6 +82,7 @@ Model execution components.
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp.Qwen3OmniMoeTalkerCodePredictor][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker.Qwen3OmniMoeModel][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker.Qwen3OmniMoeTalkerForConditionalGeneration][]
+- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker.Qwen3OmniMoeTalkerSharedExpertWrapper][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3MoeLLMForCausalLM][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3MoeLLMModel][]
 - [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeConditionalGenerationMixin][]
@@ -102,8 +103,9 @@ Configuration classes.
 
 Worker classes and model runners for distributed inference.
 
-- [vllm_omni.diffusion.worker.gpu_worker.GPUWorker][]
-- [vllm_omni.diffusion.worker.gpu_worker.WorkerProc][]
+- [vllm_omni.diffusion.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]
+- [vllm_omni.diffusion.worker.gpu_diffusion_worker.GPUDiffusionWorker][]
+- [vllm_omni.diffusion.worker.gpu_diffusion_worker.WorkerProc][]
 - [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
 - [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
 - [vllm_omni.worker.gpu_ar_model_runner.ExecuteModelState][]

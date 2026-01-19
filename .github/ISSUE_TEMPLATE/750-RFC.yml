@@ -20,6 +20,8 @@ body:
     label: Proposed Change.
     description: >
       The proposed change of the RFC.
+    value: |
+      Please provide the detailed design document of the RFC using the [template](https://docs.google.com/document/d/12YxSsVeD1jvL-InClkeAEnZyWFDndz_65JmXvsamuV4/edit?tab=t.0#heading=h.4ef4szrsgspp).
   validations:
     required: true
 - type: textarea
