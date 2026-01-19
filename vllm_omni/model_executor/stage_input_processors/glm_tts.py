@@ -109,23 +109,15 @@ def llm2dit(
         # Extract speaker embedding if available in multimodal output
         if hasattr(output, "multimodal_output") and output.multimodal_output:
             if "speaker_embedding" in output.multimodal_output:
-                additional_information["speaker_embedding"] = (
-                    output.multimodal_output["speaker_embedding"]
-                )
+                additional_information["speaker_embedding"] = output.multimodal_output["speaker_embedding"]
             if "latent" in output.multimodal_output:
-                additional_information["llm_hidden_states"] = (
-                    output.multimodal_output["latent"]
-                )
+                additional_information["llm_hidden_states"] = output.multimodal_output["latent"]
 
         dit_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=speech_tokens,
                 additional_information=additional_information,
-                multi_modal_data=(
-                    multi_modal_data.get(llm_output.request_id)
-                    if requires_multimodal_data
-                    else None
-                ),
+                multi_modal_data=(multi_modal_data.get(llm_output.request_id) if requires_multimodal_data else None),
                 mm_processor_kwargs=None,
             )
         )
