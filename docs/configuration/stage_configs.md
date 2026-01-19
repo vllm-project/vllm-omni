@@ -166,7 +166,7 @@ Specifies the scheduling strategy used by the stage's runtime to manage incoming
 
 "omni_modality_aware": Enables the Modality-Aware Scheduler. This policy optimizes throughput for multi-modal workloads (e.g., mixed streams of video, audio, and text) by grouping requests of the same modality to maximize encoder batching efficiency and minimize context switching overhead.
 
-Default: "fcfs" 
+Default: "fcfs"
 
 #### `runtime.omni_modality_aware_config`
 

@@ -1,6 +1,8 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -8,8 +10,6 @@ from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
 
-from vllm.config import VllmConfig
-from typing import TYPE_CHECKING, Optional, Any
 if TYPE_CHECKING:
     from vllm.usage.usage_lib import UsageContext
 else:
@@ -188,16 +188,16 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         omni_config.hf_config.architectures = omni_config.architectures
 
         return omni_config
-    
+
     def create_engine_config(
         self,
-        usage_context: Optional[UsageContext] = None,
+        usage_context: UsageContext | None = None,
         headless: bool = False,
     ) -> VllmConfig:
         if self.scheduling_policy not in ["fcfs", "priority"]:
-             # temporily set the scheduling_policy to fcfs to bypass the check in SchedulerConfig
+            # temporarily set the scheduling_policy to fcfs to bypass the check in SchedulerConfig
             logger.debug(
-                "temporily set the scheduling_policy to fcfs to bypass the check in SchedulerConfig. "
+                "temporarily set the scheduling_policy to fcfs to bypass the check in SchedulerConfig. "
                 "the policy will be changed back to omni_modality_aware inside OmniModalityAwareScheduler"
             )
             self.scheduling_policy = "fcfs"

@@ -13,7 +13,7 @@ This is a production-level, end-to-End (E2E) benchmark designed to simulate real
 The client constructs requests using local file paths residing on the shared PVC and communicates via ClusterIP. This architecture minimizes the latency uncertainty caused by public network transmissions, ensuring that the request arrival time difference between the two servers is within one millisecond. Furthermore, it ensures that I/O operations for loading multimodal data do not become a bottleneck.
 
 **Current Performance Note:**
-Currently, the system uses the standard HuggingFace processor for preprocessing, which is CPU-intensive and acts as the primary bottleneck for system throughput in this alpha stage. 
+Currently, the system uses the standard HuggingFace processor for preprocessing, which is CPU-intensive and acts as the primary bottleneck for system throughput in this alpha stage.
 * **Result:** Under `qps=20, max_token=10`, both the `ModalityAwareScheduler` and the default scheduler show similar throughput (~16.24 tokens/s), as the scheduler's potential is masked by the preprocessing latency.
 
 ### How to Run
@@ -60,14 +60,14 @@ Open run_benchmark.sh and modify the [USER CONFIGURATION SECTION] to match your 
     # Please modify the variables below to match your Kubernetes environment.
     # ==============================================================================
     # TODO: change the yaml path to your own local path
-    DUAL_SERVER_YAML="./dual_server_start.yaml" 
+    DUAL_SERVER_YAML="./dual_server_start.yaml"
     TESTER_YAML="./tester_start.yaml"
     LOCAL_OUTPUT_DIR="./results"
 
     # TODO: PVC claim name & mount path in your cluster
     # it is recommended to mount the pvc to the same path for both servers & client
     # make sure it is a ssd pvc.
-    PVC_CLAIME_NAME="omnitest"
+    PVC_CLAIM_NAME="omnitest"
     PVC_DIR="/root/data"
 
     # TODO: change the vllm code & data dir to your remote cluster path
@@ -76,7 +76,7 @@ Open run_benchmark.sh and modify the [USER CONFIGURATION SECTION] to match your 
     DATA_DIR="${PVC_DIR}/datasets"
     OUTPUT_DIR="${PVC_DIR}/benchmark_results"
 
-    # TODO: images: because we rollout for a lot of time in this experiment, 
+    # TODO: images: because we rollout for a lot of time in this experiment,
     # it is recommended to download the image from docker hub to a local registry
     SERVER_IMAGE_NAME="vllm/vllm-omni:v0.12.0rc1"
     CLIENT_IMAGE_NAME="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
@@ -84,7 +84,7 @@ Open run_benchmark.sh and modify the [USER CONFIGURATION SECTION] to match your 
 
     # TODO: GPU labels & driver versions in your cluster
     # it is important to use the same hardware & driver for production level e2e test
-    GPU_LABEL_KEY="kubernetes.io/hostname" 
+    GPU_LABEL_KEY="kubernetes.io/hostname"
     GPU_LABEL="<YOUR_GPU_NODE_HOSTNAME>"
     GPU_DRIVER_KEY="nvidia.com/cuda.driver.major"
     GPU_DRIVER="<YOUR_DRIVER_VERSION>"

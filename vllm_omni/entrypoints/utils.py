@@ -4,13 +4,13 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf,DictConfig
+from omegaconf import DictConfig, OmegaConf
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.utils import detect_device_type, is_rocm
 from vllm_omni.core.sched import resolve_scheduling_config
+from vllm_omni.utils import detect_device_type, is_rocm
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -189,7 +189,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     config_data = OmegaConf.load(config_path)
 
     # obtain global_policy and its related config
-    global_policy,policy_config=load_global_config(config_data)
+    global_policy, policy_config = load_global_config(config_data)
 
     stage_args = config_data.stage_args
     # Convert any nested dataclass objects to dicts before creating OmegaConf
@@ -200,27 +200,29 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
             base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
-        
+
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None:
             runtime_cfg = stage_arg.runtime
             max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
 
         # detect potential conflicts in stage configuration/global policy
-        # An error will be raised at this step if the user explicitly 
+        # An error will be raised at this step if the user explicitly
         # specifies a scheduler that is not applicable to this stage.
-        base_engine_args_tmp=validate_scheduler_for_stage(stage_arg, base_engine_args_tmp, global_policy, policy_config)
-        
+        base_engine_args_tmp = validate_scheduler_for_stage(
+            stage_arg, base_engine_args_tmp, global_policy, policy_config
+        )
+
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
 
 
-def load_global_config(config_data: DictConfig)-> tuple[str | None, DictConfig | None]:
+def load_global_config(config_data: DictConfig) -> tuple[str | None, DictConfig | None]:
     """
     Extracts the global scheduling policy and its corresponding configuration from the runtime settings.
 
     Args:
-        config_data: The root configuration object (typically an OmegaConf DictConfig) 
+        config_data: The root configuration object (typically an OmegaConf DictConfig)
             containing runtime and scheduling parameters.
 
     Returns:
@@ -230,19 +232,24 @@ def load_global_config(config_data: DictConfig)-> tuple[str | None, DictConfig |
     """
     global_policy = None
     policy_config = None
-    if hasattr(config_data, "runtime") and hasattr(config_data.runtime, "scheduling_policy"):
+    has_runtime = hasattr(config_data, "runtime")
+    has_policy = hasattr(config_data.runtime, "scheduling_policy")
+    if has_runtime and has_policy:
         global_policy = config_data.runtime.scheduling_policy
     if global_policy:
         policy_config = getattr(config_data.runtime, f"{global_policy}_config", None)
-    return global_policy,policy_config
+    return global_policy, policy_config
 
-def validate_scheduler_for_stage(stage_arg:DictConfig, base_engine_args_tmp:DictConfig,global_policy:str|None,policy_config:DictConfig|None)->DictConfig:
+
+def validate_scheduler_for_stage(
+    stage_arg: DictConfig, base_engine_args_tmp: DictConfig, global_policy: str | None, policy_config: DictConfig | None
+) -> DictConfig:
     """
     Resolves the appropriate scheduler class for a specific pipeline stage and updates engine arguments.
 
     This function determines whether a stage is a 'comprehension' task or a 'DiT' (Diffusion Transformer)
-    task (e.g., audio generation) based on the stage attributes and worker types. It then 
-    resolves the final scheduler class and injects the global policy configuration into 
+    task (e.g., audio generation) based on the stage attributes and worker types. It then
+    resolves the final scheduler class and injects the global policy configuration into
     the engine's extra config.
 
     Args:
@@ -252,20 +259,20 @@ def validate_scheduler_for_stage(stage_arg:DictConfig, base_engine_args_tmp:Dict
         policy_config: The detailed configuration dictionary associated with the global policy.
 
     Returns:
-        The updated base_engine_args_tmp containing the resolved scheduler class 
+        The updated base_engine_args_tmp containing the resolved scheduler class
         and converted policy configuration.
     """
-    
+
     is_comprehension = getattr(stage_arg, "is_comprehension", False)
     stage_id = getattr(stage_arg, "stage_id", "unknown")
     explicit_scheduler_cls = getattr(base_engine_args_tmp, "scheduler_cls", None)
     is_dit = (
-        getattr(base_engine_args_tmp, "engine_output_type", "") == "audio" or 
-        getattr(stage_arg, "final_output_type", "") == "audio" or
-        "GenerationWorker" in getattr(base_engine_args_tmp, "worker_cls", "") 
+        getattr(base_engine_args_tmp, "engine_output_type", "") == "audio"
+        or getattr(stage_arg, "final_output_type", "") == "audio"
+        or "GenerationWorker" in getattr(base_engine_args_tmp, "worker_cls", "")
     )
-        
-    resolved_cls,resolved_scheduling_policy = resolve_scheduling_config(
+
+    resolved_cls, resolved_scheduling_policy = resolve_scheduling_config(
         global_policy=global_policy,
         stage_id=stage_id,
         explicit_cls=explicit_scheduler_cls,
@@ -275,13 +282,10 @@ def validate_scheduler_for_stage(stage_arg:DictConfig, base_engine_args_tmp:Dict
     base_engine_args_tmp.scheduler_cls = resolved_cls
     base_engine_args_tmp.scheduling_policy = resolved_scheduling_policy
 
-    # If an experimental optional scheduling policy requires additional 
+    # If an experimental optional scheduling policy requires additional
     # parameters, they should be passed through the additional_config field.
-    base_engine_args_tmp.additional_config = (
-        OmegaConf.to_container(policy_config) if policy_config else {}
-    )
-    return base_engine_args_tmp 
-
+    base_engine_args_tmp.additional_config = OmegaConf.to_container(policy_config) if policy_config else {}
+    return base_engine_args_tmp
 
 
 def get_final_stage_id_for_e2e(

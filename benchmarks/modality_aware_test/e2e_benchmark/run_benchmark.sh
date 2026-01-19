@@ -5,14 +5,14 @@
 # Please modify the variables below to match your Kubernetes environment.
 # ==============================================================================
 # TODO: change the yaml path to your own local path
-DUAL_SERVER_YAML="./dual_server_start.yaml" 
+DUAL_SERVER_YAML="./dual_server_start.yaml"
 TESTER_YAML="./tester_start.yaml"
 LOCAL_OUTPUT_DIR="./results"
 
 # TODO: PVC claim name & mount path in your cluster
 # it is recommended to mount the pvc to the same path for both servers & client
 # make sure it is a ssd pvc.
-PVC_CLAIME_NAME="omnitest"
+PVC_CLAIM_NAME="omnitest"
 PVC_DIR="/root/data"
 
 # TODO: change the vllm code & data dir to your remote cluster path
@@ -21,7 +21,7 @@ HF_CACHE_PATH="${PVC_DIR}/hf_cache"
 DATA_DIR="${PVC_DIR}/datasets"
 OUTPUT_DIR="${PVC_DIR}/benchmark_results"
 
-# TODO: images: because we rollout for a lot of time in this experiment, 
+# TODO: images: because we rollout for a lot of time in this experiment,
 # it is recommended to download the image from docker hub to a local registry
 SERVER_IMAGE_NAME="vllm/vllm-omni:v0.12.0rc1"
 CLIENT_IMAGE_NAME="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
@@ -29,7 +29,7 @@ CLIENT_IMAGE_NAME="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"
 
 # TODO: GPU labels & driver versions in your cluster
 # it is important to use the same hardware & driver for production level e2e test
-GPU_LABEL_KEY="kubernetes.io/hostname" 
+GPU_LABEL_KEY="kubernetes.io/hostname"
 GPU_LABEL="<YOUR_GPU_NODE_HOSTNAME>"
 GPU_DRIVER_KEY="nvidia.com/cuda.driver.major"
 GPU_DRIVER="<YOUR_DRIVER_VERSION>"
@@ -43,11 +43,11 @@ CLIENT_PYTHON_CMD="python3"
 # Do not modify the script below unless you know what you are doing.
 # ==============================================================================
 
-OUTPUT_NAME="benchmark_results" 
-LOG_NAME="error_packets" 
+OUTPUT_NAME="benchmark_results"
+LOG_NAME="error_packets"
 
 BASELINE_DEPLOYMENT="vllm-baseline-backend"
-OPTIMIZED_DEPLOYMENT="vllm-opt-backend" 
+OPTIMIZED_DEPLOYMENT="vllm-opt-backend"
 CLIENT_DEPLOYMENT="vllm-benchmark-client"
 CLIENT_LABEL="app=vllm-benchmark-client"
 
@@ -55,7 +55,7 @@ export VLLM_OMNI_PATH
 export HF_CACHE_PATH
 
 export PVC_DIR
-export PVC_CLAIME_NAME
+export PVC_CLAIM_NAME
 
 export SERVER_IMAGE_NAME
 export CLIENT_IMAGE_NAME
@@ -86,7 +86,7 @@ exec_with_retry() {
 
             echo "Executing on $CURRENT_POD: $cmd"
             if kubectl exec "$CURRENT_POD" -- bash -c "$cmd"; then
-                return 0 
+                return 0
             else
                 EXIT_CODE=$?
                 echo " Command failed with exit code $EXIT_CODE."
@@ -99,7 +99,7 @@ exec_with_retry() {
         ((retry_count++))
         echo " Retry $retry_count/$max_retries in ${sleep_sec}s..."
         sleep $sleep_sec
-        
+
         echo " Waiting for pod to be ready..."
         kubectl wait --for=condition=ready pod -l $CLIENT_LABEL --timeout=300s >/dev/null 2>&1
     done
@@ -111,7 +111,7 @@ exec_with_retry() {
 cleanup() {
     echo ""
     echo " [Trap Triggered] Script is exiting..."
-    
+
     FINAL_POD=$(get_client_pod)
     if [ ! -z "$FINAL_POD" ]; then
         echo " Attempting to save current CSV results from $FINAL_POD before deleting..."
@@ -124,7 +124,7 @@ cleanup() {
     echo " Cleaning up Kubernetes resources (Releasing GPUs)..."
     envsubst < $DUAL_SERVER_YAML | kubectl delete -f - --wait=false >/dev/null 2>&1 || true
     kubectl delete -f $TESTER_YAML --wait=false >/dev/null 2>&1 || true
-    
+
     echo " Cleanup complete. Resources deleted."
 }
 
@@ -132,9 +132,9 @@ trap cleanup EXIT INT TERM
 
 echo "======= [step 1] deploy and initialize the environment ======="
 
-envsubst '${VLLM_OMNI_PATH} ${HF_CACHE_PATH} ${PVC_DIR} ${SERVER_IMAGE_NAME} ${GPU_LABEL} ${GPU_DRIVER} ${GPU_LABEL_KEY} ${GPU_DRIVER_KEY} ${PVC_CLAIME_NAME}' < $DUAL_SERVER_YAML | kubectl apply -f - 
+envsubst '${VLLM_OMNI_PATH} ${HF_CACHE_PATH} ${PVC_DIR} ${SERVER_IMAGE_NAME} ${GPU_LABEL} ${GPU_DRIVER} ${GPU_LABEL_KEY} ${GPU_DRIVER_KEY} ${PVC_CLAIM_NAME}' < $DUAL_SERVER_YAML | kubectl apply -f -
 
-envsubst '${CLIENT_PYTHON_CMD} ${CLIENT_IMAGE_NAME} ${PVC_DIR} ${PVC_CLAIME_NAME}' < $TESTER_YAML | kubectl apply -f - 
+envsubst '${CLIENT_PYTHON_CMD} ${CLIENT_IMAGE_NAME} ${PVC_DIR} ${PVC_CLAIM_NAME}' < $TESTER_YAML | kubectl apply -f -
 
 
 
@@ -196,10 +196,10 @@ echo " Server is ready! Starting benchmark..."
 echo "======= [step 3] run the actual benchmark ======="
 
 TEST_CONFIGS=(
-    "5:20"    
-    "10:10"   
-    "20:5"   
-    "50:2"  
+    "5:20"
+    "10:10"
+    "20:5"
+    "50:2"
 )
 SCENARIO_NAMES=("MIXED")
 SCENARIO_WEIGHTS=(
@@ -225,14 +225,14 @@ for config in "${TEST_CONFIGS[@]}"; do
             FIRST_RUN=false
         else
             echo "🧹 Hard restarting server to release GPU memory and clean KV cache..."
-            
+
             kubectl scale deployment/$BASELINE_DEPLOYMENT --replicas=0
             kubectl scale deployment/$OPTIMIZED_DEPLOYMENT --replicas=0
-            
+
             echo "   Waiting for pods to terminate..."
             kubectl wait --for=delete pod -l app=$BASELINE_DEPLOYMENT --timeout=120s >/dev/null 2>&1
             kubectl wait --for=delete pod -l app=$OPTIMIZED_DEPLOYMENT --timeout=120s >/dev/null 2>&1
-            
+
 
             kubectl scale deployment/$BASELINE_DEPLOYMENT --replicas=1
             kubectl scale deployment/$OPTIMIZED_DEPLOYMENT --replicas=1
@@ -241,18 +241,18 @@ for config in "${TEST_CONFIGS[@]}"; do
 
             kubectl wait --for=condition=ready pod -l app=$BASELINE_DEPLOYMENT --timeout=1000s &
             PID_BASE=$!
-            
+
             kubectl wait --for=condition=ready pod -l app=$OPTIMIZED_DEPLOYMENT --timeout=1000s &
             PID_OPT=$!
-            
+
             wait $PID_BASE
             wait $PID_OPT
-            
-            sleep 15 
+
+            sleep 15
         fi
 
         echo " run the benchmark script..."
-        
+
         BENCHMARK_CMD="$CLIENT_PYTHON_CMD ${VLLM_OMNI_PATH}/benchmarks/modality_aware_test/e2e_benchmark/modality_aware_benchmark.py \
             --scenario '$NAME' \
             --qps '$qps' \

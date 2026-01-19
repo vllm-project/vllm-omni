@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: tester
-        image: '${CLIENT_IMAGE_NAME}' 
+        image: '${CLIENT_IMAGE_NAME}'
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -26,7 +26,7 @@ spec:
           mountPath: '${PVC_DIR}'
         resources:
           requests:
-            cpu: "4"       
+            cpu: "4"
             memory: "10Gi"
           limits:
             cpu: "4"
@@ -34,6 +34,4 @@ spec:
       volumes:
       - name: shared-data
         persistentVolumeClaim:
-          claimName: '${PVC_CLAIME_NAME}'
-       
-
+          claimName: '${PVC_CLAIM_NAME}'

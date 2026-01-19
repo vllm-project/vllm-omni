@@ -11,17 +11,17 @@ class OmniARScheduler(BaseOmniARScheduler):
 
     This scheduler extends BaseOmniARScheduler with minimal modifications,
     primarily adding Omni-specific payload enrichment to the scheduler output.
-    
+
     For multimodal comprehension stages that need modality-aware scheduling,
     use OmniModalityAwareScheduler instead.
-    
+
     Inherited from BaseOmniARScheduler:
     - update_from_output(): Fixes check_stop bug for multimodal models
     - _enrich_scheduler_output(): Wraps NewRequestData with OmniNewRequestData
     """
 
     @classmethod
-    def validate_stage_config(cls, global_policy, stage_id, is_comprehension, is_dit):
+    def validate_stage_config(cls, global_policy: str | None, stage_id: int, is_comprehension: bool, is_dit: bool):
         if is_dit:
             raise ValueError(
                 f"Stage {stage_id} Configuration Error: {cls.__name__} is an "
@@ -32,7 +32,7 @@ class OmniARScheduler(BaseOmniARScheduler):
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
         """
         Schedule requests and enrich output with Omni-specific payloads.
-        
+
         This method calls the parent vLLM scheduler's schedule() and then
         enriches the output with Omni-specific data (prompt_embeds,
         additional_information) via _enrich_scheduler_output().

@@ -2,9 +2,9 @@
 # Uses OmniModalityAwareScheduler with omni_modality_aware scheduling policy
 # Stage 0: Thinker (multimodal understanding + text generation)
 
-# NOTE: 
+# NOTE:
 # When using "omni_modality_aware" for global scheduling_policy,
-# the stage with encoders (usually stage 0) will use 
+# the stage with encoders (usually stage 0) will use
 # vllm_omni.core.sched.omni_modality_aware_scheduler.OmniModalityAwareScheduler
 # which implements the modality-aware batching optimization.
 runtime:
@@ -15,7 +15,7 @@ runtime:
     # otherwise wait for a while to see if there will be more image request for batching.
     encoder_gain_threshold: 768
     # starve_threshold: Maximum wait time before starvation rescue (in seconds)
-    # 10 means when a request waits for more than 10s, it should be scheduled 
+    # 10 means when a request waits for more than 10s, it should be scheduled
     # regardless of its modality (to prevent starvation)
     # for a alpha system + small tp number testing, it is recommended to use a large number to ban starvation rescue.
     # in an optimized on-line serving setting, it should match the time of one encoder+decoder forwarding.
@@ -43,7 +43,7 @@ stage_args:
       max_num_seqs:  256
       hf_config_name: thinker_config
       tensor_parallel_size: 2
-      enable_mm_embeds: true 
+      enable_mm_embeds: true
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -58,5 +58,3 @@ stage_args:
       ignore_eos: true
       stop_token_ids: []
       stop: []
-
-

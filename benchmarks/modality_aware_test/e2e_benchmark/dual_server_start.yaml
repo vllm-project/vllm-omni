@@ -38,15 +38,15 @@ spec:
               - key: "${GPU_LABEL_KEY}"
                 operator: In
                 values:
-                - "${GPU_LABEL}"   
+                - "${GPU_LABEL}"
               - key: "${GPU_DRIVER_KEY}"
                 operator: In
                 values:
-                - "${GPU_DRIVER}" 
+                - "${GPU_DRIVER}"
       volumes:
       - name: shared-data
         persistentVolumeClaim:
-          claimName: "${PVC_CLAIME_NAME}"
+          claimName: "${PVC_CLAIM_NAME}"
       - name: shm
         emptyDir:
           medium: Memory
@@ -78,7 +78,7 @@ spec:
           python3 -c "import sys; sys.path.insert(0, '$VLLM_OMNI_PATH'); import vllm_omni; print(f'Loaded vllm_omni from: {vllm_omni.__file__}')"
 
           echo "================ DEBUG INFO END =================="
-        
+
           python3 -m vllm_omni.entrypoints.cli.main serve \
           ${HF_CACHE_PATH}/Qwen3-Omni-30B-A3B-Instruct \
           --omni \
@@ -94,14 +94,14 @@ spec:
           httpGet:
             path: /health
             port: 8000
-          failureThreshold: 60      
+          failureThreshold: 60
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: 5    
-          periodSeconds: 5          
+          initialDelaySeconds: 5
+          periodSeconds: 5
           failureThreshold: 3
         resources:
           requests:
@@ -109,12 +109,12 @@ spec:
             memory: "200Gi"
             nvidia.com/gpu: 2
           limits:
-            cpu: "20"        
+            cpu: "20"
             memory: "200Gi"
             nvidia.com/gpu: 2
         volumeMounts:
         - name: shared-data
-          mountPath: '${PVC_DIR}' 
+          mountPath: '${PVC_DIR}'
         - name: shm
           mountPath: /dev/shm
 ---
@@ -160,15 +160,15 @@ spec:
               - key: "${GPU_LABEL_KEY}"
                 operator: In
                 values:
-                - "${GPU_LABEL}"   
+                - "${GPU_LABEL}"
               - key: "${GPU_DRIVER_KEY}"
                 operator: In
                 values:
-                - "${GPU_DRIVER}" 
+                - "${GPU_DRIVER}"
       volumes:
       - name: shared-data
         persistentVolumeClaim:
-          claimName: '${PVC_CLAIME_NAME}'
+          claimName: '${PVC_CLAIM_NAME}'
       - name: shm
         emptyDir:
           medium: Memory
@@ -199,7 +199,7 @@ spec:
           echo "Checking imports (Simulation):"
           python3 -c "import sys; sys.path.insert(0, '$VLLM_OMNI_PATH'); import vllm_omni; print(f'Loaded vllm_omni from: {vllm_omni.__file__}')"
           echo "================ DEBUG INFO END =================="
-        
+
           python3 -m vllm_omni.entrypoints.cli.main serve \
           ${HF_CACHE_PATH}/Qwen3-Omni-30B-A3B-Instruct \
           --omni \
@@ -208,21 +208,21 @@ spec:
           --served-model-name "Qwen/Qwen3-Omni-30B-A3B-Instruct" \
           --stage-configs-path ${VLLM_OMNI_PATH}/benchmarks/modality_aware_test/stage_configs/modality_aware.yaml \
           > ${PVC_DIR}/vllm_opt_debug_$(date +%s).log 2>&1
- 
+
         ports:
         - containerPort: 8000
         startupProbe:
           httpGet:
             path: /health
             port: 8000
-          failureThreshold: 60      
+          failureThreshold: 60
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: 5    
-          periodSeconds: 5          
+          initialDelaySeconds: 5
+          periodSeconds: 5
           failureThreshold: 3
         resources:
           requests:
@@ -230,7 +230,7 @@ spec:
             memory: "200Gi"
             nvidia.com/gpu: 2
           limits:
-            cpu: "20"        
+            cpu: "20"
             memory: "200Gi"
             nvidia.com/gpu: 2
         volumeMounts:

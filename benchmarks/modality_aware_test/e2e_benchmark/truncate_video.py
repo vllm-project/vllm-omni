@@ -1,9 +1,11 @@
+import argparse
 import os
 import random
 import subprocess
-import argparse
 import sys
+
 from tqdm import tqdm
+
 
 def check_ffmpeg():
     """Check if ffmpeg is installed and accessible."""
@@ -12,6 +14,7 @@ def check_ffmpeg():
     except FileNotFoundError:
         print("❌ Error: 'ffmpeg' command not found. Please install FFmpeg (e.g., 'apt-get install ffmpeg').")
         sys.exit(1)
+
 
 def truncate_videos(data_dir):
     # Inferring path based on your previous script: [data_dir]/video/files
@@ -25,7 +28,7 @@ def truncate_videos(data_dir):
     # Gather all mp4 files
     files = [f for f in os.listdir(video_dir) if f.endswith(".mp4")]
     total_files = len(files)
-    
+
     if total_files == 0:
         print(f"⚠️ No .mp4 files found in {video_dir}")
         return
@@ -58,26 +61,33 @@ def truncate_videos(data_dir):
             "ffmpeg",
             "-y",
             "-hide_banner",
-            "-loglevel", "error",
-            "-i", full_path,
-            "-ss", "0",
-            "-t", f"{target_duration:.2f}",
-            "-c:v", "libx264", 
-            "-preset", "ultrafast",
-            "-c:a", "copy",
-            temp_path
+            "-loglevel",
+            "error",
+            "-i",
+            full_path,
+            "-ss",
+            "0",
+            "-t",
+            f"{target_duration:.2f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "copy",
+            temp_path,
         ]
 
         try:
             # Run FFmpeg
             subprocess.run(cmd, check=True)
-            
+
             # If successful, replace the original file with the truncated one
             # os.replace is atomic on POSIX systems
             os.replace(temp_path, full_path)
             processed_count += 1
-            
-        except subprocess.CalledProcessError as e:
+
+        except subprocess.CalledProcessError:
             error_count += 1
             # Clean up temp file if it was created but failed
             if os.path.exists(temp_path):
@@ -87,19 +97,19 @@ def truncate_videos(data_dir):
             print(f"\nError processing {filename}: {e}")
 
     pbar.close()
-    
+
     print("\n✅ Truncation complete!")
     print(f"   - Processed: {processed_count}")
     print(f"   - Errors:    {error_count}")
     print(f"   - Target directory: {video_dir}")
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     # python3 vllm-omni/benchmarks/modality_aware_scheduling/truncate_video.py --data_dir /root/data/datasets
     parser = argparse.ArgumentParser(description="Truncate existing video dataset to random 2s-3s lengths")
     parser.add_argument("--data_dir", type=str, required=True, help="Root directory where datasets were downloaded")
-    
+
     args = parser.parse_args()
-    
+
     check_ffmpeg()
     truncate_videos(args.data_dir)

@@ -23,18 +23,17 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from .omni_base_scheduler import BaseOmniScheduler
 
-
 logger = init_logger(__name__)
 
 
 class BaseOmniARScheduler(BaseOmniScheduler):
     """
     Base scheduler for Auto-Regressive Omni models.
-    
+
     This class provides shared functionality for AR-based schedulers:
     - OmniARScheduler: Simple wrapper with Omni enrichment
     - OmniModalityAwareScheduler: Complex modality-aware scheduling
-    
+
     Key shared methods:
     - update_from_output(): Fixes check_stop bug for multimodal models
     - _enrich_scheduler_output(): Wraps NewRequestData with OmniNewRequestData
@@ -43,13 +42,13 @@ class BaseOmniARScheduler(BaseOmniScheduler):
     def _enrich_scheduler_output(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
         """
         Enrich scheduler output with Omni-specific request payloads.
-        
+
         This method wraps NewRequestData entries with OmniNewRequestData,
         adding prompt_embeds and additional_information from the request.
-        
+
         Args:
             scheduler_output: The scheduler output to enrich
-            
+
         Returns:
             The enriched scheduler output with OmniNewRequestData entries
         """
@@ -92,7 +91,7 @@ class BaseOmniARScheduler(BaseOmniScheduler):
     ) -> dict[int, EngineCoreOutputs]:
         """
         Update scheduler state based on model runner output.
-        
+
         This method overrides vLLM's update_from_output to fix the check_stop bug
         when output_token_ids is empty. The original vLLM implementation calls
         check_stop when pooler_outputs exist, but doesn't check if output_token_ids
@@ -101,11 +100,11 @@ class BaseOmniARScheduler(BaseOmniScheduler):
 
         This fix adds a safety check before calling check_stop to prevent the
         IndexError when accessing output_token_ids[-1].
-        
+
         Args:
             scheduler_output: The scheduler output from the current step
             model_runner_output: The model runner output from the current step
-            
+
         Returns:
             Dictionary mapping client indices to their EngineCoreOutputs
         """
@@ -260,4 +259,3 @@ class BaseOmniARScheduler(BaseOmniScheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
-
