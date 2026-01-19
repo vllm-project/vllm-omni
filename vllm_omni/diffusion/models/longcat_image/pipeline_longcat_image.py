@@ -484,16 +484,25 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
             )
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    latents = latents.to(latents_dtype)
-
             if cfg_group is not None:
+                if cfg_rank == 0:
+                    latents = self.scheduler_step(noise_pred, t, latents)
                 cfg_group.broadcast(latents, src=0)
+            else:
+                latents = self.scheduler_step(noise_pred, t, latents)
 
+        return latents
+
+    def scheduler_step(self, noise_pred, t, latents):
+        """
+        Step the scheduler.
+        """
+        latents_dtype = latents.dtype
+        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        if latents.dtype != latents_dtype:
+            if torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
         return latents
 
     def prepare_latents(

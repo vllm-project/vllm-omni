@@ -574,7 +574,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             if cfg_group is not None:
                 if cfg_rank == 0:
                     latents = self.scheduler_step(noise_pred, t, latents)
-                    cfg_group.broadcast(latents, src=0)
+                cfg_group.broadcast(latents, src=0)
             else:
                 latents = self.scheduler_step(noise_pred, t, latents)
 
