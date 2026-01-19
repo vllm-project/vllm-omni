@@ -114,9 +114,11 @@ def main():
     start_time = time.time()
 
     # Initialize the Omni engine with GLM-TTS stage config
+    # Note: stage_configs_path tells Omni to use the YAML config instead of
+    # auto-detecting the model format
     omni = Omni(
         model=args.model,
-        stage_config=stage_config,
+        stage_configs_path=stage_config,
     )
 
     load_time = time.time() - start_time
