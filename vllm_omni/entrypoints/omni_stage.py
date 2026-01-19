@@ -603,10 +603,14 @@ def _stage_worker(
     )
     try:
         if stage_type == "diffusion":
-            engine_args.pop("model_stage")
+            # Remove parameters that are not valid for OmniDiffusionConfig
+            engine_args.pop("model_stage", None)
+            engine_args.pop("max_num_seqs", None)  # Added by runtime config, not valid for diffusion
             stage_engine = OmniDiffusion(**engine_args)
         else:
             # Default to LLM engine
+            # Remove 'model' from engine_args if present to avoid duplicate argument
+            engine_args.pop("model", None)
             stage_engine = OmniLLM(model=model, **engine_args)
     finally:
         # Release all locks by closing file descriptors
