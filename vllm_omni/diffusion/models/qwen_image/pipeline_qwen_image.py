@@ -20,13 +20,14 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.base_pipeline import BaseQwenImagePipeline
+from vllm_omni.diffusion.models.base_pipeline import QwenImageCFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -234,7 +235,7 @@ def apply_rotary_emb_qwen(
         return x_out.type_as(x)
 
 
-class QwenImagePipeline(BaseQwenImagePipeline):
+class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
     def __init__(
         self,
         *,

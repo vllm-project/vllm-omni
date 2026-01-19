@@ -18,13 +18,14 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.base_pipeline import BaseQwenImagePipeline
+from vllm_omni.diffusion.models.base_pipeline import QwenImageCFGParallelMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
@@ -163,7 +164,7 @@ def get_qwen_image_edit_plus_post_process_func(
     return post_process_func
 
 
-class QwenImageEditPlusPipeline(SupportImageInput, BaseQwenImagePipeline):
+class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
     def __init__(
         self,
         *,

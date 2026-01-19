@@ -5,8 +5,9 @@
 Base pipeline class for Qwen Image models with shared CFG functionality.
 """
 
+from abc import ABCMeta
+
 import torch
-from torch import nn
 
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
@@ -15,20 +16,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 
 
-class BasePipeline(nn.Module):
+class CFGParallelMixin(metaclass=ABCMeta):
     """
-    Base class for Diffusion pipelines providing shared CFG methods.
+    Base Mixi class for Diffusion pipelines providing shared CFG methods.
 
     All pipelines should inherit from this class to reuse
     classifier-free guidance logic.
     """
-
-    def __init__(
-        self,
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
 
     def predict_noise_maybe_with_cfg(
         self,
@@ -160,7 +154,7 @@ class BasePipeline(nn.Module):
         return getattr(self, "_interrupt", False)
 
 
-class BaseQwenImagePipeline(BasePipeline):
+class QwenImageCFGParallelMixin(CFGParallelMixin):
     """
     Base class for Qwen Image pipelines providing shared CFG methods.
     """
