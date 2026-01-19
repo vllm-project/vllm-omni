@@ -11,20 +11,25 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.base_pipeline import BasePipeline
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.model_executor.model_loader.weight_utils import (
-    download_weights_from_hf_specific,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +131,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusion3Pipeline(
-    nn.Module,
-):
+class StableDiffusion3Pipeline(BasePipeline):
     def __init__(
         self,
         *,
@@ -498,15 +501,35 @@ class StableDiffusion3Pipeline(
 
     def diffuse(
         self,
+        latents,
+        timesteps,
         prompt_embeds,
         pooled_prompt_embeds,
         negative_prompt_embeds,
         negative_pooled_prompt_embeds,
-        latents,
-        timesteps,
-        do_cfg,
+        do_true_cfg,
+        guidance_scale,
+        cfg_normalize=False,
     ):
+        """
+        Diffusion loop with optional classifier-free guidance.
+
+        Args:
+            latents: Noise latents to denoise
+            timesteps: Diffusion timesteps
+            prompt_embeds: Positive prompt embeddings
+            pooled_prompt_embeds: Pooled positive prompt embeddings
+            negative_prompt_embeds: Negative prompt embeddings
+            negative_pooled_prompt_embeds: Pooled negative prompt embeddings
+            do_true_cfg: Whether to apply CFG
+            guidance_scale: CFG scale factor
+            cfg_normalize: Whether to normalize CFG output (default: False)
+
+        Returns:
+            Denoised latents
+        """
         self.scheduler.set_begin_index(0)
+
         for _, t in enumerate(timesteps):
             if self.interrupt:
                 continue
@@ -515,29 +538,42 @@ class StableDiffusion3Pipeline(
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-            transformer_kwargs = {
+            # Enable CFG-parallel: rank0 computes positive, rank1 computes negative
+            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+            cfg_group = get_cfg_group() if cfg_parallel_ready else None
+            cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel_ready else None
+
+            positive_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,
                 "encoder_hidden_states": prompt_embeds,
                 "pooled_projections": pooled_prompt_embeds,
                 "return_dict": False,
             }
+            negative_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "encoder_hidden_states": negative_prompt_embeds,
+                "pooled_projections": negative_pooled_prompt_embeds,
+                "return_dict": False,
+            }
 
-            noise_pred = self.transformer(**transformer_kwargs)[0]
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg,
+                guidance_scale,
+                positive_kwargs,
+                negative_kwargs,
+                cfg_group,
+                cfg_rank,
+                cfg_normalize,
+            )
 
-            if do_cfg:
-                neg_transformer_kwargs = {
-                    "hidden_states": latents,
-                    "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "pooled_projections": negative_pooled_prompt_embeds,
-                    "return_dict": False,
-                }
-
-                neg_noise_pred = self.transformer(**neg_transformer_kwargs)[0]
-                noise_pred = neg_noise_pred + self.guidance_scale * (noise_pred - neg_noise_pred)
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if cfg_group is not None:
+                cfg_group.broadcast(latents, src=0)
+
         return latents
 
     def forward(
@@ -644,14 +680,17 @@ class StableDiffusion3Pipeline(
         timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
         self._num_timesteps = len(timesteps)
 
+        # Denoising loop using diffuse method
         latents = self.diffuse(
-            prompt_embeds,
-            pooled_prompt_embeds,
-            negative_prompt_embeds,
-            negative_pooled_prompt_embeds,
-            latents,
-            timesteps,
-            do_cfg,
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds if do_cfg else None,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds if do_cfg else None,
+            do_true_cfg=do_cfg,
+            guidance_scale=self.guidance_scale,
+            cfg_normalize=False,
         )
 
         self._current_timestep = None
