@@ -11,6 +11,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -25,7 +26,7 @@ from vllm_omni.diffusion.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.base_pipeline import BasePipeline
+from vllm_omni.diffusion.models.base_pipeline import CFGParallelMixin
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
@@ -131,7 +132,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusion3Pipeline(BasePipeline):
+class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -569,10 +570,13 @@ class StableDiffusion3Pipeline(BasePipeline):
             )
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
             if cfg_group is not None:
-                cfg_group.broadcast(latents, src=0)
+                if cfg_rank == 0:
+                    latents = self.scheduler_step(noise_pred, t, latents)
+                    cfg_group.broadcast(latents, src=0)
+            else:
+                latents = self.scheduler_step(noise_pred, t, latents)
 
         return latents
 

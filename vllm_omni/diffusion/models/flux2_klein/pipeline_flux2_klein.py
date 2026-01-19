@@ -30,6 +30,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retri
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -42,7 +43,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.base_pipeline import BasePipeline
+from vllm_omni.diffusion.models.base_pipeline import CFGParallelMixin
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
@@ -183,7 +184,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(mu)
 
 
-class Flux2KleinPipeline(BasePipeline, SupportImageInput):
+class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     """Flux2 klein pipeline for text-to-image generation."""
 
     support_image_input = True
@@ -736,17 +737,28 @@ class Flux2KleinPipeline(BasePipeline, SupportImageInput):
             )
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
-
             if cfg_group is not None:
-                cfg_group.broadcast(latents, src=0)
+                if cfg_rank == 0:
+                    latents = self.scheduler_step(noise_pred, t, latents)
+                    cfg_group.broadcast(latents, src=0)
+            else:
+                latents = self.scheduler_step(noise_pred, t, latents)
 
         return latents
 
+    def scheduler_step(self, noise_pred, t, latents):
+        """
+        Step the scheduler.
+        """
+        latents_dtype = latents.dtype
+        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        if latents.dtype != latents_dtype:
+            if torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
+        return latents
+
+    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,

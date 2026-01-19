@@ -18,7 +18,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 
 class CFGParallelMixin(metaclass=ABCMeta):
     """
-    Base Mixi class for Diffusion pipelines providing shared CFG methods.
+    Base Mixin class for Diffusion pipelines providing shared CFG methods.
 
     All pipelines should inherit from this class to reuse
     classifier-free guidance logic.
@@ -69,7 +69,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     noise_pred = gathered[0]
                     neg_noise_pred = gathered[1]
                     noise_pred = self.combine_cfg_noise(noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize)
-                return noise_pred
+
+                    return noise_pred
             else:
                 # Sequential CFG: compute both positive and negative
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
@@ -156,7 +157,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
 class QwenImageCFGParallelMixin(CFGParallelMixin):
     """
-    Base class for Qwen Image pipelines providing shared CFG methods.
+    Base Mixin class for Qwen Image pipelines providing shared CFG methods.
     """
 
     def diffuse(
@@ -258,8 +259,17 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
             )
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if cfg_group is not None:
-                cfg_group.broadcast(latents, src=0)
+                if cfg_rank == 0:
+                    latents = self.scheduler_step(noise_pred, t, latents)
+                    cfg_group.broadcast(latents, src=0)
+            else:
+                latents = self.scheduler_step(noise_pred, t, latents)
 
         return latents
+
+    def scheduler_step(self, noise_pred, t, latents):
+        """
+        Step the scheduler.
+        """
+        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]

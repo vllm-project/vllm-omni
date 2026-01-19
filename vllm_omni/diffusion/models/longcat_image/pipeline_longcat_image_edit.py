@@ -16,6 +16,7 @@ from diffusers.models import AutoencoderKL
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 from transformers import (
     AutoTokenizer,
     Qwen2_5_VLForConditionalGeneration,
@@ -32,7 +33,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.base_pipeline import BasePipeline
+from vllm_omni.diffusion.models.base_pipeline import CFGParallelMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
     LongCatImageTransformer2DModel,
@@ -220,7 +221,7 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongCatImageEditPipeline(BasePipeline, SupportImageInput):
+class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     def __init__(
         self,
         *,
@@ -487,16 +488,25 @@ class LongCatImageEditPipeline(BasePipeline, SupportImageInput):
             )
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    latents = latents.to(latents_dtype)
-
             if cfg_group is not None:
-                cfg_group.broadcast(latents, src=0)
+                if cfg_rank == 0:
+                    latents = self.scheduler_step(noise_pred, t, latents)
+                    cfg_group.broadcast(latents, src=0)
+            else:
+                latents = self.scheduler_step(noise_pred, t, latents)
 
+        return latents
+
+    def scheduler_step(self, noise_pred, t, latents):
+        """
+        Step the scheduler.
+        """
+        latents_dtype = latents.dtype
+        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+        if latents.dtype != latents_dtype:
+            if torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
         return latents
 
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
