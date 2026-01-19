@@ -21,7 +21,6 @@ import numpy as np
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type
 
 
@@ -116,44 +115,6 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
             )
 
 
-def extract_audio_from_outputs(outputs):
-    """Extract audio tensor/array from omni.generate() outputs."""
-    if isinstance(outputs, (torch.Tensor, np.ndarray)):
-        return outputs
-
-    if isinstance(outputs, list):
-        if not outputs:
-            raise ValueError("No output generated from omni.generate()")
-        candidate = outputs[0]
-    else:
-        candidate = outputs
-
-    if hasattr(candidate, "multimodal_output"):
-        multimodal_output = candidate.multimodal_output or {}
-        if "audio" in multimodal_output:
-            return multimodal_output["audio"]
-
-    if isinstance(candidate, OmniRequestOutput):
-        if candidate.request_output:
-            if isinstance(candidate.request_output, list) and candidate.request_output:
-                request_output = candidate.request_output[0]
-            else:
-                request_output = candidate.request_output
-
-            if isinstance(request_output, OmniRequestOutput) and request_output.images:
-                return request_output.images[0]
-
-            if hasattr(request_output, "multimodal_output"):
-                multimodal_output = request_output.multimodal_output or {}
-                if "audio" in multimodal_output:
-                    return multimodal_output["audio"]
-
-        if hasattr(candidate, "images") and candidate.images:
-            return candidate.images[0]
-
-    raise ValueError("No audio output found in omni.generate() result")
-
-
 def main():
     args = parse_args()
     device = detect_device_type()
@@ -205,7 +166,23 @@ def main():
     suffix = output_path.suffix or ".wav"
     stem = output_path.stem or "stable_audio_output"
 
-    audio = extract_audio_from_outputs(outputs)
+    # Extract audio from omni.generate() outputs
+    if isinstance(outputs, (torch.Tensor, np.ndarray)):
+        audio = outputs
+    elif isinstance(outputs, list) and outputs:
+        output = outputs[0]
+        if not hasattr(output, "request_output") or not output.request_output:
+            raise ValueError("No request_output found in OmniRequestOutput")
+        request_output = output.request_output[0]
+        if hasattr(request_output, "multimodal_output"):
+            multimodal_output = request_output.multimodal_output or {}
+            audio = multimodal_output.get("audio")
+        elif hasattr(request_output, "images") and request_output.images:
+            audio = request_output.images[0]
+        else:
+            raise ValueError("No audio output found in request_output")
+    else:
+        raise ValueError("No output generated from omni.generate()")
 
     # Handle different output formats
     if isinstance(audio, torch.Tensor):
