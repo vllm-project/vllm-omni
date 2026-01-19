@@ -630,6 +630,7 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         return latents
 
+    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
