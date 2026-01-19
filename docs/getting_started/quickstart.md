@@ -42,6 +42,22 @@ if __name__ == "__main__":
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 
+## Gated Models on Hugging Face
+
+Some models (for example, `stabilityai/stable-audio-open-1.0`) are gated on
+Hugging Face. Before using them, you must:
+
+1. Accept the model license on the Hugging Face model page.
+2. Authenticate your environment, for example:
+
+```bash
+huggingface-cli login
+```
+
+If you skip these steps, you may see errors like "Could not determine
+model_type" or "no config file found" because the config files are not
+accessible.
+
 ## Online Serving with OpenAI-Completions API
 
 Text-to-image generation quickstart with vLLM-Omni:
