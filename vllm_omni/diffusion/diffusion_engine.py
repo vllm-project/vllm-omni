@@ -131,6 +131,8 @@ class DiffusionEngine:
             if not isinstance(images, list):
                 images = [images] if images is not None else []
 
+            is_stable_audio = self.od_config.model_class_name == "StableAudioPipeline"
+
             # Handle single request or multiple requests
             if len(requests) == 1:
                 # Single request: return single OmniRequestOutput
@@ -144,13 +146,25 @@ class DiffusionEngine:
                 if output.trajectory_timesteps is not None:
                     metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
-                return OmniRequestOutput.from_diffusion(
-                    request_id=request_id,
-                    images=images,
-                    prompt=prompt,
-                    metrics=metrics,
-                    latents=output.trajectory_latents,
-                )
+                if is_stable_audio:
+                    audio_payload = images[0] if len(images) == 1 else images
+                    return OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                        multimodal_output={"audio": audio_payload},
+                        final_output_type="audio",
+                    )
+                else:
+                    return OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=images,
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                    )
             else:
                 # Multiple requests: return list of OmniRequestOutput
                 # Split images based on num_outputs_per_prompt for each request
@@ -172,15 +186,29 @@ class DiffusionEngine:
                     if output.trajectory_timesteps is not None:
                         metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
-                    results.append(
-                        OmniRequestOutput.from_diffusion(
-                            request_id=request_id,
-                            images=request_images,
-                            prompt=prompt,
-                            metrics=metrics,
-                            latents=output.trajectory_latents,
+                    if is_stable_audio:
+                        audio_payload = request_images[0] if len(request_images) == 1 else request_images
+                        results.append(
+                            OmniRequestOutput.from_diffusion(
+                                request_id=request_id,
+                                images=[],
+                                prompt=prompt,
+                                metrics=metrics,
+                                latents=output.trajectory_latents,
+                                multimodal_output={"audio": audio_payload},
+                                final_output_type="audio",
+                            )
                         )
-                    )
+                    else:
+                        results.append(
+                            OmniRequestOutput.from_diffusion(
+                                request_id=request_id,
+                                images=request_images,
+                                prompt=prompt,
+                                metrics=metrics,
+                                latents=output.trajectory_latents,
+                            )
+                        )
 
                 return results
         except Exception as e:
