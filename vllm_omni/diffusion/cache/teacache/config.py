@@ -25,6 +25,15 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # SD3 / SD3.5 default coefficients.
+    #
+    # Empirically we want SD3's default caching behavior (rel_l1_thresh=0.2) to be
+    # conservative enough to preserve quality. We therefore scale the raw rel-L1
+    # distance up (linear polynomial), effectively reducing the aggressiveness
+    # without requiring the user to change rel_l1_thresh.
+    #
+    # rescaled_distance = 4 * rel_distance
+    "SD3Transformer2DModel": [0.0, 0.0, 0.0, 4.0, 0.0],
 }
 
 

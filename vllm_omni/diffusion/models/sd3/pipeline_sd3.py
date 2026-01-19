@@ -515,6 +515,10 @@ class StableDiffusion3Pipeline(
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
+            # Used by TeaCache hook to separate positive/negative CFG branches.
+            # Keep this attribute present even when do_cfg=False for robustness.
+            self.transformer.do_true_cfg = do_cfg
+
             transformer_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,
