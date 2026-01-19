@@ -272,6 +272,6 @@ def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
             audio_content = convert_audio_to_text(audio_data)
             print(f"text content is: {text_content}")
             print(f"audio content is: {audio_content}")
-            assert cosine_similarity_text(audio_content.lower(), text_content.lower()) > 0.9, (
-                "The audio content is not same as the text"
-            )
+            similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+            print(f"The similarity between audio and text is: {similarity}")
+            assert similarity > 0.9, "The audio content is not same as the text"
