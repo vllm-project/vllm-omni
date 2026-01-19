@@ -101,196 +101,93 @@ def generate_synthetic_audio(
     sample_rate: int = 48000,  # Default use 48000Hz.
     save_to_file: bool = False,
 ) -> dict[str, Any]:
-    """ "Generate synthetic audio with musical scale (do re mi fa so la ti do)."""
+    """ "Generate synthetic audio with rain."""
     import soundfile as sf
 
-    # Initialize audio data
+    # Initialize audio data array
     num_samples = int(sample_rate * duration)
     audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
 
-    # Major scale frequencies (C major scale starting from C4)
-    # do re mi fa so la ti do
-    scale_notes = [
-        ("do", 261.63),  # C4
-        ("re", 293.66),  # D4
-        ("mi", 329.63),  # E4
-        ("fa", 349.23),  # F4
-        ("so", 392.00),  # G4
-        ("la", 440.00),  # A4
-        ("ti", 493.88),  # B4
-        ("do", 523.25),  # C5 (octave higher)
-    ]
+    # Configure parameters based on rain intensity
+    drop_density = 10  # Number of raindrops per second
+    drop_volume = 0.15  # Volume of individual raindrops
+    background_volume = 0.02  # Volume of background rain noise
 
-    # Timing for clear notes
-    note_duration = 0.5  # Each note 0.5 seconds
-    pause_duration = 0.1  # Short pause between notes
-    total_note_time = note_duration + pause_duration
+    # Pink noise sounds more natural than white noise for rain
+    white_noise = np.random.randn(num_samples)
+    pink_noise = np.convolve(white_noise, np.ones(8) / 8, mode="same")
+    pink_noise = pink_noise / np.max(np.abs(pink_noise)) if np.max(np.abs(pink_noise)) > 0 else pink_noise
+    bg_noise = pink_noise * background_volume
 
-    # Calculate how many scales we can fit
-    scale_length = len(scale_notes) * total_note_time
-    num_scales = max(1, int(duration / scale_length))
+    # Add background noise to all channels
+    for ch in range(num_channels):
+        audio_data[:, ch] += bg_noise
 
-    current_time = 0
+    # Total number of raindrops = density × duration × channels for stereo effect
+    total_drops = int(drop_density * duration * num_channels)
 
-    for scale_num in range(num_scales):
-        for note_name, freq in scale_notes:
-            if current_time >= duration:
-                break
+    for _ in range(total_drops):
+        # Random timing for raindrop
+        drop_time = random.uniform(0, duration)
 
-            # Note sound
-            start_time = current_time
-            end_time = min(current_time + note_duration, duration)
+        # Random duration of raindrop sound (0.01-0.05 seconds)
+        drop_duration = random.uniform(0.01, 0.05)
 
-            if start_time < end_time:
-                start_sample = int(start_time * sample_rate)
-                end_sample = int(end_time * sample_rate)
-                end_sample = min(end_sample, num_samples)
+        # Random frequency gives variation in raindrop pitch
+        drop_freq = random.uniform(500, 5000)  # Hz
 
-                if start_sample < end_sample:
-                    # Generate clean sine wave for the note
-                    t = np.arange(end_sample - start_sample) / sample_rate
+        # Random channel selection for stereo positioning
+        channel = random.randint(0, num_channels - 1)
 
-                    # Main frequency
-                    sound = 0.3 * np.sin(2 * math.pi * freq * t)
+        # Calculate sample positions for this raindrop
+        start_sample = int(drop_time * sample_rate)
+        drop_samples = int(drop_duration * sample_rate)
+        end_sample = min(start_sample + drop_samples, num_samples)
 
-                    # Add harmonics for richer tone (musical)
-                    # 2nd harmonic (octave)
-                    sound += 0.1 * np.sin(2 * math.pi * freq * 2 * t)
-                    # 3rd harmonic (fifth)
-                    sound += 0.05 * np.sin(2 * math.pi * freq * 3 * t)
+        if start_sample < end_sample:
+            # Generate the raindrop sound
+            num_drop_samples = end_sample - start_sample
+            t = np.arange(num_drop_samples) / sample_rate
 
-                    # Piano-like envelope: quick attack, longer decay
-                    envelope = np.ones_like(t)
-                    total_samples = len(t)
+            # Basic sine wave for raindrop sound
+            drop_sound = drop_volume * np.sin(2 * math.pi * drop_freq * t)
 
-                    # Piano envelope: 5% attack, 60% decay, 35% release
-                    attack_samples = int(total_samples * 0.05)  # Quick attack
-                    decay_samples = int(total_samples * 0.6)  # Longer decay
-                    sustain_level = 0.3  # Sustain level
-                    release_samples = int(total_samples * 0.35)  # Release
+            # Apply envelope for natural attack and decay
+            envelope = np.ones(num_drop_samples)
+            attack_samples = int(num_drop_samples * 0.1)  # 10% of samples for attack
+            decay_samples = num_drop_samples - attack_samples
 
-                    if attack_samples > 0:
-                        envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
+            if attack_samples > 0:
+                # Linear attack: volume increases from 0 to 1
+                envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
 
-                    if decay_samples > 0 and attack_samples + decay_samples <= total_samples:
-                        envelope[attack_samples : attack_samples + decay_samples] = np.linspace(
-                            1, sustain_level, decay_samples
-                        )
+            if decay_samples > 0:
+                # Exponential decay for natural sound fade
+                decay = np.exp(-8 * t[attack_samples:] / drop_duration)
+                envelope[attack_samples:] = decay
 
-                    if release_samples > 0:
-                        envelope[-release_samples:] = np.linspace(sustain_level, 0, release_samples)
+            # Apply envelope to raindrop sound
+            drop_sound *= envelope
 
-                    sound *= envelope
+            # Add raindrop sound to selected channel
+            audio_data[start_sample:end_sample, channel] += drop_sound
 
-                    # Apply to channels with stereo positioning
-                    if num_channels == 1:
-                        # Mono
-                        audio_data[start_sample:end_sample, 0] += sound
-
-                    elif num_channels == 2:
-                        # Stereo - different positions for different notes
-                        # do: center, re: slight left, mi: center, fa: slight right, etc.
-                        note_positions = {
-                            "do": 0.0,  # Center
-                            "re": -0.2,  # Slight left
-                            "mi": 0.0,  # Center
-                            "fa": 0.2,  # Slight right
-                            "so": -0.3,  # More left
-                            "la": 0.3,  # More right
-                            "ti": 0.0,  # Center
-                        }
-
-                        pan = note_positions.get(note_name, 0.0)
-                        left_gain = 0.5 - pan / 2
-                        right_gain = 0.5 + pan / 2
-
-                        audio_data[start_sample:end_sample, 0] += sound * left_gain
-                        audio_data[start_sample:end_sample, 1] += sound * right_gain
-
-                    elif num_channels == 5:
-                        # 5.1 surround - notes spread around
-                        # Front channels get full sound
-                        audio_data[start_sample:end_sample, 0] += sound * 0.7  # Front Left
-                        audio_data[start_sample:end_sample, 1] += sound * 0.7  # Front Right
-                        audio_data[start_sample:end_sample, 2] += sound * 0.8  # Center
-
-                        # Rear channels get quieter version
-                        delay = int(0.02 * sample_rate)  # 20ms delay
-                        rear_start = min(start_sample + delay, num_samples - 1)
-                        rear_end = min(end_sample + delay, num_samples)
-
-                        if rear_start < rear_end:
-                            rear_len = rear_end - rear_start
-                            sound_for_rear = sound[:rear_len] * 0.25
-                            audio_data[rear_start:rear_end, 3] += sound_for_rear  # Rear Left
-                            audio_data[rear_start:rear_end, 4] += sound_for_rear  # Rear Right
-
-            # Move to next note
-            current_time += total_note_time
-
-            # Add a small transition between scales
-            if note_name == "do" and scale_num < num_scales - 1 and current_time < duration:
-                transition_duration = 0.3
-                transition_start = current_time
-                transition_end = min(transition_start + transition_duration, duration)
-
-                if transition_start < transition_end:
-                    start_sample = int(transition_start * sample_rate)
-                    end_sample = int(transition_end * sample_rate)
-                    end_sample = min(end_sample, num_samples)
-
-                    if start_sample < end_sample:
-                        transition_t = np.arange(end_sample - start_sample) / sample_rate
-
-                        # Glissando effect between scales
-                        start_freq = 523.25  # High do
-                        end_freq = 261.63  # Low do (next scale)
-                        freq_sweep = np.linspace(start_freq, end_freq, len(transition_t))
-
-                        transition_sound = 0.15 * np.sin(2 * math.pi * freq_sweep * transition_t)
-
-                        # Fade in/out envelope
-                        transition_env = np.ones_like(transition_t)
-                        env_len = len(transition_env)
-                        if env_len > 0:
-                            transition_env[: int(env_len * 0.3)] = np.linspace(0, 1, int(env_len * 0.3))
-                            transition_env[-int(env_len * 0.3) :] = np.linspace(1, 0, int(env_len * 0.3))
-
-                        transition_sound *= transition_env
-
-                        for ch in range(min(num_channels, 3)):
-                            audio_data[start_sample:end_sample, ch] += transition_sound
-
-                        current_time += transition_duration
-
-    # Add very subtle reverb effect for musical feel
+    # Step 3: Add simple reverb effect for realism
+    # Reverb simulates sound reflections in environment
     if duration > 2:
-        # Simple reverb: add delayed copies
-        delay_times = [0.08, 0.15, 0.25]  # Different delay times in seconds
-        delay_gains = [0.3, 0.2, 0.1]  # Decreasing gains
-
-        for delay_sec, gain in zip(delay_times, delay_gains):
-            delay_samples = int(delay_sec * sample_rate)
-            if delay_samples < num_samples:
-                for ch in range(num_channels):
-                    delayed = np.zeros(num_samples)
-                    delayed[delay_samples:] = audio_data[:-delay_samples, ch] * gain
-                    audio_data[:, ch] += delayed
-
-    # Normalize to avoid clipping
-    max_amplitude = np.max(np.abs(audio_data))
-    if max_amplitude > 0:
-        # Normalize to 85% volume
-        audio_data = audio_data / max_amplitude * 0.85
-
-    # Optional: apply gentle low-pass filter for smoother sound
-    if duration > 1:
-        # Simple averaging filter
-        filter_size = 3
-        if filter_size > 0:
+        # Single delay reverb (100ms delay)
+        delay_samples = int(0.1 * sample_rate)
+        if delay_samples < num_samples:
             for ch in range(num_channels):
-                filtered = np.convolve(audio_data[:, ch], np.ones(filter_size) / filter_size, mode="same")
-                audio_data[:, ch] = filtered
+                delayed = np.zeros(num_samples)
+                delayed[delay_samples:] = audio_data[:-delay_samples, ch] * 0.3
+                audio_data[:, ch] += delayed
+
+    # Step 4: Normalize audio to prevent clipping
+    # Find maximum amplitude and scale to 80% of maximum volume
+    max_amp = np.max(np.abs(audio_data))
+    if max_amp > 0:
+        audio_data = audio_data / max_amp * 0.8
 
     # Handle file saving
     audio_bytes = None
@@ -556,21 +453,32 @@ def preprocess_text(text):
     return text.lower().strip()
 
 
-def cosine_similarity_text(s1, s2):
-    """
-        Calculate cosine similarity between two text strings.
-        Notes:
-    ------
-    - Higher score means more similar texts
-    - Score of 1.0 means identical word composition (bag-of-words)
-    - Score of 0.0 means completely different vocabulary
-    """
-    from sklearn.feature_extraction.text import CountVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
+def cosine_similarity_text(text1, text2, n: int = 3):
+    from collections import Counter
 
-    vectorizer = CountVectorizer().fit_transform([preprocess_text(s1), preprocess_text(s2)])
-    vectors = vectorizer.toarray()
-    return cosine_similarity([vectors[0]], [vectors[1]])[0][0]
+    if not text1 or not text2:
+        return 0.0
+
+    text1 = preprocess_text(text1)
+    text2 = preprocess_text(text2)
+
+    ngrams1 = [text1[i : i + n] for i in range(len(text1) - n + 1)]
+    ngrams2 = [text2[i : i + n] for i in range(len(text2) - n + 1)]
+
+    counter1 = Counter(ngrams1)
+    counter2 = Counter(ngrams2)
+
+    all_ngrams = set(counter1.keys()) | set(counter2.keys())
+    vec1 = [counter1.get(ng, 0) for ng in all_ngrams]
+    vec2 = [counter2.get(ng, 0) for ng in all_ngrams]
+
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot_product / (norm1 * norm2)
 
 
 def convert_audio_to_text(audio_data):
