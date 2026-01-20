@@ -82,7 +82,7 @@ VAE patch parallelism distributes the VAE decode/encode workload across multiple
 
 !!! note "Enablement and feature gate"
     - VAE patch parallelism is currently **enabled only for validated pipelines** (currently: `Tongyi-MAI/Z-Image-Turbo`).
-    - Set `vae_use_tiling=True` to enable this feature. (We use `vae_use_tiling` as a safety gate because it indicates the VAE supports diffusers tiling parameters like `tile_latent_min_size` and `tile_overlap_factor`.)
+    - If `vae_patch_parallel_size > 1` is set for a validated pipeline, vLLM-Omni will automatically enable `vae_use_tiling` as a safety gate. (We use `vae_use_tiling` because it indicates the VAE supports diffusers tiling parameters like `tile_latent_min_size` and `tile_overlap_factor`.)
 
 #### Offline Inference
 

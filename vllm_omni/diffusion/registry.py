@@ -134,11 +134,6 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
-        # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
-            model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
-            model.vae.use_tiling = od_config.vae_use_tiling
 
         vae_pp_size = int(getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1))
         if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
@@ -147,8 +142,22 @@ def initialize_model(
                 vae_pp_size,
                 sorted(_VAE_PATCH_PARALLEL_ALLOWLIST),
             )
-        if vae_pp_size > 1 and not od_config.vae_use_tiling:
-            logger.warning("vae_patch_parallel_size=%d requires vae_use_tiling=True; ignoring.", vae_pp_size)
+        if (
+            vae_pp_size > 1
+            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+            and not od_config.vae_use_tiling
+        ):
+            logger.info(
+                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                vae_pp_size,
+            )
+            od_config.vae_use_tiling = True
+
+        # Configure VAE memory optimization settings from config
+        if hasattr(model.vae, "use_slicing"):
+            model.vae.use_slicing = od_config.vae_use_slicing
+        if hasattr(model.vae, "use_tiling"):
+            model.vae.use_tiling = od_config.vae_use_tiling
 
         if (
             vae_pp_size > 1
