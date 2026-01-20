@@ -4,15 +4,24 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
+import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 import base64
 import concurrent.futures
-import os
+import ctypes
+import signal
+import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import openai
 import pytest
 from vllm.assets.video import VideoAsset
+from vllm.utils.network_utils import get_open_port
 
 from tests.conftest import (
     OmniServer,
@@ -22,8 +31,6 @@ from tests.conftest import (
     modify_stage_config,
 )
 from vllm_omni.utils import is_rocm
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 

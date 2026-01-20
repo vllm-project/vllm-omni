@@ -132,9 +132,10 @@ class AsyncOmni(OmniBase):
             ring_degree = kwargs.get("ring_degree") or 1
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
+            cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
-            num_devices = sequence_parallel_size * tensor_parallel_size
+            num_devices = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
             for i in range(1, num_devices):
                 devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
@@ -144,7 +145,7 @@ class AsyncOmni(OmniBase):
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
-                cfg_parallel_size=1,
+                cfg_parallel_size=cfg_parallel_size,
             )
         default_stage_cfg = [
             {

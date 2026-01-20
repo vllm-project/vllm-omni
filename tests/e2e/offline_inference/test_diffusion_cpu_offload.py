@@ -1,11 +1,10 @@
 import sys
-import threading
-import time
 from pathlib import Path
 
 import pytest
 import torch
 
+from tests.utils import GPUMemoryMonitor
 from vllm_omni.utils.platform_utils import is_npu, is_rocm
 
 # ruff: noqa: E402
@@ -14,39 +13,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni import Omni
-
-
-class GPUMemoryMonitor:
-    """Poll global device memory usage via CUDA APIs."""
-
-    def __init__(self, device_index: int, interval: float = 0.05):
-        self.device_index = device_index
-        self.interval = interval
-        self.peak_used_mb = 0.0
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        def monitor_loop() -> None:
-            while not self._stop_event.is_set():
-                try:
-                    with torch.cuda.device(self.device_index):
-                        free_bytes, total_bytes = torch.cuda.mem_get_info()
-                    used_mb = (total_bytes - free_bytes) / (1024**2)
-                    self.peak_used_mb = max(self.peak_used_mb, used_mb)
-                except Exception:
-                    pass
-                time.sleep(self.interval)
-
-        self._thread = threading.Thread(target=monitor_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        if self._thread is None:
-            return
-        self._stop_event.set()
-        self._thread.join(timeout=2.0)
-
 
 models = ["riverclouds/qwen_image_random"]
 
@@ -73,13 +39,7 @@ def test_cpu_offload_diffusion_model(model_name: str):
             generator=torch.Generator("cuda").manual_seed(42),
         )
 
-        monitor.stop()
-        torch.cuda.synchronize(device_index)
-        fallback_alloc = torch.cuda.max_memory_allocated(device=device_index) / (1024**2)
-        fallback_reserved = torch.cuda.max_memory_reserved(device=device_index) / (1024**2)
-        peak_memory_mb = max(monitor.peak_used_mb, fallback_alloc, fallback_reserved)
-
-        return peak_memory_mb
+        return monitor.peak_used_mb
 
     offload_peak_memory = inference(offload=True)
     no_offload_peak_memory = inference(offload=False)
