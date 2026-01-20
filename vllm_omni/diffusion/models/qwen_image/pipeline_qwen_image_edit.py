@@ -717,8 +717,8 @@ class QwenImageEditPipeline(
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         """Forward pass for image editing."""
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        prompt = req.prompt
+        negative_prompt = req.negative_prompt
 
         # Get preprocessed image from request (pre-processing is done in DiffusionEngine)
         if hasattr(req, "preprocessed_image"):
