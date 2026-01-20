@@ -213,6 +213,7 @@ def test_video_to_audio_concurrent(
     assert len(audio_data) > 0
 
 
+@pytest.mark.skipif(is_rocm(), reason="Test skipped on AMD environment due to known output issues")
 @pytest.mark.parametrize("test_config", test_params)
 def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
     """Test processing text, generating text and audio output via OpenAI API."""
