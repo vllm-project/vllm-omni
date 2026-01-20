@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -95,6 +96,9 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
+    # Check if profiling is requested via environment variable
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
@@ -102,6 +106,10 @@ def main():
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
     )
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
 
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(
@@ -177,6 +185,23 @@ def main():
 
     export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
+
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
+            print("\n" + "=" * 60)
+            print("PROFILING RESULTS:")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
+            print("=" * 60)
+        else:
+            print("[Profiler] No valid profiling data returned.")
 
 
 if __name__ == "__main__":
