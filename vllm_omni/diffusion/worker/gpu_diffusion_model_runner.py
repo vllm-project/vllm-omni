@@ -207,10 +207,11 @@ class GPUDiffusionModelRunner:
                 start_time = time.time()
 
                 while True:
+                    get_key = f"omni_{from_stage}_to_{to_stage}_kv_cache_{req.request_id}"
                     result = self.connector.get(
                         from_stage=from_stage,
                         to_stage=to_stage,
-                        request_id=f"kv_cache_{req.request_id}",
+                        get_key=get_key,
                     )
                     if result:
                         break

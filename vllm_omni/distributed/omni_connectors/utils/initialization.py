@@ -91,6 +91,8 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
         # (Worker needs to create connectors to receive data)
         if to_stage == target_stage:
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": spec.extra}}
+        elif from_stage == target_stage and target_stage == "0":
+            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": spec.extra}}
 
     return stage_connectors_config
 

@@ -15,6 +15,12 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
+If you want to open async chunking for qwen3-omni, launch the server with command below
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
+```
+
 If you have custom stage configs file, launch the server with command below
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
@@ -238,4 +244,16 @@ The gradio script supports the following arguments:
 ??? abstract "run_gradio_demo.sh"
     ``````sh
     --8<-- "examples/online_serving/qwen3_omni/run_gradio_demo.sh"
+    ``````
+??? abstract "server-async-debug.log"
+    ``````log
+    --8<-- "examples/online_serving/qwen3_omni/server-async-debug.log"
+    ``````
+??? abstract "server-main.log"
+    ``````log
+    --8<-- "examples/online_serving/qwen3_omni/server-main.log"
+    ``````
+??? abstract "server.log"
+    ``````log
+    --8<-- "examples/online_serving/qwen3_omni/server.log"
     ``````

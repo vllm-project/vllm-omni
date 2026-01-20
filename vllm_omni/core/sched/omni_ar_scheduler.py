@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -18,6 +19,10 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+from vllm_omni.distributed.omni_connectors.adapter import get_chunk, put_chunk
+from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 logger = init_logger(__name__)
 
@@ -59,6 +64,25 @@ class OmniARScheduler(VLLMScheduler):
 
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
+        model_config = self.vllm_config.model_config
+        self.omni_connector = None
+        if model_config.async_chunk:
+            connector_config = model_config.stage_connector_config
+            connector_specs = ConnectorSpec(
+                name=connector_config.get("name", "SharedMemoryConnector"),
+                extra=connector_config.get("extra", {}),
+            )
+            self.omni_connector = OmniConnectorFactory.create_connector(connector_specs)
+
+            custom_process_next_stage_input_func = getattr(
+                self.vllm_config.model_config, "custom_process_next_stage_input_func", None
+            )
+            if custom_process_next_stage_input_func:
+                module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
+                module = importlib.import_module(module_path)
+                self.custom_process_next_stage_input_func = getattr(module, func_name)
+
+        self.stage_id = getattr(self.vllm_config.model_config, "stage_id", None)
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -156,6 +180,8 @@ class OmniARScheduler(VLLMScheduler):
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
+            if self.omni_connector is not None:
+                get_chunk(self.omni_connector, scheduler_output)
 
             # Add information about requests needing KV cache transfer
             scheduler_output.finished_requests_needing_kv_transfer = self.get_finished_requests_needing_kv_transfer()
@@ -337,6 +363,9 @@ class OmniARScheduler(VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
+                if self.omni_connector is not None:
+                    custom_process_next_stage_input_func = self.custom_process_next_stage_input_func
+                    put_chunk(self.omni_connector, pooler_output, request, custom_process_next_stage_input_func)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors

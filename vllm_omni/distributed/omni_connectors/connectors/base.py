@@ -13,15 +13,13 @@ class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 
     @abstractmethod
-    def put(
-        self, from_stage: str, to_stage: str, request_id: str, data: Any
-    ) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.
 
         Args:
             from_stage: Source stage identifier
             to_stage: Destination stage identifier
-            request_id: Unique request identifier
+            put_key: Unique request identifier
             data: Python object to store
 
         Returns:
@@ -31,16 +29,13 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def get(
-        self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
-    ) -> tuple[Any, int] | None:
+    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
         """Retrieve Python object and payload size (bytes).
 
         Args:
             from_stage: Source stage identifier
             to_stage: Destination stage identifier
-            request_id: Unique request identifier
-            metadata: Optional transport-specific metadata from the put operation
+            get_key: Unique request identifier
 
         Returns:
             Tuple of (Python object, serialized byte size) if found, None otherwise

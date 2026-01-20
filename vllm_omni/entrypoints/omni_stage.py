@@ -673,12 +673,15 @@ def _stage_worker(
                 e,
             )
     # Init engine based on stage_type
-    logger.debug(
-        "[Stage-%s] Initializing %s engine with args keys=%s",
-        stage_id,
-        stage_type,
-        list(engine_args.keys()),
-    )
+    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
+    if engine_args.get("async_chunk", False):
+        logger.debug("[Stage-%s] Async chunk enabled, injecting connectors config", stage_id)
+        stage_connector_spec = {}
+        for v in connectors_config.values():
+            stage_connector_spec = dict(v.get("spec", {}))
+            break
+        engine_args["stage_connector_spec"] = stage_connector_spec
+        engine_args["stage_id"] = stage_id
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage", None)
@@ -1206,6 +1209,14 @@ async def _stage_worker_async(
         stage_type,
         list(engine_args.keys()),
     )
+    if engine_args.get("async_chunk", False):
+        logger.debug("[Stage-%s] Async chunk enabled, injecting connectors config", stage_id)
+        stage_connector_spec = {}
+        for v in connectors_config.values():
+            stage_connector_spec = dict(v.get("spec", {}))
+            break
+        engine_args["stage_connector_spec"] = stage_connector_spec
+        engine_args["stage_id"] = stage_id
     try:
         if stage_type == "diffusion":
             # For diffusion, we need to extract diffusion-specific config

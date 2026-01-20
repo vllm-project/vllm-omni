@@ -53,8 +53,10 @@ Engine classes for offline and online inference.
 
 Core scheduling and caching components.
 
+- [vllm_omni.core.sched.omni_ar_scheduler.KVCacheTransferData][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
+- [vllm_omni.core.sched.output.OmniCachedRequestData][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedGroupResidualVectorQuantization][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedResidualVectorQuantization][]
