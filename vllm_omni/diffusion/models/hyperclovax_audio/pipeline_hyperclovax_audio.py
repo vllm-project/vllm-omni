@@ -13,6 +13,7 @@ import numpy as np
 
 from typing import Any, Dict, List, Iterable, Tuple, Optional
 from librosa.filters import mel as librosa_mel_fn
+from pydub import AudioSegment
 
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -60,7 +61,29 @@ def get_hyperclovax_audio_post_process_func(od_config: OmniDiffusionConfig):
 
     Returns a function that converts model output tensors to audio file.
     """
-    pass
+    def post_process_func(output: List[Tuple[torch.Tensor, str]]) -> List[bytes]:
+        response = []
+        for wav_tensor, fmt in output:
+            wav = wav_tensor.squeeze().cpu().numpy()
+            pcm = (wav * 32767.0).astype(np.int16)
+
+            if fmt == "pcm":
+                response.append(pcm.tobytes())
+                continue
+
+            segment = AudioSegment(
+                pcm.tobytes(),
+                frame_rate=sample_rate,
+                sample_width=pcm.dtype.itemsize,
+                channels=1
+            )
+
+            buf = io.BytesIO()
+            export_kwargs = {"format": fmt}
+            segment.export(buf, **export_kwargs)
+            response.append(buf.getvalue())
+
+    return post_process_func
 
 
 class HyperCLOVAXAudioPipeline(nn.Module):
@@ -74,6 +97,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         super().__init__()
         self.od_config = od_config
         self.device = get_local_device()
+        self._dtype = od_config.dtype
 
         self.model = self.od_config.model
         self.weights_sources = [
@@ -327,8 +351,14 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         return down_sample_rate
 
     def _detect_audio_format(self, header_bytes: bytes) -> Optional[str]:
-        for magic, fmt in AUDIO_FORMAT_MAP:
-            if header_bytes.startswith(magic):
+        """
+        Detect audio format from header bytes of audio file.
+        
+        Args:
+            header_bytes: first 4 bytes of audio file.
+        """
+        for prefix_bytes, fmt in AUDIO_FORMAT_MAP:
+            if header_bytes.startswith(prefix_bytes):
                 return fmt
         return None
 
