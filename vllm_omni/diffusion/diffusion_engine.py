@@ -132,7 +132,9 @@ class DiffusionEngine:
             if not isinstance(images, list):
                 images = [images] if images is not None else []
 
-            is_stable_audio = self.od_config.model_class_name == "StableAudioPipeline"
+            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+            output_type = getattr(model_cls, "output_type", "image") if model_cls is not None else "image"
+            is_audio_output = output_type == "audio"
 
             # Handle single request or multiple requests
             if len(requests) == 1:
@@ -147,7 +149,7 @@ class DiffusionEngine:
                 if output.trajectory_timesteps is not None:
                     metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
-                if is_stable_audio:
+                if is_audio_output:
                     audio_payload = images[0] if len(images) == 1 else images
                     return OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -187,7 +189,7 @@ class DiffusionEngine:
                     if output.trajectory_timesteps is not None:
                         metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
-                    if is_stable_audio:
+                    if is_audio_output:
                         audio_payload = request_images[0] if len(request_images) == 1 else request_images
                         results.append(
                             OmniRequestOutput.from_diffusion(
