@@ -32,7 +32,7 @@ class Res2Conv1dReluBn(nn.Module):
         scale=4,
     ):
         super().__init__()
-        assert channels % scale == 0, "{} % {} != 0".format(channels, scale)
+        assert channels % scale == 0, f"{channels} % {scale} != 0"
         self.scale = scale
         self.width = channels // scale
         self.nums = scale if scale == 1 else scale - 1
@@ -182,8 +182,8 @@ class AttentiveStatsPool(nn.Module):
 """ Implementation of
     "ECAPA-TDNN: Emphasized Channel Attention, Propagation and Aggregation in TDNN Based Speaker Verification".
 
-    Note that we DON'T concatenate the last frame-wise layer with non-weighted mean and standard deviation, 
-    because it brings little improvment but significantly increases model parameters. 
+    Note that we DON'T concatenate the last frame-wise layer with non-weighted mean and standard deviation,
+    because it brings little improvement but significantly increases model parameters.
     As a result, this implementation basically equals the A.2 of Table 2 in the paper.
 """
 

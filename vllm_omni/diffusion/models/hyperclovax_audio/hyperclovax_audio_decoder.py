@@ -8,7 +8,6 @@
 import json
 import math
 from pathlib import Path
-from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -23,7 +22,7 @@ from vllm_omni.diffusion.models.hyperclovax_audio.ecapa_tdnn import ECAPA_TDNN
 # Dataclass for model hyper-parameters
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
-        super(AttrDict, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.__dict__ = self
 
 
@@ -231,8 +230,10 @@ class AMPBlock1(torch.nn.Module):
         h (AttrDict): Hyperparameters.
         channels (int): Number of convolution channels.
         kernel_size (int): Size of the convolution kernel. Default is 3.
-        dilation (tuple): Dilation rates for the convolutions. Each dilation layer has two convolutions. Default is (1, 3, 5).
-        activation (str): Activation function type. Should be either 'snake' or 'snakebeta'. Default is None.
+        dilation (tuple): Dilation rates for the convolutions. Each dilation layer has two convolutions.
+                          Default is (1, 3, 5).
+        activation (str): Activation function type. Should be either 'snake' or 'snakebeta'.
+                          Default is None.
     """
 
     def __init__(
@@ -279,9 +280,7 @@ class AMPBlock1(torch.nn.Module):
         )
         self.convs2.apply(init_weights)
 
-        self.num_layers = len(self.convs1) + len(
-            self.convs2
-        )  # Total number of conv layers
+        self.num_layers = len(self.convs1) + len(self.convs2)  # Total number of conv layers
 
         # Activation functions
         if activation == "snakebeta":
@@ -305,9 +304,7 @@ class AMPBlock1(torch.nn.Module):
 
         hidden_states_new = []
         acts1, acts2 = self.activations[::2], self.activations[1::2]
-        for c1, c2, a1, a2, (h_a1, h_c1, h_a2, h_c2) in zip(
-            self.convs1, self.convs2, acts1, acts2, hidden_states
-        ):
+        for c1, c2, a1, a2, (h_a1, h_c1, h_a2, h_c2) in zip(self.convs1, self.convs2, acts1, acts2, hidden_states):
             xt, ht_a1 = a1(x, h_a1)
             xt, ht_c1 = c1(xt, h_c1)
             xt, ht_a2 = a2(xt, h_a2)
@@ -318,15 +315,16 @@ class AMPBlock1(torch.nn.Module):
         return x, hidden_states_new
 
     def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm(l)
-        for l in self.convs2:
-            remove_weight_norm(l)
+        for layer in self.convs1:
+            remove_weight_norm(layer)
+        for layer in self.convs2:
+            remove_weight_norm(layer)
 
 
 class HyperCLOVAXAudioDecoderModel(nn.Module):
     """
-    HyperCLOVAXAudioDecoderModel is a neural vocoder model that applies anti-aliased periodic activation for residual blocks (resblocks).
+    HyperCLOVAXAudioDecoderModel is a neural vocoder model that applies anti-aliased periodic activation
+    for residual blocks (resblocks).
 
     Args:
         od_config (OmniDiffusionConfig): Configuration object containing model hyperparameters.
@@ -341,11 +339,11 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         resblock: str = "1",
         causal: bool = False,
         finetune: bool = False,
-        upsample_rates: List[int] = [5,4,4,3,2,2],
-        upsample_kernel_sizes: List[int] = [10,8,8,6,4,4],
+        upsample_rates: list[int] = [5, 4, 4, 3, 2, 2],
+        upsample_kernel_sizes: list[int] = [10, 8, 8, 6, 4, 4],
         upsample_initial_channel: int = 1536,
-        resblock_kernel_sizes: List[int] = [3,7,11],
-        resblock_dilation_sizes: List[List[int]] = [[1,3,5], [1,3,5], [1,3,5]],
+        resblock_kernel_sizes: list[int] = [3, 7, 11],
+        resblock_dilation_sizes: list[list[int]] = [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
         use_tanh_at_final: bool = False,
         use_bias_at_final: bool = False,
         activation: str = "snakebeta",
@@ -362,7 +360,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         sampling_rate: int = 24000,
         fmin: int = 0,
         fmax: int = 8000,
-        num_spk: int = 26
+        num_spk: int = 26,
     ):
         super().__init__()
 
@@ -398,9 +396,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
 
         self.causal = self.h.get("causal", True)
         conv1d = CausalConv1d if self.causal else NonCausalConv1d
-        convtranspose1d = (
-            CausalConvTranspose1d if self.causal else NonCausalConvTranspose1d
-        )
+        convtranspose1d = CausalConvTranspose1d if self.causal else NonCausalConvTranspose1d
 
         self.num_kernels = len(self.h.resblock_kernel_sizes)
         self.num_upsamples = len(self.h.upsample_rates)
@@ -430,9 +426,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         if self.h.resblock == "1":
             resblock_class = AMPBlock1
         else:
-            raise ValueError(
-                f"Incorrect resblock class specified in hyperparameters. Got {self.h.resblock}"
-            )
+            raise ValueError(f"Incorrect resblock class specified in hyperparameters. Got {self.h.resblock}")
 
         # Transposed conv-based upsamplers. does not apply anti-aliasing
         self.ups = nn.ModuleList()
@@ -456,20 +450,14 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = self.h.upsample_initial_channel // (2 ** (i + 1))
-            for j, (k, d) in enumerate(
-                zip(self.h.resblock_kernel_sizes, self.h.resblock_dilation_sizes)
-            ):
+            for j, (k, d) in enumerate(zip(self.h.resblock_kernel_sizes, self.h.resblock_dilation_sizes)):
                 self.resblocks.append(
-                    resblock_class(
-                        self.h, ch, k, d, activation=self.h.activation, causal=self.causal
-                    )
+                    resblock_class(self.h, ch, k, d, activation=self.h.activation, causal=self.causal)
                 )
 
         # Post-conv
         activation_post = (
-            SnakeBeta(ch, alpha_logscale=self.h.snake_logscale)
-            if self.h.activation == "snakebeta"
-            else None
+            SnakeBeta(ch, alpha_logscale=self.h.snake_logscale) if self.h.activation == "snakebeta" else None
         )
         if activation_post is None:
             raise NotImplementedError(
@@ -525,8 +513,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
                 hidden_states_new.append(h)
             # AMP blocks
             resblock_outputs = [
-                self.resblocks[i * self.num_kernels + j](x, next(hidden_state_iter))
-                for j in range(self.num_kernels)
+                self.resblocks[i * self.num_kernels + j](x, next(hidden_state_iter)) for j in range(self.num_kernels)
             ]
             x = sum(o for o, _ in resblock_outputs) / self.num_kernels
             hidden_states_new.extend([h for _, h in resblock_outputs])
@@ -547,11 +534,11 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
     def remove_weight_norm(self):
         try:
             print("Removing weight norm...")
-            for l in self.ups:
-                for l_i in l:
+            for layer in self.ups:
+                for l_i in layer:
                     remove_weight_norm(l_i)
-            for l in self.resblocks:
-                l.remove_weight_norm()
+            for layer in self.resblocks:
+                layer.remove_weight_norm()
             remove_weight_norm(self.conv_pre)
             remove_weight_norm(self.conv_post)
         except ValueError:
@@ -562,7 +549,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
     def from_pretrained(
         cls,
         ckpt_path: str,
-        config_path: Optional[str] = None,
+        config_path: str | None = None,
         map_location: str = "cpu",  # Additional argument
     ):
         """Load Pytorch pretrained weights and return the loaded model."""

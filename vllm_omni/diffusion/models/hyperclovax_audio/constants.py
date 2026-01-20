@@ -24,7 +24,7 @@ SPEAKERS_LIST = [
     "mmhb",
     "mngm",
     "msnh",
-    "mjhh"
+    "mjhh",
 ]
 
 FORMAT_MIME_MAP = {
@@ -39,14 +39,14 @@ FORMAT_MIME_MAP = {
 DEFAULT_FORMAT = "wav"
 
 AUDIO_FORMAT_MAP = [
-    (b"RIFF", "wav"),                      # WAV (RIFF container)
-    (b"\x1a\x45\xdf\xa3", "webm"),         # WebM / MKV (EBML header)
-    (b"OggS", "ogg"),                      # OGG
-    (b"fLaC", "flac"),                     # FLAC
-    (b"ID3", "mp3"),                       # MP3 with ID3 tag
-    (b"\xff\xfb", "mp3"),                  # MP3 without ID3
-    (b"\x00\x00\x00\x1c", "mp4"),          # MP4 / M4A
-    (b"\x00\x00\x00\x20", "mp4"),          # MP4 / M4A
+    (b"RIFF", "wav"),  # WAV (RIFF container)
+    (b"\x1a\x45\xdf\xa3", "webm"),  # WebM / MKV (EBML header)
+    (b"OggS", "ogg"),  # OGG
+    (b"fLaC", "flac"),  # FLAC
+    (b"ID3", "mp3"),  # MP3 with ID3 tag
+    (b"\xff\xfb", "mp3"),  # MP3 without ID3
+    (b"\x00\x00\x00\x1c", "mp4"),  # MP4 / M4A
+    (b"\x00\x00\x00\x20", "mp4"),  # MP4 / M4A
 ]
 
 VOLUME_LEVEL_DB = -26

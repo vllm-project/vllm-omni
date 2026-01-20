@@ -5,9 +5,8 @@ import math
 
 import torch
 import torch.nn.functional as F
-from torch import nn, sin, pow
+from torch import nn, pow, sin
 from torch.nn import Parameter
-
 
 if "sinc" in dir(torch):
     sinc = torch.sinc
@@ -30,9 +29,7 @@ else:
 # This code is adopted from adefossez's julius.lowpass.LowPassFilters under the MIT License
 # https://adefossez.github.io/julius/julius/lowpass.html
 # See NOTICE file for license details.
-def kaiser_sinc_filter1d(
-    cutoff, half_width, kernel_size
-):  # return filter [1,1,kernel_size]
+def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):  # return filter [1,1,kernel_size]
     even = kernel_size % 2 == 0
     half_size = kernel_size // 2
 
@@ -57,7 +54,8 @@ def kaiser_sinc_filter1d(
     else:
         filter_ = 2 * cutoff * window * sinc(2 * cutoff * time)
         """
-        Normalize filter to have sum = 1, otherwise we will have a small leakage of the constant component in the input signal.
+        Normalize filter to have sum = 1,
+        otherwise we will have a small leakage of the constant component in the input signal.
         """
         filter_ /= filter_.sum()
         filter = filter_.view(1, 1, kernel_size)
@@ -167,9 +165,7 @@ class DownSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, causal=False):
         super().__init__()
         self.ratio = ratio
-        self.kernel_size = (
-            int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        )
+        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         self.lowpass = LowPassFilter1d(
             cutoff=0.5 / ratio,
             half_width=0.6 / ratio,
@@ -194,17 +190,16 @@ class SnakeBeta(nn.Module):
         - alpha - trainable parameter that controls frequency
         - beta - trainable parameter that controls magnitude
     References:
-        - This activation function is a modified version based on this paper by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-        https://arxiv.org/abs/2006.08195
+        - This activation function is a modified version based on this paper
+          by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
+          https://arxiv.org/abs/2006.08195
     Examples:
         >>> a1 = snakebeta(256)
         >>> x = torch.randn(256)
         >>> x = a1(x)
     """
 
-    def __init__(
-        self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False
-    ):
+    def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
         """
         Initialization.
         INPUT:
@@ -215,7 +210,7 @@ class SnakeBeta(nn.Module):
             beta is initialized to 1 by default, higher values = higher-magnitude.
             alpha will be trained along with the rest of your model.
         """
-        super(SnakeBeta, self).__init__()
+        super().__init__()
         self.in_features = in_features
 
         # Initialize alpha
