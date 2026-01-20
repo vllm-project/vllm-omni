@@ -1,4 +1,4 @@
-"""Thin Omni wrapper: reuse upstream Qwen2.5-Omni thinker (v0.12) with minimal overrides."""
+"""Thin Omni wrapper: reuse upstream Qwen2.5-Omni thinker (v0.14) with minimal overrides."""
 
 from collections.abc import Iterable
 from typing import Any
@@ -12,6 +12,7 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
     Qwen2_5OmniAudioEncoder,
 )
 from vllm.config import VllmConfig
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -26,8 +27,6 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerDummyInputsBuilder,
     Qwen2_5OmniThinkerMultiModalProcessor,
     Qwen2_5OmniThinkerProcessingInfo,
-    get_llm_pos_ids_for_vision,
-    split_list_into_ranges,
 )
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin as Qwen2_5OmniConditionalGenerationMixinBase,
@@ -46,7 +45,9 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
+    split_list_into_ranges,
 )
+from vllm.model_executor.models.vision import get_llm_pos_ids_for_vision
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -166,6 +167,43 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
                 video_grid_thw=video_grid_thw,
             )
 
+    def _process_image_input(self, image_input: Qwen2_5_VLImageInputs) -> tuple[torch.Tensor, ...]:
+        if image_input["type"] == "image_embeds":
+            return image_input["image_embeds"].type(self.visual.dtype)
+
+        grid_thw = image_input["image_grid_thw"]
+        assert grid_thw.ndim == 2
+
+        pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+        with set_forward_context(None, self.vllm_config):
+            image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+        # Split concatenated embeddings for each image item.
+        merge_size = self.visual.spatial_merge_size
+        sizes = grid_thw.prod(-1) // merge_size // merge_size
+
+        return image_embeds.split(sizes.tolist())
+
+    def _process_video_input(
+        self,
+        video_input: Qwen2_5_VLVideoInputs,
+        video_hashes: list[str] = None,
+        cached_video_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if video_input["type"] == "video_embeds":
+            return video_input["video_embeds"].type(self.visual.dtype)
+
+        grid_thw = video_input["video_grid_thw"]
+        assert grid_thw.ndim == 2
+
+        pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
+        with set_forward_context(None, self.vllm_config):
+            video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
+        # Split concatenated embeddings for each video item.
+        merge_size = self.visual.spatial_merge_size
+        sizes = grid_thw.prod(-1) // merge_size // merge_size
+
+        return video_embeds.split(sizes.tolist())
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen2_5OmniThinkerMultiModalProcessor,
@@ -180,8 +218,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     SupportsMRoPE,
     Qwen2_5OmniConditionalGenerationMixin,
 ):
-    merge_by_field_config = True
-
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "thinker.lm_head.": "language_model.lm_head.",
@@ -250,6 +286,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
+                multimodal_config=multimodal_config,
             )
         else:
             self.visual = None

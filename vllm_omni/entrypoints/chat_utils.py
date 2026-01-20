@@ -22,7 +22,6 @@ from vllm.entrypoints.chat_utils import (
     _postprocess_messages,
     _ToolParser,
 )
-from vllm.transformers_utils.tokenizer import AnyTokenizer
 
 
 class OmniAsyncMultiModalItemTracker(AsyncMultiModalItemTracker):
@@ -129,7 +128,6 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
 def parse_chat_messages_futures(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
-    tokenizer: AnyTokenizer,
     content_format: _ChatTemplateContentFormat,
     mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> tuple[
@@ -138,7 +136,7 @@ def parse_chat_messages_futures(
     MultiModalUUIDDict | None,
 ]:
     conversation: list[ConversationMessage] = []
-    mm_tracker = OmniAsyncMultiModalItemTracker(model_config, tokenizer)
+    mm_tracker = OmniAsyncMultiModalItemTracker(model_config)
 
     for msg in messages:
         sub_messages = _parse_chat_message_content(

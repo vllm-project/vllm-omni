@@ -30,8 +30,6 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import device_count
 from vllm_omni.diffusion.envs import get_device_name
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 # Use random weights model for testing
 models = ["riverclouds/qwen_image_random"]
 

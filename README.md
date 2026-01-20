@@ -15,7 +15,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 ---
 
 *Latest News* 🔥
-
+- [2026/01] We released [0.14.0rc1](https://github.com/vllm-project/vllm-omni/releases/tag/v0.14.0).
 - [2026/01] We released [0.12.0rc1](https://github.com/vllm-project/vllm-omni/releases/tag/v0.12.0rc1) - a major RC milestone focused on maturing the diffusion stack, strengthening OpenAI-compatible serving, expanding omni-model coverage, and improving stability across platforms (GPU/NPU/ROCm), please check our latest [design](https://docs.google.com/presentation/d/1qv4qMW1rKAqDREMXiUDLIgqqHQe7TDPj/edit?usp=sharing&ouid=110473603432222024453&rtpof=true&sd=true).
 - [2025/11] vLLM community officially released [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) in order to support omni-modality models serving.
 

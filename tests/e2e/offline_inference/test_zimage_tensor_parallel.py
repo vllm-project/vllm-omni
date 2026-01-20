@@ -23,7 +23,8 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import is_npu, is_rocm
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 
@@ -129,8 +130,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
-    height = 256
-    width = 256
+    height = 512
+    width = 512
     num_inference_steps = 2
     seed = 42
 
