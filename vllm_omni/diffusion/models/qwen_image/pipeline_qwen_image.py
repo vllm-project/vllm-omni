@@ -642,8 +642,8 @@ class QwenImagePipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: str | list[str] = "",
-        negative_prompt: str | list[str] = "",
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
         true_cfg_scale: float = 4.0,
         height: int | None = None,
         width: int | None = None,
