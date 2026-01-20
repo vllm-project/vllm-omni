@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""Unit tests for VAE patch/tile parallelism helpers (CPU-only)."""
+
 import pytest
 
 from vllm_omni.diffusion.distributed import vae_patch_parallel as pp
