@@ -178,6 +178,25 @@ omni = Omni(
 outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
 ```
 
+### Using Tensor Parallelism
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+)
+
+outputs = omni.generate(
+    prompt="a cat reading a book",
+    num_inference_steps=9,
+    width=512,
+    height=512,
+)
+```
+
 ### Using CFG-Parallel
 
 Run image-to-image:
