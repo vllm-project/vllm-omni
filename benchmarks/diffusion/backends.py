@@ -192,7 +192,7 @@ async def async_request_sglang_images(
     return output
 
 
-backends_function_mapping = dict(
-    omni=(async_request_chat_completions, "/v1/chat/completions"),
-    sglang=(async_request_sglang_images, "/v1/images/generations"),
-)
+backends_function_mapping = {
+    "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
+    "sglang": (async_request_sglang_images, "/v1/images/generations"),
+}
