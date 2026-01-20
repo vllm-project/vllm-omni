@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from typing import Any, Dict, List, Iterable, Tuple, Optional
+from typing import Any, Dict, List, Iterable, Tuple, Optional, Union
 from librosa.filters import mel as librosa_mel_fn
 from pydub import AudioSegment
 
@@ -85,10 +85,12 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                 fall_back_to_pt=True
             )
         ]
+        
         self.bigvgan = HyperCLOVAXAudioDecoderModel(
             od_config=od_config
-        )
-        self.spk_emb = self.bigvgan.spk_emb
+        ).to(self.device)
+
+        self.spk_emb = self.bigvgan.spk_emb.to(self.device)
         self._vocab = int(getattr(self.bigvgan.h, "num_units", 0))
 
         speakers = SPEAKERS_LIST
@@ -117,6 +119,8 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         """
         batch = []
         for units, speaker, fmt, ref_audio in zip(audio_tokens, speakers, formats, ref_audio_tokens):
+            units = torch.tensor(units, dtype=torch.long, device=self.device)
+
             if self._vocab > 0:
                 mask = (units < 0) | (units >= self._vocab)
                 if mask.any():
@@ -141,6 +145,8 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                         f"Unsupported format '{fmt}'. Choose from {list(FORMAT_MIME_MAP)}"
                     )
                 speaker_id = torch.tensor([self.speaker_map[speaker]], dtype=torch.long)
+                speaker_id = speaker_id.unsqueeze(0).to(self.device)
+
                 batch.append((units, speaker_id, fmt))
 
         return batch

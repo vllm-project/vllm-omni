@@ -5,7 +5,7 @@ from vllm_omni.diffusion.models.hyperclovax_audio.hyperclovax_audio_decoder impo
     HyperCLOVAXAudioDecoderModel,
 )
 
-from vllm_omni.diffusion.models.hyperclovax_vision.pipeline_hyperclovax_audio import (
+from vllm_omni.diffusion.models.hyperclovax_audio.pipeline_hyperclovax_audio import (
     HyperCLOVAXAudioPipeline,
     get_hyperclovax_audio_post_process_func,
 )

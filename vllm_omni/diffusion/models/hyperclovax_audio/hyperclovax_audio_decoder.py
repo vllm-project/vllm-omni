@@ -340,7 +340,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         od_config: OmniDiffusionConfig,
         resblock: str = "1",
         causal: bool = False,
-        finetune: bool = False,
+        finetune: bool = True,
         upsample_rates: List[int] = [5,4,4,3,2,2],
         upsample_kernel_sizes: List[int] = [10,8,8,6,4,4],
         upsample_initial_channel: int = 1536,
@@ -362,6 +362,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         sampling_rate: int = 24000,
         fmin: int = 0,
         fmax: int = 8000,
+        num_spk: int = 26
     ):
         super().__init__()
 
@@ -391,6 +392,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
                 "sampling_rate": sampling_rate,
                 "fmin": fmin,
                 "fmax": fmax,
+                "num_spk": num_spk,
             }
         )
 
