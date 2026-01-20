@@ -197,6 +197,28 @@ outputs = omni.generate(
 )
 ```
 
+### Using VAE Patch Parallelism
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=2,
+    ),
+)
+
+outputs = omni.generate(
+    prompt="a cat reading a book",
+    num_inference_steps=9,
+    width=1024,
+    height=1024,
+)
+```
+
 ### Using CFG-Parallel
 
 Run image-to-image:
