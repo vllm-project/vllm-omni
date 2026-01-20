@@ -3,7 +3,7 @@
 
 import pytest
 
-from vllm_omni.diffusion.vae import patch_parallelism as pp
+from vllm_omni.diffusion.distributed import vae_patch_parallel as pp
 
 
 class _DummyConfig:

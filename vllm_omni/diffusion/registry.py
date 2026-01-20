@@ -13,6 +13,8 @@ from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
 logger = init_logger(__name__)
 
+logger = init_logger(__name__)
+
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
     "QwenImagePipeline": (
@@ -137,17 +139,29 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+
+        vae_pp_size = int(getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1))
+        if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
+            logger.warning(
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is only enabled for %s; ignoring.",
+                vae_pp_size,
+                sorted(_VAE_PATCH_PARALLEL_ALLOWLIST),
+            )
+        if vae_pp_size > 1 and not od_config.vae_use_tiling:
+            logger.warning("vae_patch_parallel_size=%d requires vae_use_tiling=True; ignoring.", vae_pp_size)
+
         if (
-            hasattr(model, "vae")
-            and hasattr(od_config, "parallel_config")
+            vae_pp_size > 1
+            and hasattr(model, "vae")
             and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+            and od_config.vae_use_tiling
         ):
             from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-            from vllm_omni.diffusion.vae.patch_parallelism import maybe_install_vae_patch_parallelism
+            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_install_vae_patch_parallelism
 
             maybe_install_vae_patch_parallelism(
                 model,
-                vae_patch_parallel_size=od_config.parallel_config.vae_patch_parallel_size,
+                vae_patch_parallel_size=vae_pp_size,
                 group_getter=get_dit_group,
             )
 
