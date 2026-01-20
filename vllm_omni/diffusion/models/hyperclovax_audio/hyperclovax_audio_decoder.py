@@ -8,13 +8,14 @@
 import json
 import math
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.hyperclovax_audio.activations import Activation1d, SnakeBeta
 from vllm_omni.diffusion.models.hyperclovax_audio.ecapa_tdnn import ECAPA_TDNN
 
@@ -328,7 +329,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
     HyperCLOVAXAudioDecoderModel is a neural vocoder model that applies anti-aliased periodic activation for residual blocks (resblocks).
 
     Args:
-        h (AttrDict): Hyperparameters.
+        od_config (OmniDiffusionConfig): Configuration object containing model hyperparameters.
 
     Note:
         Ensure that the activation function is correctly specified in the hyperparameters (h.activation).
@@ -337,60 +338,109 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
-        h: AttrDict
+        resblock: str = "1",
+        causal: bool = False,
+        finetune: bool = False,
+        upsample_rates: List[int] = [5,4,4,3,2,2],
+        upsample_kernel_sizes: List[int] = [10,8,8,6,4,4],
+        upsample_initial_channel: int = 1536,
+        resblock_kernel_sizes: List[int] = [3,7,11],
+        resblock_dilation_sizes: List[List[int]] = [[1,3,5], [1,3,5], [1,3,5]],
+        use_tanh_at_final: bool = False,
+        use_bias_at_final: bool = False,
+        activation: str = "snakebeta",
+        snake_logscale: bool = True,
+        num_units: int = 6561,
+        unit_emb_dim: int = 1280,
+        num_mels: int = 100,
+        n_fft: int = 1024,
+        hop_size: int = 256,
+        win_size: int = 1024,
+        spk_emb_dim: int = 256,
+        spk_hidden_dim: int = 512,
+        global_context_att: bool = False,
+        sampling_rate: int = 24000,
+        fmin: int = 0,
+        fmax: int = 8000,
     ):
         super().__init__()
 
-        self.h = h
-        self.od_config = od_config
+        self.h = AttrDict(
+            {
+                "resblock": resblock,
+                "causal": causal,
+                "finetune": finetune,
+                "upsample_rates": upsample_rates,
+                "upsample_kernel_sizes": upsample_kernel_sizes,
+                "upsample_initial_channel": upsample_initial_channel,
+                "resblock_kernel_sizes": resblock_kernel_sizes,
+                "resblock_dilation_sizes": resblock_dilation_sizes,
+                "use_tanh_at_final": use_tanh_at_final,
+                "use_bias_at_final": use_bias_at_final,
+                "activation": activation,
+                "snake_logscale": snake_logscale,
+                "num_units": num_units,
+                "unit_emb_dim": unit_emb_dim,
+                "num_mels": num_mels,
+                "n_fft": n_fft,
+                "hop_size": hop_size,
+                "win_size": win_size,
+                "spk_emb_dim": spk_emb_dim,
+                "spk_hidden_dim": spk_hidden_dim,
+                "global_context_att": global_context_att,
+                "sampling_rate": sampling_rate,
+                "fmin": fmin,
+                "fmax": fmax,
+            }
+        )
 
-        self.causal = h.get("causal", True)
+        self.causal = self.h.get("causal", True)
         conv1d = CausalConv1d if self.causal else NonCausalConv1d
         convtranspose1d = (
             CausalConvTranspose1d if self.causal else NonCausalConvTranspose1d
         )
 
-        self.num_kernels = len(h.resblock_kernel_sizes)
-        self.num_upsamples = len(h.upsample_rates)
+        self.num_kernels = len(self.h.resblock_kernel_sizes)
+        self.num_upsamples = len(self.h.upsample_rates)
 
-        self.finetune = getattr(h, "finetune", False)
+        self.finetune = getattr(self.h, "finetune", False)
         # Speaker embedding
         if not self.finetune:
             self.spk_emb = ECAPA_TDNN(
-                in_channel=h.num_mels,
-                hidden_channel=h.spk_hidden_dim,
-                emb_dim=h.spk_emb_dim,
-                global_context_att=h.global_context_att,
+                in_channel=self.h.num_mels,
+                hidden_channel=self.h.spk_hidden_dim,
+                emb_dim=self.h.spk_emb_dim,
+                global_context_att=self.h.global_context_att,
             )
         else:
-            self.spk_emb = nn.Embedding(h.num_spk, h.spk_emb_dim)
+            self.spk_emb = nn.Embedding(self.h.num_spk, self.h.spk_emb_dim)
 
         # Unit embedding
-        self.unit_emb = nn.Embedding(h.num_units, h.unit_emb_dim)
-        self.unit_emb_dim = h.unit_emb_dim
+        self.unit_emb = nn.Embedding(self.h.num_units, self.h.unit_emb_dim)
+        self.unit_emb_dim = self.h.unit_emb_dim
 
         # Pre-conv
         self.conv_pre = conv1d(
-            h.unit_emb_dim + h.spk_emb_dim, h.upsample_initial_channel, 7, 1, padding=3
+            self.h.unit_emb_dim + self.h.spk_emb_dim, self.h.upsample_initial_channel, 7, 1, padding=3
         )
 
         # Define which AMPBlock to use. BigVGAN uses AMPBlock1 as default
-        if h.resblock == "1":
+        if self.h.resblock == "1":
             resblock_class = AMPBlock1
         else:
             raise ValueError(
-                f"Incorrect resblock class specified in hyperparameters. Got {h.resblock}"
+                f"Incorrect resblock class specified in hyperparameters. Got {self.h.resblock}"
             )
 
         # Transposed conv-based upsamplers. does not apply anti-aliasing
         self.ups = nn.ModuleList()
-        for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
+        for i, (u, k) in enumerate(zip(self.h.upsample_rates, self.h.upsample_kernel_sizes)):
             self.ups.append(
                 nn.ModuleList(
                     [
                         convtranspose1d(
-                            h.upsample_initial_channel // (2**i),
-                            h.upsample_initial_channel // (2 ** (i + 1)),
+                            self.h.upsample_initial_channel // (2**i),
+                            self.h.upsample_initial_channel // (2 ** (i + 1)),
                             k,
                             u,
                             padding=math.ceil((k - u) / 2),
@@ -403,20 +453,20 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         # Residual blocks using anti-aliased multi-periodicity composition modules (AMP)
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
-            ch = h.upsample_initial_channel // (2 ** (i + 1))
+            ch = self.h.upsample_initial_channel // (2 ** (i + 1))
             for j, (k, d) in enumerate(
-                zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes)
+                zip(self.h.resblock_kernel_sizes, self.h.resblock_dilation_sizes)
             ):
                 self.resblocks.append(
                     resblock_class(
-                        h, ch, k, d, activation=h.activation, causal=self.causal
+                        self.h, ch, k, d, activation=self.h.activation, causal=self.causal
                     )
                 )
 
         # Post-conv
         activation_post = (
-            SnakeBeta(ch, alpha_logscale=h.snake_logscale)
-            if h.activation == "snakebeta"
+            SnakeBeta(ch, alpha_logscale=self.h.snake_logscale)
+            if self.h.activation == "snakebeta"
             else None
         )
         if activation_post is None:
@@ -427,7 +477,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         self.activation_post = Activation1d(activation=activation_post, causal=False)
 
         # Whether to use bias for the final conv_post. Default to True for backward compatibility
-        self.use_bias_at_final = h.get("use_bias_at_final", True)
+        self.use_bias_at_final = self.h.get("use_bias_at_final", True)
         self.conv_post = conv1d(ch, 1, 7, 1, padding=3, bias=self.use_bias_at_final)
 
         # Weight initialization
@@ -436,7 +486,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         self.conv_post.apply(init_weights)
 
         # Final tanh activation. Defaults to True for backward compatibility
-        self.use_tanh_at_final = h.get("use_tanh_at_final", True)
+        self.use_tanh_at_final = self.h.get("use_tanh_at_final", True)
 
         self.num_layers = self.num_upsamples + self.num_upsamples * self.num_kernels + 3
 

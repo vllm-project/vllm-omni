@@ -23,33 +23,9 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .hyperclovax_audio_decoder import HyperCLOVAXAudioDecoderModel
+from .constants import SPEAKERS_LIST, FORMAT_MIME_MAP, DEFAULT_FORMAT, AUDIO_FORMAT_MAP, VOLUME_LEVEL
 
 logger = init_logger(__name__)
-
-FORMAT_MIME_MAP = {
-    "mp3": "audio/mpeg",
-    "wav": "audio/wav",
-    "flac": "audio/flac",
-    "ogg": "audio/ogg",
-    "aac": "audio/aac",
-    "pcm": "audio/pcm",
-}
-
-DEFAULT_FORMAT = "wav"
-
-AUDIO_FORMAT_MAP = [
-    (b"RIFF", "wav"),                      # WAV (RIFF container)
-    (b"\x1a\x45\xdf\xa3", "webm"),         # WebM / MKV (EBML header)
-    (b"OggS", "ogg"),                      # OGG
-    (b"fLaC", "flac"),                     # FLAC
-    (b"ID3", "mp3"),                       # MP3 with ID3 tag
-    (b"\xff\xfb", "mp3"),                  # MP3 without ID3
-    (b"\x00\x00\x00\x1c", "mp4"),          # MP4 / M4A
-    (b"\x00\x00\x00\x20", "mp4"),          # MP4 / M4A
-]
-
-VOLUME_LEVEL_DB = -26
-VOLUME_LEVEL = 10 ** (VOLUME_LEVEL_DB / 20)
 
 # Global caches for mel filter banks and Hann windows.
 mel_basis = {}
@@ -73,7 +49,7 @@ def get_hyperclovax_audio_post_process_func(od_config: OmniDiffusionConfig):
 
             segment = AudioSegment(
                 pcm.tobytes(),
-                frame_rate=sample_rate,
+                frame_rate=24000,
                 sample_width=pcm.dtype.itemsize,
                 channels=1
             )
@@ -105,22 +81,17 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                 model_or_path=od_config.model,
                 subfolder="bigvgan",
                 revision=None,
-                prefix="transformer.",
+                prefix=None,
                 fall_back_to_pt=True
             )
         ]
         self.bigvgan = HyperCLOVAXAudioDecoderModel(
-            od_config=od_config,
-            ## TODO:
-            ##  이 부분 나중에 config 통해서 받도록 수정 필요
-            h={}
+            od_config=od_config
         )
         self.spk_emb = self.bigvgan.spk_emb
-        self._vocab = int(getattr(self.bigvgan.model.h, "num_units", 0))
+        self._vocab = int(getattr(self.bigvgan.h, "num_units", 0))
 
-        with open(self._speaker_list_path, "r") as f:
-            speakers = [line.strip() for line in f]
-
+        speakers = SPEAKERS_LIST
         self.speaker_map = {spk: i for i, spk in enumerate(speakers)}
 
     def _prepare_batch(
@@ -157,7 +128,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             if ref_audio is not None:
                 ref_audio_bytes = base64.b64decode(ref_audio.encode("ascii"), validate=True)
                 ref_mel = (
-                    self._get_reference_mel_spectrogram(ref_audio_bytes, self.model.model.h)
+                    self._get_reference_mel_spectrogram(ref_audio_bytes, self.bigvgan.h)
                     .to(self.device)
                     .to(self._dtype)
                 )
