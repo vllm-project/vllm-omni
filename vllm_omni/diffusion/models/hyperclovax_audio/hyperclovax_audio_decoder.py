@@ -340,7 +340,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         od_config: OmniDiffusionConfig,
         resblock: str = "1",
         causal: bool = False,
-        finetune: bool = True,
+        finetune: bool = False,
         upsample_rates: List[int] = [5,4,4,3,2,2],
         upsample_kernel_sizes: List[int] = [10,8,8,6,4,4],
         upsample_initial_channel: int = 1536,
