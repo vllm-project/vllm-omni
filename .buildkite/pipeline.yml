@@ -3,9 +3,9 @@ steps:
     key: image-build
     commands:
       - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "docker build --file docker/Dockerfile.ci -t vllm-omni-full ."
-      - "docker tag vllm-omni-full public.ecr.aws/q9t5s3a7/vllm-full-test-repo:$BUILDKITE_COMMIT"
-      - "docker push public.ecr.aws/q9t5s3a7/vllm-full-test-repo:$BUILDKITE_COMMIT"
+      - "docker build --file docker/Dockerfile.ci -t vllm-omni-ci ."
+      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
     agents:
       queue: "cpu_queue_premerge"
 
@@ -21,7 +21,7 @@ steps:
       - kubernetes:
           podSpec:
             containers:
-              - image: public.ecr.aws/q9t5s3a7/vllm-full-test-repo:$BUILDKITE_COMMIT
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                 resources:
                   limits:
                     nvidia.com/gpu: 2
