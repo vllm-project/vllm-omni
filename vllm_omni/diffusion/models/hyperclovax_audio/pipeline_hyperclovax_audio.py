@@ -85,7 +85,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                 fall_back_to_pt=True
             )
         ]
-        
+
         self.bigvgan = HyperCLOVAXAudioDecoderModel(
             od_config=od_config
         ).to(self.device)
@@ -219,7 +219,10 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             # 6. Append decoded audio to result
             results.append((out.to(torch.float32), fmt))
 
-        return DiffusionOutput(output=results)
+        return DiffusionOutput(
+            output=results,
+            post_process_func=get_hyperclovax_audio_post_process_func(self.od_config)
+        )
 
     def pad(self, unit: torch.Tensor) -> Tuple[torch.Tensor, float]:
         """
