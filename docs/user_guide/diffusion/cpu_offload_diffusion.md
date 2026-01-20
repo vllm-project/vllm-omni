@@ -23,7 +23,7 @@ if __name__ == "__main__":
     m = Omni(model="Qwen/Qwen-Image",enable_cpu_offload=True)
 ```
 
-- **CLI**: pass `--dit-cpu-offload` to the diffusion service entrypoint.
+- **CLI**: pass `--enable-cpu-offload` to the diffusion service entrypoint.
 
 ## Known Limitations
 - Cold start latency increases for over one minute for some models(e.g., Qwen-Image)

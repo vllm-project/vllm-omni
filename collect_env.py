@@ -57,6 +57,7 @@ SystemEnv = namedtuple(
         "cpu_info",
         "rocm_version",  # vllm specific field
         "vllm_version",  # vllm specific field
+        "vllm_omni_version",  # vllm-omni specific field
         "vllm_build_flags",  # vllm specific field
         "gpu_topo",  # vllm specific field
         "env_vars",
@@ -287,6 +288,31 @@ def get_vllm_version():
             git_sha = version_str[1:]  # type: ignore
             return f"{__version__} (git sha: {git_sha})"
     return __version__
+
+
+def get_vllm_omni_version(run_lambda):
+    try:
+        import vllm_omni
+        from vllm_omni import __version__, __version_tuple__
+
+        version_str = __version_tuple__[-1]
+        if isinstance(version_str, str) and version_str.startswith("g"):
+            if "." in version_str:
+                git_sha = version_str.split(".")[0][1:]
+                date = version_str.split(".")[-1][1:]
+                return f"{__version__} (git sha: {git_sha}, date: {date})"
+            else:
+                git_sha = version_str[1:]
+                return f"{__version__} (git sha: {git_sha})"
+
+        package_dir = os.path.dirname(os.path.abspath(vllm_omni.__file__))
+        git_sha = run_and_read_all(run_lambda, f"git -C {package_dir} rev-parse --short HEAD")
+        if git_sha:
+            return f"{__version__} (git sha: {git_sha})"
+
+        return __version__
+    except ImportError:
+        return "N/A (vllm_omni not installed)"
 
 
 def summarize_vllm_build_flags():
@@ -524,6 +550,7 @@ def get_env_info():
 
     rocm_version = get_rocm_version(run_lambda)
     vllm_version = get_vllm_version()
+    vllm_omni_version = get_vllm_omni_version(run_lambda)
     vllm_build_flags = summarize_vllm_build_flags()
     gpu_topo = get_gpu_topo(run_lambda)
 
@@ -555,6 +582,7 @@ def get_env_info():
         cpu_info=get_cpu_info(run_lambda),
         rocm_version=rocm_version,
         vllm_version=vllm_version,
+        vllm_omni_version=vllm_omni_version,
         vllm_build_flags=vllm_build_flags,
         gpu_topo=gpu_topo,
         env_vars=get_env_vars(),
@@ -621,6 +649,7 @@ env_info_fmt += """
 ==============================
 ROCM Version                 : {rocm_version}
 vLLM Version                 : {vllm_version}
+vLLM-Omni Version            : {vllm_omni_version}
 vLLM Build Flags:
   {vllm_build_flags}
 GPU Topology:

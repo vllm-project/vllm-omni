@@ -60,6 +60,10 @@ hooks:
   - docs/mkdocs/hooks/url_schemes.py
   - docs/mkdocs/hooks/generate_examples.py
 
+# Exclude include files from navigation warnings
+exclude_docs: |
+  **/*.inc.md
+
 # Plugins
 plugins:
   - meta

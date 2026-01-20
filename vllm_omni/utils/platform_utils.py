@@ -53,6 +53,6 @@ def get_diffusion_worker_class() -> type:
         return NPUWorkerProc
     else:
         # Default to GPU worker for cuda and other devices
-        from vllm_omni.diffusion.worker.gpu_worker import WorkerProc
+        from vllm_omni.diffusion.worker.gpu_diffusion_worker import WorkerProc
 
         return WorkerProc

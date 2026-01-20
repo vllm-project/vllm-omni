@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import FeedForward
+import torch.nn.functional as F
 
 # TODO replace this with vLLM implementation
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
@@ -16,14 +16,18 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.selector import get_attn_backend
+from vllm_omni.diffusion.attention.selector import _BACKENDS_SUPPORT_ATTENTION_MASK, get_attn_backend
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -287,79 +291,133 @@ class QwenEmbedRope(nn.Module):
         return freqs.clone().contiguous()
 
 
+class ColumnParallelApproxGELU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim_in,
+            dim_out,
+            bias=bias,
+            gather_output=False,
+            return_bias=False,
+        )
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        return F.gelu(x, approximate=self.approximate)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        activation_fn: str = "gelu-approximate",
+        inner_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+
+        assert activation_fn == "gelu-approximate", "Only gelu-approximate is supported."
+
+        inner_dim = inner_dim or int(dim * mult)
+        dim_out = dim_out or dim
+
+        layers: list[nn.Module] = [
+            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            nn.Identity(),  # placeholder for weight loading
+            RowParallelLinear(
+                inner_dim,
+                dim_out,
+                input_is_parallel=True,
+                return_bias=False,
+            ),
+        ]
+
+        self.net = nn.ModuleList(layers)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
+
+
 class QwenImageCrossAttention(nn.Module):
     def __init__(
         self,
         dim: int,  # query_dim
         num_heads: int,
         head_dim: int,
-        window_size=(-1, -1),
-        added_kv_proj_dim: int = None,
+        added_kv_proj_dim: int,
+        window_size: tuple[int, int] = (-1, -1),
         out_bias: bool = True,
-        qk_norm=True,  # rmsnorm
-        eps=1e-6,
-        pre_only=False,
+        qk_norm: bool = True,
+        eps: float = 1e-6,
+        pre_only: bool = False,
         context_pre_only: bool = False,
-        parallel_attention=False,
-        out_dim: int = None,
+        out_dim: int | None = None,
     ) -> None:
-        assert dim % num_heads == 0
         super().__init__()
+        assert dim % num_heads == 0
+
         self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = head_dim
+        self.total_num_heads = num_heads
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
-        self.parallel_attention = parallel_attention
 
-        # layers
-        # self.to_q = ReplicatedLinear(dim, dim)
-        # self.to_k = ReplicatedLinear(dim, dim)
-        # self.to_v = ReplicatedLinear(dim, dim)
         self.to_qkv = QKVParallelLinear(
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
-            disable_tp=True,
         )
+        self.query_num_heads = self.to_qkv.num_heads
+        self.kv_num_heads = self.to_qkv.num_kv_heads
+
         self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
-        self.inner_kv_dim = self.inner_dim
-        if added_kv_proj_dim is not None:
-            assert context_pre_only is not None
-            # self.add_k_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_kv_dim, bias=True)
-            # self.add_v_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_kv_dim, bias=True)
-            # self.add_q_proj = ReplicatedLinear(
-            #     added_kv_proj_dim, self.inner_dim, bias=True
-            # )
-            self.add_kv_proj = QKVParallelLinear(
-                added_kv_proj_dim,
-                head_size=self.inner_kv_dim // self.num_heads,
-                total_num_heads=self.num_heads,
-                disable_tp=True,
-            )
 
-        if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
-        else:
-            self.to_add_out = None
+        self.inner_dim = out_dim if out_dim is not None else head_dim * self.total_num_heads
 
-        if not pre_only:
-            self.to_out = nn.ModuleList([])
-            self.to_out.append(ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias))
-        else:
-            self.to_out = None
+        assert context_pre_only is not None
+        self.add_kv_proj = QKVParallelLinear(
+            hidden_size=added_kv_proj_dim,
+            head_size=head_dim,
+            total_num_heads=num_heads,
+        )
+        self.add_query_num_heads = self.add_kv_proj.num_heads
+        self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
+
+        assert not context_pre_only
+        self.to_add_out = RowParallelLinear(
+            self.inner_dim,
+            self.dim,
+            bias=out_bias,
+            input_is_parallel=True,
+            return_bias=False,
+        )
+
+        assert not pre_only
+        self.to_out = RowParallelLinear(
+            self.inner_dim,
+            self.dim,
+            bias=out_bias,
+            input_is_parallel=True,
+            return_bias=False,
+        )
 
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.query_num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            num_kv_heads=self.kv_num_heads,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
 
@@ -377,61 +435,55 @@ class QwenImageCrossAttention(nn.Module):
         txt_freqs: torch.Tensor,
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
-    ):
-        # if mask is all true, set it to None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if hidden_states_mask is not None and hidden_states_mask.all():
             hidden_states_mask = None
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
-        seq_len_txt = encoder_hidden_states.shape[1]
 
-        # Compute QKV for image stream (sample projections)
-        qkv, _ = self.to_qkv(hidden_states)
-        img_query, img_key, img_value = qkv.chunk(3, dim=-1)
+        img_qkv, _ = self.to_qkv(hidden_states)
+        q_size = self.query_num_heads * self.head_dim
+        kv_size = self.kv_num_heads * self.head_dim
+        img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        # Compute QKV for text stream (context projections)
-        qkv, _ = self.add_kv_proj(encoder_hidden_states)
-        txt_query, txt_key, txt_value = qkv.chunk(3, dim=-1)
+        txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+        add_q_size = self.add_query_num_heads * self.head_dim
+        add_kv_size = self.add_kv_num_heads * self.head_dim
+        txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
 
-        # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.num_heads, -1))
+        img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+        img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+        img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
 
-        txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
-        txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
-        txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
+        txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+        txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+        txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        # Apply QK normalization
         img_query = self.norm_q(img_query)
         img_key = self.norm_k(img_key)
         txt_query = self.norm_added_q(txt_query)
         txt_key = self.norm_added_k(txt_key)
 
-        # Apply RoPE
         img_cos = vid_freqs.real.to(img_query.dtype)
         img_sin = vid_freqs.imag.to(img_query.dtype)
         txt_cos = txt_freqs.real.to(txt_query.dtype)
         txt_sin = txt_freqs.imag.to(txt_query.dtype)
+
         img_query = self.rope(img_query, img_cos, img_sin)
         img_key = self.rope(img_key, img_cos, img_sin)
         txt_query = self.rope(txt_query, txt_cos, txt_sin)
         txt_key = self.rope(txt_key, txt_cos, txt_sin)
 
-        # Concatenate for joint attention
-        # Order: [text, image]
+        seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        # Compute joint attention
         if (
             self.parallel_config is not None
             and self.parallel_config.sequence_parallel_size > 1
             and not get_forward_context().split_text_embed_in_sp
         ):
-            # if using sequence parallel, but not splitting text embed,
-            #  we need to pass text embedding to attention layer as joint qkv
             attn_metadata = AttentionMetadata(
                 joint_query=txt_query,
                 joint_key=txt_key,
@@ -443,22 +495,17 @@ class QwenImageCrossAttention(nn.Module):
             if encoder_hidden_states_mask is not None:
                 attn_metadata.joint_attn_mask = encoder_hidden_states_mask
 
-            joint_hidden_states = self.attn(
-                img_query,
-                img_key,
-                img_value,
-                attn_metadata,
-            )
+            joint_hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
         else:
             attn_metadata = None
             if hidden_states_mask is not None or encoder_hidden_states_mask is not None:
-                mask_list = []
+                mask_list: list[torch.Tensor] = []
                 if encoder_hidden_states_mask is not None:
                     mask_list.append(encoder_hidden_states_mask)
                 else:
                     mask_list.append(
                         torch.ones(
-                            [encoder_hidden_states.shape[0], encoder_hidden_states.shape[1]],
+                            encoder_hidden_states.shape[:2],
                             dtype=torch.bool,
                             device=encoder_hidden_states.device,
                         )
@@ -468,34 +515,22 @@ class QwenImageCrossAttention(nn.Module):
                 else:
                     mask_list.append(
                         torch.ones(
-                            [hidden_states.shape[0], hidden_states.shape[1]],
+                            hidden_states.shape[:2],
                             dtype=torch.bool,
                             device=hidden_states.device,
                         )
                     )
-                joint_mask = (
-                    None if len(mask_list) == 0 else torch.cat(mask_list, dim=1) if len(mask_list) > 1 else mask_list[0]
-                )
+                joint_mask = torch.cat(mask_list, dim=1) if len(mask_list) > 1 else mask_list[0]
                 attn_metadata = AttentionMetadata(attn_mask=joint_mask)
-            joint_hidden_states = self.attn(
-                joint_query,
-                joint_key,
-                joint_value,
-                attn_metadata,
-            )
-        joint_hidden_states = joint_hidden_states.flatten(2, 3)
-        joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
-        # Split attention outputs back
-        txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part
-        img_attn_output = joint_hidden_states[:, seq_len_txt:, :]  # Image part
+            joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
 
-        # Apply output projections
-        img_attn_output, _ = self.to_out[0](img_attn_output)
-        if len(self.to_out) > 1:
-            (img_attn_output,) = self.to_out[1](img_attn_output)  # dropout
+        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
+        txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]
+        img_attn_output = joint_hidden_states[:, seq_len_txt:, :]
 
-        txt_attn_output, _ = self.to_add_out(txt_attn_output)
+        img_attn_output = self.to_out(img_attn_output)
+        txt_attn_output = self.to_add_out(txt_attn_output)
 
         return img_attn_output, txt_attn_output
 
@@ -530,7 +565,7 @@ class QwenImageTransformerBlock(nn.Module):
             head_dim=attention_head_dim,
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.img_mlp = FeedForward(dim=dim, dim_out=dim)
 
         # Text processing modules
         self.txt_mod = nn.Sequential(
@@ -540,7 +575,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.txt_mlp = FeedForward(dim=dim, dim_out=dim)
 
         self.zero_cond_t = zero_cond_t
 
@@ -604,7 +639,7 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1)
+        img_modulated, img_gate1 = self.img_norm1(hidden_states, img_mod1, modulate_index)
 
         # Process text stream - norm1 + modulation
         txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
@@ -632,7 +667,8 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2)
+        img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2, modulate_index)
+
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
@@ -692,15 +728,13 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_head_dim: int = 128,
         num_attention_heads: int = 24,
         joint_attention_dim: int = 3584,
-        guidance_embeds: bool = False,  # TODO: this should probably be removed
+        guidance_embeds: bool = False,
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
         zero_cond_t: bool = False,
         use_additional_t_cond: bool = False,
         use_layer3d_rope: bool = False,
     ):
         super().__init__()
-        model_config = od_config.tf_model_config
-        num_layers = model_config.num_layers
         self.parallel_config = od_config.parallel_config
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
@@ -791,8 +825,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
             sp_size = get_sequence_parallel_world_size()
 
             if seq_len % sp_size != 0:
-                #  flash_attn, ring_attn, sage_attn do not support attention_mask
-                if get_attn_backend(-1).get_name() != "SDPA" and get_attn_backend(-1).get_name() != "ASCEND":
+                #  ring_attn, sage_attn do not support attention_mask
+                if get_attn_backend(-1).get_name() not in _BACKENDS_SUPPORT_ATTENTION_MASK:
                     raise ValueError(
                         f"When generating image shape that the sequence length is NOT divisible by sp_size={sp_size},"
                         f"cannot use {get_attn_backend(-1).get_name()} which does not support attention_mask."
@@ -893,6 +927,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
             if original_seq_len is not None:
                 output = output[:, :original_seq_len, :]
 
+        torch.cuda.empty_cache()
+
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -917,17 +953,22 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            original_name = name
+            lookup_name = name
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in original_name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                lookup_name = original_name.replace(weight_name, param_name)
+                param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                if lookup_name not in params_dict and ".to_out.0." in lookup_name:
+                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+                param = params_dict[lookup_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            loaded_params.add(original_name)
+            loaded_params.add(lookup_name)
         return loaded_params

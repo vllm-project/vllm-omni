@@ -94,7 +94,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
-        if supports_mrope(self.model):
+        if supports_mrope(self.get_model()):
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,
@@ -563,11 +563,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices,
                 ),
             ):
-                if (
-                    getattr(self.model, "talker", None) is not None
-                    and hasattr(self.model, "talker_mtp")
-                    and num_tokens_padded == 1
-                ):
+                if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
                     outputs = self.talker_mtp(
                         self.talker_mtp_input_ids.gpu[:num_tokens_padded],
                         self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
@@ -884,6 +880,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
+            decode_req_ids = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests.get(req_id)
                 req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
@@ -897,33 +894,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
                 )
-                # run talker mtp decode
-                if hasattr(self.model, "talker_mtp"):
-                    _cudagraph_mode, batch_desc, _, _ = self._determine_batch_execution_and_padding(
-                        num_tokens=span_len,
-                        num_reqs=1,
-                        num_scheduled_tokens_np=num_scheduled_tokens_np[req_index],
-                        max_num_scheduled_tokens=1,
-                        force_eager=span_len > 1,
-                        use_cascade_attn=False,
-                    )
+                if hasattr(self.model, "talker_mtp") and span_len == 1:
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    if _cudagraph_mode != CUDAGraphMode.NONE:
-                        self.talker_mtp_input_ids.gpu[:span_len].copy_(req_input_ids)
-                        self.talker_mtp_inputs_embeds.gpu[:span_len].copy_(req_embeds)
-                        self.last_talker_hidden.gpu[:span_len].copy_(last_talker_hidden)
-                        self.text_step.gpu[:span_len].copy_(text_step)
-                        req_input_ids = self.talker_mtp_input_ids.gpu[:span_len]
-                        req_embeds = self.talker_mtp_inputs_embeds.gpu[:span_len]
-                        last_talker_hidden = self.last_talker_hidden.gpu[:span_len]
-                        text_step = self.text_step.gpu[:span_len]
-                    with set_forward_context(
-                        None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
-                    ):
-                        req_embeds, code_predictor_codes = self.talker_mtp(
-                            req_input_ids, req_embeds, last_talker_hidden, text_step
-                        )
-                        update_dict["code_predictor_codes"] = code_predictor_codes
+                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                    self.text_step.gpu[decode_slice].copy_(text_step)
+                    decode_req_ids.append(req_id)
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
                 self._merge_additional_information_update(req_id, update_dict)
@@ -934,6 +912,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
                     input_ids[s : s + seg_len] = req_input_ids
 
+            # run talker mtp decode
+            if hasattr(self.model, "talker_mtp"):
+                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+
         return (
             input_ids,
             inputs_embeds,
@@ -942,6 +924,34 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs,
             ec_connector_output,
         )
+
+    def _talker_mtp_forward(self, decode_req_ids: list[str], inputs_embeds: torch.Tensor) -> None:
+        decode_batch_size = len(decode_req_ids)
+        if decode_batch_size == 0:
+            return
+        _cudagraph_mode, batch_desc, _, _ = self._determine_batch_execution_and_padding(
+            num_tokens=decode_batch_size,
+            num_reqs=decode_batch_size,
+            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
+            max_num_scheduled_tokens=1,
+            use_cascade_attn=False,
+        )
+        req_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size]
+        req_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size]
+        last_talker_hidden = self.last_talker_hidden.gpu[:decode_batch_size]
+        text_step = self.text_step.gpu[:decode_batch_size]
+        with set_forward_context(
+            None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
+        ):
+            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
+        # update the inputs_embeds and code_predictor_codes
+        code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
+        for idx, req_id in enumerate(decode_req_ids):
+            req_index = self.input_batch.req_ids.index(req_id)
+            start_offset = int(self.query_start_loc.cpu[req_index])
+            inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
+            update_dict = {"code_predictor_codes": code_predictor_codes_cpu[idx : idx + 1]}
+            self._merge_additional_information_update(req_id, update_dict)
 
     def _model_forward(
         self,
