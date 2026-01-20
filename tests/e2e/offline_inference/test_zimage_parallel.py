@@ -155,8 +155,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
     enforce_eager = _get_enforce_eager_for_cuda()
 
-    height = 256
-    width = 256
+    height = 512
+    width = 512
     num_inference_steps = 2
     seed = 42
 
