@@ -58,11 +58,11 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.12.0
+git checkout v0.14.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.12.0/vllm-0.12.0-cp38-abi3-manylinux_2_31_x86_64.whl
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.14.0/vllm-0.14.0-cp38-abi3-manylinux_2_31_x86_64.whl
 ```
 Install vllm with command below (If you have no existing PyTorch).
 ```bash
@@ -93,7 +93,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.12.0rc1 \
+    vllm/vllm-omni:v0.14.0 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 

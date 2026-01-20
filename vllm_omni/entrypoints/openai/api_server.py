@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
@@ -14,31 +16,48 @@ import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
-from vllm.config import VllmConfig
+from starlette.routing import Route
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import load_chat_template, resolve_hf_chat_template, resolve_mistral_chat_template
+from vllm.entrypoints.anthropic.serving_messages import AnthropicServingMessages
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.api_server import (
     base,
     build_app,
     load_log_config,
-    maybe_register_tokenizer_info_endpoint,
     router,
     setup_server,
-    validate_json_request,
 )
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
-from vllm.entrypoints.openai.serving_models import BaseModelPath, LoRAModulePath, OpenAIServingModels
-from vllm.entrypoints.openai.tool_parsers import ToolParserManager
-
-# yapf conflicts with isort for this block
-# yapf: disable
-# yapf: enable
+from vllm.entrypoints.openai.orca_metrics import metrics_header
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ErrorResponse,
+)
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.serving_responses import OpenAIServingResponses
+from vllm.entrypoints.openai.serving_transcription import (
+    OpenAIServingTranscription,
+    OpenAIServingTranslation,
+)
+from vllm.entrypoints.openai.utils import validate_json_request
+from vllm.entrypoints.pooling.classify.serving import ServingClassification
+from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
+from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
+from vllm.entrypoints.pooling.score.serving import ServingScores
+from vllm.entrypoints.serve.disagg.serving import ServingTokens
+from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.entrypoints.tool_server import DemoToolServer, MCPToolServer, ToolServer
-from vllm.entrypoints.utils import load_aware_call, with_cancellation
+from vllm.entrypoints.utils import (
+    load_aware_call,
+    process_chat_template,
+    process_lora_modules,
+    with_cancellation,
+)
 from vllm.logger import init_logger
-from vllm.tokenizers import MistralTokenizer
+from vllm.tasks import POOLING_TASKS
+from vllm.tool_parsers import ToolParserManager
 from vllm.utils.system_utils import decorate_logs
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -56,6 +75,29 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 logger = init_logger(__name__)
+
+ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
+
+
+def _remove_route_from_router(router_obj, path: str, methods: set[str] | None = None):
+    """Remove a route from the router by path and optionally by methods.
+
+    This is needed because vllm's api_server registers routes when imported,
+    and we need to override some routes (like /v1/chat/completions) with
+    omni-specific implementations.
+    """
+    routes_to_remove = []
+    for route in router_obj.routes:
+        if isinstance(route, Route) and route.path == path:
+            if methods is None or (hasattr(route, "methods") and route.methods & methods):
+                routes_to_remove.append(route)
+
+    for route in routes_to_remove:
+        router_obj.routes.remove(route)
+
+
+# Remove vllm's /v1/chat/completions route so we can register our own omni version
+_remove_route_from_router(router, "/v1/chat/completions", {"POST"})
 
 
 # Server entry points
@@ -88,6 +130,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
+    if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
+        from vllm.reasoning import ReasoningParserManager
+
+        ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
     # Load logging config for uvicorn if specified
     log_config = load_log_config(args.log_config_file)
@@ -98,11 +144,11 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         args,
         client_config=client_config,
     ) as engine_client:
-        maybe_register_tokenizer_info_endpoint(args)
         app = build_app(args)
 
+        await omni_init_app_state(engine_client, app.state, args)
+
         vllm_config = await engine_client.get_vllm_config()
-        await omni_init_app_state(engine_client, vllm_config, app.state, args)
 
         # Check if pure diffusion mode (vllm_config will be None)
         is_pure_diffusion = vllm_config is None
@@ -233,7 +279,6 @@ async def build_async_omni_from_stage_config(
 
 async def omni_init_app_state(
     engine_client: EngineClient,
-    vllm_config: VllmConfig | None,
     state: State,
     args: Namespace,
 ) -> None:
@@ -246,10 +291,12 @@ async def omni_init_app_state(
 
     Args:
         engine_client: Engine client instance (AsyncOmni)
-        vllm_config: vLLM configuration object (may be None for pure diffusion)
         state: FastAPI application state object to initialize
         args: Parsed command-line arguments
     """
+    # Get vllm_config from engine_client (following 0.14.0 pattern)
+    vllm_config = await engine_client.get_vllm_config()
+
     # Detect if it's pure Diffusion mode (single stage and is Diffusion)
     is_pure_diffusion = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
@@ -273,6 +320,7 @@ async def omni_init_app_state(
     base_model_paths = [BaseModelPath(name=name, model_path=args.model) for name in served_model_names]
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
+    state.args = args
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -302,32 +350,18 @@ async def omni_init_app_state(
             logger.warning("vllm_config is None, some features may not work correctly")
 
     state.vllm_config = vllm_config
-    if vllm_config is not None:
-        _model_config = vllm_config.model_config
 
-    resolved_chat_template = load_chat_template(args.chat_template)
-    if resolved_chat_template is not None and vllm_config is not None:
-        # Get the tokenizer to check official template
-        tokenizer = await engine_client.get_tokenizer()
+    # Get supported tasks
+    supported_tasks: set[str] = {"generate"}
+    if hasattr(engine_client, "get_supported_tasks"):
+        supported_tasks = set(await engine_client.get_supported_tasks())
+    logger.info("Supported tasks: %s", supported_tasks)
 
-        if tokenizer is not None:
-            if isinstance(tokenizer, MistralTokenizer):
-                # The warning is logged in resolve_mistral_chat_template.
-                resolved_chat_template = resolve_mistral_chat_template(chat_template=resolved_chat_template)
-            else:
-                hf_chat_template = resolve_hf_chat_template(
-                    tokenizer=tokenizer,
-                    chat_template=None,
-                    tools=None,
-                    model_config=vllm_config.model_config,
-                )
-
-                if hf_chat_template != resolved_chat_template:
-                    logger.warning(
-                        "Using supplied chat template: %s\nIt is different from official chat template '%s'. This discrepancy may lead to performance degradation.",  # noqa: E501
-                        resolved_chat_template,
-                        args.model,
-                    )
+    resolved_chat_template = await process_chat_template(
+        args.chat_template,
+        engine_client,
+        vllm_config.model_config if vllm_config is not None else None,
+    )
 
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()
@@ -340,23 +374,12 @@ async def omni_init_app_state(
         tool_server = None
 
     # Merge default_mm_loras into the static lora_modules
-    default_mm_loras = {}
-    if vllm_config is not None and vllm_config.lora_config is not None:
-        default_mm_loras = vllm_config.lora_config.default_mm_loras
-
-    lora_modules = args.lora_modules
-    if default_mm_loras:
-        default_mm_lora_paths = [
-            LoRAModulePath(
-                name=modality,
-                path=lora_path,
-            )
-            for modality, lora_path in default_mm_loras.items()
-        ]
-        if args.lora_modules is None:
-            lora_modules = default_mm_lora_paths
-        else:
-            lora_modules += default_mm_lora_paths
+    default_mm_loras = (
+        vllm_config.lora_config.default_mm_loras
+        if vllm_config is not None and vllm_config.lora_config is not None
+        else {}
+    )
+    lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
     # Ensure input_processor, io_processor, and model_config exist for OpenAIServingModels compatibility
     if (
@@ -415,23 +438,181 @@ async def omni_init_app_state(
         lora_modules=lora_modules,
     )
     await state.openai_serving_models.init_static_loras()
-    state.openai_serving_chat = OmniOpenAIServingChat(
+
+    state.openai_serving_responses = (
+        OpenAIServingResponses(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+            enable_auto_tools=args.enable_auto_tool_choice,
+            tool_parser=args.tool_call_parser,
+            tool_server=tool_server,
+            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+            enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
+            log_error_stack=args.log_error_stack,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
+    state.openai_serving_chat = (
+        OmniOpenAIServingChat(
+            engine_client,
+            state.openai_serving_models,
+            args.response_role,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            trust_request_chat_template=args.trust_request_chat_template,
+            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+            enable_auto_tools=args.enable_auto_tool_choice,
+            exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+            tool_parser=args.tool_call_parser,
+            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+            enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
+            enable_log_deltas=args.enable_log_deltas,
+            log_error_stack=args.log_error_stack,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
+    # Warm up chat template processing to avoid first-request latency
+    if state.openai_serving_chat is not None:
+        await state.openai_serving_chat.warmup()
+
+    state.openai_serving_completion = (
+        OpenAIServingCompletion(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+            enable_force_include_usage=args.enable_force_include_usage,
+            log_error_stack=args.log_error_stack,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
+    state.openai_serving_pooling = (
+        OpenAIServingPooling(
+            engine_client,
+            state.openai_serving_models,
+            supported_tasks=supported_tasks,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            trust_request_chat_template=args.trust_request_chat_template,
+            log_error_stack=args.log_error_stack,
+        )
+        if any(task in POOLING_TASKS for task in supported_tasks)
+        else None
+    )
+    state.openai_serving_embedding = (
+        OpenAIServingEmbedding(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            trust_request_chat_template=args.trust_request_chat_template,
+            log_error_stack=args.log_error_stack,
+        )
+        if "embed" in supported_tasks
+        else None
+    )
+    state.openai_serving_classification = (
+        ServingClassification(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            trust_request_chat_template=args.trust_request_chat_template,
+            log_error_stack=args.log_error_stack,
+        )
+        if "classify" in supported_tasks
+        else None
+    )
+    state.openai_serving_scores = (
+        ServingScores(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            score_template=resolved_chat_template,
+            log_error_stack=args.log_error_stack,
+        )
+        if ("embed" in supported_tasks or "score" in supported_tasks)
+        else None
+    )
+    state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
         state.openai_serving_models,
-        args.response_role,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
         trust_request_chat_template=args.trust_request_chat_template,
-        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-        enable_force_include_usage=args.enable_force_include_usage,
-        enable_log_outputs=args.enable_log_outputs,
         log_error_stack=args.log_error_stack,
+    )
+    state.openai_serving_transcription = (
+        OpenAIServingTranscription(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            log_error_stack=args.log_error_stack,
+            enable_force_include_usage=args.enable_force_include_usage,
+        )
+        if "transcription" in supported_tasks
+        else None
+    )
+    state.openai_serving_translation = (
+        OpenAIServingTranslation(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            log_error_stack=args.log_error_stack,
+            enable_force_include_usage=args.enable_force_include_usage,
+        )
+        if "transcription" in supported_tasks
+        else None
+    )
+    state.anthropic_serving_messages = (
+        AnthropicServingMessages(
+            engine_client,
+            state.openai_serving_models,
+            args.response_role,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+            enable_auto_tools=args.enable_auto_tool_choice,
+            tool_parser=args.tool_call_parser,
+            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+            enable_force_include_usage=args.enable_force_include_usage,
+        )
+        if "generate" in supported_tasks
+        else None
+    )
+    state.serving_tokens = (
+        ServingTokens(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            return_tokens_as_token_ids=args.return_tokens_as_token_ids,
+            log_error_stack=args.log_error_stack,
+            enable_prompt_tokens_details=args.enable_prompt_tokens_details,
+            enable_log_outputs=args.enable_log_outputs,
+            force_no_detokenize=args.tokens_only,
+        )
+        if "generate" in supported_tasks
+        else None
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
@@ -463,6 +644,7 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(message="The model does not support Chat Completions API")
@@ -474,7 +656,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
-            content=generator.model_dump(), status_code=generator.code if hasattr(generator, "code") else 400
+            content=generator.model_dump(),
+            status_code=generator.error.code if generator.error else 400,
         )
 
     elif isinstance(generator, ChatCompletionResponse):
@@ -490,18 +673,27 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             try:
                 # Use serialize_as_any=True to bypass type checking
                 response_dict = generator.model_dump(mode="json", serialize_as_any=True, warnings="none")
-                return JSONResponse(content=response_dict)
+                return JSONResponse(
+                    content=response_dict,
+                    headers=metrics_header(metrics_header_format),
+                )
             except Exception:
                 # Fallback: convert to JSON string and parse back to avoid any serialization issues
                 try:
                     response_json = generator.model_dump_json(warnings="none", serialize_as_any=True)
                     response_dict = json_lib.loads(response_json)
-                    return JSONResponse(content=response_dict)
+                    return JSONResponse(
+                        content=response_dict,
+                        headers=metrics_header(metrics_header_format),
+                    )
                 except Exception:
                     # Last resort: regular dump with warnings suppressed
                     with warnings_module.catch_warnings():
                         warnings_module.filterwarnings("ignore", category=UserWarning)
-                        return JSONResponse(content=generator.model_dump(mode="json", warnings="none"))
+                        return JSONResponse(
+                            content=generator.model_dump(mode="json", warnings="none"),
+                            headers=metrics_header(metrics_header_format),
+                        )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 

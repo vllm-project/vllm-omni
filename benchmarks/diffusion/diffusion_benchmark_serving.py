@@ -973,10 +973,10 @@ if __name__ == "__main__":
         "--base-url",
         type=str,
         default=None,
-        help="Base URL of the server (e.g., http://localhost:30000). Overrides host/port.",
+        help="Base URL of the server (e.g., http://localhost:8091). Overrides host/port.",
     )
     parser.add_argument("--host", type=str, default="localhost", help="Server host.")
-    parser.add_argument("--port", type=int, default=30000, help="Server port.")
+    parser.add_argument("--port", type=int, default=8091, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
     parser.add_argument(
         "--dataset",

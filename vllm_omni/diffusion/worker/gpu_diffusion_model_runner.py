@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from contextlib import nullcontext
 
 import torch
+from torch.profiler import record_function
 from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
@@ -160,6 +161,7 @@ class GPUDiffusionModelRunner:
             self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
 
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            output = self.pipeline.forward(req)
+            with record_function("pipeline_forward"):
+                output = self.pipeline.forward(req)
 
         return output

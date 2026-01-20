@@ -278,9 +278,9 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
 
 
 query_map = {
-    "mixed_modalities": get_mixed_modalities_query,
+    "use_mixed_modalities": get_mixed_modalities_query,
     "use_audio_in_video": get_use_audio_in_video_query,
-    "multi_audios": get_multi_audios_query,
+    "use_multi_audios": get_multi_audios_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
     "use_audio": get_audio_query,
@@ -434,7 +434,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="mixed_modalities",
+        default="use_mixed_modalities",
         choices=query_map.keys(),
         help="Query type.",
     )

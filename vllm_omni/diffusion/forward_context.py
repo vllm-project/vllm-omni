@@ -86,5 +86,14 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
     )
+    # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
+    # vLLM config set via set_current_vllm_config().
     with override_forward_context(forward_context):
-        yield
+        if vllm_config is None:
+            yield
+        else:
+            # Local import to avoid importing vllm.config.vllm at module import time.
+            from vllm.config.vllm import set_current_vllm_config
+
+            with set_current_vllm_config(vllm_config):
+                yield
