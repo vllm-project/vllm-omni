@@ -119,7 +119,7 @@ def _run_zimage_generate(
 
         return _extract_single_image([last_output]), median_time_s, peak_memory_mb
     finally:
-        m.close()
+        monitor.stop()
         cleanup_dist_env_and_memory()
 
 
