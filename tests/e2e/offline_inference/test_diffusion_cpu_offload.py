@@ -38,8 +38,10 @@ def test_cpu_offload_diffusion_model(model_name: str):
             guidance_scale=0.0,
             generator=torch.Generator("cuda").manual_seed(42),
         )
+        peak = monitor.peak_used_mb
+        monitor.stop()
 
-        return monitor.peak_used_mb
+        return peak
 
     offload_peak_memory = inference(offload=True)
     no_offload_peak_memory = inference(offload=False)
