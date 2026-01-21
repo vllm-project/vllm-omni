@@ -170,6 +170,11 @@ def test_sequence_parallel(
     """Test Ulysses attention by comparing with and without SP enabled."""
     sequence_parallel_size = ulysses_degree * ring_degree
 
+    # Skip if not enough GPUs available
+    available_gpus = torch_device.device_count()
+    if available_gpus < sequence_parallel_size:
+        pytest.skip(f"Test requires {sequence_parallel_size} GPUs but only {available_gpus} available")
+
     # Create temporary files to share results between processes
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f:
         baseline_output_file = f.name

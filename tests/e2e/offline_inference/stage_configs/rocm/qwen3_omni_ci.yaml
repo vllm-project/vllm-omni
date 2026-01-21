@@ -84,6 +84,7 @@ stage_args:
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
       load_format: dummy
+      async_scheduling: false
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true
