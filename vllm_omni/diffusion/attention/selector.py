@@ -66,14 +66,21 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
     """
     # Check environment variable
 
+    backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND", None)
+
     if detect_device_type() == "cuda":
         compute_capability = torch.cuda.get_device_capability()
         major, minor = compute_capability
         if 80 <= major * 10 + minor < 100:
-            backend_name = "FLASH_ATTN"
-
-    if os.environ.get("DIFFUSION_ATTENTION_BACKEND") is not None:
-        backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+            if backend_name is None:
+                backend_name = "FLASH_ATTN"
+        else:
+            if backend_name == "FLASH_ATTN":
+                logger.warning(
+                    """Flash Attention requires GPU with compute capability >= 8.0 or < 10.0. "
+                               "Falling back to TORCH_SDPA backend."""
+                )
+                backend_name = "TORCH_SDPA"
 
     if backend_name is not None:
         backend_name_upper = backend_name.upper()
