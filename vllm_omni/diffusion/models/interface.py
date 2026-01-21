@@ -8,7 +8,7 @@ from typing import (
 
 
 @runtime_checkable
-class SupportImageInput(Protocol):
+class SupportInputType(Protocol):
     support_image_input: ClassVar[bool] = True
 
 
