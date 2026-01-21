@@ -10,18 +10,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import base64
 import concurrent.futures
-import ctypes
-import signal
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import openai
 import pytest
 from vllm.assets.video import VideoAsset
-from vllm.utils.network_utils import get_open_port
 
 from tests.conftest import (
     OmniServer,
