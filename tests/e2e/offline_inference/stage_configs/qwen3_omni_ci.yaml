@@ -45,7 +45,7 @@ stage_args:
        worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
        scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
        gpu_memory_utilization: 0.3
-       enforce_eager: false
+       enforce_eager: true
        trust_remote_code: true
        engine_output_type: latent  # Output codec codes for code2wav
       #  tensor_parallel_size: 2
@@ -84,6 +84,7 @@ stage_args:
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
       load_format: dummy
+      async_scheduling: false
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true

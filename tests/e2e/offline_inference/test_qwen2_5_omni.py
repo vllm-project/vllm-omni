@@ -35,7 +35,7 @@ test_params = [(model, stage_config) for model in models]
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("test_config", test_params)
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     model, stage_config_path = test_config
@@ -95,7 +95,7 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("test_config", test_params)
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_mixed_modalities_to_text_only(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     model, stage_config_path = test_config

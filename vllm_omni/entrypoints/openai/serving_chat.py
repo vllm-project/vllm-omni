@@ -29,7 +29,10 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
     resolve_chat_template_content_format,
 )
-from vllm.entrypoints.harmony_utils import get_streamable_parser_for_assistant, parse_chat_output
+from vllm.entrypoints.openai.parser.harmony_utils import (
+    get_streamable_parser_for_assistant,
+    parse_chat_output,
+)
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -41,29 +44,24 @@ from vllm.entrypoints.openai.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
+    ErrorInfo,
     ErrorResponse,
     FunctionCall,
     FunctionDefinition,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponsesRequest,
     ToolCall,
     UsageInfo,
 )
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_engine import (
     ChatLikeRequest,
-    EngineTokensPrompt,
-    RequestPrompt,
-    ResponsesRequest,
-    TextTokensPrompt,
     clamp_prompt_logprobs,
-    is_list_of,
 )
-from vllm.entrypoints.openai.tool_parsers import ToolParser
-from vllm.entrypoints.openai.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import should_include_usage
-from vllm.inputs.data import PromptType
+from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -75,8 +73,10 @@ from vllm.tokenizers.mistral import (
     truncate_tool_call_ids,
     validate_request_params,
 )
+from vllm.tool_parsers import ToolParser
+from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.utils.collection_utils import as_list
+from vllm.utils.collection_utils import as_list, is_list_of
 
 from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
@@ -177,52 +177,68 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 truncate_tool_call_ids(request)
                 validate_request_params(request)
 
-            if (
-                request.tool_choice == "auto"
-                and not (self.enable_auto_tools and tool_parser is not None)
-                and not isinstance(tokenizer, MistralTokenizer)
-                and not self.use_harmony
+            # Check if tool parsing is unavailable (common condition)
+            tool_parsing_unavailable = (
+                tool_parser is None and not isinstance(tokenizer, MistralTokenizer) and not self.use_harmony
+            )
+
+            # Validate tool_choice when tool parsing is required but unavailable
+            if tool_parsing_unavailable and request.tool_choice not in (
+                None,
+                "none",
             ):
-                # for hf tokenizers, "auto" tools requires
-                # --enable-auto-tool-choice and --tool-call-parser
-                return self.create_error_response(
-                    '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
-                )
+                if request.tool_choice == "auto" and not self.enable_auto_tools:
+                    # for hf tokenizers, "auto" tools requires
+                    # --enable-auto-tool-choice and --tool-call-parser
+                    return self.create_error_response(
+                        '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+                    )
+                elif request.tool_choice != "auto":
+                    # "required" or named tool requires tool parser
+                    return self.create_error_response(
+                        f'tool_choice="{request.tool_choice}" requires --tool-call-parser to be set'
+                    )
 
             if request.tools is None or (request.tool_choice == "none" and self.exclude_tools_when_tool_choice_none):
                 tool_dicts = None
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
-            # Common case.
-            request_chat_template = request.chat_template
-            chat_template_kwargs = request.chat_template_kwargs
-            if not self.trust_request_chat_template and (
-                request_chat_template is not None
-                or (chat_template_kwargs and chat_template_kwargs.get("chat_template") is not None)
-            ):
-                return self.create_error_response(
-                    "Chat template is passed with request, but --trust-request-chat-template is not set. "
-                    "Refused request with untrusted chat template."
+            if not self.use_harmony:
+                error_check_ret = self._validate_chat_template(
+                    request_chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    trust_request_chat_template=self.trust_request_chat_template,
                 )
-            (
-                conversation,
-                request_prompts,
-                engine_prompts,
-            ) = await self._preprocess_chat(
-                request,
-                tokenizer,
-                request.messages,
-                chat_template=request_chat_template or self.chat_template,
-                chat_template_content_format=self.chat_template_content_format,
-                add_generation_prompt=request.add_generation_prompt,
-                continue_final_message=request.continue_final_message,
-                tool_dicts=tool_dicts,
-                documents=request.documents,
-                chat_template_kwargs=request.chat_template_kwargs,
-                tool_parser=tool_parser,
-                add_special_tokens=request.add_special_tokens,
-            )
+                if error_check_ret is not None:
+                    return error_check_ret
+
+                chat_template_kwargs = request.chat_template_kwargs or {}
+                chat_template_kwargs.update(reasoning_effort=request.reasoning_effort)
+
+                (
+                    conversation,
+                    request_prompts,
+                    engine_prompts,
+                ) = await self._preprocess_chat(
+                    request,
+                    tokenizer,
+                    request.messages,
+                    chat_template=request.chat_template or self.chat_template,
+                    chat_template_content_format=self.chat_template_content_format,
+                    add_generation_prompt=request.add_generation_prompt,
+                    continue_final_message=request.continue_final_message,
+                    tool_dicts=tool_dicts,
+                    documents=getattr(request, "documents", None),
+                    chat_template_kwargs=chat_template_kwargs,
+                    default_chat_template_kwargs=self.default_chat_template_kwargs,
+                    tool_parser=tool_parser,
+                    add_special_tokens=request.add_special_tokens,
+                )
+            else:
+                should_include_tools = tool_dicts is not None
+                conversation, engine_prompts = self._make_request_with_harmony(request, should_include_tools)
+                request_prompts = [engine_prompt.get("prompt_token_ids", []) for engine_prompt in engine_prompts]
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -314,12 +330,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         tool_dicts: list[dict[str, Any]] | None = None,
         documents: list[dict[str, str]] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        default_chat_template_kwargs: dict[str, Any] | None = None,
         tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[
         list[ConversationMessage],
-        Sequence[RequestPrompt],
-        list[EngineTokensPrompt],
+        Sequence[PromptType],
+        list[TokensPrompt],
     ]:
         model_config = self.model_config
 
@@ -333,9 +350,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         conversation, mm_data_future, mm_uuids = parse_chat_messages_futures(
             messages,
             model_config,
-            tokenizer,
             content_format=resolved_content_format,
             mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+        )
+
+        # Merge default_chat_template_kwargs with request-provided kwargs
+        # Request kwargs take precedence over defaults
+        merged_kwargs = self._prepare_extra_chat_template_kwargs(
+            chat_template_kwargs,
+            default_chat_template_kwargs,
         )
 
         _chat_template_kwargs: dict[str, Any] = dict(
@@ -345,7 +368,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             tools=tool_dicts,
             documents=documents,
         )
-        _chat_template_kwargs.update(chat_template_kwargs or {})
+        _chat_template_kwargs.update(merged_kwargs)
 
         request_prompt: str | list[int]
 
@@ -388,7 +411,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "Prompt has to be a string",
                 "when the tokenizer is not initialised",
             )
-            prompt_inputs = TextTokensPrompt(prompt=request_prompt, prompt_token_ids=[1])
+            prompt_inputs = TokensPrompt(prompt=request_prompt, prompt_token_ids=[1])
         elif isinstance(request_prompt, str):
             prompt_inputs = await self._tokenize_prompt_input_async(
                 request,
@@ -399,20 +422,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             # For MistralTokenizer
             assert is_list_of(request_prompt, int), "Prompt has to be either a string or a list of token ids"
-            prompt_inputs = TextTokensPrompt(
+            prompt_inputs = TokensPrompt(
                 prompt=tokenizer.decode(request_prompt),
                 prompt_token_ids=request_prompt,
             )
 
-        engine_prompt = EngineTokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
+        engine_prompt = TokensPrompt(prompt_token_ids=prompt_inputs["prompt_token_ids"])
         if mm_data is not None:
             engine_prompt["multi_modal_data"] = mm_data
 
         if mm_uuids is not None:
             engine_prompt["multi_modal_uuids"] = mm_uuids
 
-        if request.mm_processor_kwargs is not None:
-            engine_prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
+        mm_processor_kwargs = getattr(request, "mm_processor_kwargs", None)
+        if mm_processor_kwargs is not None:
+            engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
 
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
@@ -513,7 +537,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     def _log_inputs(
         self,
         request_id: str,
-        inputs: RequestPrompt | PromptType,
+        inputs: PromptType,
         params_list: list[SamplingParams] | None,
         lora_request: LoRARequest | None,
     ) -> None:
@@ -599,9 +623,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         try:
             if self.reasoning_parser:
+                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    request.chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
                 reasoning_parser = self.reasoning_parser(
                     tokenizer,
-                    chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
+                    chat_template_kwargs=chat_template_kwargs,  # type: ignore
                 )
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
@@ -1052,10 +1080,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # wasn't ready to send a token, then
                         #   get the next token without streaming a chunk
                         if delta_message is None:
-                            if output.finish_reason is None:
+                            if output.finish_reason is None and not request.return_token_ids:
                                 continue
-                            else:
-                                delta_message = DeltaMessage()
+                            delta_message = DeltaMessage()
 
                         # Log streaming delta if output logging is enabled
                         if self.enable_log_outputs and self.request_logger:
@@ -1438,13 +1465,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             if self.reasoning_parser:
                 try:
-                    reasoning_parser = self.reasoning_parser(tokenizer)
+                    chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                        request.chat_template_kwargs,
+                        self.default_chat_template_kwargs,
+                    )
+                    reasoning_parser = self.reasoning_parser(
+                        tokenizer,
+                        chat_template_kwargs=chat_template_kwargs,  # type: ignore
+                    )
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")
                     return self.create_error_response(str(e))
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning_content, content = reasoning_parser.extract_reasoning_content(output.text, request=request)
+                reasoning_content, content = reasoning_parser.extract_reasoning(output.text, request=request)
                 if not request.include_reasoning:
                     reasoning_content = None
             else:
@@ -2049,7 +2083,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ) -> ErrorResponse:
         """Create an error response following OpenAI error format."""
         return ErrorResponse(
-            message=message,
-            type=err_type,
-            code=status_code,
+            error=ErrorInfo(
+                message=message,
+                type=err_type,
+                code=status_code,
+            )
         )

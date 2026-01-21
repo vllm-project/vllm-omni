@@ -2,20 +2,14 @@
 Engine components for vLLM-Omni.
 """
 
-import time
-from collections.abc import Mapping
 from typing import Any
 
 import msgspec
 import torch
 from vllm.v1.engine import (
-    EngineCoreEvent,
+    EngineCoreOutput,
+    EngineCoreOutputs,
     EngineCoreRequest,
-    FinishReason,
-    LogprobsLists,
-    LogprobsTensors,
-    SchedulerStats,
-    UtilityOutput,
 )
 
 
@@ -79,64 +73,9 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     additional_information: AdditionalInformationPayload | None = None
 
 
-class OmniEngineCoreOutput(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):  # type: ignore[call-arg]
-    request_id: str
-    new_token_ids: list[int]
-
-    new_logprobs: LogprobsLists | None = None
-    new_prompt_logprobs_tensors: LogprobsTensors | None = None
-
+class OmniEngineCoreOutput(EngineCoreOutput):
     pooling_output: dict[str, torch.Tensor] | None = None
 
-    finish_reason: FinishReason | None = None
-    stop_reason: int | str | None = None
-    events: list[EngineCoreEvent] | None = None
-    kv_transfer_params: dict[str, Any] | None = None
 
-    trace_headers: Mapping[str, str] | None = None
-    # The number of tokens with prefix cache hits.
-    num_cached_tokens: int = 0
-
-    # The number of NaNs in logits.
-    # A value greater than 0 indicates that the output is corrupted.
-    num_nans_in_logits: int = 0
-
-    @property
-    def finished(self) -> bool:
-        return self.finish_reason is not None
-
-
-class OmniEngineCoreOutputs(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):  # type: ignore[call-arg]
-    # NOTE(Nick): We could consider ways to make this more compact,
-    # e.g. columnwise layout
-
-    engine_index: int = 0
-
-    # [num_reqs]
+class OmniEngineCoreOutputs(EngineCoreOutputs):
     outputs: list[OmniEngineCoreOutput] = []
-    scheduler_stats: SchedulerStats | None = None
-    timestamp: float = 0.0
-
-    utility_output: UtilityOutput | None = None
-    finished_requests: set[str] | None = None
-
-    # In DP case, used to signal that the current wave of requests
-    # has finished and the engines are paused.
-    wave_complete: int | None = None
-    # In DP case, used to signal that a request was received for an
-    # "old" wave, so the next wave needs to be started in other engines.
-    start_wave: int | None = None
-
-    def __post_init__(self):
-        if self.timestamp == 0.0:
-            self.timestamp = time.monotonic()
