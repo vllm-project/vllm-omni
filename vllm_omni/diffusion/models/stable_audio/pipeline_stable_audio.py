@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
@@ -58,7 +59,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput):
+class StableAudioPipeline(nn.Module, SupportAudioOutput, CFGParallelMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -319,10 +320,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         seconds_start_hidden_states = projection_output.seconds_start_hidden_states
         seconds_end_hidden_states = projection_output.seconds_end_hidden_states
 
-        if do_classifier_free_guidance:
-            seconds_start_hidden_states = torch.cat([seconds_start_hidden_states, seconds_start_hidden_states], dim=0)
-            seconds_end_hidden_states = torch.cat([seconds_end_hidden_states, seconds_end_hidden_states], dim=0)
-
         return seconds_start_hidden_states, seconds_end_hidden_states
 
     def prepare_latents(
@@ -464,11 +461,20 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             batch_size,
         )
 
+        if do_classifier_free_guidance:
+            # split prompt_embeds into positive and negative
+            negative_prompt_embeds, prompt_embeds = prompt_embeds.chunk(2)
+
         # Create combined embeddings
         text_audio_duration_embeds = torch.cat(
             [prompt_embeds, seconds_start_hidden_states, seconds_end_hidden_states],
             dim=1,
         )
+        if do_classifier_free_guidance and negative_prompt_embeds is not None:
+            negative_text_audio_duration_embeds = torch.cat(
+                [negative_prompt_embeds, seconds_start_hidden_states, seconds_end_hidden_states],
+                dim=1,
+            )
         audio_duration_embeds = torch.cat(
             [seconds_start_hidden_states, seconds_end_hidden_states],
             dim=2,
@@ -477,14 +483,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         # Handle CFG without negative prompt
         if do_classifier_free_guidance and negative_prompt_embeds is None and negative_prompt is None:
             negative_text_audio_duration_embeds = torch.zeros_like(text_audio_duration_embeds)
-            text_audio_duration_embeds = torch.cat(
-                [negative_text_audio_duration_embeds, text_audio_duration_embeds],
-                dim=0,
-            )
-            audio_duration_embeds = torch.cat(
-                [audio_duration_embeds, audio_duration_embeds],
-                dim=0,
-            )
 
         # Duplicate for multiple waveforms per prompt
         bs_embed, seq_len, hidden_size = text_audio_duration_embeds.shape
@@ -532,27 +530,39 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         for t in timesteps:
             self._current_timestep = t
 
-            # Expand latents for CFG
-            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            latent_model_input = self.scheduler.scale_model_input(latents, t)
+
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": t.unsqueeze(0),
+                "encoder_hidden_states": text_audio_duration_embeds,
+                "global_hidden_states": audio_duration_embeds,
+                "rotary_embedding": rotary_embedding,
+                "return_dict": False,
+            }
+            if do_classifier_free_guidance:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": t.unsqueeze(0),
+                    "encoder_hidden_states": negative_text_audio_duration_embeds,
+                    "global_hidden_states": audio_duration_embeds,
+                    "rotary_embedding": rotary_embedding,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
 
             # Predict noise
-            noise_pred = self.transformer(
-                latent_model_input,
-                t.unsqueeze(0),
-                encoder_hidden_states=text_audio_duration_embeds,
-                global_hidden_states=audio_duration_embeds,
-                rotary_embedding=rotary_embedding,
-                return_dict=False,
-            )[0]
-
-            # Perform CFG
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_classifier_free_guidance,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
 
             # Scheduler step
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_classifier_free_guidance)
 
         self._current_timestep = None
 
@@ -568,6 +578,14 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         audio = audio[:, :, waveform_start:waveform_end]
 
         return DiffusionOutput(output=audio)
+
+    def scheduler_step(self, noise_pred, t, latents):
+        """
+        Step the scheduler.
+        """
+        latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+
+        return latents
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""
