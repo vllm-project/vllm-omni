@@ -220,6 +220,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 latents = self.scheduler_step(noise_pred, t, latents)
 
             # Broadcast the updated latents to all ranks
+            latents = latents.contiguous()
             cfg_group.broadcast(latents, src=0)
         else:
             # No CFG parallel: directly compute scheduler step
