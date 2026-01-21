@@ -24,6 +24,7 @@ from tests.conftest import (
     dummy_messages_from_mix_data,
     modify_stage_config,
 )
+from tests.utils import hardware_test
 from vllm_omni.utils import is_rocm
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -122,6 +123,9 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_audio_concurrent(
     client: openai.OpenAI,
@@ -214,6 +218,9 @@ def test_video_to_audio_concurrent(
     assert len(audio_data) > 0
 
 
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.skipif(is_rocm(), reason="Test skipped on AMD environment due to known output issues")
 @pytest.mark.parametrize("test_config", test_params)
 def test_text_to_text_audio_001(test_config: tuple[str, str]) -> None:
