@@ -705,6 +705,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 "txt_ids": text_ids,
                 "img_ids": latent_image_ids,
                 "joint_attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
             }
             negative_kwargs = {
                 "hidden_states": latent_model_input,
@@ -714,6 +715,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 "txt_ids": negative_text_ids,
                 "img_ids": latent_image_ids,
                 "joint_attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
             }
 
             # For image conditioning, we need to slice the output to remove condition latents
