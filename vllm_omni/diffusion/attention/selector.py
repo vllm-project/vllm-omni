@@ -12,7 +12,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
-from vllm_omni.utils.platform_utils import detect_device_type
+from vllm_omni.utils.platform_utils import detect_device_type, is_rocm
 
 logger = init_logger(__name__)
 
@@ -68,7 +68,7 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
 
     backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND", None)
 
-    if detect_device_type() == "cuda":
+    if detect_device_type() == "cuda" and not is_rocm():
         compute_capability = torch.cuda.get_device_capability()
         major, minor = compute_capability
         if 80 <= major * 10 + minor < 100:
