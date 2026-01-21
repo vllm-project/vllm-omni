@@ -541,13 +541,16 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
                 "pooled_projections": pooled_prompt_embeds,
                 "return_dict": False,
             }
-            negative_kwargs = {
-                "hidden_states": latents,
-                "timestep": timestep,
-                "encoder_hidden_states": negative_prompt_embeds,
-                "pooled_projections": negative_pooled_prompt_embeds,
-                "return_dict": False,
-            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "pooled_projections": negative_pooled_prompt_embeds,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
 
             # Predict noise with automatic CFG parallel handling
             noise_pred = self.predict_noise_maybe_with_cfg(
