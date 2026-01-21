@@ -30,8 +30,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
         true_cfg_scale,
         positive_kwargs,
         negative_kwargs,
-        cfg_group=None,
-        cfg_rank=None,
         cfg_normalize=True,
         output_slice=None,
     ):
@@ -43,18 +41,21 @@ class CFGParallelMixin(metaclass=ABCMeta):
             true_cfg_scale: CFG scale factor
             positive_kwargs: Kwargs for positive/conditional prediction
             negative_kwargs: Kwargs for negative/unconditional prediction
-            cfg_group: Communication group for CFG parallelism
-            cfg_rank: Rank in CFG parallel group
             cfg_normalize: Whether to normalize CFG output (default: True)
             output_slice: If set, slice output to [:, :output_slice] for image editing
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor (only valid on rank 0 in CFG parallel mode)
         """
         if do_true_cfg:
-            if cfg_group is not None:
+            # Automatically detect CFG parallel configuration
+            cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
+
+            if cfg_parallel_ready:
                 # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-                assert cfg_rank is not None, "cfg_rank must be provided if cfg_group is provided"
+                cfg_group = get_cfg_group()
+                cfg_rank = get_classifier_free_guidance_rank()
+
                 if cfg_rank == 0:
                     local_pred = self.predict_noise(**positive_kwargs)
                 else:
@@ -69,8 +70,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     noise_pred = gathered[0]
                     neg_noise_pred = gathered[1]
                     noise_pred = self.combine_cfg_noise(noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize)
-
                     return noise_pred
+                else:
+                    return None
             else:
                 # Sequential CFG: compute both positive and negative
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
@@ -154,6 +156,55 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """Property to check if diffusion should be interrupted."""
         return getattr(self, "_interrupt", False)
 
+    def scheduler_step(self, noise_pred, t, latents):
+        """
+        Step the scheduler.
+
+        Args:
+            noise_pred: Predicted noise
+            t: Current timestep
+            latents: Current latents
+
+        Returns:
+            Updated latents after scheduler step
+        """
+        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+    def scheduler_step_maybe_with_cfg(self, noise_pred, t, latents, do_true_cfg):
+        """
+        Step the scheduler with (maybe) automatic CFG parallel synchronization.
+
+        In CFG parallel mode, only rank 0 computes the scheduler step,
+        then broadcasts the result to other ranks.
+
+        Args:
+            noise_pred: Predicted noise (only valid on rank 0 in CFG parallel)
+            t: Current timestep
+            latents: Current latents
+            do_true_cfg: Whether CFG is enabled
+
+        Returns:
+            Updated latents (synchronized across all CFG ranks)
+        """
+        # Automatically detect CFG parallel configuration
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+
+        if cfg_parallel_ready:
+            cfg_group = get_cfg_group()
+            cfg_rank = get_classifier_free_guidance_rank()
+
+            # Only rank 0 computes the scheduler step
+            if cfg_rank == 0:
+                latents = self.scheduler_step(noise_pred, t, latents)
+
+            # Broadcast the updated latents to all ranks
+            cfg_group.broadcast(latents, src=0)
+        else:
+            # No CFG parallel: directly compute scheduler step
+            latents = self.scheduler_step(noise_pred, t, latents)
+
+        return latents
+
 
 class QwenImageCFGParallelMixin(CFGParallelMixin):
     """
@@ -218,11 +269,6 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
-            # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
-            cfg_group = get_cfg_group() if cfg_parallel_ready else None
-            cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel_ready else None
-
             positive_kwargs = {
                 "hidden_states": latent_model_input,
                 "timestep": timestep / 1000,
@@ -247,29 +293,17 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
             # For editing pipelines, we need to slice the output to remove condition latents
             output_slice = latents.size(1) if image_latents is not None else None
 
+            # Predict noise with automatic CFG parallel handling
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg,
                 true_cfg_scale,
                 positive_kwargs,
                 negative_kwargs,
-                cfg_group,
-                cfg_rank,
                 cfg_normalize,
                 output_slice,
             )
 
-            # compute the previous noisy sample x_t -> x_t-1
-            if cfg_group is not None:
-                if cfg_rank == 0:
-                    latents = self.scheduler_step(noise_pred, t, latents)
-                cfg_group.broadcast(latents, src=0)
-            else:
-                latents = self.scheduler_step(noise_pred, t, latents)
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
         return latents
-
-    def scheduler_step(self, noise_pred, t, latents):
-        """
-        Step the scheduler.
-        """
-        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]

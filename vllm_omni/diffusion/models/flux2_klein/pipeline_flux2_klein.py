@@ -37,11 +37,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -698,11 +693,6 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
                 latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
-            # Enable CFG-parallel: rank0 computes positive, rank1 computes negative
-            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
-            cfg_group = get_cfg_group() if cfg_parallel_ready else None
-            cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel_ready else None
-
             positive_kwargs = {
                 "hidden_states": latent_model_input,
                 "timestep": timestep / 1000,
@@ -725,24 +715,18 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             # For image conditioning, we need to slice the output to remove condition latents
             output_slice = latents.size(1) if image_latents is not None else None
 
+            # Predict noise with automatic CFG parallel handling
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg,
                 guidance_scale,
                 positive_kwargs,
                 negative_kwargs,
-                cfg_group,
-                cfg_rank,
                 cfg_normalize,
                 output_slice,
             )
 
-            # compute the previous noisy sample x_t -> x_t-1
-            if cfg_group is not None:
-                if cfg_rank == 0:
-                    latents = self.scheduler_step(noise_pred, t, latents)
-                cfg_group.broadcast(latents, src=0)
-            else:
-                latents = self.scheduler_step(noise_pred, t, latents)
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
         return latents
 
