@@ -1,11 +1,15 @@
+import base64
+import datetime
+import io
+import math
 import os
+import random
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 # Set CPU device for CI environments without GPU
 if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
-import base64
 import socket
 import subprocess
 import sys
@@ -13,10 +17,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import psutil
 import pytest
 import torch
-import whisper
 import yaml
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
@@ -119,27 +123,397 @@ def dummy_messages_from_mix_data(
     return messages
 
 
-def cosine_similarity_text(s1, s2):
-    """
-        Calculate cosine similarity between two text strings.
-        Notes:
-    ------
-    - Higher score means more similar texts
-    - Score of 1.0 means identical word composition (bag-of-words)
-    - Score of 0.0 means completely different vocabulary
-    """
-    from sklearn.feature_extraction.text import CountVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
+def generate_synthetic_audio(
+    duration: int,  # seconds
+    num_channels: int,  # 1：Mono，2：Stereo 5：5.1 surround sound
+    sample_rate: int = 48000,  # Default use 48000Hz.
+    save_to_file: bool = False,
+) -> dict[str, Any]:
+    """ "Generate synthetic audio with rain."""
+    import soundfile as sf
 
-    vectorizer = CountVectorizer().fit_transform([s1, s2])
-    vectors = vectorizer.toarray()
-    return cosine_similarity([vectors[0]], [vectors[1]])[0][0]
+    # Initialize audio data array
+    num_samples = int(sample_rate * duration)
+    audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
+
+    # Configure parameters based on rain intensity
+    drop_density = 10  # Number of raindrops per second
+    drop_volume = 0.15  # Volume of individual raindrops
+    background_volume = 0.02  # Volume of background rain noise
+
+    # Pink noise sounds more natural than white noise for rain
+    white_noise = np.random.randn(num_samples)
+    pink_noise = np.convolve(white_noise, np.ones(8) / 8, mode="same")
+    pink_noise = pink_noise / np.max(np.abs(pink_noise)) if np.max(np.abs(pink_noise)) > 0 else pink_noise
+    bg_noise = pink_noise * background_volume
+
+    # Add background noise to all channels
+    for ch in range(num_channels):
+        audio_data[:, ch] += bg_noise
+
+    # Total number of raindrops = density × duration × channels for stereo effect
+    total_drops = int(drop_density * duration * num_channels)
+
+    for _ in range(total_drops):
+        # Random timing for raindrop
+        drop_time = random.uniform(0, duration)
+
+        # Random duration of raindrop sound (0.01-0.05 seconds)
+        drop_duration = random.uniform(0.01, 0.05)
+
+        # Random frequency gives variation in raindrop pitch
+        drop_freq = random.uniform(500, 5000)  # Hz
+
+        # Random channel selection for stereo positioning
+        channel = random.randint(0, num_channels - 1)
+
+        # Calculate sample positions for this raindrop
+        start_sample = int(drop_time * sample_rate)
+        drop_samples = int(drop_duration * sample_rate)
+        end_sample = min(start_sample + drop_samples, num_samples)
+
+        if start_sample < end_sample:
+            # Generate the raindrop sound
+            num_drop_samples = end_sample - start_sample
+            t = np.arange(num_drop_samples) / sample_rate
+
+            # Basic sine wave for raindrop sound
+            drop_sound = drop_volume * np.sin(2 * math.pi * drop_freq * t)
+
+            # Apply envelope for natural attack and decay
+            envelope = np.ones(num_drop_samples)
+            attack_samples = int(num_drop_samples * 0.1)  # 10% of samples for attack
+            decay_samples = num_drop_samples - attack_samples
+
+            if attack_samples > 0:
+                # Linear attack: volume increases from 0 to 1
+                envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
+
+            if decay_samples > 0:
+                # Exponential decay for natural sound fade
+                decay = np.exp(-8 * t[attack_samples:] / drop_duration)
+                envelope[attack_samples:] = decay
+
+            # Apply envelope to raindrop sound
+            drop_sound *= envelope
+
+            # Add raindrop sound to selected channel
+            audio_data[start_sample:end_sample, channel] += drop_sound
+
+    # Step 3: Add simple reverb effect for realism
+    # Reverb simulates sound reflections in environment
+    if duration > 2:
+        # Single delay reverb (100ms delay)
+        delay_samples = int(0.1 * sample_rate)
+        if delay_samples < num_samples:
+            for ch in range(num_channels):
+                delayed = np.zeros(num_samples)
+                delayed[delay_samples:] = audio_data[:-delay_samples, ch] * 0.3
+                audio_data[:, ch] += delayed
+
+    # Step 4: Normalize audio to prevent clipping
+    # Find maximum amplitude and scale to 80% of maximum volume
+    max_amp = np.max(np.abs(audio_data))
+    if max_amp > 0:
+        audio_data = audio_data / max_amp * 0.8
+
+    # Handle file saving
+    audio_bytes = None
+
+    if save_to_file:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"audio_{num_channels}ch_{timestamp}.wav"
+
+        try:
+            sf.write(output_path, audio_data, sample_rate, format="WAV", subtype="PCM_16")
+            print(f"Audio saved: {output_path}")
+
+            with open(output_path, "rb") as f:
+                audio_bytes = f.read()
+        except Exception as e:
+            print(f"Save failed: {e}")
+            save_to_file = False
+
+    # If not saving or save failed, create in memory
+    if not save_to_file or audio_bytes is None:
+        buffer = io.BytesIO()
+        sf.write(buffer, audio_data, sample_rate, format="WAV", subtype="PCM_16")
+        buffer.seek(0)
+        audio_bytes = buffer.read()
+
+    # Return result
+    base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+    result = {
+        "base64": base64_audio,
+    }
+    if save_to_file and output_path:
+        result["file_path"] = output_path
+
+    return result
+
+
+def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> str:
+    """Generate synthetic video with bouncing balls and return base64 string."""
+
+    import cv2
+    import imageio
+
+    # Create random balls
+    num_balls = random.randint(3, 8)
+    balls = []
+
+    for _ in range(num_balls):
+        radius = min(width, height) // 8
+        if radius < 1:
+            raise ValueError(f"Video dimensions ({width}x{height}) are too small for synthetic video generation")
+        x = random.randint(radius, width - radius)
+        y = random.randint(radius, height - radius)
+
+        speed = random.uniform(3.0, 8.0)
+        angle = random.uniform(0, 2 * math.pi)
+        vx = speed * math.cos(angle)
+        vy = speed * math.sin(angle)
+
+        # OpenCV uses BGR format, but imageio expects RGB
+        # We'll create in BGR first, then convert to RGB later
+        color_bgr = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+
+        balls.append({"x": x, "y": y, "vx": vx, "vy": vy, "radius": radius, "color_bgr": color_bgr})
+
+    # Generate video frames
+    video_frames = []
+
+    for frame_idx in range(num_frames):
+        # Create black background (BGR format)
+        frame_bgr = np.zeros((height, width, 3), dtype=np.uint8)
+
+        for ball in balls:
+            # Update position
+            ball["x"] += ball["vx"]
+            ball["y"] += ball["vy"]
+
+            # Boundary collision detection
+            if ball["x"] - ball["radius"] <= 0 or ball["x"] + ball["radius"] >= width:
+                ball["vx"] = -ball["vx"]
+                ball["x"] = max(ball["radius"], min(width - ball["radius"], ball["x"]))
+
+            if ball["y"] - ball["radius"] <= 0 or ball["y"] + ball["radius"] >= height:
+                ball["vy"] = -ball["vy"]
+                ball["y"] = max(ball["radius"], min(height - ball["radius"], ball["y"]))
+
+            # Use cv2 to draw circle
+            x, y = int(ball["x"]), int(ball["y"])
+            radius = ball["radius"]
+
+            # Draw solid circle (main circle)
+            cv2.circle(frame_bgr, (x, y), radius, ball["color_bgr"], -1)
+
+            # Add simple 3D effect: draw a brighter center
+            if radius > 3:  # Only add highlight when radius is large enough
+                highlight_radius = max(1, radius // 2)
+                highlight_x = max(highlight_radius, min(x - radius // 4, width - highlight_radius))
+                highlight_y = max(highlight_radius, min(y - radius // 4, height - highlight_radius))
+
+                # Create highlight color (brighter)
+                highlight_color = tuple(min(c + 40, 255) for c in ball["color_bgr"])
+                cv2.circle(frame_bgr, (highlight_x, highlight_y), highlight_radius, highlight_color, -1)
+
+        # Convert BGR to RGB for imageio
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        video_frames.append(frame_rgb)
+
+    video_bytes = None
+    saved_file_path = None
+
+    buffer = io.BytesIO()
+    writer_kwargs = {
+        "format": "mp4",
+        "fps": 30,
+        "codec": "libx264",
+        "quality": 7,
+        "pixelformat": "yuv420p",
+        "macro_block_size": 16,
+        "ffmpeg_params": [
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-movflags",
+            "+faststart",
+            "-pix_fmt",
+            "yuv420p",
+            "-vf",
+            f"scale={width}:{height}",
+        ],
+    }
+
+    if save_to_file:
+        import datetime
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"video_{width}x{height}_{timestamp}.mp4"
+        try:
+            with imageio.get_writer(output_path, **writer_kwargs) as writer:
+                for frame in video_frames:
+                    writer.append_data(frame)
+
+            saved_file_path = output_path
+            print(f"Video saved to: {saved_file_path}")
+            with open(output_path, "rb") as f:
+                video_bytes = f.read()
+
+        except Exception as e:
+            print(f"Warning: Failed to save video to file {output_path}: {e}")
+            save_to_file = False
+
+    if not save_to_file or video_bytes is None:
+        with imageio.get_writer(buffer, **writer_kwargs) as writer:
+            for frame in video_frames:
+                writer.append_data(frame)
+
+        buffer.seek(0)
+        video_bytes = buffer.read()
+
+    base64_video = base64.b64encode(video_bytes).decode("utf-8")
+
+    result = {
+        "base64": base64_video,
+    }
+    if save_to_file and saved_file_path:
+        result["file_path"] = saved_file_path
+
+    return result
+
+
+def generate_synthetic_image(width: int, height: int, save_to_file: bool = False) -> Any:
+    """Generate synthetic image with randomly colored squares and return base64 string."""
+    from PIL import Image, ImageDraw
+
+    # Create white background
+    image = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+
+    # Generate random number of squares
+    num_squares = random.randint(3, 8)
+
+    for _ in range(num_squares):
+        # Random square size
+        square_size = random.randint(min(width, height) // 8, min(width, height) // 4)
+
+        # Random position
+        x = random.randint(0, width - square_size - 1)
+        y = random.randint(0, height - square_size - 1)
+
+        # Random color
+        color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+        # Random border width
+        border_width = random.randint(1, 5)
+
+        # Draw square
+        draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
+
+    # Handle file saving
+    image_bytes = None
+    saved_file_path = None
+
+    if save_to_file:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"image_{width}x{height}_{timestamp}.jpg"
+
+        try:
+            # Save image to file
+            image.save(output_path, format="JPEG", quality=85, optimize=True)
+            saved_file_path = output_path
+            print(f"Image saved to: {saved_file_path}")
+
+            # Read file for base64 encoding
+            with open(output_path, "rb") as f:
+                image_bytes = f.read()
+
+        except Exception as e:
+            print(f"Warning: Failed to save image to file {output_path}: {e}")
+            save_to_file = False
+
+    # If not saving or save failed, create in memory
+    if not save_to_file or image_bytes is None:
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85, optimize=True)
+        buffer.seek(0)
+        image_bytes = buffer.read()
+
+    # Generate base64
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    # Return result
+    result = {
+        "base64": base64_image,
+    }
+    if save_to_file and saved_file_path:
+        result["file_path"] = saved_file_path
+
+    return result
+
+
+def preprocess_text(text):
+    import re
+
+    word_to_num = {
+        "zero": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+        "ten": "10",
+    }
+
+    for word, num in word_to_num.items():
+        pattern = r"\b" + re.escape(word) + r"\b"
+        text = re.sub(pattern, num, text, flags=re.IGNORECASE)
+
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.lower().strip()
+
+
+def cosine_similarity_text(text1, text2, n: int = 3):
+    from collections import Counter
+
+    if not text1 or not text2:
+        return 0.0
+
+    text1 = preprocess_text(text1)
+    text2 = preprocess_text(text2)
+
+    ngrams1 = [text1[i : i + n] for i in range(len(text1) - n + 1)]
+    ngrams2 = [text2[i : i + n] for i in range(len(text2) - n + 1)]
+
+    counter1 = Counter(ngrams1)
+    counter2 = Counter(ngrams2)
+
+    all_ngrams = set(counter1.keys()) | set(counter2.keys())
+    vec1 = [counter1.get(ng, 0) for ng in all_ngrams]
+    vec2 = [counter2.get(ng, 0) for ng in all_ngrams]
+
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot_product / (norm1 * norm2)
 
 
 def convert_audio_to_text(audio_data):
     """
     Convert base64 encoded audio data to text using speech recognition.
     """
+    import whisper
 
     audio_data = base64.b64decode(audio_data)
     output_path = f"./test_{int(time.time())}"
@@ -147,8 +521,15 @@ def convert_audio_to_text(audio_data):
         audio_file.write(audio_data)
 
     print(f"audio data is saved: {output_path}")
+
     model = whisper.load_model("base")
-    text = model.transcribe(output_path)["text"]
+    text = model.transcribe(
+        output_path,
+        temperature=0.0,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        initial_prompt="Please transcribe with proper word spacing.",
+    )["text"]
     if text:
         return text
     else:
