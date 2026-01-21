@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -20,6 +22,14 @@ class ForwardContext:
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
+
+    # Sequence Parallel padding support
+    # When sequence length is not divisible by SP world size, padding is added
+    # These values are used by SequenceParallelGatherHook to remove padding,
+    # and by attention layers to create attention masks dynamically
+    sp_padding_size: int = 0
+    # Original sequence length before padding (for removing padding in gather)
+    sp_original_seq_len: int | None = None
 
     def __post_init__(self):
         pass
