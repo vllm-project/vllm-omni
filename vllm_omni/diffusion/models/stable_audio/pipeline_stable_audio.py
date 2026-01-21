@@ -27,7 +27,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportOutputType
+from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -58,7 +58,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportOutputType):
+class StableAudioPipeline(nn.Module, SupportAudioOutput):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -70,7 +70,7 @@ class StableAudioPipeline(nn.Module, SupportOutputType):
         prefix: Weight prefix for loading (default: "")
     """
 
-    output_type: str = "audio"
+    support_audio_output: bool = True
 
     def __init__(
         self,

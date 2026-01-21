@@ -29,7 +29,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportInputType
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import (
     AutoencoderKLQwenImage,
 )
@@ -172,7 +172,7 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class QwenImageLayeredPipeline(nn.Module, SupportInputType):
+class QwenImageLayeredPipeline(nn.Module, SupportImageInput):
     def __init__(
         self,
         *,

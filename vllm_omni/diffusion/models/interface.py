@@ -8,10 +8,10 @@ from typing import (
 
 
 @runtime_checkable
-class SupportInputType(Protocol):
+class SupportImageInput(Protocol):
     support_image_input: ClassVar[bool] = True
 
 
 @runtime_checkable
-class SupportOutputType(Protocol):
-    output_type: ClassVar[str] = "image"
+class SupportAudioOutput(Protocol):
+    support_audio_output: ClassVar[bool] = True

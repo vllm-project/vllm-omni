@@ -31,7 +31,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportInputType
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
@@ -104,7 +104,7 @@ def get_wan22_ti2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22TI2VPipeline(nn.Module, SupportInputType):
+class Wan22TI2VPipeline(nn.Module, SupportImageInput):
     """
     Wan2.2 Text-Image-to-Video (TI2V) Pipeline.
 

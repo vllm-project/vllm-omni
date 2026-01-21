@@ -133,8 +133,7 @@ class DiffusionEngine:
                 outputs = [outputs] if outputs is not None else []
 
             model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
-            output_type = getattr(model_cls, "output_type", "image") if model_cls is not None else "image"
-            is_audio_output = output_type == "audio"
+            is_audio_output = bool(getattr(model_cls, "support_audio_output", False)) if model_cls is not None else False
 
             # Handle single request or multiple requests
             if len(requests) == 1:
