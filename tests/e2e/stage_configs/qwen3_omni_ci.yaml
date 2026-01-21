@@ -15,7 +15,7 @@ stage_args:
     worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
     gpu_memory_utilization: 0.6
-    enforce_eager: true
+    enforce_eager: false
     trust_remote_code: true
     engine_output_type: latent  # Output hidden states for talker
     distributed_executor_backend: "mp"
@@ -46,7 +46,7 @@ stage_args:
     worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
     gpu_memory_utilization: 0.3
-    enforce_eager: true
+    enforce_eager: false
     trust_remote_code: true
     engine_output_type: latent  # Output codec codes for code2wav
     enable_prefix_caching: false
@@ -58,7 +58,7 @@ stage_args:
   default_sampling_params:
     temperature: 0.9
     top_k: 50
-    max_tokens: 100
+    max_tokens: 1000
     seed: 42
     detokenize: False
     repetition_penalty: 1.05
@@ -90,7 +90,7 @@ stage_args:
     temperature: 0.0
     top_p: 1.0
     top_k: -1
-    max_tokens: 200
+    max_tokens: 2000
     seed: 42
     detokenize: True
     repetition_penalty: 1.1
