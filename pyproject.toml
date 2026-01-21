@@ -40,7 +40,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "torchsde>=0.2.6",  # Required for Stable Audio scheduler
     "openai-whisper>=20250625",
-    # "vllm==0.12.0",  # TODO: fix the entrypoints overwrite problem
+    # "vllm==0.14.0",  # TODO: fix the entrypoints overwrite problem
 ]
 
 [project.optional-dependencies]
