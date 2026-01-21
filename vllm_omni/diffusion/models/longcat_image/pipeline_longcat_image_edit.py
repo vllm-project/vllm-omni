@@ -26,7 +26,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -216,7 +215,7 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class LongCatImageEditPipeline(nn.Module, SupportImageInput):
     def __init__(
         self,
         *,
@@ -395,104 +394,6 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
 
-        return latents
-
-    def diffuse(
-        self,
-        latents,
-        image_latents,
-        latent_image_ids,
-        prompt_embeds,
-        text_ids,
-        negative_prompt_embeds,
-        negative_text_ids,
-        timesteps,
-        do_true_cfg,
-        guidance_scale,
-        image_seq_len,
-        cfg_normalize=False,
-    ):
-        """
-        Diffusion loop with optional classifier-free guidance.
-
-        Args:
-            latents: Noise latents to denoise
-            image_latents: Conditional image latents
-            latent_image_ids: Position IDs for latents and image
-            prompt_embeds: Positive prompt embeddings
-            text_ids: Position IDs for positive text
-            negative_prompt_embeds: Negative prompt embeddings
-            negative_text_ids: Position IDs for negative text
-            timesteps: Diffusion timesteps
-            do_true_cfg: Whether to apply CFG
-            guidance_scale: CFG scale factor
-            image_seq_len: Sequence length of image latents for slicing
-            cfg_normalize: Whether to normalize CFG output (default: False)
-
-        Returns:
-            Denoised latents
-        """
-        guidance = None
-
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-
-            self._current_timestep = t
-
-            latent_model_input = latents
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1)
-
-            timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
-
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states": prompt_embeds,
-                "txt_ids": text_ids,
-                "img_ids": latent_image_ids,
-                "return_dict": False,
-            }
-            negative_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states": negative_prompt_embeds,
-                "txt_ids": negative_text_ids,
-                "img_ids": latent_image_ids,
-                "return_dict": False,
-            }
-
-            # For editing pipelines, we need to slice the output to remove condition latents
-            output_slice = image_seq_len if image_latents is not None else None
-
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg,
-                guidance_scale,
-                positive_kwargs,
-                negative_kwargs,
-                cfg_normalize,
-                output_slice,
-            )
-
-            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-
-        return latents
-
-    def scheduler_step(self, noise_pred, t, latents):
-        """
-        Step the scheduler.
-        """
-        latents_dtype = latents.dtype
-        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        if latents.dtype != latents_dtype:
-            if torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
         return latents
 
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
@@ -736,26 +637,53 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
         self._num_timesteps = len(timesteps)
 
+        guidance = None
+
         if image is not None:
             latent_image_ids = torch.cat([latents_ids, image_latents_ids], dim=0)
         else:
             latent_image_ids = latents_ids
 
-        # Denoising loop using diffuse method
-        latents = self.diffuse(
-            latents=latents,
-            image_latents=image_latents,
-            latent_image_ids=latent_image_ids,
-            prompt_embeds=prompt_embeds,
-            text_ids=text_ids,
-            negative_prompt_embeds=negative_prompt_embeds if guidance_scale > 1 else None,
-            negative_text_ids=negative_text_ids if guidance_scale > 1 else None,
-            timesteps=timesteps,
-            do_true_cfg=guidance_scale > 1,
-            guidance_scale=guidance_scale,
-            image_seq_len=image_seq_len,
-            cfg_normalize=False,
-        )
+        for i, t in enumerate(timesteps):
+            self._current_timestep = t
+
+            latent_model_input = latents
+            if image_latents is not None:
+                latent_model_input = torch.cat([latents, image_latents], dim=1)
+
+            timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+
+            noise_pred_text = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep / 1000,
+                guidance=guidance,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                return_dict=False,
+            )[0]
+            noise_pred_text = noise_pred_text[:, :image_seq_len]
+            if guidance_scale > 1:
+                noise_pred_uncond = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep / 1000,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    txt_ids=negative_text_ids,
+                    img_ids=latent_image_ids,
+                    return_dict=False,
+                )[0]
+                noise_pred_uncond = noise_pred_uncond[:, :image_seq_len]
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            else:
+                noise_pred = noise_pred_text
+            # compute the previous noisy sample x_t -> x_t-1
+            latents_dtype = latents.dtype
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if latents.dtype != latents_dtype:
+                if torch.backends.mps.is_available():
+                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                    latents = latents.to(latents_dtype)
 
         self._current_timestep = None
 
