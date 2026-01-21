@@ -478,14 +478,17 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
                 "img_ids": latent_image_ids,
                 "return_dict": False,
             }
-            negative_kwargs = {
-                "hidden_states": latents,
-                "timestep": timestep / 1000,
-                "encoder_hidden_states": negative_prompt_embeds,
-                "txt_ids": negative_text_ids,
-                "img_ids": latent_image_ids,
-                "return_dict": False,
-            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep / 1000,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_image_ids,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
 
             # Predict noise with automatic CFG parallel handling
             noise_pred = self.predict_noise_maybe_with_cfg(
