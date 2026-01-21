@@ -453,6 +453,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
                 "encoder_hidden_states": prompt_embeds,
                 "txt_ids": text_ids,
                 "img_ids": latent_image_ids,
+                "return_dict": False,
             }
             negative_kwargs = {
                 "hidden_states": latents,
@@ -461,6 +462,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
                 "encoder_hidden_states": negative_prompt_embeds,
                 "txt_ids": negative_text_ids,
                 "img_ids": latent_image_ids,
+                "return_dict": False,
             }
 
             # Predict noise with automatic CFG parallel handling

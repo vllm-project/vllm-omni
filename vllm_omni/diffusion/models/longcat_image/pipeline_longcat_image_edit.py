@@ -453,6 +453,7 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 "encoder_hidden_states": prompt_embeds,
                 "txt_ids": text_ids,
                 "img_ids": latent_image_ids,
+                "return_dict": False,
             }
             negative_kwargs = {
                 "hidden_states": latent_model_input,
@@ -461,6 +462,7 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 "encoder_hidden_states": negative_prompt_embeds,
                 "txt_ids": negative_text_ids,
                 "img_ids": latent_image_ids,
+                "return_dict": False,
             }
 
             # For editing pipelines, we need to slice the output to remove condition latents
