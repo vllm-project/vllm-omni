@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -520,7 +521,7 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
-class ZImageTransformer2DModel(nn.Module):
+class ZImageTransformer2DModel(CachedTransformer):
     """Z-Image Transformer model for image generation.
 
     Sequence Parallelism:
