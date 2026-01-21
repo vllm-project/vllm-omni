@@ -1,5 +1,11 @@
-import base64
 import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+# Set CPU device for CI environments without GPU
+if "VLLM_TARGET_DEVICE" not in os.environ:
+    os.environ["VLLM_TARGET_DEVICE"] = "cpu"
+
+import base64
 import socket
 import subprocess
 import sys
@@ -13,9 +19,31 @@ import torch
 import whisper
 import yaml
 from vllm.logger import init_logger
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
 logger = init_logger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def default_vllm_config():
+    """Set a default VllmConfig for all tests.
+
+    This fixture is auto-used for all tests to ensure that any test
+    that directly instantiates vLLM CustomOps (e.g., RMSNorm, LayerNorm)
+    or model components has the required VllmConfig context.
+
+    This fixture is required for vLLM 0.14.0+ where CustomOp initialization
+    requires a VllmConfig context set via set_current_vllm_config().
+    """
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+
+    # Use CPU device if no GPU is available (e.g., in CI environments)
+    has_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    device = "cuda" if has_gpu else "cpu"
+    device_config = DeviceConfig(device=device)
+
+    with set_current_vllm_config(VllmConfig(device_config=device_config)):
+        yield
 
 
 @pytest.fixture(autouse=True)

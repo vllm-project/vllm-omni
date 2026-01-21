@@ -77,6 +77,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio  # Final output: audio waveform
       gpu_memory_utilization: 0.1

@@ -10,7 +10,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.tokenizers import init_tokenizer_from_config
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
@@ -111,7 +111,7 @@ class AsyncOmniLLM(AsyncLLM):
             tokenizer = None
         else:
             # Tokenizer (+ ensure liveness if running in another process).
-            tokenizer = init_tokenizer_from_config(model_config=vllm_config.model_config)
+            tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
 
         # InputProcessor (converts Inputs --> EngineCoreRequests).
         self.input_processor = OmniInputProcessor(

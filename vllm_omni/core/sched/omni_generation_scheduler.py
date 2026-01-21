@@ -90,7 +90,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             any_request = self.running[0]
             num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
 
-        # Assemble SchedulerOutput (align with v0.12.0)
+        # Assemble SchedulerOutput (align with v0.14.0)
         if self.use_v2_model_runner:
             # No resumed reqs in fast path; pass prefill_token_ids for new reqs.
             new_reqs_data = [
@@ -129,7 +129,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             preempted_req_ids=set(),
         )
 
-        # Record the request ids scheduled in this step (v0.12.0 behavior).
+        # Record the request ids scheduled in this step (v0.14.0 behavior).
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
@@ -176,7 +176,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
-        # Merge connector-side stats (align with v0.12.0)
+        # Merge connector-side stats (align with v0.14.0)
         if kv_connector_stats and self.connector:
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
@@ -294,7 +294,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
-        # Collect and publish KV cache events (align with v0.12.0)
+        # Collect and publish KV cache events (align with v0.14.0)
         events = self.kv_cache_manager.take_events()
         if self.connector is not None:
             connector_events = self.connector.take_events()
