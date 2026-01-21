@@ -641,6 +641,10 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     def current_timestep(self):
         return self._current_timestep
 
+    @property
+    def interrupt(self):
+        return self._interrupt
+
     def diffuse(
         self,
         latents,

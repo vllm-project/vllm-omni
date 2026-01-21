@@ -151,11 +151,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
-    @property
-    def interrupt(self):
-        """Property to check if diffusion should be interrupted."""
-        return getattr(self, "_interrupt", False)
-
     def scheduler_step(self, noise_pred, t, latents):
         """
         Step the scheduler.
