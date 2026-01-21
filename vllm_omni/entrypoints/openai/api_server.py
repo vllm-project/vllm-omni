@@ -631,6 +631,14 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
 
 
+# Remove the original /v1/chat/completions route before registering our own
+# This prevents duplicate route registration warnings in FastAPI logs.
+for route in router.routes[:]:
+    if hasattr(route, "path") and route.path == "/v1/chat/completions":
+        router.routes.remove(route)
+        break
+
+
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
