@@ -193,7 +193,6 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
     def current_timestep(self):
         return self._current_timestep
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,

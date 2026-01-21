@@ -684,7 +684,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
     def interrupt(self):
         return self._interrupt
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,

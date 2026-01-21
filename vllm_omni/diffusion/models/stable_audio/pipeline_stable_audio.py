@@ -346,7 +346,6 @@ class StableAudioPipeline(nn.Module):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,

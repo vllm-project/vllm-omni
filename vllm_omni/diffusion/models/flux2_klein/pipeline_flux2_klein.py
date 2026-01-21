@@ -644,7 +644,6 @@ class Flux2KleinPipeline(nn.Module, SupportImageInput):
     def interrupt(self):
         return self._interrupt
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
