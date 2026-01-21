@@ -24,19 +24,18 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
+import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -179,7 +178,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(mu)
 
 
-class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class Flux2KleinPipeline(nn.Module, SupportImageInput):
     """Flux2 klein pipeline for text-to-image generation."""
 
     support_image_input = True
@@ -645,109 +644,6 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     def interrupt(self):
         return self._interrupt
 
-    def diffuse(
-        self,
-        latents,
-        latent_ids,
-        prompt_embeds,
-        text_ids,
-        negative_prompt_embeds,
-        negative_text_ids,
-        timesteps,
-        do_true_cfg,
-        guidance_scale,
-        image_latents=None,
-        image_latent_ids=None,
-        cfg_normalize=False,
-    ):
-        """
-        Diffusion loop with optional classifier-free guidance.
-
-        Args:
-            latents: Noise latents to denoise
-            latent_ids: Position IDs for latents
-            prompt_embeds: Positive prompt embeddings
-            text_ids: Position IDs for positive text
-            negative_prompt_embeds: Negative prompt embeddings
-            negative_text_ids: Position IDs for negative text
-            timesteps: Diffusion timesteps
-            do_true_cfg: Whether to apply CFG
-            guidance_scale: CFG scale factor
-            image_latents: Conditional image latents (default: None)
-            image_latent_ids: Position IDs for image latents (default: None)
-            cfg_normalize: Whether to normalize CFG output (default: False)
-
-        Returns:
-            Denoised latents
-        """
-        self.scheduler.set_begin_index(0)
-
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-
-            self._current_timestep = t
-            timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-            # Prepare latent model input
-            latent_model_input = latents.to(self.transformer.dtype)
-            latent_image_ids = latent_ids
-
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
-
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": None,
-                "encoder_hidden_states": prompt_embeds,
-                "txt_ids": text_ids,
-                "img_ids": latent_image_ids,
-                "joint_attention_kwargs": self.attention_kwargs,
-                "return_dict": False,
-            }
-            negative_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": None,
-                "encoder_hidden_states": negative_prompt_embeds,
-                "txt_ids": negative_text_ids,
-                "img_ids": latent_image_ids,
-                "joint_attention_kwargs": self.attention_kwargs,
-                "return_dict": False,
-            }
-
-            # For image conditioning, we need to slice the output to remove condition latents
-            output_slice = latents.size(1) if image_latents is not None else None
-
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg,
-                guidance_scale,
-                positive_kwargs,
-                negative_kwargs,
-                cfg_normalize,
-                output_slice,
-            )
-
-            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-
-        return latents
-
-    def scheduler_step(self, noise_pred, t, latents):
-        """
-        Step the scheduler.
-        """
-        latents_dtype = latents.dtype
-        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        if latents.dtype != latents_dtype:
-            if torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
-        return latents
-
     @torch.no_grad()
     def forward(
         self,
@@ -1010,21 +906,65 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
         self._num_timesteps = len(timesteps)
 
-        # 7. Denoising loop using diffuse method
-        latents = self.diffuse(
-            latents=latents,
-            latent_ids=latent_ids,
-            prompt_embeds=prompt_embeds,
-            text_ids=text_ids,
-            negative_prompt_embeds=negative_prompt_embeds if self.do_classifier_free_guidance else None,
-            negative_text_ids=negative_text_ids if self.do_classifier_free_guidance else None,
-            timesteps=timesteps,
-            do_true_cfg=self.do_classifier_free_guidance,
-            guidance_scale=guidance_scale,
-            image_latents=image_latents,
-            image_latent_ids=image_latent_ids,
-            cfg_normalize=False,  # Flux2Klein doesn't use CFG normalization
-        )
+        # 7. Denoising loop
+        # We set the index here to remove DtoH sync, helpful especially during compilation.
+        # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
+        self.scheduler.set_begin_index(0)
+        for i, t in enumerate(timesteps):
+            if self.interrupt:
+                continue
+
+            self._current_timestep = t
+            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+            latent_model_input = latents.to(self.transformer.dtype)
+            latent_image_ids = latent_ids
+
+            if image_latents is not None:
+                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+
+            noise_pred = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep / 1000,
+                guidance=None,
+                encoder_hidden_states=prompt_embeds,
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=self.attention_kwargs,
+                return_dict=False,
+            )[0]
+
+            noise_pred = noise_pred[:, : latents.size(1) :]
+
+            if self.do_classifier_free_guidance:
+                neg_noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep / 1000,
+                    guidance=None,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    txt_ids=negative_text_ids,
+                    img_ids=latent_image_ids,
+                    joint_attention_kwargs=self.attention_kwargs,
+                    return_dict=False,
+                )[0]
+                neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
+                noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+
+            latents_dtype = latents.dtype
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
+
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
         self._current_timestep = None
 
