@@ -110,7 +110,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         noise_pred = comb_pred * (cond_norm / noise_norm)
         return noise_pred
 
-    def combine_cfg_noise(self, noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize=True):
+    def combine_cfg_noise(self, noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize=False):
         """
         Combine conditional and unconditional noise predictions with CFG.
 
@@ -118,7 +118,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             noise_pred: Conditional noise prediction
             neg_noise_pred: Unconditional noise prediction
             true_cfg_scale: CFG scale factor
-            cfg_normalize: Whether to normalize the combined prediction (default: True)
+            cfg_normalize: Whether to normalize the combined prediction (default: False)
 
         Returns:
             Combined noise prediction tensor
@@ -148,6 +148,33 @@ class CFGParallelMixin(metaclass=ABCMeta):
     ):
         """
         Diffusion loop with optional classifier-free guidance.
+
+        Subclasses MUST implement this method to define the complete
+        diffusion/denoising loop for their specific model.
+
+        Typical implementation pattern:
+        ```python
+        def diffuse(self, latents, timesteps, prompt_embeds, negative_embeds, ...):
+            for t in timesteps:
+                # Prepare kwargs for positive and negative predictions
+                positive_kwargs = {...}
+                negative_kwargs = {...}
+
+                # Predict noise with automatic CFG handling
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=True,
+                    true_cfg_scale=self.guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                )
+
+                # Step scheduler with automatic CFG sync
+                latents = self.scheduler_step_maybe_with_cfg(
+                    noise_pred, t, latents, do_true_cfg=True
+                )
+
+            return latents
+        ```
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
