@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from time import time
 
+import numpy as np
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
@@ -10,9 +12,12 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+logger = init_logger(__name__)
 
 
 class OmniARScheduler(VLLMScheduler):
@@ -73,6 +78,11 @@ class OmniARScheduler(VLLMScheduler):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+
+        perf_stats: PerfStats | None = None
+        if self.perf_metrics and self.perf_metrics.is_enabled():
+            perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
@@ -131,11 +141,14 @@ class OmniARScheduler(VLLMScheduler):
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
+                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                    request_id=req_id,
                 )
 
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
+            pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status
 
@@ -143,14 +156,31 @@ class OmniARScheduler(VLLMScheduler):
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
 
-            # Stop checking for pooler models.
-            pooler_output = None
-            if pooler_outputs:
-                pooler_output = pooler_outputs[req_index]
+            if pooler_output:
+                # Note: For multimodal outputs, we skip intermediate stop checks.
                 if request.output_token_ids:
-                    stopped = check_stop(request, self.max_model_len, pooler_output)
-
+                    stopped = check_stop(request, self.max_model_len)
+            routed_experts = None
             if stopped:
+                if self.vllm_config.model_config.enable_return_routed_experts:
+                    kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
+                    block_ids = kv_blocks.get_block_ids()[0]
+                    num_tokens = request.num_tokens - 1
+
+                    # compute slot mapping
+                    block_ids_array = np.array(block_ids, dtype=np.int32)
+                    num_blocks = len(block_ids)
+                    block_size = self.block_size
+
+                    # generate block offsets
+                    block_offsets = np.arange(0, block_size)
+
+                    # compute slot mapping: slot = block_id * block_size + offset
+                    slot_mapping = (
+                        block_offsets.reshape((1, block_size)) + block_ids_array.reshape((num_blocks, 1)) * block_size
+                    ).flatten()[:num_tokens]
+
+                    routed_experts = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -165,7 +195,13 @@ class OmniARScheduler(VLLMScheduler):
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 assert struct_output_request.grammar is not None
-                struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+                ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
+                if not ok:
+                    logger.warning(
+                        "Unexpected: grammar rejected tokens %s for request %s.",
+                        new_token_ids,
+                        req_id,
+                    )
 
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
@@ -187,6 +223,7 @@ class OmniARScheduler(VLLMScheduler):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
@@ -201,6 +238,20 @@ class OmniARScheduler(VLLMScheduler):
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
 
+        if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
+            requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+            self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
+            for request in requests:
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=request.get_finished_reason(),
+                        events=request.take_events(),
+                        trace_headers=request.trace_headers,
+                        num_cached_tokens=request.num_cached_tokens,
+                    )
+                )
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -238,7 +289,7 @@ class OmniARScheduler(VLLMScheduler):
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats)) is not None:
+        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request

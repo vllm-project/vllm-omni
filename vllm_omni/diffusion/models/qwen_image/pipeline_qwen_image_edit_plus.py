@@ -41,6 +41,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -191,7 +192,9 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = QwenImageTransformer2DModel(od_config=od_config)
+
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
+        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="processor", local_files_only=local_files_only
@@ -630,8 +633,8 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: str | list[str] = "",
-        negative_prompt: str | list[str] = "",
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
         image: PIL.Image.Image | list[PIL.Image.Image] | torch.Tensor | None = None,
         true_cfg_scale: float = 4.0,
         height: int | None = None,
@@ -652,8 +655,8 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         """Forward pass for image editing with support for multiple images."""
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        prompt = req.prompt
+        negative_prompt = req.negative_prompt
 
         # Get preprocessed images from request (pre-processing is done in DiffusionEngine)
         if hasattr(req, "vae_images") and hasattr(req, "condition_images"):

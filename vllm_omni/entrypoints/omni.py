@@ -374,36 +374,71 @@ class OmniBase:
                         e,
                     )
 
-    def stop_profile(self, stages: list[int] | None = None) -> None:
-        """Stop profiling for specified stages.
-
-        Sends stop_profile command to stage workers to finalize and save traces.
-
-        Args:
-            stages: List of stage IDs to stop profiling. If None, stops
-                profiling for all stages.
-
-        Example:
-            >>> omni.start_profile()
-            >>> outputs = omni.generate(prompts, sampling_params)
-            >>> omni.stop_profile()
-            >>> # Traces saved to VLLM_TORCH_PROFILER_DIR/stage_X_<model_stage>/
+    def stop_profile(self, stages: list[int] | None = None) -> dict:
+        """
+        Synchronously stop profiling for specified stages and collect
+        the file paths for traces and tables.
         """
         if stages is None:
             stages = list(range(len(self.stage_list)))
 
+        all_results = {"traces": [], "tables": []}
+
         for stage_id in stages:
             if stage_id < len(self.stage_list):
-                try:
-                    self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_STOP})
-                    logger.info("[%s] Sent stop_profile to stage-%s", self._name, stage_id)
-                except Exception as e:
+                stage = self.stage_list[stage_id]
+
+                # Check if the stage object has our new bridge method
+                if hasattr(stage, "stop_profile"):
+                    logger.info("[%s] Requesting profile data collection from stage-%s", self._name, stage_id)
+
+                    # This is the blocking call that triggers the RPC chain
+                    stage_data = stage.stop_profile()
+
+                    if isinstance(stage_data, dict):
+                        # FIX: Handle both single key and list key formats
+                        traces = stage_data.get("trace") or stage_data.get("traces")
+                        tables = stage_data.get("table") or stage_data.get("tables")
+
+                        # Debug logging
+                        logger.debug(f"[{self._name}] Stage-{stage_id} returned: {stage_data.keys()}")
+                        if traces:
+                            logger.debug(f"[{self._name}] Stage-{stage_id} traces type: {type(traces)}")
+                        if tables:
+                            logger.debug(f"[{self._name}] Stage-{stage_id} tables type: {type(tables)}")
+
+                        # Handle single strings
+                        if traces:
+                            if isinstance(traces, str):
+                                all_results["traces"].append(traces)
+                            elif isinstance(traces, list):
+                                all_results["traces"].extend(traces)
+
+                        # Handle single strings
+                        if tables:
+                            if isinstance(tables, str):
+                                all_results["tables"].append(tables)
+                            elif isinstance(tables, list):
+                                all_results["tables"].extend(tables)
+                        else:
+                            logger.warning(f"[{self._name}] Stage-{stage_id} returned no table data")
+                    else:
+                        logger.warning(f"[{self._name}] Stage-{stage_id} returned non-dict data: {type(stage_data)}")
+                else:
+                    # Fallback for non-diffusion stages
                     logger.warning(
-                        "[%s] Failed to send stop_profile to stage-%s: %s",
+                        "[%s] Stage-%s does not support synchronous stop_profile. Falling back to async.",
                         self._name,
                         stage_id,
-                        e,
                     )
+                    stage.submit({"type": OmniStageTaskType.PROFILER_STOP})
+
+        # Final debug output
+        logger.info(
+            f"[{self._name}] Collected {len(all_results['traces'])} trace(s) and {len(all_results['tables'])} table(s)"
+        )
+
+        return all_results
 
     def close(self) -> None:
         """Close all stage processes and clean up resources."""
@@ -518,7 +553,6 @@ class Omni(OmniBase):
                 return self._run_generation_with_generator(prompts, sampling_params_list)
             else:
                 outputs = list(self._run_generation(prompts, sampling_params_list))
-                self.close()
                 return outputs
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)

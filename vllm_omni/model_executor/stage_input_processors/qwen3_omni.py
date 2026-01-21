@@ -160,7 +160,7 @@ def talker2code2wav(
     # Process each talker output
     for i, talker_output in enumerate(talker_outputs):
         output = talker_output.outputs[0]
-        seq_len = len(output.token_ids)
+        seq_len = len(output.token_ids) - 1
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (

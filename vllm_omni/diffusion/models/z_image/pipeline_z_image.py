@@ -176,6 +176,9 @@ class ZImagePipeline(nn.Module):
         self.transformer = ZImageTransformer2DModel()
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
+        # Note: Context parallelism is applied centrally in registry.initialize_model()
+        # following diffusers' pattern of enable_parallelism() at model loading time
+
         self.vae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1) if hasattr(self, "vae") and self.vae is not None else 8
         )

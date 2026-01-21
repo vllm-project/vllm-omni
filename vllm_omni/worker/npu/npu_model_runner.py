@@ -64,7 +64,7 @@ class OmniNPUModelRunner(NPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
-        if supports_mrope(self.model):
+        if supports_mrope(self.get_model()):
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,

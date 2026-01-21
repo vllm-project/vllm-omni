@@ -140,7 +140,7 @@ Key point for writing the example:
 + Save or display the generated results so users can validate the integration.
 
 # Testing
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../tests/tests_style.md).
+For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
 
 
 ## Adding a Model Recipe

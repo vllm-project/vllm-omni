@@ -1,20 +1,12 @@
 import warnings
-from importlib.util import find_spec
 from typing import Any
 
 import torch
-import vllm.envs as envs
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import ModelConfig, config
 from vllm.config.model import (
     _RUNNER_CONVERTS,
-    _RUNNER_TASKS,
-    ConvertOption,
-    ConvertType,
-    RunnerOption,
-    TaskOption,
     _get_and_verify_dtype,
     get_served_model_name,
 )
@@ -29,12 +21,11 @@ from vllm.transformers_utils.config import (
     get_pooling_config,
 )
 from vllm.transformers_utils.gguf_utils import (
+    is_gguf,
     maybe_patch_hf_config_from_gguf,
 )
-from vllm.transformers_utils.utils import (
-    is_gguf,
-    maybe_model_redirect,
-)
+from vllm.transformers_utils.utils import maybe_model_redirect
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 import vllm_omni.model_executor.models as me_models
 
@@ -146,14 +137,6 @@ class OmniModelConfig(ModelConfig):
 
         self.maybe_pull_model_tokenizer_for_runai(self.model, self.tokenizer)
 
-        if (backend := envs.VLLM_ATTENTION_BACKEND) and backend == "FLASHINFER" and find_spec("flashinfer") is None:
-            raise ValueError(
-                "VLLM_ATTENTION_BACKEND is set to FLASHINFER, but flashinfer "
-                "module was not found. See "
-                "https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile "  # noqa: E501
-                "for instructions on how to install it."
-            )
-
         if self.override_attention_dtype is not None and not current_platform.is_rocm():
             warnings.warn(
                 "override-attention-dtype is set but not using ROCm platform",
@@ -183,110 +166,15 @@ class OmniModelConfig(ModelConfig):
         self.hf_text_config = self.draw_hf_text_config()
         self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
         self.encoder_config = self._get_encoder_config()
-        # Try to load image processor config, but allow it to fail for stages that don't need it
-        try:
-            self.hf_image_processor_config = get_hf_image_processor_config(
-                self.model, hf_token=self.hf_token, revision=self.revision
-            )
-        except (OSError, ValueError, IndexError) as e:
-            # Some stages (e.g., code2wav, talker) don't need image processor
-            # Log warning but allow initialization to continue
-            logger.warning(
-                f"Failed to load image processor config for model '{self.model}': {e}. "
-                "This is expected for stages that don't require image processing."
-            )
-            self.hf_image_processor_config = None
+        self.hf_image_processor_config = get_hf_image_processor_config(
+            self.model, hf_token=self.hf_token, revision=self.revision
+        )
+        self.model_arch_config = self.get_model_arch_config()
 
         architectures = self.architectures
         registry = self.registry
         is_generative_model = registry.is_text_generation_model(architectures, self)
         is_pooling_model = registry.is_pooling_model(architectures, self)
-
-        def _task_to_convert(task: TaskOption) -> ConvertType:
-            if task == "embedding" or task == "embed":
-                return "embed"
-            if task == "classify":
-                return "classify"
-            if task == "reward":
-                return "reward"
-            if task == "score":
-                new_task = self._get_default_pooling_task(architectures)
-                return "classify" if new_task == "classify" else "embed"
-
-            return "none"
-
-        if self.task is not None:
-            runner: RunnerOption = "auto"
-            convert: ConvertOption = "auto"
-            msg_prefix = (
-                "The 'task' option has been deprecated and will be removed in v0.13.0 or v1.0, whichever comes first."
-            )
-            msg_hint = "Please remove this option."
-
-            is_generative_task = self.task in _RUNNER_TASKS["generate"]
-            is_pooling_task = self.task in _RUNNER_TASKS["pooling"]
-
-            if is_generative_model and is_pooling_model:
-                if is_generative_task:
-                    runner = "generate"
-                    convert = "auto"
-                    msg_hint = (
-                        "Please replace this option with `--runner "
-                        "generate` to continue using this model "
-                        "as a generative model."
-                    )
-                elif is_pooling_task:
-                    runner = "pooling"
-                    convert = "auto"
-                    msg_hint = (
-                        "Please replace this option with `--runner "
-                        "pooling` to continue using this model "
-                        "as a pooling model."
-                    )
-                else:  # task == "auto"
-                    pass
-            elif is_generative_model or is_pooling_model:
-                if is_generative_task:
-                    runner = "generate"
-                    convert = "auto"
-                    msg_hint = "Please remove this option"
-                elif is_pooling_task:
-                    runner = "pooling"
-                    convert = _task_to_convert(self.task)
-                    msg_hint = (
-                        "Please replace this option with `--convert "
-                        f"{convert}` to continue using this model "
-                        "as a pooling model."
-                    )
-                else:  # task == "auto"
-                    pass
-            else:
-                # Neither generative nor pooling model - try to convert if possible
-                if is_pooling_task:
-                    runner = "pooling"
-                    convert = _task_to_convert(self.task)
-                    msg_hint = (
-                        "Please replace this option with `--runner pooling "
-                        f"--convert {convert}` to continue using this model "
-                        "as a pooling model."
-                    )
-                else:
-                    debug_info = {
-                        "architectures": architectures,
-                        "is_generative_model": is_generative_model,
-                        "is_pooling_model": is_pooling_model,
-                    }
-                    raise AssertionError(
-                        "The model should be a generative or "
-                        "pooling model when task is set to "
-                        f"{self.task!r}. Found: {debug_info}"
-                    )
-
-            self.runner = runner
-            self.convert = convert
-
-            msg = f"{msg_prefix} {msg_hint}"
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
 
         self.runner_type = self._get_runner_type(architectures, self.runner)
         self.convert_type = self._get_convert_type(architectures, self.runner_type, self.convert)
@@ -325,9 +213,12 @@ class OmniModelConfig(ModelConfig):
                     if getattr(self.pooler_config, k) is None:
                         setattr(self.pooler_config, k, v)
 
-            default_pooling_type = self._model_info.default_pooling_type
-            if self.pooler_config.pooling_type is None:
-                self.pooler_config.pooling_type = default_pooling_type
+            default_seq_pooling_type = self._model_info.default_seq_pooling_type
+            if self.pooler_config.seq_pooling_type is None:
+                self.pooler_config.seq_pooling_type = default_seq_pooling_type
+            default_tok_pooling_type = self._model_info.default_tok_pooling_type
+            if self.pooler_config.tok_pooling_type is None:
+                self.pooler_config.tok_pooling_type = default_tok_pooling_type
 
         self.dtype: torch.dtype = _get_and_verify_dtype(
             self.model,
@@ -339,6 +230,11 @@ class OmniModelConfig(ModelConfig):
 
         self.original_max_model_len = self.max_model_len
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
+
+        if self.is_encoder_decoder:
+            self.mm_processor_cache_gb = 0
+            logger.info("Encoder-decoder model detected, disabling mm processor cache.")
+
         # Init multimodal config if needed
         if self._model_info.supports_multimodal:
             if mm_encoder_tp_mode == "data" and not self._model_info.supports_multimodal_encoder_tp_data:
@@ -382,7 +278,7 @@ class OmniModelConfig(ModelConfig):
 
         # Avoid running try_verify_and_update_config multiple times
         self.config_updated = False
-
+        self._try_verify_and_update_model_config()
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()

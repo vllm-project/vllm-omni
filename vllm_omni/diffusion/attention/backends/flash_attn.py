@@ -9,13 +9,14 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_input, _upad_input
 
 logger = init_logger(__name__)
 
 try:
     # only tested with flash_attn v3
     # from flash_attn_interface import flash_attn_func as flash_attn_3_func  # not available in flash-attn 2.8.1
-    from flash_attn import flash_attn_func  # can be FA2 or FA3
+    from flash_attn import flash_attn_func, flash_attn_varlen_func  # can be FA2 or FA3
 except ImportError:
     logger.warning(
         "FlashAttentionBackend is not available. You may install flash-attn "
@@ -63,12 +64,51 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        # TODO: flash_attn_func does not support attn_mask.
-        out: torch.Tensor = flash_attn_func(
-            query,
-            key,
-            value,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
-        )
+        """
+        Flash attention implementation.
+
+        Args:
+            query: (batch_size, seq_len, num_heads, head_dim)
+            key: (batch_size, seq_len, num_heads, head_dim)
+            value: (batch_size, seq_len, num_heads, head_dim)
+            attn_metadata: AttentionMetadata. Attention mask is supported as attn_metadata.attn_mask
+
+        Returns:
+            (batch_size, seq_len, num_heads, head_dim)
+        """
+        query_length = query.size(1)
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        #  Contains at least one padding token in the sequence
+        if attention_mask is not None and torch.any(~attention_mask):
+            assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
+
+            out_unpad = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seq_lens_q,
+                cu_seqlens_k=cu_seq_lens_k,
+                max_seqlen_q=max_length_q,
+                max_seqlen_k=max_length_k,
+                **{
+                    "causal": self.causal,
+                    "softmax_scale": self.softmax_scale,
+                },
+            )
+            if isinstance(out_unpad, tuple):
+                out_unpad = out_unpad[0]
+
+            out = _pad_input(out_unpad, indices_q, query.size(0), query_length)
+
+        else:
+            out: torch.Tensor = flash_attn_func(
+                query,
+                key,
+                value,
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+            )
         return out

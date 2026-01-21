@@ -100,7 +100,7 @@ def main():
     parser.add_argument("--width", type=int, default=1024, help="Image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")
     parser.add_argument("--cfg-scale", type=float, default=4.0, help="True CFG scale")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
     args = parser.parse_args()

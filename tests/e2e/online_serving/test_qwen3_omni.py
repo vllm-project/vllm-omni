@@ -4,10 +4,13 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
+import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 import base64
 import concurrent.futures
 import ctypes
-import os
 import signal
 import socket
 import subprocess
@@ -18,11 +21,9 @@ from pathlib import Path
 import openai
 import pytest
 from vllm.assets.video import VideoAsset
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
 from vllm_omni.utils import is_rocm
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
