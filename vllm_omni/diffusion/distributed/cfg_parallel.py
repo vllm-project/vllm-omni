@@ -301,16 +301,19 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
                 "txt_seq_lens": txt_seq_lens,
                 **additional_transformer_kwargs,
             }
-            negative_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "encoder_hidden_states_mask": negative_prompt_embeds_mask,
-                "encoder_hidden_states": negative_prompt_embeds,
-                "img_shapes": img_shapes,
-                "txt_seq_lens": negative_txt_seq_lens,
-                **additional_transformer_kwargs,
-            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "img_shapes": img_shapes,
+                    "txt_seq_lens": negative_txt_seq_lens,
+                    **additional_transformer_kwargs,
+                }
+            else:
+                negative_kwargs = None
 
             # For editing pipelines, we need to slice the output to remove condition latents
             output_slice = latents.size(1) if image_latents is not None else None
