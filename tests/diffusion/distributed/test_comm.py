@@ -48,6 +48,11 @@ def test_4d_identity(
     use_sync: bool,
 ):
     """Test that two consecutive all-to-all operations return the original input."""
+    # Skip if not enough GPUs available
+    available_gpus = torch_device.device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
     # Ensure num_heads is divisible by world_size
     if num_heads % world_size != 0:
         pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
@@ -177,6 +182,11 @@ def test_5d_identity(
     use_sync: bool,
 ):
     """Test that two consecutive all-to-all operations return the original input."""
+    # Skip if not enough GPUs available
+    available_gpus = torch_device.device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
     # Ensure num_heads is divisible by world_size
     if num_heads % world_size != 0:
         pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
@@ -305,6 +315,11 @@ def test_ring_p2p(
     head_size: int,
 ):
     """Test Ring P2P communication (send_recv)."""
+    # Skip if not enough GPUs available
+    available_gpus = torch_device.device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
     torch.multiprocessing.spawn(
         _test_ring_p2p_worker,
         args=(world_size, dtype, batch_size, num_heads, head_size),

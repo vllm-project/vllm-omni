@@ -107,6 +107,7 @@ class Qwen2_5OmniForConditionalGeneration(
             )
             if t2w_token_end_id:
                 self.model.set_suppress_start_id(t2w_token_end_id + 1)
+            self.requires_raw_input_tokens = True
 
         elif self.model_stage == "code2wav":
             self.thinker = None
@@ -125,6 +126,7 @@ class Qwen2_5OmniForConditionalGeneration(
             self._token2wav_conds: dict[str, torch.Tensor] = {}
             self._token2wav_ref_mels: dict[str, torch.Tensor] = {}
             self.model = self.token2wav
+            self.requires_raw_input_tokens = True
         else:
             raise ValueError("Invalid model stage")
 
@@ -248,14 +250,27 @@ class Qwen2_5OmniForConditionalGeneration(
             if is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
-                thinker_positions = positions[0] if positions.ndim > 1 else positions
+                # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
+                if positions.ndim == 2 and positions.shape[0] == 3:
+                    thinker_positions = positions  # MRoPE positions, keep as is
+                else:
+                    thinker_positions = positions[0] if positions.ndim > 1 else positions
                 thinker_inputs_embeds = (
                     inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
                 )
             else:
-                thinker_input_ids = input_ids
-                thinker_positions = positions[0]
-                thinker_inputs_embeds = inputs_embeds
+                # Squeeze back if we added batch dim earlier
+                thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
+                # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
+                if positions.ndim == 2 and positions.shape[0] == 3:
+                    thinker_positions = positions  # MRoPE positions, keep as is
+                elif added_batch_dim:
+                    thinker_positions = positions[0]
+                else:
+                    thinker_positions = positions
+                thinker_inputs_embeds = (
+                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                )
 
             # Run thinker
             thinker_output = self.thinker(
@@ -288,10 +303,16 @@ class Qwen2_5OmniForConditionalGeneration(
             if not hasattr(self, "voice_type"):
                 self.voice_type = voice_type
 
+            # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it
+            if positions.ndim == 2 and positions.shape[0] == 3:
+                talker_positions = positions  # MRoPE positions, keep as is
+            else:
+                talker_positions = positions[0]
+
             with torch.inference_mode():
                 talker_hidden = self.talker(
                     input_ids=input_ids,
-                    positions=positions[0],
+                    positions=talker_positions,
                     inputs_embeds=inputs_embeds,
                 )
 

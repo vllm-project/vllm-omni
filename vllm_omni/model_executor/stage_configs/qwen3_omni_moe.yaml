@@ -16,7 +16,7 @@ stage_args:
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.6
-      enforce_eager: false
+      enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"
@@ -46,8 +46,8 @@ stage_args:
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.3
-      enforce_eager: false
+      gpu_memory_utilization: 0.35
+      enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent  # Output codec codes for code2wav
       # tensor_parallel_size: 2
@@ -80,6 +80,7 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio  # Final output: audio waveform
       gpu_memory_utilization: 0.1

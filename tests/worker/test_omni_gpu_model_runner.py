@@ -69,7 +69,7 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
 
     # Provide a minimal implementation that returns the expected 4-tuple.
     def _determine_batch_execution_and_padding(**kwargs):
-        return None, object(), None, None
+        return None, object(), None, None, None
 
     runner._determine_batch_execution_and_padding = _determine_batch_execution_and_padding
 

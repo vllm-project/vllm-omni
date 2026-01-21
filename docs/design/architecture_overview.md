@@ -192,4 +192,4 @@ curl -sS -X POST http://localhost:8091/v1/chat/completions \
 }
 ```
 
-For more usages, please refer to [examples](../examples/README.md).
+For more usages, please refer to [examples](https://github.com/vllm-project/vllm-omni/tree/main/examples).
