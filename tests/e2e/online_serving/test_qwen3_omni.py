@@ -39,7 +39,7 @@ else:
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def omni_server(request):
     """Start vLLM-Omni server as a subprocess with actual model weights.
     Uses session scope so the server starts only once for the entire test session.

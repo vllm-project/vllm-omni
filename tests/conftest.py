@@ -713,4 +713,4 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        clean_gpu_memory_between_tests()
+        clean_gpu_memory()
