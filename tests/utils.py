@@ -500,7 +500,7 @@ class GPUMemoryMonitor:
                     pass
                 time.sleep(self.interval)
 
-        self._thread = threading.Thread(target=monitor_loop, daemon=True)
+        self._thread = threading.Thread(target=monitor_loop, daemon=False)
         self._thread.start()
 
     def stop(self) -> None:

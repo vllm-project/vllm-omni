@@ -9,6 +9,7 @@ correctly with diffusion models. It uses minimal settings to keep test time
 short for CI.
 """
 
+import gc
 import os
 import sys
 import time
@@ -21,7 +22,7 @@ import torch.distributed as dist
 from PIL import Image
 
 # ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -30,7 +31,6 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import device_count
 from vllm_omni.diffusion.envs import get_device_name
 
-# Use random weights model for testing
 models = ["riverclouds/qwen_image_random"]
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
@@ -51,44 +51,145 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
     return abs_diff.mean().item(), abs_diff.max().item()
 
 
-def _get_images(output):
-    """Extract images from output, handling both dict and SimpleNamespace types.
+def _cleanup_distributed():
+    """Clean up distributed environment and GPU resources."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-    The output structure varies depending on serialization path:
-    - Direct memory: SimpleNamespace with .images attribute
-    - SHM serialization: dict with "images" key (dataclass converted via asdict)
-    - Wrapped output: SimpleNamespace(output=...) which needs unwrapping
-    """
-    # Check if output has direct images attribute (diffusion mode)
-    if hasattr(output, "images") and output.images:
-        return output.images
+    for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
+        os.environ.pop(key, None)
 
-    # Check request_output for pipeline mode
-    if output.request_output is None:
-        return None
+    gc.collect()
 
-    if isinstance(output.request_output, list) and len(output.request_output) == 0:
-        return None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
-    item = output.request_output[0]
+    time.sleep(5)
 
-    # Handle wrapped SimpleNamespace (e.g. from omni_stage.py)
-    # Some items are wrapped as SimpleNamespace(request_id=..., output=...)
-    while hasattr(item, "output") and not hasattr(item, "images"):
-        item = item.output
-        if item is None:
-            return None
 
-    # Handle both dict (from SHM serialization) and object (direct) types
-    if isinstance(item, dict):
-        return item.get("images")
-    return getattr(item, "images", None)
+def _run_baseline(model_name: str, dtype: torch.dtype, attn_backend: str, height: int, width: int, seed: int):
+    """Run baseline inference (no SP)."""
+    baseline_parallel_config = DiffusionParallelConfig(ulysses_degree=1, ring_degree=1)
+    baseline = Omni(
+        model=model_name,
+        parallel_config=baseline_parallel_config,
+        dtype=dtype,
+        attention_backend=attn_backend,
+    )
+
+    try:
+        outputs = baseline.generate(
+            PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            generator=torch.Generator(get_device_name()).manual_seed(seed),
+            num_outputs_per_prompt=1,
+        )
+        return outputs[0].request_output[0].images
+    finally:
+        baseline.close()
+        _cleanup_distributed()
+
+
+def _run_sp(
+    model_name: str,
+    dtype: torch.dtype,
+    attn_backend: str,
+    height: int,
+    width: int,
+    seed: int,
+    ulysses_degree: int,
+    ring_degree: int,
+):
+    """Run SP inference."""
+    sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    sp = Omni(
+        model=model_name,
+        parallel_config=sp_parallel_config,
+        dtype=dtype,
+        attention_backend=attn_backend,
+    )
+
+    try:
+        outputs = sp.generate(
+            PROMPT,
+            height=height,
+            width=width,
+            num_inference_steps=4,
+            guidance_scale=0.0,
+            generator=torch.Generator(get_device_name()).manual_seed(seed),
+            num_outputs_per_prompt=1,
+        )
+        return outputs[0].request_output[0].images
+    finally:
+        sp.close()
+        _cleanup_distributed()
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_baseline_only(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test baseline inference only (no SP)."""
+    height = 256
+    width = 256
+    seed = 42
+
+    images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0].width == width
+    assert images[0].height == height
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_sp_ulysses2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test SP inference only (ulysses=2)."""
+    if device_count() < 2:
+        pytest.skip(f"Test requires 2 GPUs but only {device_count()} available")
+
+    height = 256
+    width = 256
+    seed = 42
+
+    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=2, ring_degree=1)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0].width == width
+    assert images[0].height == height
+
+
+@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("attn_backend", ["sdpa"])
+def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test SP inference only (ring=2)."""
+    if device_count() < 2:
+        pytest.skip(f"Test requires 2 GPUs but only {device_count()} available")
+
+    height = 256
+    width = 256
+    seed = 42
+
+    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2)
+
+    assert images is not None
+    assert len(images) == 1
+    assert images[0].width == width
+    assert images[0].height == height
 
 
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("ulysses_degree", [1, 2])
 @pytest.mark.parametrize("ring_degree", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])  # Only test bfloat16 to reduce CI time
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sequence_parallel(
     model_name: str,
@@ -100,214 +201,60 @@ def test_sequence_parallel(
     """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs."""
     if ulysses_degree <= 1 and ring_degree <= 1:
         pytest.skip(
-            "This test compares ulysses_degree * ring_degree = 1 vs ulysses_degree * ring_degree > 1; provide ulysses_degree or ring_degree>1."
+            "This test compares ulysses_degree * ring_degree = 1 vs ulysses_degree * ring_degree > 1; "
+            "provide ulysses_degree or ring_degree>1."
         )
 
-    # Skip if not enough GPUs available for SP run
-    if device_count() < ulysses_degree * ring_degree:
-        pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
+    sp_size = ulysses_degree * ring_degree
+    if device_count() < sp_size:
+        pytest.skip(f"Test requires {sp_size} GPUs but only {device_count()} available")
 
-    # Use minimal settings for fast testing
     height = 256
     width = 256
-    num_inference_steps = 4  # Minimal steps for fast test
     seed = 42
 
-    # Step 1: Baseline (no Ulysses sequence parallel)
-    baseline_parallel_config = DiffusionParallelConfig(ulysses_degree=1, ring_degree=1)
-    baseline = Omni(
-        model=model_name,
-        parallel_config=baseline_parallel_config,
-        dtype=dtype,
-        attention_backend=attn_backend,
-    )
-    try:
-        outputs = baseline.generate(
-            PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=0.0,
-            generator=torch.Generator(get_device_name()).manual_seed(seed),
-            num_outputs_per_prompt=1,
-        )
-        baseline_images = outputs[0].request_output[0].images
-    finally:
-        baseline.close()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-            os.environ.pop(key, None)
-        time.sleep(2)  # Wait for resources to release
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    assert baseline_images is not None and len(baseline_images) == 1
 
-    assert baseline_images is not None
-    assert len(baseline_images) == 1
-    assert baseline_images[0].width == width
-    assert baseline_images[0].height == height
+    sp_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree, ring_degree)
+    assert sp_images is not None and len(sp_images) == 1
 
-    # Step 2: SP (Ulysses-SP + Ring-SP)
-    sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
-    sp = Omni(
-        model=model_name,
-        parallel_config=sp_parallel_config,
-        dtype=dtype,
-        attention_backend=attn_backend,
-    )
-    try:
-        outputs = sp.generate(
-            PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=0.0,
-            generator=torch.Generator(get_device_name()).manual_seed(seed),
-            num_outputs_per_prompt=1,
-        )
-        sp_images = outputs[0].request_output[0].images
-    finally:
-        sp.close()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-            os.environ.pop(key, None)
-        time.sleep(2)
-
-    assert sp_images is not None
-    assert len(sp_images) == 1
-    assert sp_images[0].width == width
-    assert sp_images[0].height == height
-
-    # Step 3: Compare outputs
     mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
 
-    # FP16/BF16 may differ slightly due to different computation order under parallelism.
-    if dtype in (torch.float16, torch.bfloat16):
-        mean_threshold = 2e-2
-        max_threshold = 2e-1
-    else:
-        mean_threshold = 1e-2
-        max_threshold = 1e-1
-
-    print(
-        "Image diff stats (baseline ulysses_degree*ring_degree=1 vs SP): "
-        f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
-        f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
-    )
+    mean_threshold = 2e-2
+    max_threshold = 2e-1
 
     assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}); "
-        f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
+        f"Image diff exceeded threshold: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}"
     )
 
 
 @pytest.mark.parametrize("model_name", models)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sequence_parallel_ulysses_sp_only(
-    model_name: str,
-    dtype: torch.dtype,
-    attn_backend: str,
-):
-    """Test sequence parallel with ulysses_degree=4, ring_degree=1, and the image size (332x332) where the sequence length is NOT divisible by sp_size."""
+def test_sequence_parallel_ulysses4(model_name: str, dtype: torch.dtype, attn_backend: str):
+    """Test SP with ulysses_degree=4."""
     ulysses_degree = 4
     ring_degree = 1
 
-    # Skip if not enough GPUs available for SP run
     if device_count() < ulysses_degree * ring_degree:
         pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
 
-    # (272/8) * (272/8) = 17 * 17 = 289 Not divisible by sp_size=4
     height = 272
     width = 272
-    num_inference_steps = 4  # Minimal steps for fast test
     seed = 42
 
-    # Step 1: Baseline (no Ulysses sequence parallel)
-    baseline_parallel_config = DiffusionParallelConfig(ulysses_degree=1, ring_degree=1)
-    baseline = Omni(
-        model=model_name,
-        parallel_config=baseline_parallel_config,
-        dtype=dtype,
-        attention_backend=attn_backend,
-    )
-    try:
-        outputs = baseline.generate(
-            PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=0.0,
-            generator=torch.Generator(get_device_name()).manual_seed(seed),
-            num_outputs_per_prompt=1,
-        )
-        baseline_images = outputs[0].request_output[0].images
-    finally:
-        baseline.close()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-            os.environ.pop(key, None)
-        time.sleep(2)  # Wait for resources to release
+    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+    assert baseline_images is not None and len(baseline_images) == 1
 
-    assert baseline_images is not None
-    assert len(baseline_images) == 1
-    assert baseline_images[0].width == width
-    assert baseline_images[0].height == height
+    sp_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree, ring_degree)
+    assert sp_images is not None and len(sp_images) == 1
 
-    # Step 2: SP (Ulysses-SP + Ring-SP)
-    sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
-    sp = Omni(
-        model=model_name,
-        parallel_config=sp_parallel_config,
-        dtype=dtype,
-        attention_backend=attn_backend,
-    )
-    try:
-        outputs = sp.generate(
-            PROMPT,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=0.0,
-            generator=torch.Generator(get_device_name()).manual_seed(seed),
-            num_outputs_per_prompt=1,
-        )
-        sp_images = outputs[0].request_output[0].images
-    finally:
-        sp.close()
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        for key in ["MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"]:
-            os.environ.pop(key, None)
-        time.sleep(2)
-
-    assert sp_images is not None
-    assert len(sp_images) == 1
-    assert sp_images[0].width == width
-    assert sp_images[0].height == height
-
-    # Step 3: Compare outputs
     mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
 
-    # FP16/BF16 may differ slightly due to different computation order under parallelism.
-    if dtype in (torch.float16, torch.bfloat16):
-        mean_threshold = 2e-2
-        max_threshold = 2e-1
-    else:
-        mean_threshold = 1e-2
-        max_threshold = 1e-1
-
-    print(
-        "Image diff stats (baseline ulysses_degree*ring_degree=1 vs SP): "
-        f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
-        f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
-        f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
-    )
+    mean_threshold = 2e-2
+    max_threshold = 2e-1
 
     assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-        f"Image diff exceeded threshold: mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e} "
-        f"(thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}); "
-        f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, dtype={dtype}"
+        f"Image diff exceeded threshold: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}"
     )

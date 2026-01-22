@@ -24,7 +24,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
-        "--negative_prompt", default="", help="negative prompt for classifier-free conditional guidance."
+        "--negative_prompt",
+        default=None,
+        help="negative prompt for classifier-free conditional guidance.",
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
