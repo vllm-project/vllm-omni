@@ -15,8 +15,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
-from transformers.configuration_utils import PretrainedConfig
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2MLP,
@@ -25,6 +24,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2RotaryEmbedding,
 )
 from transformers.utils import ModelOutput
+from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -71,7 +71,7 @@ torch._dynamo.config.accumulated_cache_size_limit = 4096
 flex_attention = torch.compile(flex_attention)
 
 
-class Qwen2MoTConfig(_Qwen2Config):
+class Qwen2MoTConfig(Qwen2Config):
     """Configuration for Qwen2MoT (Mixture of Tokens) model.
 
     This is fundamentally different from Qwen2, hence the distinct name.
@@ -637,36 +637,6 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
     coords_w = torch.arange(0, num_patches_w)
     pos_ids = (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
     return pos_ids
-
-
-class BagelConfig(PretrainedConfig):
-    def __init__(
-        self,
-        visual_gen=True,
-        visual_und=True,
-        llm_config=None,
-        vit_config=None,
-        vae_config=None,
-        latent_patch_size=2,
-        max_latent_size=32,
-        vit_max_num_patch_per_side=70,
-        connector_act="gelu_pytorch_tanh",
-        interpolate_pos=False,
-        timestep_shift=1.0,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.visual_gen = visual_gen
-        self.visual_und = visual_und
-        self.llm_config = llm_config
-        self.vit_config = vit_config
-        self.vae_config = vae_config
-        self.latent_patch_size = latent_patch_size
-        self.max_latent_size = max_latent_size
-        self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
-        self.connector_act = connector_act
-        self.interpolate_pos = interpolate_pos
-        self.timestep_shift = timestep_shift
 
 
 class Bagel(torch.nn.Module):

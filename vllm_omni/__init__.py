@@ -20,6 +20,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
     # Allow importing vllm_omni without vllm (e.g., documentation builds)
     patch = None  # type: ignore
 
+
 from .config import OmniModelConfig
 from .entrypoints.async_omni import AsyncOmni
 

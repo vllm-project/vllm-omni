@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -12,18 +13,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_input, _upad_input
 
 logger = init_logger(__name__)
-
-try:
-    # only tested with flash_attn v3
-    # from flash_attn_interface import flash_attn_func as flash_attn_3_func  # not available in flash-attn 2.8.1
-    from flash_attn import flash_attn_func, flash_attn_varlen_func  # can be FA2 or FA3
-except ImportError:
-    logger.warning(
-        "FlashAttentionBackend is not available. You may install flash-attn "
-        "by running `uv pip install flash-attn==2.8.1 --no-build-isolation`"
-        " or install pre-built flash-attn from https://github.com/Dao-AILab/flash-attention/releases"
-    )
-    raise ImportError
 
 
 class FlashAttentionBackend(AttentionBackend):
