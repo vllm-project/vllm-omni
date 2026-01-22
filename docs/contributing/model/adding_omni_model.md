@@ -572,7 +572,7 @@ def talker2code2wav(
 
 ## Testing
 
-For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../tests/tests_style.md).
+For comprehensive testing guidelines, please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
 
 ## Adding a Model Recipe
 

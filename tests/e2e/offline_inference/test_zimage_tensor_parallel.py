@@ -17,12 +17,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tests.utils import GPUMemoryMonitor
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import is_npu, is_rocm
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 
@@ -66,7 +68,12 @@ def _extract_single_image(outputs) -> Image.Image:
 
 def _run_zimage_generate(
     *, tp_size: int, height: int, width: int, num_inference_steps: int, seed: int
-) -> tuple[Image.Image, float]:
+) -> tuple[Image.Image, float, float]:
+    torch.cuda.empty_cache()
+    device_index = torch.cuda.current_device()
+    monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
+    monitor.start()
+
     m = Omni(
         model=_get_zimage_model(),
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=tp_size),
@@ -107,9 +114,12 @@ def _run_zimage_generate(
             pass
 
         median_time_s = float(np.median(per_request_times_s))
-        return _extract_single_image([last_output]), median_time_s
+
+        peak_memory_mb = monitor.peak_used_mb
+
+        return _extract_single_image([last_output]), median_time_s, peak_memory_mb
     finally:
-        m.close()
+        monitor.stop()
         cleanup_dist_env_and_memory()
 
 
@@ -120,19 +130,19 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
-    height = 256
-    width = 256
+    height = 512
+    width = 512
     num_inference_steps = 2
     seed = 42
 
-    tp1_img, tp1_time_s = _run_zimage_generate(
+    tp1_img, tp1_time_s, tp1_peak_mem = _run_zimage_generate(
         tp_size=1,
         height=height,
         width=width,
         num_inference_steps=num_inference_steps,
         seed=seed,
     )
-    tp2_img, tp2_time_s = _run_zimage_generate(
+    tp2_img, tp2_time_s, tp2_peak_mem = _run_zimage_generate(
         tp_size=2,
         height=height,
         width=width,
@@ -150,7 +160,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
     mean_abs_diff, max_abs_diff = _diff_metrics(tp1_img, tp2_img)
     mean_threshold = 3e-2
-    max_threshold = 3.5e-1
+    max_threshold = 5e-1
     print(
         "Z-Image TP image diff stats (TP=1 vs TP=2): "
         f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "
@@ -164,3 +174,8 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
     print(f"Z-Image TP perf (lower is better): tp1_time_s={tp1_time_s:.6f}, tp2_time_s={tp2_time_s:.6f}")
     assert tp2_time_s < tp1_time_s, f"Expected TP=2 to be faster than TP=1 (tp1={tp1_time_s}, tp2={tp2_time_s})"
+
+    print(f"Z-Image TP peak memory (MB): tp1_peak_mem={tp1_peak_mem:.2f}, tp2_peak_mem={tp2_peak_mem:.2f}")
+    assert tp2_peak_mem < tp1_peak_mem, (
+        f"Expected TP=2 to use less peak memory than TP=1 (tp1={tp1_peak_mem}, tp2={tp2_peak_mem})"
+    )

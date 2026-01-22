@@ -22,6 +22,8 @@ from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import Qwen2_5OmniPr
 from transformers.utils.logging import get_logger as _hf_get_logger
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader as _Vllm_AutoWeightsLoader
 from vllm.model_executor.models.utils import WeightsMapper as _Vllm_WeightsMapper
@@ -529,7 +531,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class DiTAttention(nn.Module):
-    def __init__(self, config: Qwen2_5OmniDiTConfig):
+    def __init__(self, config: Qwen2_5OmniDiTConfig, prefix: str = ""):
         super().__init__()
 
         self.config = config
@@ -539,11 +541,16 @@ class DiTAttention(nn.Module):
         self.dropout = config.dropout
         self.is_causal = False
 
-        self.to_q = nn.Linear(config.hidden_size, self.inner_dim)
-        self.to_k = nn.Linear(config.hidden_size, self.inner_dim)
-        self.to_v = nn.Linear(config.hidden_size, self.inner_dim)
-
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, config.hidden_size), nn.Dropout(config.dropout)])
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.dim,
+            head_size=config.head_dim,
+            total_num_heads=self.heads,
+            bias=True,
+            prefix=f"{prefix}.qkv_proj",
+            disable_tp=True,
+            return_bias=False,
+        )
+        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, self.dim), nn.Dropout(config.dropout)])
 
     def forward(
         self,
@@ -553,10 +560,8 @@ class DiTAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
 
-        # `sample` projections.
-        query = self.to_q(hidden_states)
-        key = self.to_k(hidden_states)
-        value = self.to_v(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        query, key, value = qkv.split([self.inner_dim, self.inner_dim, self.inner_dim], dim=-1)
 
         # attention
         inner_dim = key.shape[-1]
@@ -1399,6 +1404,34 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         generated_waveform = solution_trajectory[-1]
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
         return generated_mel_spectrogram
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            # self-attn
+            (".qkv_proj", ".to_q", "q"),
+            (".qkv_proj", ".to_k", "k"),
+            (".qkv_proj", ".to_v", "v"),
+        ]
+
+        params_dict = dict(self.named_parameters())
+
+        loaded_params = set[str]()
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
 
 
 @auto_docstring(

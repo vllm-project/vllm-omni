@@ -78,6 +78,7 @@ stage_args:
       trust_remote_code: true
       enable_prefix_caching: false
       engine_output_type: audio
+      max_num_batched_tokens: 4069
     engine_input_source: [1]
     final_output: true
     final_output_type: audio

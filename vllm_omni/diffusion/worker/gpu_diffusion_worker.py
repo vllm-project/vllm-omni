@@ -1,20 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Diffusion Worker for vLLM-Omni.
+
+Handles GPU infrastructure initialization and delegates model operations
+to GPUDiffusionModelRunner.
+"""
+
 import multiprocessing as mp
 import os
-import time
-from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
 import zmq
-from vllm.config import LoadConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
-from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.mem_utils import GiB_bytes
 
-from vllm_omni.diffusion.cache.selector import get_cache_backend
-from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
@@ -25,16 +28,24 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.offload import apply_offload_hooks
+from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
 
 logger = init_logger(__name__)
 
 
-class GPUWorker:
+class GPUDiffusionWorker:
     """
-    A worker that executes the model on a single GPU.
+    A worker that manages GPU infrastructure and delegates to the model runner.
+
+    This class handles infrastructure initialization only:
+    - Device setup (CUDA device selection)
+    - Distributed environment (NCCL, model parallel)
+    - Memory management (sleep/wake)
+
+    All model-related operations (loading, compilation, execution) are
+    delegated to GPUDiffusionModelRunner.
     """
 
     def __init__(
@@ -46,15 +57,17 @@ class GPUWorker:
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
-        self.pipeline = None
-        self.device = None
+        self.device: torch.device | None = None
+        self.vllm_config: VllmConfig | None = None
+        self.model_runner: GPUDiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
-        self.init_device_and_model()
+        self.init_device()
 
-    def init_device_and_model(self) -> None:
-        """Initialize the device and load the model."""
+    def init_device(self) -> None:
+        """Initialize the device and distributed environment."""
         world_size = self.od_config.num_gpus
         rank = self.rank
+
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.od_config.master_port)
@@ -62,19 +75,21 @@ class GPUWorker:
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
+        # Setup device
         self.device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(self.device)
 
-        # hack
+        # Create vllm_config for parallel configuration
         vllm_config = VllmConfig()
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
-        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
 
+        # Initialize distributed environment
         with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+
             parallel_config = self.od_config.parallel_config
             initialize_model_parallel(
                 data_parallel_size=parallel_config.data_parallel_size,
@@ -86,107 +101,55 @@ class GPUWorker:
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
 
-            load_config = LoadConfig()
-            model_loader = DiffusersPipelineLoader(load_config)
-            time_before_load = time.perf_counter()
-            with self._maybe_get_memory_pool_context(tag="weights"):
-                with DeviceMemoryProfiler() as m:
-                    self.pipeline = model_loader.load_model(
-                        od_config=self.od_config,
-                        load_device=load_device,
-                    )
-            time_after_load = time.perf_counter()
-
-        logger.info(
-            "Model loading took %.4f GiB and %.6f seconds",
-            m.consumed_memory / GiB_bytes,
-            time_after_load - time_before_load,
+        # Create model runner and load model
+        self.model_runner = GPUDiffusionModelRunner(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
         )
-        logger.info(f"Worker {self.rank}: Model loaded successfully.")
-
-        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
-        if self.od_config.enable_cpu_offload:
-            for name in ["vae"]:
-                module = getattr(self.pipeline, name, None)
-                if module is None:
-                    continue
-                try:
-                    module.to(self.device, non_blocking=True)
-                except Exception as exc:
-                    logger.debug("Failed to move %s to GPU: %s", name, exc)
-
-            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
-
-        if not self.od_config.enforce_eager:
-            try:
-                self.pipeline.transformer = regionally_compile(
-                    self.pipeline.transformer,
-                    dynamic=True,
-                )
-                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
-            except Exception as e:
-                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
-
-        # Setup cache backend based on type (both backends use enable()/reset() interface)
-        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
-
-        if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+        self.model_runner.load_model(
+            memory_pool_context_fn=self._maybe_get_memory_pool_context,
+        )
+        logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-        """
-        Generate output for the given requests.
-
-        Args:
-            requests: List of diffusion requests
-
-        Returns:
-            DiffusionOutput with generated results
-        """
+        """Generate output for the given requests."""
         return self.execute_model(requests, self.od_config)
 
-    @torch.inference_mode()
+    @classmethod
+    def start_profile(cls, trace_path_template: str) -> str:
+        """Start profiling for this GPU worker."""
+        return CurrentProfiler.start(trace_path_template)
+
+    @classmethod
+    def stop_profile(cls) -> dict | None:
+        """Stop profiling and return the result dictionary."""
+        return CurrentProfiler.stop()
+
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
-        """
-        Execute a forward pass.
-        """
-        assert self.pipeline is not None
-        if not reqs or len(reqs) == 0:
-            raise ValueError("Cannot execute model with empty request list")
-        # TODO: dealing with first req for now
-        req = reqs[0]
+        """Execute a forward pass by delegating to the model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_model(reqs)
 
-        if req.generator is None and req.seed is not None:
-            req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
-
-        # Refresh cache context if needed
-        if self.cache_backend is not None and self.cache_backend.is_enabled():
-            self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            output = self.pipeline.forward(req)
-        return output
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.pipeline.load_weights(weights)
+    def load_weights(self, weights) -> set[str]:
+        """Load weights by delegating to the model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.load_weights(weights)
 
     def sleep(self, level: int = 1) -> bool:
         """
-        Put the worker to sleep. The worker should not process any requests.
-        The caller should guarantee that no requests are being processed
-        during the sleep period, before `wake_up` is called.
+        Put the worker to sleep, offloading model weights.
 
         Args:
-            level: The sleep level. Level 1 sleep will offload the model
-                weights and discard the kv cache.
-                Currently only support level 1.
+            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
         from vllm.device_allocator.cumem import CuMemAllocator
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
-        if level == 2:
-            model = self.pipeline
+        if level == 2 and self.model_runner is not None:
+            model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
         allocator = CuMemAllocator.get_instance()
@@ -220,8 +183,8 @@ class GPUWorker:
         allocator.wake_up(tags)
 
         # Restore the buffers after level 2 sleep
-        if len(self._sleep_saved_buffers):
-            model = self.pipeline
+        if len(self._sleep_saved_buffers) and self.model_runner is not None:
+            model = self.model_runner.pipeline
             for name, buffer in model.named_buffers():
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
@@ -229,6 +192,7 @@ class GPUWorker:
         return True
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        """Get memory pool context for sleep mode support."""
         if self.od_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -240,6 +204,7 @@ class GPUWorker:
             return nullcontext()
 
     def shutdown(self) -> None:
+        """Shutdown the worker and cleanup distributed environment."""
         destroy_distributed_env()
 
 
@@ -257,17 +222,14 @@ class WorkerProc:
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
 
-        # Initialize MessageQueue reader from handle (unified for generation & RPC)
+        # Initialize MessageQueue reader from handle
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
 
         self.result_mq = None
         self.result_mq_handle = None
 
-        # Setup result sender (only for rank 0 for now, or whoever needs to reply)
-        # Assuming only rank 0 replies to scheduler as per original logic
+        # Setup result sender (only for rank 0)
         if gpu_id == 0:
-            # Create MessageQueue for results (1 writer -> 1 reader)
-            # We assume the reader (SyncScheduler) will act as rank 0
             self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
             self.result_mq_handle = self.result_mq.export_handle()
             logger.info(f"Worker {gpu_id} created result MessageQueue")
@@ -277,31 +239,25 @@ class WorkerProc:
         self.gpu_id = gpu_id
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> GPUWorker:
+    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> GPUDiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
-        return GPUWorker(
+        return GPUDiffusionWorker(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
         )
 
     def return_result(self, output: DiffusionOutput):
-        """
-        replies to client, only on rank 0
-        """
+        """Reply to client, only on rank 0."""
         if self.result_mq is not None:
             self.result_mq.enqueue(output)
 
     def recv_message(self):
-        """
-        Receive unified messages (RPC requests, shutdown) from broadcast queue.
-        Uses indefinite=True to block until a message arrives.
-        """
+        """Receive messages from broadcast queue."""
         return self.mq.dequeue(indefinite=True)
 
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
-
         method = rpc_request["method"]
         args = rpc_request.get("args", ())
         kwargs = rpc_request.get("kwargs", {})
@@ -325,14 +281,11 @@ class WorkerProc:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             return {"status": "error", "error": str(e)}, should_reply
 
-    # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
-        """Main busy loop for Multiprocessing Workers"""
-
+        """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
-            # Receive unified message (generation request, RPC request, or shutdown)
             msg = None
             try:
                 msg = self.recv_message()
@@ -349,7 +302,6 @@ class WorkerProc:
 
             # Route message based on type
             if isinstance(msg, dict) and msg.get("type") == "rpc":
-                # Handle RPC request
                 try:
                     result, should_reply = self.execute_rpc(msg)
                     if should_reply:
@@ -360,13 +312,12 @@ class WorkerProc:
                         self.return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
-                # Handle shutdown message
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
                 self._running = False
                 continue
 
             else:
-                # Handle generation request (OmniDiffusionRequest list)
+                # Handle generation request
                 try:
                     output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
@@ -379,17 +330,14 @@ class WorkerProc:
                 try:
                     self.return_result(output)
                 except zmq.ZMQError as e:
-                    # Reply failed; log and keep loop alive to accept future requests
                     logger.error(f"ZMQ error sending reply: {e}")
                     continue
 
         logger.info("event loop terminated.")
         try:
             self.worker.shutdown()
-        except Exception as exc:  # pragma: no cover - best effort cleanup
+        except Exception as exc:
             logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
-        # if self.result_sender is not None:
-        #     self.result_sender.close()
         self.context.term()
 
     @staticmethod
@@ -400,7 +348,6 @@ class WorkerProc:
         broadcast_handle,
     ) -> None:
         """Worker initialization and execution loops."""
-
         worker_proc = WorkerProc(
             od_config,
             gpu_id=rank,

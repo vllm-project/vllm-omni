@@ -234,13 +234,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 # Use the corresponding lm_head for this layer
                 logits = self.code_predictor.lm_head[layer_idx](hidden_state[:, -1:, :])  # [batch, 1, vocab_size]
 
-                if len(pos_codes) > 1:
-                    input_ids_for_logits_processors = torch.cat(pos_codes[1:], dim=1).to(
-                        device=logits.device, dtype=torch.long
-                    )
-                else:
-                    input_ids_for_logits_processors = self.empty_code
-                logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(0)).unsqueeze(0)
+                logits = logits_processors(None, logits[:, -1])
 
                 # Sample from the filtered distribution
                 probs = F.softmax(logits, dim=-1)
@@ -288,7 +282,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             all_summed_embeddings.append(pos_summed)
 
         # Concatenate across positions: [batch, seq_len, hidden_size]
-        summed_embeddings = torch.cat(all_summed_embeddings, dim=1)
+        summed_embeddings = torch.cat(all_summed_embeddings, dim=1).squeeze(1)
 
         return result_codes, summed_embeddings
 

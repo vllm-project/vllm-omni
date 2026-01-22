@@ -1,12 +1,15 @@
+from collections.abc import Callable
 from typing import Any
 
 import cloudpickle
 from pydantic import ValidationError
+from tqdm import tqdm
 
 # External library imports (vLLM)
 from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
 from vllm.entrypoints.llm import LLM
 from vllm.logger import init_logger
+from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
@@ -190,3 +193,47 @@ class OmniLLM(LLM):
             self.close()
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
+
+    def _run_engine(self, *, use_tqdm: bool | Callable[..., tqdm] = True) -> list[RequestOutput | PoolingRequestOutput]:
+        # Initialize tqdm.
+        if use_tqdm:
+            num_requests = self.llm_engine.get_num_unfinished_requests()
+            tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            pbar = tqdm_func(
+                total=num_requests,
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"),
+            )
+
+        # Run the engine.
+        outputs: list[RequestOutput | PoolingRequestOutput] = []
+        total_in_toks = 0
+        total_out_toks = 0
+        while self.llm_engine.has_unfinished_requests():
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                if output.finished:
+                    outputs.append(output)
+                    if use_tqdm:
+                        if isinstance(output, RequestOutput):
+                            # Calculate tokens only for RequestOutput
+                            n = len(output.outputs)
+                            assert output.prompt_token_ids is not None
+                            total_in_toks += len(output.prompt_token_ids) * n
+                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            total_out_toks += sum(len(stp.token_ids) for stp in output.outputs)
+                            out_spd = total_out_toks / pbar.format_dict["elapsed"]
+                            pbar.postfix = f"est. speed input: {in_spd:.2f} toks/s, output: {out_spd:.2f} toks/s"
+                            pbar.update(n)
+                        else:
+                            pbar.update(1)
+                        if pbar.n == num_requests:
+                            pbar.refresh()
+
+        if use_tqdm:
+            pbar.close()
+        # Sort the outputs by the int part of request ID which is in format of 'int-uuid'.
+        # This is necessary because some requests may be finished earlier than
+        # its previous requests.
+        return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))

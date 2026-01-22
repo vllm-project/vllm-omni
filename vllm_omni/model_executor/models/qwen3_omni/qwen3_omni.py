@@ -154,6 +154,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
             self._init_special_tokens_embeddings()
+            self.requires_raw_input_tokens = True
 
         elif self.model_stage == "code2wav":
             self.thinker = None
@@ -168,6 +169,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 architectures=["Qwen3OmniMoeCode2Wav"],
             )
             self.model = self.code2wav
+            self.requires_raw_input_tokens = True
         else:
             raise ValueError(
                 f"Invalid model_stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'"
@@ -354,18 +356,24 @@ class Qwen3OmniMoeForConditionalGeneration(
         elif self.model_stage == "code2wav":
             # Extract codec codes from input
             codes = []
-            if input_ids is not None:
+            if input_ids.shape[0] % 16 == 0:
                 codes.append(input_ids.reshape(1, 16, -1))
-
             else:
-                # for profile, we use max length from inputs_embeds
-                codes.append(
-                    torch.zeros(
-                        (1, 16, inputs_embeds.shape[1]),
-                        dtype=torch.long,
-                        device=inputs_embeds.device,
-                    )
+                logger.warning(
+                    (
+                        "Input_ids length: %s is not divisible by 16, padding "
+                        "with zeros. This should only happen in warm up."
+                    ),
+                    input_ids.shape[0],
                 )
+                input_ids_flatten = input_ids.reshape(-1)
+                input_ids_flatten = torch.cat(
+                    [
+                        input_ids_flatten,
+                        torch.zeros(16 - input_ids.shape[0] % 16, dtype=torch.long, device=input_ids.device),
+                    ]
+                )
+                codes.append(input_ids_flatten.reshape(1, 16, -1))
 
             # Generate audio from codec codes
             audio_tensors = []
@@ -573,30 +581,22 @@ class Qwen3OmniMoeForConditionalGeneration(
         if input_embeds is None and input_ids is not None:
             input_embeds = self.talker.embed_input_ids(input_ids)
 
-        text_step = torch.zeros(
-            1,
-            self.talker_config.text_config.hidden_size,
-            device=self._module_device(self.talker),
-            dtype=torch.bfloat16,
-        )
-        last_talker_hidden = torch.zeros(
-            1,
-            1,
-            self.talker_config.text_config.hidden_size,
-            device=self._module_device(self.talker),
-            dtype=torch.bfloat16,
-        )
-
         span_len = input_ids.shape[0]
         if span_len > 1:
             # prefill
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, **info_dict)
+            code_predictor_codes = torch.zeros(
+                (input_embeds.shape[0], self.talker.num_code_groups),
+                device=self._module_device(self.talker),
+                dtype=torch.long,
+            )
+            update_dict["code_predictor_codes"] = code_predictor_codes
         else:
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
                 input_ids, input_embeds, **info_dict
             )
 
-        update_dict["mtp_inputs"] = last_talker_hidden, text_step
+            update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
         return input_ids, input_embeds, update_dict
 
@@ -608,24 +608,19 @@ class Qwen3OmniMoeForConditionalGeneration(
         text_step: torch.Tensor,
     ):
         # TODO(Peiqi): not support intermediate_tensors now
-        input_ids = safe_tensor_reshape(input_ids, (1, -1))
+        input_ids = safe_tensor_reshape(input_ids, (input_ids.shape[0], -1))
         inputs_embeds = safe_tensor_reshape(input_embeds, (-1, self.talker_config.text_config.hidden_size))
-        text_step = safe_tensor_reshape(text_step, (1, -1))
-        last_talker_hidden = safe_tensor_reshape(last_talker_hidden, (1, 1, self.talker_config.text_config.hidden_size))
+        text_step = safe_tensor_reshape(text_step, (-1, self.talker_config.text_config.hidden_size))
+        last_talker_hidden = safe_tensor_reshape(
+            last_talker_hidden, (-1, 1, self.talker_config.text_config.hidden_size)
+        )
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
-        if inputs_embeds.shape[0] == 1:
-            code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-                input_ids, inputs_embeds.clone(), last_talker_hidden=last_talker_hidden
-            )
-            inputs_embeds = summed_embeddings.clone()
-        else:
-            code_predictor_codes = torch.zeros(
-                (inputs_embeds.shape[0], self.talker.num_code_groups),
-                device=self._module_device(self.talker),
-                dtype=torch.long,
-            )
+        code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
+            input_ids, inputs_embeds.clone(), last_talker_hidden=last_talker_hidden
+        )
+        inputs_embeds = summed_embeddings.clone()
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
         return inputs_embeds, code_predictor_codes.squeeze(-1)
 
@@ -848,7 +843,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 use_vec = q_tail[0:1, :]
                 new_q_tail = (
                     q_tail[1:, :].detach().to("cpu").contiguous()
-                    if q_tail.shape[1] > 1
+                    if q_tail.shape[0] > 1
                     else self.tts_pad_embed.to(input_embeds.device, dtype=input_embeds.dtype)
                 )
                 text_step = use_vec.to(input_embeds.device, dtype=input_embeds.dtype)

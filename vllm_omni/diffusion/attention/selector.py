@@ -31,6 +31,8 @@ _BACKEND_CONFIG = {
     "ASCEND": {"module": "vllm_omni.diffusion.attention.backends.ascend_attn", "class": "AscendAttentionBackend"},
 }
 
+_BACKENDS_SUPPORT_ATTENTION_MASK = ["SDPA", "ASCEND", "FLASH_ATTN"]
+
 
 def load_backend(backend_name: str) -> type[AttentionBackend]:
     config = _BACKEND_CONFIG[backend_name]

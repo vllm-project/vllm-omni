@@ -69,7 +69,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 ## Acceleration Methods
 
-For comprehensive illustration, please view cache-dit [User_Guide](https://github.com/vipshop/cache-dit/blob/main/docs/User_Guide.md)
+For comprehensive illustration, please view cache-dit [User_Guide](https://cache-dit.readthedocs.io/en/latest/user_guide/OVERVIEWS/)
 
 ### 1. DBCache (Dual Block Cache)
 
@@ -222,6 +222,6 @@ To test another model, you can modify `--model` with the target model identifier
 
 ## Additional Resources
 
-- [Cache-DiT User Guide](https://github.com/vipshop/cache-dit/blob/main/docs/User_Guide.md)
-- [Cache-DiT Benchmark](https://github.com/vipshop/cache-dit/tree/main/bench)
-- [DBCache Technical Details](https://github.com/vipshop/cache-dit/blob/main/docs/DBCache.md)
+- [Cache-DiT User Guide](https://cache-dit.readthedocs.io/en/latest/user_guide/OVERVIEWS/)
+- [Cache-DiT Benchmark](https://cache-dit.readthedocs.io/en/latest/benchmark/HYBRID_CACHE/)
+- [DBCache Technical Details](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)
