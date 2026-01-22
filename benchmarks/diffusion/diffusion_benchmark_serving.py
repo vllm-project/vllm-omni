@@ -8,7 +8,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
 Supports multiple backends:
     - vllm-omni: Uses /v1/chat/completions endpoint (default)
-    - sglang: Uses /v1/images/generations endpoint (OpenAI-compatible)
+    - openai: Uses /v1/images/generations endpoint
 
 Usage:
     # Video (vllm-omni backend)
@@ -32,10 +32,10 @@ Usage:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
 
-    # Image (sglang backend)
+    # Image (openai backend)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend sglang --dataset vbench --task t2i --num-prompts 10 \
+        --backend openai --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
 """
@@ -883,9 +883,8 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="vllm-omni",
-        choices=["vllm-omni", "sglang"],
-        help="Backend to use. 'vllm-omni' uses /v1/chat/completions, "
-        "'sglang' uses /v1/images/generations (OpenAI-compatible).",
+        choices=["vllm-omni", "openai"],
+        help="Backend to target the benchmark to.",
     )
     parser.add_argument(
         "--dataset",

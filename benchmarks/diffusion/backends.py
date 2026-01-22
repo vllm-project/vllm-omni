@@ -125,13 +125,13 @@ async def async_request_chat_completions(
     return output
 
 
-async def async_request_sglang_images(
+async def async_request_openai_images(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
     """
-    Send request to SGLang's /v1/images/generations endpoint.
+    Send request to OpenAI's /v1/images/generations endpoint.
     """
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
@@ -194,5 +194,5 @@ async def async_request_sglang_images(
 
 backends_function_mapping = {
     "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
-    "sglang": (async_request_sglang_images, "/v1/images/generations"),
+    "openai": (async_request_openai_images, "/v1/images/generations"),
 }
