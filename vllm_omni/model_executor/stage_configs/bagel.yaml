@@ -1,0 +1,88 @@
+# Stage 0: Thinker (multimodal understanding + text generation)
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"  # Adjust as needed
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: BagelForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: text
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+      omni_kv_config:
+        need_send_cache: true
+        kv_transfer_criteria:
+          type: prefill_finished #or special token generated
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 52
+      detokenize: True
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: image
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+      omni_kv_config:
+        need_recv_cache: true
+    engine_input_source: [0]
+
+    final_output: true
+    final_output_type: image
+    is_comprehension: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 52
+      detokenize: True
+      repetition_penalty: 1.0
+
+# Runtime edges
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  # Distributed connectors configuration (optional)
+  # More connectors will be supported in the future.
+  connectors:
+    shared_memory_connector:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536 # 64KB threshold
+
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

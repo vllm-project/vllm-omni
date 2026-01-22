@@ -20,6 +20,7 @@ from torch import nn
 from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -28,7 +29,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams
-from .bagel_transformer import Bagel, BagelConfig, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
+from .bagel_transformer import Bagel, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
 
@@ -304,120 +305,84 @@ class BagelPipeline(nn.Module):
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
         injected_kv = getattr(req, "past_key_values", None)
-        injected_metadata = getattr(req, "kv_metadata", None)
+        if injected_kv is not None:
+            logger.info("Using injected KV Cache (direct)")
+            gen_context["past_key_values"] = injected_kv
 
-        # Image input handling
-        image_input = getattr(req, "pil_image", None)
-        if image_input and not isinstance(image_input, list):
-            image_input = [image_input]
-
-        if image_input:
-            # If we have an image, we prefill with it
-            if self.image_processor and self.vae:
-
-                def vit_transforms(img):
-                    # SigLIP processor returns dict with pixel_values; we want the tensor
-                    return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
-
-                def vae_transforms(img):
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
-                    arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
-                    return arr.permute(2, 0, 1)
-
-                # 1. Update VAE
-                gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
-                    curr_kvlens=gen_context["kv_lens"],
-                    curr_rope=gen_context["ropes"],
-                    images=image_input,
-                    transforms=vae_transforms,
-                    new_token_ids=self.new_token_ids,
-                )
-
-                for k, v in gen_input_vae.items():
-                    if torch.is_tensor(v):
-                        gen_input_vae[k] = v.to(self.device)
-
-                # VAE needs bfloat16 to match model strings usually, specifically encode
-                with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
-                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                        self.vae, gen_context["past_key_values"], **gen_input_vae
-                    )
-                gen_context["kv_lens"] = newlens_vae
-                gen_context["ropes"] = new_rope_vae
-
-                # 2. Update ViT
-                gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
-                    curr_kvlens=gen_context["kv_lens"],
-                    curr_rope=gen_context["ropes"],
-                    images=image_input,
-                    transforms=vit_transforms,
-                    new_token_ids=self.new_token_ids,
-                )
-
-                for k, v in gen_input_img.items():
-                    if torch.is_tensor(v):
-                        gen_input_img[k] = v.to(self.device)
-
-                with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
-                    gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
-                        gen_context["past_key_values"], **gen_input_img
-                    )
-                gen_context["kv_lens"] = newlens_img
-                gen_context["ropes"] = new_rope_img
-            else:
-                logger.warning("Image provided but no image processor available.")
-
-        if injected_kv is not None and injected_metadata is not None:
-            logger.info("Using injected KV Cache from remote transfer")
-
-            # [Fix] Reconstruct NaiveCache if injected_kv is a dict of tensors
-            current_cache = gen_context["past_key_values"]
-            if isinstance(current_cache, NaiveCache) and isinstance(injected_kv, dict):
-                # injected_kv keys are like "0_k", "0_v", "1_k", ...
-                for key_name, tensor in injected_kv.items():
-                    try:
-                        # Parse layer index and type
-                        parts = key_name.split("_")
-                        if len(parts) < 2:
-                            continue
-
-                        layer_idx = int(parts[0])
-                        cache_type = parts[1]  # 'k' or 'v'
-
-                        # Ensure tensor is on correct device
-                        if tensor.device != self.device:
-                            tensor = tensor.to(self.device)
-
-                        if layer_idx in current_cache.key_cache:
-                            if cache_type == "k":
-                                current_cache.key_cache[layer_idx] = tensor
-                            elif cache_type == "v":
-                                current_cache.value_cache[layer_idx] = tensor
-                            elif cache_type == "kv":
-                                # Fallback if sender sent mixed/packed (less ideal)
-                                current_cache.key_cache[layer_idx] = tensor
-                                current_cache.value_cache[layer_idx] = tensor
-                    except Exception as e:
-                        logger.warning(f"Failed to load injected KV part {key_name}: {e}")
-
-            if "kv_lens" in injected_metadata:
-                val = injected_metadata["kv_lens"]
-                if isinstance(val, (int, float)):
-                    gen_context["kv_lens"] = [int(val)]
-                else:
-                    gen_context["kv_lens"] = list(val)
-
-            if "ropes" in injected_metadata:
-                val = injected_metadata["ropes"]
-                if isinstance(val, (int, float)):
-                    gen_context["ropes"] = [int(val)]
-                else:
-                    gen_context["ropes"] = list(val)
+            # User requested: kv_lens and ropes set to [gen_context["past_key_values"].key_cache[0].shape[0]]
+            # Assuming injected_kv is compatible and has key_cache[0]
+            seq_len = injected_kv.key_cache[0].shape[0]
+            gen_context["kv_lens"] = [seq_len]
+            gen_context["ropes"] = [seq_len]
 
         else:
-            # Standard local prefill path
+            image_input = getattr(req, "pil_image", None)
+            if image_input and not isinstance(image_input, list):
+                image_input = [image_input]
+
+            if image_input:
+                # If we have an image, we prefill with it
+                if self.image_processor and self.vae:
+
+                    def vit_transforms(img):
+                        # SigLIP processor returns dict with pixel_values; we want the tensor
+                        return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
+
+                    def vae_transforms(img):
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
+                        arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
+                        return arr.permute(2, 0, 1)
+
+                    # 1. Update VAE
+                    gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
+                        curr_kvlens=gen_context["kv_lens"],
+                        curr_rope=gen_context["ropes"],
+                        images=image_input,
+                        transforms=vae_transforms,
+                        new_token_ids=self.new_token_ids,
+                    )
+
+                    for k, v in gen_input_vae.items():
+                        if torch.is_tensor(v):
+                            gen_input_vae[k] = v.to(self.device)
+
+                    # VAE needs bfloat16 to match model strings usually, specifically encode
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
+                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                            self.vae, gen_context["past_key_values"], **gen_input_vae
+                        )
+                    gen_context["kv_lens"] = newlens_vae
+                    gen_context["ropes"] = new_rope_vae
+
+                    # 2. Update ViT
+                    gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
+                        curr_kvlens=gen_context["kv_lens"],
+                        curr_rope=gen_context["ropes"],
+                        images=image_input,
+                        transforms=vit_transforms,
+                        new_token_ids=self.new_token_ids,
+                    )
+
+                    for k, v in gen_input_img.items():
+                        if torch.is_tensor(v):
+                            gen_input_img[k] = v.to(self.device)
+
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
+                        gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                            gen_context["past_key_values"], **gen_input_img
+                        )
+                    gen_context["kv_lens"] = newlens_img
+                    gen_context["ropes"] = new_rope_img
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -438,7 +403,11 @@ class BagelPipeline(nn.Module):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(self.device)
-            with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
                 gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
                     gen_context["past_key_values"], **generation_input
                 )
@@ -483,7 +452,11 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,

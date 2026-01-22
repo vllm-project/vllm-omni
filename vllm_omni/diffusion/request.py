@@ -122,6 +122,11 @@ class OmniDiffusionRequest:
     # Other parameters that may be needed by specific schedulers
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # [Omni] KV Cache Transfer, for bagel model now
+    past_key_values: Any | None = None  # Injected KV Cache
+    kv_metadata: dict[str, Any] | None = None  # Metadata for KV Cache (e.g., kv_lens, ropes)
+    need_kv_receive: bool = True  # Flag to indicate if this request expects KV transfer
+
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
 

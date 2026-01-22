@@ -121,6 +121,9 @@ class OmniLLM(LLM):
                 )
                 raise ValueError(f"Invalid 'kv_transfer_config' provided: {e}") from e
 
+        # Extract omni_kv_config from kwargs if present (injected by Omni)
+        omni_kv_config = kwargs.pop("omni_kv_config", None)
+
         if compilation_config is not None:
             if isinstance(compilation_config, int):
                 compilation_config_instance = CompilationConfig(level=compilation_config)
@@ -147,6 +150,7 @@ class OmniLLM(LLM):
             model=model,
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
+            omni_kv_config=omni_kv_config,
             **kwargs,
         )
 

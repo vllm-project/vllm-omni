@@ -63,6 +63,7 @@ class OmniEngineArgs(EngineArgs):
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: str | None = None
     hf_config_name: str | None = None
+    omni_kv_config: dict | None = None
 
     def draw_hf_text_config(self, config_dict: dict) -> Qwen3OmniMoeTextConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -115,6 +116,7 @@ class OmniEngineArgs(EngineArgs):
         config_dict["model_arch"] = self.model_arch
         config_dict["engine_output_type"] = self.engine_output_type
         config_dict["hf_config_name"] = self.hf_config_name
+        config_dict["omni_kv_config"] = self.omni_kv_config
         if self.hf_config_name is not None:
             config_dict["hf_text_config"] = self.draw_hf_text_config(config_dict)
         # Create and return the OmniModelConfig instance
@@ -145,6 +147,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: str | None = None
     hf_config_name: str | None = None
+    omni_kv_config: dict | None = None
 
     def draw_hf_text_config(self, config_dict: dict) -> Qwen3OmniMoeTextConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -188,6 +191,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         config_dict["engine_output_type"] = self.engine_output_type
 
         config_dict["hf_config_name"] = self.hf_config_name
+        config_dict["omni_kv_config"] = self.omni_kv_config
         if self.hf_config_name is not None:
             config_dict["hf_text_config"] = self.draw_hf_text_config(config_dict)
         # Create and return the OmniModelConfig instance

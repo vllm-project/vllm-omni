@@ -42,7 +42,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if size > self.threshold:
                 # Use Shared Memory
-                meta = shm_write_bytes(payload)
+                shm_name = f"omni_{from_stage}_to_{to_stage}_{request_id}"
+                meta = shm_write_bytes(payload, name=shm_name)
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
                 self._metrics["shm_writes"] += 1
@@ -65,9 +66,40 @@ class SharedMemoryConnector(OmniConnectorBase):
     def get(
         self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
     ) -> tuple[Any, int] | None:
+        # Helper to try reading SHM with a specific name
+        def try_read_shm(name: str):
+            # _shm is imported at module level as: import multiprocessing.shared_memory as _shm
+            # but to be safe inside this closure if not picked up:
+            from multiprocessing import shared_memory as shm_pkg
+
+            shm = shm_pkg.SharedMemory(name=name)
+            try:
+                # We assume the buffer size matches the data size
+                return shm_read_bytes({"name": name, "size": shm.size})
+            finally:
+                shm.close()
+
         if not metadata:
-            logger.error(f"SharedMemoryConnector get called without metadata for req {request_id}")
-            return None
+            # Try to infer metadata from request_id for KV cache transfer scenarios
+            # where metadata is not passed out-of-band.
+            shm_name = f"omni_{from_stage}_to_{to_stage}_{request_id}"
+
+            # We need the size to read from SHM using stage_utils.shm_read_bytes
+            try:
+                # Use local import to avoid potential scope issues if _shm isn't available
+                from multiprocessing import shared_memory as shm_pkg
+
+                temp_shm = shm_pkg.SharedMemory(name=shm_name)
+                size = temp_shm.size
+                temp_shm.close()
+
+                metadata = {"shm": {"name": shm_name, "size": size}, "is_fallback": True}
+                logger.debug(f"SharedMemoryConnector inferred metadata for {request_id}: {metadata}")
+            except Exception as e:
+                # If file not found or other error, standard path will likely fail too, but we let it try or return None
+                logger.debug(f"SharedMemoryConnector failed to infer metadata for {request_id} (fallback): {e}")
+                # We can't proceed without size if we rely on shm_read_bytes
+                return None
 
         try:
             obj = None

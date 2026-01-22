@@ -55,6 +55,7 @@ _OMNI_MODELS = {
     ),
 }
 
+
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
     **_OMNI_MODELS,
