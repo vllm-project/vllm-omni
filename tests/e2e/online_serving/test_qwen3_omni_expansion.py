@@ -4,6 +4,7 @@
 E2E Online tests for Qwen3-Omni model.
 """
 
+import concurrent.futures
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -15,6 +16,8 @@ import pytest
 
 from tests.conftest import (
     OmniServer,
+    convert_audio_to_text,
+    cosine_similarity_text,
     dummy_messages_from_mix_data,
     generate_synthetic_audio,
     generate_synthetic_image,
