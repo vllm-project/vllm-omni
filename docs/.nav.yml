@@ -14,6 +14,7 @@ nav:
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
+      - Qwen3-TTS Offline Inference: user_guide/examples/offline_inference/qwen3_tts.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
     - Online Serving:

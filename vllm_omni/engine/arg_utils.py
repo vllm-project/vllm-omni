@@ -11,10 +11,30 @@ from vllm_omni.config import OmniModelConfig
 logger = init_logger(__name__)
 
 
+def _register_omni_hf_configs() -> None:
+    try:
+        from transformers import AutoConfig
+
+        from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+            Qwen3TTSConfig,
+        )
+    except Exception as exc:  # pragma: no cover - best-effort optional registration
+        logger.warning("Skipping omni HF config registration due to import error: %s", exc)
+        return
+
+    try:
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+    except ValueError:
+        # Already registered elsewhere; ignore.
+        return
+
+
 def register_omni_models_to_vllm():
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+    _register_omni_hf_configs()
 
     supported_archs = ModelRegistry.get_supported_archs()
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():

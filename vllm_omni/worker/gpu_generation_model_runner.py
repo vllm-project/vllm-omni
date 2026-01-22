@@ -308,8 +308,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
+            mm_payload = {}
             for key, out in multimodal_outputs.items():
-                pooler_output.append({key: out.detach().to("cpu").contiguous() if out is not None else None})
+                if out is not None and isinstance(out, torch.Tensor):
+                    mm_payload[key] = out.detach().to("cpu").contiguous()
+            pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
         output = OmniModelRunnerOutput(

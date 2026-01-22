@@ -2,6 +2,7 @@ import time
 from collections import defaultdict
 
 from vllm.distributed.kv_events import KVEventBatch
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -145,6 +146,35 @@ class OmniGenerationScheduler(VLLMScheduler):
         # Update internal state (advance num_computed_tokens, free encoder inputs,
         # etc.)
         self._update_after_schedule(scheduler_output)
+
+        try:
+            # Rewrap base NewRequestData entries with OmniNewRequestData,
+            # enriching with request-level payloads
+            new_list = []
+            for nr in scheduler_output.scheduled_new_reqs:
+                req_id = getattr(nr, "req_id", None)
+                request = self.requests.get(req_id) if req_id else None
+                # Build omni entry preserving all base fields
+                omni_nr = OmniNewRequestData(
+                    req_id=nr.req_id,
+                    prompt_token_ids=nr.prompt_token_ids,
+                    mm_features=nr.mm_features,
+                    sampling_params=nr.sampling_params,
+                    pooling_params=nr.pooling_params,
+                    block_ids=nr.block_ids,
+                    num_computed_tokens=nr.num_computed_tokens,
+                    lora_request=nr.lora_request,
+                    # Enrich with omni payloads from the live request object
+                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    additional_information=(getattr(request, "additional_information", None) if request else None),
+                )
+                new_list.append(omni_nr)
+
+            scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
+        except Exception:
+            # If anything goes wrong, leave the original output unchanged
+            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+
         return scheduler_output
 
     """
