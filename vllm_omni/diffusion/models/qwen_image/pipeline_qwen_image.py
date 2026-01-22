@@ -36,13 +36,14 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.step_batch import StepOutput
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
-
 
 def get_qwen_image_post_process_func(
     od_config: OmniDiffusionConfig,
@@ -498,18 +499,19 @@ class QwenImagePipeline(
 
         return latents
 
-    def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len):
+    def prepare_timesteps(self, num_inference_steps, sigmas, image_seq_len, scheduler=None):
+        scheduler = self.scheduler if scheduler is None else scheduler
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
         # image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
+            scheduler.config.get("base_image_seq_len", 256),
+            scheduler.config.get("max_image_seq_len", 4096),
+            scheduler.config.get("base_shift", 0.5),
+            scheduler.config.get("max_shift", 1.15),
         )
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
+            scheduler,
             num_inference_steps,
             sigmas=sigmas,
             mu=mu,
@@ -639,7 +641,7 @@ class QwenImagePipeline(
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         return latents
 
-    def forward(
+    def prepare_encode(
         self,
         req: OmniDiffusionRequest,
         prompt: str | list[str] | None = None,
@@ -657,30 +659,22 @@ class QwenImagePipeline(
         prompt_embeds_mask: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds_mask: torch.Tensor | None = None,
-        output_type: str | None = "pil",
         attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+        callback_on_step_end_tensor_inputs: list[str] | None = None,
         max_sequence_length: int = 512,
-    ) -> DiffusionOutput:
-        # # TODO: only support single prompt now
-        # if req.prompt is not None:
-        #     prompt = req.prompt[0] if isinstance(req.prompt, list) else req.prompt
-        prompt = req.prompt
-        negative_prompt = req.negative_prompt
-        height = req.height or self.default_sample_size * self.vae_scale_factor
-        width = req.width or self.default_sample_size * self.vae_scale_factor
+        scheduler_override: Any | None = None,
+    ):
+        prompt = req.prompt if prompt is None else prompt
+        negative_prompt = req.negative_prompt if negative_prompt is None else negative_prompt
+        height = req.height or height or self.default_sample_size * self.vae_scale_factor
+        width = req.width or width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.num_inference_steps or num_inference_steps
         generator = req.generator or generator
         true_cfg_scale = req.true_cfg_scale or true_cfg_scale
         req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs
-        # 1. check inputs
-        # 2. encode prompts
-        # 3. prepare latents and timesteps
-        # 4. diffusion process
-        # 5. decode latents
-        # 6. post-process outputs
+
         self.check_inputs(
             prompt,
             height,
@@ -748,11 +742,14 @@ class QwenImagePipeline(
             ]
         ] * batch_size
 
-        timesteps, num_inference_steps = self.prepare_timesteps(num_inference_steps, sigmas, latents.shape[1])
-        # num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        timesteps, num_inference_steps = self.prepare_timesteps(
+            num_inference_steps,
+            sigmas,
+            latents.shape[1],
+            scheduler=scheduler_override,
+        )
         self._num_timesteps = len(timesteps)
 
-        # handle guidance
         if self.transformer.guidance_embeds:
             guidance = torch.full([1], guidance_scale, dtype=torch.float32)
             guidance = guidance.expand(latents.shape[0])
@@ -766,9 +763,8 @@ class QwenImagePipeline(
         negative_txt_seq_lens = (
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
-        # print inputp params
 
-        latents = self.diffuse(
+        return (
             prompt_embeds,
             prompt_embeds_mask,
             negative_prompt_embeds,
@@ -781,26 +777,280 @@ class QwenImagePipeline(
             do_true_cfg,
             guidance,
             true_cfg_scale,
+            height,
+            width,
         )
 
-        self._current_timestep = None
-        if output_type == "latent":
-            image = latents
-        else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-            # processed_image = self.image_processor.postprocess(image, output_type=output_type)
+    def denoise_step(
+        self,
+        prompt_embeds,
+        prompt_embeds_mask,
+        negative_prompt_embeds,
+        negative_prompt_embeds_mask,
+        latents,
+        img_shapes,
+        txt_seq_lens,
+        negative_txt_seq_lens,
+        timestep,
+        do_true_cfg,
+        guidance,
+        true_cfg_scale,
+    ) -> torch.Tensor | None:
+        """Single denoise step.
 
+        Supports batched requests where each sample can use a different
+        timestep. Pass `timestep` as a 1D tensor of shape [B].
+        """
+        if self.interrupt:
+            return None
+
+        def _normalize_timestep(t: torch.Tensor | float | int | list | tuple) -> torch.Tensor:
+            if not torch.is_tensor(t):
+                t = torch.tensor(t, device=latents.device, dtype=latents.dtype)
+            if t.ndim == 0:
+                return t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+            if t.ndim == 1:
+                if t.shape[0] == 1:
+                    return t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+                if t.shape[0] != latents.shape[0]:
+                    raise ValueError("timestep batch size must match latents batch size.")
+                return t.to(device=latents.device, dtype=latents.dtype)
+            raise ValueError("timestep must be a scalar or 1D tensor.")
+
+        self._current_timestep = timestep
+        t_for_model = _normalize_timestep(timestep)
+
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        self.transformer.do_true_cfg = do_true_cfg
+
+        if cfg_parallel_ready:
+            cfg_group = get_cfg_group()
+            cfg_rank = get_classifier_free_guidance_rank()
+            if cfg_rank == 0:
+                local_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=t_for_model / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    encoder_hidden_states=prompt_embeds,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=txt_seq_lens,
+                    attention_kwargs=self.attention_kwargs,
+                    return_dict=False,
+                )[0]
+            else:
+                local_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=t_for_model / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=negative_txt_seq_lens,
+                    attention_kwargs=self.attention_kwargs,
+                    return_dict=False,
+                )[0]
+
+            gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
+            if cfg_rank == 0:
+                noise_pred = gathered[0]
+                neg_noise_pred = gathered[1]
+                comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+                noise_pred = comb_pred * (cond_norm / noise_norm)
+                return noise_pred
+            return None
+
+        noise_pred = self.transformer(
+            hidden_states=latents,
+            timestep=t_for_model / 1000,
+            guidance=guidance,
+            encoder_hidden_states_mask=prompt_embeds_mask,
+            encoder_hidden_states=prompt_embeds,
+            img_shapes=img_shapes,
+            txt_seq_lens=txt_seq_lens,
+            attention_kwargs=self.attention_kwargs,
+            return_dict=False,
+        )[0]
+        if do_true_cfg:
+            neg_noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=t_for_model / 1000,
+                guidance=guidance,
+                encoder_hidden_states_mask=negative_prompt_embeds_mask,
+                encoder_hidden_states=negative_prompt_embeds,
+                img_shapes=img_shapes,
+                txt_seq_lens=negative_txt_seq_lens,
+                attention_kwargs=self.attention_kwargs,
+                return_dict=False,
+            )[0]
+            comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+            noise_pred = comb_pred * (cond_norm / noise_norm)
+        return noise_pred
+
+    def scheduler_step(
+        self,
+        latents,
+        noise_pred,
+        timestep,
+        do_true_cfg,
+        step_index: int,
+        req_id: str | None = None,
+        is_complete: bool = False,
+        scheduler_override: Any | None = None,
+    ) -> tuple[torch.Tensor, StepOutput]:
+        """Single scheduler step (per-request only)."""
+        if self.interrupt:
+            return latents, StepOutput(
+                req_id=req_id or "",
+                step_index=step_index,
+                timestep=timestep,
+                latents=latents,
+                noise_pred=None,
+                is_complete=is_complete,
+            )
+        if torch.is_tensor(timestep) and timestep.ndim != 0:
+            raise ValueError("scheduler_step only supports a single (scalar) timestep.")
+        if torch.is_tensor(latents) and latents.ndim > 0 and latents.shape[0] != 1:
+            raise ValueError("scheduler_step only supports a single request (batch size = 1).")
+
+        scheduler = self.scheduler if scheduler_override is None else scheduler_override
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        if cfg_parallel_ready:
+            cfg_group = get_cfg_group()
+            cfg_rank = get_classifier_free_guidance_rank()
+            if cfg_rank == 0:
+                if noise_pred is None:
+                    raise ValueError("noise_pred is required on cfg rank 0.")
+                latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+            cfg_group.broadcast(latents, src=0)
+        else:
+            if noise_pred is None:
+                raise ValueError("noise_pred is required for scheduler_step.")
+            latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+
+        return latents, StepOutput(
+            req_id=req_id or "",
+            step_index=step_index,
+            timestep=timestep,
+            latents=latents,
+            noise_pred=noise_pred,
+            is_complete=is_complete,
+        )
+
+    def post_decode(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: str | None = "pil",
+    ) -> torch.Tensor:
+        if output_type == "latent":
+            return latents
+
+        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        return image
+
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        true_cfg_scale: float = 4.0,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 50,
+        sigmas: list[float] | None = None,
+        guidance_scale: float = 1.0,
+        num_images_per_prompt: int = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        prompt_embeds_mask: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds_mask: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        attention_kwargs: dict[str, Any] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+        max_sequence_length: int = 512,
+    ) -> DiffusionOutput:
+        (
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
+            latents,
+            img_shapes,
+            txt_seq_lens,
+            negative_txt_seq_lens,
+            timesteps,
+            do_true_cfg,
+            guidance,
+            true_cfg_scale,
+            height,
+            width,
+        ) = self.prepare_encode(
+            req=req,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            true_cfg_scale=true_cfg_scale,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            attention_kwargs=attention_kwargs,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length,
+        )
+
+        self.scheduler.set_begin_index(0)
+        for i, t in enumerate(timesteps):
+            noise_pred = self.denoise_step(
+                prompt_embeds,
+                prompt_embeds_mask,
+                negative_prompt_embeds,
+                negative_prompt_embeds_mask,
+                latents,
+                img_shapes,
+                txt_seq_lens,
+                negative_txt_seq_lens,
+                t,
+                do_true_cfg,
+                guidance,
+                true_cfg_scale,
+            )
+            latents, _ = self.scheduler_step(
+                latents,
+                noise_pred,
+                t,
+                do_true_cfg,
+                step_index=i,
+            )
+
+        self._current_timestep = None
+        image = self.post_decode(latents, height, width, output_type=output_type)
         return DiffusionOutput(output=image)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

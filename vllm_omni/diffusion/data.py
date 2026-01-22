@@ -474,6 +474,12 @@ class DiffusionOutput:
     # timings: Optional["RequestTimings"] = None
 
 
+@dataclass
+class DiffusionSchedulerOutput:
+    scheduled_req_ids: list[str]
+
+
+
 class AttentionBackendEnum(enum.Enum):
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
