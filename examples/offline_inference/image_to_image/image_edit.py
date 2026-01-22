@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--negative_prompt",
         type=str,
-        default=" ",
+        default=None,
         required=False,
     )
     parser.add_argument(

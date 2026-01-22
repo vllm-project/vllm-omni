@@ -1324,9 +1324,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_token_ids = None
         kv_transfer_params = None
 
+        # Build requested modalities set for filtering
+        requested_modalities = (
+            set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
+        )
+
         for omni_outputs in final_outputs:
             choices_data = []
             if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
+                continue
+
+            # Filter outputs based on requested modalites
+            if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
+                logger.warning(f"final output type: {omni_outputs.final_output_type} is not needed by the request")
                 continue
 
             if omni_outputs.final_output_type == "text":

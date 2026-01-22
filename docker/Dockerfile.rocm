@@ -1,9 +1,7 @@
-ARG BASE_IMAGE=rocm/vllm-dev:nightly_main_20251205
-FROM ${BASE_IMAGE}
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.14.0
+FROM ${BASE_IMAGE} AS final
 
 ARG COMMON_WORKDIR=/app
-ARG VLLM_VERSION=v0.14.0
-ARG PYTORCH_ROCM_ARCH="gfx942;gfx950"
 
 WORKDIR ${COMMON_WORKDIR}
 
@@ -13,30 +11,18 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Step 2: Reinstall vllm from source
-RUN python3 -m pip uninstall -y vllm && rm -rf vllm &&\
-    git clone https://github.com/vllm-project/vllm.git && \
-    cd vllm && \
-    git checkout ${VLLM_VERSION} && \
-    python3 -m pip install -r requirements/rocm.txt && \
-    python3 setup.py clean --all && \
-    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} python3 setup.py develop && \
-    cd ../ && \
-    rm -rf vllm/.git
-
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
-# Step 3: Copy vllm-omni code and install without uv
+# Step 2: Copy vllm-omni code and install without uv
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && python3 -m pip install --no-cache-dir ".[dev]"
+RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]"
 
-# Create python symlink
-# `GPU_ARCHS` is an environment variable that is used to set the GPU archs for the AITER.
-# This is needed to prevent the AITER automatic GPU arch detection from failing on MI325X.
-# The AITER version used in this dockerfile has issues with handling
-# the GPU archs of MI325X (CI machine) correctly. So we manually set the GPU archs here.
-# We reuse AITER_ROCM_ARCH from the base image to avoid duplication.
-ENV GPU_ARCHS=${AITER_ROCM_ARCH}
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
+CMD ["/bin/bash"]
+
 ENTRYPOINT []
+
+#Set entrypoint for vllm-openai official images
+FROM final AS vllm-openai
+ENTRYPOINT ["vllm", "serve"]
