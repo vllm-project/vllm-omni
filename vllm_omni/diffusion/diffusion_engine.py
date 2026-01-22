@@ -29,6 +29,13 @@ def supports_image_input(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_image_input", False))
 
 
+def supports_audio_output(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_audio_output", False))
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -95,11 +102,6 @@ class DiffusionEngine:
             if not isinstance(outputs, list):
                 outputs = [outputs] if outputs is not None else []
 
-            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
-            is_audio_output = (
-                bool(getattr(model_cls, "support_audio_output", False)) if model_cls is not None else False
-            )
-
             # Handle single request or multiple requests
             if len(requests) == 1:
                 # Single request: return single OmniRequestOutput
@@ -113,7 +115,7 @@ class DiffusionEngine:
                 if output.trajectory_timesteps is not None:
                     metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
-                if is_audio_output:
+                if supports_audio_output(self.od_config.model_class_name):
                     audio_payload = outputs[0] if len(outputs) == 1 else outputs
                     return OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -155,7 +157,7 @@ class DiffusionEngine:
                     if output.trajectory_timesteps is not None:
                         metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
-                    if is_audio_output:
+                    if supports_audio_output(self.od_config.model_class_name):
                         audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                         results.append(
                             OmniRequestOutput.from_diffusion(

@@ -70,8 +70,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         prefix: Weight prefix for loading (default: "")
     """
 
-    support_audio_output: bool = True
-
     def __init__(
         self,
         *,
