@@ -8,7 +8,7 @@ stage_args:
 - stage_id: 0
   runtime:
     devices: "0,1"
-    max_batch_size: 1
+    max_batch_size: 5
   engine_args:
     model_stage: thinker
     model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -39,7 +39,7 @@ stage_args:
 - stage_id: 1
   runtime:
     devices: "1"
-    max_batch_size: 1
+    max_batch_size: 5
   engine_args:
     model_stage: talker
     model_arch: Qwen3OmniMoeForConditionalGeneration

@@ -528,7 +528,6 @@ def convert_audio_to_text(audio_data):
         temperature=0.0,
         word_timestamps=True,
         condition_on_previous_text=False,
-        initial_prompt="Please transcribe with proper word spacing.",
     )["text"]
     if text:
         return text
