@@ -29,6 +29,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 models = ["riverclouds/qwen_image_random"]
 
 
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 @pytest.mark.parametrize("model_name", models)
 def test_teacache(model_name: str):
     """Test TeaCache backend with diffusion model."""

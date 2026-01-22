@@ -32,6 +32,7 @@ elif is_rocm():
     models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str):
     m = Omni(model=model_name)
