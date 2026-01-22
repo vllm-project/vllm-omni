@@ -357,6 +357,9 @@ class OmniDiffusionConfig:
     # Logging
     log_level: str = "info"
 
+    # Omni configuration (injected from stage config)
+    omni_kv_config: dict[str, Any] = field(default_factory=dict)
+
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
@@ -453,7 +456,12 @@ class OmniDiffusionConfig:
         if "cache_backend" not in kwargs:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-        return cls(**kwargs)
+
+        # Filter kwargs to only include valid fields
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+
+        return cls(**filtered_kwargs)
 
 
 @dataclass

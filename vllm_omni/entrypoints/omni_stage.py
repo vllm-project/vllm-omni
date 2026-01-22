@@ -294,6 +294,7 @@ class OmniStage:
             "shm_threshold_bytes": self._shm_threshold_bytes,
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
+            "engine_input_source": self.engine_input_source,
         }
         try:
             old_env = os.environ.get("VLLM_LOGGING_PREFIX")
@@ -389,6 +390,36 @@ class OmniStage:
                 sampling_params, etc.)
         """
         assert self._in_q is not None
+
+        # [Omni] Inject global request_id into additional_information for cross-stage ID consistency
+        # This allows workers (like GPUARModelRunner) to use the global ID for side-channel
+        # operations like KV transfer, even if they use internal IDs for execution.
+        if "request_id" in payload and "engine_inputs" in payload:
+            req_id = payload["request_id"]
+            ein = payload["engine_inputs"]
+
+            # Helper to inject into additional_information
+            def _inject_global_id(target_ein):
+                # OmniTokensPrompt is a TypedDict at runtime, so we treat it as a dict
+                if isinstance(target_ein, dict):
+                    if "additional_information" not in target_ein:
+                        target_ein["additional_information"] = {}
+
+                    # Ensure additional_information is a dict before assignment
+                    # (in case it was somehow initialized as None or other type)
+                    if target_ein["additional_information"] is None:
+                        target_ein["additional_information"] = {}
+
+                    if isinstance(target_ein["additional_information"], dict):
+                        # Wrap in list because OmniInputProcessor requires Tensor or list values
+                        target_ein["additional_information"]["global_request_id"] = [str(req_id)]
+
+            if isinstance(ein, list):
+                for item in ein:
+                    _inject_global_id(item)
+            else:
+                _inject_global_id(ein)
+
         self._in_q.put(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
@@ -466,8 +497,22 @@ def _stage_worker(
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     # Use local aliases to avoid conflicts with global imports in worker process
     logger.info(f"Starting stage worker with model: {model}")
+    import multiprocessing as _mp
     import os as _os
     import time as _time
+
+    # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
+    # GPUARModelRunner) are spawned with a fork-safe method.
+    # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
+    if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
+        _os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        logger.info("[Stage] Set VLLM_WORKER_MULTIPROC_METHOD=spawn")
+    # Best-effort: also force python mp start method in this stage process.
+    # This may raise if already set; that's fine.
+    try:
+        _mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
@@ -636,8 +681,14 @@ def _stage_worker(
     )
     try:
         if stage_type == "diffusion":
-            engine_args.pop("model_stage")
-            stage_engine = OmniDiffusion(**engine_args)
+            engine_args.pop("model_stage", None)
+            engine_args.pop("model", None)
+            stage_engine = OmniDiffusion(
+                model=model,
+                stage_id=stage_id,
+                engine_input_source=stage_payload.get("engine_input_source", []),
+                **engine_args,
+            )
         else:
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
@@ -831,6 +882,10 @@ def _stage_worker(
                         prompts.append(str(ein))
                 # Prepare diffusion kwargs from sampling parameters
                 diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
+
+                # Pass batch_request_ids to ensure correct ID mapping
+                diffusion_kwargs["request_ids"] = batch_request_ids
+
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(prompts, **diffusion_kwargs)
                 # Convert to list format compatible with LLM outputs
@@ -975,8 +1030,19 @@ async def _stage_worker_async(
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC."""
     # Use local aliases to avoid conflicts with global imports in worker process
+    import multiprocessing as _mp
     import os as _os
     import time as _time
+
+    # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
+    # GPUARModelRunner) are spawned with a fork-safe method.
+    if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
+        _os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        logger.info("[Stage-async] Set VLLM_WORKER_MULTIPROC_METHOD=spawn")
+    try:
+        _mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
     stage_id = stage_payload["stage_id"]
     engine_args = stage_payload.get("engine_args", {})
@@ -1144,6 +1210,13 @@ async def _stage_worker_async(
         if stage_type == "diffusion":
             # For diffusion, we need to extract diffusion-specific config
             od_config = _build_od_config(engine_args, model)
+
+            # Inject omni config for worker to access stage info
+            if "omni_kv_config" not in od_config:
+                od_config["omni_kv_config"] = {}
+            od_config["omni_kv_config"]["stage_id"] = stage_id
+            od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get("engine_input_source", [])
+
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
             stage_engine = AsyncOmniDiffusion(
                 model=model,

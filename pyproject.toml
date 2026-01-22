@@ -39,7 +39,9 @@ dependencies = [
     "cache-dit==1.2.0",
     "tqdm>=4.66.0",
     "torchsde>=0.2.6",  # Required for Stable Audio scheduler
+    "fa3-fwd", # flash attention 3, maintained by @ZJY0516
     "openai-whisper>=20250625",
+    "imageio[ffmpeg]>=2.37.2",
     # "vllm==0.14.0",  # TODO: fix the entrypoints overwrite problem
 ]
 

@@ -48,7 +48,13 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "Qwen3TTSForConditionalGeneration": (
+        "qwen3_tts",
+        "qwen3_tts",
+        "Qwen3TTSModelForGeneration",
+    ),
 }
+
 
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,

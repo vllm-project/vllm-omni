@@ -10,7 +10,7 @@ python text_to_video.py \
   --negative_prompt "<optional quality filter>" \
   --height 480 \
   --width 640 \
-  --num_frames 32 \
+  --num_frames 33 \
   --guidance_scale 4.0 \
   --guidance_scale_high 3.0 \
   --num_inference_steps 40 \
