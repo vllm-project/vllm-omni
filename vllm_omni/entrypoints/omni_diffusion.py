@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import uuid
 from dataclasses import fields
 
 from vllm.logger import init_logger
@@ -44,12 +45,27 @@ class OmniDiffusion:
     """
 
     def __init__(self, od_config: OmniDiffusionConfig | None = None, **kwargs):
+        # Capture stage info from kwargs before they might be filtered out
+        stage_id = kwargs.get("stage_id")
+        engine_input_source = kwargs.get("engine_input_source")
+
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
         elif isinstance(od_config, dict):
+            # If config is dict, check it too (priority to kwargs if both exist)
+            if stage_id is None:
+                stage_id = od_config.get("stage_id")
+            if engine_input_source is None:
+                engine_input_source = od_config.get("engine_input_source")
             od_config = OmniDiffusionConfig.from_kwargs(**od_config)
 
         self.od_config = od_config
+
+        # Inject stage info into omni_kv_config if present
+        if stage_id is not None:
+            self.od_config.omni_kv_config.setdefault("stage_id", stage_id)
+        if engine_input_source is not None:
+            self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
         # Diffusers-style models expose `model_index.json` with `_class_name`.
         # Bagel models (and other non-diffusers) typically expose `config.json`.
@@ -99,12 +115,15 @@ class OmniDiffusion:
 
         # Check if request_id is provided in kwargs
         request_id = kwargs.get("request_id")
+        request_ids = kwargs.pop("request_ids", None)
 
         for i, p in enumerate(prompts):
             req_kwargs = kwargs.copy()
-            if request_id is None:
+            if request_ids and isinstance(request_ids, list) and i < len(request_ids):
+                req_kwargs["request_id"] = request_ids[i]
+            elif request_id is None:
                 # Generate default ID consistent with OmniLLM: "{i}_{uuid}"
-                req_kwargs["request_id"] = f"{i}"
+                req_kwargs["request_id"] = f"{i}_{uuid.uuid4()}"
 
             requests.append(
                 prepare_requests(

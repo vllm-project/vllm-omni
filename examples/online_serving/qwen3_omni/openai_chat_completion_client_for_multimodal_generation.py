@@ -305,6 +305,26 @@ def get_multi_audios_query(custom_prompt: str | None = None):
     }
 
 
+def get_use_audio_in_video_query(
+    video_path: str | None = None,
+    audio_path: str | None = None,
+    custom_prompt: str | None = None,
+):
+    question = custom_prompt or (
+        "Describe the content of the video in details, then convert what the baby say into text."
+    )
+    video_url = get_video_url_from_path(video_path)
+    audio_url = get_audio_url_from_path(audio_path)
+    return {
+        "role": "user",
+        "content": [
+            {"type": "video_url", "video_url": {"url": video_url}},
+            {"type": "audio_url", "audio_url": {"url": audio_url}},
+            {"type": "text", "text": question},
+        ],
+    }
+
+
 query_map = {
     "text": get_text_query,
     "use_audio": get_audio_query,
@@ -312,6 +332,7 @@ query_map = {
     "use_video": get_video_query,
     "use_mixed_modalities": get_mixed_modalities_query,
     "use_multi_audios": get_multi_audios_query,
+    "use_audio_in_video": get_use_audio_in_video_query,
 }
 
 
@@ -372,6 +393,12 @@ def run_multimodal_generation(args) -> None:
         prompt = query_func(audio_path=audio_path, custom_prompt=custom_prompt)
     elif args.query_type == "text":
         prompt = query_func(custom_prompt=custom_prompt)
+    elif args.query_type == "use_audio_in_video":
+        prompt = query_func(
+            video_path=video_path,
+            audio_path=audio_path,
+            custom_prompt=custom_prompt,
+        )
     else:
         prompt = query_func()
 

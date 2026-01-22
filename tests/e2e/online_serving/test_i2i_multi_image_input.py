@@ -17,7 +17,7 @@ import openai
 import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 

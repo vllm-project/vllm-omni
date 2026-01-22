@@ -47,7 +47,7 @@ class OmniConnectorFactory:
             return connector
         except Exception as e:
             logger.error(f"Failed to create connector {spec.name}: {e}")
-            raise
+            raise ValueError(f"Failed to create connector {spec.name}: {e}")
 
     @classmethod
     def list_registered_connectors(cls) -> list[str]:

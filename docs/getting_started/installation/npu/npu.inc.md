@@ -13,10 +13,10 @@ export DEVICE0=/dev/davinci0
 export DEVICE1=/dev/davinci1
 # Update the vllm-ascend image
 # Atlas A2:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.12.0rc1
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.14.0
 # Atlas A3:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.12.0rc1-a3
-export IMAGE=quay.io/ascend/vllm-ascend:v0.12.0rc1
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.14.0-a3
+export IMAGE=quay.io/ascend/vllm-ascend:v0.14.0
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
@@ -42,7 +42,7 @@ source ~/.bashrc
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.12.0rc1 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.14.0 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e .
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

@@ -9,12 +9,46 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
+from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.utils import detect_device_type, is_rocm
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+
+def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
+    """Inject connector configuration into stage engine arguments."""
+    # Prepare omni_kv_config dict
+    omni_conf_dict = {}
+    try:
+        # Access engine_args safely (might be OmegaConf or dict)
+        existing_args = stage.engine_args
+        if hasattr(existing_args, "get"):
+            _oc = existing_args.get("omni_kv_config", None)
+            if _oc:
+                if hasattr(_oc, "items"):  # dict-like
+                    omni_conf_dict = dict(_oc)
+                else:  # object?
+                    omni_conf_dict = _to_dict(_oc)
+    except Exception:
+        omni_conf_dict = {}
+
+    # Inject connector info
+    omni_conf_dict["connector_config"] = omni_conn_cfg
+    omni_conf_dict["omni_from_stage"] = omni_from
+    omni_conf_dict["omni_to_stage"] = omni_to
+
+    # Write back to engine_args
+    try:
+        if hasattr(stage.engine_args, "__setitem__"):
+            stage.engine_args["omni_kv_config"] = omni_conf_dict
+        else:
+            setattr(stage.engine_args, "omni_kv_config", omni_conf_dict)
+    except Exception as e:
+        # Fallback for OmegaConf or similar if direct set fails?
+        logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
 def _try_get_class_name_from_diffusers_config(model: str) -> str | None:

@@ -141,12 +141,25 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
-def shm_write_bytes(payload: bytes) -> dict[str, Any]:
+def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
     """
-    shm = _shm.SharedMemory(create=True, size=len(payload))
+    try:
+        shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+    except FileExistsError:
+        if name:
+            # If name is specified and exists, unlink it and try again
+            try:
+                existing = _shm.SharedMemory(name=name)
+                existing.unlink()
+            except Exception:
+                pass
+            shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+        else:
+            raise
+
     mv = memoryview(shm.buf)
     mv[: len(payload)] = payload
     del mv

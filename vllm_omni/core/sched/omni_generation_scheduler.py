@@ -2,6 +2,7 @@ import time
 from collections import defaultdict
 
 from vllm.distributed.kv_events import KVEventBatch
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
@@ -90,7 +91,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             any_request = self.running[0]
             num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request.request_id)
 
-        # Assemble SchedulerOutput (align with v0.12.0)
+        # Assemble SchedulerOutput (align with v0.14.0)
         if self.use_v2_model_runner:
             # No resumed reqs in fast path; pass prefill_token_ids for new reqs.
             new_reqs_data = [
@@ -129,7 +130,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             preempted_req_ids=set(),
         )
 
-        # Record the request ids scheduled in this step (v0.12.0 behavior).
+        # Record the request ids scheduled in this step (v0.14.0 behavior).
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
@@ -145,6 +146,35 @@ class OmniGenerationScheduler(VLLMScheduler):
         # Update internal state (advance num_computed_tokens, free encoder inputs,
         # etc.)
         self._update_after_schedule(scheduler_output)
+
+        try:
+            # Rewrap base NewRequestData entries with OmniNewRequestData,
+            # enriching with request-level payloads
+            new_list = []
+            for nr in scheduler_output.scheduled_new_reqs:
+                req_id = getattr(nr, "req_id", None)
+                request = self.requests.get(req_id) if req_id else None
+                # Build omni entry preserving all base fields
+                omni_nr = OmniNewRequestData(
+                    req_id=nr.req_id,
+                    prompt_token_ids=nr.prompt_token_ids,
+                    mm_features=nr.mm_features,
+                    sampling_params=nr.sampling_params,
+                    pooling_params=nr.pooling_params,
+                    block_ids=nr.block_ids,
+                    num_computed_tokens=nr.num_computed_tokens,
+                    lora_request=nr.lora_request,
+                    # Enrich with omni payloads from the live request object
+                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    additional_information=(getattr(request, "additional_information", None) if request else None),
+                )
+                new_list.append(omni_nr)
+
+            scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
+        except Exception:
+            # If anything goes wrong, leave the original output unchanged
+            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+
         return scheduler_output
 
     """
@@ -176,7 +206,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
         kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
-        # Merge connector-side stats (align with v0.12.0)
+        # Merge connector-side stats (align with v0.14.0)
         if kv_connector_stats and self.connector:
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
@@ -294,7 +324,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
-        # Collect and publish KV cache events (align with v0.12.0)
+        # Collect and publish KV cache events (align with v0.14.0)
         events = self.kv_cache_manager.take_events()
         if self.connector is not None:
             connector_events = self.connector.take_events()

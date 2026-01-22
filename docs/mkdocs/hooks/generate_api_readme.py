@@ -34,10 +34,10 @@ CATEGORIES = {
         "name": "Core",
         "description": "Core scheduling and caching components.",
     },
-    "model_executor": {
-        "name": "Model Executor",
-        "description": "Model execution components.",
-    },
+    # "model_executor": {
+    #     "name": "Model Executor",
+    #     "description": "Model execution components.",
+    # },
     "config": {
         "name": "Configuration",
         "description": "Configuration classes.",
