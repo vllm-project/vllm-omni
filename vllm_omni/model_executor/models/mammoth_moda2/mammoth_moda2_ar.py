@@ -6,7 +6,6 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
-from vllm.v1.attention.backend import AttentionType
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -44,6 +43,7 @@ from vllm.transformers_utils.config import (
     patch_rope_parameters,
     set_default_rope_theta,
 )
+from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
