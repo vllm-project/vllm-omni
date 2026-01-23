@@ -23,15 +23,6 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
 ```
 
-If you want to specify which GPU Arch to build for to cutdown build time:
-
-```bash
-DOCKER_BUILDKIT=1 docker build \
-  -f docker/Dockerfile.rocm \
-  --build-arg PYTORCH_ROCM_ARCH="gfx942;gfx950" \
-  -t vllm-omni-rocm .
-```
-
 #### Launch the docker image
 
 ##### Launch with OpenAI API Server
