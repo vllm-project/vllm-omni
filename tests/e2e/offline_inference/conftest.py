@@ -10,6 +10,7 @@ import pytest
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.sampling_params import SamplingParams
 
+from tests.conftest import clean_gpu_memory
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -335,6 +336,7 @@ class OmniRunner:
         self.close()
         del self.omni
         cleanup_dist_env_and_memory()
+        clean_gpu_memory()
 
     def close(self):
         """Close and cleanup the Omni instance."""
