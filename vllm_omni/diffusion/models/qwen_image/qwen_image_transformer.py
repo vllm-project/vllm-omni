@@ -552,6 +552,10 @@ class QwenImageCrossAttention(nn.Module):
             and self.parallel_config.sequence_parallel_size > 1
             and not get_forward_context().split_text_embed_in_sp
         ):
+            txt_query = joint_query[:, :seq_len_txt, :, :]
+            img_query = joint_query[:, seq_len_txt:, :, :]
+            txt_key = joint_key[:, :seq_len_txt, :, :]
+            img_key = joint_key[:, seq_len_txt:, :, :]
             attn_metadata = AttentionMetadata(
                 joint_query=txt_query,
                 joint_key=txt_key,
