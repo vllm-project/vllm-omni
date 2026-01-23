@@ -23,15 +23,6 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
 ```
 
-If you want to specify which GPU Arch to build for to cutdown build time:
-
-```bash
-DOCKER_BUILDKIT=1 docker build \
-  -f docker/Dockerfile.rocm \
-  --build-arg PYTORCH_ROCM_ARCH="gfx942;gfx950" \
-  -t vllm-omni-rocm .
-```
-
 #### Launch the docker image
 
 ##### Launch with OpenAI API Server
@@ -89,7 +80,7 @@ docker run --rm \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
-  vllm/vllm-omni-rocm:v0.14.0 \
+  vllm/vllm-omni-rocm:v0.14.0rc1 \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
@@ -108,7 +99,7 @@ docker run --rm -it \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   --entrypoint bash \
-  vllm/vllm-omni-rocm:v0.14.0
+  vllm/vllm-omni-rocm:v0.14.0rc1
 ```
 
 # --8<-- [end:pre-built-images]

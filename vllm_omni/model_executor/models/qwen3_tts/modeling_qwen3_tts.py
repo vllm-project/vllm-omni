@@ -43,6 +43,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple, logging
 from transformers.utils.hub import cached_file
 
+from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
 from .configuration_qwen3_tts import (
     Qwen3TTSConfig,
     Qwen3TTSSpeakerEncoderConfig,
@@ -1844,6 +1846,15 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             weights_only=weights_only,
             **kwargs,
         )
+        if not local_files_only and not os.path.isdir(pretrained_model_name_or_path):
+            download_cache_dir = kwargs.get("cache_dir", cache_dir)
+            download_revision = kwargs.get("revision", revision)
+            download_weights_from_hf_specific(
+                pretrained_model_name_or_path,
+                cache_dir=download_cache_dir,
+                allow_patterns=["speech_tokenizer/*"],
+                revision=download_revision,
+            )
         speech_tokenizer_path = cached_file(
             pretrained_model_name_or_path,
             "speech_tokenizer/config.json",

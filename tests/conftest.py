@@ -52,6 +52,10 @@ def default_vllm_config():
 
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests():
+    clean_gpu_memory()
+
+
+def clean_gpu_memory():
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
         yield
         return
@@ -528,7 +532,6 @@ def convert_audio_to_text(audio_data):
         temperature=0.0,
         word_timestamps=True,
         condition_on_previous_text=False,
-        initial_prompt="Please transcribe with proper word spacing.",
     )["text"]
     if text:
         return text
@@ -709,31 +712,5 @@ class OmniServer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
-            try:
-                parent = psutil.Process(self.proc.pid)
-                children = parent.children(recursive=True)
-                for child in children:
-                    try:
-                        child.terminate()
-                    except psutil.NoSuchProcess:
-                        pass
-
-                gone, still_alive = psutil.wait_procs(children, timeout=10)
-
-                for child in still_alive:
-                    try:
-                        child.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-
-                try:
-                    parent.terminate()
-                    parent.wait(timeout=10)
-                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                    try:
-                        parent.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-
-            except psutil.NoSuchProcess:
-                pass
+            self._kill_process_tree(self.proc.pid)
+        clean_gpu_memory()
