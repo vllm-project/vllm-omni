@@ -8,8 +8,6 @@ from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
-from vllm.v1.engine.detokenizer import IncrementalDetokenizer
-from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import OutputProcessorOutput, RequestOutputCollector, RequestState
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -36,65 +34,6 @@ class OmniRequestState(RequestState):
         super().__init__(*args, **kwargs)
         self.mm_type: str | None = None
         self.mm_accumulated: Dict[str, Any] | None = None
-
-    @classmethod
-    def from_new_request(
-        cls,
-        tokenizer: TokenizerLike,
-        request: EngineCoreRequest,
-        prompt: str | None,
-        parent_req: ParentRequest | None,
-        request_index: int,
-        queue: Any | None,
-        log_stats: bool,
-        stream_interval: int,
-    ) -> "OmniRequestState":
-        if sampling_params := request.sampling_params:
-            if not sampling_params.detokenize:
-                tokenizer = None
-            output_kind = sampling_params.output_kind
-            logprobs_processor = LogprobsProcessor.from_new_request(
-                tokenizer=tokenizer,
-                request=request,
-            )
-            detokenizer = IncrementalDetokenizer.from_new_request(
-                tokenizer=tokenizer,
-                request=request,
-            )
-            max_tokens_param = sampling_params.max_tokens
-            top_p = sampling_params.top_p
-            n = sampling_params.n
-            temperature = sampling_params.temperature
-        else:
-            logprobs_processor = None
-            detokenizer = None
-            max_tokens_param = None
-            top_p = None
-            n = None
-            temperature = None
-            assert request.pooling_params is not None
-            output_kind = request.pooling_params.output_kind
-
-        return cls(
-            request_id=request.request_id,
-            parent_req=parent_req,
-            request_index=request_index,
-            lora_name=(request.lora_request.name if request.lora_request is not None else None),
-            output_kind=output_kind,
-            prompt=prompt,
-            prompt_token_ids=request.prompt_token_ids,
-            prompt_embeds=request.prompt_embeds,
-            logprobs_processor=logprobs_processor,
-            detokenizer=detokenizer,
-            max_tokens_param=max_tokens_param,
-            top_p=top_p,
-            n=n,
-            temperature=temperature,
-            arrival_time=request.arrival_time,
-            queue=queue,
-            log_stats=log_stats,
-            stream_interval=stream_interval,
-        )
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:

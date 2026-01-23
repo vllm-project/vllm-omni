@@ -12,13 +12,6 @@ logger = init_logger(__name__)
 
 
 class Scheduler:
-    _instance = None
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
     def initialize(self, od_config: OmniDiffusionConfig):
         existing_context = getattr(self, "context", None)
         if existing_context is not None and not existing_context.closed:
@@ -81,7 +74,3 @@ class Scheduler:
         self.context = None
         self.mq = None
         self.result_mq = None
-
-
-# Singleton instance for easy access
-scheduler = Scheduler()

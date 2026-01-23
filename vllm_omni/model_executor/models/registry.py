@@ -77,7 +77,13 @@ _OMNI_MODELS = {
         "mammoth_moda2",
         "MammothModa2ForConditionalGeneration",
     ),
+    "Qwen3TTSForConditionalGeneration": (
+        "qwen3_tts",
+        "qwen3_tts",
+        "Qwen3TTSModelForGeneration",
+    ),
 }
+
 
 _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,

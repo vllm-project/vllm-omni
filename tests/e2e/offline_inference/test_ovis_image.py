@@ -233,7 +233,8 @@ def test_real_transformer_init_and_forward():
         }
     )
 
-    od_config = OmniDiffusionConfig(model="dummy-ovis", tf_model_config=tf_config, dtype=torch.float32, num_gpus=1)
+    od_config = OmniDiffusionConfig(model="dummy-ovis", tf_model_config=tf_config, dtype=torch.bfloat16, num_gpus=1)
+    torch.set_default_dtype(torch.bfloat16)
 
     # Mock distributed state for QKVParallelLinear initialization
     # We patch get_tp_group because get_tensor_model_parallel_rank calls it and asserts _TP is not None

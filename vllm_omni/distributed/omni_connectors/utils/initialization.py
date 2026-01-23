@@ -318,3 +318,58 @@ def build_stage_connectors(
         raise
 
     return connectors
+
+
+def resolve_omni_kv_config_for_stage(
+    transfer_cfg: OmniTransferConfig | None, stage_id: int | str
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Resolve connector configuration for a specific stage (Sender/Receiver).
+
+    This determines the primary connector configuration to be injected into the
+    engine arguments, prioritizing outgoing edges (Sender role).
+    """
+    if not transfer_cfg or not getattr(transfer_cfg, "connectors", None):
+        return None, None, None
+
+    stage_id_str = str(stage_id)
+
+    # Find outgoing edges (Sender logic)
+    outgoing = [
+        (to_stage, spec)
+        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+        if from_stage == stage_id_str
+    ]
+
+    # Find incoming edges (Receiver logic)
+    incoming = [
+        (from_stage, spec)
+        for (from_stage, to_stage), spec in transfer_cfg.connectors.items()
+        if to_stage == stage_id_str
+    ]
+
+    omni_conn_cfg = None
+    omni_from = None
+    omni_to = None
+
+    # Prioritize outgoing (Sender) if exists, else check incoming (Receiver)
+    if outgoing:
+        if len(outgoing) > 1:
+            logger.debug(
+                "Stage-%s has %d outgoing edges; using the smallest to_stage",
+                stage_id,
+                len(outgoing),
+            )
+        outgoing.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
+        to_s, spec = outgoing[0]
+        omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+        omni_from = stage_id_str
+        omni_to = str(to_s)
+    elif incoming:
+        # For receiver, pick one incoming edge to configure the connector
+        incoming.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]))
+        from_s, spec = incoming[0]
+        omni_conn_cfg = {"type": spec.name, **(spec.extra or {})}
+        omni_from = str(from_s)
+        omni_to = stage_id_str
+
+    return omni_conn_cfg, omni_from, omni_to

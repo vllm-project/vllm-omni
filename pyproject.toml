@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni"
-version = "0.12.0rc1"
+version = "0.14.0rc1"
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -36,10 +36,13 @@ dependencies = [
     "accelerate==1.12.0",
     "gradio==5.50",
     "soundfile>=0.13.1",
-    "cache-dit==1.1.8",
+    "cache-dit==1.2.0",
     "tqdm>=4.66.0",
     "torchsde>=0.2.6",  # Required for Stable Audio scheduler
-    # "vllm==0.12.0",  # TODO: fix the entrypoints overwrite problem
+    "fa3-fwd", # flash attention 3, maintained by @ZJY0516
+    "openai-whisper>=20250625",
+    "imageio[ffmpeg]>=2.37.2",
+    # "vllm==0.14.0",  # TODO: fix the entrypoints overwrite problem
 ]
 
 [project.optional-dependencies]
@@ -51,7 +54,10 @@ dev = [
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
-    "psutil>=7.2.0"
+    "psutil>=7.2.0",
+    "soundfile>=0.13.1",
+    "imageio[ffmpeg]>=0.6.0",
+    "opencv-python>=4.12.0.88"
 ]
 
 docs = [
