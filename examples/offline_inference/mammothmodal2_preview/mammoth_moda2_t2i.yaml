@@ -30,6 +30,7 @@ stage_args:
       trust_remote_code: true
       engine_output_type: image
       enable_prefix_caching: false
+      async_scheduling: false
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit
     final_output: true
