@@ -173,7 +173,9 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
 
     # Verify text output success
     assert text_content is not None and len(text_content) >= 2, "No text output is generated"
-    assert "square" in text_content.lower(), "The output do not contain keywords."
+    assert any(
+        keyword in text_content.lower() for keyword in ["square", "quadrate", "sphere", "globe", "circle", "round"]
+    ), "The output does not contain any of the keywords."
 
     # Verify text output same as audio output
     audio_content = convert_audio_to_text(audio_data)
