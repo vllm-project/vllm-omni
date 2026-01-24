@@ -328,8 +328,6 @@ class AsyncOmni(OmniBase):
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
-            # Mark first input time for stage-0
-            metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
 
             if self.async_chunk:
                 stage_queues = {stage_id: asyncio.Queue() for stage_id in range(num_stages)}
@@ -350,6 +348,7 @@ class AsyncOmni(OmniBase):
                         "sampling_params": sp,
                     }
                     self.stage_list[i].submit(task)
+                    metrics.stage_first_ts[i] = metrics.stage_first_ts[0] or time.time()
 
                     logger.info(f"[{self._name}] Enqueued request {request_id} to stage-{str(i)}")
 
@@ -378,7 +377,8 @@ class AsyncOmni(OmniBase):
                 self.stage_list[0].submit(task)
 
                 _req_start_ts[request_id] = time.time()
-
+                # Mark first input time for stage-0
+                metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
                 logger.info(
                     f"[{self._name}] Entering scheduling loop: "
                     f"stages={num_stages}, final_stage={final_stage_id_for_e2e}"

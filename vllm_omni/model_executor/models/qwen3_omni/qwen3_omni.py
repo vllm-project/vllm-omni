@@ -936,7 +936,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                 assistant_hidden[:3],
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
-                assistant_hidden[3:4],  # First text
+                assistant_hidden[3:4]
+                if assistant_hidden.shape[0] > 3
+                else torch.zeros(
+                    (1, assistant_hidden.shape[1]),
+                    device=assistant_hidden.device,
+                    dtype=assistant_hidden.dtype,
+                ),  # First text
             ),
             dim=0,
         )

@@ -245,15 +245,3 @@ The gradio script supports the following arguments:
     ``````sh
     --8<-- "examples/online_serving/qwen3_omni/run_gradio_demo.sh"
     ``````
-??? abstract "server-async-debug.log"
-    ``````log
-    --8<-- "examples/online_serving/qwen3_omni/server-async-debug.log"
-    ``````
-??? abstract "server-main.log"
-    ``````log
-    --8<-- "examples/online_serving/qwen3_omni/server-main.log"
-    ``````
-??? abstract "server.log"
-    ``````log
-    --8<-- "examples/online_serving/qwen3_omni/server.log"
-    ``````

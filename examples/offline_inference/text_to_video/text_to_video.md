@@ -28,3 +28,4 @@ Key arguments:
 - `--boundary_ratio`: Boundary split ratio for low/high DiT.
 - `--fps`: frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: path to save the generated video.
+- `--enable-cpu-offload`: enable CPU offloading for diffusion models.
