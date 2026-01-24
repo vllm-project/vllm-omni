@@ -48,7 +48,7 @@ The following table shows which models are currently supported by each accelerat
 | **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ | ✅ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ❌ | ❌ | ❌ |
+| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ✅ | ✅ | ❌ |
 | **Bagel** | `ByteDance-Seed/BAGEL-7B-MoT` | ❌ | ✅ | ❌ | ❌ | ❌ |
 
 ### VideoGen

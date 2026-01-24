@@ -28,7 +28,7 @@ The following table shows which models are currently supported by parallelism me
 | **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ❌ |
 | **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ | ❌ |
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ✅ (TP=2 only) |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
+| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ✅ | ✅ | ❌ | ❌ |
 
 
 !!! note "TP Limitations for Diffusion Models"
