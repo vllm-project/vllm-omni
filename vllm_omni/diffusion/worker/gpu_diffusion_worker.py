@@ -279,7 +279,7 @@ class WorkerProc:
             return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            return {"status": "error", "error": str(e)}, should_reply
+            raise e
 
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""

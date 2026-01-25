@@ -62,6 +62,9 @@ class Scheduler:
                 raise RuntimeError("Result queue not initialized")
 
             output = self.result_mq.dequeue()
+            # {"status": "error", "error": str(e)}
+            if isinstance(output, dict) and output.get("status") == "error":
+                raise RuntimeError("worker error")
             return output
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")

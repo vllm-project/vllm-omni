@@ -61,130 +61,124 @@ class DiffusionEngine:
             raise e
 
     def step(self, requests: list[OmniDiffusionRequest]):
-        try:
-            # Apply pre-processing if available
-            if self.pre_process_func is not None:
-                preprocess_start_time = time.time()
-                requests = self.pre_process_func(requests)
-                preprocess_time = time.time() - preprocess_start_time
-                logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+        # Apply pre-processing if available
+        if self.pre_process_func is not None:
+            preprocess_start_time = time.time()
+            requests = self.pre_process_func(requests)
+            preprocess_time = time.time() - preprocess_start_time
+            logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
-            output = self.add_req_and_wait_for_response(requests)
-            if output.error:
-                raise Exception(f"{output.error}")
-            logger.info("Generation completed successfully.")
+        output = self.add_req_and_wait_for_response(requests)
+        if output.error:
+            raise Exception(f"{output.error}")
+        logger.info("Generation completed successfully.")
 
-            if output.output is None:
-                logger.warning("Output is None, returning empty OmniRequestOutput")
-                # Return empty output for the first request
-                if len(requests) > 0:
-                    request = requests[0]
-                    request_id = request.request_id or ""
-                    prompt = request.prompt
-                    if isinstance(prompt, list):
-                        prompt = prompt[0] if prompt else None
-                    return OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics={},
-                        latents=None,
-                    )
-                return None
-
-            postprocess_start_time = time.time()
-            outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
-            postprocess_time = time.time() - postprocess_start_time
-            logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
-
-            # Convert to OmniRequestOutput format
-            # Ensure outputs is a list
-            if not isinstance(outputs, list):
-                outputs = [outputs] if outputs is not None else []
-
-            # Handle single request or multiple requests
-            if len(requests) == 1:
-                # Single request: return single OmniRequestOutput
+        if output.output is None:
+            logger.warning("Output is None, returning empty OmniRequestOutput")
+            # Return empty output for the first request
+            if len(requests) > 0:
                 request = requests[0]
                 request_id = request.request_id or ""
                 prompt = request.prompt
                 if isinstance(prompt, list):
                     prompt = prompt[0] if prompt else None
+                return OmniRequestOutput.from_diffusion(
+                    request_id=request_id,
+                    images=[],
+                    prompt=prompt,
+                    metrics={},
+                    latents=None,
+                )
+            return None
+
+        postprocess_start_time = time.time()
+        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        postprocess_time = time.time() - postprocess_start_time
+        logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+        # Convert to OmniRequestOutput format
+        # Ensure outputs is a list
+        if not isinstance(outputs, list):
+            outputs = [outputs] if outputs is not None else []
+
+        # Handle single request or multiple requests
+        if len(requests) == 1:
+            # Single request: return single OmniRequestOutput
+            request = requests[0]
+            request_id = request.request_id or ""
+            prompt = request.prompt
+            if isinstance(prompt, list):
+                prompt = prompt[0] if prompt else None
+
+            metrics = {}
+            if output.trajectory_timesteps is not None:
+                metrics["trajectory_timesteps"] = output.trajectory_timesteps
+
+            if supports_audio_output(self.od_config.model_class_name):
+                audio_payload = outputs[0] if len(outputs) == 1 else outputs
+                return OmniRequestOutput.from_diffusion(
+                    request_id=request_id,
+                    images=[],
+                    prompt=prompt,
+                    metrics=metrics,
+                    latents=output.trajectory_latents,
+                    multimodal_output={"audio": audio_payload},
+                    final_output_type="audio",
+                )
+            else:
+                return OmniRequestOutput.from_diffusion(
+                    request_id=request_id,
+                    images=outputs,
+                    prompt=prompt,
+                    metrics=metrics,
+                    latents=output.trajectory_latents,
+                )
+        else:
+            # Multiple requests: return list of OmniRequestOutput
+            # Split images based on num_outputs_per_prompt for each request
+            results = []
+            output_idx = 0
+
+            for request in requests:
+                request_id = request.request_id or ""
+                prompt = request.prompt
+                if isinstance(prompt, list):
+                    prompt = prompt[0] if prompt else None
+
+                # Get images for this request
+                num_outputs = request.num_outputs_per_prompt
+                request_outputs = outputs[output_idx : output_idx + num_outputs] if output_idx < len(outputs) else []
+                output_idx += num_outputs
 
                 metrics = {}
                 if output.trajectory_timesteps is not None:
                     metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
                 if supports_audio_output(self.od_config.model_class_name):
-                    audio_payload = outputs[0] if len(outputs) == 1 else outputs
-                    return OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=[],
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                        multimodal_output={"audio": audio_payload},
-                        final_output_type="audio",
+                    audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                    results.append(
+                        OmniRequestOutput.from_diffusion(
+                            request_id=request_id,
+                            images=[],
+                            prompt=prompt,
+                            metrics=metrics,
+                            latents=output.trajectory_latents,
+                            multimodal_output={"audio": audio_payload},
+                            final_output_type="audio",
+                        )
                     )
                 else:
-                    return OmniRequestOutput.from_diffusion(
-                        request_id=request_id,
-                        images=outputs,
-                        prompt=prompt,
-                        metrics=metrics,
-                        latents=output.trajectory_latents,
-                    )
-            else:
-                # Multiple requests: return list of OmniRequestOutput
-                # Split images based on num_outputs_per_prompt for each request
-                results = []
-                output_idx = 0
-
-                for request in requests:
-                    request_id = request.request_id or ""
-                    prompt = request.prompt
-                    if isinstance(prompt, list):
-                        prompt = prompt[0] if prompt else None
-
-                    # Get images for this request
-                    num_outputs = request.num_outputs_per_prompt
-                    request_outputs = (
-                        outputs[output_idx : output_idx + num_outputs] if output_idx < len(outputs) else []
-                    )
-                    output_idx += num_outputs
-
-                    metrics = {}
-                    if output.trajectory_timesteps is not None:
-                        metrics["trajectory_timesteps"] = output.trajectory_timesteps
-
-                    if supports_audio_output(self.od_config.model_class_name):
-                        audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
-                        results.append(
-                            OmniRequestOutput.from_diffusion(
-                                request_id=request_id,
-                                images=[],
-                                prompt=prompt,
-                                metrics=metrics,
-                                latents=output.trajectory_latents,
-                                multimodal_output={"audio": audio_payload},
-                                final_output_type="audio",
-                            )
+                    results.append(
+                        OmniRequestOutput.from_diffusion(
+                            request_id=request_id,
+                            images=request_outputs,
+                            prompt=prompt,
+                            metrics=metrics,
+                            latents=output.trajectory_latents,
                         )
-                    else:
-                        results.append(
-                            OmniRequestOutput.from_diffusion(
-                                request_id=request_id,
-                                images=request_outputs,
-                                prompt=prompt,
-                                metrics=metrics,
-                                latents=output.trajectory_latents,
-                            )
-                        )
+                    )
 
-                return results
-        except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            return None
+            return results
 
     @staticmethod
     def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
