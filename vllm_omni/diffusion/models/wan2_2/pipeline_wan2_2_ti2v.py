@@ -200,11 +200,11 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
         prompt: str | None = None,
         negative_prompt: str | None = None,
         image: PIL.Image.Image | torch.Tensor | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int | None = None,
+        height: int = 704,
+        width: int = 1280,
+        num_inference_steps: int = 40,
         guidance_scale: float = 5.0,
-        frame_num: int | None = None,
+        frame_num: int = 81,
         output_type: str | None = "np",
         generator: torch.Generator | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -223,10 +223,14 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
             image = req.pil_image
 
         # Default dimensions for TI2V-5B (720P)
-        height = req.height or height or 704
-        width = req.width or width or 1280
-        num_frames = req.num_frames if req.num_frames else frame_num or 121
-        num_steps = req.num_inference_steps or num_inference_steps or 50
+        height = req.height or height
+        width = req.width or width
+        num_frames = req.num_frames if req.num_frames else frame_num
+        num_steps = req.num_inference_steps or num_inference_steps
+
+        # Respect per-request guidance_scale when explicitly provided.
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
 
         self._guidance_scale = guidance_scale
 

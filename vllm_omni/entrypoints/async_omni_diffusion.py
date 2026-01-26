@@ -138,6 +138,9 @@ class AsyncOmniDiffusion:
             if key in field_names:
                 init_kwargs[key] = value
 
+        if "guidance_scale" in kwargs:
+            init_kwargs["guidance_scale_provided"] = True
+
         return OmniDiffusionRequest(**init_kwargs)
 
     async def generate(

@@ -9,6 +9,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import concurrent.futures
+import threading
 import time
 from pathlib import Path
 
@@ -41,14 +42,14 @@ def get_chunk_config():
             "async_chunk": True,
             "stage_args": {
                 0: {
-                    "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
                 },
                 1: {
-                    "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
                 },
             },
         },
-        deletes={2: ["custom_process_input_func"]},
+        deletes={"stage_args": {2: ["custom_process_input_func"]}},
     )
     return path
 
@@ -65,20 +66,25 @@ else:
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
+_omni_server_lock = threading.Lock()
+
+
 @pytest.fixture(scope="module")
 def omni_server(request):
     """Start vLLM-Omni server as a subprocess with actual model weights.
     Uses session scope so the server starts only once for the entire test session.
     Multi-stage initialization can take 10-20+ minutes.
     """
-    model, stage_config_path = request.param
+    with _omni_server_lock:
+        model, stage_config_path = request.param
 
-    print(f"Starting OmniServer with model: {model}")
-    print("This may take 10-20+ minutes for initialization...")
+        print(f"Starting OmniServer with model: {model}")
 
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
-        print("OmniServer started successfully")
-        yield server
+        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+            print("OmniServer started successfully")
+            yield server
+            print("OmniServer stopping...")
+
         print("OmniServer stopped")
 
 
@@ -148,9 +154,10 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     Input Setting: stream=True
     Datasets: single request
     """
+    # TODO：This skip will be removed when the chunk scenario supports multimodal input.
     param = request.node.callspec.params.get("omni_server")
 
-    if param.get("stage_config") == CHUNK_CONFIG_PATH:
+    if param[1] == CHUNK_CONFIG_PATH:
         pytest.skip("The current chunk scenario does not support multimodal.")
 
     # Test single completion
@@ -253,16 +260,18 @@ def test_text_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
     for chat_completion in chat_completions:
         # Verify audio output success
-        audio_message = chat_completion.choices[1].message
-        audio_data = audio_message.audio.data
-        assert audio_data is not None, "No audio output is generated"
-        assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
+        audio_data = None
+        text_content = None
+        for choice in chat_completion.choices:
+            if choice.message.audio is not None:
+                audio_message = choice.message
+                audio_data = audio_message.audio.data
+                assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
 
-        # Verify text output success
-        text_choice = chat_completion.choices[0]
-        text_content = text_choice.message.content
-        assert text_choice.message.content is not None, "No text output is generated"
-        assert "beijing" in text_choice.message.content.lower(), "The output do not contain keywords."
+            if choice.message.content is not None:
+                # Verify text output success
+                text_content = choice.message.content
+                assert "beijing" in text_content.lower(), "The output do not contain keywords."
 
         # Verify text output same as audio output
         audio_content = convert_audio_to_text(audio_data)
