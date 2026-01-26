@@ -517,10 +517,10 @@ class QwenImageCrossAttention(nn.Module):
         add_q_size = self.add_query_num_heads * self.head_dim
         add_kv_size = self.add_kv_num_heads * self.head_dim
 
-        img_cos = vid_freqs.real.to(img_query.dtype)
-        img_sin = vid_freqs.imag.to(img_query.dtype)
-        txt_cos = txt_freqs.real.to(txt_query.dtype)
-        txt_sin = txt_freqs.imag.to(txt_query.dtype)
+        img_cos = vid_freqs.real.to(img_qkv.dtype)
+        img_sin = vid_freqs.imag.to(img_qkv.dtype)
+        txt_cos = txt_freqs.real.to(txt_qkv.dtype)
+        txt_sin = txt_freqs.imag.to(txt_qkv.dtype)
 
         if not self.use_fused_qk_rope:
             img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
