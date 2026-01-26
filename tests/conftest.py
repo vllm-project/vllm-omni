@@ -74,6 +74,7 @@ def _print_simple_gpu_status():
 
 
 def clean_gpu_memory():
+    print(f"VLLM_TEST_CLEAN_GPU_MEMORY is:  {os.getenv('VLLM_TEST_CLEAN_GPU_MEMORY', '0')}")
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
         yield
         return
