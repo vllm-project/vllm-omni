@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
@@ -53,3 +53,14 @@ class OmniNewRequestData(NewRequestData):
             prefill_token_ids=prefill_token_ids,
             additional_information=request.additional_information,
         )
+
+
+@dataclass
+class OmniCachedRequestData(CachedRequestData):
+    """Cached request data for omni models with embeddings support.
+
+    Args:
+        prompt_token_ids: Mapping from request ID to list of prompt token IDs
+    """
+
+    prompt_token_ids: dict[int, list[int]]
