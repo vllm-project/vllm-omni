@@ -284,11 +284,11 @@ class Wan22Pipeline(nn.Module):
         req: OmniDiffusionRequest,
         prompt: str | None = None,
         negative_prompt: str | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int | None = None,
+        height: int = 480,
+        width: int = 832,
+        num_inference_steps: int = 40,
         guidance_scale: float | tuple[float, float] = 4.0,
-        frame_num: int | None = None,
+        frame_num: int = 81,
         output_type: str | None = "np",
         generator: torch.Generator | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -301,9 +301,9 @@ class Wan22Pipeline(nn.Module):
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
-        height = req.height or height or 720
-        width = req.width or width or 1280
-        num_frames = req.num_frames if req.num_frames else frame_num or 81
+        height = req.height or height
+        width = req.width or width
+        num_frames = req.num_frames if req.num_frames else frame_num
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
@@ -311,7 +311,11 @@ class Wan22Pipeline(nn.Module):
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = req.num_inference_steps or num_inference_steps or 40
+        num_steps = req.num_inference_steps or num_inference_steps
+
+        # Respect per-request guidance_scale when explicitly provided.
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
