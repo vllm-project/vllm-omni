@@ -510,15 +510,20 @@ class QwenImageCrossAttention(nn.Module):
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
-        if not self.use_fused_qk_rope:
-            img_qkv, _ = self.to_qkv(hidden_states)
-            q_size = self.query_num_heads * self.head_dim
-            kv_size = self.kv_num_heads * self.head_dim
-            img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+        img_qkv, _ = self.to_qkv(hidden_states)
+        q_size = self.query_num_heads * self.head_dim
+        kv_size = self.kv_num_heads * self.head_dim
+        txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+        add_q_size = self.add_query_num_heads * self.head_dim
+        add_kv_size = self.add_kv_num_heads * self.head_dim
 
-            txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
-            add_q_size = self.add_query_num_heads * self.head_dim
-            add_kv_size = self.add_kv_num_heads * self.head_dim
+        img_cos = vid_freqs.real.to(img_query.dtype)
+        img_sin = vid_freqs.imag.to(img_query.dtype)
+        txt_cos = txt_freqs.real.to(txt_query.dtype)
+        txt_sin = txt_freqs.imag.to(txt_query.dtype)
+
+        if not self.use_fused_qk_rope:
+            img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
             txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
 
             img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
@@ -534,32 +539,15 @@ class QwenImageCrossAttention(nn.Module):
             txt_query = self.norm_added_q(txt_query)
             txt_key = self.norm_added_k(txt_key)
 
-            img_cos = vid_freqs.real.to(img_query.dtype)
-            img_sin = vid_freqs.imag.to(img_query.dtype)
-            txt_cos = txt_freqs.real.to(txt_query.dtype)
-            txt_sin = txt_freqs.imag.to(txt_query.dtype)
-
             img_query = self.rope(img_query, img_cos, img_sin)
             img_key = self.rope(img_key, img_cos, img_sin)
             txt_query = self.rope(txt_query, txt_cos, txt_sin)
             txt_key = self.rope(txt_key, txt_cos, txt_sin)
-
-            seq_len_txt = encoder_hidden_states.shape[1]
-            joint_query = torch.cat([txt_query, img_query], dim=1)
-            joint_key = torch.cat([txt_key, img_key], dim=1)
-            joint_value = torch.cat([txt_value, img_value], dim=1)
         else:
-            img_qkv, _ = self.to_qkv(hidden_states)
-            txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             img_qkv_shape_ori = img_qkv.shape
             txt_qkv_shape_ori = txt_qkv.shape
             img_qkv = img_qkv.view(-1, img_qkv_shape_ori[-1])
             txt_qkv = txt_qkv.view(-1, txt_qkv_shape_ori[-1])
-            
-            img_cos = vid_freqs.real.to(img_qkv.dtype)
-            img_sin = vid_freqs.imag.to(img_qkv.dtype)
-            txt_cos = txt_freqs.real.to(txt_qkv.dtype)
-            txt_sin = txt_freqs.imag.to(txt_qkv.dtype)
 
             img_cos_sin = torch.cat([img_cos, img_sin], dim=-1)
             img_position_ids = torch.arange(img_cos_sin.shape[0], device=img_cos_sin.device)
@@ -594,13 +582,8 @@ class QwenImageCrossAttention(nn.Module):
             )
             img_qkv = img_qkv.view(img_qkv_shape_ori)
             txt_qkv = txt_qkv.view(txt_qkv_shape_ori)
-            q_size = self.query_num_heads * self.head_dim
-            kv_size = self.kv_num_heads * self.head_dim
             img_query, img_key, img_value = img_qkv.split(
                 [q_size, kv_size, kv_size], dim=-1)
-
-            add_q_size = self.add_query_num_heads * self.head_dim
-            add_kv_size = self.add_kv_num_heads * self.head_dim
             txt_query, txt_key, txt_value = txt_qkv.split(
                 [add_q_size, add_kv_size, add_kv_size], dim=-1)
 
@@ -612,10 +595,10 @@ class QwenImageCrossAttention(nn.Module):
             txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
             txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-            seq_len_txt = encoder_hidden_states.shape[1]
-            joint_query = torch.cat([txt_query, img_query], dim=1)
-            joint_key = torch.cat([txt_key, img_key], dim=1)
-            joint_value = torch.cat([txt_value, img_value], dim=1)
+        seq_len_txt = encoder_hidden_states.shape[1]
+        joint_query = torch.cat([txt_query, img_query], dim=1)
+        joint_key = torch.cat([txt_key, img_key], dim=1)
+        joint_value = torch.cat([txt_value, img_value], dim=1)
 
         if (
             self.parallel_config is not None
