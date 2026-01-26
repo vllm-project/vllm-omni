@@ -5,4 +5,3 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --prompt_type text \
                   --init-sleep-seconds 0 \
                   --prompts "${prompt}"
-
