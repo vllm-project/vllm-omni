@@ -53,7 +53,46 @@ def default_vllm_config():
 
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests():
-    clean_gpu_memory()
+    print("\n=== PRE-TEST GPU CLEANUP ===")
+    _run_pre_test_cleanup()
+    yield
+    _run_post_test_cleanup()
+
+
+def _run_pre_test_cleanup():
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+        print("GPU cleanup disabled")
+        return
+
+    print("Pre-test GPU status:")
+    _print_simple_gpu_status()
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 0:
+        try:
+            from tests.utils import wait_for_gpu_memory_to_clear
+
+            wait_for_gpu_memory_to_clear(
+                devices=list(range(num_gpus)),
+                threshold_ratio=0.1,
+            )
+        except Exception as e:
+            print(f"Pre-test cleanup note: {e}")
+
+
+def _run_post_test_cleanup():
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+        return
+
+    import gc
+
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print("Post-test GPU status:")
+        _print_simple_gpu_status()
+        _print_gpu_processes()
 
 
 def _print_simple_gpu_status():
@@ -71,38 +110,6 @@ def _print_simple_gpu_status():
             print(f"  GPU {device_id}: Allocated: {allocated:.1f}MB, Reserved: {reserved:.1f}MB")
         except Exception:
             print(f"  GPU {device_id}: Error reading status")
-
-
-def clean_gpu_memory():
-    print(f"VLLM_TEST_CLEAN_GPU_MEMORY is:  {os.getenv('VLLM_TEST_CLEAN_GPU_MEMORY', '0')}")
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
-        yield
-        return
-
-    # Wait for GPU memory to be cleared before starting the test
-    import gc
-
-    from tests.utils import wait_for_gpu_memory_to_clear
-
-    _print_simple_gpu_status()
-    num_gpus = torch.cuda.device_count()
-    if num_gpus > 0:
-        try:
-            wait_for_gpu_memory_to_clear(
-                devices=list(range(num_gpus)),
-                threshold_ratio=0.1,
-            )
-        except ValueError as e:
-            logger.info("Failed to clean GPU memory: %s", e)
-
-    yield
-
-    # Clean up GPU memory after the test
-    if torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
-        _print_simple_gpu_status()
-        _print_gpu_processes()
 
 
 def _print_gpu_processes():
@@ -979,5 +986,5 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        clean_gpu_memory()
+        _run_post_test_cleanup()
         cleanup_dist_env_and_memory()
