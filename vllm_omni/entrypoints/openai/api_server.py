@@ -403,7 +403,6 @@ async def omni_init_app_state(
                     if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
                         engine_client.input_processor = OmniInputProcessor(
                             vllm_config=vllm_config,
-                            tokenizer=tokenizer,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
 

@@ -162,7 +162,7 @@ class OmniLLM(LLM):
             engine_core_output_type=engine_args.engine_output_type,
         )
         self.llm_engine.input_processor = OmniInputProcessor(
-            vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
+            vllm_config=self.llm_engine.vllm_config,
         )
         self.engine_class = type(self.llm_engine)
 

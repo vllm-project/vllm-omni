@@ -131,79 +131,20 @@ class OmniRequestState(RequestState):
         except Exception:
             logger.exception("Error consolidating multimodal tensors")
 
-    # Override: do not route to pooling-only path; always create completion
-    # outputs, and attach pooling_result into the CompletionOutput.
-    def make_request_output(
-        self,
-        new_token_ids: list[int],
-        pooling_output: torch.Tensor | None,
-        finish_reason: FinishReason | None,
-        stop_reason: int | str | None,
-        kv_transfer_params: dict[str, Any] | None = None,
-    ) -> OmniRequestOutput | PoolingRequestOutput | None:
-        """Create a request output from generation results.
-
-        Creates a RequestOutput or PoolingRequestOutput from the generated
-        tokens and accumulated multimodal outputs. Attaches multimodal
-        tensors to the completion output if available.
-
-        Args:
-            new_token_ids: List of newly generated token IDs
-            pooling_output: Optional pooling output tensor
-            finish_reason: Optional finish reason indicating why generation stopped
-            stop_reason: Optional stop reason (token ID or stop string)
-            kv_transfer_params: Optional KV cache transfer parameters
-
-        Returns:
-            OmniRequestOutput or PoolingRequestOutput if output should be
-            emitted (based on finish status and output kind), None otherwise
-        """
-        finished = finish_reason is not None
-        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
-
-        if not finished and final_only:
-            return None
-
-        if self.stream_interval > 1:
-            assert self.detokenizer is not None
-
-            # Send output request only when
-            # 1. It has finished, or
-            # 2. It is the first token, or
-            # 3. It has reached the stream interval number of tokens
-            if not (
-                finished
-                or self.sent_tokens_offset == 0
-                or len(self.detokenizer.output_token_ids) - self.sent_tokens_offset >= self.stream_interval
-            ):
-                return None
-
-            if self.output_kind == RequestOutputKind.DELTA:
-                # Send tokens from the offset in DELTA mode, otherwise all
-                # tokens are sent.
-                new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
-                self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
-
-        request_id = self.request_id
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
-
-        if self.parent_req is None:
-            outputs = [output]
-        else:
-            request_id, outputs, finished = self.parent_req.get_outputs(request_id, output)
-            if not outputs:
-                return None
-
-        return self._new_request_output(request_id, outputs, finished, kv_transfer_params)
+    # Note: make_request_output is inherited from base RequestState.
+    # The multimodal output attachment is done in _new_completion_output below.
 
     def _new_completion_output(
         self,
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
+        routed_experts: Any = None,
     ) -> Any:
-        # Reuse base text/logprobs logic, then annotate with pooling_result.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
+        # Reuse base text/logprobs logic, then annotate with multimodal output.
+        base_output = super()._new_completion_output(
+            token_ids, finish_reason, stop_reason, routed_experts
+        )
         try:
             if self.mm_accumulated is not None:
                 # Attach accumulated multimodal dict on the completion output
@@ -286,13 +227,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             parent_req: Optional parent request for parallel sampling
             request_index: Index of the request in the batch
             queue: Optional queue for collecting outputs
-
-        Raises:
-            ValueError: If the request ID is already registered
         """
         request_id = request.request_id
-        if request_id in self.request_states:
-            raise ValueError(f"Request id {request_id} already running.")
+        req_state = self.request_states.get(request_id)
+        if req_state is not None:
+            # Streaming input session update - use base class method
+            self._update_streaming_request_state(req_state, request, prompt)
+            return
 
         req_state = OmniRequestState.from_new_request(
             tokenizer=self.tokenizer,
@@ -304,9 +245,22 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
+        if self._requests_drained.is_set():
+            self._requests_drained.clear()
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
+        # Track the external_req_id -> [internal_req_id, ...] mapping
+        self.external_req_ids[req_state.external_req_id].append(request_id)
+
+    def _finish_request(self, req_state: RequestState) -> None:
+        """Clean up a finished request with omni-specific cleanup."""
+        # Cleanup per-request mm state before calling base
+        if isinstance(req_state, OmniRequestState):
+            req_state.mm_accumulated = None
+            req_state.mm_type = None
+        # Call base class implementation
+        super()._finish_request(req_state)
 
     def process_outputs(
         self,
@@ -395,6 +349,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 kv_transfer_params,
             )
             if ro:
+                # For streaming input, mark output as not finished while streaming
+                if isinstance(req_state, OmniRequestState) and req_state.streaming_input:
+                    ro.finished = False
+
                 # Attach accumulated multimodal payload if any
                 try:
                     if isinstance(req_state, OmniRequestState) and req_state.mm_accumulated is not None:
@@ -410,21 +368,24 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # 4) Free completed
             if finish_reason is not None:
-                self.request_states.pop(req_id)
-                parent_req = req_state.parent_req
-                if parent_req and not parent_req.child_requests:
-                    self.parent_requests.pop(parent_req.request_id, None)
-                if not self.request_states:
-                    self._requests_drained.set()
-                if not eco.finished:
-                    reqs_to_abort.append(req_id)
-                self._update_stats_from_finished(req_state, finish_reason, iteration_stats)
-                if self.tracer:
-                    self.do_tracing(eco, req_state, iteration_stats)
-                # Cleanup per-request mm state
-                if isinstance(req_state, OmniRequestState):
-                    req_state.mm_accumulated = None
-                    req_state.mm_type = None
+                # Handle streaming input state
+                if isinstance(req_state, OmniRequestState) and req_state.streaming_input:
+                    if req_state.input_chunk_queue:
+                        update = req_state.input_chunk_queue.popleft()
+                        req_state.apply_streaming_update(update)
+                    else:
+                        req_state.input_chunk_queue = None
+                else:
+                    self._finish_request(req_state)
+                    if not eco.finished:
+                        # If req not finished in EngineCore, but Detokenizer
+                        # detected stop string, abort needed in EngineCore.
+                        reqs_to_abort.append(req_id)
+
+                    # Track per-request stats
+                    self._update_stats_from_finished(req_state, finish_reason, iteration_stats)
+                    if self.tracer:
+                        self.do_tracing(eco, req_state, iteration_stats)
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,

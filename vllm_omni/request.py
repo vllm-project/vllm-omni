@@ -68,4 +68,5 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
+            resumable=request.resumable,
         )

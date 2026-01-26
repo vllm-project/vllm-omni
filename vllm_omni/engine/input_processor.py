@@ -75,16 +75,20 @@ class OmniInputProcessor(InputProcessor):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        tokenizer: TokenizerLike,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
-        super().__init__(vllm_config, tokenizer, mm_registry)
+        super().__init__(vllm_config, mm_registry)
         self.input_preprocessor = OmniInputPreprocessor(
             self.model_config,
-            self.tokenizer,
+            vllm_config.observability_config,
             mm_registry,
             mm_processor_cache=self.mm_processor_cache,
         )
+
+    @property
+    def tokenizer(self) -> TokenizerLike | None:
+        """Get tokenizer from input_preprocessor."""
+        return self.input_preprocessor.tokenizer
 
     def process_inputs(
         self,
@@ -97,6 +101,7 @@ class OmniInputProcessor(InputProcessor):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        resumable: bool = False,
     ) -> tuple[str | None, OmniEngineCoreRequest]:
         """Process input prompt into an engine core request.
 
@@ -281,4 +286,5 @@ class OmniInputProcessor(InputProcessor):
             trace_headers=trace_headers,
             prompt_embeds=prompt_embeds_payload,
             additional_information=additional_information_payload,
+            resumable=resumable,
         )
