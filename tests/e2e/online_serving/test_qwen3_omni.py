@@ -23,17 +23,43 @@ from tests.conftest import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
+    modify_stage_config,
 )
 from vllm_omni.utils import is_rocm
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
+
+def get_default_config():
+    return str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+
+
+def get_chunk_config():
+    path = modify_stage_config(
+        get_default_config(),
+        updates={
+            "async_chunk": True,
+            "stage_args": {
+                0: {
+                    "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                },
+                1: {
+                    "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                },
+            },
+        },
+        deletes={2: ["custom_process_input_func"]},
+    )
+    return path
+
+
+CHUNK_CONFIG_PATH = get_chunk_config()
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+    stage_configs = [get_default_config(), CHUNK_CONFIG_PATH]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
@@ -113,7 +139,7 @@ def get_max_batch_size(size_type="few"):
 
 @pytest.mark.skipif(is_rocm(), reason="Test skipped on AMD environment due to known output issues")
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
+def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -122,6 +148,10 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     Input Setting: stream=True
     Datasets: single request
     """
+    param = request.node.callspec.params.get("omni_server")
+
+    if param.get("stage_config") == CHUNK_CONFIG_PATH:
+        pytest.skip("The current chunk scenario does not support multimodal.")
 
     # Test single completion
     e2e_list = list()

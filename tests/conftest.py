@@ -541,73 +541,187 @@ def convert_audio_to_text(audio_data):
 
 def modify_stage_config(
     yaml_path: str,
-    stage_updates: dict[int, dict[str, Any]],
+    updates: dict[str, Any],
+    deletes: dict[str, Any] = None,
 ) -> str:
     """
-    Batch modify configurations for multiple stages in a YAML file.
+    Modify configurations in a YAML file, supporting both top-level and stage-specific modifications,
+    including addition, modification, and deletion of configurations.
 
     Args:
         yaml_path: Path to the YAML configuration file.
-        stage_updates: Dictionary where keys are stage IDs and values are dictionaries of
-                      modifications for that stage. Each modification dictionary uses
-                      dot-separated paths as keys and new configuration values as values.
-                      Example: {
-                          0: {'engine_args.max_model_len': 5800},
-                          1: {'runtime.max_batch_size': 2}
-                      }
+        updates: Dictionary containing both top-level and stage-specific modifications to add or update.
+                Format: {
+                    'async_chunk': True,
+                    'stage_args': {
+                        0: {'engine_args.max_model_len': 5800},
+                        1: {'runtime.max_batch_size': 2}
+                    }
+                }
+        deletes: Dictionary containing configurations to delete.
+                Format: {
+                    'old_config': None,  # Delete entire key
+                    'stage_args': {
+                        0: ['engine_args.old_param'],
+                        1: ['runtime.unused_setting']
+                    }
+                }
 
     Returns:
         str: Path to the newly created modified YAML file with timestamp suffix.
-
-    Example:
-        >>> output_file = modify_stage_config(
-        ...     'config.yaml',
-        ...     {
-        ...         0: {'engine_args.max_model_len': 5800},
-        ...         1: {'runtime.max_batch_size': 2}
-        ...     }
-        ... )
-        >>> print(f"Modified configuration saved to: {output_file}")
-        Modified configuration saved to: config_1698765432.yaml
     """
     path = Path(yaml_path)
     if not path.exists():
         raise FileNotFoundError(f"yaml does not exist: {path}")
+
     try:
         with open(yaml_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
     except Exception as e:
         raise ValueError(f"Cannot parse YAML file: {e}")
 
-    stage_args = config.get("stage_args", [])
-    if not stage_args:
-        raise ValueError("the stage_args does not exist")
+    # Helper function to apply update
+    def apply_update(config_dict: dict, key_path: str, value: Any) -> None:
+        """Apply update to dictionary using dot-separated path."""
+        current = config_dict
+        keys = key_path.split(".")
 
-    for stage_id, config_dict in stage_updates.items():
-        target_stage = None
-        for stage in stage_args:
-            if stage.get("stage_id") == stage_id:
-                target_stage = stage
-                break
+        for i in range(len(keys) - 1):
+            key = keys[i]
 
-        if target_stage is None:
-            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-            raise KeyError(f"Stage ID {stage_id} is not exist, available IDs: {available_ids}")
-
-        for key_path, value in config_dict.items():
-            current = target_stage
-            keys = key_path.split(".")
-            for i in range(len(keys) - 1):
-                key = keys[i]
+            # Handle list indices
+            if key.isdigit() and isinstance(current, list):
+                index = int(key)
+                if index < 0 or index >= len(current):
+                    # Expand list if needed
+                    while len(current) <= index:
+                        current.append({} if i < len(keys) - 2 else None)
+                current = current[index]
+            else:
+                # Handle dictionary keys
                 if key not in current:
-                    raise KeyError(f"the {'.'.join(keys[: i + 1])} does not exist")
-
-                elif not isinstance(current[key], dict) and i < len(keys) - 2:
-                    raise ValueError(f"{'.'.join(keys[: i + 1])}' cannot continue deeper because it's not a dict")
+                    current[key] = {}
+                elif not isinstance(current[key], (dict, list)) and i < len(keys) - 1:
+                    current[key] = {}
                 current = current[key]
+
+        # Set the final value
+        if isinstance(current, list) and keys[-1].isdigit():
+            index = int(keys[-1])
+            if index >= len(current):
+                while len(current) <= index:
+                    current.append(None)
+            current[index] = value
+        else:
             current[keys[-1]] = value
 
-    output_path = f"{yaml_path.split('.')[0]}_{int(time.time())}.yaml"
+    # Helper function to delete by path
+    def delete_by_path(config_dict: dict, path: str) -> None:
+        """Delete configuration by dot-separated path."""
+        if not path:
+            return
+
+        current = config_dict
+        keys = path.split(".")
+
+        # Traverse to the parent
+        for i in range(len(keys) - 1):
+            key = keys[i]
+
+            # Handle list indices
+            if key.isdigit() and isinstance(current, list):
+                index = int(key)
+                if index < 0 or index >= len(current):
+                    raise KeyError(f"List index {index} out of bounds")
+                current = current[index]
+            else:
+                if key not in current:
+                    raise KeyError(f"Path {'.'.join(keys[: i + 1])} does not exist")
+                current = current[key]
+
+        # Delete the item
+        last_key = keys[-1]
+
+        if isinstance(current, list) and last_key.isdigit():
+            index = int(last_key)
+            if index < 0 or index >= len(current):
+                raise KeyError(f"List index {index} out of bounds")
+            del current[index]
+        elif isinstance(current, dict) and last_key in current:
+            del current[last_key]
+        else:
+            raise KeyError(f"Path {path} does not exist")
+
+    # Apply deletions first
+    if deletes:
+        for key, value in deletes.items():
+            if key == "stage_args":
+                if value and isinstance(value, dict):
+                    stage_args = config.get("stage_args", [])
+                    if not stage_args:
+                        raise ValueError("stage_args does not exist in config")
+
+                    for stage_id, delete_paths in value.items():
+                        if not delete_paths:
+                            continue
+
+                        # Find stage by ID
+                        target_stage = None
+                        for stage in stage_args:
+                            if stage.get("stage_id") == stage_id:
+                                target_stage = stage
+                                break
+
+                        if target_stage is None:
+                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+
+                        # Delete specified paths in this stage
+                        for path in delete_paths:
+                            if path:  # Skip empty paths
+                                delete_by_path(target_stage, path)
+            elif "." in key:
+                # Delete using dot-separated path
+                delete_by_path(config, key)
+            elif value is None and key in config:
+                # Delete entire key
+                del config[key]
+
+    # Apply updates
+    for key, value in updates.items():
+        if key == "stage_args":
+            if value and isinstance(value, dict):
+                stage_args = config.get("stage_args", [])
+                if not stage_args:
+                    raise ValueError("stage_args does not exist in config")
+
+                for stage_id, stage_updates in value.items():
+                    # Find stage by ID
+                    target_stage = None
+                    for stage in stage_args:
+                        if stage.get("stage_id") == stage_id:
+                            target_stage = stage
+                            break
+
+                    if target_stage is None:
+                        available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                        raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+
+                    # Apply updates to this stage
+                    for path, val in stage_updates.items():
+                        apply_update(target_stage, path, val)
+        elif "." in key:
+            # Apply using dot-separated path
+            apply_update(config, key, value)
+        else:
+            # Direct top-level key
+            config[key] = value
+
+    # Save to new file with timestamp
+    timestamp = int(time.time())
+    base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
+    output_path = f"{base_name}_{timestamp}.yaml"
+
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
 
