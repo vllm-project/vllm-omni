@@ -30,6 +30,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -263,17 +264,23 @@ class Flux2ParallelSelfAttention(nn.Module):
         self.mlp_hidden_dim = int(query_dim * self.mlp_ratio)
         self.mlp_mult_factor = mlp_mult_factor
 
-        self.to_qkv_mlp_proj = nn.Linear(
+        self.to_qkv_mlp_proj = ColumnParallelLinear(
             self.query_dim,
             self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
             bias=bias,
+            gather_output=True,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.to_out = nn.Linear(self.inner_dim + self.mlp_hidden_dim, self.out_dim, bias=out_bias)
+        self.to_out = ColumnParallelLinear(
+            self.inner_dim + self.mlp_hidden_dim,
+            self.out_dim,
+            bias=out_bias,
+            gather_output=True,
+        )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
             num_heads=self.heads,
@@ -289,7 +296,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.to_qkv_mlp_proj(hidden_states)
+        hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
             [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
@@ -322,7 +329,8 @@ class Flux2ParallelSelfAttention(nn.Module):
 
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
-        return self.to_out(hidden_states)
+        hidden_states, _ = self.to_out(hidden_states)
+        return hidden_states
 
 
 class Flux2SingleTransformerBlock(nn.Module):
