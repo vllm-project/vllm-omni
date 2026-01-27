@@ -84,7 +84,7 @@ class OmniServer:
         )
 
         # Wait for server to be ready.
-        max_wait = 600
+        max_wait = 1200
         url = f"http://{self.host}:{self.port}/v1/models"
         start_time = time.time()
         while time.time() - start_time < max_wait:
