@@ -81,6 +81,28 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
                                "Falling back to TORCH_SDPA backend."""
                 )
                 backend_name = "TORCH_SDPA"
+    elif detect_device_type() == "cuda" and is_rocm():
+        from vllm._aiter_ops import is_aiter_found_and_supported
+
+        compute_capability = torch.cuda.get_device_capability()
+        major, minor = compute_capability
+
+        # Choose to enable this by default on ROCm
+        # Whenever possible as it is the fastest backend
+        # is_aiter_found_and_supported() checks if aiter library is found
+        # and is aiter supported on the current platform
+        # aiter currently only is supported on gfx942 and gfx950
+        # https://github.com/vllm-project/vllm/blob/main/vllm/_aiter_ops.py
+        if is_aiter_found_and_supported() and 90 < major * 10 + minor < 100:
+            if backend_name is None:
+                backend_name = "FLASH_ATTN"
+        else:
+            if backend_name == "FLASH_ATTN":
+                logger.warning(
+                    "Flash Attention requires `aiter` library which is only supported "
+                    "on gfx942 and gfx950. Falling back to TORCH_SDPA backend."
+                )
+                backend_name = "TORCH_SDPA"
 
     if backend_name is not None:
         backend_name_upper = backend_name.upper()
