@@ -725,7 +725,7 @@ class WanTransformer3DModel(nn.Module):
         Returns:
             Set of parameter names that were successfully loaded.
         """
-        # Stacked params mapping for self-attention QKV fusion
+        # Stacked params mapping for self-attention QKV fusion.
         # Format: (param_name, shard_name, shard_id)
         # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
         stacked_params_mapping = [
@@ -734,6 +734,8 @@ class WanTransformer3DModel(nn.Module):
             (".attn1.to_qkv", ".attn1.to_k", "k"),
             (".attn1.to_qkv", ".attn1.to_v", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
