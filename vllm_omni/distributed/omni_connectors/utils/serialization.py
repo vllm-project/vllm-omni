@@ -82,7 +82,11 @@ class OmniMsgpackEncoder:
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
-        t = tensor.detach().contiguous().cpu().view(torch.uint8)
+        t = tensor.detach().contiguous().cpu()
+        # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
+        if t.dim() == 0:
+            t = t.reshape(1)
+        t = t.view(torch.uint8)
         return {
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),
