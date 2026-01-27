@@ -210,6 +210,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                 # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
+                    external_req_id=(getattr(request, "external_req_id", None) if request else None),
                     prompt_token_ids=nr.prompt_token_ids,
                     mm_features=nr.mm_features,
                     sampling_params=nr.sampling_params,

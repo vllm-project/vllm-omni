@@ -180,8 +180,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.thinker.make_empty_intermediate_tensors if self.model_stage == "thinker" else lambda: None
         )
 
-        self.chunk_segment_info = {}  # request_id -> chunk_segment_info
-
     # ==================== Device utilities ====================
 
     @staticmethod

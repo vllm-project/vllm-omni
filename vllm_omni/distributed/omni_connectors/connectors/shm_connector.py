@@ -29,6 +29,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.request_payload = {}
         self.request_prompt_token_ids: dict[str, list[int]] = defaultdict(list)
         self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.request_ids_mapping: dict[str, str] = {}
         # Default threshold matches legacy behavior (64KB)
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
         self._metrics = {

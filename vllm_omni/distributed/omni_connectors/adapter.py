@@ -199,7 +199,8 @@ def get_chunk(
     target_stage_id = stage_id - 1
     # Handle new requests
     for new_req_data in scheduler_output.scheduled_new_reqs:
-        req_id = new_req_data.req_id[0:25]
+        connector.request_ids_mapping[new_req_data.req_id] = new_req_data.external_req_id
+        req_id = new_req_data.external_req_id
         chunk_id = connector.get_requests[req_id]
         connector_get_key = f"{req_id}_{target_stage_id}_{chunk_id}"
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
@@ -214,7 +215,7 @@ def get_chunk(
         cached_reqs.additional_information = {}
 
     for i, cached_req_id in enumerate(cached_reqs.req_ids):
-        req_id = cached_req_id[0:25]
+        req_id = connector.request_ids_mapping.get(cached_req_id, cached_req_id)
         if req_id in connector.finished_requests:
             continue
         chunk_id = connector.get_requests[req_id]
@@ -265,7 +266,7 @@ def get_chunk_for_generation(
     """
     stage_id = connector.stage_id
     target_stage_id = stage_id - 1
-    request_id = request.request_id[0:25]
+    request_id = request.external_req_id
 
     if request_id in connector.finished_requests:
         return
@@ -306,7 +307,7 @@ def put_chunk(
     """
     stage_id = connector.stage_id
     next_stage_id = stage_id + 1
-    request_id = request.request_id[0:25]
+    request_id = request.external_req_id
     prompt_token_ids = request.prompt_token_ids
     connector.request_prompt_token_ids[request_id] = prompt_token_ids
     chunk_id = connector.put_requests[request_id]
