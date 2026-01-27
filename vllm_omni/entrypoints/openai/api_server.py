@@ -33,7 +33,14 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ErrorResponse,
+    ModelCard,
+    ModelList,
+    ModelPermission,
 )
+
+# yapf conflicts with isort for this block
+# yapf: disable
+# yapf: enable
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
 from vllm.entrypoints.openai.serving_responses import OpenAIServingResponses
@@ -73,6 +80,8 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 
@@ -98,6 +107,31 @@ def _remove_route_from_router(router_obj, path: str, methods: set[str] | None = 
 
 # Remove vllm's /v1/chat/completions route so we can register our own omni version
 _remove_route_from_router(router, "/v1/chat/completions", {"POST"})
+
+
+class _DiffusionServingModels:
+    """Minimal OpenAIServingModels implementation for diffusion-only servers.
+
+    vLLM's /v1/models route expects `app.state.openai_serving_models` to expose
+    `show_available_models()`. In pure diffusion mode we don't initialize the
+    full OpenAIServingModels (it depends on LLM-specific processors), so we
+    provide a lightweight fallback.
+    """
+
+    def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
+        self._base_model_paths = base_model_paths
+
+    async def show_available_models(self) -> ModelList:
+        return ModelList(
+            data=[
+                ModelCard(
+                    id=base_model.name,
+                    root=base_model.model_path,
+                    permission=[ModelPermission()],
+                )
+                for base_model in self._base_model_paths
+            ]
+        )
 
 
 # Server entry points
@@ -330,6 +364,7 @@ async def omni_init_app_state(
         model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
+        state.openai_serving_models = _DiffusionServingModels(base_model_paths)
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
@@ -822,6 +857,40 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             "prompt": request.prompt,
             "num_outputs_per_prompt": request.n,
         }
+
+        # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
+        if request.lora is not None:
+            if not isinstance(request.lora, dict):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="Invalid lora field: expected an object.",
+                )
+            lora_body = request.lora
+            lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
+            lora_path = (
+                lora_body.get("local_path")
+                or lora_body.get("path")
+                or lora_body.get("lora_path")
+                or lora_body.get("lora_local_path")
+            )
+            lora_scale = lora_body.get("scale")
+            if lora_scale is None:
+                lora_scale = lora_body.get("lora_scale")
+            lora_int_id = lora_body.get("int_id")
+            if lora_int_id is None:
+                lora_int_id = lora_body.get("lora_int_id")
+            if lora_int_id is None and lora_path:
+                lora_int_id = stable_lora_int_id(str(lora_path))
+
+            if not lora_name or not lora_path:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="Invalid lora object: both name and path are required.",
+                )
+
+            gen_params["lora_request"] = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+            if lora_scale is not None:
+                gen_params["lora_scale"] = float(lora_scale)
 
         # Parse and add size if provided
         if request.size:

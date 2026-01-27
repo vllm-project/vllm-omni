@@ -28,9 +28,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
+from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
 
@@ -61,6 +63,7 @@ class GPUDiffusionWorker:
         self.vllm_config: VllmConfig | None = None
         self.model_runner: GPUDiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
 
     def init_device(self) -> None:
@@ -110,6 +113,15 @@ class GPUDiffusionWorker:
         self.model_runner.load_model(
             memory_pool_context_fn=self._maybe_get_memory_pool_context,
         )
+        assert self.model_runner.pipeline is not None
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.model_runner.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+            max_cached_adapters=self.od_config.max_cpu_loras,
+            lora_path=self.od_config.lora_path,
+            lora_scale=self.od_config.lora_scale,
+        )
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
@@ -129,12 +141,51 @@ class GPUDiffusionWorker:
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if self.lora_manager is not None and reqs:
+            req = reqs[0]
+
+            if len(reqs) > 1:
+                # This worker (and the current diffusion model runner) applies
+                # a single LoRA to the whole batch. Reject inconsistent LoRA
+                # settings to avoid silently applying the wrong adapter.
+                def _lora_key(r: OmniDiffusionRequest):
+                    if r.lora_request is None:
+                        return None
+                    lr = r.lora_request
+                    return (lr.lora_name, lr.lora_int_id, lr.lora_path, lr.tensorizer_config_dict)
+
+                key0 = _lora_key(req)
+                scale0 = req.lora_scale if key0 is not None else None
+                for other in reqs[1:]:
+                    if _lora_key(other) != key0:
+                        raise ValueError("All requests in a diffusion batch must share the same LoRARequest.")
+                    if key0 is not None and other.lora_scale != scale0:
+                        raise ValueError("All requests in a diffusion batch must share the same lora_scale.")
+
+            try:
+                self.lora_manager.set_active_adapter(req.lora_request, req.lora_scale)
+            except Exception as exc:
+                if req.lora_request is not None:
+                    raise
+                logger.warning("LoRA activation skipped: %s", exc)
         return self.model_runner.execute_model(reqs)
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.load_weights(weights)
+
+    def remove_lora(self, adapter_id: int) -> bool:
+        return self.lora_manager.remove_adapter(adapter_id)
+
+    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+        return self.lora_manager.add_adapter(lora_request, lora_scale)
+
+    def list_loras(self) -> list[int]:
+        return self.lora_manager.list_adapters()
+
+    def pin_lora(self, adapter_id: int) -> bool:
+        return self.lora_manager.pin_adapter(adapter_id)
 
     def sleep(self, level: int = 1) -> bool:
         """
