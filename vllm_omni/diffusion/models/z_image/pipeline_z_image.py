@@ -312,7 +312,6 @@ class ZImagePipeline(nn.Module):
     def interrupt(self):
         return self._interrupt
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
