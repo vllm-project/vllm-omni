@@ -117,8 +117,15 @@ runtime:
         localbuf: 64000000     # 64MB
         proto: "tcp"
 
+    # Yuanrong connector for cross-node/intra-node communication
+    yuanrong_connector:
+      name: YuanrongConnector
+      extra:
+        host: "127.0.0.1"
+        port: "35000"
+
     # SharedMemory connector for intra-node communication
-    #Alternative SHM connector with different threshold
+    # Alternative SHM connector with different threshold
     shared_memory_connector:
       name: SharedMemoryConnector
       extra:

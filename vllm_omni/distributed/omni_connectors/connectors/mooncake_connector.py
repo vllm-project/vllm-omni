@@ -51,7 +51,7 @@ class MooncakeConnector(OmniConnectorBase):
 
     def _make_key(self, rid: str, from_stage: str, to_stage: str) -> str:
         """Generate store key for request between stages."""
-        return f"{rid}/{from_stage}_to_{to_stage}"
+        return f"{rid}/{from_stage}_{to_stage}"
 
     def _init_store(self):
         """Initialize Mooncake store."""
@@ -72,16 +72,14 @@ class MooncakeConnector(OmniConnectorBase):
 
     # Use base class serialization methods for consistency
 
-    def put(
-        self, from_stage: str, to_stage: str, request_id: str, data: Any
-    ) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         if not self.store:
             logger.error("Store not initialized")
             return False, 0, None
 
         try:
             serialized_data = self.serialize_obj(data)
-            key = self._make_key(request_id, from_stage, to_stage)
+            key = self._make_key(put_key, from_stage, to_stage)
             self.store.put(key, serialized_data, self.pin)
 
             self._metrics["puts"] += 1
@@ -102,7 +100,7 @@ class MooncakeConnector(OmniConnectorBase):
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
+        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
     ) -> tuple[Any, int] | None:
         if not self.store:
             logger.error("Store not initialized")
@@ -110,7 +108,7 @@ class MooncakeConnector(OmniConnectorBase):
 
         retries = 20
         sleep_s = 0.05
-        key = self._make_key(request_id, from_stage, to_stage)
+        key = self._make_key(get_key, from_stage, to_stage)
 
         for attempt in range(retries):
             try:
