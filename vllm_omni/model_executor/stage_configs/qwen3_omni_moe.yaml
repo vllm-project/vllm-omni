@@ -4,12 +4,13 @@
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
 
 # The following config has been verified on 2x H100-80G GPUs.
+async_chunk: false
 stage_args:
   - stage_id: 0
     stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "0,1"
-      max_batch_size: 1
+      max_batch_size: 64
     engine_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -40,17 +41,16 @@ stage_args:
     stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "1"
-      max_batch_size: 1
+      max_batch_size: 64
     engine_args:
       model_stage: talker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.35
+      gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent  # Output codec codes for code2wav
-      # tensor_parallel_size: 2
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       distributed_executor_backend: "mp"

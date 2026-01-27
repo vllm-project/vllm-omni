@@ -544,6 +544,10 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "w13": ["w1", "w3"],
+    }
 
     # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,

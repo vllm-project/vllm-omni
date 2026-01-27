@@ -15,8 +15,40 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
+
+
+def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    """
+    Enable TeaCache for Bagel model.
+    """
+    teacache_config = TeaCacheConfig(
+        transformer_type="Bagel",
+        rel_l1_thresh=config.rel_l1_thresh,
+        coefficients=config.coefficients,
+    )
+    transformer = pipeline.bagel
+    original_forward_flow = transformer._forward_flow
+
+    import types
+
+    def forward_alias(self, *args, **kwargs):
+        return original_forward_flow(*args, **kwargs)
+
+    transformer.forward = types.MethodType(forward_alias, transformer)
+    apply_teacache_hook(transformer, teacache_config)
+    transformer._forward_flow = transformer.forward
+    pipeline.transformer = transformer
+
+    logger.info(
+        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"transformer_class={teacache_config.transformer_type}"
+    )
+
+
+CUSTOM_TEACACHE_ENABLERS = {"BagelPipeline": enable_bagel_teacache}
 
 
 class TeaCacheBackend(CacheBackend):
@@ -51,37 +83,44 @@ class TeaCacheBackend(CacheBackend):
                      - transformer: pipeline.transformer
                      - transformer_type: pipeline.transformer.__class__.__name__
         """
-        # Extract transformer and transformer_type from pipeline
-        transformer = pipeline.transformer
-        transformer_type = transformer.__class__.__name__
+        # Helper to get pipeline class name
+        pipeline_type = pipeline.__class__.__name__
 
-        # Create TeaCacheConfig from DiffusionCacheConfig with transformer_type
-        # Access parameters via attribute access: config.rel_l1_thresh
-        # rel_l1_thresh already has a default value of 0.2 in DiffusionCacheConfig
-        try:
-            teacache_config = TeaCacheConfig(
-                transformer_type=transformer_type,
-                rel_l1_thresh=self.config.rel_l1_thresh,
-                coefficients=self.config.coefficients,
-            )
-        except Exception as e:
-            logger.error(f"Failed to create TeaCacheConfig: {e}")
-            raise ValueError(
-                f"Invalid TeaCache configuration: {e}. "
-                f"Expected keys: rel_l1_thresh, coefficients (optional). "
-                f"transformer_type is automatically extracted from pipeline.transformer.__class__.__name__."
-            )
+        # Check for pipeline-level custom enablers
+        if pipeline_type in CUSTOM_TEACACHE_ENABLERS:
+            logger.info(f"Using custom TeaCache enabler for model: {pipeline_type}")
+            CUSTOM_TEACACHE_ENABLERS[pipeline_type](pipeline, self.config)
+        else:
+            transformer = pipeline.transformer
+            transformer_type = transformer.__class__.__name__
 
-        # Apply hook to transformer
-        apply_teacache_hook(transformer, teacache_config)
+            # Create TeaCacheConfig from DiffusionCacheConfig with transformer_type
+            # Access parameters via attribute access: config.rel_l1_thresh
+            # rel_l1_thresh already has a default value of 0.2 in DiffusionCacheConfig
+            try:
+                teacache_config = TeaCacheConfig(
+                    transformer_type=transformer_type,
+                    rel_l1_thresh=self.config.rel_l1_thresh,
+                    coefficients=self.config.coefficients,
+                )
+            except Exception as e:
+                logger.error(f"Failed to create TeaCacheConfig: {e}")
+                raise ValueError(
+                    f"Invalid TeaCache configuration: {e}. "
+                    f"Expected keys: rel_l1_thresh, coefficients (optional). "
+                    f"transformer_type is automatically extracted from pipeline.transformer.__class__.__name__."
+                )
+
+            # Apply hook to transformer
+            apply_teacache_hook(transformer, teacache_config)
+
+            logger.info(
+                f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+                f"transformer_class={teacache_config.transformer_type}"
+            )
 
         # Mark as enabled
         self.enabled = True
-
-        logger.info(
-            f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
-            f"transformer_class={teacache_config.transformer_type}"
-        )
 
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """

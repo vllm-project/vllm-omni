@@ -8,6 +8,7 @@ for text-to-image generation, with vllm-omni specific extensions.
 """
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -87,6 +88,18 @@ class ImageGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+
+    # vllm-omni extension for per-request LoRA.
+    # This mirrors the `extra_body.lora` convention in /v1/chat/completions.
+    lora: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional LoRA adapter for this request. Expected shape: "
+            "{name/path/scale/int_id}. Field names are flexible "
+            "(e.g. name|lora_name|adapter, path|lora_path|local_path, "
+            "scale|lora_scale, int_id|lora_int_id)."
+        ),
+    )
 
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")

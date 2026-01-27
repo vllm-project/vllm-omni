@@ -44,15 +44,14 @@ def test_stable_audio_model(model_name: str):
     # Extract audio from OmniRequestOutput
     assert outputs is not None
     first_output = outputs[0]
-    assert first_output.final_output_type == "image"  # Generic output type
+    assert first_output.final_output_type == "image"
     assert hasattr(first_output, "request_output") and first_output.request_output
 
     req_out = first_output.request_output[0]
     assert isinstance(req_out, OmniRequestOutput)
-    assert hasattr(req_out, "images") and len(req_out.images) >= 1
-
-    # For stable audio, the "images" field contains audio numpy arrays
-    audio = req_out.images[0]
+    assert req_out.final_output_type == "audio"
+    assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
+    audio = req_out.multimodal_output.get("audio")
     assert isinstance(audio, np.ndarray)
     # audio shape: (batch, channels, samples)
     # For stable-audio-open-1.0: sample_rate=44100, so 2 seconds = 88200 samples

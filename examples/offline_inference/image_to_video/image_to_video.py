@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Enable CPU offloading for diffusion models.",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +110,7 @@ def main():
         vae_use_tiling=vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
+        enable_cpu_offload=args.enable_cpu_offload,
     )
 
     if profiler_enabled:
