@@ -6,19 +6,21 @@ import socket
 from typing import TYPE_CHECKING
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.func_utils import deprecate_kwargs
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core_client import EngineCoreClient
-from vllm.v1.executor.abstract import Executor
-from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
+from vllm.v1.executor import Executor
+from vllm.v1.metrics.loggers import (
+    StatLoggerFactory,
+    StatLoggerManager,
+    load_stat_logger_plugin_factories,
+)
 
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.engine.input_processor import OmniInputProcessor
@@ -51,6 +53,7 @@ class AsyncOmniLLM(AsyncLLM):
         stat_loggers: Customized stat loggers for the engine.
             If not provided, default stat loggers will be used.
             Note: Stat logger interface may change in V1.
+        aggregate_engine_logging: Whether to aggregate engine logging
         client_addresses: Optional dictionary mapping client names to addresses
         client_count: Total number of clients (default: 1)
         client_index: Index of this client (default: 0)
@@ -68,6 +71,7 @@ class AsyncOmniLLM(AsyncLLM):
         log_requests: bool = True,
         start_engine_loop: bool = True,
         stat_loggers: list[StatLoggerFactory] | None = None,
+        aggregate_engine_logging: bool = False,
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
         client_index: int = 0,
@@ -76,6 +80,7 @@ class AsyncOmniLLM(AsyncLLM):
         Create an AsyncOmniLLM.
 
         Args:
+            engine_args: AsyncOmniEngineArgs containing engine configuration
             vllm_config: global configuration.
             executor_class: an Executor impl, e.g. MultiprocExecutor.
             log_stats: Whether to log stats.
@@ -88,6 +93,7 @@ class AsyncOmniLLM(AsyncLLM):
                 If not provided, default stat loggers will be used.
                 PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
                 IN V1, AND ITS BASE CLASS INTERFACE MIGHT CHANGE.
+            aggregate_engine_logging: Whether to aggregate engine logging.
 
         Returns:
             None
@@ -100,18 +106,16 @@ class AsyncOmniLLM(AsyncLLM):
         self.observability_config = vllm_config.observability_config
         self.log_requests = log_requests
 
-        self.log_stats = log_stats or (stat_loggers is not None)
-        if not log_stats and stat_loggers is not None:
+        custom_stat_loggers = list(stat_loggers or [])
+        custom_stat_loggers.extend(load_stat_logger_plugin_factories())
+
+        has_custom_loggers = bool(custom_stat_loggers)
+        self.log_stats = log_stats or has_custom_loggers
+        if not log_stats and has_custom_loggers:
             logger.info(
-                "AsyncLLM created with log_stats=False and non-empty custom logger list; "
+                "AsyncOmniLLM created with log_stats=False and non-empty custom logger list; "
                 "enabling logging without default stat loggers"
             )
-
-        if self.model_config.skip_tokenizer_init:
-            tokenizer = None
-        else:
-            # Tokenizer (+ ensure liveness if running in another process).
-            tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
 
         # InputProcessor (converts Inputs --> EngineCoreRequests).
         self.input_processor = OmniInputProcessor(
@@ -121,7 +125,7 @@ class AsyncOmniLLM(AsyncLLM):
 
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         self.output_processor = MultimodalOutputProcessor(
-            tokenizer=tokenizer,
+            tokenizer=self.tokenizer,
             log_stats=self.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
@@ -150,9 +154,10 @@ class AsyncOmniLLM(AsyncLLM):
             self.logger_manager = StatLoggerManager(
                 vllm_config=vllm_config,
                 engine_idxs=self.engine_core.engine_ranks_managed,
-                custom_stat_loggers=stat_loggers,
+                custom_stat_loggers=custom_stat_loggers,
                 enable_default_loggers=log_stats,
                 client_count=client_count,
+                aggregate_engine_logging=aggregate_engine_logging,
             )
             self.logger_manager.log_engine_initialized()
 
@@ -164,21 +169,25 @@ class AsyncOmniLLM(AsyncLLM):
         except RuntimeError:
             pass
 
-        if envs.VLLM_TORCH_PROFILER_DIR and not envs.VLLM_TORCH_PROFILER_DISABLE_ASYNC_LLM:
+        if (
+            vllm_config.profiler_config.profiler == "torch"
+            and not vllm_config.profiler_config.ignore_frontend
+        ):
+            profiler_dir = vllm_config.profiler_config.torch_profiler_dir
             logger.info(
                 "Torch profiler enabled. AsyncOmniLLM CPU traces will be collected under %s",
-                envs.VLLM_TORCH_PROFILER_DIR,
+                profiler_dir,
             )
             worker_name = f"{socket.gethostname()}_{os.getpid()}.async_omni_llm"
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                 ],
-                with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
+                with_stack=vllm_config.profiler_config.torch_profiler_with_stack,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    envs.VLLM_TORCH_PROFILER_DIR,
+                    profiler_dir,
                     worker_name=worker_name,
-                    use_gzip=envs.VLLM_TORCH_PROFILER_USE_GZIP,
+                    use_gzip=vllm_config.profiler_config.torch_profiler_use_gzip,
                 ),
             )
         else:
@@ -197,6 +206,7 @@ class AsyncOmniLLM(AsyncLLM):
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
         enable_log_requests: bool = False,
+        aggregate_engine_logging: bool = False,
         disable_log_stats: bool = False,
         client_addresses: dict[str, str] | None = None,
         client_count: int = 1,
@@ -211,6 +221,7 @@ class AsyncOmniLLM(AsyncLLM):
             stat_loggers=stat_loggers,
             log_requests=enable_log_requests,
             log_stats=not disable_log_stats,
+            aggregate_engine_logging=aggregate_engine_logging,
             usage_context=usage_context,
             client_addresses=client_addresses,
             client_count=client_count,
