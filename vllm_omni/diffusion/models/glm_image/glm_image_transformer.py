@@ -551,6 +551,10 @@ class GlmImageTransformer2DModel(CachedTransformer):
             are read from `od_config.tf_model_config`.
     """
 
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,

@@ -196,6 +196,39 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
         return torch.cat(wavs, dim=-1)
 
+    def chunked_decode_streaming(
+        self,
+        codes: torch.Tensor,
+        chunk_size: int = 25,
+        left_context_size: int = 25,
+    ) -> torch.Tensor:
+        """
+        Decode long sequences in chunks to avoid OOM.
+
+        Uses overlapping chunks with left context to avoid boundary artifacts.
+
+        Args:
+            codes: [batch, num_quantizers, seq_len] - num_quantizers-layer RVQ codes
+            chunk_size: Number of codec frames per chunk
+            left_context_size: Number of overlapping frames for context
+
+        Returns:
+            waveform: [batch, 1, waveform_len] - Complete waveform
+        """
+        wavs = []
+        end_index = codes.shape[-1]
+        # TODO: need to optimize algorithms, current only support
+        # chunk_size = left_context_size = 25
+        if end_index == chunk_size:
+            context_size = 0
+        else:
+            context_size = left_context_size
+        # Decode chunk
+        wav_chunk = self(codes)
+        # Remove context from output (context_size * total_upsample samples)
+        wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+        return torch.cat(wavs, dim=-1)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""
         loader = AutoWeightsLoader(

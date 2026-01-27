@@ -47,3 +47,4 @@ Key arguments:
 - `--guidance_scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--output`: path to save the generated PNG.
+- `--enable-cpu-offload`: enable CPU offloading for diffusion models.
