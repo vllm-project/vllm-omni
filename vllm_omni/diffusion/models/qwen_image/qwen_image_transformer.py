@@ -43,8 +43,8 @@ logger = init_logger(__name__)
 
 
 @functools.cache
-def has_fused_qknorm_rope():
-    return current_platform.is_cuda_alike()
+def _use_fused_qknorm_rope():
+    return current_platform.is_rocm()
 
 
 class ImageRopePrepare(nn.Module):
@@ -892,7 +892,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.img_in = nn.Linear(in_channels, self.inner_dim)
         self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
 
-        self.use_fused_qk_rope = has_fused_qknorm_rope()
+        self.use_fused_qk_rope = _use_fused_qknorm_rope()
 
         self.transformer_blocks = nn.ModuleList(
             [
