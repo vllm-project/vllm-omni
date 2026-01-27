@@ -20,6 +20,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.forward_context import get_forward_context
+
 
 @dataclass
 class CacheContext:
@@ -217,14 +219,37 @@ def extract_qwen_context(
         """Execute all Qwen transformer blocks."""
         h = hidden_states
         e = encoder_hidden_states
+        encoder_mask = encoder_hidden_states_mask
+        hidden_states_mask = None  # default
+        if module.parallel_config is not None and module.parallel_config.sequence_parallel_size > 1:
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                # Create mask for the full (padded) sequence
+                # valid positions = True, padding positions = False
+                batch_size = hidden_states.shape[0]
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    batch_size,
+                    padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+
+        # if mask is all true, set it to None
+        if hidden_states_mask is not None and hidden_states_mask.all():
+            hidden_states_mask = None
+        if encoder_mask is not None and encoder_mask.all():
+            encoder_mask = None
         for block in module.transformer_blocks:
             e, h = block(
                 hidden_states=h,
                 encoder_hidden_states=e,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                encoder_hidden_states_mask=encoder_mask,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
+                hidden_states_mask=hidden_states_mask,
             )
         return (h, e)
 
