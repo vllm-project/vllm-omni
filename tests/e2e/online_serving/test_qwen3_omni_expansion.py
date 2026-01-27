@@ -73,12 +73,14 @@ def get_max_batch_size(size_type="few"):
 def get_deploy_config(deploy_type="TP1"):
     result = {
         "TP1": {
-            0: {
-                "engine_args.gpu_memory_utilization": 0.95,
-                "engine_args.tensor_parallel_size": 1,
-                "runtime.devices": "0",
-            },
-            2: {"runtime.devices": "1"},
+            "stage_args": {
+                0: {
+                    "engine_args.gpu_memory_utilization": 0.95,
+                    "engine_args.tensor_parallel_size": 1,
+                    "runtime.devices": "0",
+                },
+                2: {"runtime.devices": "1"},
+            }
         }
     }
     return result.get(deploy_type, result["TP1"])
@@ -151,8 +153,10 @@ def test_audio_to_text_audio_001(test_config: tuple[str, str]) -> None:
     stage_config_path = modify_stage_config(
         stage_config_path,
         {
-            0: {"runtime.max_batch_size": num_concurrent_requests},
-            1: {"runtime.max_batch_size": num_concurrent_requests},
+            "stage_args": {
+                0: {"runtime.max_batch_size": num_concurrent_requests},
+                1: {"runtime.max_batch_size": num_concurrent_requests},
+            }
         },
     )
     with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
@@ -246,8 +250,10 @@ def test_image_to_text_audio_001(test_config: tuple[str, str]) -> None:
     stage_config_path = modify_stage_config(
         stage_config_path,
         {
-            0: {"runtime.max_batch_size": num_concurrent_requests},
-            1: {"runtime.max_batch_size": num_concurrent_requests},
+            "stage_args": {
+                0: {"runtime.max_batch_size": num_concurrent_requests},
+                1: {"runtime.max_batch_size": num_concurrent_requests},
+            }
         },
     )
     with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:

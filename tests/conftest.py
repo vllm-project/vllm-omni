@@ -22,6 +22,7 @@ import psutil
 import pytest
 import torch
 import yaml
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 
@@ -52,35 +53,118 @@ def default_vllm_config():
 
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests():
-    clean_gpu_memory()
+    print("\n=== PRE-TEST GPU CLEANUP ===")
+    _run_pre_test_cleanup()
+    yield
+    _run_post_test_cleanup()
 
 
-def clean_gpu_memory():
+def _run_pre_test_cleanup():
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
-        yield
+        print("GPU cleanup disabled")
         return
 
-    # Wait for GPU memory to be cleared before starting the test
-    import gc
-
-    from tests.utils import wait_for_gpu_memory_to_clear
+    print("Pre-test GPU status:")
+    _print_simple_gpu_status()
 
     num_gpus = torch.cuda.device_count()
     if num_gpus > 0:
         try:
+            from tests.utils import wait_for_gpu_memory_to_clear
+
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_gpus)),
                 threshold_ratio=0.1,
             )
-        except ValueError as e:
-            logger.info("Failed to clean GPU memory: %s", e)
+        except Exception as e:
+            print(f"Pre-test cleanup note: {e}")
 
-    yield
 
-    # Clean up GPU memory after the test
+def _run_post_test_cleanup():
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+        return
+
+    import gc
+
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
         gc.collect()
+        torch.cuda.empty_cache()
+
+        print("Post-test GPU status:")
+        _print_simple_gpu_status()
+        _print_gpu_processes()
+
+
+def _print_simple_gpu_status():
+    """Print simple GPU memory status"""
+    if not torch.cuda.is_available():
+        print("  CUDA not available")
+        return
+
+    num_devices = torch.cuda.device_count()
+    for device_id in range(num_devices):
+        try:
+            torch.cuda.set_device(device_id)
+            allocated = torch.cuda.memory_allocated(device_id) / (1024**2)
+            reserved = torch.cuda.memory_reserved(device_id) / (1024**2)
+            print(f"  GPU {device_id}: Allocated: {allocated:.1f}MB, Reserved: {reserved:.1f}MB")
+        except Exception:
+            print(f"  GPU {device_id}: Error reading status")
+
+
+def _print_gpu_processes():
+    """Print GPU information including nvidia-smi and system processes"""
+
+    print("\n" + "=" * 80)
+    print("NVIDIA GPU Information (nvidia-smi)")
+    print("=" * 80)
+
+    try:
+        nvidia_result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if nvidia_result.returncode == 0:
+            lines = nvidia_result.stdout.strip().split("\n")
+            for line in lines[:20]:
+                print(line)
+
+            if len(lines) > 20:
+                print(f"... (showing first 20 of {len(lines)} lines)")
+        else:
+            print("nvidia-smi command failed")
+
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        print("nvidia-smi not available or timed out")
+    except Exception as e:
+        print(f"Error running nvidia-smi: {e}")
+
+    print("\n" + "=" * 80)
+    print("Detailed GPU Processes (nvidia-smi pmon)")
+    print("=" * 80)
+
+    try:
+        pmon_result = subprocess.run(
+            ["nvidia-smi", "pmon", "-c", "1"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+
+        if pmon_result.returncode == 0 and pmon_result.stdout.strip():
+            print(pmon_result.stdout)
+        else:
+            print("No active GPU processes found via nvidia-smi pmon")
+
+    except Exception:
+        print("nvidia-smi pmon not available")
+
+    print("\n" + "=" * 80)
+    print("System Processes with GPU keywords")
+    print("=" * 80)
 
 
 def dummy_messages_from_mix_data(
@@ -541,75 +625,238 @@ def convert_audio_to_text(audio_data):
 
 def modify_stage_config(
     yaml_path: str,
-    stage_updates: dict[int, dict[str, Any]],
+    updates: dict[str, Any],
+    deletes: dict[str, Any] = None,
 ) -> str:
     """
-    Batch modify configurations for multiple stages in a YAML file.
+    Modify configurations in a YAML file, supporting both top-level and stage-specific modifications,
+    including addition, modification, and deletion of configurations.
 
     Args:
         yaml_path: Path to the YAML configuration file.
-        stage_updates: Dictionary where keys are stage IDs and values are dictionaries of
-                      modifications for that stage. Each modification dictionary uses
-                      dot-separated paths as keys and new configuration values as values.
-                      Example: {
-                          0: {'engine_args.max_model_len': 5800},
-                          1: {'runtime.max_batch_size': 2}
-                      }
+        updates: Dictionary containing both top-level and stage-specific modifications to add or update.
+                Format: {
+                    'async_chunk': True,
+                    'stage_args': {
+                        0: {'engine_args.max_model_len': 5800},
+                        1: {'runtime.max_batch_size': 2}
+                    }
+                }
+        deletes: Dictionary containing configurations to delete.
+                Format: {
+                    'old_config': None,  # Delete entire key
+                    'stage_args': {
+                        0: ['engine_args.old_param'],
+                        1: ['runtime.unused_setting']
+                    }
+                }
 
     Returns:
         str: Path to the newly created modified YAML file with timestamp suffix.
-
-    Example:
-        >>> output_file = modify_stage_config(
-        ...     'config.yaml',
-        ...     {
-        ...         0: {'engine_args.max_model_len': 5800},
-        ...         1: {'runtime.max_batch_size': 2}
-        ...     }
-        ... )
-        >>> print(f"Modified configuration saved to: {output_file}")
-        Modified configuration saved to: config_1698765432.yaml
     """
     path = Path(yaml_path)
     if not path.exists():
         raise FileNotFoundError(f"yaml does not exist: {path}")
+
     try:
         with open(yaml_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
     except Exception as e:
         raise ValueError(f"Cannot parse YAML file: {e}")
 
-    stage_args = config.get("stage_args", [])
-    if not stage_args:
-        raise ValueError("the stage_args does not exist")
+    # Helper function to apply update
+    def apply_update(config_dict: dict, key_path: str, value: Any) -> None:
+        """Apply update to dictionary using dot-separated path."""
+        # Handle direct list assignment (e.g., engine_input_source: [1, 2])
+        if "." not in key_path:
+            # Simple key, set directly
+            config_dict[key_path] = value
+            return
 
-    for stage_id, config_dict in stage_updates.items():
-        target_stage = None
-        for stage in stage_args:
-            if stage.get("stage_id") == stage_id:
-                target_stage = stage
-                break
+        current = config_dict
+        keys = key_path.split(".")
 
-        if target_stage is None:
-            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-            raise KeyError(f"Stage ID {stage_id} is not exist, available IDs: {available_ids}")
+        for i in range(len(keys) - 1):
+            key = keys[i]
 
-        for key_path, value in config_dict.items():
-            current = target_stage
-            keys = key_path.split(".")
-            for i in range(len(keys) - 1):
-                key = keys[i]
+            # Handle list indices
+            if key.isdigit() and isinstance(current, list):
+                index = int(key)
+                if index < 0:
+                    raise ValueError(f"Negative list index not allowed: {index}")
+                if index >= len(current):
+                    # Expand list if needed
+                    while len(current) <= index:
+                        # If we need to go deeper (more keys after this), create a dict
+                        # Otherwise, create None placeholder
+                        current.append({} if i < len(keys) - 2 else None)
+                current = current[index]
+            elif isinstance(current, dict):
+                # Handle dictionary keys
                 if key not in current:
-                    raise KeyError(f"the {'.'.join(keys[: i + 1])} does not exist")
-
-                elif not isinstance(current[key], dict) and i < len(keys) - 2:
-                    raise ValueError(f"{'.'.join(keys[: i + 1])}' cannot continue deeper because it's not a dict")
+                    # If there are more keys after this, create appropriate structure
+                    if i < len(keys) - 1:
+                        # Check if next key is a digit (list index) or string (dict key)
+                        if keys[i + 1].isdigit():
+                            current[key] = []
+                        else:
+                            current[key] = {}
+                    else:
+                        # This is the last key, create based on value type
+                        current[key] = [] if isinstance(value, list) else {}
+                elif not isinstance(current[key], (dict, list)) and i < len(keys) - 1:
+                    # If current value is not dict/list but we need to go deeper, replace it
+                    if keys[i + 1].isdigit():
+                        current[key] = []
+                    else:
+                        current[key] = {}
                 current = current[key]
-            current[keys[-1]] = value
+            else:
+                # Current is not a dict or list, cannot traverse further
+                raise TypeError(
+                    f"Cannot access {'.'.join(keys[: i + 1])} as a dict/list. It's a {type(current).__name__}"
+                )
 
-    output_path = f"{yaml_path.split('.')[0]}_{int(time.time())}.yaml"
+        # Set the final value
+        last_key = keys[-1]
+        if isinstance(current, list) and last_key.isdigit():
+            # Setting a value in a list by index
+            index = int(last_key)
+            if index < 0:
+                raise ValueError(f"Negative list index not allowed: {index}")
+            if index >= len(current):
+                # Expand list if needed
+                while len(current) <= index:
+                    current.append(None)
+            current[index] = value
+        elif isinstance(current, dict):
+            # Special case: if the value is a list and we're setting a top-level key
+            # Example: updating engine_input_source with [1, 2]
+            current[last_key] = value
+        else:
+            # Current is not a dict, cannot set key
+            raise TypeError(f"Cannot set value at {key_path}. Current type is {type(current).__name__}, expected dict.")
+
+    # Helper function to delete by path
+    def delete_by_path(config_dict: dict, path: str) -> None:
+        """Delete configuration by dot-separated path."""
+        if not path:
+            return
+
+        current = config_dict
+        keys = path.split(".")
+
+        # Traverse to the parent
+        for i in range(len(keys) - 1):
+            key = keys[i]
+
+            # Handle list indices
+            if key.isdigit() and isinstance(current, list):
+                index = int(key)
+                if index < 0 or index >= len(current):
+                    raise KeyError(f"List index {index} out of bounds")
+                current = current[index]
+            elif isinstance(current, dict):
+                if key not in current:
+                    raise KeyError(f"Path {'.'.join(keys[: i + 1])} does not exist")
+                current = current[key]
+            else:
+                raise TypeError(
+                    f"Cannot access {'.'.join(keys[: i + 1])} as a dict/list. It's a {type(current).__name__}"
+                )
+
+        # Delete the item
+        last_key = keys[-1]
+
+        if isinstance(current, list) and last_key.isdigit():
+            index = int(last_key)
+            if index < 0 or index >= len(current):
+                raise KeyError(f"List index {index} out of bounds")
+            del current[index]
+        elif isinstance(current, dict) and last_key in current:
+            del current[last_key]
+        else:
+            raise KeyError(f"Path {path} does not exist")
+
+    # Apply deletions first
+    if deletes:
+        for key, value in deletes.items():
+            if key == "stage_args":
+                if value and isinstance(value, dict):
+                    stage_args = config.get("stage_args", [])
+                    if not stage_args:
+                        raise ValueError("stage_args does not exist in config")
+
+                    for stage_id, delete_paths in value.items():
+                        if not delete_paths:
+                            continue
+
+                        # Find stage by ID
+                        target_stage = None
+                        for stage in stage_args:
+                            if stage.get("stage_id") == stage_id:
+                                target_stage = stage
+                                break
+
+                        if target_stage is None:
+                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+
+                        # Delete specified paths in this stage
+                        for path in delete_paths:
+                            if path:  # Skip empty paths
+                                delete_by_path(target_stage, path)
+            elif "." in key:
+                # Delete using dot-separated path
+                delete_by_path(config, key)
+            elif value is None and key in config:
+                # Delete entire key
+                del config[key]
+
+    # Apply updates
+    for key, value in updates.items():
+        if key == "stage_args":
+            if value and isinstance(value, dict):
+                stage_args = config.get("stage_args", [])
+                if not stage_args:
+                    raise ValueError("stage_args does not exist in config")
+
+                for stage_id, stage_updates in value.items():
+                    # Find stage by ID
+                    target_stage = None
+                    for stage in stage_args:
+                        if stage.get("stage_id") == stage_id:
+                            target_stage = stage
+                            break
+
+                    if target_stage is None:
+                        available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                        raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+
+                    # Apply updates to this stage
+                    for path, val in stage_updates.items():
+                        # Check if this is a simple key (not dot-separated)
+                        # Example: 'engine_input_source' vs 'engine_args.max_model_len'
+                        if "." not in path:
+                            # Direct key assignment (e.g., updating a list value)
+                            target_stage[path] = val
+                        else:
+                            # Dot-separated path (e.g., nested dict access)
+                            apply_update(target_stage, path, val)
+        elif "." in key:
+            # Apply using dot-separated path
+            apply_update(config, key, value)
+        else:
+            # Direct top-level key
+            config[key] = value
+
+    # Save to new file with timestamp
+    timestamp = int(time.time())
+    base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
+    output_path = f"{base_name}_{timestamp}.yaml"
+
     with open(output_path, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
+        yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
 
     return output_path
 
@@ -676,24 +923,32 @@ class OmniServer:
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
 
     def _kill_process_tree(self, pid):
-        """kill process and its children"""
+        """kill process and its children with verification"""
         try:
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
+
+            # Get all PIDs first
+            all_pids = [pid] + [child.pid for child in children]
+
+            # Terminate children
             for child in children:
                 try:
                     child.terminate()
                 except psutil.NoSuchProcess:
                     pass
 
+            # Wait for children
             gone, still_alive = psutil.wait_procs(children, timeout=10)
 
+            # Kill remaining children
             for child in still_alive:
                 try:
                     child.kill()
                 except psutil.NoSuchProcess:
                     pass
 
+            # Terminate parent
             try:
                 parent.terminate()
                 parent.wait(timeout=10)
@@ -702,6 +957,24 @@ class OmniServer:
                     parent.kill()
                 except psutil.NoSuchProcess:
                     pass
+
+            # VERIFICATION: Check if all processes are gone
+            time.sleep(1)  # Give system time
+            alive_processes = []
+            for check_pid in all_pids:
+                if psutil.pid_exists(check_pid):
+                    alive_processes.append(check_pid)
+
+            if alive_processes:
+                print(f"Warning: Processes still alive: {alive_processes}")
+                # Optional: Try system kill
+                import subprocess
+
+                for alive_pid in alive_processes:
+                    try:
+                        subprocess.run(["kill", "-9", str(alive_pid)], timeout=2)
+                    except Exception as e:
+                        print(f"Cleanup failed: {e}")
 
         except psutil.NoSuchProcess:
             pass
@@ -713,4 +986,5 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        clean_gpu_memory()
+        _run_post_test_cleanup()
+        cleanup_dist_env_and_memory()

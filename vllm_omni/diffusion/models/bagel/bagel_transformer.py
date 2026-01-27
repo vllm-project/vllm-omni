@@ -714,7 +714,6 @@ class Bagel(torch.nn.Module):
 
         return generation_input, newlens, new_rope
 
-    @torch.no_grad
     def forward_cache_update_text(
         self,
         past_key_values: NaiveCache,
@@ -821,7 +820,6 @@ class Bagel(torch.nn.Module):
 
         return generation_input, newlens, new_rope
 
-    @torch.no_grad
     def forward_cache_update_vae(
         self,
         vae_model,
@@ -946,7 +944,6 @@ class Bagel(torch.nn.Module):
 
         return generation_input, newlens, new_rope
 
-    @torch.no_grad
     def forward_cache_update_vit(
         self,
         past_key_values: NaiveCache,
@@ -1064,7 +1061,6 @@ class Bagel(torch.nn.Module):
     def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
         return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids)
 
-    @torch.no_grad
     def generate_image(
         self,
         packed_text_ids: torch.LongTensor,
@@ -1121,7 +1117,6 @@ class Bagel(torch.nn.Module):
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
 
-    @torch.no_grad
     def _forward_flow(
         self,
         x_t: torch.Tensor,
