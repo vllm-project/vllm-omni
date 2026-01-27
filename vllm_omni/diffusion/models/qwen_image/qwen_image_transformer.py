@@ -43,7 +43,7 @@ logger = init_logger(__name__)
 
 
 @functools.cache
-def has_fused_qk_rope():
+def has_fused_qknorm_rope():
     return current_platform.is_cuda_alike()
 
 
@@ -513,15 +513,15 @@ class QwenImageCrossAttention(nn.Module):
             txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
             txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-            img_cos = vid_freqs.real.to(img_qkv.dtype)
-            img_sin = vid_freqs.imag.to(img_qkv.dtype)
-            txt_cos = txt_freqs.real.to(txt_qkv.dtype)
-            txt_sin = txt_freqs.imag.to(txt_qkv.dtype)
-
             img_query = self.norm_q(img_query)
             img_key = self.norm_k(img_key)
             txt_query = self.norm_added_q(txt_query)
             txt_key = self.norm_added_k(txt_key)
+
+            img_cos = vid_freqs.real.to(img_qkv.dtype)
+            img_sin = vid_freqs.imag.to(img_qkv.dtype)
+            txt_cos = txt_freqs.real.to(txt_qkv.dtype)
+            txt_sin = txt_freqs.imag.to(txt_qkv.dtype)
 
             img_query = self.rope(img_query, img_cos, img_sin)
             img_key = self.rope(img_key, img_cos, img_sin)
@@ -892,7 +892,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.img_in = nn.Linear(in_channels, self.inner_dim)
         self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
 
-        self.use_fused_qk_rope = has_fused_qk_rope()
+        self.use_fused_qk_rope = has_fused_qknorm_rope()
 
         self.transformer_blocks = nn.ModuleList(
             [
