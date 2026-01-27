@@ -109,6 +109,7 @@ def parse_args() -> argparse.Namespace:
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
+
     return parser.parse_args()
 
 
