@@ -11,13 +11,11 @@ from typing import Any
 from vllm.config import VllmConfig
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.plugins.io_processors import get_io_processor
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine.exceptions import EngineDeadError
 
-# Internal imports (our code)
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
@@ -34,6 +32,9 @@ from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
 )
+
+# Internal imports (our code)
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)

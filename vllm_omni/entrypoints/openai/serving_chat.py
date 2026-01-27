@@ -64,7 +64,6 @@ from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import should_include_usage
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -83,6 +82,8 @@ from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -1883,6 +1884,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
             guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+            lora_body = extra_body.get("lora")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -1925,6 +1927,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_kwargs["num_frames"] = num_frames
             if guidance_scale_2 is not None:
                 gen_kwargs["guidance_scale_2"] = guidance_scale_2
+
+            # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
+            if lora_body and isinstance(lora_body, dict):
+                try:
+                    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
+                    lora_path = (
+                        lora_body.get("local_path")
+                        or lora_body.get("path")
+                        or lora_body.get("lora_path")
+                        or lora_body.get("lora_local_path")
+                    )
+                    # using "or" directly here may be buggy if `scale=0`
+                    lora_scale = lora_body.get("scale")
+                    if lora_scale is None:
+                        lora_scale = lora_body.get("lora_scale")
+                    lora_int_id = lora_body.get("int_id")
+                    if lora_int_id is None:
+                        lora_int_id = lora_body.get("lora_int_id")
+                    if lora_int_id is None and lora_path:
+                        lora_int_id = stable_lora_int_id(str(lora_path))
+                    if lora_name and lora_path:
+                        lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                        gen_kwargs["lora_request"] = lora_req
+                        if lora_scale is not None:
+                            gen_kwargs["lora_scale"] = float(lora_scale)
+                except Exception as e:  # pragma: no cover - safeguard
+                    logger.warning("Failed to parse LoRA request: %s", e)
 
             # Add reference image if provided
             if pil_images:

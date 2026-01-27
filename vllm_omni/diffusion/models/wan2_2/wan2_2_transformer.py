@@ -516,6 +516,9 @@ class WanTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["WanTransformerBlock"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
 
     def __init__(
         self,

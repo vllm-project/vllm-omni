@@ -221,6 +221,26 @@ class OmniBase:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
 
+        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        for cfg in self.stage_configs:
+            try:
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+                if kwargs.get("lora_path") is not None:
+                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
+                        cfg.engine_args.lora_path = kwargs["lora_path"]
+                lora_scale = kwargs.get("lora_scale")
+                if lora_scale is None:
+                    # Backwards compatibility for older callers.
+                    lora_scale = kwargs.get("static_lora_scale")
+                if lora_scale is not None:
+                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
+                        cfg.engine_args.lora_scale = lora_scale
+            except Exception as e:
+                logger.warning("Failed to inject LoRA config for stage: %s", e)
+
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
             self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
