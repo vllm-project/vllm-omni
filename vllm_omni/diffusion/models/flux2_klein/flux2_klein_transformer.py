@@ -28,8 +28,13 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -63,9 +68,20 @@ class Flux2FeedForward(nn.Module):
             inner_dim = int(dim * mult)
         dim_out = dim_out or dim
 
-        self.linear_in = nn.Linear(dim, inner_dim * 2, bias=bias)
+        self.linear_in = MergedColumnParallelLinear(
+            dim,
+            [inner_dim, inner_dim],
+            bias=bias,
+            return_bias=False,
+        )
         self.act_fn = Flux2SwiGLU()
-        self.linear_out = nn.Linear(inner_dim, dim_out, bias=bias)
+        self.linear_out = RowParallelLinear(
+            inner_dim,
+            dim_out,
+            bias=bias,
+            input_is_parallel=True,
+            return_bias=False,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear_in(x)
@@ -101,15 +117,25 @@ class Flux2Attention(nn.Module):
             hidden_size=query_dim,
             head_size=self.head_dim,
             total_num_heads=self.heads,
-            disable_tp=True,
             bias=bias,
         )
+        self.query_num_heads = self.to_qkv.num_heads
+        self.kv_num_heads = self.to_qkv.num_kv_heads
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.to_out = nn.ModuleList(
-            [ReplicatedLinear(self.inner_dim, self.out_dim, bias=out_bias), nn.Dropout(dropout)]
+            [
+                RowParallelLinear(
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    return_bias=False,
+                ),
+                nn.Dropout(dropout),
+            ]
         )
 
         if added_kv_proj_dim is not None:
@@ -119,17 +145,25 @@ class Flux2Attention(nn.Module):
                 hidden_size=added_kv_proj_dim,
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
-                disable_tp=True,
                 bias=added_proj_bias,
             )
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.add_query_num_heads = self.add_kv_proj.num_heads
+            self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                input_is_parallel=True,
+                return_bias=False,
+            )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
-            num_heads=self.heads,
+            num_heads=self.query_num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
+            num_kv_heads=self.kv_num_heads,
         )
 
     def forward(
@@ -148,17 +182,17 @@ class Flux2Attention(nn.Module):
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.query_num_heads, -1))
+        key = key.unflatten(-1, (self.kv_num_heads, -1))
+        value = value.unflatten(-1, (self.kv_num_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
 
         if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+            encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.add_kv_num_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.add_kv_num_heads, -1))
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
@@ -189,9 +223,9 @@ class Flux2Attention(nn.Module):
                 [context_len, hidden_states.shape[1] - context_len],
                 dim=1,
             )
-            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
 
-        hidden_states, _ = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
@@ -230,20 +264,55 @@ class Flux2ParallelSelfAttention(nn.Module):
         self.mlp_hidden_dim = int(query_dim * self.mlp_ratio)
         self.mlp_mult_factor = mlp_mult_factor
 
-        self.to_qkv_mlp_proj = nn.Linear(
+        try:
+            self.tp_size = int(get_tensor_model_parallel_world_size())
+        except Exception:
+            self.tp_size = 1
+        if self.heads % self.tp_size != 0:
+            raise ValueError(
+                f"Flux2ParallelSelfAttention requires heads % tp_size == 0, got heads={self.heads}, tp={self.tp_size}"
+            )
+        if self.inner_dim % self.tp_size != 0:
+            raise ValueError(
+                "Flux2ParallelSelfAttention requires inner_dim % tp_size == 0, "
+                "got inner_dim={self.inner_dim}, tp={self.tp_size}"
+            )
+        if self.mlp_hidden_dim % self.tp_size != 0:
+            raise ValueError(
+                "Flux2ParallelSelfAttention requires mlp_hidden_dim % tp_size == 0, "
+                f"got mlp_hidden_dim={self.mlp_hidden_dim}, tp={self.tp_size}"
+            )
+        self.heads_per_rank = self.heads // self.tp_size
+        self.inner_dim_per_rank = self.inner_dim // self.tp_size
+        self.mlp_hidden_dim_per_rank = self.mlp_hidden_dim // self.tp_size
+
+        self.to_qkv_mlp_proj = MergedColumnParallelLinear(
             self.query_dim,
-            self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
+            [
+                self.inner_dim,
+                self.inner_dim,
+                self.inner_dim,
+                self.mlp_hidden_dim,
+                self.mlp_hidden_dim,
+            ],
             bias=bias,
+            return_bias=False,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.to_out = nn.Linear(self.inner_dim + self.mlp_hidden_dim, self.out_dim, bias=out_bias)
+        self.to_out = RowParallelLinear(
+            self.inner_dim + self.mlp_hidden_dim,
+            self.out_dim,
+            bias=out_bias,
+            input_is_parallel=True,
+            return_bias=False,
+        )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
-            num_heads=self.heads,
+            num_heads=self.heads_per_rank,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
@@ -257,16 +326,21 @@ class Flux2ParallelSelfAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.to_qkv_mlp_proj(hidden_states)
-        qkv, mlp_hidden_states = torch.split(
+        q, k, v, mlp_gate, mlp_up = torch.split(
             hidden_states,
-            [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
+            [
+                self.inner_dim_per_rank,
+                self.inner_dim_per_rank,
+                self.inner_dim_per_rank,
+                self.mlp_hidden_dim_per_rank,
+                self.mlp_hidden_dim_per_rank,
+            ],
             dim=-1,
         )
 
-        query, key, value = qkv.chunk(3, dim=-1)
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = q.unflatten(-1, (self.heads_per_rank, -1))
+        key = k.unflatten(-1, (self.heads_per_rank, -1))
+        value = v.unflatten(-1, (self.heads_per_rank, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -287,7 +361,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
 
-        mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
+        mlp_hidden_states = self.mlp_act_fn(torch.cat([mlp_gate, mlp_up], dim=-1))
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
         return self.to_out(hidden_states)
 
