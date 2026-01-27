@@ -308,7 +308,7 @@ class TestTTSMethods:
         assert speech_server._validate_tts_request(req) == "Input text cannot be empty"
 
         # Invalid language
-        req = OpenAICreateSpeechRequest(input="Hello", language="French")
+        req = OpenAICreateSpeechRequest(input="Hello", language="InvalidLang")
         assert "Invalid language" in speech_server._validate_tts_request(req)
 
         # Invalid speaker
