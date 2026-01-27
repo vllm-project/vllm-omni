@@ -254,7 +254,6 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput):
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,

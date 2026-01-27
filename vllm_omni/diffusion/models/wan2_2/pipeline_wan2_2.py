@@ -278,7 +278,6 @@ class Wan22Pipeline(nn.Module):
     def current_timestep(self):
         return self._current_timestep
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,

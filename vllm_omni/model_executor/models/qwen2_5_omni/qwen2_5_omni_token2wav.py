@@ -1258,7 +1258,6 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
         return output
 
-    @torch.no_grad()
     def sample(
         self,
         conditioning_vector,
@@ -1333,7 +1332,6 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         generated_mel_spectrogram = generated_waveform.permute(0, 2, 1)
         return generated_mel_spectrogram
 
-    @torch.no_grad()
     def fast_block_sample(
         self,
         conditioning_vector: torch.Tensor,

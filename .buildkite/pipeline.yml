@@ -187,7 +187,10 @@ steps:
     depends_on: image-build
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_async_omni.py
+      - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
+      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
+      - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py
+      - pytest -s -v tests/e2e/online_serving/test_async_omni.py
     agents:
       queue: "mithril-h100-pool"
     plugins:
