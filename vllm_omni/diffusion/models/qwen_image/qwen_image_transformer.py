@@ -15,7 +15,6 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm._custom_ops import fused_qk_norm_rope
-from vllm.platforms import current_platform
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -24,6 +23,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -480,9 +480,8 @@ class QwenImageCrossAttention(nn.Module):
             self.parallel_config = config.parallel_config
         except Exception:
             self.parallel_config = None
-        
-        self.use_fused_qk_rope = use_fused_qk_rope \
-            if use_fused_qk_rope is not None else False
+
+        self.use_fused_qk_rope = use_fused_qk_rope if use_fused_qk_rope is not None else False
 
     def forward(
         self,
@@ -591,10 +590,8 @@ class QwenImageCrossAttention(nn.Module):
             )
             img_qkv = img_qkv.view(img_qkv_shape_ori)
             txt_qkv = txt_qkv.view(txt_qkv_shape_ori)
-            img_query, img_key, img_value = img_qkv.split(
-                [q_size, kv_size, kv_size], dim=-1)
-            txt_query, txt_key, txt_value = txt_qkv.split(
-                [add_q_size, add_kv_size, add_kv_size], dim=-1)
+            img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+            txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
 
             img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
             img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
