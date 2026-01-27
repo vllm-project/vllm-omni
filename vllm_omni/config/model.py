@@ -21,10 +21,7 @@ from vllm.transformers_utils.config import (
     get_hf_text_config,
     get_pooling_config,
 )
-from vllm.transformers_utils.gguf_utils import (
-    is_gguf,
-    maybe_patch_hf_config_from_gguf,
-)
+from vllm.transformers_utils.gguf_utils import is_gguf, maybe_patch_hf_config_from_gguf
 from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
