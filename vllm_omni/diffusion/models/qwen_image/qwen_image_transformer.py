@@ -482,30 +482,6 @@ class QwenImageCrossAttention(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Check for SP auto_pad: create attention mask dynamically if padding was applied
-        # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
-        if (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and hidden_states_mask is None
-        ):
-            ctx = get_forward_context()
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                # Create mask for the full (padded) sequence
-                # valid positions = True, padding positions = False
-                batch_size = hidden_states.shape[0]
-                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                hidden_states_mask = torch.ones(
-                    batch_size, padded_seq_len, dtype=torch.bool, device=hidden_states.device
-                )
-                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-
-        # if mask is all true, set it to None
-        if hidden_states_mask is not None and hidden_states_mask.all():
-            hidden_states_mask = None
-        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
-            encoder_hidden_states_mask = None
-
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -951,6 +927,30 @@ class QwenImageTransformer2DModel(CachedTransformer):
             else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
         )
 
+        # Check for SP auto_pad: create attention mask dynamically if padding was applied
+        # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
+        hidden_states_mask = None  # default
+        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                # Create mask for the full (padded) sequence
+                # valid positions = True, padding positions = False
+                batch_size = hidden_states.shape[0]
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    batch_size,
+                    padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+
+        # if mask is all true, set it to None
+        if hidden_states_mask is not None and hidden_states_mask.all():
+            hidden_states_mask = None
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
+
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -960,6 +960,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
+                hidden_states_mask=hidden_states_mask,
             )
 
         if self.zero_cond_t:
