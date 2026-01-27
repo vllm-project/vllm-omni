@@ -226,7 +226,7 @@ def test_images_generations_per_request_lora_switching(omni_server: OmniServer, 
 
     # Adapter A: apply delta to Q slice only.
     lora_a_dir = tmp_path / "zimage_lora_a"
-    _write_zimage_lora(lora_a_dir, q_scale=1.0)
+    _write_zimage_lora(lora_a_dir, q_scale=2.0)
     payload_a = _basic_payload()
     payload_a["lora"] = {"name": "a", "path": str(lora_a_dir), "scale": 32.0}
     img_a = _post_images(omni_server, payload_a)
