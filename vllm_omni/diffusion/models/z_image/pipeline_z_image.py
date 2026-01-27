@@ -19,7 +19,6 @@ import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
-from functools import partial
 from typing import Any
 
 import torch
@@ -33,7 +32,6 @@ from transformers import AutoModel, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
@@ -144,7 +142,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class ZImagePipeline(nn.Module, CFGParallelMixin):
+class ZImagePipeline(nn.Module):
     def __init__(
         self,
         *,
@@ -529,8 +527,6 @@ class ZImagePipeline(nn.Module, CFGParallelMixin):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        self.cfg_normalize_function = partial(self.cfg_normalize_function, actual_batch_size=actual_batch_size)
-
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
             if self.interrupt:
@@ -554,36 +550,57 @@ class ZImagePipeline(nn.Module, CFGParallelMixin):
 
             # Run CFG only if configured AND scale is non-zero
             apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
-            latents = latents.to(self.transformer.dtype)
 
-            positive_kwargs = {
-                "x": latents,
-                "t": timestep,
-                "cap_feats": prompt_embeds,
-            }
             if apply_cfg:
-                negative_kwargs = {
-                    "x": latents,
-                    "t": timestep,
-                    "cap_feats": negative_prompt_embeds,
-                }
+                latents_typed = latents.to(self.transformer.dtype)
+                latent_model_input = latents_typed.repeat(2, 1, 1, 1)
+                prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
+                timestep_model_input = timestep.repeat(2)
             else:
-                negative_kwargs = None
+                latent_model_input = latents.to(self.transformer.dtype)
+                prompt_embeds_model_input = prompt_embeds
+                timestep_model_input = timestep
 
-            cfg_normalize = self._cfg_normalization and float(self._cfg_normalization) > 0.0
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=apply_cfg,
-                true_cfg_scale=current_guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=cfg_normalize,
-            ).float()
+            latent_model_input = latent_model_input.unsqueeze(2)
+            latent_model_input_list = list(latent_model_input.unbind(dim=0))
+
+            model_out_list = self.transformer(
+                latent_model_input_list,
+                timestep_model_input,
+                prompt_embeds_model_input,
+            )[0]
+
+            if apply_cfg:
+                # Perform CFG
+                pos_out = model_out_list[:actual_batch_size]
+                neg_out = model_out_list[actual_batch_size:]
+
+                noise_pred = []
+                for j in range(actual_batch_size):
+                    pos = pos_out[j].float()
+                    neg = neg_out[j].float()
+
+                    pred = pos + current_guidance_scale * (pos - neg)
+
+                    # Renormalization
+                    if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
+                        ori_pos_norm = torch.linalg.vector_norm(pos)
+                        new_pos_norm = torch.linalg.vector_norm(pred)
+                        max_new_norm = ori_pos_norm * float(self._cfg_normalization)
+                        if new_pos_norm > max_new_norm:
+                            pred = pred * (max_new_norm / new_pos_norm)
+
+                    noise_pred.append(pred)
+
+                noise_pred = torch.stack(noise_pred, dim=0)
+            else:
+                noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
 
             noise_pred = noise_pred.squeeze(2)
             noise_pred = -noise_pred
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, apply_cfg)
+            latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
             assert latents.dtype == torch.float32
 
             if callback_on_step_end is not None:
@@ -606,26 +623,6 @@ class ZImagePipeline(nn.Module, CFGParallelMixin):
             # image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(output=image)
-
-    def cfg_normalize_function(self, noise_pred, comb_pred, actual_batch_size):
-        assert noise_pred.shape[0] == actual_batch_size, (
-            f"Expected noise_pred to have shape ({actual_batch_size}, *), got {noise_pred.shape}"
-        )
-
-        noise_pred, comb_pred = noise_pred.float(), comb_pred.float()
-        norm_pred = []
-        for j in range(actual_batch_size):
-            pos = noise_pred[j]
-            pred = comb_pred[j]
-            # Renormalization
-            ori_pos_norm = torch.linalg.vector_norm(pos)
-            new_pos_norm = torch.linalg.vector_norm(pred)
-            max_new_norm = ori_pos_norm * float(self._cfg_normalization)
-            if new_pos_norm > max_new_norm:
-                pred = pred * (max_new_norm / new_pos_norm)
-            norm_pred.append(pred)
-        norm_pred = torch.stack(norm_pred, dim=0)
-        return norm_pred
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
