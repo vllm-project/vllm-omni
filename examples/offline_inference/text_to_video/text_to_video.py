@@ -140,14 +140,12 @@ def main():
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
-    parallel_config = DiffusionParallelConfig(
-        cfg_parallel_size=args.cfg_parallel_size,
-    )
     omni = Omni(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
