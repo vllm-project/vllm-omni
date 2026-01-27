@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Base pipeline class for Qwen Image models with shared CFG functionality.
+Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
