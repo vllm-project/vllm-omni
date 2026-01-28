@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -95,18 +96,17 @@ def main():
         )
         print(f"Activating pre-loaded LoRA: id={lora_request_id}, scale={args.lora_scale}")
 
-    gen_kwargs = {
-        "prompt": args.prompt,
-        "height": args.height,
-        "width": args.width,
-        "num_inference_steps": args.num_inference_steps,
-    }
+    sampling_params = OmniDiffusionSamplingParams(
+        height=args.height,
+        width=args.width,
+        num_inference_steps=args.num_inference_steps,
+    )
 
     if lora_request:
-        gen_kwargs["lora_request"] = lora_request
-        gen_kwargs["lora_scale"] = args.lora_scale
+        sampling_params.lora_request = lora_request
+        sampling_params.lora_scale = args.lora_scale
 
-    outputs = omni.generate(**gen_kwargs)
+    outputs = omni.generate(args.prompt, sampling_params)
 
     if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")

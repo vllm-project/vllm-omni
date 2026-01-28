@@ -6,6 +6,8 @@ from PIL import Image
 from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_omni.inputs.data import OmniPromptType
+
 
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
@@ -54,7 +56,7 @@ class OmniRequestOutput:
 
     # Diffusion model fields
     images: list[Image.Image] = field(default_factory=list)
-    prompt: str | None = None
+    prompt: OmniPromptType | None = None
     latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     multimodal_output: dict[str, Any] = field(default_factory=dict)
@@ -89,7 +91,7 @@ class OmniRequestOutput:
         cls,
         request_id: str,
         images: list[Image.Image],
-        prompt: str | None = None,
+        prompt: OmniPromptType | None = None,
         metrics: dict[str, Any] | None = None,
         latents: torch.Tensor | None = None,
         multimodal_output: dict[str, Any] | None = None,

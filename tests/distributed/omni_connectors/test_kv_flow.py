@@ -1,10 +1,12 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
@@ -109,11 +111,12 @@ class TestKVFlow(unittest.TestCase):
         transfer_data.metadata = {"kv_lens": [self.seq_len], "ropes": [0]}
 
         # 2. Setup Request with Injected Data
-        req = OmniDiffusionRequest(prompt="test")
-        from types import SimpleNamespace
+        sp = OmniDiffusionSamplingParams(
+            past_key_values=SimpleNamespace(**layer_blocks),
+            kv_metadata=transfer_data.metadata,
+        )
 
-        req.past_key_values = SimpleNamespace(**layer_blocks)
-        req.kv_metadata = transfer_data.metadata
+        req = OmniDiffusionRequest(["test"], sp)
 
         # 3. Setup Pipeline
         pipeline = MockBagelPipeline()
@@ -144,7 +147,7 @@ class TestKVFlow(unittest.TestCase):
         current_cache = RealNaiveCache(self.num_layers)
 
         # --- Logic from Source Code ---
-        injected_kv = req.past_key_values
+        injected_kv = req.sampling_params.past_key_values
         if isinstance(current_cache, RealNaiveCache) and hasattr(injected_kv, "key_cache"):
             # Assuming injected_kv is SimpleNamespace or object with list attrs
             for layer_idx in range(len(injected_kv.key_cache)):
@@ -176,9 +179,11 @@ class TestKVFlow(unittest.TestCase):
         data_dict = runner_test_result.to_dict()
 
         # 3. Receiver (Request Setup)
-        req = OmniDiffusionRequest(prompt="integration_test")
-        req.past_key_values = data_dict["layer_blocks"]
-        req.kv_metadata = data_dict["metadata"]
+        sp = OmniDiffusionSamplingParams(
+            past_key_values=data_dict["layer_blocks"],
+            kv_metadata=data_dict["metadata"],
+        )
+        req = OmniDiffusionRequest(["integration_test"], sp)  # noqa: F841
 
         # 4. Receiver (Injection Simulation)
         # Use the logic verification again

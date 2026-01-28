@@ -6,7 +6,7 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE
+from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler
@@ -130,8 +130,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
-    def add_req(self, requests: list[OmniDiffusionRequest]):
-        return self.scheduler.add_req(requests)
+    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        return self.scheduler.add_req(request)
 
     def collective_rpc(
         self,

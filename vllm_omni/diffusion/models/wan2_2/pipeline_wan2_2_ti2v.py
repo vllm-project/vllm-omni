@@ -16,8 +16,10 @@ The key difference from the MoE-based I2V pipeline is:
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Iterable
+from typing import cast
 
 import numpy as np
 import PIL.Image
@@ -39,6 +41,9 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniTextPrompt
+
+logger = logging.getLogger(__name__)
 
 
 def get_wan22_ti2v_post_process_func(
@@ -67,39 +72,56 @@ def get_wan22_ti2v_pre_process_func(
 
     video_processor = VideoProcessor(vae_scale_factor=8)
 
-    def pre_process_func(requests: list[OmniDiffusionRequest]) -> list[OmniDiffusionRequest]:
-        for req in requests:
-            # Load image if path is provided
-            if req.image_path is not None and req.pil_image is None:
-                req.pil_image = PIL.Image.open(req.image_path).convert("RGB")
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        for i, prompt in enumerate(request.prompts):
+            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
 
-            if req.pil_image is not None:
-                image = req.pil_image
+            if raw_image is None:
+                raise ValueError(
+                    """No image is provided. This model requires an image to run.""",
+                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
+                )
+            if not isinstance(raw_image, (str, PIL.Image.Image)):
+                raise TypeError(
+                    f"""Unsupported image format {raw_image.__class__}.""",
+                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
+                )
+            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
 
-                # Calculate dimensions based on aspect ratio if not provided
-                if req.height is None or req.width is None:
-                    # Default max area for 720P (TI2V-5B default)
-                    max_area = 720 * 1280
-                    aspect_ratio = image.height / image.width
+            # Calculate dimensions based on aspect ratio if not provided
+            if request.sampling_params.height is None or request.sampling_params.width is None:
+                # Default max area for 720P (TI2V-5B default)
+                max_area = 720 * 1280
+                aspect_ratio = image.height / image.width
 
-                    # Calculate dimensions maintaining aspect ratio
-                    mod_value = 16  # Must be divisible by 16
-                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+                # Calculate dimensions maintaining aspect ratio
+                mod_value = 16  # Must be divisible by 16
+                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-                    if req.height is None:
-                        req.height = height
-                    if req.width is None:
-                        req.width = width
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = height
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = width
 
-                # Resize image to target dimensions
-                image = image.resize((req.width, req.height), PIL.Image.Resampling.LANCZOS)
-                req.pil_image = image
+            # Resize image to target dimensions
+            image = image.resize(
+                (request.sampling_params.width, request.sampling_params.height),  # type: ignore # Above has ensured that width & height are not None
+                PIL.Image.Resampling.LANCZOS,
+            )
+            prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
-                # Preprocess for VAE
-                req.preprocessed_image = video_processor.preprocess(image, height=req.height, width=req.width)
-
-        return requests
+            # Preprocess for VAE
+            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
+                image, height=request.sampling_params.height, width=request.sampling_params.width
+            )
+            request.prompts[i] = prompt
+        return request
 
     return pre_process_func
 
@@ -205,31 +227,53 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
         guidance_scale: float = 5.0,
         frame_num: int = 81,
         output_type: str | None = "np",
-        generator: torch.Generator | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
         **kwargs,
     ) -> DiffusionOutput:
         # Get parameters from request or arguments
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        if len(req.prompts) > 1:
+            raise ValueError(
+                """This model only supports a single prompt, not a batched request.""",
+                """Please pass in a single prompt object or string, or a single-item list.""",
+            )
+        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
+            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
+            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 TI2V generation.")
+            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
         # Get image from request (optional for TI2V)
         if image is None:
-            image = req.pil_image
+            multi_modal_data = (
+                req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
+            )
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(raw_image, list):
+                if len(raw_image) > 1:
+                    logger.warning(
+                        """Received a list of image. Only a single image is supported by this model."""
+                        """Taking only the first image for now."""
+                    )
+                raw_image = raw_image[0]
+            if raw_image is None:
+                image = None
+            elif isinstance(raw_image, str):
+                image = PIL.Image.open(raw_image)
+            else:
+                image = cast(PIL.Image.Image | torch.Tensor, raw_image)
 
         # Default dimensions for TI2V-5B (720P)
-        height = req.height or height
-        width = req.width or width
-        num_frames = req.num_frames if req.num_frames else frame_num
-        num_steps = req.num_inference_steps or num_inference_steps
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
 
         # Respect per-request guidance_scale when explicitly provided.
-        if req.guidance_scale_provided:
-            guidance_scale = req.guidance_scale
+        if req.sampling_params.guidance_scale_provided:
+            guidance_scale = req.sampling_params.guidance_scale
 
         self._guidance_scale = guidance_scale
 
@@ -254,9 +298,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
 
         # Generator setup
         if generator is None:
-            generator = req.generator
-        if generator is None and req.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.seed)
+            generator = req.sampling_params.generator
+        if generator is None and req.sampling_params.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
         # Encode prompts
         if prompt_embeds is None:
@@ -264,8 +308,8 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_scale > 1.0,
-                num_videos_per_prompt=req.num_outputs_per_prompt or 1,
-                max_sequence_length=req.max_sequence_length or 512,
+                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                max_sequence_length=req.sampling_params.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
@@ -310,7 +354,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.latents,
+                latents=req.sampling_params.latents,
             )
         else:
             # T2V mode: prepare random latents
@@ -323,7 +367,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput):
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.latents,
+                latents=req.sampling_params.latents,
             )
             latent_condition = None
             first_frame_mask = torch.ones(

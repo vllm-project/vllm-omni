@@ -8,6 +8,7 @@ Enable TeaCache by setting `cache_backend` to `"tea_cache"`:
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Simple configuration - model_type is automatically extracted from pipeline.__class__.__name__
 omni = Omni(
@@ -17,7 +18,12 @@ omni = Omni(
         "rel_l1_thresh": 0.2  # Optional, defaults to 0.2
     }
 )
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+    ),
+)
 ```
 
 ### Using Environment Variable
@@ -68,13 +74,19 @@ Controls the balance between speed and quality. Lower values prioritize quality,
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 omni = Omni(
     model="Qwen/Qwen-Image",
     cache_backend="tea_cache",
     cache_config={"rel_l1_thresh": 0.2}
 )
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(
+        num_inference_steps=50,
+    ),
+)
 ```
 
 ## Performance Tuning

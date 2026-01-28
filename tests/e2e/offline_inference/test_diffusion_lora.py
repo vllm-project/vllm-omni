@@ -7,6 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import is_npu
 
@@ -88,12 +89,14 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
 
         outputs = m.generate(
             prompt,
-            height=height,
-            width=width,
-            num_inference_steps=2,
-            guidance_scale=0.0,
-            generator=torch.Generator("cuda").manual_seed(42),
-            num_outputs_per_prompt=1,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=2,
+                guidance_scale=0.0,
+                generator=torch.Generator("cuda").manual_seed(42),
+                num_outputs_per_prompt=1,
+            ),
         )
         images = _extract_images(outputs)
 
@@ -116,14 +119,16 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
             )
             outputs_lora = m.generate(
                 prompt,
-                height=height,
-                width=width,
-                num_inference_steps=2,
-                guidance_scale=0.0,
-                generator=torch.Generator("cuda").manual_seed(42),
-                num_outputs_per_prompt=1,
-                lora_request=lora_request,
-                lora_scale=2.0,
+                OmniDiffusionSamplingParams(
+                    height=height,
+                    width=width,
+                    num_inference_steps=2,
+                    guidance_scale=0.0,
+                    generator=torch.Generator("cuda").manual_seed(42),
+                    num_outputs_per_prompt=1,
+                    lora_request=lora_request,
+                    lora_scale=2.0,
+                ),
             )
             images_lora = _extract_images(outputs_lora)
             assert len(images_lora) == 1
