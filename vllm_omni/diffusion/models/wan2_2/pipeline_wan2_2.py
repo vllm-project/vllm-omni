@@ -7,8 +7,7 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from re import A
-from typing import cast, Any
+from typing import Any, cast
 
 import PIL.Image
 import torch
