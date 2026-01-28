@@ -54,6 +54,7 @@ class OmniRunner:
         _run_post_test_cleanup(enable_force=True)
         self.model_name = model_name
         self.seed = seed
+
         self.omni = Omni(
             model=model_name,
             log_stats=log_stats,
