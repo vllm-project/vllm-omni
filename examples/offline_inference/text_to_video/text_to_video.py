@@ -13,7 +13,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import detect_device_type, is_npu
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +55,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
     parser.add_argument(
+        "--vae_use_slicing",
+        action="store_true",
+        help="Enable VAE slicing for memory optimization.",
+    )
+    parser.add_argument(
+        "--vae_use_tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
         "--enforce_eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
@@ -81,12 +91,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    device = detect_device_type()
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-
-    # Enable VAE memory optimizations on NPU
-    vae_use_slicing = is_npu()
-    vae_use_tiling = is_npu()
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     # Wan2.2 cache-dit tuning (from cache-dit examples and cache_alignment).
     cache_config = None
@@ -118,8 +123,8 @@ def main():
 
     omni = Omni(
         model=args.model,
-        vae_use_slicing=vae_use_slicing,
-        vae_use_tiling=vae_use_tiling,
+        vae_use_slicing=args.vae_use_slicing,
+        vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
         cache_backend=args.cache_backend,

@@ -7,6 +7,7 @@ from vllm.transformers_utils.config import get_hf_text_config
 from vllm.v1.engine.async_llm import AsyncEngineArgs
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
 
@@ -89,7 +90,11 @@ class OmniEngineArgs(EngineArgs):
                 f"Config attribute '{hf_config_name}' not found in hf_config, "
                 "falling back to default get_hf_text_config"
             )
-            return get_hf_text_config(hf_config)
+        return get_hf_text_config(hf_config)
+
+    def __post_init__(self) -> None:
+        load_omni_general_plugins()
+        super().__post_init__()
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -187,7 +192,11 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
                 f"Config attribute '{hf_config_name}' not found in hf_config, "
                 "falling back to default get_hf_text_config"
             )
-            return get_hf_text_config(hf_config)
+        return get_hf_text_config(hf_config)
+
+    def __post_init__(self) -> None:
+        load_omni_general_plugins()
+        super().__post_init__()
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):

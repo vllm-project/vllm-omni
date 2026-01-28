@@ -30,8 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.diffusion.distributed.parallel_state import device_count
-from vllm_omni.diffusion.envs import get_device_name
+from vllm_omni.platforms import current_omni_platform
 
 models = ["riverclouds/qwen_image_random"]
 
@@ -63,9 +62,9 @@ def _cleanup_distributed():
 
     gc.collect()
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    if current_omni_platform.is_available():
+        current_omni_platform.empty_cache()
+        current_omni_platform.synchronize()
 
     time.sleep(5)
 
@@ -88,7 +87,7 @@ def _run_baseline(model_name: str, dtype: torch.dtype, attn_backend: str, height
                 width=width,
                 num_inference_steps=4,
                 guidance_scale=0.0,
-                generator=torch.Generator(get_device_name()).manual_seed(seed),
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -125,7 +124,7 @@ def _run_sp(
                 width=width,
                 num_inference_steps=4,
                 guidance_scale=0.0,
-                generator=torch.Generator(get_device_name()).manual_seed(seed),
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -157,8 +156,8 @@ def test_baseline_only(model_name: str, dtype: torch.dtype, attn_backend: str):
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sp_ulysses2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     """Test SP inference only (ulysses=2)."""
-    if device_count() < 2:
-        pytest.skip(f"Test requires 2 GPUs but only {device_count()} available")
+    if current_omni_platform.get_device_count() < 2:
+        pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
 
     height = 256
     width = 256
@@ -177,8 +176,8 @@ def test_sp_ulysses2_only(model_name: str, dtype: torch.dtype, attn_backend: str
 @pytest.mark.parametrize("attn_backend", ["sdpa"])
 def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
     """Test SP inference only (ring=2)."""
-    if device_count() < 2:
-        pytest.skip(f"Test requires 2 GPUs but only {device_count()} available")
+    if current_omni_platform.get_device_count() < 2:
+        pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
 
     height = 256
     width = 256
@@ -212,8 +211,8 @@ def test_sequence_parallel(
         )
 
     sp_size = ulysses_degree * ring_degree
-    if device_count() < sp_size:
-        pytest.skip(f"Test requires {sp_size} GPUs but only {device_count()} available")
+    if current_omni_platform.get_device_count() < sp_size:
+        pytest.skip(f"Test requires {sp_size} GPUs but only {current_omni_platform.get_device_count()} available")
 
     height = 256
     width = 256
@@ -243,8 +242,10 @@ def test_sequence_parallel_ulysses4(model_name: str, dtype: torch.dtype, attn_ba
     ulysses_degree = 4
     ring_degree = 1
 
-    if device_count() < ulysses_degree * ring_degree:
-        pytest.skip(f"Test requires {ulysses_degree * ring_degree} GPUs but only {device_count()} available")
+    if current_omni_platform.get_device_count() < ulysses_degree * ring_degree:
+        pytest.skip(
+            f"Test requires {ulysses_degree * ring_degree} GPUs but only {current_omni_platform.get_device_count()} available"
+        )
 
     height = 272
     width = 272

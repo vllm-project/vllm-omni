@@ -27,8 +27,6 @@ from PIL import Image
 from safetensors.torch import save_file
 from vllm.utils.network_utils import get_open_port
 
-from vllm_omni.utils.platform_utils import is_npu
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
@@ -122,8 +120,6 @@ class OmniServer:
 
 @pytest.fixture(scope="module")
 def omni_server():
-    if is_npu():
-        pytest.skip("Tongyi-MAI/Z-Image-Turbo is not supported on NPU yet.")
     with OmniServer(MODEL, ["--num-gpus", "1"]) as server:
         yield server
 

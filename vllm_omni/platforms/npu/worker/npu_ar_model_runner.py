@@ -37,7 +37,7 @@ from vllm_ascend.utils import ProfileExecuteDuration
 
 from vllm_omni.core.sched.omni_ar_scheduler import KVCacheTransferData
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.npu.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 
 
 class ExecuteModelState(NamedTuple):
