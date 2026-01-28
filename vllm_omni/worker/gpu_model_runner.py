@@ -52,12 +52,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
                 )
             hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
-            self.talker_mtp_input_ids = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            self.talker_mtp_input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
-                self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False
+                self.max_num_tokens, hidden_size, dtype=self.dtype, numpy=False
             )
-            self.last_talker_hidden = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
+            self.last_talker_hidden = self._make_buffer(self.max_num_tokens, hidden_size, dtype=self.dtype, numpy=False)
+            self.text_step = self._make_buffer(self.max_num_tokens, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -649,6 +649,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         self.last_talker_hidden.gpu[:num_tokens_padded],
                         self.text_step.gpu[:num_tokens_padded],
                     )
+                    self.compilation_config.cache_dir = None
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
