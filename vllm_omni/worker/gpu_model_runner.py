@@ -52,12 +52,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
                 )
             hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
-            self.talker_mtp_input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+            self.talker_mtp_input_ids = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
-                self.max_num_tokens, hidden_size, dtype=self.dtype, numpy=False
+                self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False
             )
-            self.last_talker_hidden = self._make_buffer(self.max_num_tokens, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(self.max_num_tokens, hidden_size, dtype=self.dtype, numpy=False)
+            self.last_talker_hidden = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
+            self.text_step = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -643,11 +643,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 ),
             ):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
+                    num_tokens_padded_talker_mtp = min(num_tokens_padded, self.max_num_reqs)
                     outputs = self.talker_mtp(
-                        self.talker_mtp_input_ids.gpu[:num_tokens_padded],
-                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
-                        self.last_talker_hidden.gpu[:num_tokens_padded],
-                        self.text_step.gpu[:num_tokens_padded],
+                        self.talker_mtp_input_ids.gpu[:num_tokens_padded_talker_mtp],
+                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded_talker_mtp],
+                        self.last_talker_hidden.gpu[:num_tokens_padded_talker_mtp],
+                        self.text_step.gpu[:num_tokens_padded_talker_mtp],
                     )
                     self.compilation_config.cache_dir = None
                 outputs = self.model(
