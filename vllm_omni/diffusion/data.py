@@ -451,6 +451,7 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
