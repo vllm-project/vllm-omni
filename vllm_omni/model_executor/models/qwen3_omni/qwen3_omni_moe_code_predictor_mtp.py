@@ -126,23 +126,22 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape for attention
-        q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
-        k = k.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         # Apply normalization
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q = q.view(-1, self.q_size)
-        k = k.view(-1, self.kv_size)
+        q = self.q_norm(q).contiguous()
+        k = self.k_norm(k).contiguous()
+        q = q.reshape(-1, self.q_size)
+        k = k.reshape(-1, self.kv_size)
 
         # Apply RoPE
-        q, k = self.rotary_emb(position_ids.flatten(), q, k)
+        q, k = self.rotary_emb(position_ids.flatten().contiguous(), q, k)
 
         # Reshape for attention
-        q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
-        k = k.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         v_heads = v.transpose(1, 2).contiguous()
         q_heads = q.transpose(1, 2).contiguous()
@@ -409,7 +408,7 @@ def code_predictor_sample_fake(
     logits: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    return torch.zeros((logits.shape[0], 1), dtype=torch.int32, device=logits.device)
+    return torch.empty((logits.shape[0], 1), dtype=torch.int64, device=logits.device)
 
 
 direct_register_custom_op(
