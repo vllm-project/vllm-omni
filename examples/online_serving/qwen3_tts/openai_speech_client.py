@@ -61,13 +61,6 @@ def encode_audio_to_base64(audio_path: str) -> str:
 def run_tts_generation(args) -> None:
     """Run TTS generation via OpenAI-compatible /v1/audio/speech API."""
 
-    if args.task_type == "VoiceDesign":
-        args.model = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-    elif args.task_type == "Base":
-        args.model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    else:
-        args.model = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-
     # Build request payload
     payload = {
         "model": args.model,
