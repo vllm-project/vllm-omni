@@ -80,9 +80,10 @@ def _run_pre_test_cleanup():
 
 
 def _run_post_test_cleanup(enable_force=False):
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and enable_force:
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
         return
+
     import gc
 
     if torch.cuda.is_available():
