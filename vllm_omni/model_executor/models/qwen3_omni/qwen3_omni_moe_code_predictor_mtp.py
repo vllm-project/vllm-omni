@@ -460,7 +460,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             ]
         )
 
-        max_batch_size = vllm_config.scheduler_config.max_num_seqs
+        max_batch_size = vllm_config.scheduler_config.max_num_seqs * self.num_code_groups
         self.register_buffer(
             "position_ids_buffer",
             torch.arange(self.num_code_groups, dtype=torch.int64, device=next(self.parameters()).device)
