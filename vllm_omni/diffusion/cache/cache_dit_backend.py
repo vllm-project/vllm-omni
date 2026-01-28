@@ -791,7 +791,7 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
 CUSTOM_DIT_ENABLERS.update(
     {
         "WanPipeline": enable_cache_for_wan22,
-        "FluxPipeline": enable_cache_for_flux,
+        # "FluxPipeline": enable_cache_for_flux,
         "LongCatImagePipeline": enable_cache_for_longcat_image,
         "LongCatImageEditPipeline": enable_cache_for_longcat_image,
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
