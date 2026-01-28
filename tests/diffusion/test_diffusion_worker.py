@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Unit tests for GPUDiffusionWorker class.
+Unit tests for DiffusionWorker class.
 
-This module tests the GPUDiffusionWorker implementation:
+This module tests the DiffusionWorker implementation:
 - load_weights: Loading model weights
 - sleep: Putting worker into sleep mode (levels 1 and 2)
 - wake_up: Waking worker from sleep mode
@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from vllm_omni.diffusion.worker.gpu_diffusion_worker import GPUDiffusionWorker
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
 
 @pytest.fixture
@@ -33,18 +33,19 @@ def mock_od_config():
 
 @pytest.fixture
 def mock_gpu_worker(mock_od_config):
-    """Create a GPUDiffusionWorker with mocked initialization."""
-    with patch.object(GPUDiffusionWorker, "init_device"):
-        worker = GPUDiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
+    """Create a DiffusionWorker with mocked initialization."""
+    with patch.object(DiffusionWorker, "init_device"):
+        worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
         # Mock the model_runner with pipeline
         worker.model_runner = Mock()
         worker.model_runner.pipeline = Mock()
+        worker.device = torch.device("cuda", 0)
         worker._sleep_saved_buffers = {}
         return worker
 
 
-class TestGPUDiffusionWorkerLoadWeights:
-    """Test GPUDiffusionWorker.load_weights method."""
+class TestDiffusionWorkerLoadWeights:
+    """Test DiffusionWorker.load_weights method."""
 
     def test_load_weights_calls_pipeline(self, mock_gpu_worker):
         """Test that load_weights delegates to model_runner.load_weights."""
@@ -75,20 +76,21 @@ class TestGPUDiffusionWorkerLoadWeights:
         assert result == set()
 
 
-class TestGPUDiffusionWorkerSleep:
-    """Test GPUDiffusionWorker.sleep method."""
+class TestDiffusionWorkerSleep:
+    """Test DiffusionWorker.sleep method."""
 
-    @patch("vllm_omni.diffusion.worker.gpu_diffusion_worker.torch.cuda.mem_get_info")
+    @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
-    def test_sleep_level_1(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
+    def test_sleep_level_1(self, mock_allocator_class, mock_platform, mock_gpu_worker):
         """Test sleep mode level 1 (offload weights only)."""
         # Setup memory info mocks
-        # Before sleep: 1GB free, 8GB total
-        # After sleep: 3GB free, 8GB total (freed 2GB)
-        mock_mem_info.side_effect = [
-            (1 * 1024**3, 8 * 1024**3),  # Before sleep
-            (3 * 1024**3, 8 * 1024**3),  # After sleep
+        # Before sleep: 1GB free
+        # After sleep: 3GB free (freed 2GB)
+        mock_platform.get_free_memory.side_effect = [
+            1 * 1024**3,  # Before sleep
+            3 * 1024**3,  # After sleep
         ]
+        mock_platform.get_device_total_memory.return_value = 8 * 1024**3
 
         # Setup allocator mock
         mock_allocator = Mock()
@@ -104,15 +106,16 @@ class TestGPUDiffusionWorkerSleep:
         # Verify buffers were NOT saved (level 1 doesn't save buffers)
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
 
-    @patch("vllm_omni.diffusion.worker.gpu_diffusion_worker.torch.cuda.mem_get_info")
+    @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
-    def test_sleep_level_2(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
+    def test_sleep_level_2(self, mock_allocator_class, mock_platform, mock_gpu_worker):
         """Test sleep mode level 2 (offload all, save buffers)."""
         # Setup memory info mocks
-        mock_mem_info.side_effect = [
-            (1 * 1024**3, 8 * 1024**3),  # Before sleep
-            (5 * 1024**3, 8 * 1024**3),  # After sleep (freed 4GB)
+        mock_platform.get_free_memory.side_effect = [
+            1 * 1024**3,  # Before sleep
+            5 * 1024**3,  # After sleep (freed 4GB)
         ]
+        mock_platform.get_device_total_memory.return_value = 8 * 1024**3
 
         # Setup allocator mock
         mock_allocator = Mock()
@@ -141,15 +144,16 @@ class TestGPUDiffusionWorkerSleep:
         assert "buffer1" in mock_gpu_worker._sleep_saved_buffers
         assert "buffer2" in mock_gpu_worker._sleep_saved_buffers
 
-    @patch("vllm_omni.diffusion.worker.gpu_diffusion_worker.torch.cuda.mem_get_info")
+    @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
-    def test_sleep_memory_freed_validation(self, mock_allocator_class, mock_mem_info, mock_gpu_worker):
+    def test_sleep_memory_freed_validation(self, mock_allocator_class, mock_platform, mock_gpu_worker):
         """Test that sleep validates memory was actually freed."""
         # Simulate memory increase (should trigger assertion error)
-        mock_mem_info.side_effect = [
-            (3 * 1024**3, 8 * 1024**3),  # Before sleep: 3GB free
-            (1 * 1024**3, 8 * 1024**3),  # After sleep: 1GB free (negative freed!)
+        mock_platform.get_free_memory.side_effect = [
+            3 * 1024**3,  # Before sleep: 3GB free
+            1 * 1024**3,  # After sleep: 1GB free (negative freed!)
         ]
+        mock_platform.get_device_total_memory.return_value = 8 * 1024**3
 
         mock_allocator = Mock()
         mock_allocator_class.get_instance = Mock(return_value=mock_allocator)
@@ -160,8 +164,8 @@ class TestGPUDiffusionWorkerSleep:
             mock_gpu_worker.sleep(level=1)
 
 
-class TestGPUDiffusionWorkerWakeUp:
-    """Test GPUDiffusionWorker.wake_up method."""
+class TestDiffusionWorkerWakeUp:
+    """Test DiffusionWorker.wake_up method."""
 
     @patch("vllm.device_allocator.cumem.CuMemAllocator")
     def test_wake_up_without_buffers(self, mock_allocator_class, mock_gpu_worker):

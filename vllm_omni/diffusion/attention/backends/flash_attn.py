@@ -9,19 +9,16 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.fa import (
-    _pad_input,
-    _unpad_input,
-    _upad_input,
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
 
 logger = init_logger(__name__)
 
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def supports_attention_mask(cls) -> bool:
+        return True
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -51,25 +48,22 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
 
-    def forward(
+    def forward_cuda(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        """
-        Flash attention implementation.
+        """CUDA/ROCm flash attention implementation."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            _pad_input,
+            _unpad_input,
+            _upad_input,
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
 
-        Args:
-            query: (batch_size, seq_len, num_heads, head_dim)
-            key: (batch_size, seq_len, num_heads, head_dim)
-            value: (batch_size, seq_len, num_heads, head_dim)
-            attn_metadata: AttentionMetadata. Attention mask is supported as attn_metadata.attn_mask
-
-        Returns:
-            (batch_size, seq_len, num_heads, head_dim)
-        """
         query_length = query.size(1)
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         #  Contains at least one padding token in the sequence
@@ -106,3 +100,25 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.softmax_scale,
             )
         return out
+
+    def forward_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        """NPU attention implementation using mindiesd."""
+        from mindiesd import attention_forward
+
+        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        output = attention_forward(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            opt_mode="manual",
+            op_type="fused_attn_score",
+            layout="BNSD",
+        )
+        return output

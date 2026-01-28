@@ -81,7 +81,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import detect_device_type, is_npu
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
@@ -281,6 +281,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable torch.compile and force eager execution.",
     )
     parser.add_argument(
+        "--vae_use_slicing",
+        action="store_true",
+        help="Enable VAE slicing for memory optimization.",
+    )
+    parser.add_argument(
+        "--vae_use_tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
         help="Enable CPU offloading for diffusion models.",
@@ -306,12 +316,8 @@ def main():
     else:
         input_image = input_images
 
-    device = detect_device_type()
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
-    # Enable VAE memory optimizations on NPU
-    vae_use_slicing = is_npu()
-    vae_use_tiling = is_npu()
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -344,8 +350,8 @@ def main():
     # Initialize Omni with appropriate pipeline
     omni = Omni(
         model=args.model,
-        vae_use_slicing=vae_use_slicing,
-        vae_use_tiling=vae_use_tiling,
+        vae_use_slicing=args.vae_use_slicing,
+        vae_use_tiling=args.vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         parallel_config=parallel_config,

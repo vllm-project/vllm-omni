@@ -18,11 +18,23 @@ steps:
   #     queue: "ascend"
 
   - label: "Simple Unit Test"
-    depends_on: ~
+    depends_on: image-build
     commands:
-      - ".buildkite/scripts/simple_test.sh"
+      - pytest -v -s tests/entrypoints/
+      - pytest -v -s tests/diffusion/cache/
+      - pytest -v -s tests/model_executor/models/qwen2_5_omni/test_audio_length.py
+      - pytest -v -s tests/worker/
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Model Test"
     timeout_in_minutes: 20
@@ -149,7 +161,7 @@ steps:
     timeout_in_minutes: 20
     depends_on: image-build
     commands:
-      - pytest -s -v tests/diffusion/test_gpu_diffusion_worker.py
+      - pytest -s -v tests/diffusion/test_diffusion_worker.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
