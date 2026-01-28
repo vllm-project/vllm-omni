@@ -15,9 +15,11 @@ import queue
 import sys
 import time
 import traceback
+from collections.abc import Sequence
 from dataclasses import fields
-from typing import Any
+from typing import Any, Literal, cast
 
+from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -31,6 +33,7 @@ from vllm.v1.engine.llm_engine import LLMEngine
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors import build_stage_connectors
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
+from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
 from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
@@ -46,7 +49,8 @@ from vllm_omni.entrypoints.stage_utils import (
     maybe_dump_to_shm,
     set_stage_devices,
 )
-from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils import detect_device_type
 
 logger = init_logger(__name__)
@@ -62,35 +66,6 @@ def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
             if key in od_field_names:
                 od_config[key] = value
     return od_config
-
-
-def prepare_sampling_params(sampling_params: Any, stage_type: str) -> Any:
-    """Prepare sampling parameters for the given stage type.
-
-    Args:
-        sampling_params: Raw sampling parameters (dict or SamplingParams)
-        stage_type: Either "llm" or "diffusion"
-
-    Returns:
-        Processed sampling parameters ready for engine consumption
-    """
-    if stage_type == "diffusion":
-        # For diffusion stages: extract kwargs, handling different input types
-        if isinstance(sampling_params, dict):
-            diffusion_kwargs = dict(sampling_params)
-        else:
-            diffusion_kwargs = getattr(sampling_params, "__dict__", {}) or {}
-
-        # Remove 'prompt' and 'request_id' to avoid conflict with explicit arguments
-        diffusion_kwargs.pop("prompt", None)
-        diffusion_kwargs.pop("request_id", None)
-        return diffusion_kwargs
-
-    else:  # stage_type == "llm"
-        # For LLM stages: ensure we have a SamplingParams object
-        if isinstance(sampling_params, dict):
-            return SamplingParams(**sampling_params)
-        return sampling_params
 
 
 class OmniStage:
@@ -123,7 +98,7 @@ class OmniStage:
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
-        self.stage_type = getattr(stage_config, "stage_type", "llm")
+        self.stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -137,7 +112,14 @@ class OmniStage:
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
         # For LLM stage, this can directly be a SamplingParams-compatible dict;
         # For diffusion stage, this only serves as default values for diffusion kwargs.
-        self.default_sampling_params = _to_dict(default_sampling_params)
+        default_sampling_params = _to_dict(default_sampling_params)
+        # Further convert it to dataclass to check fields
+        try:
+            self.default_sampling_params = (
+                SamplingParams if self.stage_type == "llm" else OmniDiffusionSamplingParams
+            )(**default_sampling_params)
+        except TypeError as error:
+            raise TypeError(f"Invalid default_sampling_params for stage {self.stage_id}: {error}") from error
         # Runtime orchestration state (added)
         self._in_q: mp.Queue | None = None
         self._out_q: mp.Queue | None = None
@@ -519,7 +501,7 @@ def _stage_worker(
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
     connectors_config = stage_payload.get("connectors_config", {})
-    stage_type = stage_payload.get("stage_type", "llm")
+    stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
 
     # Aggregates for running average
     _agg_total_tokens = 0
@@ -708,15 +690,14 @@ def _stage_worker(
                 pass
     logger.debug("Engine initialized")
     # Initialize OmniConnectors if configured
-    connectors = {}
+    connectors: dict[tuple[str, str], OmniConnectorBase] | None = {}
     if connectors_config:
-        built_connectors = build_stage_connectors(
+        connectors = build_stage_connectors(
             stage_id=stage_id,
             connectors_config=connectors_config,
         )
-        if built_connectors is None:
+        if connectors is None:
             return
-        connectors = built_connectors
 
     # Signal readiness to orchestrator
     try:
@@ -785,6 +766,7 @@ def _stage_worker(
             continue
 
         batch_tasks: list[dict[str, Any]] = [task]
+        tasks_failed_to_add_to_batch: list[dict[str, Any]] = []
         start_time = _time.time()
         if max_batch_size > 1:
             while len(batch_tasks) < max_batch_size:
@@ -800,7 +782,20 @@ def _stage_worker(
                         if extra_type == OmniStageTaskType.PROFILER_STOP:
                             out_q.put({"type": "profiler_result", "data": p_data})
                         continue
-                    batch_tasks.append(extra)
+                    # Ensure that all tasks have the same sampling params
+                    # If no, put them in a temporary container and add back to queue
+                    # This should be always true, because user only calls omni.generate() once and it blocks
+                    # User can only pass one sampling param object, but the list of prompts are separated.
+                    if task.get("sampling_params") != extra.get("sampling_params"):
+                        logger.warning(
+                            """In offline mode, expect all prompts in one `omni.generate()` call to share same sampling params"""  # noqa: E501 # line too long
+                            f"""However, prompt {task.get("engine_inputs")} has sampling params {task.get("sampling_params")}, """  # noqa: E501 # line too long
+                            f"""whereas the prompt {extra.get("engine_inputs")} has sampling params {extra.get("sampling_params")}."""  # noqa: E501 # line too long
+                            """The two tasks cannot be combined in one batch request."""
+                        )
+                        tasks_failed_to_add_to_batch.append(extra)
+                    else:
+                        batch_tasks.append(extra)
                     end_time = _time.time()
                     duration = end_time - start_time
                     if duration > batch_timeout:
@@ -815,9 +810,13 @@ def _stage_worker(
                         break
                     else:
                         continue
+        for task_to_readd in tasks_failed_to_add_to_batch:
+            in_q.put(task_to_readd)
+        # Ensure that the popped tasks are with identical sampling params. Take one of them.
+        batch_engine_sampling_params: OmniSamplingParams = batch_tasks[0]["sampling_params"]
 
         batch_request_ids: list[Any] = []
-        batch_engine_inputs: list[Any] = []
+        batch_engine_inputs: list[OmniPromptType] = []
         _rx_bytes_by_rid: dict[Any, int] = {}
         _rx_decode_ms_by_rid: dict[Any, float] = {}
         _in_flight_ms_by_rid: dict[Any, float] = {}
@@ -839,6 +838,9 @@ def _stage_worker(
                 connectors=connectors,
                 stage_id=stage_id,
             )
+            # TODO: hack type annotation for now.
+            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
+            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
 
             if ein is None or _rx_metrics is None:
                 raise RuntimeError(
@@ -850,17 +852,14 @@ def _stage_worker(
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
-            if isinstance(ein, list):
+            if isinstance(ein, (str, dict)):
+                # Types like OmniTextPrompt, TextPrompt are TypedDict, essentially dict and enters this branch
+                batch_engine_inputs.append(ein)
+            elif isinstance(ein, Sequence):
                 batch_engine_inputs.extend(ein)
-            elif isinstance(ein, dict):
-                batch_engine_inputs.append(ein)
-            elif isinstance(ein, str):
-                # For diffusion stage-0, ein might be a string prompt directly
-                batch_engine_inputs.append(ein)
             else:
-                # For other types (e.g., OmniTokensPrompt, TextPrompt), append as-is
+                # Other unknown types, append as-is
                 batch_engine_inputs.append(ein)
-        sampling_params = batch_tasks[0]["sampling_params"]
         logger.debug(
             "Received batch size=%d, request_ids=%s",
             len(batch_tasks),
@@ -868,65 +867,30 @@ def _stage_worker(
         )
         try:
             _batch_seq += 1
-            gen_outputs: list[Any] = []
+            gen_outputs: list[OmniRequestOutput | RequestOutput] = []
             _gen_t0 = _time.time()
             if stage_type == "diffusion":
-                # For diffusion, batch_engine_inputs should be prompts (strings)
-                # Convert to list of strings if needed
-                prompts = []
-                for ein in batch_engine_inputs:
-                    if isinstance(ein, str):
-                        prompts.append(ein)
-                    elif isinstance(ein, dict) and "prompt" in ein:
-                        prompts.append(ein["prompt"])
-                    elif hasattr(ein, "prompt"):
-                        prompts.append(ein.prompt)
-                    else:
-                        prompts.append(str(ein))
-                # Prepare diffusion kwargs from sampling parameters
-                diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
-
-                # Pass batch_request_ids to ensure correct ID mapping
-                diffusion_kwargs["request_ids"] = batch_request_ids
-
+                stage_engine = cast(OmniDiffusion, stage_engine)
+                batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
                 # Diffusion generate returns results directly, not an iterator
-                diffusion_results = stage_engine.generate(prompts, **diffusion_kwargs)
-                # Convert to list format compatible with LLM outputs
-                # Ensure each result has a request_id for proper mapping
-                if isinstance(diffusion_results, list):
-                    gen_outputs = diffusion_results
-                    # Assign request_ids if not present
-                    for idx, result in enumerate(gen_outputs):
-                        if not hasattr(result, "request_id") or result.request_id is None:
-                            if idx < len(batch_request_ids):
-                                if hasattr(result, "request_id"):
-                                    result.request_id = batch_request_ids[idx]
-                                else:
-                                    # Create a wrapper object if result doesn't support request_id
-                                    from types import SimpleNamespace
-
-                                    wrapped = SimpleNamespace()
-                                    wrapped.request_id = batch_request_ids[idx]
-                                    wrapped.output = result
-                                    gen_outputs[idx] = wrapped
-                else:
-                    gen_outputs = [diffusion_results]
-                    # Assign request_id to single result
-                    if len(batch_request_ids) > 0:
-                        if hasattr(gen_outputs[0], "request_id"):
-                            gen_outputs[0].request_id = batch_request_ids[0]
-                        else:
-                            from types import SimpleNamespace
-
-                            wrapped = SimpleNamespace()
-                            wrapped.request_id = batch_request_ids[0]
-                            wrapped.output = gen_outputs[0]
-                            gen_outputs[0] = wrapped
+                diffusion_results = stage_engine.generate(
+                    batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
+                )
+                gen_outputs.extend(diffusion_results)
+                # Assign request_ids if not present
+                for idx, result in enumerate(gen_outputs):
+                    if not hasattr(result, "request_id") or result.request_id is None:
+                        if idx < len(batch_request_ids):
+                            result.request_id = batch_request_ids[idx]
             else:
-                # LLM engine: use vLLM native SamplingParams
-                llm_sampling_params = prepare_sampling_params(sampling_params, "llm")
-                for ro in stage_engine.generate(batch_engine_inputs, llm_sampling_params, use_tqdm=False):
-                    gen_outputs.append(ro)
+                stage_engine = cast(OmniLLM, stage_engine)
+                batch_engine_sampling_params = cast(SamplingParams, batch_engine_sampling_params)
+                results = stage_engine.generate(
+                    batch_engine_inputs,  # type: ignore # silent complaints about list of subclassed TypedDict
+                    batch_engine_sampling_params,
+                    use_tqdm=False,
+                )
+                gen_outputs.extend(results)
             _gen_t1 = _time.time()
             _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
             logger.debug(f"Generate done: batch={len(batch_tasks)}, req_ids={batch_request_ids}, gen_ms={_gen_ms:.1f}")
@@ -935,7 +899,7 @@ def _stage_worker(
             req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
             unmapped: list[Any] = []
             for ro in gen_outputs:
-                rid = getattr(ro, "request_id", None)
+                rid = ro.request_id
                 if rid in req_to_outputs:
                     req_to_outputs[rid].append(ro)
                 else:
@@ -1354,6 +1318,10 @@ async def _stage_worker_async(
                 connectors=connectors,
                 stage_id=stage_id,
             )
+            # TODO: hack type annotation for now.
+            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
+            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+
             if ein is None or _rx_metrics is None:
                 raise RuntimeError(
                     f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
@@ -1362,36 +1330,23 @@ async def _stage_worker_async(
             _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
-            sampling_params = task["sampling_params"]
             logger.debug("Received batch size=1, request_ids=%s", rid)
             _gen_t0 = _time.time()
-            if isinstance(ein, list):
+            if isinstance(ein, Sequence) and not isinstance(ein, str):
                 ein = ein[0]
 
             if stage_type == "diffusion":
-                # For diffusion, ein should be prompts (strings)
-                # Convert to string if needed
-                if isinstance(ein, str):
-                    prompt = ein
-                elif isinstance(ein, dict) and "prompt" in ein:
-                    prompt = ein["prompt"]
-                elif hasattr(ein, "prompt"):
-                    prompt = ein.prompt
-                else:
-                    prompt = str(ein)
-
-                # Prepare diffusion kwargs from sampling parameters
-                diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
+                diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await stage_engine.generate(prompt=prompt, request_id=rid, **diffusion_kwargs)
+                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))
             else:
-                # LLM stages: ensure using SamplingParams
-                llm_sampling_params = prepare_sampling_params(sampling_params, "llm")
+                ein = cast(PromptType, ein)
+                llm_sampling_params: SamplingParams = task["sampling_params"]
                 gen_output = None
-                async for res in stage_engine.generate(ein, llm_sampling_params, rid):
+                async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0

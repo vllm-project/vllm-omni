@@ -10,13 +10,14 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
 import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
 from starlette.routing import Route
+from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving_messages import AnthropicServingMessages
 from vllm.entrypoints.launcher import serve_http
@@ -80,6 +81,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -865,7 +867,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         HTTPException: For validation errors, missing engine, or generation failures
     """
     # Get engine client (AsyncOmni) from app state
-    engine_client: EngineClient | None = getattr(raw_request.app.state, "engine_client", None)
+    engine_client: EngineClient | AsyncOmni | None = getattr(raw_request.app.state, "engine_client", None)
     if engine_client is None or not hasattr(engine_client, "stage_list"):
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -925,10 +927,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
     try:
         # Build params - pass through user values directly
-        gen_params = {
-            "prompt": request.prompt,
-            "num_outputs_per_prompt": request.n,
-        }
+        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
 
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         if request.lora is not None:
@@ -960,62 +960,72 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                     detail="Invalid lora object: both name and path are required.",
                 )
 
-            gen_params["lora_request"] = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+            gen_params.lora_request = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
             if lora_scale is not None:
-                gen_params["lora_scale"] = float(lora_scale)
+                gen_params.lora_scale = float(lora_scale)
 
         # Parse and add size if provided
         if request.size:
             width, height = parse_size(request.size)
-            gen_params["height"] = height
-            gen_params["width"] = width
+            gen_params.height = height
+            gen_params.width = width
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
 
         # Add optional parameters ONLY if provided
         if request.num_inference_steps is not None:
-            gen_params["num_inference_steps"] = request.num_inference_steps
+            gen_params.num_inference_steps = request.num_inference_steps
         if request.negative_prompt is not None:
-            gen_params["negative_prompt"] = request.negative_prompt
+            prompt["negative_prompt"] = request.negative_prompt
         if request.guidance_scale is not None:
-            gen_params["guidance_scale"] = request.guidance_scale
+            gen_params.guidance_scale = request.guidance_scale
         if request.true_cfg_scale is not None:
-            gen_params["true_cfg_scale"] = request.true_cfg_scale
+            gen_params.true_cfg_scale = request.true_cfg_scale
         if request.seed is not None:
-            gen_params["seed"] = request.seed
-        gen_params["request_id"] = f"img_gen_{int(time.time())}"
+            gen_params.seed = request.seed
+        request_id = f"img_gen_{int(time.time())}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
+        engine_client = cast(AsyncOmni, engine_client)
         result = None
         stage_list = getattr(engine_client, "stage_list", None)
         if isinstance(stage_list, list):
-            default_params_list = getattr(engine_client, "default_sampling_params_list", None)
+            default_params_list: list[OmniSamplingParams] | None = getattr(
+                engine_client, "default_sampling_params_list", None
+            )
             if not isinstance(default_params_list, list):
-                default_params_list = [{} for _ in stage_types]
+                default_params_list = [
+                    OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
+                ]
             else:
                 default_params_list = list(default_params_list)
             if len(default_params_list) != len(stage_types):
-                default_params_list = (default_params_list + [{} for _ in stage_types])[: len(stage_types)]
+                default_params_list = (
+                    default_params_list
+                    + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
+                )[: len(stage_types)]
 
-            sampling_params_list: list[dict[str, Any]] = []
+            sampling_params_list: list[OmniSamplingParams] = []
             for idx, stage_type in enumerate(stage_types):
                 if stage_type == "diffusion":
                     sampling_params_list.append(gen_params)
                 else:
                     base_params = default_params_list[idx]
-                    sampling_params_list.append(dict(base_params) if isinstance(base_params, dict) else base_params)
+                    sampling_params_list.append(base_params)
 
             async for output in engine_client.generate(
-                prompt=gen_params["prompt"],
-                request_id=gen_params["request_id"],
+                prompt=prompt,
+                request_id=request_id,
                 sampling_params_list=sampling_params_list,
             ):
                 result = output
         else:
-            result = await engine_client.generate(**gen_params)
+            result = await engine_client.generate(
+                prompt=prompt, request_id=request_id, sampling_params_list=[gen_params]
+            )
 
         if result is None:
             raise HTTPException(
