@@ -44,7 +44,7 @@ logger = init_logger(__name__)
 
 @functools.cache
 def _has_fused_qknorm_rope():
-    return current_platform.is_rocm()
+    return current_platform.is_cuda_alike()
 
 
 class ImageRopePrepare(nn.Module):
@@ -533,11 +533,7 @@ class QwenImageCrossAttention(nn.Module):
             img_qkv = img_qkv.view(-1, img_qkv_shape_ori[-1])
             txt_qkv = txt_qkv.view(-1, txt_qkv_shape_ori[-1])
 
-            img_cos_sin = vid_freqs
-            txt_cos_sin = txt_freqs
-            img_position_ids = vid_position_ids
-            txt_position_ids = txt_position_ids
-
+            # fused_qk_norm_rope applies qk rmsnorm and rope to qkv in-place
             fused_qk_norm_rope(
                 qkv=img_qkv,
                 num_heads_q=self.query_num_heads,
@@ -545,11 +541,11 @@ class QwenImageCrossAttention(nn.Module):
                 num_heads_v=self.kv_num_heads,
                 head_dim=self.head_dim,
                 eps=self.eps,
-                q_weight=self.norm_q.weight.data,
-                k_weight=self.norm_k.weight.data,
-                cos_sin_cache=img_cos_sin,
+                q_weight=self.norm_q.weight,
+                k_weight=self.norm_k.weight,
+                cos_sin_cache=vid_freqs,
                 is_neox=False,
-                position_ids=img_position_ids,
+                position_ids=vid_position_ids,
             )
             fused_qk_norm_rope(
                 qkv=txt_qkv,
@@ -558,9 +554,9 @@ class QwenImageCrossAttention(nn.Module):
                 num_heads_v=self.add_kv_num_heads,
                 head_dim=self.head_dim,
                 eps=self.eps,
-                q_weight=self.norm_added_q.weight.data,
-                k_weight=self.norm_added_k.weight.data,
-                cos_sin_cache=txt_cos_sin,
+                q_weight=self.norm_added_q.weight,
+                k_weight=self.norm_added_k.weight,
+                cos_sin_cache=txt_freqs,
                 is_neox=False,
                 position_ids=txt_position_ids,
             )
@@ -892,6 +888,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.img_in = nn.Linear(in_channels, self.inner_dim)
         self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
 
+        # The fused qk norm rope is only supported when head_dim is divisible by 64
         self.use_fused_qk_rope = _has_fused_qknorm_rope() and attention_head_dim % 64 == 0
 
         self.transformer_blocks = nn.ModuleList(
