@@ -76,12 +76,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     noise_pred = self.combine_cfg_noise(noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize)
 
                     del gathered, neg_noise_pred
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                     return noise_pred
                 else:
                     del gathered
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     return None
             else:
                 # Sequential CFG: compute both positive and negative
