@@ -53,6 +53,9 @@ def default_vllm_config():
 
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests():
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+        print("GPU cleanup disabled")
+        return
     print("\n=== PRE-TEST GPU CLEANUP ===")
     _run_pre_test_cleanup()
     yield
@@ -60,10 +63,6 @@ def clean_gpu_memory_between_tests():
 
 
 def _run_pre_test_cleanup():
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
-        print("GPU cleanup disabled")
-        return
-
     print("Pre-test GPU status:")
     _print_simple_gpu_status()
 
@@ -81,9 +80,6 @@ def _run_pre_test_cleanup():
 
 
 def _run_post_test_cleanup():
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
-        return
-
     import gc
 
     if torch.cuda.is_available():
@@ -871,6 +867,8 @@ class OmniServer:
         *,
         env_dict: dict[str, str] | None = None,
     ) -> None:
+        _run_post_test_cleanup()
+        cleanup_dist_env_and_memory()
         self.model = model
         self.serve_args = serve_args
         self.env_dict = env_dict
