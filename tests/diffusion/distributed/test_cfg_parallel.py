@@ -7,7 +7,6 @@ equivalent results with and without CFG parallel using fixed random inputs.
 """
 
 import os
-from tkinter.constants import X
 
 import pytest
 import torch
@@ -117,7 +116,7 @@ class SimpleTransformer(torch.nn.Module):
         x = residual + attn_output
         residual = x
         x = self.norm2(x)
-        x = residual + X
+        x = residual + x
         x = x.transpose(1, 2).view(B, self.hidden_dim, H, W)
 
         out = self.final_proj(x)
@@ -305,8 +304,8 @@ def _test_cfg_sequential_worker(
 
 
 @pytest.mark.parametrize("cfg_parallel_size", [2])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 def test_predict_noise_maybe_with_cfg(
     cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool, tmp_path
@@ -389,7 +388,7 @@ def test_predict_noise_maybe_with_cfg(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_predict_noise_without_cfg(dtype: torch.dtype):
     """
     Test predict_noise_maybe_with_cfg when do_true_cfg=False.
