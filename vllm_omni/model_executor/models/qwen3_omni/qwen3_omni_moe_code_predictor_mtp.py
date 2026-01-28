@@ -460,15 +460,6 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             ]
         )
 
-        max_batch_size = max(vllm_config.scheduler_config.max_num_seqs, self.num_code_groups)
-        self.register_buffer(
-            "position_ids_buffer",
-            torch.arange(self.num_code_groups, dtype=torch.int64, device=next(self.parameters()).device)
-            .unsqueeze(0)
-            .expand(max_batch_size, -1),
-            persistent=False,
-        )
-
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -512,7 +503,11 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             # Input for this layer: [last_talker_hidden, prev_layer_embed]
 
             # Forward through code_predictor model
-            position_ids = self.position_ids_buffer[:batch_size, : layer_idx + 2]  # [1, seq_len]
+            position_ids = (
+                torch.arange(layer_idx + 2, dtype=torch.int64, device=layer0_code.device)
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+            )  # [1, seq_len]
             outputs = self.model(
                 inputs_embeds=current_input,
                 attention_mask=None,
