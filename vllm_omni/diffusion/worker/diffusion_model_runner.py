@@ -28,8 +28,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 
 logger = init_logger(__name__)
 
@@ -62,10 +61,9 @@ class DiffusionModelRunner:
         self.device = device
         self.pipeline = None
         self.cache_backend = None
-        self.connector = None
 
-        # Initialize OmniConnector after vllm_config is available (via init_device_and_model)
-        self._init_omni_connector()
+        # Initialize KV cache manager for connector management
+        self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
     def load_model(
         self,
@@ -138,126 +136,6 @@ class DiffusionModelRunner:
 
         logger.info("Model runner: Initialization complete.")
 
-    def _init_omni_connector(self) -> None:
-        # TODO(wzliu)! get real connector from yaml file instead of hardcode
-        """Initialize OmniConnector for KV cache transfer."""
-        try:
-            connector_config = None
-
-            # 1. Try to get from omni_kv_config (injected from YAML)
-            # Use self.od_config because self.vllm_config is a dummy VllmConfig without model_config
-            if self.od_config.omni_kv_config:
-                connector_config = self.od_config.omni_kv_config.get("connector_config")
-
-            if not connector_config:
-                logger.warning("No OmniConnector config found, skipping initialization")
-                return
-
-            logger.info(f"Initializing OmniConnector with config: {connector_config}")
-
-            c_type = connector_config.get("type")
-            if not c_type:
-                logger.error("Connector config missing 'type'")
-                return
-
-            c_extra = {k: v for k, v in connector_config.items() if k != "type"}
-            connector_spec = ConnectorSpec(name=c_type, extra=c_extra)
-
-            self.connector = OmniConnectorFactory.create_connector(connector_spec)
-
-        except Exception as e:
-            logger.error(f"Failed to initialize OmniConnector: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
-        """Receive KV cache for a request via OmniConnector."""
-        # TODO(wzliu)! must get control info from stage queue instead of hardcode
-        if not req.request_ids:
-            logger.warning("Request has no ID, cannot receive KV cache")
-            return
-        request_id = req.request_ids[0]
-
-        try:
-            logger.info(f"Attempting to receive KV cache for request {request_id}")
-
-            # TODO: Key used for transfer (must match sender side)
-            # key = f"kv_cache_{req.request_id}"
-
-            # Get data from connector
-            # Determine from_stage and to_stage dynamically
-            omni_kv_config = self.od_config.omni_kv_config
-            stage_id = omni_kv_config.get("stage_id")
-            engine_input_source = omni_kv_config.get("engine_input_source", [])
-
-            to_stage = stage_id
-            # Default to stage_id - 1 if input source is not explicit
-            if engine_input_source:
-                from_stage = engine_input_source[0]
-            elif isinstance(stage_id, int):
-                from_stage = stage_id - 1
-            else:
-                raise ValueError("Invalid stage id")
-            logger.info(f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}...")
-
-            # Check if we should receive KV cache based on config
-            need_recv_cache = omni_kv_config.get("need_recv_cache", False)
-            if need_recv_cache:
-                # Default timeout 30 seconds to prevent infinite hanging
-                timeout = omni_kv_config.get("recv_timeout", 30.0)
-                start_time = time.time()
-
-                while True:
-                    get_key = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
-                    result = self.connector.get(
-                        from_stage=from_stage,
-                        to_stage=to_stage,
-                        get_key=get_key,
-                    )
-                    if result:
-                        break
-
-                    if time.time() - start_time > timeout:
-                        logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
-                        result = None
-                        break
-
-                    time.sleep(0.5)
-            else:
-                logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
-                result = None
-
-            if result:
-                data, size = result
-                logger.info(f"Successfully received KV cache for {request_id}")
-
-                # Assume data structure matches KVCacheTransferData.to_dict()
-                if isinstance(data, dict) and "layer_blocks" in data:
-                    # Get layer blocks and ensure they are on the correct device
-                    layer_blocks = data["layer_blocks"]
-
-                    # Move tensors to GPU if needed (OmniSerializer should handle tensor reconstruction)
-                    for cache_list in [layer_blocks["key_cache"], layer_blocks["value_cache"]]:
-                        for i, tensor in enumerate(cache_list):
-                            if isinstance(tensor, torch.Tensor) and tensor.device != self.pipeline.device:
-                                cache_list[i] = tensor.to(self.pipeline.device).contiguous()
-                    from types import SimpleNamespace
-
-                    req.sampling_params.past_key_values = SimpleNamespace(**layer_blocks)
-
-                if "metadata" in data:
-                    req.sampling_params.kv_metadata = data["metadata"]
-
-            else:
-                logger.warning(f"No KV cache received for {request_id} (timeout or empty)")
-
-        except Exception as e:
-            logger.error(f"Error receiving KV cache for {request_id}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
@@ -277,9 +155,8 @@ class DiffusionModelRunner:
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
-        # [Omni] KV Cache Receiving Logic
-        if req.sampling_params.need_kv_receive and self.connector is not None:
-            self._receive_kv_cache_for_request(req)
+        # The manager handles the check for need_recv_cache internally
+        self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
 
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
             req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
