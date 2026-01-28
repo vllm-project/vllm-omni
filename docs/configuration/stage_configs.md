@@ -40,7 +40,7 @@ stage_args:
     engine_args: # Engine arguments for a certain engine
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration # The model implementation registered in model_executor/models/registry.py
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker # The specific worker used
+      worker_type: ar # The specific worker used
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler # The specific scehduler used
       gpu_memory_utilization: 0.8 # The gpu memory allocation for the stage within a single chip
       enforce_eager: true  # Now we only support eager mode
@@ -66,7 +66,7 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true
@@ -92,7 +92,7 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.15
       enforce_eager: true

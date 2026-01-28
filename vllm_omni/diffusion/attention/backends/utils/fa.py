@@ -15,9 +15,9 @@
 import torch
 import torch.nn.functional as F
 
-from vllm_omni.utils.platform_utils import is_rocm
+from vllm_omni.platforms import current_omni_platform
 
-if is_rocm():
+if current_omni_platform.is_rocm():
     from vllm._aiter_ops import is_aiter_found_and_supported
 
     # Choose to enable this by default on ROCm

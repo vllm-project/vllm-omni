@@ -22,7 +22,7 @@ import torch
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.utils.platform_utils import detect_device_type
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,8 +118,7 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 
 def main():
     args = parse_args()
-    device = detect_device_type()
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     print(f"\n{'=' * 60}")
     print("Stable Audio Open - Text-to-Audio Generation")

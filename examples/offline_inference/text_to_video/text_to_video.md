@@ -29,4 +29,8 @@ Key arguments:
 - `--boundary_ratio`: Boundary split ratio for low/high DiT.
 - `--fps`: frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: path to save the generated video.
+- `--vae_use_slicing`: enable VAE slicing for memory optimization.
+- `--vae_use_tiling`: enable VAE tiling for memory optimization.
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+
+> ℹ️ If you encounter OOM errors, try using `--vae_use_slicing` and `--vae_use_tiling` to reduce memory usage.

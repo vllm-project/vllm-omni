@@ -57,12 +57,12 @@ def set_stage_devices(
         - CUDA: Sets CUDA_VISIBLE_DEVICES and calls torch.cuda.set_device()
         - NPU: Sets ASCEND_RT_VISIBLE_DEVICES and calls torch.npu.set_device()
     """
-    from vllm_omni.utils import detect_device_type, get_device_control_env_var
+    from vllm_omni.platforms import current_omni_platform
 
     if device_type is None:
-        device_type = detect_device_type()
+        device_type = current_omni_platform.device_type
 
-    env_var = get_device_control_env_var()
+    env_var = current_omni_platform.device_control_env_var
 
     try:
         selected_physical: int | None = None

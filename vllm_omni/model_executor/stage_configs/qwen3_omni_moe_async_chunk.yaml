@@ -14,7 +14,7 @@ stage_args:
     engine_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.6
       enforce_eager: false
@@ -46,7 +46,7 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.3
       enforce_eager: false
@@ -77,7 +77,7 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true

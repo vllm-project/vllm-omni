@@ -9,7 +9,7 @@ stage_args:
     engine_args:
       model_stage: thinker
       model_arch: BagelForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.4
       enforce_eager: true
