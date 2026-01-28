@@ -154,7 +154,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     Input Setting: stream=True
     Datasets: single request
     """
-    # TODO：This skip will be removed when the chunk scenario supports multimodal input
+    # TODO：This skip will be removed when the chunk scenario supports multimodal input.
     param = request.node.callspec.params.get("omni_server")
 
     if param[1] == CHUNK_CONFIG_PATH:
