@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionMetadata
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend
@@ -34,9 +34,11 @@ class Attention(nn.Module):
         scatter_idx: int = 2,
         gather_idx: int = 1,
         use_sync: bool = False,
+        # To support different attn backends in cross- and self-attention
+        attn_backend: AttentionBackend = None,
     ):
         super().__init__()
-        self.attn_backend = get_attn_backend(-1)
+        self.attn_backend = get_attn_backend(-1) if attn_backend is None else attn_backend
         self.attn_impl_cls = self.attn_backend.get_impl_cls()
         self.attention = self.attn_impl_cls(
             num_heads=num_heads,

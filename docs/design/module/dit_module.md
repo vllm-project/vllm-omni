@@ -441,6 +441,8 @@ class Attention(nn.Module):
 
 - **SageAttention**: Sparse attention implementation from SageAttention library
 
+- **SpargeAttention**: Sparse attention implementation from SpargeAttention library
+
 - **AscendAttention**: NPU-optimized attention for Ascend hardware
 
 These backends provide the **kernel implementations** for attention computation. For attention-level sequence parallelism strategies (Ring Attention, Ulysses), see [Parallel Attention](#52-parallel-attention).
@@ -463,7 +465,7 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
 
 1. **Environment Variable**: `DIFFUSION_ATTENTION_BACKEND` for manual override
 
-    - Valid values: `FLASH_ATTN`, `TORCH_SDPA`, `SAGE_ATTN`, `ASCEND`
+    - Valid values: `FLASH_ATTN`, `TORCH_SDPA`, `SAGE_ATTN`, `SPARGE_ATTN`, `ASCEND`
 
     - Example: `export DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN`
 
@@ -478,6 +480,10 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
 - **FlashAttention**: Requires `flash-attn` package installed
 
 - **SageAttention**: Requires `sage-attention` package (from THU-ML GitHub)
+
+- **SpargeAttention**: Requires `spas_sage_attn` package (from THU-ML GitHub)
+
+  - Environment variable `SPARGE_ATTN_TOPK` to set topk (default: 0.5)
 
 - **AscendAttention**: Only available on Ascend NPU hardware
 
@@ -504,6 +510,10 @@ _BACKEND_CONFIG = {
     "SAGE_ATTN": {
         "module": "vllm_omni.diffusion.attention.backends.sage_attn",
         "class": "SageAttentionBackend",
+    },
+    "SPARGE_ATTN": {
+        "module": "vllm_omni.diffusion.attention.backends.sparge_attn",
+        "class": "SpargeAttentionBackend",
     },
     "ASCEND": {
         "module": "vllm_omni.diffusion.attention.backends.ascend_attn",

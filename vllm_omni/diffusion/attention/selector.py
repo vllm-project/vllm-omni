@@ -30,6 +30,10 @@ _BACKEND_CONFIG = {
         "module": "vllm_omni.diffusion.attention.backends.sage_attn",
         "class": "SageAttentionBackend",
     },
+    "SPARGE_ATTN": {
+        "module": "vllm_omni.diffusion.attention.backends.sparge_attn",
+        "class": "SpargeAttentionBackend",
+    },
     "ASCEND": {"module": "vllm_omni.diffusion.attention.backends.ascend_attn", "class": "AscendAttentionBackend"},
 }
 

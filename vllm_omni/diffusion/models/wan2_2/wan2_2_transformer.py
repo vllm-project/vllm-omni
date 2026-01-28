@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -17,6 +18,14 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+try:
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -341,12 +350,19 @@ class WanCrossAttention(nn.Module):
             ]
         )
 
+        # TODO Generalize this for other backends
+        # TODO Add this to attention configuration when available
+        attn_backend = None
+        if os.environ.get("DIFFUSION_ATTENTION_BACKEND") == "SPARGE_ATTN":
+            attn_backend = FlashAttentionBackend if HAS_FLASH_ATTN else SDPABackend
+
         # Unified attention layer
         self.attn = Attention(
             num_heads=num_heads,
             head_size=head_dim,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            attn_backend=attn_backend,
         )
 
     def forward(
