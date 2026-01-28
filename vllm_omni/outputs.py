@@ -123,6 +123,58 @@ class OmniRequestOutput:
         """Return the number of generated images."""
         return len(self.images)
 
+    # Pass-through properties keep vLLM serving codepaths compatible with
+    # OmniRequestOutput for pipeline outputs (Issue #345).
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        """Return prompt token IDs from the underlying request output.
+
+        This property is required for compatibility with vLLM's streaming
+        chat completion generator which checks res.prompt_token_ids.
+        """
+        if self.request_output is not None:
+            return getattr(self.request_output, "prompt_token_ids", None)
+        return None
+
+    @property
+    def outputs(self) -> list[Any]:
+        """Return outputs from the underlying request output.
+
+        This property is required for compatibility with vLLM's streaming
+        and non-streaming chat completion generators.
+        """
+        if self.request_output is not None:
+            return getattr(self.request_output, "outputs", [])
+        return []
+
+    @property
+    def encoder_prompt_token_ids(self) -> list[int] | None:
+        """Return encoder prompt token IDs from the underlying request output."""
+        if self.request_output is not None:
+            return getattr(self.request_output, "encoder_prompt_token_ids", None)
+        return None
+
+    @property
+    def prompt_logprobs(self) -> Any:
+        """Return prompt logprobs from the underlying request output."""
+        if self.request_output is not None:
+            return getattr(self.request_output, "prompt_logprobs", None)
+        return None
+
+    @property
+    def num_cached_tokens(self) -> int | None:
+        """Return number of cached tokens from the underlying request output."""
+        if self.request_output is not None:
+            return getattr(self.request_output, "num_cached_tokens", None)
+        return None
+
+    @property
+    def kv_transfer_params(self) -> Any:
+        """Return KV transfer params from the underlying request output."""
+        if self.request_output is not None:
+            return getattr(self.request_output, "kv_transfer_params", None)
+        return None
+
     @property
     def is_diffusion_output(self) -> bool:
         """Check if this is a diffusion model output."""

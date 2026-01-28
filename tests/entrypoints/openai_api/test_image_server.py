@@ -124,6 +124,8 @@ class FakeAsyncOmni:
 def mock_async_diffusion():
     """Mock AsyncOmniDiffusion instance that returns fake images"""
     mock = Mock()
+    mock.is_running = True  # For health endpoint
+    mock.check_health = AsyncMock()  # For LLM mode health check
 
     async def generate(**kwargs):
         # Return n PIL images wrapped in result object
@@ -147,8 +149,9 @@ def test_client(mock_async_diffusion):
 
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
+    app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [{"stage_type": "diffusion"}]
-    app.state.served_model_names = "Qwen/Qwen-Image"
+    app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
 
     return TestClient(app)
 
@@ -169,10 +172,58 @@ def async_omni_test_client():
     return TestClient(app)
 
 
-@pytest.mark.skip(reason="Async API server uses different health check mechanism")
 def test_health_endpoint(test_client):
-    """Test health check endpoint - skipped for async server"""
-    pass
+    """Test health check endpoint for diffusion mode"""
+    response = test_client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "healthy"
+
+
+def test_health_endpoint_no_engine():
+    """Test health check endpoint when no engine is initialized"""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+    # Don't set any engine
+
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 503
+    data = response.json()
+    assert data["status"] == "unhealthy"
+
+
+def test_models_endpoint(test_client):
+    """Test /v1/models endpoint for diffusion mode"""
+    response = test_client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 1
+    assert data["data"][0]["id"] == "Qwen/Qwen-Image"
+    assert data["data"][0]["object"] == "model"
+
+
+def test_models_endpoint_no_engine():
+    """Test /v1/models endpoint when no engine is initialized"""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+    # Don't set any engine
+
+    client = TestClient(app)
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 0
 
 
 def test_generate_single_image(test_client):

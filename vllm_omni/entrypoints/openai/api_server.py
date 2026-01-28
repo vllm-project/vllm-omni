@@ -666,14 +666,6 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
 
 
-# Remove the original /v1/chat/completions route before registering our own
-# This prevents duplicate route registration warnings in FastAPI logs.
-for route in router.routes[:]:
-    if hasattr(route, "path") and route.path == "/v1/chat/completions":
-        router.routes.remove(route)
-        break
-
-
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -761,6 +753,86 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         return await handler.create_speech(request, raw_request)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+# Health and Model endpoints for diffusion mode
+
+
+# Remove existing health endpoint if present (from vllm imports)
+# to ensure our handler takes precedence
+_remove_route_from_router(router, "/health")
+
+
+@router.get("/health")
+async def health(raw_request: Request) -> JSONResponse:
+    """Health check endpoint that works for both LLM and diffusion modes.
+
+    Returns 200 OK if the server is healthy.
+    For LLM mode: delegates to engine_client health check
+    For diffusion mode: checks if diffusion_engine is running
+    """
+    # Check if we're in diffusion mode
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None)
+    if diffusion_engine is not None:
+        # Diffusion mode health check
+        if hasattr(diffusion_engine, "is_running") and diffusion_engine.is_running:
+            return JSONResponse(content={"status": "healthy"})
+        return JSONResponse(
+            content={"status": "unhealthy", "reason": "Diffusion engine is not running"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+
+    # LLM mode - delegate to engine_client
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    if engine_client is not None:
+        await engine_client.check_health()
+        return JSONResponse(content={"status": "healthy"})
+
+    return JSONResponse(
+        content={"status": "unhealthy", "reason": "No engine initialized"},
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+    )
+
+
+# Remove existing models endpoint if present (from vllm imports)
+# to ensure our handler takes precedence
+_remove_route_from_router(router, "/v1/models")
+
+
+@router.get("/v1/models")
+async def show_available_models(raw_request: Request) -> JSONResponse:
+    """Show available models endpoint that works for both LLM and diffusion modes.
+
+    Returns model information in OpenAI-compatible format.
+    """
+    # Check if we're in diffusion mode
+    diffusion_model_name = getattr(raw_request.app.state, "diffusion_model_name", None)
+    if diffusion_model_name is not None:
+        # Diffusion mode - return the loaded model
+        return JSONResponse(
+            content={
+                "object": "list",
+                "data": [
+                    {
+                        "id": diffusion_model_name,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "vllm-omni",
+                        "permission": [],
+                    }
+                ],
+            }
+        )
+
+    # LLM mode - delegate to openai_serving_models
+    openai_serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
+    if openai_serving_models is not None:
+        models = await openai_serving_models.show_available_models()
+        return JSONResponse(content=models.model_dump())
+
+    return JSONResponse(
+        content={"object": "list", "data": []},
+    )
 
 
 # Image generation API endpoints
