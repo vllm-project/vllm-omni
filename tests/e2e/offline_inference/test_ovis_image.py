@@ -25,6 +25,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image import OvisImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
 @pytest.fixture
@@ -162,11 +163,13 @@ def test_basic_generation(ovis_pipeline):
     """Test the forward pass logic."""
     # Setup request
     req = OmniDiffusionRequest(
-        prompt="A photo of a cat",
-        height=256,
-        width=256,
-        num_inference_steps=2,
-        guidance_scale=1.0,
+        prompts=["A photo of a cat"],
+        sampling_params=OmniDiffusionSamplingParams(
+            height=256,
+            width=256,
+            num_inference_steps=2,
+            guidance_scale=1.0,
+        ),
     )
 
     output = ovis_pipeline(req)
@@ -184,12 +187,18 @@ def test_basic_generation(ovis_pipeline):
 def test_guidance_scale(ovis_pipeline):
     """Test that classifier-free guidance path is taken when scale > 1.0."""
     req = OmniDiffusionRequest(
-        prompt="A photo of a cat",
-        negative_prompt="bad quality",
-        height=256,
-        width=256,
-        num_inference_steps=1,
-        guidance_scale=2.0,  # Trigger CFG
+        prompts=[
+            {
+                "prompt": "A photo of a cat",
+                "negative_prompt": "bad quality",
+            }
+        ],
+        sampling_params=OmniDiffusionSamplingParams(
+            height=256,
+            width=256,
+            num_inference_steps=1,
+            guidance_scale=2.0,  # Trigger CFG
+        ),
     )
 
     ovis_pipeline(req)
@@ -200,9 +209,11 @@ def test_resolution_check(ovis_pipeline):
     """Test resolution divisible validation logic if present."""
     # Pass odd resolution
     req = OmniDiffusionRequest(
-        prompt="test",
-        height=250,  # Not divisible by 16 (8*2)
-        width=250,
+        prompts=["test"],
+        sampling_params=OmniDiffusionSamplingParams(
+            height=250,  # Not divisible by 16 (8*2)
+            width=250,
+        ),
     )
 
     # Should warn but proceed (as per code I read earlier) or resize?

@@ -21,7 +21,8 @@ import numpy as np
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.utils.platform_utils import detect_device_type
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,8 +118,7 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 
 def main():
     args = parse_args()
-    device = detect_device_type()
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     print(f"\n{'=' * 60}")
     print("Stable Audio Open - Text-to-Audio Generation")
@@ -143,16 +143,20 @@ def main():
 
     # Generate audio
     outputs = omni.generate(
-        args.prompt,
-        negative_prompt=args.negative_prompt,
-        generator=generator,
-        guidance_scale=args.guidance_scale,
-        num_inference_steps=args.num_inference_steps,
-        num_outputs_per_prompt=args.num_waveforms,
-        extra={
-            "audio_start_in_s": args.audio_start,
-            "audio_end_in_s": audio_end_in_s,
+        {
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
         },
+        OmniDiffusionSamplingParams(
+            generator=generator,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
+            num_outputs_per_prompt=args.num_waveforms,
+            extra_args={
+                "audio_start_in_s": args.audio_start,
+                "audio_end_in_s": audio_end_in_s,
+            },
+        ),
     )
 
     generation_end = time.perf_counter()

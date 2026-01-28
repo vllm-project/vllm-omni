@@ -35,7 +35,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.platforms import current_omni_platform
 
 
 # Provide a no-op auto_docstring decorator to satisfy annotations if missing
@@ -732,7 +732,7 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
         beta = 0.0
 
     # TODO: When torch.kaiser_window supports NPU, remove the device="cpu" argument
-    if is_npu():
+    if current_omni_platform.is_npu():
         kaiser_window = torch.kaiser_window(
             kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
         ).to("npu")
@@ -796,7 +796,7 @@ class UpSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        if is_npu():
+        if current_omni_platform.is_npu():
             # TODO: When F.pad supports replicate mode on NPU, remove this branch
             input_dtype = hidden_states.dtype
             # F.pad in NPU doesn't support BF16 when mode is replicate.
@@ -843,7 +843,7 @@ class DownSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        if is_npu():
+        if current_omni_platform.is_npu():
             input_dtype = hidden_states.dtype
             # F.pad in NPU doesn't support BF16 when mode is replicate.
             # To ensure the accuracy, manually pad the input tensor.

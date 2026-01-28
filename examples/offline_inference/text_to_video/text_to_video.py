@@ -11,8 +11,9 @@ import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import detect_device_type, is_npu
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,8 +36,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--flow_shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )
+    parser.add_argument(
+        "--cache_backend",
+        type=str,
+        default=None,
+        choices=["cache_dit"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer). "
+            "Default: None (no cache acceleration)."
+        ),
+    )
+    parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
     parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--vae_use_slicing",
+        action="store_true",
+        help="Enable VAE slicing for memory optimization.",
+    )
+    parser.add_argument(
+        "--vae_use_tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
+        "--enforce_eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
     parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
@@ -54,23 +86,31 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
-    parser.add_argument(
-        "--enforce_eager",
-        action="store_true",
-        help="Disable torch.compile and force eager execution.",
-    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    device = detect_device_type()
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
-    # Enable VAE memory optimizations on NPU
-    vae_use_slicing = is_npu()
-    vae_use_tiling = is_npu()
-
+    # Wan2.2 cache-dit tuning (from cache-dit examples and cache_alignment).
+    cache_config = None
+    if args.cache_backend == "cache_dit":
+        cache_config = {
+            # DBCache parameters [cache-dit only]
+            "Fn_compute_blocks": 1,  # Optimized for single-transformer models
+            "Bn_compute_blocks": 0,  # Number of backward compute blocks
+            "max_warmup_steps": 4,  # Maximum warmup steps (works for few-step models)
+            "max_cached_steps": 20,
+            "residual_diff_threshold": 0.24,  # Higher threshold for more aggressive caching
+            "max_continuous_cached_steps": 3,  # Limit to prevent precision degradation
+            # TaylorSeer parameters [cache-dit only]
+            "enable_taylorseer": False,  # Disabled by default (not suitable for few-step models)
+            "taylorseer_order": 1,  # TaylorSeer polynomial order
+            # SCM (Step Computation Masking) parameters [cache-dit only]
+            "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
+            "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
+        }
     # Configure parallel settings (only SP is supported for Wan)
     # Note: cfg_parallel and tensor_parallel are not implemented for Wan models
     parallel_config = DiffusionParallelConfig(
@@ -83,10 +123,13 @@ def main():
 
     omni = Omni(
         model=args.model,
-        vae_use_slicing=vae_use_slicing,
-        vae_use_tiling=vae_use_tiling,
+        vae_use_slicing=args.vae_use_slicing,
+        vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
+        enable_cache_dit_summary=args.enable_cache_dit_summary,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
@@ -108,15 +151,19 @@ def main():
 
     generation_start = time.perf_counter()
     frames = omni.generate(
-        args.prompt,
-        negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
-        generator=generator,
-        guidance_scale=args.guidance_scale,
-        guidance_scale_2=args.guidance_scale_high,
-        num_inference_steps=args.num_inference_steps,
-        num_frames=args.num_frames,
+        {
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+        },
+        OmniDiffusionSamplingParams(
+            height=args.height,
+            width=args.width,
+            generator=generator,
+            guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_high,
+            num_inference_steps=args.num_inference_steps,
+            num_frames=args.num_frames,
+        ),
     )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start

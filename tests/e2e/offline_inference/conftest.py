@@ -7,11 +7,12 @@ Pytest configuration and fixtures for vllm-omni tests.
 from typing import Any
 
 import pytest
+from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
-from vllm.sampling_params import SamplingParams
 
 from tests.conftest import _run_post_test_cleanup
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
@@ -64,7 +65,7 @@ class OmniRunner:
             **kwargs,
         )
 
-    def get_default_sampling_params_list(self) -> list[SamplingParams]:
+    def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
         """
         Get a list of default sampling parameters for all stages.
 
@@ -82,7 +83,7 @@ class OmniRunner:
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
         modalities: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[TextPrompt]:
         """
         Construct Omni input format from prompts and multimodal data.
 
@@ -175,7 +176,7 @@ class OmniRunner:
                 f"<|im_start|>assistant\n"
             )
 
-            input_dict: dict[str, Any] = {"prompt": full_prompt}
+            input_dict: TextPrompt = {"prompt": full_prompt}
             if multi_modal_data:
                 input_dict["multi_modal_data"] = multi_modal_data
             if modalities:
@@ -189,8 +190,8 @@ class OmniRunner:
 
     def generate(
         self,
-        prompts: list[dict[str, Any]],
-        sampling_params_list: list[SamplingParams] | None = None,
+        prompts: list[TextPrompt],
+        sampling_params_list: list[OmniSamplingParams] | None = None,
     ) -> list[OmniRequestOutput]:
         """
         Generate outputs for the given prompts.
@@ -212,7 +213,7 @@ class OmniRunner:
     def generate_multimodal(
         self,
         prompts: list[str] | str,
-        sampling_params_list: list[SamplingParams] | None = None,
+        sampling_params_list: list[OmniSamplingParams] | None = None,
         system_prompt: str | None = None,
         audios: PromptAudioInput = None,
         images: PromptImageInput = None,
@@ -249,7 +250,7 @@ class OmniRunner:
     def generate_audio(
         self,
         prompts: list[str] | str,
-        sampling_params_list: list[SamplingParams] | None = None,
+        sampling_params_list: list[OmniSamplingParams] | None = None,
         system_prompt: str | None = None,
         audios: PromptAudioInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -276,7 +277,7 @@ class OmniRunner:
     def generate_video(
         self,
         prompts: list[str] | str,
-        sampling_params_list: list[SamplingParams] | None = None,
+        sampling_params_list: list[OmniSamplingParams] | None = None,
         system_prompt: str | None = None,
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -303,7 +304,7 @@ class OmniRunner:
     def generate_image(
         self,
         prompts: list[str] | str,
-        sampling_params_list: list[SamplingParams] | None = None,
+        sampling_params_list: list[OmniSamplingParams] | None = None,
         system_prompt: str | None = None,
         images: PromptImageInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,

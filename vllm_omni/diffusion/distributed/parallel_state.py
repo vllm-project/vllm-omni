@@ -35,20 +35,13 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
     GroupCoordinator,
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
 )
-
-if envs._is_npu():
-    from torch.npu import device_count, set_device
-elif envs._is_musa():
-    from torch_musa.core.device import device_count, set_device
-else:
-    from torch.cuda import device_count, set_device
-
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
 
@@ -396,7 +389,7 @@ def init_distributed_environment(
     backend: str | None = None,
 ):
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        backend = current_omni_platform.dist_backend
     logger.debug(
         "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
         world_size,
@@ -416,7 +409,8 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
         )
-        set_device(torch.distributed.get_rank() % device_count())
+        device_id = torch.distributed.get_rank() % current_omni_platform.get_device_count()
+        current_omni_platform.set_device(current_omni_platform.get_torch_device(device_id))
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -572,7 +566,7 @@ def initialize_model_parallel(
     backend: str | None = None,
 ) -> None:
     if backend is None:
-        backend = envs.get_torch_distributed_backend()
+        backend = current_omni_platform.dist_backend
     """
     Initialize model parallel groups.
 
@@ -632,7 +626,7 @@ def initialize_model_parallel(
 
     # FIXME: Since the async p2p communication operation of NPU is not same as cuda in torch,
     # the pipefusion is not ready for npu yet
-    if envs._is_npu():
+    if current_omni_platform.is_npu():
         assert pipeline_parallel_size == 1, "Current pipefusion is not ready for NPU"
 
     dit_parallel_size = (

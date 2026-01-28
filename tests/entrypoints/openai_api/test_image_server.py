@@ -14,11 +14,13 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Unit Tests
 
@@ -111,7 +113,7 @@ class FakeAsyncOmni:
 
     def __init__(self):
         self.stage_list = ["llm", "diffusion"]
-        self.default_sampling_params_list = [{"temperature": 0.1}, {"top_p": 0.9}]
+        self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
 
     async def generate(self, prompt, request_id, sampling_params_list):
@@ -124,10 +126,13 @@ class FakeAsyncOmni:
 def mock_async_diffusion():
     """Mock AsyncOmniDiffusion instance that returns fake images"""
     mock = Mock()
+    mock.is_running = True  # For health endpoint
+    mock.check_health = AsyncMock()  # For LLM mode health check
 
     async def generate(**kwargs):
         # Return n PIL images wrapped in result object
-        n = kwargs.get("num_outputs_per_prompt", 1)
+        print("!!!!!!!!!!!!!!!!!!!!! kwargs", kwargs)
+        n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
         images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
         return MockGenerationResult(images)
 
@@ -147,8 +152,9 @@ def test_client(mock_async_diffusion):
 
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
+    app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [{"stage_type": "diffusion"}]
-    app.state.served_model_names = "Qwen/Qwen-Image"
+    app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
 
     return TestClient(app)
 
@@ -169,10 +175,58 @@ def async_omni_test_client():
     return TestClient(app)
 
 
-@pytest.mark.skip(reason="Async API server uses different health check mechanism")
 def test_health_endpoint(test_client):
-    """Test health check endpoint - skipped for async server"""
-    pass
+    """Test health check endpoint for diffusion mode"""
+    response = test_client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "healthy"
+
+
+def test_health_endpoint_no_engine():
+    """Test health check endpoint when no engine is initialized"""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+    # Don't set any engine
+
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 503
+    data = response.json()
+    assert data["status"] == "unhealthy"
+
+
+def test_models_endpoint(test_client):
+    """Test /v1/models endpoint for diffusion mode"""
+    response = test_client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 1
+    assert data["data"][0]["id"] == "Qwen/Qwen-Image"
+    assert data["data"][0]["object"] == "model"
+
+
+def test_models_endpoint_no_engine():
+    """Test /v1/models endpoint when no engine is initialized"""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+    # Don't set any engine
+
+    client = TestClient(app)
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 0
 
 
 def test_generate_single_image(test_client):
@@ -217,11 +271,11 @@ def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
-    assert captured[0] == {"temperature": 0.1}
-    assert captured[1]["num_outputs_per_prompt"] == 2
-    assert captured[1]["height"] == 256
-    assert captured[1]["width"] == 256
-    assert captured[1]["seed"] == 7
+    assert captured[0].temperature == 0.1
+    assert captured[1].num_outputs_per_prompt == 2
+    assert captured[1].height == 256
+    assert captured[1].width == 256
+    assert captured[1].seed == 7
 
 
 def test_generate_multiple_images(test_client):
@@ -454,30 +508,11 @@ def test_parameters_passed_through(test_client, mock_async_diffusion):
 
     # Ensure generate() was called exactly once
     mock_async_diffusion.generate.assert_awaited_once()
-    call_kwargs = mock_async_diffusion.generate.call_args[1]
-    assert call_kwargs["num_inference_steps"] == 100
-    assert call_kwargs["guidance_scale"] == 7.5
-    assert call_kwargs["true_cfg_scale"] == 3.0
-    assert call_kwargs["seed"] == 42
-
-
-def test_optional_parameters_omitted(test_client, mock_async_diffusion):
-    """Verify optional parameters not passed when omitted"""
-    response = test_client.post(
-        "/v1/images/generations",
-        json={
-            "prompt": "test",
-            "size": "512x512",
-        },
-    )
-    assert response.status_code == 200
-
-    # Ensure generate() was called exactly once
-    mock_async_diffusion.generate.assert_awaited_once()
-    call_kwargs = mock_async_diffusion.generate.call_args[1]
-    assert "num_inference_steps" not in call_kwargs
-    assert "guidance_scale" not in call_kwargs
-    assert "true_cfg_scale" not in call_kwargs
+    call_kwargs = mock_async_diffusion.generate.call_args[1]["sampling_params_list"][0]
+    assert call_kwargs.num_inference_steps == 100
+    assert call_kwargs.guidance_scale == 7.5
+    assert call_kwargs.true_cfg_scale == 3.0
+    assert call_kwargs.seed == 42
 
 
 def test_model_field_omitted_works(test_client):

@@ -19,7 +19,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -742,27 +742,54 @@ class Flux2KleinPipeline(nn.Module, SupportImageInput):
             `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
             generated images.
         """
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
-        prompt = req.prompt if req.prompt is not None else prompt
-        image = req.pil_image if req.pil_image is not None else image
-        height = req.height or height
-        width = req.width or width
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        guidance_scale = req.guidance_scale if req.guidance_scale is not None else guidance_scale
-        generator = req.generator or generator
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        if (
+            raw_image := None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("multi_modal_data", {}).get("image")
+        ) is None:
+            pass  # use image from param list
+        elif isinstance(raw_image, list):
+            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
+        else:
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        if isinstance(req.prompt_embeds, torch.Tensor):
-            prompt_embeds = req.prompt_embeds
-        if isinstance(req.negative_prompt_embeds, torch.Tensor):
-            negative_prompt_embeds = req.negative_prompt_embeds
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+        )
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
 
-        if req.max_sequence_length is not None:
-            max_sequence_length = req.max_sequence_length
-        if getattr(req, "text_encoder_out_layers", None) is not None:
-            text_encoder_out_layers = req.text_encoder_out_layers
+        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        if any(p is not None for p in req_prompt_embeds):
+            # If at list one prompt is provided as an embedding,
+            # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
+            # If the user in fact provides mixed input format, req_prompt_embeds will have some None's
+            # And `torch.stack` automatically raises an exception for us
+            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
+
+        req_negative_prompt_embeds = [
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+        ]
+        if any(p is not None for p in req_negative_prompt_embeds):
+            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(

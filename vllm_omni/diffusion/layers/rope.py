@@ -137,6 +137,14 @@ class RotaryEmbedding(CustomOp):
         else:
             return self.forward_native(x, cos, sin)
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x, cos, sin)
+
     def forward_native(
         self,
         x: torch.Tensor,

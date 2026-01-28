@@ -91,6 +91,14 @@ class AdaLayerNorm(CustomOp):
 
         return output, gate_result
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        mod_params: torch.Tensor,
+        index: torch.Tensor = None,
+    ) -> torch.Tensor:
+        return self.forward_native(x, mod_params, index)
+
     def forward_native(
         self,
         x: torch.Tensor,

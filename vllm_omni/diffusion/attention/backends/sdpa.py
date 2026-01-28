@@ -16,6 +16,10 @@ logger = init_logger(__name__)
 class SDPABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
+    @classmethod
+    def supports_attention_mask(cls) -> bool:
+        return True
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [x for x in range(1024)]  # todo
