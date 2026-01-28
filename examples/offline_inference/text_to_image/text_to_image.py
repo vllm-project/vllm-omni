@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable torch.compile and force eager execution.",
     )
     parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Enable CPU offloading for diffusion models.",
+    )
+    parser.add_argument(
         "--tensor_parallel_size",
         type=int,
         default=1,
@@ -162,6 +167,7 @@ def main():
         cache_config=cache_config,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        enable_cpu_offload=args.enable_cpu_offload,
     )
 
     if profiler_enabled:

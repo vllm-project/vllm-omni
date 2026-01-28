@@ -111,9 +111,15 @@ class OmniRequestState(RequestState):
             for k, v in self.mm_accumulated.items():
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
-                        self.mm_accumulated[k] = torch.cat(v, dim=0)
+                        if k == "audio":
+                            # When the audio tensor shape is inconsistent, torch.cat will fail.
+                            # We need to use torch.cat in -1 dimension.
+                            self.mm_accumulated[k] = torch.cat(v, dim=-1)
+                        else:
+                            self.mm_accumulated[k] = torch.cat(v, dim=0)
                     except Exception:
                         # Keep last tensor on failure
+                        logger.warning(f"Error concatenating tensor for key {k}; keeping last tensor")
                         self.mm_accumulated[k] = v[-1]
                 elif isinstance(v, dict):
                     for sk, sv in v.items():

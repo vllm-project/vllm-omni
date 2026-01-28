@@ -142,7 +142,7 @@ def main():
     generation_start = time.perf_counter()
 
     # Generate audio
-    audio = omni.generate(
+    outputs = omni.generate(
         args.prompt,
         negative_prompt=args.negative_prompt,
         generator=generator,
@@ -165,6 +165,21 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".wav"
     stem = output_path.stem or "stable_audio_output"
+
+    # Extract audio from omni.generate() outputs
+    if not outputs:
+        raise ValueError("No output generated from omni.generate()")
+
+    output = outputs[0]
+    if not hasattr(output, "request_output") or not output.request_output:
+        raise ValueError("No request_output found in OmniRequestOutput")
+    request_output = output.request_output[0]
+    if not hasattr(request_output, "multimodal_output"):
+        raise ValueError("No multimodal_output found in request_output")
+
+    audio = request_output.multimodal_output.get("audio")
+    if audio is None:
+        raise ValueError("No audio output found in request_output")
 
     # Handle different output formats
     if isinstance(audio, torch.Tensor):

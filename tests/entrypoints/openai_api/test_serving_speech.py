@@ -10,8 +10,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
-from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.serving_speech import (
+    OmniOpenAIServingSpeech,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = logging.getLogger(__name__)
@@ -265,3 +267,78 @@ class TestSpeechAPI:
         audio_obj = call_args[0]
         assert isinstance(audio_obj, CreateAudio)
         assert audio_obj.speed == 2.5
+
+
+class TestTTSMethods:
+    """Unit tests for TTS validation and parameter building."""
+
+    @pytest.fixture
+    def speech_server(self):
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_list = None
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+        return OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+
+    def test_is_tts_model(self, speech_server):
+        """Test TTS model detection."""
+        # No stage_list -> False
+        assert speech_server._is_tts_model() is False
+
+        # With qwen3_tts stage -> True
+        mock_stage = MagicMock()
+        mock_stage.model_stage = "qwen3_tts"
+        speech_server.engine_client.stage_list = [mock_stage]
+        assert speech_server._is_tts_model() is True
+
+    def test_build_tts_prompt(self, speech_server):
+        """Test TTS prompt format."""
+        prompt = speech_server._build_tts_prompt("Hello")
+        assert prompt == "<|im_start|>assistant\nHello<|im_end|>\n<|im_start|>assistant\n"
+
+    def test_validate_tts_request_basic(self, speech_server):
+        """Test basic validation cases."""
+        # Empty input
+        req = OpenAICreateSpeechRequest(input="")
+        assert speech_server._validate_tts_request(req) == "Input text cannot be empty"
+
+        # Invalid language
+        req = OpenAICreateSpeechRequest(input="Hello", language="InvalidLang")
+        assert "Invalid language" in speech_server._validate_tts_request(req)
+
+        # Invalid speaker
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Invalid")
+        assert "Invalid speaker" in speech_server._validate_tts_request(req)
+
+        # Valid request
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Vivian")
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_validate_tts_request_task_types(self, speech_server):
+        """Test task-specific validation."""
+        # Base task requires ref_audio
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base")
+        assert "ref_audio" in speech_server._validate_tts_request(req)
+
+        # VoiceDesign requires instructions
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="VoiceDesign")
+        assert "instructions" in speech_server._validate_tts_request(req)
+
+        # ref_text only for Base
+        req = OpenAICreateSpeechRequest(input="Hello", ref_text="text")
+        assert "Base task" in speech_server._validate_tts_request(req)
+
+    def test_build_tts_params(self, speech_server):
+        """Test TTS parameter building."""
+        req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
+        params = speech_server._build_tts_params(req)
+
+        assert params["text"] == ["Hello"]
+        assert params["speaker"] == ["Ryan"]
+        assert params["language"] == ["English"]
+        assert params["task_type"] == ["CustomVoice"]

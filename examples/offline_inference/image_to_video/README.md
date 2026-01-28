@@ -54,3 +54,4 @@ Key arguments:
 - `--num_inference_steps`: Number of denoising steps (default 50).
 - `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: Path to save the generated video.
+- `--enable-cpu-offload`: enable CPU offloading for diffusion models.

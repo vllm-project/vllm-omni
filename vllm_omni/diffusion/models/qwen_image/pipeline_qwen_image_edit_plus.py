@@ -704,6 +704,8 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
         num_inference_steps = req.num_inference_steps or num_inference_steps
         generator = req.generator or generator
         true_cfg_scale = req.true_cfg_scale or true_cfg_scale
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
         req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs

@@ -563,7 +563,10 @@ class Qwen3OmniMoeTalkerSharedExpertWrapper(nn.Module):
     - mlp.shared_expert.{gate_proj, up_proj, down_proj}.weight
     - mlp.shared_expert_gate.weight  (sibling, not child)
 
-    The wrapper applies: sigmoid(shared_expert_gate(x)) * shared_expert(x)
+    The wrapper applies: sigmoid(shared_expert_gate(x)) * shared_expert(x).
+
+    It also exposes the underlying shared_expert interface to keep
+    compatibility with backends that split shared-expert computation.
     """
 
     def __init__(
@@ -575,9 +578,30 @@ class Qwen3OmniMoeTalkerSharedExpertWrapper(nn.Module):
         self._shared_expert = shared_expert
         self._shared_expert_gate = shared_expert_gate
 
+    @property
+    def gate_up_proj(self):
+        return self._shared_expert.gate_up_proj
+
+    @property
+    def down_proj(self):
+        return self._shared_expert.down_proj
+
+    @property
+    def act_fn(self):
+        return self._shared_expert.act_fn
+
+    def expert_gate(self, x: torch.Tensor):
+        gate_out = self._shared_expert_gate(x)
+        if isinstance(gate_out, tuple):
+            return gate_out
+        return gate_out, None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self._shared_expert(x)
-        gate_values = F.sigmoid(self._shared_expert_gate(x))  # [batch, 1]
+        gate_out = self._shared_expert_gate(x)
+        if isinstance(gate_out, tuple):
+            gate_out = gate_out[0]
+        gate_values = F.sigmoid(gate_out)  # [batch, 1]
         return gate_values * out  # Broadcasting: [batch, 1] * [batch, hidden]
 
 
