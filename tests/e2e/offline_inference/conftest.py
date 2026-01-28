@@ -50,6 +50,8 @@ class OmniRunner:
             stage_configs_path: Optional path to YAML stage config file
             **kwargs: Additional arguments passed to Omni
         """
+        cleanup_dist_env_and_memory()
+        _run_post_test_cleanup(enable_force=True)
         self.model_name = model_name
         self.seed = seed
 
@@ -336,7 +338,7 @@ class OmniRunner:
         self.close()
         del self.omni
         cleanup_dist_env_and_memory()
-        _run_post_test_cleanup()
+        _run_post_test_cleanup(enable_force=True)
 
     def close(self):
         """Close and cleanup the Omni instance."""
