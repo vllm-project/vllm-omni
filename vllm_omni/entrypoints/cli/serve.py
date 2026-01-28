@@ -175,6 +175,11 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
         )
+        omni_config_group.add_argument(
+            "--enable-cache-dit-summary",
+            action="store_true",
+            help="Enable cache-dit summary logging after diffusion forward passes.",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(

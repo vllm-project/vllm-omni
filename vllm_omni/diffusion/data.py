@@ -258,6 +258,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    enable_cache_dit_summary: bool = False
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
