@@ -133,7 +133,7 @@ def dummy_messages_from_video_data(
 
 def get_prompt(prompt_type="text_only"):
     prompts = {
-        "text_only": "What is the capital of China?",
+        "text_only": "What is the capital of China? Answer in 20 words.",
         "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["text_only"])

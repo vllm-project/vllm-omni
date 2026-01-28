@@ -20,6 +20,7 @@ stage_args:
     engine_output_type: latent  # Output hidden states for talker
     distributed_executor_backend: "mp"
     max_num_batched_tokens: 32768
+    max_model_len: 32768
     enable_prefix_caching: false
     hf_config_name: thinker_config
     tensor_parallel_size: 2
@@ -51,6 +52,7 @@ stage_args:
     engine_output_type: latent  # Output codec codes for code2wav
     enable_prefix_caching: false
     max_num_batched_tokens: 32768
+    max_model_len: 32768
     distributed_executor_backend: "mp"
     hf_config_name: talker_config
   engine_input_source: [0]
