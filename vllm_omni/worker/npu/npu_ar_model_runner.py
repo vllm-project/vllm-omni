@@ -438,7 +438,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
             kv_connector_output=kv_connector_output,
         )
-        output.kv_extracted_req_ids = kv_extracted_req_ids
+        model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         durations = ProfileExecuteDuration().pop_captured_sync()
