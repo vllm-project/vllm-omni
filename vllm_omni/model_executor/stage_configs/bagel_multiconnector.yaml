@@ -61,13 +61,7 @@ stage_args:
     final_output_type: image
     is_comprehension: false
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 2048
       seed: 52
-      detokenize: True
-      repetition_penalty: 1.0
     input_connectors:
       from_stage_0: mooncake_connector
 

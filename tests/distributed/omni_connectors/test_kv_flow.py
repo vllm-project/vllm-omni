@@ -1,194 +1,251 @@
-import unittest
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
-
+import pytest
 import torch
 
-from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
+from tests.utils import hardware_test
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+    OmniKVCacheConfig,
+    OmniKVTransferManager,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 
-class MockGPUARModelRunner(GPUARModelRunner):
-    """Subclass to bypass heavy initialization."""
-
-    def __init__(self, kv_caches, input_batch):
-        self.kv_caches = kv_caches
-        self.input_batch = input_batch
-        self.device = "cpu"
-        self.cache_config = MagicMock()
-        self.cache_config.block_size = 16
-        self.cache_config.cache_dtype = "auto"
-        self.logger = MagicMock()
-
-
-class MockBagelPipeline(BagelPipeline):
-    """Subclass to bypass heavy initialization."""
-
+class MockConnector:
     def __init__(self):
-        self.device = "cpu"
-        self.od_config = MagicMock()
-        self.bagel = MagicMock()
-        self.tokenizer = MagicMock()
-        self.language_model = MagicMock()
-        self.new_token_ids = {}
+        self.store = {}
+
+    def put(self, from_stage, to_stage, put_key, data):
+        # The manager now passes full key as put_key
+        key = f"{from_stage}->{to_stage}:{put_key}"
+        self.store[key] = data
+        return True, len(str(data)), None  # (success, size, metadata)
+
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        # The manager now passes full key as get_key
+        key = f"{from_stage}->{to_stage}:{get_key}"
+        if key in self.store:
+            return self.store[key], len(str(self.store[key]))
+        return None
 
 
-class TestKVFlow(unittest.TestCase):
-    def setUp(self):
-        # Common constants
-        self.num_layers = 2
-        self.num_heads = 4
-        self.head_dim = 16
-        self.block_size = 8
-        self.x = 8  # PagedAttention factor
-        self.seq_len = 20
-        self.req_id = "req_test_1"
-
-    def test_sender_extraction_logic(self):
-        """Test extraction logic in GPUARModelRunner."""
-        if GPUARModelRunner is object:
-            self.skipTest("vLLM not installed")
-
-        # 1. Setup KV Cache (List of tuples (K, V))
-        # Shape: [num_blocks, block_size, num_heads, head_dim] matching 4D expectation
-        num_blocks = 10
-        kv_caches = []
-        for _ in range(self.num_layers):
-            k_cache = torch.randn(num_blocks, self.block_size, self.num_heads, self.head_dim)
-            v_cache = torch.randn(num_blocks, self.block_size, self.num_heads, self.head_dim)
-            # Stack K and V to create [2, num_blocks, block_size, n_heads, head_dim]
-            layer_cache = torch.stack([k_cache, v_cache], dim=0)
-            kv_caches.append(layer_cache)
-
-        # 2. Setup Input Batch Mock
-        block_ids = [1, 3, 5]
-        mock_input_batch = MagicMock()
-        mock_input_batch.req_id_to_index = {self.req_id: 0}
-        mock_input_batch.block_table.get_row.return_value = block_ids
-
-        # 3. Instantiate Runner
-        runner = MockGPUARModelRunner(kv_caches, mock_input_batch)
-
-        # 4. Run Extraction
-        # calling _extract_kv_cache directly: (req_id, block_ids, seq_len)
-        result = runner._extract_kv_cache(self.req_id, block_ids, self.seq_len)
-
-        # 5. Verify Result
-        self.assertIsNotNone(result)
-        self.assertEqual(result.request_id, self.req_id)
-
-        # Check keys "key_cache" and "value_cache" exist (length 2)
-        self.assertEqual(len(result.layer_blocks["key_cache"]), 2)
-        self.assertEqual(len(result.layer_blocks["value_cache"]), 2)
-
-        # Check Tensor Shape: [seq_len, num_heads, head_dim]
-        # result.layer_blocks["key_cache"] is a list of tensors
-        expected_shape = (self.seq_len, self.num_heads, self.head_dim)
-        self.assertEqual(result.layer_blocks["key_cache"][0].shape, expected_shape)
-
-        return result  # Return for use in next test
-
-    def test_receiver_injection_logic(self):
-        """Test injection logic in BagelPipeline."""
-        if BagelPipeline is object:
-            self.skipTest("vLLM not installed")
-
-        # 1. Get Data from Sender Test (simulate transfer)
-        # Re-create data manually to be independent
-        key_cache = []
-        value_cache = []
-        expected_shape = (self.seq_len, self.num_heads, self.head_dim)
-        for i in range(self.num_layers):
-            key_cache.append(torch.randn(expected_shape))
-            value_cache.append(torch.randn(expected_shape))
-
-        layer_blocks = {"key_cache": key_cache, "value_cache": value_cache}
-
-        transfer_data = MagicMock()  # Mock KVCacheTransferData
-        transfer_data.layer_blocks = layer_blocks
-        transfer_data.metadata = {"kv_lens": [self.seq_len], "ropes": [0]}
-
-        # 2. Setup Request with Injected Data
-        sp = OmniDiffusionSamplingParams(
-            past_key_values=SimpleNamespace(**layer_blocks),
-            kv_metadata=transfer_data.metadata,
-        )
-
-        req = OmniDiffusionRequest(["test"], sp)
-
-        # 3. Setup Pipeline
-        pipeline = MockBagelPipeline()
-
-        # Mock Bagel's NaiveCache
-        class RealNaiveCache:  # Minimal impl
-            def __init__(self, n):
-                self.key_cache = {i: None for i in range(n)}
-                self.value_cache = {i: None for i in range(n)}
-
-        pipeline.bagel.config.llm_config.num_hidden_layers = self.num_layers
-
-        captured_context = {}
-
-        def mock_prepare_prompts(curr_kvlens, curr_rope, **kwargs):
-            # Capture the state passed to prepare_prompts
-            captured_context["kv_lens"] = curr_kvlens
-            captured_context["ropes"] = curr_rope
-            return {}, [0], [0]
-
-        pipeline.bagel.prepare_prompts = MagicMock(side_effect=mock_prepare_prompts)
-        with patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.NaiveCache") as MockNaiveCacheCls:
-            # Setup the instance returned by the constructor
-            mock_cache_instance = RealNaiveCache(self.num_layers)
-            MockNaiveCacheCls.return_value = mock_cache_instance
-
-        # Verification of Injection Logic (Simulation)
-        current_cache = RealNaiveCache(self.num_layers)
-
-        # --- Logic from Source Code ---
-        injected_kv = req.sampling_params.past_key_values
-        if isinstance(current_cache, RealNaiveCache) and hasattr(injected_kv, "key_cache"):
-            # Assuming injected_kv is SimpleNamespace or object with list attrs
-            for layer_idx in range(len(injected_kv.key_cache)):
-                if injected_kv.key_cache[layer_idx] is not None:
-                    k_tensor = injected_kv.key_cache[layer_idx]
-                    v_tensor = injected_kv.value_cache[layer_idx]
-
-                    if k_tensor.device != pipeline.device:
-                        k_tensor = k_tensor.to(pipeline.device)
-                    if v_tensor.device != pipeline.device:
-                        v_tensor = v_tensor.to(pipeline.device)
-
-                    current_cache.key_cache[layer_idx] = k_tensor
-                    current_cache.value_cache[layer_idx] = v_tensor
-
-        self.assertTrue(torch.allclose(current_cache.key_cache[0], layer_blocks["key_cache"][0]))
-        self.assertTrue(torch.allclose(current_cache.value_cache[1], layer_blocks["value_cache"][1]))
-
-    def test_integration(self):
-        """Simulate the flow from Sender -> Connector (Dict) -> Receiver."""
-        if GPUARModelRunner is object or BagelPipeline is object:
-            self.skipTest("vLLM not installed")
-
-        # 1. Sender (Extraction)
-        runner_test_result = self.test_sender_extraction_logic()  # Get KVCacheTransferData
-
-        # 2. Connector (Serialize/Deserialize Simulation)
-        # KVCacheTransferData has to_dict
-        data_dict = runner_test_result.to_dict()
-
-        # 3. Receiver (Request Setup)
-        sp = OmniDiffusionSamplingParams(
-            past_key_values=data_dict["layer_blocks"],
-            kv_metadata=data_dict["metadata"],
-        )
-        req = OmniDiffusionRequest(["integration_test"], sp)  # noqa: F841
-
-        # 4. Receiver (Injection Simulation)
-        # Use the logic verification again
-        pass
+@pytest.fixture
+def mock_connector():
+    return MockConnector()
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.fixture
+def kv_config():
+    return OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="stage1",
+        to_stage="stage2",
+        stage_id="stage2",  # Acting as receiver for some tests
+        need_recv_cache=True,
+        need_send_cache=True,
+        recv_timeout=1.0,  # Short timeout for tests
+    )
+
+
+@pytest.fixture
+def common_constants():
+    return {
+        "num_layers": 2,
+        "num_heads": 4,
+        "head_dim": 16,
+        "block_size": 8,
+        "seq_len": 20,
+        "req_id": "req_test_1",
+    }
+
+
+@pytest.mark.cache
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
+def test_manager_extraction(kv_config, mock_connector, common_constants):
+    """Test extraction and sending logic in OmniKVTransferManager."""
+    num_layers = common_constants["num_layers"]
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    seq_len = common_constants["seq_len"]
+    req_id = common_constants["req_id"]
+
+    num_blocks = 10
+    kv_caches = []
+    for _ in range(num_layers):
+        k_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        v_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        # Stack K and V to create [2, num_blocks, block_size, n_heads, head_dim]
+        layer_cache = torch.stack([k_cache, v_cache], dim=0)
+        kv_caches.append(layer_cache)
+
+    block_ids = [1, 3, 5]
+    finished_reqs = {req_id: {"block_ids": block_ids, "seq_len": seq_len}}
+
+    manager = OmniKVTransferManager(kv_config)
+    # Mock the connector factory or injection
+    manager._connector = mock_connector
+
+    processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+
+    assert req_id in processed
+
+    # Check if data was put into connector
+    # Manager builds full key: omni_{from}_to_{to}_kv_cache_{req_id}
+    full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
+    expected_key = f"stage1->stage2:{full_request_id}"
+    assert expected_key in mock_connector.store
+
+    data = mock_connector.store[expected_key]
+    assert data["request_id"] == req_id
+    assert "layer_blocks" in data
+    assert len(data["layer_blocks"]["key_cache"]) == num_layers
+
+    # Verify shape of extracted tensor: [seq_len, heads, dim]
+    # Note: Manager detaches and moves to CPU
+    expected_shape = (seq_len, num_heads, head_dim)
+    assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
+
+
+@pytest.mark.cache
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
+def test_manager_reception(kv_config, mock_connector, common_constants):
+    """Test reception and injection logic in OmniKVTransferManager."""
+    num_layers = common_constants["num_layers"]
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    seq_len = common_constants["seq_len"]
+    req_id = common_constants["req_id"]
+
+    expected_shape = (seq_len, num_heads, head_dim)
+    key_cache = [torch.randn(expected_shape) for _ in range(num_layers)]
+    value_cache = [torch.randn(expected_shape) for _ in range(num_layers)]
+
+    layer_blocks = {"key_cache": key_cache, "value_cache": value_cache}
+    metadata = {
+        "block_size": block_size,
+        "num_layers": num_layers,
+        "dtype": "float32",
+        "seq_len": seq_len,
+    }
+
+    data_to_receive = {
+        "request_id": req_id,
+        "layer_blocks": layer_blocks,
+        "metadata": metadata,
+        "block_ids": [],
+    }
+
+    # In setUp, from_stage="stage1", stage_id="stage2". recv_stages=("stage1", "stage2")
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = mock_connector
+
+    # Pre-populate connector with data
+    # Manager builds full key: omni_{from}_to_{to}_kv_cache_{req_id}
+    full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
+    store_key = f"stage1->stage2:{full_request_id}"
+    mock_connector.store[store_key] = data_to_receive
+
+    req = OmniDiffusionRequest(
+        prompts=["test_recv"],
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_ids=[req_id],
+    )
+    # req.need_kv_receive = True # Implicitly handled by receive_kv_cache check? No, manager doesn't check it, runner does.
+    # But receive_kv_cache in manager checks request_id. Which we need to fix in manager next.
+    success = manager.receive_kv_cache(req, target_device=torch.device("cpu"))
+
+    assert success
+    assert hasattr(req, "past_key_values")
+    assert hasattr(req, "kv_metadata")
+
+    assert len(req.past_key_values.key_cache) == num_layers
+    assert torch.allclose(req.past_key_values.key_cache[0], key_cache[0])
+    assert req.kv_metadata["seq_len"] == seq_len
+
+
+@pytest.mark.cache
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
+def test_integration_flow(common_constants):
+    """Simulate extraction -> connector -> reception."""
+    num_layers = common_constants["num_layers"]
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+
+    sender_config = OmniKVCacheConfig(
+        connector_config={"type": "mock"}, from_stage="sender", to_stage="receiver", need_send_cache=True
+    )
+    sender_manager = OmniKVTransferManager(sender_config)
+    connector = MockConnector()
+    sender_manager._connector = connector  # Shared connector
+
+    # Create Data
+    num_blocks = 5
+    kv_caches = []
+    for _ in range(num_layers):
+        layer = torch.randn(2, num_blocks, block_size, num_heads, head_dim)
+        kv_caches.append(layer)
+
+    finished_reqs = {req_id: {"block_ids": [0, 1], "seq_len": 10}}
+
+    # Send
+    sender_manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+
+    receiver_config = OmniKVCacheConfig(
+        connector_config={"type": "mock"},
+        from_stage="sender",
+        stage_id="receiver",
+        need_recv_cache=True,
+        recv_timeout=1.0,
+    )
+    receiver_manager = OmniKVTransferManager(receiver_config)
+    receiver_manager._connector = connector  # Share the same mock connector instance
+
+    req = OmniDiffusionRequest(
+        prompts=["test_integ"],
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_ids=[req_id],
+    )
+
+    # Receive
+    success = receiver_manager.receive_kv_cache(req)
+
+    # Verify
+    assert success
+    assert req.past_key_values is not None
+    assert req.kv_metadata["seq_len"] == 10
+
+
+@pytest.mark.cache
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
+def test_manager_extraction_no_connector(kv_config, common_constants):
+    """Test extraction when connector is unavailable (should still return IDs)."""
+    block_size = common_constants["block_size"]
+    req_id = common_constants["req_id"]
+
+    manager = OmniKVTransferManager(kv_config)
+    # Force connector to be None
+    manager._connector = None
+    manager.config.connector_config = None
+    finished_reqs = {req_id: {"block_ids": [1, 2], "seq_len": 10}}
+
+    processed = manager.handle_finished_requests_kv_transfer(
+        finished_reqs, kv_caches=[], block_size=block_size, cache_dtype="float32"
+    )
+
+    assert req_id in processed
