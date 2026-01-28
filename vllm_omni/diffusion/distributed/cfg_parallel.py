@@ -6,6 +6,7 @@ Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
+from typing import Any
 
 import torch
 
@@ -26,13 +27,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
     def predict_noise_maybe_with_cfg(
         self,
-        do_true_cfg,
-        true_cfg_scale,
-        positive_kwargs,
-        negative_kwargs,
-        cfg_normalize=True,
-        output_slice=None,
-    ):
+        do_true_cfg: bool,
+        true_cfg_scale: float,
+        positive_kwargs: dict[str, Any],
+        negative_kwargs: dict[str, Any] | None,
+        cfg_normalize: bool = True,
+        output_slice: int | None = None,
+    ) -> torch.Tensor | None:
         """
         Predict noise with optional classifier-free guidance.
 
@@ -103,7 +104,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 pred = pred[:, :output_slice]
             return pred
 
-    def cfg_normalize_function(self, noise_pred, comb_pred):
+    def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
         """
         Normalize the combined noise prediction.
 
@@ -119,7 +120,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
         noise_pred = comb_pred * (cond_norm / noise_norm)
         return noise_pred
 
-    def combine_cfg_noise(self, noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize=False):
+    def combine_cfg_noise(
+        self, noise_pred: torch.Tensor, neg_noise_pred: torch.Tensor, true_cfg_scale: float, cfg_normalize: bool = False
+    ) -> torch.Tensor:
         """
         Combine conditional and unconditional noise predictions with CFG.
 
@@ -141,7 +144,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
         return noise_pred
 
-    def predict_noise(self, *args, **kwargs):
+    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """
         Forward pass through transformer to predict noise.
 
@@ -152,9 +155,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
     def diffuse(
         self,
-        *args,
-        **kwargs,
-    ):
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         """
         Diffusion loop with optional classifier-free guidance.
 
@@ -187,7 +190,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
-    def scheduler_step(self, noise_pred, t, latents):
+    def scheduler_step(self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
         """
         Step the scheduler.
 
@@ -201,7 +204,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-    def scheduler_step_maybe_with_cfg(self, noise_pred, t, latents, do_true_cfg):
+    def scheduler_step_maybe_with_cfg(
+        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, do_true_cfg: bool
+    ) -> torch.Tensor:
         """
         Step the scheduler with (maybe) automatic CFG parallel synchronization.
 
@@ -245,22 +250,22 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
 
     def diffuse(
         self,
-        prompt_embeds,
-        prompt_embeds_mask,
-        negative_prompt_embeds,
-        negative_prompt_embeds_mask,
-        latents,
-        img_shapes,
-        txt_seq_lens,
-        negative_txt_seq_lens,
-        timesteps,
-        do_true_cfg,
-        guidance,
-        true_cfg_scale,
-        image_latents=None,
-        cfg_normalize=True,
-        additional_transformer_kwargs=None,
-    ):
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds_mask: torch.Tensor,
+        latents: torch.Tensor,
+        img_shapes: torch.Tensor,
+        txt_seq_lens: torch.Tensor,
+        negative_txt_seq_lens: torch.Tensor,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        guidance: torch.Tensor,
+        true_cfg_scale: float,
+        image_latents: torch.Tensor | None = None,
+        cfg_normalize: bool = True,
+        additional_transformer_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
         """
         Diffusion loop with optional classifier-free guidance.
 
