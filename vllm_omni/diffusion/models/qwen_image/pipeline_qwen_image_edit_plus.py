@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -42,6 +42,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -70,24 +71,33 @@ def get_qwen_image_edit_plus_pre_process_func(
     latent_channels = vae_config.get("z_dim", 16)
 
     def pre_process_func(
-        requests: list[OmniDiffusionRequest],
+        request: OmniDiffusionRequest,
     ):
         """Pre-process requests for QwenImageEditPlusPipeline."""
-        for req in requests:
-            image = req.pil_image
+        for i, prompt in enumerate(request.prompts):
+            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
 
             # Handle single image or list of images
-            if image is None:
+            if raw_image is None:
                 continue
 
-            if not isinstance(image, list):
-                image = [image]
+            if not isinstance(raw_image, list):
+                raw_image = [raw_image]
+            image = [
+                PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image | np.ndarray | torch.Tensor, im)
+                for im in raw_image
+            ]
 
             # Calculate dimensions based on first image
             image_size = image[0].size
             calculated_width, calculated_height = calculate_dimensions(VAE_IMAGE_SIZE, image_size[0] / image_size[1])
-            height = req.height or calculated_height
-            width = req.width or calculated_width
+            height = request.sampling_params.height or calculated_height
+            width = request.sampling_params.width or calculated_width
 
             # Ensure dimensions are multiples of vae_scale_factor * 2
             multiple_of = vae_scale_factor * 2
@@ -95,10 +105,10 @@ def get_qwen_image_edit_plus_pre_process_func(
             width = width // multiple_of * multiple_of
 
             # Store calculated dimensions in request
-            req.calculated_height = calculated_height
-            req.calculated_width = calculated_width
-            req.height = height
-            req.width = width
+            prompt["additional_information"]["calculated_height"] = calculated_height
+            prompt["additional_information"]["calculated_width"] = calculated_width
+            request.sampling_params.height = height
+            request.sampling_params.width = width
 
             # Preprocess images into condition_images (for prompt encoding) and vae_images (for VAE encoding)
             condition_images = []
@@ -124,12 +134,12 @@ def get_qwen_image_edit_plus_pre_process_func(
                 vae_images.append(image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
 
             # Store preprocessed images in request
-            req.condition_images = condition_images
-            req.vae_images = vae_images
-            req.condition_image_sizes = condition_image_sizes
-            req.vae_image_sizes = vae_image_sizes
-
-        return requests
+            prompt["additional_information"]["condition_images"] = condition_images
+            prompt["additional_information"]["vae_images"] = vae_images
+            prompt["additional_information"]["condition_image_sizes"] = condition_image_sizes
+            prompt["additional_information"]["vae_image_sizes"] = vae_image_sizes
+            request.prompts[i] = prompt
+        return request
 
     return pre_process_func
 
@@ -281,7 +291,7 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
 
     def _get_qwen_prompt_embeds(
         self,
-        prompt: str | list[str] = None,
+        prompt: str | list[str],
         image: list[torch.Tensor] | torch.Tensor | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -655,19 +665,31 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
         max_sequence_length: int = 512,
     ) -> DiffusionOutput:
         """Forward pass for image editing with support for multiple images."""
-        prompt = req.prompt
-        negative_prompt = req.negative_prompt
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
 
         # Get preprocessed images from request (pre-processing is done in DiffusionEngine)
-        if hasattr(req, "vae_images") and hasattr(req, "condition_images"):
-            condition_images = req.condition_images
-            vae_images = req.vae_images
-            condition_image_sizes = req.condition_image_sizes
-            vae_image_sizes = req.vae_image_sizes
-            calculated_height = req.calculated_height
-            calculated_width = req.calculated_width
-            height = req.height
-            width = req.width
+        if (
+            not isinstance(first_prompt, str)
+            and "vae_images" in (additional_information := first_prompt.get("additional_information", {}))
+            and "condition_images" in additional_information
+        ):
+            condition_images = additional_information.get("condition_images")
+            vae_images = additional_information.get("vae_images")
+            condition_image_sizes = additional_information.get("condition_image_sizes")
+            vae_image_sizes = additional_information.get("vae_image_sizes")
+            calculated_height = additional_information.get("calculated_height")
+            calculated_width = additional_information.get("calculated_width")
+            height = req.sampling_params.height
+            width = req.sampling_params.width
         else:
             # fallback to run pre-processing in pipeline (debug only)
             if image is None:
@@ -701,14 +723,18 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
                 condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
                 vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
 
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        generator = req.generator or generator
-        true_cfg_scale = req.true_cfg_scale or true_cfg_scale
-        if req.guidance_scale_provided:
-            guidance_scale = req.guidance_scale
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        generator = req.sampling_params.generator or generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        if req.sampling_params.guidance_scale_provided:
+            guidance_scale = req.sampling_params.guidance_scale
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
 
         # 1. check inputs
         # 2. encode prompts

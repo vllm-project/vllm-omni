@@ -10,13 +10,14 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
 import vllm.envs as envs
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
 from starlette.routing import Route
+from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving_messages import AnthropicServingMessages
 from vllm.entrypoints.launcher import serve_http
@@ -80,6 +81,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -666,14 +668,6 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
 
 
-# Remove the original /v1/chat/completions route before registering our own
-# This prevents duplicate route registration warnings in FastAPI logs.
-for route in router.routes[:]:
-    if hasattr(route, "path") and route.path == "/v1/chat/completions":
-        router.routes.remove(route)
-        break
-
-
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -763,6 +757,86 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
 
+# Health and Model endpoints for diffusion mode
+
+
+# Remove existing health endpoint if present (from vllm imports)
+# to ensure our handler takes precedence
+_remove_route_from_router(router, "/health")
+
+
+@router.get("/health")
+async def health(raw_request: Request) -> JSONResponse:
+    """Health check endpoint that works for both LLM and diffusion modes.
+
+    Returns 200 OK if the server is healthy.
+    For LLM mode: delegates to engine_client health check
+    For diffusion mode: checks if diffusion_engine is running
+    """
+    # Check if we're in diffusion mode
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None)
+    if diffusion_engine is not None:
+        # Diffusion mode health check
+        if hasattr(diffusion_engine, "is_running") and diffusion_engine.is_running:
+            return JSONResponse(content={"status": "healthy"})
+        return JSONResponse(
+            content={"status": "unhealthy", "reason": "Diffusion engine is not running"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+
+    # LLM mode - delegate to engine_client
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    if engine_client is not None:
+        await engine_client.check_health()
+        return JSONResponse(content={"status": "healthy"})
+
+    return JSONResponse(
+        content={"status": "unhealthy", "reason": "No engine initialized"},
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+    )
+
+
+# Remove existing models endpoint if present (from vllm imports)
+# to ensure our handler takes precedence
+_remove_route_from_router(router, "/v1/models")
+
+
+@router.get("/v1/models")
+async def show_available_models(raw_request: Request) -> JSONResponse:
+    """Show available models endpoint that works for both LLM and diffusion modes.
+
+    Returns model information in OpenAI-compatible format.
+    """
+    # Check if we're in diffusion mode
+    diffusion_model_name = getattr(raw_request.app.state, "diffusion_model_name", None)
+    if diffusion_model_name is not None:
+        # Diffusion mode - return the loaded model
+        return JSONResponse(
+            content={
+                "object": "list",
+                "data": [
+                    {
+                        "id": diffusion_model_name,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "vllm-omni",
+                        "permission": [],
+                    }
+                ],
+            }
+        )
+
+    # LLM mode - delegate to openai_serving_models
+    openai_serving_models = getattr(raw_request.app.state, "openai_serving_models", None)
+    if openai_serving_models is not None:
+        models = await openai_serving_models.show_available_models()
+        return JSONResponse(content=models.model_dump())
+
+    return JSONResponse(
+        content={"object": "list", "data": []},
+    )
+
+
 # Image generation API endpoints
 
 
@@ -793,7 +867,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         HTTPException: For validation errors, missing engine, or generation failures
     """
     # Get engine client (AsyncOmni) from app state
-    engine_client: EngineClient | None = getattr(raw_request.app.state, "engine_client", None)
+    engine_client: EngineClient | AsyncOmni | None = getattr(raw_request.app.state, "engine_client", None)
     if engine_client is None or not hasattr(engine_client, "stage_list"):
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -853,10 +927,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
     try:
         # Build params - pass through user values directly
-        gen_params = {
-            "prompt": request.prompt,
-            "num_outputs_per_prompt": request.n,
-        }
+        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
 
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         if request.lora is not None:
@@ -888,62 +960,72 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                     detail="Invalid lora object: both name and path are required.",
                 )
 
-            gen_params["lora_request"] = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+            gen_params.lora_request = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
             if lora_scale is not None:
-                gen_params["lora_scale"] = float(lora_scale)
+                gen_params.lora_scale = float(lora_scale)
 
         # Parse and add size if provided
         if request.size:
             width, height = parse_size(request.size)
-            gen_params["height"] = height
-            gen_params["width"] = width
+            gen_params.height = height
+            gen_params.width = width
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
 
         # Add optional parameters ONLY if provided
         if request.num_inference_steps is not None:
-            gen_params["num_inference_steps"] = request.num_inference_steps
+            gen_params.num_inference_steps = request.num_inference_steps
         if request.negative_prompt is not None:
-            gen_params["negative_prompt"] = request.negative_prompt
+            prompt["negative_prompt"] = request.negative_prompt
         if request.guidance_scale is not None:
-            gen_params["guidance_scale"] = request.guidance_scale
+            gen_params.guidance_scale = request.guidance_scale
         if request.true_cfg_scale is not None:
-            gen_params["true_cfg_scale"] = request.true_cfg_scale
+            gen_params.true_cfg_scale = request.true_cfg_scale
         if request.seed is not None:
-            gen_params["seed"] = request.seed
-        gen_params["request_id"] = f"img_gen_{int(time.time())}"
+            gen_params.seed = request.seed
+        request_id = f"img_gen_{int(time.time())}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
+        engine_client = cast(AsyncOmni, engine_client)
         result = None
         stage_list = getattr(engine_client, "stage_list", None)
         if isinstance(stage_list, list):
-            default_params_list = getattr(engine_client, "default_sampling_params_list", None)
+            default_params_list: list[OmniSamplingParams] | None = getattr(
+                engine_client, "default_sampling_params_list", None
+            )
             if not isinstance(default_params_list, list):
-                default_params_list = [{} for _ in stage_types]
+                default_params_list = [
+                    OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
+                ]
             else:
                 default_params_list = list(default_params_list)
             if len(default_params_list) != len(stage_types):
-                default_params_list = (default_params_list + [{} for _ in stage_types])[: len(stage_types)]
+                default_params_list = (
+                    default_params_list
+                    + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
+                )[: len(stage_types)]
 
-            sampling_params_list: list[dict[str, Any]] = []
+            sampling_params_list: list[OmniSamplingParams] = []
             for idx, stage_type in enumerate(stage_types):
                 if stage_type == "diffusion":
                     sampling_params_list.append(gen_params)
                 else:
                     base_params = default_params_list[idx]
-                    sampling_params_list.append(dict(base_params) if isinstance(base_params, dict) else base_params)
+                    sampling_params_list.append(base_params)
 
             async for output in engine_client.generate(
-                prompt=gen_params["prompt"],
-                request_id=gen_params["request_id"],
+                prompt=prompt,
+                request_id=request_id,
                 sampling_params_list=sampling_params_list,
             ):
                 result = output
         else:
-            result = await engine_client.generate(**gen_params)
+            result = await engine_client.generate(
+                prompt=prompt, request_id=request_id, sampling_params_list=[gen_params]
+            )
 
         if result is None:
             raise HTTPException(

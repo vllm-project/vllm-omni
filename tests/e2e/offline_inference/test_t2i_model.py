@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import is_npu, is_rocm
 
@@ -42,12 +43,14 @@ def test_diffusion_model(model_name: str):
         width = 256
         outputs = m.generate(
             "a photo of a cat sitting on a laptop keyboard",
-            height=height,
-            width=width,
-            num_inference_steps=2,
-            guidance_scale=0.0,
-            generator=torch.Generator("cuda").manual_seed(42),
-            num_outputs_per_prompt=2,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=2,
+                guidance_scale=0.0,
+                generator=torch.Generator("cuda").manual_seed(42),
+                num_outputs_per_prompt=2,
+            ),
         )
         # Extract images from request_output[0]['images']
         first_output = outputs[0]

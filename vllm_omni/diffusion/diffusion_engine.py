@@ -17,6 +17,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -60,36 +61,31 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    def step(self, requests: list[OmniDiffusionRequest]):
+    def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         # Apply pre-processing if available
         if self.pre_process_func is not None:
             preprocess_start_time = time.time()
-            requests = self.pre_process_func(requests)
+            request = self.pre_process_func(request)
             preprocess_time = time.time() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
-        output = self.add_req_and_wait_for_response(requests)
+        output = self.add_req_and_wait_for_response(request)
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
-            # Return empty output for the first request
-            if len(requests) > 0:
-                request = requests[0]
-                request_id = request.request_id or ""
-                prompt = request.prompt
-                if isinstance(prompt, list):
-                    prompt = prompt[0] if prompt else None
-                return OmniRequestOutput.from_diffusion(
-                    request_id=request_id,
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id=request.request_ids[i] if i < len(request.request_ids) else "",
                     images=[],
                     prompt=prompt,
                     metrics={},
                     latents=None,
                 )
-            return None
+                for i, prompt in enumerate(request.prompts)
+            ]
 
         postprocess_start_time = time.time()
         outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
@@ -102,13 +98,10 @@ class DiffusionEngine:
             outputs = [outputs] if outputs is not None else []
 
         # Handle single request or multiple requests
-        if len(requests) == 1:
+        if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
-            request = requests[0]
-            request_id = request.request_id or ""
-            prompt = request.prompt
-            if isinstance(prompt, list):
-                prompt = prompt[0] if prompt else None
+            prompt = request.prompts[0]
+            request_id = request.request_ids[0] if request.request_ids else ""
 
             metrics = {}
             if output.trajectory_timesteps is not None:
@@ -116,37 +109,38 @@ class DiffusionEngine:
 
             if supports_audio_output(self.od_config.model_class_name):
                 audio_payload = outputs[0] if len(outputs) == 1 else outputs
-                return OmniRequestOutput.from_diffusion(
-                    request_id=request_id,
-                    images=[],
-                    prompt=prompt,
-                    metrics=metrics,
-                    latents=output.trajectory_latents,
-                    multimodal_output={"audio": audio_payload},
-                    final_output_type="audio",
-                )
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                        multimodal_output={"audio": audio_payload},
+                        final_output_type="audio",
+                    ),
+                ]
             else:
-                return OmniRequestOutput.from_diffusion(
-                    request_id=request_id,
-                    images=outputs,
-                    prompt=prompt,
-                    metrics=metrics,
-                    latents=output.trajectory_latents,
-                )
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=outputs,
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                    ),
+                ]
         else:
             # Multiple requests: return list of OmniRequestOutput
             # Split images based on num_outputs_per_prompt for each request
             results = []
             output_idx = 0
 
-            for request in requests:
-                request_id = request.request_id or ""
-                prompt = request.prompt
-                if isinstance(prompt, list):
-                    prompt = prompt[0] if prompt else None
+            for i, prompt in enumerate(request.prompts):
+                request_id = request.request_ids[i] if i < len(request.request_ids) else ""
 
                 # Get images for this request
-                num_outputs = request.num_outputs_per_prompt
+                num_outputs = request.sampling_params.num_outputs_per_prompt
                 request_outputs = outputs[output_idx : output_idx + num_outputs] if output_idx < len(outputs) else []
                 output_idx += num_outputs
 
@@ -192,8 +186,8 @@ class DiffusionEngine:
         """
         return DiffusionEngine(config)
 
-    def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
-        return self.executor.add_req(requests)
+    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
+        return self.executor.add_req(request)
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """
@@ -316,8 +310,6 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        prompt = "dummy run"
-        # note that num_inference_steps=1 will cause timestep and temb None in the pipeline
         num_inference_steps = 1
         height = 1024
         width = 1024
@@ -327,17 +319,19 @@ class DiffusionEngine:
             dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
         else:
             dummy_image = None
+        prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
         req = OmniDiffusionRequest(
-            prompt=prompt,
-            height=height,
-            width=width,
-            pil_image=dummy_image,
-            num_inference_steps=num_inference_steps,
-            num_outputs_per_prompt=1,
+            prompts=[prompt],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                num_outputs_per_prompt=1,
+            ),
         )
         logger.info("dummy run to warm up the model")
-        requests = self.pre_process_func([req]) if self.pre_process_func is not None else [req]
-        self.add_req_and_wait_for_response(requests)
+        request = self.pre_process_func(req) if self.pre_process_func is not None else req
+        self.add_req_and_wait_for_response(request)
 
     def collective_rpc(
         self,

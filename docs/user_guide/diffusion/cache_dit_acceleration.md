@@ -18,6 +18,7 @@ Enable cache-dit acceleration by simply setting `cache_backend="cache_dit"`. Cac
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Simplest way: just enable cache-dit with default parameters
 omni = Omni(
@@ -27,7 +28,7 @@ omni = Omni(
 
 images = omni.generate(
     "a beautiful landscape",
-    num_inference_steps=50,
+    OmniDiffusionSamplingParams(num_inference_steps=50),
 )
 ```
 

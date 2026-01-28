@@ -173,12 +173,13 @@ class GPUDiffusionModelRunner:
     def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
         """Receive KV cache for a request via OmniConnector."""
         # TODO(wzliu)! must get control info from stage queue instead of hardcode
-        if not req.request_id:
+        if not req.request_ids:
             logger.warning("Request has no ID, cannot receive KV cache")
             return
+        request_id = req.request_ids[0]
 
         try:
-            logger.info(f"Attempting to receive KV cache for request {req.request_id}")
+            logger.info(f"Attempting to receive KV cache for request {request_id}")
 
             # TODO: Key used for transfer (must match sender side)
             # key = f"kv_cache_{req.request_id}"
@@ -197,7 +198,7 @@ class GPUDiffusionModelRunner:
                 from_stage = stage_id - 1
             else:
                 raise ValueError("Invalid stage id")
-            logger.info(f"Wait for KV cache for request {req.request_id} from stage {from_stage} to {to_stage}...")
+            logger.info(f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}...")
 
             # Check if we should receive KV cache based on config
             need_recv_cache = omni_kv_config.get("need_recv_cache", False)
@@ -207,7 +208,7 @@ class GPUDiffusionModelRunner:
                 start_time = time.time()
 
                 while True:
-                    get_key = f"omni_{from_stage}_to_{to_stage}_kv_cache_{req.request_id}"
+                    get_key = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
                     result = self.connector.get(
                         from_stage=from_stage,
                         to_stage=to_stage,
@@ -217,18 +218,18 @@ class GPUDiffusionModelRunner:
                         break
 
                     if time.time() - start_time > timeout:
-                        logger.error(f"Timeout waiting for KV cache for request {req.request_id} after {timeout}s")
+                        logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
                         result = None
                         break
 
                     time.sleep(0.5)
             else:
-                logger.info(f"Skip receiving KV cache for {req.request_id} (need_recv_cache=False)")
+                logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
                 result = None
 
             if result:
                 data, size = result
-                logger.info(f"Successfully received KV cache for {req.request_id}")
+                logger.info(f"Successfully received KV cache for {request_id}")
 
                 # Assume data structure matches KVCacheTransferData.to_dict()
                 if isinstance(data, dict) and "layer_blocks" in data:
@@ -242,16 +243,16 @@ class GPUDiffusionModelRunner:
                                 cache_list[i] = tensor.to(self.pipeline.device).contiguous()
                     from types import SimpleNamespace
 
-                    req.past_key_values = SimpleNamespace(**layer_blocks)
+                    req.sampling_params.past_key_values = SimpleNamespace(**layer_blocks)
 
                 if "metadata" in data:
-                    req.kv_metadata = data["metadata"]
+                    req.sampling_params.kv_metadata = data["metadata"]
 
             else:
-                logger.warning(f"No KV cache received for {req.request_id} (timeout or empty)")
+                logger.warning(f"No KV cache received for {request_id} (timeout or empty)")
 
         except Exception as e:
-            logger.error(f"Error receiving KV cache for {req.request_id}: {e}")
+            logger.error(f"Error receiving KV cache for {request_id}: {e}")
             import traceback
 
             traceback.print_exc()
@@ -261,33 +262,30 @@ class GPUDiffusionModelRunner:
         return self.pipeline.load_weights(weights)
 
     @torch.inference_mode()
-    def execute_model(self, reqs: list[OmniDiffusionRequest]) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
         Args:
-            reqs: List of diffusion requests to process.
+            req: A diffusion request containing a list of prompts to process.
 
         Returns:
             DiffusionOutput with generated results.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not reqs or len(reqs) == 0:
+        if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
-        # TODO: dealing with first req for now
-        req = reqs[0]
-
         # [Omni] KV Cache Receiving Logic
-        if getattr(req, "need_kv_receive", False) and self.connector is not None:
+        if req.sampling_params.need_kv_receive and self.connector is not None:
             self._receive_kv_cache_for_request(req)
 
-        if req.generator is None and req.seed is not None:
-            req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
+        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+            req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
 
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
-            self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
+            self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             with record_function("pipeline_forward"):
