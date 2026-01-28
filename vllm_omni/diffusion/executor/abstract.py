@@ -3,7 +3,7 @@ from typing import Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 
@@ -59,7 +59,7 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
-    def add_req(self, requests: list[OmniDiffusionRequest]):
+    def add_req(self, requests: OmniDiffusionRequest) -> DiffusionOutput:
         """Add requests to the execution queue."""
         pass
 

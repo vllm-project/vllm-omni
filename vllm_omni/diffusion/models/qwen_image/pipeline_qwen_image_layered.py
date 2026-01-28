@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -69,17 +70,35 @@ def get_qwen_image_layered_pre_process_func(
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
     def pre_process_func(
-        requests: list[OmniDiffusionRequest],
+        request: OmniDiffusionRequest,
     ):
         """Pre-process requests for QwenImageLayeredPipeline."""
-        for req in requests:
-            image = req.pil_image
+        for i, prompt in enumerate(request.prompts):
+            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
+
+            if raw_image is None or isinstance(raw_image, list):
+                raise ValueError(
+                    """Received no image or a list of image. Only a single image is supported by this model."""
+                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`"""
+                )
+
+            if isinstance(raw_image, str):
+                image = PIL.Image.open(raw_image)
+            else:
+                image = cast(PIL.Image.Image | torch.Tensor | np.ndarray, raw_image)
 
             # 1. calculate dimensions
-            image_size = image[0].size if isinstance(image, list) else image.size
-            assert req.resolution in [640, 1024], f"resolution must be either 640 or 1024, but got {req.resolution}"
+            image_size = image.size
+            assert request.sampling_params.resolution in [640, 1024], (
+                f"resolution must be either 640 or 1024, but got {request.sampling_params.resolution}"
+            )
             calculated_width, calculated_height = calculate_dimensions(
-                req.resolution * req.resolution, image_size[0] / image_size[1]
+                request.sampling_params.resolution * request.sampling_params.resolution, image_size[0] / image_size[1]
             )
             height = calculated_height
             width = calculated_width
@@ -89,10 +108,10 @@ def get_qwen_image_layered_pre_process_func(
             height = height // multiple_of * multiple_of
 
             # Store calculated dimensions in request
-            req.calculated_height = calculated_height
-            req.calculated_width = calculated_width
-            req.height = height
-            req.width = width
+            prompt["additional_information"]["calculated_height"] = calculated_height
+            prompt["additional_information"]["calculated_width"] = calculated_width
+            request.sampling_params.height = height
+            request.sampling_params.width = width
 
             # 2. Preprocess image
             if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == latent_channels):
@@ -103,10 +122,10 @@ def get_qwen_image_layered_pre_process_func(
                 # image = image.to(dtype=self.text_encoder.dtype)  # do it later
 
                 # Store preprocessed image and prompt image in request
-                req.preprocessed_image = image
-                req.prompt_image = prompt_image
-
-        return requests
+                prompt["additional_information"]["preprocessed_image"] = image
+                prompt["additional_information"]["prompt_image"] = prompt_image
+            request.prompts[i] = prompt
+        return request
 
     return pre_process_func
 
@@ -689,7 +708,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         req: OmniDiffusionRequest,
         image: PIL.Image.Image | torch.Tensor | None = None,
         prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] = None,
+        negative_prompt: str | list[str] | None = None,
         true_cfg_scale: float = 4.0,
         layers: int | None = 4,
         num_inference_steps: int = 50,
@@ -713,29 +732,48 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         # 1. Get preprocessed image from request (pre-processing is done in DiffusionEngine)
         # Override parameters from request if provided
-        prompt = req.prompt if req.prompt is not None else prompt
-        layers = req.layers if req.layers is not None else layers
-        resolution = req.resolution if req.resolution is not None else resolution
-        cfg_normalize = req.cfg_normalize if req.cfg_normalize is not None else cfg_normalize
-        use_en_prompt = req.use_en_prompt if req.use_en_prompt is not None else use_en_prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        generator = req.generator or generator
-        true_cfg_scale = req.true_cfg_scale or true_cfg_scale
-        if req.guidance_scale_provided:
-            guidance_scale = req.guidance_scale
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
 
-        if hasattr(req, "preprocessed_image"):
-            prompt_image = req.prompt_image
-            image = req.preprocessed_image
+        layers = req.sampling_params.layers if req.sampling_params.layers is not None else layers
+        resolution = req.sampling_params.resolution if req.sampling_params.resolution is not None else resolution
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        cfg_normalize = (
+            req.sampling_params.cfg_normalize if req.sampling_params.cfg_normalize is not None else cfg_normalize
+        )
+        use_en_prompt = (
+            req.sampling_params.use_en_prompt if req.sampling_params.use_en_prompt is not None else use_en_prompt
+        )
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        generator = req.sampling_params.generator or generator
+        true_cfg_scale = req.sampling_params.true_cfg_scale or true_cfg_scale
+        if req.sampling_params.guidance_scale_provided:
+            guidance_scale = req.sampling_params.guidance_scale
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+
+        if not isinstance(first_prompt, str) and "preprocessed_image" in (
+            additional_information := first_prompt.get("additional_information", {})
+        ):
+            prompt_image = additional_information.get("prompt_image")
+            image = additional_information.get("preprocessed_image")
             image = image.to(dtype=self.text_encoder.dtype)  # Now we get the type
-            calculated_height = req.calculated_height
-            calculated_width = req.calculated_width
-            height = req.height
-            width = req.width
+            calculated_height = additional_information.get("calculated_height")
+            calculated_width = additional_information.get("calculated_width")
+            height = req.sampling_params.height
+            width = req.sampling_params.width
         else:
             # fallback to run pre-processing in pipeline (debug only)
             image_size = image[0].size if isinstance(image, list) else image.size

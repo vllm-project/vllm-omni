@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 # ruff: noqa: E402
@@ -29,16 +30,20 @@ def test_stable_audio_model(model_name: str):
     sample_rate = 44100  # Stable Audio uses 44100 Hz
 
     outputs = m.generate(
-        "The sound of a dog barking",
-        negative_prompt="Low quality.",
-        num_inference_steps=4,  # Minimal steps for speed
-        guidance_scale=7.0,
-        generator=torch.Generator("cuda").manual_seed(42),
-        num_outputs_per_prompt=1,
-        extra={
-            "audio_start_in_s": audio_start_in_s,
-            "audio_end_in_s": audio_end_in_s,
+        prompts={
+            "prompt": "The sound of a dog barking",
+            "negative_prompt": "Low quality.",
         },
+        sampling_params_list=OmniDiffusionSamplingParams(
+            num_inference_steps=4,  # Minimal steps for speed
+            guidance_scale=7.0,
+            generator=torch.Generator("cuda").manual_seed(42),
+            num_outputs_per_prompt=1,
+            extra_args={
+                "audio_start_in_s": audio_start_in_s,
+                "audio_end_in_s": audio_end_in_s,
+            },
+        ),
     )
 
     # Extract audio from OmniRequestOutput
