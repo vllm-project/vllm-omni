@@ -497,16 +497,16 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
 
     def diffuse(
         self,
-        latents,
-        timesteps,
-        prompt_embeds,
-        pooled_prompt_embeds,
-        negative_prompt_embeds,
-        negative_pooled_prompt_embeds,
-        do_true_cfg,
-        guidance_scale,
-        cfg_normalize=False,
-    ):
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        negative_pooled_prompt_embeds: torch.Tensor,
+        do_true_cfg: bool,
+        guidance_scale: float,
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
         """
         Diffusion loop with optional classifier-free guidance.
 
