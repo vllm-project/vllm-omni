@@ -86,7 +86,7 @@ def wait_for_gpu_memory_to_clear(
     # Print waiting start information
     device_list = ", ".join(str(d) for d in devices)
     if threshold_bytes is not None:
-        threshold_str = f"{threshold_bytes / 2**30:.2f} GB"
+        threshold_str = f"{threshold_bytes / 2**30:.2f} GiB"
         condition_str = f"Memory usage ≤ {threshold_str}"
     else:
         threshold_percent = threshold_ratio * 100
@@ -122,7 +122,7 @@ def wait_for_gpu_memory_to_clear(
             output_raw[device] = (gb_used, gb_total)
             # Format to more readable form
             usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
-            output[device] = f"{gb_used:.1f}GB/{gb_total:.1f}GB ({usage_percent:.1f}%)"
+            output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
 
         # Optimized GPU memory status print
         print("[GPU Memory Status] Current usage:")
