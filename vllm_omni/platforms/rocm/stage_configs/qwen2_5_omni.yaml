@@ -1,21 +1,23 @@
 # stage config for running qwen2.5-omni with architecture of OmniLLM.
+
+# The following config has been verified on 2x H100-80G GPU.
 stage_args:
   - stage_id: 0
-    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true            # Run this stage in a separate process
-      devices: "0"            # Visible devices for this stage
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
       max_batch_size: 1
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.npu.npu_ar_worker.NPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
       engine_output_type: latent
       enable_prefix_caching: false
+      max_num_batched_tokens: 32768
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -27,8 +29,8 @@ stage_args:
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
+
   - stage_id: 1
-    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true
       devices: "1"
@@ -36,12 +38,13 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.npu.npu_ar_worker.NPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
+      max_num_batched_tokens: 32768
       engine_output_type: latent
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen2_5_omni.thinker2talker
@@ -54,21 +57,22 @@ stage_args:
       detokenize: True
       repetition_penalty: 1.05
       stop_token_ids: [8294]
+
   - stage_id: 2
-    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       process: true
-      devices: "0"            # Example: use a different NPU than the previous stage; use "0" if single NPU
+      devices: "2"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.15
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
+      max_num_batched_tokens: 32768
       engine_output_type: audio
     engine_input_source: [1]
     final_output: true
@@ -88,6 +92,7 @@ runtime:
   defaults:
     window_size: -1             # Simplified: trigger downstream only after full upstream completion
     max_inflight: 1             # Simplified: process serially within each stage
+
   edges:
     - from: 0                   # thinker → talker: trigger only after receiving full input (-1)
       to: 1

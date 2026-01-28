@@ -9,7 +9,6 @@ from safetensors.torch import save_file
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import is_npu
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -24,10 +23,6 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 # This test is specific to Z-Image LoRA behavior. Keep it focused on a single
 # model to reduce runtime and avoid extra downloads.
 models = ["Tongyi-MAI/Z-Image-Turbo"]
-
-# NPU still can't run Tongyi-MAI/Z-Image-Turbo properly.
-if is_npu():
-    pytest.skip("Tongyi-MAI/Z-Image-Turbo is not supported on NPU yet.", allow_module_level=True)
 
 
 @pytest.mark.parametrize("model_name", models)

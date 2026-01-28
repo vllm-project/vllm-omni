@@ -13,11 +13,12 @@ from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
+from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
 
-class GPUGenerationWorker(GPUWorker):
+class GPUGenerationWorker(OmniWorkerMixin, GPUWorker):
     """GPU Worker for Generation model (non-autoregressive waveform generation).
 
     Usage in stage config:

@@ -28,6 +28,13 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
 logger = init_logger(__name__)
 
 
+# Small helper to centralize cache-dit summaries.
+def cache_summary(pipeline: Any, details: bool = True) -> None:
+    cache_dit.summary(pipeline.transformer, details=details)
+    if hasattr(pipeline, "transformer_2"):
+        cache_dit.summary(pipeline.transformer_2, details=details)
+
+
 # Registry of custom cache-dit enablers for specific models
 # Maps pipeline names to their cache-dit enablement functions
 # Models in this registry require custom handling (e.g., dual-transformer architectures)
@@ -71,52 +78,45 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
         A refresh function that can be called to update cache context with new num_inference_steps.
     """
 
-    # Build DBCacheConfig for primary transformer
-    primary_cache_config = _build_db_cache_config(cache_config)
-
-    # FIXME: secondary cache shares the same config with primary cache for now,
-    # but we should support different config for secondary transformer in the future
-    # Build DBCacheConfig for secondary transformer (can use same or different config)
-    secondary_cache_config = _build_db_cache_config(cache_config)
-
-    # Build calibrator configs if TaylorSeer is enabled
-    primary_calibrator = None
-    secondary_calibrator = None
-    if cache_config.enable_taylorseer:
-        taylorseer_order = cache_config.taylorseer_order
-        primary_calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        secondary_calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
-
-    # Build ParamsModifier for each transformer
-    primary_modifier = ParamsModifier(
-        cache_config=primary_cache_config,
-        calibrator_config=primary_calibrator,
-    )
-    secondary_modifier = ParamsModifier(
-        cache_config=secondary_cache_config,
-        calibrator_config=secondary_calibrator,
-    )
-
-    logger.info(
-        "Enabling cache-dit on Wan2.2 dual transformers with BlockAdapter: "
-        f"Fn={primary_cache_config.Fn_compute_blocks}, "
-        f"Bn={primary_cache_config.Bn_compute_blocks}, "
-        f"W={primary_cache_config.max_warmup_steps}, "
-    )
-
-    transformer = pipeline.transformer
-    transformer_2 = pipeline.transformer_2
-    transformer_blocks = transformer.blocks
-    transformer_2_blocks = transformer_2.blocks
-    # Enable cache-dit using BlockAdapter for both transformers simultaneously
     cache_dit.enable_cache(
         BlockAdapter(
-            transformer=[transformer, transformer_2],
-            blocks=[transformer_blocks, transformer_2_blocks],
-            forward_pattern=[ForwardPattern.Pattern_2, ForwardPattern.Pattern_2],
-            params_modifiers=[primary_modifier, secondary_modifier],
+            transformer=[
+                pipeline.transformer,
+                pipeline.transformer_2,
+            ],
+            blocks=[
+                pipeline.transformer.blocks,
+                pipeline.transformer_2.blocks,
+            ],
+            forward_pattern=[
+                ForwardPattern.Pattern_2,
+                ForwardPattern.Pattern_2,
+            ],
+            params_modifiers=[
+                # high-noise transformer only have 30% steps
+                ParamsModifier(
+                    cache_config=DBCacheConfig().reset(
+                        max_warmup_steps=cache_config.max_warmup_steps,
+                        max_cached_steps=cache_config.max_cached_steps,
+                    ),
+                ),
+                ParamsModifier(
+                    cache_config=DBCacheConfig().reset(
+                        max_warmup_steps=2,
+                        max_cached_steps=20,
+                    ),
+                ),
+            ],
             has_separate_cfg=True,
+        ),
+        cache_config=DBCacheConfig(
+            Fn_compute_blocks=cache_config.Fn_compute_blocks,
+            Bn_compute_blocks=cache_config.Bn_compute_blocks,
+            max_warmup_steps=cache_config.max_warmup_steps,
+            max_cached_steps=cache_config.max_cached_steps,
+            max_continuous_cached_steps=cache_config.max_continuous_cached_steps,
+            residual_diff_threshold=cache_config.residual_diff_threshold,
+            num_inference_steps=None,
         ),
     )
 
@@ -133,8 +133,8 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
         Returns:
             A tuple of (num_high_noise_steps, num_low_noise_steps).
         """
-        if pipeline.config.boundary_ratio is not None:
-            boundary_timestep = pipeline.config.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
+        if pipeline.boundary_ratio is not None:
+            boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
         else:
             boundary_timestep = None
 
@@ -158,10 +158,21 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
             pipeline: The Wan2.2 pipeline instance.
             num_inference_steps: New number of inference steps.
         """
+
         num_high_noise_steps, num_low_noise_steps = _split_inference_steps(num_inference_steps)
         # Refresh context for high-noise transformer
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_high_noise_steps, verbose=verbose)
+            # cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_high_noise_steps, verbose=verbose)
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                num_inference_steps=num_high_noise_steps,
+                verbose=verbose,
+            )
+            cache_dit.refresh_context(
+                pipeline.transformer_2,
+                num_inference_steps=num_low_noise_steps,
+                verbose=verbose,
+            )
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
@@ -175,10 +186,6 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], 
                 verbose=verbose,
             )
 
-        # Refresh context for low-noise transformer
-        if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(pipeline.transformer_2, num_inference_steps=num_low_noise_steps, verbose=verbose)
-        else:
             cache_dit.refresh_context(
                 pipeline.transformer_2,
                 cache_config=DBCacheConfig().reset(
@@ -790,8 +797,10 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
 # Register custom cache-dit enablers after function definitions
 CUSTOM_DIT_ENABLERS.update(
     {
-        "WanPipeline": enable_cache_for_wan22,
-        # "FluxPipeline": enable_cache_for_flux,
+        "Wan22Pipeline": enable_cache_for_wan22,
+        "Wan22I2VPipeline": enable_cache_for_wan22,
+        "Wan22TI2VPipeline": enable_cache_for_wan22,
+        "FluxPipeline": enable_cache_for_flux,
         "LongCatImagePipeline": enable_cache_for_longcat_image,
         "LongCatImageEditPipeline": enable_cache_for_longcat_image,
         "StableDiffusion3Pipeline": enable_cache_for_sd3,

@@ -54,7 +54,7 @@ class SageAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
 
-    def forward(
+    def forward_cuda(
         self,
         query: torch.Tensor,
         key: torch.Tensor,

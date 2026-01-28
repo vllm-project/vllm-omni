@@ -24,7 +24,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -610,7 +610,7 @@ class LongCatImageTransformer2DModel(nn.Module):
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
 
-        if is_npu():
+        if current_omni_platform.is_npu():
             freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
             image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
         else:
