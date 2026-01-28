@@ -214,7 +214,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
 @pytest.mark.integration
 def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
-    if is_npu() or is_rocm():
+    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image VAE patch parallel e2e test is only supported on CUDA for now.")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 CUDA devices.")
