@@ -295,6 +295,7 @@ class OmniARScheduler(VLLMScheduler):
                 if request.output_token_ids:
                     stopped = check_stop(request, self.max_model_len)
             routed_experts = None
+            finish_reason = None
             if stopped:
                 # [Omni] Handle routed experts if enabled
                 if self.vllm_config.model_config.enable_return_routed_experts:
@@ -317,7 +318,16 @@ class OmniARScheduler(VLLMScheduler):
 
                     routed_experts = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
-                kv_transfer_params = self._free_request(request)
+                # Capture finish_reason BEFORE _handle_stopped_request, which may
+                # reset the status to WAITING for streaming requests that continue.
+                finish_reason = request.get_finished_reason()
+
+                # Handle resumable/streaming input requests - only actually finish
+                # if _handle_stopped_request returns True
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
@@ -344,13 +354,13 @@ class OmniARScheduler(VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
-                        finish_reason=request.get_finished_reason(),
+                        finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
