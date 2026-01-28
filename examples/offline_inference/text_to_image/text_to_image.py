@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
+    parser.add_argument(
         "--ulysses_degree",
         type=int,
         default=1,
@@ -166,6 +171,7 @@ def main():
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        enable_cache_dit_summary=args.enable_cache_dit_summary,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
