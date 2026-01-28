@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterable
-from typing import cast
+from typing import cast, Any
 
 import numpy as np
 import PIL.Image
@@ -545,7 +545,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
 
         return DiffusionOutput(output=output)
 
-    def predict_noise(self, current_model=None, **kwargs):
+    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """
         Forward pass through transformer to predict noise.
 
