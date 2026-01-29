@@ -77,6 +77,8 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
+    import gc
+
     assert threshold_bytes is not None or threshold_ratio is not None
     # Use nvml instead of pytorch to reduce measurement error from torch cuda
     # context.
@@ -86,7 +88,7 @@ def wait_for_gpu_memory_to_clear(
     # Print waiting start information
     device_list = ", ".join(str(d) for d in devices)
     if threshold_bytes is not None:
-        threshold_str = f"{threshold_bytes / 2**30:.2f} GB"
+        threshold_str = f"{threshold_bytes / 2**30:.2f} GiB"
         condition_str = f"Memory usage ≤ {threshold_str}"
     else:
         threshold_percent = threshold_ratio * 100
@@ -122,7 +124,7 @@ def wait_for_gpu_memory_to_clear(
             output_raw[device] = (gb_used, gb_total)
             # Format to more readable form
             usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
-            output[device] = f"{gb_used:.1f}GB/{gb_total:.1f}GB ({usage_percent:.1f}%)"
+            output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
 
         # Optimized GPU memory status print
         print("[GPU Memory Status] Current usage:")
@@ -155,6 +157,9 @@ def wait_for_gpu_memory_to_clear(
         # Add waiting hint (optional)
         if dur_s > 10 and int(dur_s) % 10 == 0:  # Show hint every 10 seconds
             print(f"Waiting... Already waited {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         time.sleep(5)
 

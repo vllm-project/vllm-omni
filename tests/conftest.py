@@ -65,10 +65,6 @@ def _run_pre_test_cleanup(enable_force=False):
         print("GPU cleanup disabled")
         return
 
-    if torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
-
     print("Pre-test GPU status:")
 
     num_gpus = torch.cuda.device_count()
@@ -78,7 +74,7 @@ def _run_pre_test_cleanup(enable_force=False):
 
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_gpus)),
-                threshold_ratio=0.1,
+                threshold_ratio=0.05,
             )
         except Exception as e:
             print(f"Pre-test cleanup note: {e}")
