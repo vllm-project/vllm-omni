@@ -189,6 +189,7 @@ def retrieve_latents(
 
 class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
     color_format = "RGBA"
+
     def __init__(
         self,
         *,
