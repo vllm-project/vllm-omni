@@ -7,6 +7,7 @@ nav:
   - Serving:
     - OpenAI-Compatible API:
       - Image Generation: serving/image_generation_api.md
+      - Image Edit: serving/image_edit_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:

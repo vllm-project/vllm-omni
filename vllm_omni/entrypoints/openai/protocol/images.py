@@ -123,3 +123,5 @@ class ImageGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
+    output_format: str = Field(None, description="The output format of the image generation")
+    size: str = Field(None, description="The size of the image generated")
