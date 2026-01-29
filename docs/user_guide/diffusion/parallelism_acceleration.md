@@ -383,19 +383,21 @@ An example of offline inference using CFG-Parallel (image-to-image) is shown bel
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
+image_path = "path_to_image.png"
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
     parallel_config=DiffusionParallelConfig(cfg_parallel_size=2),
 )
+input_image = Image.open(image_path).convert("RGB")
 
 outputs = omni.generate(
     {
         "prompt": "turn this cat to a dog",
         "negative_prompt": "low quality, blurry",
+        "multi_modal_data": {"image": input_image},
     },
     OmniDiffusionSamplingParams(
         true_cfg_scale=4.0,
-        pil_image=input_image,
         num_inference_steps=50,
     ),
 )
@@ -404,6 +406,19 @@ outputs = omni.generate(
 Notes:
 
 - CFG-Parallel is only effective when a `negative_prompt` is provided AND a guidance scale (or `cfg_scale`) is greater than 1.
+
+See `examples/offline_inference/image_to_image/image_edit.py` for a complete working example.
+```bash
+cd examples/offline_inference/image_to_image/
+python image_edit.py \
+  --model "Qwen/Qwen-Image-Edit" \
+  --image "qwen_image_output.png" \
+  --prompt "turn this cat to a dog" \
+  --negative_prompt "low quality, blurry" \
+  --cfg_scale 4.0 \
+  --output "edited_image.png" \
+  --cfg_parallel_size 2
+```
 
 #### How to parallelize a pipeline
 
