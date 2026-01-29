@@ -4,7 +4,7 @@ stage_args:
   - stage_id: 0
     stage_type: llm
     runtime:
-      devices: "0"  # Adjust as needed
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: thinker
@@ -38,7 +38,7 @@ stage_args:
   - stage_id: 1
     stage_type: diffusion
     runtime:
-      devices: "1"
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: dit
