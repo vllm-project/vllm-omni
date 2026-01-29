@@ -375,7 +375,7 @@ def forward(self, hidden_states, ...):
 
 ##### Offline Inference
 
-CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=...)`. The recommended configuration is `cfg_parallel_size=2` (one rank for the positive branch and one rank for the negative branch).
+CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=2)`, which runs one rank for the positive branch and one rank for the negative branch.
 
 An example of offline inference using CFG-Parallel (image-to-image) is shown below:
 
@@ -403,7 +403,7 @@ outputs = omni.generate(
 
 Notes:
 
-- CFG-Parallel is only effective when **true CFG** is enabled (i.e., `true_cfg_scale > 1` and a `negative_prompt` is provided).
+- CFG-Parallel is only effective when a `negative_prompt` is provided AND a guidance scale (or `cfg_scale`) is greater than 1.
 
 #### How to parallelize a pipeline
 
