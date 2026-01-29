@@ -503,7 +503,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         except Exception as e:
             print(f"Error in current_input: {e}")
             print(f"last_talker_hidden shape: {last_talker_hidden.shape}")
-            print(f"prev_embed shape: {prev_embed.shape}")
+            print(f"prev_embed shape: {layer0_embed.shape}")
             raise e
         batch_size = current_input.shape[0]
 
