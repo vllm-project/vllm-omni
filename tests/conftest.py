@@ -589,7 +589,8 @@ def convert_audio_to_text(audio_data):
 
     print(f"audio data is saved: {output_path}")
 
-    convert_audio_file_to_text(output_path=output_path)
+    text = convert_audio_file_to_text(output_path=output_path)
+    return text
 
 
 def convert_audio_file_to_text(output_path):
@@ -627,7 +628,8 @@ def merge_base64_and_convert_to_text(base64_list):
             merged_audio += seg
     output_path = f"./test_{int(time.time())}"
     merged_audio.export(output_path, format="wav")
-    convert_audio_file_to_text(output_path)
+    text = convert_audio_file_to_text(output_path)
+    return text
 
 
 def modify_stage_config(
