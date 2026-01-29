@@ -67,7 +67,7 @@ def get_qwen_image_edit_plus_pre_process_func(
         vae_config = json.load(f)
         vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
 
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
     latent_channels = vae_config.get("z_dim", 16)
 
     def pre_process_func(
@@ -158,7 +158,7 @@ def get_qwen_image_edit_plus_post_process_func(
         vae_config = json.load(f)
         vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
 
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2, do_convert_rgb=True)
 
     def post_process_func(
         images: torch.Tensor,
@@ -214,7 +214,7 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
         self.tokenizer_max_length = 1024
         # Edit prompt template - different from generation template, supports multiple images
         self.prompt_template_encode = (

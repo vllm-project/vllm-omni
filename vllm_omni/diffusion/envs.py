@@ -66,14 +66,32 @@ class PackagesEnvChecker:
             if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
                 return False
 
+            # Check for any FA backend: FA3 (fa3_fwd_interface, flash_attn_interface) or FA2 (flash_attn)
+            # Try FA3 from fa3-fwd PyPI package
+            try:
+                import fa3_fwd_interface  # noqa: F401
+
+                return True
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+            # Try FA3 from flash-attention source build
+            try:
+                import flash_attn_interface  # noqa: F401
+
+                return True
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+            # Try FA2 from flash-attn package
             from flash_attn import __version__
 
             if __version__ < "2.6.0":
                 raise ImportError("install flash_attn >= 2.6.0")
             return True
-        except ImportError:
+        except (ImportError, ModuleNotFoundError):
             if not packages_info.get("has_aiter", False):
-                logger.warning('Flash Attention library "flash_attn" not found, using pytorch attention implementation')
+                logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")
             return False
 
     def get_packages_info(self) -> dict:

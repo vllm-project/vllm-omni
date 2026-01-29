@@ -604,6 +604,36 @@ def convert_audio_to_text(audio_data):
         return ""
 
 
+def merge_base64_and_convert_to_text(base64_list):
+    """
+    Merge a list of base64 encoded audio data and convert to text.
+    """
+    import whisper
+    from pydub import AudioSegment
+
+    merged_audio = None
+    for base64_data in base64_list:
+        audio_data = base64.b64decode(base64_data.split(",", 1)[-1])
+        seg = AudioSegment.from_file(io.BytesIO(audio_data))
+        if merged_audio is None:
+            merged_audio = seg
+        else:
+            merged_audio += seg
+    output_path = f"./test_{int(time.time())}"
+    merged_audio.export(output_path, format="wav")
+    model = whisper.load_model("base")
+    text = model.transcribe(
+        output_path,
+        temperature=0.0,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+    )["text"]
+    if text:
+        return text
+    else:
+        return ""
+
+
 def modify_stage_config(
     yaml_path: str,
     updates: dict[str, Any],

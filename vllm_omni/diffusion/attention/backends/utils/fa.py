@@ -17,17 +17,53 @@ import torch.nn.functional as F
 
 from vllm_omni.platforms import current_omni_platform
 
-if current_omni_platform.is_rocm():
-    from vllm._aiter_ops import is_aiter_found_and_supported
+# Flash Attention function detection with fallback chain
+flash_attn_func = None
+flash_attn_varlen_func = None
 
-    # Choose to enable this by default on ROCm
-    # Whenever possible as it is the fastest backend
-    if is_aiter_found_and_supported():
-        from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
-    else:
-        raise ImportError("Aiter is not found and supported on currentROCm device.")
+if current_omni_platform.is_rocm():
+    # ROCm: try Aiter first
+    try:
+        from vllm._aiter_ops import is_aiter_found_and_supported
+
+        if is_aiter_found_and_supported():
+            from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        pass
 else:
-    from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+    # CUDA: try FA3 -> FA2 fallback chain
+    # Try FA3 from fa3-fwd PyPI package
+    try:
+        from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    # Fallback: Try FA3 from flash-attention source build
+    if flash_attn_func is None:
+        try:
+            from flash_attn_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+    # Fallback: Try FA2 from flash-attn package (try multiple import paths)
+    if flash_attn_func is None:
+        try:
+            from flash_attn import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+    if flash_attn_func is None:
+        try:
+            from flash_attn.flash_attn_interface import (  # noqa: F401
+                flash_attn_func,
+                flash_attn_varlen_func,
+            )
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+# If no FA backend available, SDPA backend will be selected at the platform level
+# flash_attn_func and flash_attn_varlen_func will be None
+HAS_FLASH_ATTN = flash_attn_func is not None
 
 
 def _index_first_axis(tensor, indices):
