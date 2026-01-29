@@ -52,19 +52,16 @@ dependencies = [
 cuda = [
     # For CUDA/CPU platform (default): pip install -e .[cuda]
     "onnxruntime>=1.23.2",  # Required for Qwen3TTS tokenizer
-    "sox>=1.4.0",  # Required for audio processing
 ]
 
 rocm = [
     # For AMD ROCm platform: pip install -e .[rocm]
-    "onnxruntime-rocm>=1.23.2",
-    "sox>=1.4.0",
+    "onnxruntime-rocm>=1.22.2",
 ]
 
 npu = [
     # For Ascend NPU platform: pip install -e .[npu]
     "onnxruntime-cann>=1.23.2",
-    "sox>=1.4.0",
 ]
 
 dev = [
