@@ -162,6 +162,15 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
 
+        # CFG Parallel parameters
+        omni_config_group.add_argument(
+            "--cfg-parallel-size",
+            type=int,
+            default=1,
+            choices=[1, 2],
+            help="Number of devices for CFG parallel computation",
+        )
+
         # Cache optimization parameters
         omni_config_group.add_argument(
             "--cache-backend",
