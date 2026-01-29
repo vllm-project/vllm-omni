@@ -18,6 +18,8 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.platforms import current_omni_platform
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -63,8 +65,8 @@ class SequentialOffloader:
         module.to("cpu", non_blocking=True)
 
         # Release allocator blocks when tensors leave the GPU.
-        if previous_device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if previous_device.type != "cpu":
+            current_omni_platform.empty_cache()
 
         if self.pin_memory:
             for p in module.parameters():
@@ -87,7 +89,9 @@ class SequentialOffloader:
         for enc in self.encoders:
             self._to_cpu(enc)
         self._to_gpu(module)
-        torch.cuda.synchronize()
+
+        current_omni_platform.synchronize()
+
         logger.debug("Swapped: encoders -> CPU, DiT -> GPU")
 
     def _encoder_pre_hook(self, module: nn.Module, args: tuple) -> None:
@@ -95,7 +99,9 @@ class SequentialOffloader:
         for dit_mod in self.dits:
             self._to_cpu(dit_mod)
         self._to_gpu(module)
-        torch.cuda.synchronize()
+
+        current_omni_platform.synchronize()
+
         logger.debug("Swapped: DiT -> CPU, encoder -> GPU")
 
     def register(self) -> None:
@@ -166,7 +172,10 @@ def apply_offload_hooks(
         try:
             device = next(dit_modules[0].parameters()).device
         except StopIteration:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            try:
+                device = current_omni_platform.get_torch_device()
+            except (NotImplementedError, AttributeError):
+                device = torch.device("cpu")
 
     # Collect all encoders
     encoders: list[nn.Module] = []
@@ -184,9 +193,10 @@ def apply_offload_hooks(
     pin = getattr(od_config, "pin_cpu_memory", True)
     for dit_mod in dit_modules:
         dit_mod.to("cpu")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if pin and torch.cuda.is_available():
+
+    current_omni_platform.empty_cache()
+
+    if pin:
         for dit_mod in dit_modules:
             for p in dit_mod.parameters():
                 if p.data.device.type == "cpu" and not p.data.is_pinned():
