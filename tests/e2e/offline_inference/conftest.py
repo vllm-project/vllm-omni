@@ -10,7 +10,7 @@ import pytest
 from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.conftest import _run_post_test_cleanup
+from tests.conftest import _run_post_test_cleanup, _run_pre_test_cleanup
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -51,6 +51,9 @@ class OmniRunner:
             stage_configs_path: Optional path to YAML stage config file
             **kwargs: Additional arguments passed to Omni
         """
+        cleanup_dist_env_and_memory()
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
         self.model_name = model_name
         self.seed = seed
 
@@ -337,7 +340,7 @@ class OmniRunner:
         self.close()
         del self.omni
         cleanup_dist_env_and_memory()
-        _run_post_test_cleanup()
+        _run_post_test_cleanup(enable_force=True)
 
     def close(self):
         """Close and cleanup the Omni instance."""

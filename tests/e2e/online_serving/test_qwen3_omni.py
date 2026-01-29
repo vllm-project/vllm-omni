@@ -133,7 +133,7 @@ def dummy_messages_from_video_data(
 
 def get_prompt(prompt_type="text_only"):
     prompts = {
-        "text_only": "What is the capital of China?",
+        "text_only": "What is the capital of China? Answer in 20 words.",
         "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
@@ -144,9 +144,6 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm(), reason="Test skipped on AMD environment due to known output issues"
-)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> None:
     """
@@ -226,9 +223,6 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     assert similarity > 0.9, "The audio content is not same as the text"
 
 
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm(), reason="Test skipped on AMD environment due to known output issues"
-)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     """
