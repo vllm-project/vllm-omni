@@ -39,22 +39,34 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         selected_backend: str | None,
         head_size: int,
     ) -> str:
+        from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+
         # Check compute capability for Flash Attention support
         # Flash Attention requires compute capability >= 8.0 and < 10.0
         compute_capability = cls.get_device_capability()
-        flash_attn_supported = False
+        compute_supported = False
         if compute_capability is not None:
             major, minor = compute_capability
             capability = major * 10 + minor
-            flash_attn_supported = 80 <= capability < 100
+            compute_supported = 80 <= capability < 100
+
+        # Check if FA packages are available
+        packages_info = PACKAGES_CHECKER.get_packages_info()
+        packages_available = packages_info.get("has_flash_attn", False)
+
+        # Both compute capability and packages must be available for FA
+        flash_attn_supported = compute_supported and packages_available
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
-                logger.warning(
-                    "Flash Attention requires GPU with compute capability >= 8.0 "
-                    "and < 10.0. Falling back to TORCH_SDPA backend."
-                )
+                if not compute_supported:
+                    logger.warning(
+                        "Flash Attention requires GPU with compute capability >= 8.0 "
+                        "and < 10.0. Falling back to TORCH_SDPA backend."
+                    )
+                elif not packages_available:
+                    logger.warning("Flash Attention packages not available. Falling back to TORCH_SDPA backend.")
                 logger.info("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
