@@ -373,7 +373,7 @@ def forward(self, hidden_states, ...):
 
 ### CFG-Parallel
 
-##### Offline Inference
+#### Offline Inference
 
 CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=2)`, which runs one rank for the positive branch and one rank for the negative branch.
 
@@ -418,6 +418,14 @@ python image_edit.py \
   --cfg_scale 4.0 \
   --output "edited_image.png" \
   --cfg_parallel_size 2
+```
+
+#### Online Serving
+
+You can enable CFG-Parallel in online serving for diffusion models via `--cfg-parallel-size`:
+
+```bash
+vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
 ```
 
 #### How to parallelize a pipeline
