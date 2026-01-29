@@ -22,8 +22,10 @@ steps:
     commands:
       - pytest -v -s tests/entrypoints/
       - pytest -v -s tests/diffusion/cache/
+      - pytest -v -s tests/diffusion/lora/
       - pytest -v -s tests/model_executor/models/qwen2_5_omni/test_audio_length.py
       - pytest -v -s tests/worker/
+      - pytest -v -s tests/distributed/omni_connectors/test_kv_flow.py
     agents:
       queue: "gpu_1_queue"
     plugins:
