@@ -247,7 +247,7 @@ def get_through_connector(connector, target_stage_id, stage_id, req_id, connecto
                 connector.get_requests[req_id] += 1
                 logger.debug(f"[Stage-{stage_id}] Received one chunk for request {connector_get_key}")
                 break
-        time.sleep(0.1)
+        time.sleep(0.01)
     return payload_data
 
 
@@ -330,10 +330,11 @@ def put_chunk(
 
         if stage_id == 0 and chunk_id == 0:
             if connector.request_payload.get(request_id) is None:
-                connector.request_payload[request_id] = payload_data
-                return
+                if not payload_data.get("finished"):
+                    connector.request_payload[request_id] = payload_data
+                    return
             else:
-                save_payload = connector.request_payload.get(request_id)
+                save_payload = connector.request_payload.pop(request_id)
                 payload_data["thinker_embeddings"] = torch.cat(
                     (save_payload.get("thinker_embeddings"), payload_data.get("thinker_embeddings")), dim=0
                 )

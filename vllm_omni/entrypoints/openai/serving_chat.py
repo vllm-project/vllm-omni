@@ -9,6 +9,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Final, Optional, cast
 
 import jinja2
+import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
@@ -1656,10 +1657,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
+        audio_data = final_res.multimodal_output.get("audio")
         if stream:
-            audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+            audio_tensor = audio_data[-1].float().detach().cpu().numpy()
         else:
-            audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+            if isinstance(audio_data, list):
+                audio_data = torch.cat(audio_data, dim=-1)
+            audio_tensor = audio_data.float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:

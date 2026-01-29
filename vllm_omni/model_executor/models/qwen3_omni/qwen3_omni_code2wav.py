@@ -219,7 +219,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         end_index = codes.shape[-1]
         # TODO: need to optimize algorithms, current only support
         # chunk_size = left_context_size = 25
-        if end_index == chunk_size:
+        if end_index <= chunk_size:
             context_size = 0
         else:
             context_size = left_context_size
