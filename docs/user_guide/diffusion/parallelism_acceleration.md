@@ -30,6 +30,7 @@ The following table shows which models are currently supported by parallelism me
 | **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ✅ (TP=2 only) |
 | **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
 | **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ❌ | ❌ | ❌ | ✅ |
+| **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ❌ | ❌ | ✅ |
 
 
 !!! note "TP Limitations for Diffusion Models"
@@ -67,10 +68,12 @@ omni = Omni(
 )
 
 outputs = omni.generate(
-    prompt="a cat reading a book",
-    num_inference_steps=9,
-    width=512,
-    height=512,
+    "a cat reading a book",
+    OmniDiffusionSamplingParams(
+        num_inference_steps=9,
+        width=512,
+        height=512,
+    ),
 )
 ```
 
@@ -83,6 +86,7 @@ outputs = omni.generate(
 An example of offline inference script using [Ulysses-SP](https://arxiv.org/pdf/2309.14509) is shown below:
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 ulysses_degree = 2
 
@@ -91,7 +95,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
@@ -133,6 +140,7 @@ Ring-Attention ([arxiv paper](https://arxiv.org/abs/2310.01889)) splits the inpu
 An example of offline inference script using Ring-Attention is shown below:
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 ring_degree = 2
 
@@ -141,7 +149,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ring_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
@@ -183,6 +194,7 @@ You can combine both Ulysses-SP and Ring-Attention for larger scale parallelism.
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 # Hybrid: 2 Ulysses × 2 Ring = 4 GPUs total
@@ -191,7 +203,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 ##### Online Serving
@@ -374,11 +389,15 @@ omni = Omni(
 )
 
 outputs = omni.generate(
-    prompt="turn this cat to a dog",
-    negative_prompt="low quality, blurry",
-    true_cfg_scale=4.0,
-    pil_image=input_image,
-    num_inference_steps=50,
+    {
+        "prompt": "turn this cat to a dog",
+        "negative_prompt": "low quality, blurry",
+    },
+    OmniDiffusionSamplingParams(
+        true_cfg_scale=4.0,
+        pil_image=input_image,
+        num_inference_steps=50,
+    ),
 )
 ```
 

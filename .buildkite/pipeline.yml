@@ -18,17 +18,46 @@ steps:
   #     queue: "ascend"
 
   - label: "Simple Unit Test"
-    depends_on: ~
+    depends_on: image-build
     commands:
-      - ".buildkite/scripts/simple_test.sh"
+      - pytest -v -s tests/entrypoints/
+      - pytest -v -s tests/diffusion/cache/
+      - pytest -v -s tests/model_executor/models/qwen2_5_omni/test_audio_length.py
+      - pytest -v -s tests/worker/
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Model Test"
     timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Images API LoRA E2E"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/online_serving/test_images_generations_lora.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -132,7 +161,7 @@ steps:
     timeout_in_minutes: 20
     depends_on: image-build
     commands:
-      - pytest -s -v tests/diffusion/test_gpu_diffusion_worker.py
+      - pytest -s -v tests/diffusion/test_diffusion_worker.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
@@ -170,7 +199,10 @@ steps:
     depends_on: image-build
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_async_omni.py
+      - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
+      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
+      - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py
+      - pytest -s -v tests/e2e/online_serving/test_async_omni.py
     agents:
       queue: "mithril-h100-pool"
     plugins:

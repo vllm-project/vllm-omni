@@ -27,10 +27,22 @@ _TTS_SPEAKERS: set[str] = {
     "Eric",
     "Ryan",
     "Aiden",
-    "One_Anna",
+    "Ono_Anna",
     "Sohee",
 }
-_TTS_LANGUAGES: set[str] = {"Auto", "Chinese", "English", "Japanese", "Korean"}
+_TTS_LANGUAGES: set[str] = {
+    "Auto",
+    "Chinese",
+    "English",
+    "Japanese",
+    "Korean",
+    "German",
+    "French",
+    "Russian",
+    "Portuguese",
+    "Spanish",
+    "Italian",
+}
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096

@@ -4,11 +4,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
-)
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
@@ -140,7 +135,10 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.code_predictor = Qwen3OmniMoeTalkerCodePredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "code_predictor")
         )
-        self.empty_code = torch.empty((1, 0), dtype=torch.long)
+        self.layer0_embed_buffer = torch.zeros(
+            (vllm_config.scheduler_config.max_num_seqs, 1, self.config.text_config.hidden_size),
+            dtype=vllm_config.model_config.dtype,
+        )
 
     def code_predictor_forward(
         self,
@@ -192,62 +190,18 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         all_codes_per_position = []
         middle_hidden_states = []  # Collect hidden states for each position
 
-        logits_processors = LogitsProcessorList(
-            [
-                TopKLogitsWarper(top_k=top_k),
-                TopPLogitsWarper(top_p=top_p),
-            ]
-        )
         # Generate residual layers for each position
         for pos in range(seq_len):
             layer0_code = input_ids[:, pos : pos + 1]  # [batch, 1]
 
-            # Predict all residual layers (layers 1 to num_code_groups-1) autoregressively
-            pos_codes = [layer0_code]  # Start with layer 0: [batch, 1]
-
             # Initial input: [last_talker_hidden, layer0_embed]
             layer0_embed = self.embed_input_ids(layer0_code)
-            prev_embed = layer0_embed  # Track previous layer embedding
-            try:
-                current_input = torch.cat([last_talker_hidden, prev_embed], dim=1)  # [batch, 2, hidden_size]
-            except Exception as e:
-                print(f"Error in current_input: {e}")
-                print(f"last_talker_hidden shape: {last_talker_hidden.shape}")
-                print(f"prev_embed shape: {prev_embed.shape}")
-                raise e
-
-            for layer_idx in range(self.num_code_groups - 1):
-                # Input for this layer: [last_talker_hidden, prev_layer_embed]
-
-                # Forward through code_predictor model
-                outputs = self.code_predictor.model(
-                    inputs_embeds=current_input,
-                    attention_mask=None,
-                    position_ids=None,
-                    past_key_values=None,
-                    use_cache=False,
-                    cache_position=None,
-                )
-
-                hidden_state = outputs.last_hidden_state  # [batch, 2, hidden_size]
-
-                # Use the corresponding lm_head for this layer
-                logits = self.code_predictor.lm_head[layer_idx](hidden_state[:, -1:, :])  # [batch, 1, vocab_size]
-
-                logits = logits_processors(None, logits[:, -1])
-
-                # Sample from the filtered distribution
-                probs = F.softmax(logits, dim=-1)
-                code = torch.multinomial(probs.squeeze(1), num_samples=1)  # [batch, 1]
-                pos_codes.append(code)
-
-                # Update prev_embed for next layer (if not last layer)
-                # layer_idx=0 predicts layer 1, embed with codec_embedding[1]
-                new_embed = self.code_predictor.model.codec_embedding[layer_idx](code)  # [batch, 1, hidden_size]
-                current_input = torch.cat([current_input, new_embed], dim=1)  # [batch, 3~n, hidden_size]
+            self.layer0_embed_buffer[:batch_size].copy_(layer0_embed)
+            pos_all_layers, current_input = self.code_predictor(
+                layer0_code, self.layer0_embed_buffer[:batch_size], last_talker_hidden
+            )
 
             # Stack all layers for this position: [batch, num_code_groups, 1]
-            pos_all_layers = torch.stack(pos_codes, dim=1)  # [batch, num_code_groups, 1]
             all_codes_per_position.append(pos_all_layers)
             middle_hidden_states.append(current_input[:, 2:-1, :])
 

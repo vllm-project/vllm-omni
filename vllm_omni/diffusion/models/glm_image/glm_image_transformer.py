@@ -546,9 +546,9 @@ class GlmImageTransformer2DModel(CachedTransformer):
     This is the vllm-omni optimized version of the GLM-Image DiT model.
 
     Args:
-        od_config: OmniDiffusionConfig containing model configuration. The
-            transformer hyper-parameters (e.g. patch size / channels / heads)
-            are read from `od_config.tf_model_config`.
+        od_config: OmniDiffusionConfig containing model configuration.
+            Transformer hyper-parameters (e.g. patch size / channels / heads) are read from
+            `od_config.tf_model_config`.
     """
 
     packed_modules_mapping = {

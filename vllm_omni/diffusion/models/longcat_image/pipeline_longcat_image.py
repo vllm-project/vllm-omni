@@ -451,7 +451,7 @@ class LongCatImagePipeline(
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
+        elif prompt is not None and not isinstance(prompt, (str, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
@@ -470,11 +470,11 @@ class LongCatImagePipeline(
         num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 4.5,
-        num_images_per_prompt: int | None = 1,
+        num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
-        prompt_embeds: torch.FloatTensor | None = None,
-        negative_prompt_embeds: torch.FloatTensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
         output_type: str | None = "pil",
         return_dict: bool = True,
         joint_attention_kwargs: dict[str, Any] | None = None,
@@ -482,20 +482,44 @@ class LongCatImagePipeline(
         cfg_renorm_min: float | None = 0.0,
         enable_prompt_rewrite: bool | None = True,
     ) -> DiffusionOutput:
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+            negative_prompt = None
+        elif req.prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        height = req.height or height or self.default_sample_size * self.vae_scale_factor
-        width = req.width or width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        generator = req.generator or generator
-        guidance_scale = req.guidance_scale if getattr(req, "guidance_scale", None) is not None else guidance_scale
-        num_images_per_prompt = getattr(req, "num_outputs_per_prompt", None) or num_images_per_prompt
-        enable_prompt_rewrite = getattr(req, "enable_prompt_rewrite", None) or enable_prompt_rewrite
-        enable_cfg_renorm = getattr(req, "enable_cfg_renorm", None) or enable_cfg_renorm
-        cfg_renorm_min = getattr(req, "cfg_renorm_min", None) or cfg_renorm_min
-        prompt_embeds = getattr(req, "prompt_embeds", None) or prompt_embeds
-        negative_prompt_embeds = getattr(req, "negative_prompt_embeds", None) or negative_prompt_embeds
+        height = req.sampling_params.height or height or self.default_sample_size * self.vae_scale_factor
+        width = req.sampling_params.width or width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        generator = req.sampling_params.generator or generator
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+        )
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt is not None
+            else num_images_per_prompt
+        )
+        enable_prompt_rewrite = req.sampling_params.extra_args.get("enable_prompt_rewrite", enable_prompt_rewrite)
+        enable_cfg_renorm = req.sampling_params.extra_args.get("enable_cfg_renorm", enable_cfg_renorm)
+        cfg_renorm_min = req.sampling_params.extra_args.get("cfg_renorm_min", cfg_renorm_min)
+
+        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        if any(p is not None for p in req_prompt_embeds):
+            # If at list one prompt is provided as an embedding,
+            # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
+            # If the user in fact provides mixed input format, req_prompt_embeds will have some None's
+            # And `torch.stack` automatically raises an exception for us
+            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
+
+        req_negative_prompt_embeds = [
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+        ]
+        if any(p is not None for p in req_negative_prompt_embeds):
+            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
         self.check_inputs(
             prompt,

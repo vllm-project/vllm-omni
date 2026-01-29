@@ -5,6 +5,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
+from vllm import SamplingParams
 from vllm.inputs import PromptType
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni, ClientRequestState
@@ -25,15 +26,15 @@ async def generate(
 ) -> tuple[int, str]:
     # Ensure generate doesn't complete too fast for cancellation test.
     await asyncio.sleep(0.2)
-    thinker_sampling_params = {
-        "temperature": 0.4,  # Deterministic
-        "top_p": 0.9,
-        "top_k": 1,
-        "max_tokens": max_tokens,
-        "repetition_penalty": 1.05,
-        "stop_token_ids": [151645],  # Qwen EOS token <|im_end|>
-        "seed": SEED,
-    }
+    thinker_sampling_params = SamplingParams(
+        temperature=0.4,  # Deterministic
+        top_p=0.9,
+        top_k=1,
+        max_tokens=max_tokens,
+        repetition_penalty=1.05,
+        stop_token_ids=[151645],  # Qwen EOS token <|im_end|>
+        seed=SEED,
+    )
 
     sampling_params_list = [
         thinker_sampling_params,

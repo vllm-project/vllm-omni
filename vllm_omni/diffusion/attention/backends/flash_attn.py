@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -10,13 +9,34 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.fa import _pad_input, _unpad_input, _upad_input
+
+# Import flash attention functions with fallback chain from utils/fa.py
+# FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn)
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    HAS_FLASH_ATTN,
+    _pad_input,
+    _unpad_input,
+    _upad_input,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 
 logger = init_logger(__name__)
+
+if not HAS_FLASH_ATTN:
+    raise ImportError(
+        "FlashAttentionBackend requires Flash Attention. "
+        "Please install one of: fa3-fwd, flash-attention, or flash-attn. "
+        "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+    )
 
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+
+    @classmethod
+    def supports_attention_mask(cls) -> bool:
+        return True
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -46,25 +66,14 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
 
-    def forward(
+    def forward_cuda(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        """
-        Flash attention implementation.
-
-        Args:
-            query: (batch_size, seq_len, num_heads, head_dim)
-            key: (batch_size, seq_len, num_heads, head_dim)
-            value: (batch_size, seq_len, num_heads, head_dim)
-            attn_metadata: AttentionMetadata. Attention mask is supported as attn_metadata.attn_mask
-
-        Returns:
-            (batch_size, seq_len, num_heads, head_dim)
-        """
+        """CUDA/ROCm flash attention implementation."""
         query_length = query.size(1)
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         #  Contains at least one padding token in the sequence
@@ -93,11 +102,36 @@ class FlashAttentionImpl(AttentionImpl):
             out = _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
         else:
-            out: torch.Tensor = flash_attn_func(
+            out = flash_attn_func(
                 query,
                 key,
                 value,
                 causal=self.causal,
                 softmax_scale=self.softmax_scale,
             )
+            # FA3 may return (out, lse) tuple, FA2 returns just out
+            if isinstance(out, tuple):
+                out = out[0]
         return out
+
+    def forward_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        """NPU attention implementation using mindiesd."""
+        from mindiesd import attention_forward
+
+        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        output = attention_forward(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            opt_mode="manual",
+            op_type="fused_attn_score",
+            layout="BNSD",
+        )
+        return output

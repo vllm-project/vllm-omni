@@ -562,19 +562,24 @@ class StableDiffusion3Pipeline(
         negative_pooled_prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 256,
     ) -> DiffusionOutput:
-        # # TODO: only support single prompt now
-        # if req.prompt is not None:
-        #     prompt = req.prompt[0] if isinstance(req.prompt, list) else req.prompt
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
-        height = req.height or self.default_sample_size * self.vae_scale_factor
-        width = req.width or self.default_sample_size * self.vae_scale_factor
-        sigmas = req.sigmas or sigmas
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        generator = req.generator or generator
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        negative_prompt = [
+            "" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts
+        ] or negative_prompt
+
+        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        sigmas = req.sampling_params.sigmas or sigmas
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
         # 1. check inputs
         # 2. encode prompts
         # 3. prepare latents and timesteps
@@ -595,7 +600,7 @@ class StableDiffusion3Pipeline(
             max_sequence_length=max_sequence_length,
         )
 
-        self._guidance_scale = req.guidance_scale
+        self._guidance_scale = req.sampling_params.guidance_scale
         self._current_timestep = None
         self._interrupt = False
 

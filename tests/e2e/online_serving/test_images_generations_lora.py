@@ -27,8 +27,6 @@ from PIL import Image
 from safetensors.torch import save_file
 from vllm.utils.network_utils import get_open_port
 
-from vllm_omni.utils.platform_utils import is_npu
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
@@ -122,8 +120,6 @@ class OmniServer:
 
 @pytest.fixture(scope="module")
 def omni_server():
-    if is_npu():
-        pytest.skip("Tongyi-MAI/Z-Image-Turbo is not supported on NPU yet.")
     with OmniServer(MODEL, ["--num-gpus", "1"]) as server:
         yield server
 
@@ -224,11 +220,11 @@ def test_images_generations_per_request_lora_switching(omni_server: OmniServer, 
     base_img = _post_images(omni_server, _basic_payload())
     base_slice = _image_blue_tail_slice(base_img)
 
-    # Adapter A: apply delta to Q slice only.
+    # Adapter A: apply delta to V slice only.
     lora_a_dir = tmp_path / "zimage_lora_a"
-    _write_zimage_lora(lora_a_dir, q_scale=0.1)
+    _write_zimage_lora(lora_a_dir, v_scale=8.0)
     payload_a = _basic_payload()
-    payload_a["lora"] = {"name": "a", "path": str(lora_a_dir), "scale": 2.0}
+    payload_a["lora"] = {"name": "a", "path": str(lora_a_dir), "scale": 64.0}
     img_a = _post_images(omni_server, payload_a)
     a_slice = _image_blue_tail_slice(img_a)
     _assert_slice_diff(a_slice, base_slice, label="lora_a_vs_base")
@@ -236,9 +232,9 @@ def test_images_generations_per_request_lora_switching(omni_server: OmniServer, 
 
     # Adapter B: apply delta to K slice only (should differ from adapter A).
     lora_b_dir = tmp_path / "zimage_lora_b"
-    _write_zimage_lora(lora_b_dir, k_scale=0.1)
+    _write_zimage_lora(lora_b_dir, k_scale=4.0)
     payload_b = _basic_payload()
-    payload_b["lora"] = {"name": "b", "path": str(lora_b_dir), "scale": 2.0}
+    payload_b["lora"] = {"name": "b", "path": str(lora_b_dir), "scale": 64.0}
     img_b = _post_images(omni_server, payload_b)
     b_slice = _image_blue_tail_slice(img_b)
     _assert_slice_diff(b_slice, base_slice, label="lora_b_vs_base")

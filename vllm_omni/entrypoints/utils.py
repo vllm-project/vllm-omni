@@ -10,7 +10,7 @@ from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.entrypoints.stage_utils import _to_dict
-from vllm_omni.utils import detect_device_type, is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -164,16 +164,12 @@ def resolve_model_config_path(model: str) -> str:
                 f"Model is not in standard transformers format and does not have model_index.json. "
                 f"Please ensure the model has proper configuration files with 'model_type' field"
             )
-    device_type = detect_device_type()
 
-    # Try device-specific config first
-    if device_type != "cuda" or is_rocm():
-        device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
-        if is_rocm():
-            device_config_file = f"vllm_omni/model_executor/stage_configs/rocm/{model_type}.yaml"
-        device_config_path = PROJECT_ROOT / device_config_file
-        if os.path.exists(device_config_path):
-            return str(device_config_path)
+    default_config_path = current_omni_platform.get_default_stage_config_path()
+    model_type_str = f"{model_type}.yaml"
+    complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
+    if os.path.exists(complete_config_path):
+        return str(complete_config_path)
 
     # Fall back to default config
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"

@@ -90,6 +90,7 @@ def run_tts_generation(args) -> None:
     if args.x_vector_only:
         payload["x_vector_only_mode"] = True
 
+    print(f"Model: {args.model}")
     print(f"Task type: {args.task_type or 'CustomVoice'}")
     print(f"Text: {args.text}")
     print(f"Voice: {args.voice}")

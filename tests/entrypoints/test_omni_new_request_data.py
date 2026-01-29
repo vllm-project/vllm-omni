@@ -13,6 +13,7 @@ def test_omni_new_request_data_copies_payloads():
     }
     request = SimpleNamespace(
         request_id="req-1",
+        external_req_id="ext-1",
         prompt_token_ids=[101, 102],
         mm_features=None,
         sampling_params=None,
@@ -33,6 +34,7 @@ def test_omni_new_request_data_copies_payloads():
 def test_omni_new_request_data_allows_missing_payloads():
     request = SimpleNamespace(
         request_id="req-2",
+        external_req_id="ext-2",
         prompt_token_ids=[201, 202],
         mm_features=None,
         sampling_params=None,

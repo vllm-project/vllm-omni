@@ -21,6 +21,8 @@ class OmniNewRequestData(NewRequestData):
 
     # Optional serialized prompt embeddings
     prompt_embeds: PromptEmbedsPayload | None = None
+    # Optional external request ID for tracking
+    external_req_id: str | None = None
     # Optional serialized additional information
     additional_information: AdditionalInformationPayload | None = None
 
@@ -42,6 +44,7 @@ class OmniNewRequestData(NewRequestData):
         """
         return cls(
             req_id=request.request_id,
+            external_req_id=request.external_req_id,
             prompt_token_ids=request.prompt_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,

@@ -23,7 +23,7 @@ if __name__ == "__main__":
     images[0].save("coffee.png")
 ```
 
-Or put more than one prompt in a request, processing them sequentially.
+Or put more than one prompt in a request.
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
@@ -36,6 +36,41 @@ if __name__ == "__main__":
       "a fox waking up in bed and yawning",
     ]
     outputs = omni.generate(prompts)
+    for i, output in enumerate(outputs):
+      image = output.request_output[0].images[0].save(f"{i}.jpg")
+```
+
+!!! info
+
+    However, it is not currently recommended to do so
+    because not all models support batch inference,
+    and batch requesting mostly does not provide significant performance improvement (despite the impression that it does).
+    This feature is primarily for the sake of interface compatibility with vLLM and to allow for future improvements.
+
+!!! info
+
+    For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
+    list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
+    batched inputs, you can [modify this configuration](../../../configuration/stage_configs.md) to let the model accept a longer batch of prompts.
+
+Apart from string prompt, vLLM-Omni also supports dictionary prompts in the same style as vLLM.
+This is useful for models that support negative prompts.
+
+```python
+from vllm_omni.entrypoints.omni import Omni
+
+if __name__ == "__main__":
+    omni = Omni(model="Qwen/Qwen-Image")
+    outputs = omni.generate([
+      {
+        "prompt": "a cup of coffee on a table"，
+        "negative_prompt": "low resolution"
+      },
+      {
+        "prompt": "a toy dinosaur on a sandy beach"，
+        "negative_prompt": "cinematic, realistic"
+      }
+    ])
     for i, output in enumerate(outputs):
       image = output.request_output[0].images[0].save(f"{i}.jpg")
 ```

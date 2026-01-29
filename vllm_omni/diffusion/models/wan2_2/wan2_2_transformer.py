@@ -12,6 +12,7 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
 from vllm.logger import init_logger
+from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -605,7 +606,12 @@ class WanTransformer3DModel(nn.Module):
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
-        self.patch_embedding = nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embedding = Conv3dLayer(
+            in_channels=in_channels,
+            out_channels=inner_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
 
         # 2. Condition embeddings
         self.condition_embedder = WanTimeTextImageEmbedding(
