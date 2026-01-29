@@ -643,12 +643,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 ),
             ):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
+                    num_tokens_padded_talker_mtp = num_tokens_padded
+                    if num_tokens_padded_talker_mtp == self.max_num_tokens:
+                        num_tokens_padded_talker_mtp = min(num_tokens_padded, self.max_num_reqs)
                     outputs = self.talker_mtp(
-                        self.talker_mtp_input_ids.gpu[:num_tokens_padded],
-                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
-                        self.last_talker_hidden.gpu[:num_tokens_padded],
-                        self.text_step.gpu[:num_tokens_padded],
+                        self.talker_mtp_input_ids.gpu[:num_tokens_padded_talker_mtp],
+                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded_talker_mtp],
+                        self.last_talker_hidden.gpu[:num_tokens_padded_talker_mtp],
+                        self.text_step.gpu[:num_tokens_padded_talker_mtp],
                     )
+                    self.compilation_config.cache_dir = None
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
