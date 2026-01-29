@@ -2,7 +2,6 @@
 # Stage 0: Thinker (multimodal understanding + text generation)
 # Stage 1: Talker (text embeddings → 16-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
-
 # The following config has been verified on 2x H100-80G GPUs.
 stage_args:
   - stage_id: 0
@@ -22,7 +21,6 @@ stage_args:
       enable_prefix_caching: false
       hf_config_name: thinker_config
       tensor_parallel_size: 2
-      load_format: dummy
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -52,7 +50,6 @@ stage_args:
        enable_prefix_caching: false
        distributed_executor_backend: "mp"
        hf_config_name: talker_config
-       load_format: dummy
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
@@ -60,7 +57,7 @@ stage_args:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      max_tokens: 100
+      max_tokens: 1000
       seed: 42
       detokenize: False
       repetition_penalty: 1.05
@@ -83,7 +80,6 @@ stage_args:
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
-      load_format: dummy
       async_scheduling: false
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
@@ -93,7 +89,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 200
+      max_tokens: 2000
       seed: 42
       detokenize: True
       repetition_penalty: 1.1

@@ -10,6 +10,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
+import gc
 import socket
 import subprocess
 import sys
@@ -59,13 +60,12 @@ def clean_gpu_memory_between_tests():
     _run_post_test_cleanup()
 
 
-def _run_pre_test_cleanup():
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+def _run_pre_test_cleanup(enable_force=False):
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
         return
 
     print("Pre-test GPU status:")
-    _print_simple_gpu_status()
 
     num_gpus = torch.cuda.device_count()
     if num_gpus > 0:
@@ -74,42 +74,23 @@ def _run_pre_test_cleanup():
 
             wait_for_gpu_memory_to_clear(
                 devices=list(range(num_gpus)),
-                threshold_ratio=0.1,
+                threshold_ratio=0.05,
             )
         except Exception as e:
             print(f"Pre-test cleanup note: {e}")
 
 
-def _run_post_test_cleanup():
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1":
+def _run_post_test_cleanup(enable_force=False):
+    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
+        print("GPU cleanup disabled")
         return
-
-    import gc
 
     if torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
 
         print("Post-test GPU status:")
-        _print_simple_gpu_status()
         _print_gpu_processes()
-
-
-def _print_simple_gpu_status():
-    """Print simple GPU memory status"""
-    if not torch.cuda.is_available():
-        print("  CUDA not available")
-        return
-
-    num_devices = torch.cuda.device_count()
-    for device_id in range(num_devices):
-        try:
-            torch.cuda.set_device(device_id)
-            allocated = torch.cuda.memory_allocated(device_id) / (1024**2)
-            reserved = torch.cuda.memory_reserved(device_id) / (1024**2)
-            print(f"  GPU {device_id}: Allocated: {allocated:.1f}MB, Reserved: {reserved:.1f}MB")
-        except Exception:
-            print(f"  GPU {device_id}: Error reading status")
 
 
 def _print_gpu_processes():
@@ -871,6 +852,9 @@ class OmniServer:
         *,
         env_dict: dict[str, str] | None = None,
     ) -> None:
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
         self.model = model
         self.serve_args = serve_args
         self.env_dict = env_dict
@@ -986,5 +970,6 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        _run_post_test_cleanup()
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
         cleanup_dist_env_and_memory()

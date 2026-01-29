@@ -5,6 +5,7 @@ import multiprocessing.forkserver as forkserver
 import os
 
 # Image generation API imports
+import random
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
@@ -735,6 +736,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
+_remove_route_from_router(router, "/v1/audio/speech", {"POST"})
+
+
 @router.post(
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
@@ -984,6 +988,13 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             gen_params.true_cfg_scale = request.true_cfg_scale
         if request.seed is not None:
             gen_params.seed = request.seed
+        else:
+            # If seed is not provided, generate a random one to ensure
+            # a proper generator is initialized in the backend.
+            # This fixes issues where using the default global generator
+            # might produce blurry images in some environments.
+            gen_params.seed = random.randint(0, 2**32 - 1)
+
         request_id = f"img_gen_{int(time.time())}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")

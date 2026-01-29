@@ -77,7 +77,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -428,7 +428,6 @@ def main():
 
     if not outputs:
         raise ValueError("No output generated from omni.generate()")
-    logger.info("Outputs: %s", outputs)
 
     # Extract images from OmniRequestOutput
     # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images

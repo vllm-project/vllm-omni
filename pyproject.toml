@@ -39,7 +39,7 @@ dependencies = [
     "cache-dit==1.2.0",
     "tqdm>=4.66.0",
     "torchsde>=0.2.6",  # Required for Stable Audio scheduler
-    "fa3-fwd", # flash attention 3, maintained by @ZJY0516
+    "fa3-fwd==0.0.1", # flash attention 3, maintained by @ZJY0516
     "openai-whisper>=20250625",
     "imageio[ffmpeg]>=2.37.2",
     "onnxruntime>=1.19.0",
