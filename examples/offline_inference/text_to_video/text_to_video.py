@@ -32,7 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames (Wan default is 81).")
     parser.add_argument("--num_inference_steps", type=int, default=40, help="Sampling steps.")
-    parser.add_argument("--boundary_ratio", type=float, default=0.875, help="Boundary split ratio for low/high DiT.")
+    parser.add_argument(
+        "--boundary_ratio",
+        type=float,
+        default=0.875,
+        help="Boundary split ratio for low/high DiT. Default 0.875 uses both transformers for best quality. Set to 1.0 to load only the low-noise transformer (saves noticeable memory with good quality, recommended if memory is limited).",
+    )
     parser.add_argument(
         "--flow_shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )

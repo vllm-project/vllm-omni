@@ -26,7 +26,7 @@ Key arguments:
 - `--num_frames`: Number of frames (Wan default is 81).
 - `--guidance_scale` and `--guidance_scale_high`: CFG scale (applied to low/high).
 - `--negative_prompt`: optional list of artifacts to suppress (the PR demo used a long Chinese string).
-- `--boundary_ratio`: Boundary split ratio for low/high DiT.
+- `--boundary_ratio`: Boundary split ratio for low/high DiT. Default `0.875` uses both transformers for best quality. Set to `1.0` to load only the low-noise transformer (saves noticeable memory with good quality, recommended if memory is limited). Set to `0.0` loads only the high-noise transformer (not recommended, lower quality).
 - `--fps`: frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: path to save the generated video.
 - `--vae_use_slicing`: enable VAE slicing for memory optimization.
