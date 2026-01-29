@@ -736,6 +736,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
+_remove_route_from_router(router, "/v1/audio/speech", {"POST"})
+
+
 @router.post(
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
