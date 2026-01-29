@@ -10,6 +10,7 @@ import os
 
 import pytest
 import torch
+from vllm_omni.utils.platform_utils import detect_device_type
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -19,7 +20,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm_omni.utils.platform_utils import detect_device_type
 
 device_type = detect_device_type()
 if device_type == "cuda":
