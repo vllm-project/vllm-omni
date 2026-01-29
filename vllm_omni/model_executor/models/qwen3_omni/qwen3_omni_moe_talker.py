@@ -135,6 +135,10 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.code_predictor = Qwen3OmniMoeTalkerCodePredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "code_predictor")
         )
+        self.layer0_embed_buffer = torch.zeros(
+            (vllm_config.scheduler_config.max_num_seqs, 1, self.config.text_config.hidden_size),
+            dtype=vllm_config.model_config.dtype,
+        )
 
     def code_predictor_forward(
         self,
@@ -192,16 +196,10 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
 
             # Initial input: [last_talker_hidden, layer0_embed]
             layer0_embed = self.embed_input_ids(layer0_code)
-            prev_embed = layer0_embed  # Track previous layer embedding
-            try:
-                current_input = torch.cat([last_talker_hidden, prev_embed], dim=1)  # [batch, 2, hidden_size]
-            except Exception as e:
-                print(f"Error in current_input: {e}")
-                print(f"last_talker_hidden shape: {last_talker_hidden.shape}")
-                print(f"prev_embed shape: {prev_embed.shape}")
-                raise e
-
-            pos_all_layers, current_input = self.code_predictor(layer0_code, current_input)
+            self.layer0_embed_buffer[:batch_size].copy_(layer0_embed)
+            pos_all_layers, current_input = self.code_predictor(
+                layer0_code, self.layer0_embed_buffer[:batch_size], last_talker_hidden
+            )
 
             # Stack all layers for this position: [batch, num_code_groups, 1]
             all_codes_per_position.append(pos_all_layers)

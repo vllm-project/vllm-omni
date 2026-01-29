@@ -137,7 +137,7 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
         k = k.reshape(-1, self.kv_size)
 
         # Apply RoPE
-        q, k = self.rotary_emb(position_ids.flatten().contiguous(), q, k)
+        q, k = self.rotary_emb(position_ids, q, k)
 
         # Reshape for attention
         q = q.reshape(bsz, seq_len, self.num_heads, self.head_dim)
@@ -148,7 +148,6 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
         k_heads = k.transpose(1, 2).contiguous()
 
         if past_key_values is not None:
-            seq_len = position_ids.shape[-1]
             sin, cos = self.rotary_emb.get_cos_sin(seq_len)
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -175,7 +174,7 @@ class Qwen3OmniCodePredictorAttention(nn.Module):
                     scaling=self.head_dim**-0.5,
                     sliding_window=None,
                     use_cache=use_cache,
-                    position_ids=position_ids,
+                    position_ids=position_ids[:seq_len].unsqueeze(0),
                     output_hidden_states=True,
                     output_attentions=False,
                 )
@@ -459,6 +458,10 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
                 TopPLogitsWarper(top_p=0.8),
             ]
         )
+        max_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self.position_ids_buffer = []
+        for layer_idx in range(self.num_code_groups - 1):
+            self.position_ids_buffer.append(torch.arange(layer_idx + 2, dtype=torch.int64).repeat(max_batch_size))
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -469,7 +472,8 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
     def forward(
         self,
         layer0_code: torch.Tensor,
-        current_input: torch.Tensor,
+        layer0_embed: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for code predictor.
@@ -479,11 +483,9 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
                 Code index for code-group (layer) 0.
                 Shape: [batch_size, 1], dtype typically int64.
 
-            current_input:
-                Input embeddings fed into the code predictor transformer.
-                It is expected to already contain the embeddings corresponding to
-                the conditioning context (e.g., talker hidden state + layer0 embed).
-                Shape: [batch_size, 2, hidden_size].
+            last_talker_hidden:
+
+                Shape: [batch_size, hidden_size].
 
         Returns:
             pos_all_layers:
@@ -496,18 +498,23 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
                 Shape: [batch_size, num_code_groups + 2, hidden_size].
         """
         pos_codes = [layer0_code]  # Start with layer 0: [batch, 1]
+        try:
+            current_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [batch, 2, hidden_size]
+        except Exception as e:
+            print(f"Error in current_input: {e}")
+            print(f"last_talker_hidden shape: {last_talker_hidden.shape}")
+            print(f"prev_embed shape: {prev_embed.shape}")
+            raise e
         batch_size = current_input.shape[0]
 
         # Predict all residual layers (layers 1 to num_code_groups-1) autoregressively
+        begin_pos = 0
         for layer_idx in range(self.num_code_groups - 1):
             # Input for this layer: [last_talker_hidden, prev_layer_embed]
 
             # Forward through code_predictor model
-            position_ids = (
-                torch.arange(layer_idx + 2, dtype=torch.int64, device=layer0_code.device)
-                .unsqueeze(0)
-                .repeat(batch_size, 1)
-            )  # [1, seq_len]
+            position_ids = self.position_ids_buffer[layer_idx][: (layer_idx + 2) * batch_size]  # [1, seq_len]
+            begin_pos += layer_idx + 2
             outputs = self.model(
                 inputs_embeds=current_input,
                 attention_mask=None,
