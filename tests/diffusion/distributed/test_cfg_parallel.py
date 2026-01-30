@@ -326,9 +326,11 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
         "input_seed": 123,  # Fixed seed for input generation
     }
 
-    # Create queues for receiving results
-    baseline_queue = torch.multiprocessing.Queue()
-    cfg_parallel_queue = torch.multiprocessing.Queue()
+    mp_context = torch.multiprocessing.get_context("spawn")
+
+    manager = mp_context.Manager()
+    baseline_queue = manager.Queue()
+    cfg_parallel_queue = manager.Queue()
 
     # Run baseline (sequential CFG) on single GPU
     torch.multiprocessing.spawn(
