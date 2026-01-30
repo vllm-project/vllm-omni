@@ -197,6 +197,25 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "Benchmark Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - export VLLM_LOGGING_LEVEL=DEBUG
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/benchmarks/test_serve_cli.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Omni Model Test with H100"
     timeout_in_minutes: 30
     depends_on: image-build
