@@ -245,7 +245,7 @@ def get_through_connector(connector, target_stage_id, stage_id, req_id, connecto
             if payload_data:
                 connector.request_prompt_token_ids[req_id] = payload_data.get("thinker_input_ids", [])
                 connector.get_requests[req_id] += 1
-                logger.debug(f"[Stage-{stage_id}] Received one chunk for request {connector_get_key}")
+                logger.debug("[Stage-%d] Received one chunk for request %s", stage_id, connector_get_key)
                 break
         time.sleep(0.01)
     return payload_data
@@ -325,7 +325,7 @@ def put_chunk(
             logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
-            logger.warning(f"[Stage-{stage_id}] No payload data to send for request {request_id}")
+            logger.warning("[Stage-%d] No payload data to send for request %s", stage_id, request_id)
             return
 
         if stage_id == 0 and chunk_id == 0:
@@ -341,7 +341,7 @@ def put_chunk(
                 payload_data["thinker_hidden_states"] = torch.cat(
                     (save_payload.get("thinker_hidden_states"), payload_data.get("thinker_hidden_states")), dim=0
                 )
-                logger.info(f"[Stage-{stage_id}] Merged embeddings and hidden states for request {request_id}")
+                logger.debug("[Stage-%d] Merged embeddings and hidden states for request %s", stage_id, request_id)
 
         if stage_id == 1:
             # TODO: Make parameters configurable and optimize algorithms
@@ -367,7 +367,7 @@ def put_chunk(
 
         if success:
             connector.put_requests[request_id] += 1
-            logger.info(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            logger.debug("[Stage-%d] Sent %s", stage_id, connector_put_key)
 
 
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
