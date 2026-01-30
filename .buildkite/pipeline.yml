@@ -240,7 +240,7 @@ steps:
     depends_on: image-build
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_i2i_multi_image_input.py
+      - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
     agents:
       queue: "mithril-h100-pool"
     plugins:
