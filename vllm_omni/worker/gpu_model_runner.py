@@ -1076,10 +1076,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             max_num_scheduled_tokens=1,
             use_cascade_attn=False,
         )
-        req_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size]
-        last_talker_hidden = self.last_talker_hidden.gpu[:decode_batch_size]
-        text_step = self.text_step.gpu[:decode_batch_size]
+        num_tokens_padded = batch_desc.num_tokens
+        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+        text_step = self.text_step.gpu[:num_tokens_padded]
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
