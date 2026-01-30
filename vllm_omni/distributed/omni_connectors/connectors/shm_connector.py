@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import fcntl
+import os
 import time
 from collections import defaultdict
 from typing import Any
@@ -53,7 +55,12 @@ class SharedMemoryConnector(OmniConnectorBase):
             # if size > self.threshold:
             if True:  # TODO: correct put & get logic
                 # Use Shared Memory
-                meta = shm_write_bytes(payload, name=put_key)
+                lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+                with open(lock_file, "w") as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    meta = shm_write_bytes(payload, name=put_key)
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+
                 # meta contains {'name': ..., 'size': ...}
                 metadata[put_key] = {"shm": meta, "size": size}
                 self._metrics["shm_writes"] += 1
@@ -97,7 +104,14 @@ class SharedMemoryConnector(OmniConnectorBase):
             return None, 0
 
         try:
-            data_bytes = shm_read_bytes({"name": get_key, "size": shm.size})
+            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+            with open(lock_file) as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_SH)
+                data_bytes = shm_read_bytes({"name": get_key, "size": shm.size})
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            # Clean up the temporary file if it still exists.
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
             obj = self.deserialize_obj(data_bytes)
             return obj, shm.size
         finally:
