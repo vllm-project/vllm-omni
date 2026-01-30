@@ -52,12 +52,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
                 )
             hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
-            self.talker_mtp_input_ids = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
-                self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False
+                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
             )
-            self.last_talker_hidden = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
+            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
@@ -645,7 +646,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
                     num_tokens_padded_talker_mtp = num_tokens_padded
                     if num_tokens_padded_talker_mtp == self.max_num_tokens:
-                        num_tokens_padded_talker_mtp = min(num_tokens_padded, self.max_num_reqs)
+                        num_tokens_padded_talker_mtp = self.talker_mtp_input_ids.gpu.shape[0]
                     outputs = self.talker_mtp(
                         self.talker_mtp_input_ids.gpu[:num_tokens_padded_talker_mtp],
                         self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded_talker_mtp],
@@ -1075,10 +1076,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             max_num_scheduled_tokens=1,
             use_cascade_attn=False,
         )
-        req_input_ids = self.talker_mtp_input_ids.gpu[:decode_batch_size]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size]
-        last_talker_hidden = self.last_talker_hidden.gpu[:decode_batch_size]
-        text_step = self.text_step.gpu[:decode_batch_size]
+        num_tokens_padded = batch_desc.num_tokens
+        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+        text_step = self.text_step.gpu[:num_tokens_padded]
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
