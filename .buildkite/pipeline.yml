@@ -203,7 +203,7 @@ steps:
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/benchmarks/test_serve_cli.py
+      - pytest -s -v tests/benchmarks/test_serve_cli.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
