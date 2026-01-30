@@ -149,6 +149,7 @@ def _test_cfg_parallel_worker(
     cfg_parallel_size: int,
     dtype: torch.dtype,
     test_config: dict,
+    result_queue: torch.multiprocessing.Queue,
 ):
     """Worker function for CFG parallel test."""
     device = torch.device(f"{device_type}:{local_rank}")
@@ -219,8 +220,7 @@ def _test_cfg_parallel_worker(
     # Only rank 0 has valid output in CFG parallel mode
     if cfg_rank == 0:
         assert noise_pred is not None
-        result_path = test_config["result_path"]
-        torch.save(noise_pred.cpu(), result_path)
+        result_queue.put(noise_pred.cpu())
     else:
         assert noise_pred is None
 
@@ -232,6 +232,7 @@ def _test_cfg_sequential_worker(
     world_size: int,
     dtype: torch.dtype,
     test_config: dict,
+    result_queue: torch.multiprocessing.Queue,
 ):
     """Worker function for sequential CFG test (baseline)."""
     device = torch.device(f"{device_type}:{local_rank}")
@@ -297,8 +298,7 @@ def _test_cfg_sequential_worker(
 
     # Sequential CFG always returns output
     assert noise_pred is not None
-    result_path = test_config["baseline_path"]
-    torch.save(noise_pred.cpu(), result_path)
+    result_queue.put(noise_pred.cpu())
 
     destroy_distributed_env()
 
@@ -307,9 +307,7 @@ def _test_cfg_sequential_worker(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_predict_noise_maybe_with_cfg(
-    cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool, tmp_path
-):
+def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype, batch_size: int, cfg_normalize: bool):
     """
     Test that predict_noise_maybe_with_cfg produces identical results
     with and without CFG parallel.
@@ -319,7 +317,6 @@ def test_predict_noise_maybe_with_cfg(
         dtype: Data type for computation
         batch_size: Batch size for testing
         cfg_normalize: Whether to normalize CFG output
-        tmp_path: Temporary directory for storing results
     """
     available_gpus = torch_device.device_count()
     if available_gpus < cfg_parallel_size:
@@ -335,27 +332,29 @@ def test_predict_noise_maybe_with_cfg(
         "cfg_normalize": cfg_normalize,
         "model_seed": 42,  # Fixed seed for model initialization
         "input_seed": 123,  # Fixed seed for input generation
-        "baseline_path": str(tmp_path / "baseline.pt"),
-        "result_path": str(tmp_path / "cfg_parallel.pt"),
     }
+
+    # Create queues for receiving results
+    baseline_queue = torch.multiprocessing.Queue()
+    cfg_parallel_queue = torch.multiprocessing.Queue()
 
     # Run baseline (sequential CFG) on single GPU
     torch.multiprocessing.spawn(
         _test_cfg_sequential_worker,
-        args=(1, dtype, test_config),
+        args=(1, dtype, test_config, baseline_queue),
         nprocs=1,
     )
 
     # Run CFG parallel on multiple GPUs
     torch.multiprocessing.spawn(
         _test_cfg_parallel_worker,
-        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config),
+        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
         nprocs=cfg_parallel_size,
     )
 
-    # Load and compare results
-    baseline_output = torch.load(test_config["baseline_path"])
-    cfg_parallel_output = torch.load(test_config["result_path"])
+    # Get results from queues
+    baseline_output = baseline_queue.get()
+    cfg_parallel_output = cfg_parallel_queue.get()
 
     # Verify shapes match
     assert baseline_output.shape == cfg_parallel_output.shape, (
