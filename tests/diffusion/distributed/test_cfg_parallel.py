@@ -10,7 +10,6 @@ import os
 
 import pytest
 import torch
-from vllm_omni.utils.platform_utils import detect_device_type
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -20,14 +19,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-
-device_type = detect_device_type()
-if device_type == "cuda":
-    torch_device = torch.cuda
-elif device_type == "npu":
-    torch_device = torch.npu
-else:
-    raise ValueError(f"Unsupported device type: {device_type} for this test script! Expected GPU or NPU.")
+from vllm_omni.platforms import current_omni_platform
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -152,8 +144,8 @@ def _test_cfg_parallel_worker(
     result_queue: torch.multiprocessing.Queue,
 ):
     """Worker function for CFG parallel test."""
-    device = torch.device(f"{device_type}:{local_rank}")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
 
     update_environment_variables(
         {
@@ -235,8 +227,8 @@ def _test_cfg_sequential_worker(
     result_queue: torch.multiprocessing.Queue,
 ):
     """Worker function for sequential CFG test (baseline)."""
-    device = torch.device(f"{device_type}:{local_rank}")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
 
     update_environment_variables(
         {
@@ -318,7 +310,7 @@ def test_predict_noise_maybe_with_cfg(cfg_parallel_size: int, dtype: torch.dtype
         batch_size: Batch size for testing
         cfg_normalize: Whether to normalize CFG output
     """
-    available_gpus = torch_device.device_count()
+    available_gpus = current_omni_platform.get_device_count()
     if available_gpus < cfg_parallel_size:
         pytest.skip(f"Test requires {cfg_parallel_size} GPUs but only {available_gpus} available")
 
@@ -395,12 +387,12 @@ def test_predict_noise_without_cfg(dtype: torch.dtype):
     When CFG is disabled, only the positive branch should be computed.
     This test runs on a single GPU without distributed environment.
     """
-    available_gpus = torch_device.device_count()
+    available_gpus = current_omni_platform.get_device_count()
     if available_gpus < 1:
         pytest.skip("Test requires at least 1 GPU")
 
-    device = torch.device(f"{device_type}:0")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:0")
+    current_omni_platform.set_device(device)
 
     # Create pipeline without distributed environment
     pipeline = TestCFGPipeline(in_channels=4, hidden_dim=128, seed=42)
