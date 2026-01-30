@@ -102,6 +102,14 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+
     return parser.parse_args()
 
 
@@ -132,6 +140,7 @@ def main():
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     # Check if profiling is requested via environment variable
@@ -163,7 +172,9 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
+    print(
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+    )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 

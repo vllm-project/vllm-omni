@@ -225,7 +225,12 @@ class OmniServeCommand(CLISubcommand):
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
         omni_config_group.add_argument(
-            "--cfg-parallel-size", type=int, default=1, help="Number of GPUs for CFG parallel computation"
+            "--cfg-parallel-size",
+            type=int,
+            default=1,
+            choices=[1, 2],
+            help="Number of devices for CFG parallel computation for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
         )
         return serve_parser
 

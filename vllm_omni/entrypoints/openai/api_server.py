@@ -7,6 +7,7 @@ import os
 # Image generation API imports
 import random
 import time
+import uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -995,7 +996,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             # might produce blurry images in some environments.
             gen_params.seed = random.randint(0, 2**32 - 1)
 
-        request_id = f"img_gen_{int(time.time())}"
+        request_id = f"img_gen_{uuid.uuid4().hex}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
 

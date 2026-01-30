@@ -23,14 +23,12 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwe
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
+    QwenImageCFGParallelMixin,
+)
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     calculate_dimensions,
@@ -168,7 +166,7 @@ def get_qwen_image_edit_plus_post_process_func(
     return post_process_func
 
 
-class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
+class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMixin):
     def __init__(
         self,
         *,
@@ -530,116 +528,6 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
     def interrupt(self):
         return self._interrupt
 
-    def diffuse(
-        self,
-        prompt_embeds,
-        prompt_embeds_mask,
-        negative_prompt_embeds,
-        negative_prompt_embeds_mask,
-        latents,
-        image_latents,
-        img_shapes,
-        txt_seq_lens,
-        negative_txt_seq_lens,
-        timesteps,
-        do_true_cfg,
-        guidance,
-        true_cfg_scale,
-    ):
-        """Diffusion loop with optional image conditioning."""
-        self.scheduler.set_begin_index(0)
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-            self._current_timestep = t
-            # broadcast to batch dimension and place on same device/dtype as latents
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
-            # Concatenate image latents with noise latents if available
-            latent_model_input = latents
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1)
-
-            self.transformer.do_true_cfg = do_true_cfg
-            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
-
-            if cfg_parallel_ready:
-                cfg_group = get_cfg_group()
-                cfg_rank = get_classifier_free_guidance_rank()
-
-                if cfg_rank == 0:
-                    local_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=prompt_embeds_mask,
-                        encoder_hidden_states=prompt_embeds,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=txt_seq_lens,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                else:
-                    local_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=negative_txt_seq_lens,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-
-                local_pred = local_pred[:, : latents.size(1)]
-
-                gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
-                if cfg_rank == 0:
-                    noise_pred = gathered[0]
-                    neg_noise_pred = gathered[1]
-                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred = comb_pred * (cond_norm / noise_norm)
-                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-                cfg_group.broadcast(latents, src=0)
-
-            else:
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=prompt_embeds_mask,
-                    encoder_hidden_states=prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_pred[:, : latents.size(1)]
-
-                if do_true_cfg:
-                    neg_noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=negative_txt_seq_lens,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
-                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred = comb_pred * (cond_norm / noise_norm)
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        return latents
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -773,6 +661,8 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
         )
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=prompt,
             image=condition_images,  # Use condition images for prompt encoding
@@ -840,7 +730,6 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
             negative_prompt_embeds,
             negative_prompt_embeds_mask,
             latents,
-            image_latents,
             img_shapes,
             txt_seq_lens,
             negative_txt_seq_lens,
@@ -848,6 +737,12 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput):
             do_true_cfg,
             guidance,
             true_cfg_scale,
+            image_latents=image_latents,
+            cfg_normalize=True,
+            additional_transformer_kwargs={
+                "return_dict": False,
+                "attention_kwargs": self.attention_kwargs,
+            },
         )
 
         self._current_timestep = None
