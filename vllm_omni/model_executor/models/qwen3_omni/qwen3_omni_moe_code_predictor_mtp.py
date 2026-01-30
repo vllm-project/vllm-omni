@@ -513,7 +513,9 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
             # Input for this layer: [last_talker_hidden, prev_layer_embed]
 
             # Forward through code_predictor model
-            position_ids = self.position_ids_buffer[layer_idx][: (layer_idx + 2) * batch_size]  # [1, seq_len]
+            # Compute position_ids dynamically to avoid torch.compile specializing batch_size
+            seq_len = layer_idx + 2
+            position_ids = torch.arange(seq_len, device=current_input.device, dtype=torch.int64).repeat(batch_size)
             begin_pos += layer_idx + 2
             outputs = self.model(
                 inputs_embeds=current_input,
