@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -620,8 +621,10 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Wan2.2 is prone to out of memory errors when predicting large videos
+        # so we empty the cache here to avoid OOM before vae decoding.
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
         self._current_timestep = None
 
         # For I2V mode: blend final latents with condition
