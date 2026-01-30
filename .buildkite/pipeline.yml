@@ -77,6 +77,7 @@ steps:
     depends_on: image-build
     commands:
       - pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
+      - pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:

@@ -758,6 +758,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["QwenImageTransformerBlock"]
+    _layerwise_offload_blocks_attr = "transformer_blocks"
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
