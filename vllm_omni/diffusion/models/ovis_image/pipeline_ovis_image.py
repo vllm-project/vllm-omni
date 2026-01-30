@@ -504,18 +504,6 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
 
         return latents
 
-    def scheduler_step(self, noise_pred, t, latents):
-        """
-        Step the scheduler.
-        """
-        latents_dtype = latents.dtype
-        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        if latents.dtype != latents_dtype:
-            if torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
-        return latents
-
     @property
     def guidance_scale(self):
         return self._guidance_scale

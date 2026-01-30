@@ -991,18 +991,6 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         return DiffusionOutput(output=image)
 
-    def scheduler_step(self, noise_pred, t, latents):
-        """
-        Step the scheduler.
-        """
-        latents_dtype = latents.dtype
-        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        if latents.dtype != latents_dtype:
-            if torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
-        return latents
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

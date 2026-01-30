@@ -153,6 +153,16 @@ def main():
         print("[Profiler] Starting profiling...")
         omni.start_profile()
 
+    # Print generation configuration
+    print(f"\n{'=' * 60}")
+    print("Generation Configuration:")
+    print(f"  Model: {args.model}")
+    print(f"  Inference steps: {args.num_inference_steps}")
+    print(f"  Frames: {args.num_frames}")
+    print(f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size}")
+    print(f"  Video size: {args.width}x{args.height}")
+    print(f"{'=' * 60}\n")
+
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(
         {

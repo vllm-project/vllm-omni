@@ -701,18 +701,6 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             image = self.vae.decode(latents, return_dict=False)[0]
         return DiffusionOutput(output=image)
 
-    def scheduler_step(self, noise_pred, t, latents):
-        """
-        Step the scheduler.
-        """
-        latents_dtype = latents.dtype
-        latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-        if latents.dtype != latents_dtype:
-            if torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
-        return latents
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
