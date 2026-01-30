@@ -7,7 +7,7 @@ from vllm.utils.network_utils import get_open_port
 from tests.conftest import OmniServer
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
-stage_configs = [str(Path(__file__).parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
+stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
@@ -45,7 +45,7 @@ def test_bench_serve_chat(omni_server):
         "--model",
         omni_server.model,
         "--port",
-        SERVER_PORT,
+        str(SERVER_PORT),
         "--dataset-name",
         "random",
         "--random-input-len",
