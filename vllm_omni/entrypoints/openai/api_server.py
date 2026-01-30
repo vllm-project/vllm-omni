@@ -247,49 +247,16 @@ class _DiffusionServingModels:
 
 
 def _register_profiling_routes(app) -> None:
-    """Register /start_profile and /stop_profile directly on the app.
+    """Unconditionally register /start_profile and /stop_profile on the app.
 
-    These are registered on the app (not the module-level router) to
-    guarantee availability regardless of how vllm's build_app() handles
-    router inclusion.
+    vllm's build_app() only registers these routes when a profiler_config
+    is explicitly provided (e.g. --profiler-config).  For omni we always
+    want them available so that nsys profiling can be triggered via HTTP
+    without extra CLI flags.
     """
+    from vllm.entrypoints.serve.profile.api_router import router as profile_router
 
-    @app.post("/start_profile")
-    async def start_profile(raw_request: Request) -> JSONResponse:
-        """Start profiling on all stages.
-
-        When the server is running under nsys with
-        ``--capture-range=cudaProfilerApi``, this also opens the CUDA
-        profiler capture region.
-        """
-        engine_client = raw_request.app.state.engine_client
-        try:
-            await engine_client.start_profile()
-        except Exception as e:
-            logger.exception("Failed to start profile: %s", e)
-            raise HTTPException(
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                detail=str(e),
-            ) from e
-        return JSONResponse(content={"status": "ok"})
-
-    @app.post("/stop_profile")
-    async def stop_profile(raw_request: Request) -> JSONResponse:
-        """Stop profiling on all stages.
-
-        When running under nsys, this closes the CUDA profiler capture
-        region so nsys finalises the current capture.
-        """
-        engine_client = raw_request.app.state.engine_client
-        try:
-            await engine_client.stop_profile()
-        except Exception as e:
-            logger.exception("Failed to stop profile: %s", e)
-            raise HTTPException(
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                detail=str(e),
-            ) from e
-        return JSONResponse(content={"status": "ok"})
+    app.include_router(profile_router)
 
 
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
