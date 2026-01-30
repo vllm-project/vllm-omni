@@ -23,18 +23,19 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
 from transformers import Qwen2TokenizerFast, Qwen3Model
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
@@ -139,9 +140,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OvisImagePipeline(
-    nn.Module,
-):
+class OvisImagePipeline(nn.Module, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -431,68 +430,77 @@ class OvisImagePipeline(
         )
         return timesteps, num_inference_steps
 
-    def denoising(
+    def diffuse(
         self,
-        latents,
-        timesteps,
-        prompt_embeds,
-        negative_prompt_embeds,
-        guidance_scale,
-        do_classifier_free_guidance,
-        callback_on_step_end,
-        callback_on_step_end_tensor_inputs,
-        text_ids,
-        negative_text_ids,
-        latent_image_ids,
-    ):
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        text_ids: torch.Tensor,
+        negative_text_ids: torch.Tensor,
+        latent_image_ids: torch.Tensor,
+        do_true_cfg: bool,
+        guidance_scale: float,
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
+        """
+        Diffusion loop with optional classifier-free guidance.
+
+        Args:
+            latents: Noise latents to denoise
+            timesteps: Diffusion timesteps
+            prompt_embeds: Positive prompt embeddings
+            negative_prompt_embeds: Negative prompt embeddings
+            text_ids: Position IDs for positive text
+            negative_text_ids: Position IDs for negative text
+            latent_image_ids: Position IDs for image latents
+            do_true_cfg: Whether to apply CFG
+            guidance_scale: CFG scale factor
+            cfg_normalize: Whether to normalize CFG output (default: False)
+
+        Returns:
+            Denoised latents
+        """
         self.scheduler.set_begin_index(0)
+
         for i, t in enumerate(timesteps):
-            if self._interrupt:
+            if self.interrupt:
                 break
 
             self._current_timestep = t
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                return_dict=False,
-            )[0]
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_image_ids,
+                "return_dict": False,
+            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep / 1000,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_image_ids,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
 
-            if do_classifier_free_guidance:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    return_dict=False,
-                )[0]
+            # Predict noise with automatic CFG parallel handling
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg,
+                guidance_scale,
+                positive_kwargs,
+                negative_kwargs,
+                cfg_normalize,
+            )
 
-                noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
-
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                    latents = latents.to(latents_dtype)
-
-            # Not used in this pipeline
-            # if callback_on_step_end is not None:
-            #     callback_kwargs = {}
-            #     for k in callback_on_step_end_tensor_inputs:
-            #         callback_kwargs[k] = locals()[k]
-            #     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-            #     latents = callback_outputs.pop("latents", latents)
-            #     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
         return latents
 
@@ -704,23 +712,18 @@ class OvisImagePipeline(
         if self.joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
 
-        # 6. Denoising loop
-
-        # We set the index here to remove DtoH sync, helpful especially during compilation
-        # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
-
-        latents = self.denoising(
-            latents,
-            timesteps,
-            prompt_embeds,
-            negative_prompt_embeds,
-            guidance_scale,
-            do_classifier_free_guidance,
-            callback_on_step_end,
-            callback_on_step_end_tensor_inputs,
-            text_ids,
-            negative_text_ids,
-            latent_image_ids,
+        # 6. Denoising loop using diffuse method
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds if do_classifier_free_guidance else None,
+            text_ids=text_ids,
+            negative_text_ids=negative_text_ids if do_classifier_free_guidance else None,
+            latent_image_ids=latent_image_ids,
+            do_true_cfg=do_classifier_free_guidance,
+            guidance_scale=guidance_scale,
+            cfg_normalize=False,
         )
 
         self._current_timestep = None

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 
 import PIL.Image
 import torch
@@ -18,12 +18,14 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +186,7 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module):
+class Wan22Pipeline(nn.Module, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -585,26 +587,44 @@ class Wan22Pipeline(nn.Module):
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
 
-            noise_pred = current_model(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                attention_kwargs=attention_kwargs,
-                return_dict=False,
-            )[0]
+            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+            # Prepare kwargs for positive and negative predictions
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep,
+                "encoder_hidden_states": prompt_embeds,
+                "attention_kwargs": attention_kwargs,
+                "return_dict": False,
+                "current_model": current_model,
+            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+            else:
+                negative_kwargs = None
 
-            if current_guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                noise_uncond = current_model(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+            # Predict noise with automatic CFG parallel handling
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=current_guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
 
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+        # Wan2.2 is prone to out of memory errors when predicting large videos
+        # so we empty the cache here to avoid OOM before vae decoding.
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
         self._current_timestep = None
 
         # For I2V mode: blend final latents with condition
@@ -628,6 +648,21 @@ class Wan22Pipeline(nn.Module):
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
+
+    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+        """
+        Forward pass through transformer to predict noise.
+
+        Args:
+            current_model: The transformer model to use (transformer or transformer_2)
+            **kwargs: Arguments to pass to the transformer
+
+        Returns:
+            Predicted noise tensor
+        """
+        if current_model is None:
+            current_model = self.transformer
+        return current_model(**kwargs)[0]
 
     def encode_prompt(
         self,

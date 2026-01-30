@@ -22,6 +22,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
@@ -554,6 +555,21 @@ class FluxPipeline(
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         return latents
 
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):
+        if get_classifier_free_guidance_world_size() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -636,6 +652,8 @@ class FluxPipeline(
             negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
         (
             prompt_embeds,
