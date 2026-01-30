@@ -548,7 +548,8 @@ class ZImagePipeline(nn.Module):
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(latents.shape[0])
             timestep = (1000 - timestep) / 1000
-            # Normalized time for time-aware config (0 at start, 1 at end); use precomputed to avoid .item() sync per step
+            # Normalized time for time-aware config (0 at start, 1 at end);
+            # use precomputed to avoid .item() sync per step
             t_norm = t_norm_list[i]
 
             # Handle cfg truncation
