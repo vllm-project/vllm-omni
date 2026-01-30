@@ -67,6 +67,10 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        return True
+
+    @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/platforms/rocm/stage_configs"
 

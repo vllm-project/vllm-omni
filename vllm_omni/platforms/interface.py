@@ -74,6 +74,11 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        """Check if the platform supports torch.compile with inductor backend."""
+        raise NotImplementedError
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         raise NotImplementedError
 
