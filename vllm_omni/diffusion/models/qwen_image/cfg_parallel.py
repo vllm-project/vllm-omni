@@ -8,11 +8,15 @@ Shared by
 - QwenImageLayeredPipeline
 """
 
+import logging
 from typing import Any
 
 import torch
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+
+logger = logging.getLogger(__name__)
 
 
 class QwenImageCFGParallelMixin(CFGParallelMixin):
@@ -119,3 +123,38 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
         return latents
+
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):
+        """
+        Validate whether CFG parallel is properly configured for the current generation request.
+
+        When CFG parallel is enabled (cfg_parallel_world_size > 1), this method verifies that the necessary
+        conditions are met for correct parallel execution. If validation fails, a warning is
+        logged to help identify configuration issues.
+
+        Args:
+            true_cfg_scale: The classifier-free guidance scale value. Must be > 1 for CFG to
+                have an effect.
+            has_neg_prompt: Whether negative prompts or negative prompt embeddings are provided.
+                Required for CFG to perform unconditional prediction.
+
+        Returns:
+            True if CFG parallel is disabled or all validation checks pass, False otherwise.
+
+        Note:
+            When CFG parallel is disabled (world_size == 1), this method always returns True
+            as no parallel-specific validation is needed.
+        """
+        if get_classifier_free_guidance_world_size() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True

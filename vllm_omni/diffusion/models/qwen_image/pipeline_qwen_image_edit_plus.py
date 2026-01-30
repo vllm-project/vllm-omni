@@ -661,6 +661,8 @@ class QwenImageEditPlusPipeline(nn.Module, SupportImageInput, QwenImageCFGParall
         )
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=prompt,
             image=condition_images,  # Use condition images for prompt encoding
