@@ -521,6 +521,8 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self._current_timestep = None
 
         # For expand_timesteps mode, blend final latents with condition

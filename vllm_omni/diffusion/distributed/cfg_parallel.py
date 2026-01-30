@@ -68,22 +68,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
                 gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
 
-                del local_pred
-
                 if cfg_rank == 0:
                     noise_pred = gathered[0]
                     neg_noise_pred = gathered[1]
                     noise_pred = self.combine_cfg_noise(noise_pred, neg_noise_pred, true_cfg_scale, cfg_normalize)
-
-                    del gathered, neg_noise_pred
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
                     return noise_pred
                 else:
-                    del gathered
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     return None
             else:
                 # Sequential CFG: compute both positive and negative
