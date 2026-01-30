@@ -29,6 +29,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -112,14 +113,20 @@ class DiffusionModelRunner:
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
-            try:
-                self.pipeline.transformer = regionally_compile(
-                    self.pipeline.transformer,
-                    dynamic=True,
+            if current_omni_platform.supports_torch_inductor():
+                try:
+                    self.pipeline.transformer = regionally_compile(
+                        self.pipeline.transformer,
+                        dynamic=True,
+                    )
+                    logger.info("Model runner: Model compiled with torch.compile.")
+                except Exception as e:
+                    logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
+            else:
+                logger.warning(
+                    "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
+                    current_omni_platform.get_torch_device(),
                 )
-                logger.info("Model runner: Model compiled with torch.compile.")
-            except Exception as e:
-                logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
