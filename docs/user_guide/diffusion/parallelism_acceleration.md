@@ -449,23 +449,28 @@ vLLM-omni provides `CFGParallelMixin` base class that encapsulates the CFG paral
 
 ```python
 class QwenImageCFGParallelMixin(CFGParallelMixin):
+    """
+    Base Mixin class for Qwen Image pipelines providing shared CFG methods.
+    """
+
     def diffuse(
         self,
-        prompt_embeds,
-        prompt_embeds_mask,
-        negative_prompt_embeds,
-        negative_prompt_embeds_mask,
-        latents,
-        img_shapes,
-        txt_seq_lens,
-        negative_txt_seq_lens,
-        timesteps,
-        do_true_cfg,
-        guidance,
-        true_cfg_scale,
-        cfg_normalize=True,
-        ...
-    ):
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds_mask: torch.Tensor,
+        latents: torch.Tensor,
+        img_shapes: torch.Tensor,
+        txt_seq_lens: torch.Tensor,
+        negative_txt_seq_lens: torch.Tensor,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        guidance: torch.Tensor,
+        true_cfg_scale: float,
+        image_latents: torch.Tensor | None = None,
+        cfg_normalize: bool = True,
+        additional_transformer_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
         self.transformer.do_true_cfg = do_true_cfg
 
         for i, t in enumerate(timesteps):
