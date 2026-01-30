@@ -81,6 +81,10 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        return True
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         if local_rank is None:
             return torch.device("cuda")
