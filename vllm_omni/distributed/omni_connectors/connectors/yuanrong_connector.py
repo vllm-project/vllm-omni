@@ -11,16 +11,20 @@ logger = get_connector_logger(__name__)
 try:
     from datasystem.kv_client import KVClient, SetParam, WriteMode
 except ImportError:
-    logger.warning("Datasystem not available, YuanrongConnector will not work")
     KVClient = None
+    SetParam = None
+    WriteMode = None
 
 
 class YuanrongConnector(OmniConnectorBase):
     """Datasystem-based distributed connector for OmniConnector."""
 
     def __init__(self, config: dict[str, Any]):
-        if KVClient is None:
-            raise ImportError("Datasystem not available")
+        if KVClient is None or SetParam is None or WriteMode is None:
+            raise ImportError(
+                "Datasystem components (KVClient/SetParam/WriteMode) are not available. "
+                "Please ensure the 'datasystem' package is installed in your environment."
+            )
 
         self.config = config
         self.client = None

@@ -15,7 +15,6 @@ except ImportError:
     try:
         from mooncake import MooncakeDistributedStore, ReplicateConfig
     except ImportError:
-        logger.warning("Mooncake not available, MooncakeOmniConnector will not work")
         MooncakeDistributedStore = None
         ReplicateConfig = None
 
@@ -24,8 +23,11 @@ class MooncakeConnector(OmniConnectorBase):
     """Mooncake-based distributed connector for OmniConnector."""
 
     def __init__(self, config: dict[str, Any]):
-        if MooncakeDistributedStore is None:
-            raise ImportError("Mooncake not available")
+        if MooncakeDistributedStore is None or ReplicateConfig is None:
+            raise ImportError(
+                "Mooncake components (MooncakeDistributedStore/ReplicateConfig) are not available. "
+                "Please ensure the 'mooncake' package is installed in your environment."
+            )
 
         self.config = config
         self.host = config.get("host", "127.0.0.1")
