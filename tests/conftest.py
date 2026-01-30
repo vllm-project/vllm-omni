@@ -879,7 +879,6 @@ class OmniServer:
         self,
         model: str,
         serve_args: list[str],
-        port: int = None,
         *,
         env_dict: dict[str, str] | None = None,
     ) -> None:
@@ -891,10 +890,7 @@ class OmniServer:
         self.env_dict = env_dict
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
-        if port is None:
-            self.port = get_open_port()
-        else:
-            self.port = port
+        self.port = get_open_port()
 
     def _start_server(self) -> None:
         """Start the vLLM-Omni server subprocess."""

@@ -2,18 +2,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from vllm.utils.network_utils import get_open_port
 
 from tests.conftest import OmniServer
 
-models = ["Qwen/Qwen2.5-Omni-7B"]
-stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
+models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
+stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen3_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
-
-
-SERVER_PORT = get_open_port()
 
 
 @pytest.fixture(scope="module")
@@ -27,9 +23,7 @@ def omni_server(request):
     print(f"Starting OmniServer with model: {model}")
     print("This may take 10-20+ minutes for initialization...")
 
-    with OmniServer(
-        model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"], port=SERVER_PORT
-    ) as server:
+    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
         print("OmniServer started successfully")
         yield server
         print("OmniServer stopped")
@@ -45,7 +39,7 @@ def test_bench_serve_chat(omni_server):
         "--model",
         omni_server.model,
         "--port",
-        str(SERVER_PORT),
+        str(omni_server.port),
         "--dataset-name",
         "random",
         "--random-input-len",
