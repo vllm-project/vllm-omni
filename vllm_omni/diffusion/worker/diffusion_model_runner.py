@@ -76,7 +76,9 @@ class DiffusionModelRunner:
             memory_pool_context_fn: Optional function that returns a context manager
                 for memory pool allocation (used for sleep mode).
         """
-        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        load_device = (
+            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+        )
 
         def get_memory_context():
             if memory_pool_context_fn is not None:
@@ -104,17 +106,8 @@ class DiffusionModelRunner:
         )
         logger.info("Model runner: Model loaded successfully.")
 
-        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
-        if self.od_config.enable_cpu_offload:
-            for name in ["vae"]:
-                module = getattr(self.pipeline, name, None)
-                if module is None:
-                    continue
-                try:
-                    module.to(self.device, non_blocking=True)
-                except Exception as exc:
-                    logger.debug("Failed to move %s to GPU: %s", name, exc)
-
+        # Apply CPU offloading
+        if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
             apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
 
         # Apply torch.compile if not in eager mode
