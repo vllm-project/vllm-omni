@@ -63,7 +63,7 @@ stage_args:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      max_tokens: 4096
+      max_tokens: 2048 # TODO: The max_tokens of the async_chunk feature cannot exceed 2048.
       seed: 42
       detokenize: False
       repetition_penalty: 1.05
