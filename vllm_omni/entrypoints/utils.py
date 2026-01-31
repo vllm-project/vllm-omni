@@ -9,12 +9,46 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
-from vllm_omni.utils import detect_device_type, is_rocm
+from vllm_omni.entrypoints.stage_utils import _to_dict
+from vllm_omni.platforms import current_omni_platform
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+
+def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
+    """Inject connector configuration into stage engine arguments."""
+    # Prepare omni_kv_config dict
+    omni_conf_dict = {}
+    try:
+        # Access engine_args safely (might be OmegaConf or dict)
+        existing_args = stage.engine_args
+        if hasattr(existing_args, "get"):
+            _oc = existing_args.get("omni_kv_config", None)
+            if _oc:
+                if hasattr(_oc, "items"):  # dict-like
+                    omni_conf_dict = dict(_oc)
+                else:  # object?
+                    omni_conf_dict = _to_dict(_oc)
+    except Exception:
+        omni_conf_dict = {}
+
+    # Inject connector info
+    omni_conf_dict["connector_config"] = omni_conn_cfg
+    omni_conf_dict["omni_from_stage"] = omni_from
+    omni_conf_dict["omni_to_stage"] = omni_to
+
+    # Write back to engine_args
+    try:
+        if hasattr(stage.engine_args, "__setitem__"):
+            stage.engine_args["omni_kv_config"] = omni_conf_dict
+        else:
+            setattr(stage.engine_args, "omni_kv_config", omni_conf_dict)
+    except Exception as e:
+        # Fallback for OmegaConf or similar if direct set fails?
+        logger.error(f"Failed to inject omni connector config into stage: {e}")
 
 
 def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
@@ -130,16 +164,12 @@ def resolve_model_config_path(model: str) -> str:
                 f"Model is not in standard transformers format and does not have model_index.json. "
                 f"Please ensure the model has proper configuration files with 'model_type' field"
             )
-    device_type = detect_device_type()
 
-    # Try device-specific config first
-    if device_type != "cuda" or is_rocm():
-        device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
-        if is_rocm():
-            device_config_file = f"vllm_omni/model_executor/stage_configs/rocm/{model_type}.yaml"
-        device_config_path = PROJECT_ROOT / device_config_file
-        if os.path.exists(device_config_path):
-            return str(device_config_path)
+    default_config_path = current_omni_platform.get_default_stage_config_path()
+    model_type_str = f"{model_type}.yaml"
+    complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
+    if os.path.exists(complete_config_path):
+        return str(complete_config_path)
 
     # Fall back to default config
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
@@ -187,6 +217,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         base_engine_args = {}
     config_data = OmegaConf.load(config_path)
     stage_args = config_data.stage_args
+    global_async_chunk = config_data.get("async_chunk", False)
     # Convert any nested dataclass objects to dicts before creating OmegaConf
     base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
     base_engine_args = OmegaConf.create(base_engine_args)
@@ -200,6 +231,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
             runtime_cfg = stage_arg.runtime
             max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
+            base_engine_args_tmp.async_chunk = global_async_chunk
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
 

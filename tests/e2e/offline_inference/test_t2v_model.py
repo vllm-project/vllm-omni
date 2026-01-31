@@ -5,14 +5,18 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Wan-AI/Wan2.2-T2V-A14B-Diffusers"]
 
@@ -31,13 +35,15 @@ def test_video_diffusion_model(model_name: str):
     width = 640
     num_frames = 5
     outputs = m.generate(
-        "A cat sitting on a table",
-        height=height,
-        width=width,
-        num_frames=num_frames,
-        num_inference_steps=2,
-        guidance_scale=1.0,
-        generator=torch.Generator("cuda").manual_seed(42),
+        prompts="A cat sitting on a table",
+        sampling_params_list=OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=2,
+            guidance_scale=1.0,
+            generator=torch.Generator("cuda").manual_seed(42),
+        ),
     )
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
@@ -45,10 +51,10 @@ def test_video_diffusion_model(model_name: str):
         raise ValueError("No request_output found in OmniRequestOutput")
 
     req_out = first_output.request_output[0]
-    if not isinstance(req_out, dict) or "images" not in req_out:
+    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
-    frames = req_out["images"][0]
+    frames = req_out.images[0]
 
     assert frames is not None
     assert hasattr(frames, "shape")

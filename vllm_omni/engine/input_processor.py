@@ -7,7 +7,6 @@ from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.utils import argsort_mm_positions
@@ -25,6 +24,7 @@ from vllm_omni.engine import (
     PromptEmbedsPayload,
 )
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
 
@@ -232,8 +232,8 @@ class OmniInputProcessor(InputProcessor):
         # (direct-transfer path)
         prompt_embeds_payload: PromptEmbedsPayload | None = None
         additional_information_payload: AdditionalInformationPayload | None = None
-        if "prompt_embeds" in decoder_inputs:  # type: ignore[operator]
-            pe: torch.Tensor = decoder_inputs["prompt_embeds"]  # type: ignore[index]
+        pe: torch.Tensor | None = decoder_inputs.get("prompt_embeds")  # type: ignore[operator]
+        if pe is not None:
             if pe.ndim != 2:
                 raise ValueError("prompt_embeds must be of shape (seq_len, hidden_size)")
             # Move to CPU and ensure contiguous memory for stable serialization
@@ -246,8 +246,8 @@ class OmniInputProcessor(InputProcessor):
                 shape=[int(seq_len), int(hidden_size)],
                 dtype=dtype_str,
             )
-        if "additional_information" in decoder_inputs:  # type: ignore[operator]
-            raw_info: dict[str, Any] = decoder_inputs["additional_information"]  # type: ignore[index]  # noqa: E501
+        raw_info: dict[str, Any] | None = decoder_inputs.get("additional_information")  # type: ignore[operator]
+        if raw_info is not None:
             entries: dict[str, AdditionalInformationEntry] = {}
             for key, value in raw_info.items():
                 if isinstance(value, torch.Tensor):

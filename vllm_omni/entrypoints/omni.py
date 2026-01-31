@@ -10,19 +10,21 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any
+from typing import Any, Literal, overload
 
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
-from vllm.inputs import PromptType
+from vllm import SamplingParams
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
     initialize_orchestrator_connectors,
 )
 from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    resolve_omni_kv_config_for_stage,
+)
 from vllm_omni.distributed.ray_utils.utils import (
     create_placement_group,
     get_ray_queue_class,
@@ -34,10 +36,12 @@ from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
+    inject_omni_kv_config,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -78,10 +82,8 @@ class OmniBase:
     """Base class for serving Omni models.
 
     Args:
-        *args: Variable length argument list.
-            - args[0]: Model name or path to load.
+        model: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -98,14 +100,9 @@ class OmniBase:
             - Additional keyword arguments passed to stage engines.
     """
 
-    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        model = args[0] if args else kwargs.get("model", "")
-        assert model != "", "Null model id detected, please specify a model id."
+    def __init__(self, model: str, **kwargs: Any) -> None:
         model = omni_snapshot_download(model)
-        if args:
-            args[0] = model
-        elif kwargs.get("model", "") != "":
-            kwargs["model"] = model
+        kwargs["model"] = model
 
         # Stage management attributes
         self.stage_list: list[OmniStage] = []
@@ -217,6 +214,26 @@ class OmniBase:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
 
+        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        for cfg in self.stage_configs:
+            try:
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+                if kwargs.get("lora_path") is not None:
+                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
+                        cfg.engine_args.lora_path = kwargs["lora_path"]
+                lora_scale = kwargs.get("lora_scale")
+                if lora_scale is None:
+                    # Backwards compatibility for older callers.
+                    lora_scale = kwargs.get("static_lora_scale")
+                if lora_scale is not None:
+                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
+                        cfg.engine_args.lora_scale = lora_scale
+            except Exception as e:
+                logger.warning("Failed to inject LoRA config for stage: %s", e)
+
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
             self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
@@ -228,6 +245,8 @@ class OmniBase:
         self.worker_backend = worker_backend
         self.ray_address = ray_address
         self.batch_timeout = batch_timeout
+        # async chunk remains the same for each stage
+        self.async_chunk = self._is_async_chunk_enable(self.stage_configs)
 
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
@@ -257,6 +276,11 @@ class OmniBase:
         # Wait for all stages to report readiness before seeding
         self._wait_for_stages_ready(timeout=init_timeout)
 
+    def _is_async_chunk_enable(self, stage_args: list) -> bool:
+        """get async chunk flag"""
+        engine_args = getattr(stage_args[0], "engine_args", None)
+        return bool(getattr(engine_args, "async_chunk", False))
+
     def _start_stages(self, model: str) -> None:
         """Start all stage processes."""
         if self.worker_backend == "ray":
@@ -276,6 +300,18 @@ class OmniBase:
                 self.omni_transfer_config,
                 stage_id,
             )
+
+            # Inject YAML-resolved connector config into omni_kv_config for
+            # in-engine usage (GPU model runner reads model_config.omni_kv_config).
+            try:
+                omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(
+                    self.omni_transfer_config, stage_id
+                )
+                if omni_conn_cfg:
+                    inject_omni_kv_config(stage, omni_conn_cfg, omni_from, omni_to)  # type: ignore
+
+            except Exception as e:
+                logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
 
             stage.init_stage_worker(
                 model,
@@ -329,6 +365,7 @@ class OmniBase:
         )
 
         suggestions = [
+            f"Ignore this warning if the model weight download / load from disk time is longer than {timeout}s.",
             "Verify GPU/device assignment in config (runtime.devices) is correct.",
             "Check GPU/host memory availability; reduce model or batch size if needed.",
             "Check model weights path and network reachability (if loading remotely).",
@@ -337,7 +374,7 @@ class OmniBase:
 
         formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
 
-        logger.error(f"[{self._name}] Stage initialization failed. Troubleshooting Steps:\n{formatted_suggestions}")
+        logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
 
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.
@@ -458,10 +495,8 @@ class Omni(OmniBase):
     """Unified entrypoint for both LLM and Diffusion models for better usability.
 
     Args:
-        *args: Variable length argument list.
-            - args[0]: Model name or path to load.
+        model: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -483,8 +518,8 @@ class Omni(OmniBase):
         >>> print(outputs)
     """
 
-    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, model: str, **kwargs: Any) -> None:
+        super().__init__(model, **kwargs)
 
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
@@ -495,8 +530,31 @@ class Omni(OmniBase):
             self._ray_pg,
         )
 
+    @overload
     def generate(
-        self, *args: Any, **kwargs: dict[str, Any]
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        *,
+        py_generator: Literal[True],
+    ) -> Generator[OmniRequestOutput, None, None]: ...
+
+    @overload
+    def generate(
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        *,
+        py_generator: Literal[False] = False,
+    ) -> list[OmniRequestOutput]: ...
+
+    def generate(
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        *,
+        py_generator: bool = False,
+        use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
@@ -504,12 +562,10 @@ class Omni(OmniBase):
         Each stage will use OmniLLM or OmniDiffusion based on stage_type.
 
         Args:
-            *args: Variable length argument list.
-                - args[0]: Input prompts for generation.
-                - args[1]: Optional list of per-stage parameters.
-            **kwargs: Arbitrary keyword arguments.
-                - prompt: Input prompts for generation (if not in args).
-                - sampling_params_list: Optional list of per-stage parameters (if not in args).
+            prompts: Input prompt(s) for generation.
+            sampling_params_list: Optional list of per-stage parameters.
+            py_generator: Whether the returned result(s) are wrapped in a generator instead of a list.
+            use_tqdm: Whether to use tqdm progress bar
 
         Returns:
             List of OmniRequestOutput objects, one for each input prompt.
@@ -519,40 +575,26 @@ class Omni(OmniBase):
         Raises:
             ValueError: If sampling_params_list is None or has incorrect length.
         """
-        prompts = args[0] if args else kwargs.get("prompts")
-        sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
-        py_generator = kwargs.get("py_generator", False)
-        if prompts is None:
-            if kwargs.get("prompt") is None:
-                raise ValueError("prompts is required for generation")
-            prompts = kwargs.get("prompt")
-
         if sampling_params_list is None:
-            # For Omni LLM, the params are parsed via the yaml file. For the current version,
-            # diffusion params can parsed via the command line.
-            omni_params_kwargs = {
-                k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
-            }
-
-            per_stage_params: list[Any] = []
-            for stage_id, stage in enumerate(self.stage_list):
-                stage_type = getattr(stage, "stage_type", "llm")
-                if stage_type == "diffusion":
-                    default_dict = self.default_sampling_params_list[stage_id]
-                    # Merge user-provided kwargs
-                    merged = {**default_dict, **omni_params_kwargs}
-                    # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
-                    per_stage_params.append(merged)
+            sampling_params_list = self.default_sampling_params_list
+        elif not isinstance(sampling_params_list, Sequence):
+            # TODO: After the recent introduction of BAGEL model (one LLM and one Diffusion),
+            # expect the text_to_image example code to run when only passing one OmniDiffusionSamplingParams
+            # This behavior may be confusing, and future PR can improve it.
+            per_stage_params: list[OmniSamplingParams] = []
+            for default_stage_sp in self.default_sampling_params_list:
+                default_sp_type = default_stage_sp.__class__
+                if default_sp_type == sampling_params_list.__class__:
+                    per_stage_params.append(sampling_params_list)
                 else:
-                    # LLM directly constructs SamplingParams, don't use the merged params
-                    per_stage_params.append(self.default_sampling_params_list[stage_id])
-
+                    per_stage_params.append(default_stage_sp)
             sampling_params_list = per_stage_params
+
         try:
             if py_generator:
                 return self._run_generation_with_generator(prompts, sampling_params_list)
             else:
-                outputs = list(self._run_generation(prompts, sampling_params_list))
+                outputs = list(self._run_generation(prompts, sampling_params_list, use_tqdm))
                 return outputs
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
@@ -562,8 +604,8 @@ class Omni(OmniBase):
 
     def _run_generation_with_generator(
         self,
-        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
-        sampling_params_list: Any | Sequence[Any] | None,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: Sequence[OmniSamplingParams],
     ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline and return a generator."""
         gen = self._run_generation(prompts, sampling_params_list)
@@ -578,8 +620,8 @@ class Omni(OmniBase):
 
     def _run_generation(
         self,
-        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
-        sampling_params_list: Any | Sequence[Any] | None = None,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline."""
@@ -587,18 +629,20 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
-        # Normalize sampling_params_list to a list
-        if not isinstance(sampling_params_list, (list, tuple)):
-            sampling_params_list = [sampling_params_list]
-        else:
-            sampling_params_list = list(sampling_params_list)
-
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
+        for i, (stage, sp) in enumerate(zip(self.stage_list, sampling_params_list)):
+            ExpectedSPType = OmniDiffusionSamplingParams if stage.stage_type == "diffusion" else SamplingParams
+            if not isinstance(sp, ExpectedSPType):
+                raise ValueError(
+                    f"Expected sampling parameters with type {ExpectedSPType} in stage {i}, got {sp.__class__}"
+                )
+
         # Normalize prompts to a list for per-request iteration
-        if not isinstance(prompts, (list, tuple)):
-            request_prompts: list[PromptType] = [prompts]
+        # str is also Sequence but only test list-like containers here
+        if isinstance(prompts, str) or not isinstance(prompts, Sequence):
+            request_prompts: list[OmniPromptType] = [prompts]
         else:
             request_prompts = list(prompts)
 
@@ -606,8 +650,8 @@ class Omni(OmniBase):
         num_stages = len(self.stage_list)
 
         # Generate globally unique request IDs and map them to original prompts
-        request_ids: list[str] = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
-        request_id_to_prompt: dict[str, PromptType] = {rid: p for rid, p in zip(request_ids, request_prompts)}
+        request_ids = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
+        request_id_to_prompt = {rid: p for rid, p in zip(request_ids, request_prompts)}
 
         # Track per-request start time for end-to-end timing
         _req_start_ts: dict[str, float] = {}

@@ -13,7 +13,7 @@ logger = get_connector_logger(__name__)
 class ConnectorSpec:
     """Specification for a connector instance."""
 
-    name: str  # e.g., "MooncakeConnector", "SharedMemoryConnector"
+    name: str  # e.g., "MooncakeConnector", "SharedMemoryConnector", "YuanrongConnector"
     extra: dict[str, Any] = field(default_factory=dict)  # backend-specific config
 
 

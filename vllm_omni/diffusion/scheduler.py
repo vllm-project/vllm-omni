@@ -12,13 +12,6 @@ logger = init_logger(__name__)
 
 
 class Scheduler:
-    _instance = None
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
     def initialize(self, od_config: OmniDiffusionConfig):
         existing_context = getattr(self, "context", None)
         if existing_context is not None and not existing_context.closed:
@@ -48,14 +41,14 @@ class Scheduler:
     def get_broadcast_handle(self):
         return self.mq.export_handle()
 
-    def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
         try:
             # Prepare RPC request for generation
             rpc_request = {
                 "type": "rpc",
                 "method": "generate",
-                "args": (requests,),
+                "args": (request,),
                 "kwargs": {},
                 "output_rank": 0,
                 "exec_all_ranks": True,
@@ -69,6 +62,9 @@ class Scheduler:
                 raise RuntimeError("Result queue not initialized")
 
             output = self.result_mq.dequeue()
+            # {"status": "error", "error": str(e)}
+            if isinstance(output, dict) and output.get("status") == "error":
+                raise RuntimeError("worker error")
             return output
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
@@ -81,7 +77,3 @@ class Scheduler:
         self.context = None
         self.mq = None
         self.result_mq = None
-
-
-# Singleton instance for easy access
-scheduler = Scheduler()

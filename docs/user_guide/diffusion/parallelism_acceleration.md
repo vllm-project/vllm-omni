@@ -24,11 +24,13 @@ The following table shows which models are currently supported by parallelism me
 | **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ✅ | ✅ | ❌ | ❌ |
 | **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ❌ | ❌ | ❌ |
 | **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ❌ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ❌ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ | ❌ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ❌ | ❌ | ✅ (TP=2 only) |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ✅ (TP=2 only) |
 | **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
+| **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ❌ | ❌ | ❌ | ✅ |
+| **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ❌ | ❌ | ✅ |
 
 
 !!! note "TP Limitations for Diffusion Models"
@@ -48,7 +50,7 @@ The following table shows which models are currently supported by parallelism me
 
 | Model | Model Identifier | Ulysses-SP | Ring-SP | Tensor-Parallel |
 |-------|------------------|------------|---------|--------------------------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ❌ | ❌ |
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ❌ |
 
 ### Tensor Parallelism
 
@@ -66,10 +68,12 @@ omni = Omni(
 )
 
 outputs = omni.generate(
-    prompt="a cat reading a book",
-    num_inference_steps=9,
-    width=512,
-    height=512,
+    "a cat reading a book",
+    OmniDiffusionSamplingParams(
+        num_inference_steps=9,
+        width=512,
+        height=512,
+    ),
 )
 ```
 
@@ -82,6 +86,7 @@ outputs = omni.generate(
 An example of offline inference script using [Ulysses-SP](https://arxiv.org/pdf/2309.14509) is shown below:
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 ulysses_degree = 2
 
@@ -90,7 +95,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
@@ -132,6 +140,7 @@ Ring-Attention ([arxiv paper](https://arxiv.org/abs/2310.01889)) splits the inpu
 An example of offline inference script using Ring-Attention is shown below:
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 ring_degree = 2
 
@@ -140,7 +149,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ring_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
@@ -182,6 +194,7 @@ You can combine both Ulysses-SP and Ring-Attention for larger scale parallelism.
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 # Hybrid: 2 Ulysses × 2 Ring = 4 GPUs total
@@ -190,7 +203,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 ##### Online Serving
@@ -220,107 +236,146 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 
 ##### How to parallelize a new model
 
-If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can refer to the following instructions to parallelize it with [Ulysses-SP](https://arxiv.org/pdf/2309.14509).
+NOTE: "Terminology: SP vs CP"
+    Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in the [diffusers library](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/_modeling_parallel.py).
+    We use "Sequence Parallelism" to align with vLLM-Omni's terminology.
 
+---
 
-This section uses **Qwen-Image** (`QwenImageTransformer2DModel`) as the reference implementation. Qwen-Image is a **dual-stream** transformer (text + image) that performs **joint attention** across the concatenated sequences. Because of that, when enabling sequence parallel you typically:
+###### Non-intrusive `_sp_plan` (Recommended)
 
-- Chunk **image tokens** (`hidden_states`) across SP ranks along the **sequence dimension**.
-- Keep **text embeddings** (`encoder_hidden_states`) **replicated** on all SP ranks for correctness (unless you implement full joint-SP semantics and explicitly split text too).
-- Chunk **image RoPE freqs** to match the chunked image tokens.
-- `all_gather` the final output back along the sequence dimension.
+The `_sp_plan` mechanism allows SP without modifying `forward()` logic. The framework automatically registers hooks to shard inputs and gather outputs at module boundaries.
 
-First, add the sequence-parallel helpers and (for Qwen-Image) the forward-context flag. Then, in the transformer's `forward()`:
+**Requirements for `forward()` function:**
 
-- Chunk `hidden_states` by SP world size.
-- Set `get_forward_context().split_text_embed_in_sp = False` because Qwen-Image uses joint attention and we would use a full text embedding in each rank.
-- After `pos_embed`, chunk `img_freqs` on `dim=0` (token axis) to match the chunked image tokens; only chunk `txt_freqs` if you explicitly split text embeddings in SP.
+- Tensor operations that need sharding/gathering must happen at **`nn.Module` boundaries** (not inline Python operations)
+- If your `forward()` contains inline tensor operations (e.g., `torch.cat`, `pad_sequence`) that need sharding, **extract them into a submodule**
 
-Taking `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` as an example:
+**When to create a submodule:**
 
-```diff
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    get_sp_group,
+```python
+# ❌ BAD: Inline operations - hooks cannot intercept
+def forward(self, x, cap_feats):
+    unified = torch.cat([x, cap_feats], dim=1)  # Cannot be sharded via _sp_plan
+    ...
+
+# ✅ GOOD: Extract into a submodule
+class UnifiedPrepare(nn.Module):
+    def forward(self, x, cap_feats):
+        return torch.cat([x, cap_feats], dim=1)  # Now can be sharded via _sp_plan
+
+class MyModel(nn.Module):
+    def __init__(self):
+        self.unified_prepare = UnifiedPrepare()  # Submodule
+
+    def forward(self, x, cap_feats):
+        unified = self.unified_prepare(x, cap_feats)  # Hook can intercept here
+```
+
+---
+
+###### Defining `_sp_plan`
+
+**Type definitions** (see [diffusers `_modeling_parallel.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/_modeling_parallel.py) for reference):
+
+```python
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,   # Corresponds to diffusers' ContextParallelInput
+    SequenceParallelOutput,  # Corresponds to diffusers' ContextParallelOutput
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
-
-class QwenImageTransformer2DModel(...):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
-        encoder_hidden_states_mask: torch.Tensor = None,
-        timestep: torch.LongTensor = None,
-        img_shapes: list[tuple[int, int, int]] | None = None,
-        txt_seq_lens: list[int] | None = None,
-        ...
-    ):
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           # Chunk image tokens along sequence dimension.
-+           hidden_states = torch.chunk(
-+               hidden_states,
-+               get_sequence_parallel_world_size(),
-+               dim=-2,
-+           )[get_sequence_parallel_rank()]
-+
-+           # Qwen-Image uses *dual-stream* (text + image) and runs *joint attention*.
-+           # Text embeddings should be replicated across SP ranks for correctness.
-+           get_forward_context().split_text_embed_in_sp = False
-
-        hidden_states = self.img_in(hidden_states)
-
-        ...
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
-
-+       def get_rotary_emb_chunk(freqs):
-+           return torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[
-+               get_sequence_parallel_rank()
-+           ]
-+
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           img_freqs, txt_freqs = image_rotary_emb
-+           img_freqs = get_rotary_emb_chunk(img_freqs)
-+           if get_forward_context().split_text_embed_in_sp:
-+               txt_freqs = get_rotary_emb_chunk(txt_freqs)
-+           image_rotary_emb = (img_freqs, txt_freqs)
 ```
 
-Next, at the end of the `forward()` function, call `get_sp_group().all_gather` to gather the chunked outputs across devices and concatenate them along the sequence dimension (matching the earlier `dim=-2` chunking):
+| Parameter | Description |
+|-----------|-------------|
+| `split_dim` | Dimension to split/gather (usually `1` for sequence) |
+| `expected_dims` | Expected tensor rank for validation (optional) |
+| `split_output` | `False`: shard **input** parameters; `True`: shard **output** tensors |
+| `auto_pad` | Auto-pad if sequence not divisible by world_size (Ulysses only) |
 
-```diff
-class QwenImageTransformer2DModel(...):
-    def forward(...):
-        ...
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+**Key naming convention:**
 
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           output = get_sp_group().all_gather(output, dim=-2)
-        return Transformer2DModelOutput(sample=output)
+| Key | Meaning | Python equivalent |
+|-----|---------|-------------------|
+| `""` | Root model | `model` |
+| `"blocks.0"` | First element of ModuleList | `model.blocks[0]` |
+| `"blocks.*"` | All elements of ModuleList | `for b in model.blocks` |
+| `"outputs.main"` | ModuleDict entry | `model.outputs["main"]` |
+
+**Dictionary key types:**
+
+| Key type | `split_output` | Description |
+|----------|----------------|-------------|
+| `"param_name"` (str) | `False` | Shard **input parameter** by name |
+| `0`, `1` (int) | `True` | Shard **output tuple** by index |
+
+**Example** (similar to [diffusers `transformer_wan.py`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_wan.py)):
+
+```python
+class MyTransformer(nn.Module):
+    _sp_plan = {
+        # Shard rope module OUTPUTS (returns tuple)
+        "rope": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # cos
+            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # sin
+        },
+        # Shard transformer block INPUT parameter
+        "blocks.0": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
+        },
+        # Gather at final projection
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 ```
 
-Finally, you can set the parallel configuration and pass it to `Omni` and start parallel inference with:
-```diff
-from vllm_omni import Omni
-+from vllm_omni.diffusion.data import DiffusionParallelConfig
-ulysses_degree = 2
+---
 
-omni = Omni(
-    model="Qwen/Qwen-Image",
-+    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
-)
+###### Hook flow
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
 ```
+Input → [SequenceParallelSplitHook: pre_forward] → Module.forward() → [post_forward] → ...
+                                                                              ↓
+... → [SequenceParallelGatherHook: post_forward] → Output
+```
+
+1. **SplitHook** shards tensors before/after the target module
+2. **Attention layers** handle Ulysses/Ring communication internally
+3. **GatherHook** collects sharded outputs
+
+The framework automatically applies these hooks when `sequence_parallel_size > 1`.
+
+---
+
+###### Method 2: Intrusive modification (For complex cases)
+
+For models with dynamic sharding logic that cannot be expressed via `_sp_plan`:
+
+```python
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
+
+def forward(self, hidden_states, ...):
+    if self.parallel_config.sequence_parallel_size > 1:
+        hidden_states = sp_shard(hidden_states, dim=1)
+        # ... computation ...
+        output = sp_gather(output, dim=1)
+    return output
+```
+
+---
+
+###### Choosing the right approach
+
+| Scenario | Approach |
+|----------|----------|
+| Standard transformer | `_sp_plan` |
+| Inline tensor ops need sharding | Extract to submodule + `_sp_plan` |
+| Dynamic/conditional sharding | Intrusive modification |
 
 
 ### CFG-Parallel
 
-##### Offline Inference
+#### Offline Inference
 
-CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=...)`. The recommended configuration is `cfg_parallel_size=2` (one rank for the positive branch and one rank for the negative branch).
+CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=2)`, which runs one rank for the positive branch and one rank for the negative branch.
 
 An example of offline inference using CFG-Parallel (image-to-image) is shown below:
 
@@ -328,23 +383,50 @@ An example of offline inference using CFG-Parallel (image-to-image) is shown bel
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
+image_path = "path_to_image.png"
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
     parallel_config=DiffusionParallelConfig(cfg_parallel_size=2),
 )
+input_image = Image.open(image_path).convert("RGB")
 
 outputs = omni.generate(
-    prompt="turn this cat to a dog",
-    negative_prompt="low quality, blurry",
-    true_cfg_scale=4.0,
-    pil_image=input_image,
-    num_inference_steps=50,
+    {
+        "prompt": "turn this cat to a dog",
+        "negative_prompt": "low quality, blurry",
+        "multi_modal_data": {"image": input_image},
+    },
+    OmniDiffusionSamplingParams(
+        true_cfg_scale=4.0,
+        num_inference_steps=50,
+    ),
 )
 ```
 
 Notes:
 
-- CFG-Parallel is only effective when **true CFG** is enabled (i.e., `true_cfg_scale > 1` and a `negative_prompt` is provided).
+- CFG-Parallel is only effective when a `negative_prompt` is provided AND a guidance scale (or `cfg_scale`) is greater than 1.
+
+See `examples/offline_inference/image_to_image/image_edit.py` for a complete working example.
+```bash
+cd examples/offline_inference/image_to_image/
+python image_edit.py \
+  --model "Qwen/Qwen-Image-Edit" \
+  --image "qwen_image_output.png" \
+  --prompt "turn this cat to a dog" \
+  --negative_prompt "low quality, blurry" \
+  --cfg_scale 4.0 \
+  --output "edited_image.png" \
+  --cfg_parallel_size 2
+```
+
+#### Online Serving
+
+You can enable CFG-Parallel in online serving for diffusion models via `--cfg-parallel-size`:
+
+```bash
+vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
+```
 
 #### How to parallelize a pipeline
 
@@ -357,58 +439,130 @@ In `QwenImagePipeline`, each diffusion step runs two denoiser forward passes seq
 
 CFG-Parallel assigns these two branches to different ranks in the **CFG group** and synchronizes the results.
 
-Below is an example of CFG-Parallel implementation:
+vLLM-omni provides `CFGParallelMixin` base class that encapsulates the CFG parallel logic. By inheriting from this mixin and calling its methods, pipelines can easily implement CFG parallel without writing repetitive code.
+
+**Key Methods in CFGParallelMixin:**
+- `predict_noise_maybe_with_cfg()`: Automatically handles CFG parallel noise prediction
+- `scheduler_step_maybe_with_cfg()`: Scheduler step with automatic CFG rank synchronization
+
+**Example Implementation:**
 
 ```python
-def diffuse(
+class QwenImageCFGParallelMixin(CFGParallelMixin):
+    """
+    Base Mixin class for Qwen Image pipelines providing shared CFG methods.
+    """
+
+    def diffuse(
         self,
-        ...
-        ):
-    # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-    cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds_mask: torch.Tensor,
+        latents: torch.Tensor,
+        img_shapes: torch.Tensor,
+        txt_seq_lens: torch.Tensor,
+        negative_txt_seq_lens: torch.Tensor,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        guidance: torch.Tensor,
+        true_cfg_scale: float,
+        image_latents: torch.Tensor | None = None,
+        cfg_normalize: bool = True,
+        additional_transformer_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        self.transformer.do_true_cfg = do_true_cfg
 
-    self.transformer.do_true_cfg = do_true_cfg
+        for i, t in enumerate(timesteps):
+            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
 
-    if cfg_parallel_ready:
-        cfg_group = get_cfg_group()
-        cfg_rank = get_classifier_free_guidance_rank()
+            # Prepare kwargs for positive (conditional) prediction
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states_mask": prompt_embeds_mask,
+                "encoder_hidden_states": prompt_embeds,
+                "img_shapes": img_shapes,
+                "txt_seq_lens": txt_seq_lens,
+            }
 
-        if cfg_rank == 0:
-            local_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-        else:
-            local_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                encoder_hidden_states=negative_prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=negative_txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
+            # Prepare kwargs for negative (unconditional) prediction
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "encoder_hidden_states_mask": negative_prompt_embeds_mask,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "img_shapes": img_shapes,
+                    "txt_seq_lens": negative_txt_seq_lens,
+                }
+            else:
+                negative_kwargs = None
 
-        gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
-        if cfg_rank == 0:
-            noise_pred = gathered[0]
-            neg_noise_pred = gathered[1]
-            comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        cfg_group.broadcast(latents, src=0)
-    else:
-        # fallback: run positive then negative sequentially on one rank
-        ...
+            # Predict noise with automatic CFG parallel handling
+            # - In CFG parallel mode: rank0 computes positive, rank1 computes negative
+            # - Automatically gathers results and combines them on rank0
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=true_cfg_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=cfg_normalize,
+            )
+
+            # Step scheduler with automatic CFG synchronization
+            # - Only rank0 computes the scheduler step
+            # - Automatically broadcasts updated latents to all ranks
+            latents = self.scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg
+            )
+
+        return latents
+```
+
+**How it works:**
+1. Prepare separate `positive_kwargs` and `negative_kwargs` for conditional and unconditional predictions
+2. Call `predict_noise_maybe_with_cfg()` which:
+   - Detects if CFG parallel is enabled (`get_classifier_free_guidance_world_size() > 1`)
+   - Distributes computation: rank0 processes positive, rank1 processes negative
+   - Gathers predictions and combines them using `combine_cfg_noise()` on rank0
+   - Returns combined noise prediction (only valid on rank0)
+3. Call `scheduler_step_maybe_with_cfg()` which:
+   - Only rank0 computes the scheduler step
+   - Broadcasts the updated latents to all ranks for synchronization
+
+**How to customize**
+
+Some pipelines may need to customize the following functions in `CFGParallelMixin`:
+1. You may need to edit `predict_noise` function for custom behaviors.
+```python
+def predict_noise(self, *args, **kwargs):
+    """
+    Forward pass through transformer to predict noise.
+
+    Subclasses should override this if they need custom behavior,
+    but the default implementation calls self.transformer.
+    """
+    return self.transformer(*args, **kwargs)[0]
+
+```
+2. The default normalization function after combining the noise predictions from both branches is as follows. You may need to customize it.
+```python
+def cfg_normalize_function(self, noise_pred, comb_pred):
+    """
+    Normalize the combined noise prediction.
+
+    Args:
+        noise_pred: positive noise prediction
+        comb_pred: combined noise prediction after CFG
+
+    Returns:
+        Normalized noise prediction tensor
+    """
+    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+    noise_pred = comb_pred * (cond_norm / noise_norm)
+    return noise_pred
 ```

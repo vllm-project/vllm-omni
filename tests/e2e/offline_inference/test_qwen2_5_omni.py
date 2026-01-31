@@ -13,7 +13,7 @@ from vllm.assets.video import VideoAsset
 from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.multimodal.image import convert_image_mode
 
-from vllm_omni.utils import is_npu, is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 from .conftest import OmniRunner
 from .utils import create_new_process_for_each_test
@@ -21,9 +21,9 @@ from .utils import create_new_process_for_each_test
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
 # CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
-if is_npu():
+if current_omni_platform.is_npu():
     stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
-elif is_rocm():
+elif current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_config = str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
 else:
@@ -35,7 +35,7 @@ test_params = [(model, stage_config) for model in models]
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("test_config", test_params)
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     model, stage_config_path = test_config
@@ -95,7 +95,7 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
 
 @pytest.mark.core_model
 @pytest.mark.parametrize("test_config", test_params)
-@create_new_process_for_each_test()
+@create_new_process_for_each_test("spawn")
 def test_mixed_modalities_to_text_only(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     model, stage_config_path = test_config

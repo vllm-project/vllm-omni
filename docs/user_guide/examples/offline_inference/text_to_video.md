@@ -28,6 +28,7 @@ Key arguments:
 - `--num_frames`: Number of frames (Wan default is 81).
 - `--guidance_scale` and `--guidance_scale_high`: CFG scale (applied to low/high)..
 - `--negative_prompt`: optional list of artifacts to suppress (the PR demo used a long Chinese string).
+- `--cfg_parallel_size`: the number of devices to run CFG Parallel. CFG Parallel is valid only if classifier-free guidance is enabled and `cfg_parallel_size` is set to 2.
 - `--boundary_ratio`: Boundary split ratio for low/high DiT.
 - `--fps`: frames per second for the saved MP4 (requires `diffusers` export_to_video).
 - `--output`: path to save the generated video.

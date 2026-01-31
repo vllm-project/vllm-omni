@@ -90,6 +90,7 @@ plugins:
       api_root_uri: "api"
       nav_item_prefix: ""  # No prefix in navigation tree (clean names)
       show_full_namespace: false  # Show only module name, not full path
+      on_implicit_namespace_package: skip  # Skip directories without __init__.py (e.g., assets)
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
         - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building

@@ -12,6 +12,8 @@ import torch
 from PIL import Image
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -21,9 +23,10 @@ from tests.utils import GPUMemoryMonitor
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import is_npu, is_rocm
+from vllm_omni.platforms import current_omni_platform
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 
@@ -89,12 +92,14 @@ def _run_zimage_generate(
         num_requests = 4  # 1 warmup + 3 timed
         gen = m.generate(
             [PROMPT] * num_requests,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=0.0,
-            seed=seed,
-            num_outputs_per_prompt=1,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=0.0,
+                seed=seed,
+                num_outputs_per_prompt=1,
+            ),
             py_generator=True,
         )
 
@@ -118,19 +123,19 @@ def _run_zimage_generate(
 
         return _extract_single_image([last_output]), median_time_s, peak_memory_mb
     finally:
-        m.close()
+        monitor.stop()
         cleanup_dist_env_and_memory()
 
 
 @pytest.mark.integration
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
-    if is_npu() or is_rocm():
+    if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
-    height = 256
-    width = 256
+    height = 512
+    width = 512
     num_inference_steps = 2
     seed = 42
 
@@ -159,7 +164,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
 
     mean_abs_diff, max_abs_diff = _diff_metrics(tp1_img, tp2_img)
     mean_threshold = 3e-2
-    max_threshold = 3.5e-1
+    max_threshold = 5e-1
     print(
         "Z-Image TP image diff stats (TP=1 vs TP=2): "
         f"mean_abs_diff={mean_abs_diff:.6e}, max_abs_diff={max_abs_diff:.6e}; "

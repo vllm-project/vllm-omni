@@ -27,20 +27,126 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.attention.selector import _BACKENDS_SUPPORT_ATTENTION_MASK, get_attn_backend
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_ring_parallel_world_size,
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    get_sp_group,
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+class ImageRopePrepare(nn.Module):
+    """Prepares image hidden_states and RoPE embeddings for sequence parallel.
+
+    This module encapsulates the input linear projection and RoPE computation.
+    Similar to Z-Image's UnifiedPrepare, this creates a module boundary where
+    _sp_plan can shard outputs via split_output=True.
+
+    The key insight is that hidden_states and vid_freqs must be sharded together
+    to maintain dimension alignment for RoPE computation in attention layers.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
+    """
+
+    def __init__(self, img_in: nn.Linear, pos_embed: nn.Module):
+        super().__init__()
+        self.img_in = img_in
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        img_shapes: list[tuple[int, int, int]],
+        txt_seq_lens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare hidden_states and RoPE for SP.
+
+        Args:
+            hidden_states: [batch, img_seq_len, channels]
+            img_shapes: List of (frame, height, width) tuples
+            txt_seq_lens: List of text sequence lengths
+
+        Returns:
+            hidden_states: Processed hidden states [batch, img_seq_len, dim]
+            vid_freqs: Image RoPE frequencies [img_seq_len, rope_dim]
+            txt_freqs: Text RoPE frequencies [txt_seq_len, rope_dim]
+
+        Note: _sp_plan will shard hidden_states and vid_freqs via split_output=True
+              txt_freqs is kept replicated for dual-stream attention
+        """
+        # Apply input projection
+        hidden_states = self.img_in(hidden_states)
+
+        # Compute RoPE embeddings
+        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        vid_freqs, txt_freqs = image_rotary_emb
+
+        return hidden_states, vid_freqs, txt_freqs
+
+
+class ModulateIndexPrepare(nn.Module):
+    """Prepares modulate_index for sequence parallel when zero_cond_t is enabled.
+
+    This module encapsulates the creation of modulate_index tensor, which is used
+    to select different conditioning parameters (shift/scale/gate) for different
+    token positions in image editing tasks.
+
+    Similar to Z-Image's UnifiedPrepare and ImageRopePrepare, this creates a module
+    boundary where _sp_plan can shard the output via split_output=True.
+
+    The modulate_index must be sharded along the sequence dimension to match the
+    sharded hidden_states in SP mode.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
+    """
+
+    def __init__(self, zero_cond_t: bool = False):
+        super().__init__()
+        self.zero_cond_t = zero_cond_t
+
+    def forward(
+        self,
+        timestep: torch.Tensor,
+        img_shapes: list[list[tuple[int, int, int]]],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Prepare timestep and modulate_index for SP.
+
+        Args:
+            timestep: Timestep tensor [batch]
+            img_shapes: List of image shape tuples per batch item.
+                Each item is a list of (frame, height, width) tuples.
+                For edit models: [[source_shape], [target_shape1, target_shape2, ...]]
+
+        Returns:
+            timestep: Doubled timestep if zero_cond_t, else original [batch] or [2*batch]
+            modulate_index: Token condition index [batch, seq_len] if zero_cond_t, else None
+                - index=0: source image tokens (use normal timestep conditioning)
+                - index=1: target image tokens (use zero timestep conditioning)
+
+        Note: _sp_plan will shard modulate_index via split_output=True when SP is enabled.
+              The modulate_index sequence dimension must match hidden_states after sharding.
+        """
+        if self.zero_cond_t:
+            # Double the timestep: [timestep, timestep * 0]
+            # This creates two sets of conditioning parameters in AdaLayerNorm
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+
+            # Create modulate_index to select conditioning per token position
+            # - First image (sample[0]): source image, use index=0 (normal timestep)
+            # - Remaining images (sample[1:]): target images, use index=1 (zero timestep)
+            modulate_index = torch.tensor(
+                [[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in img_shapes],
+                device=timestep.device,
+                dtype=torch.int,
+            )
+            return timestep, modulate_index
+
+        return timestep, None
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -436,11 +542,6 @@ class QwenImageCrossAttention(nn.Module):
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states_mask is not None and hidden_states_mask.all():
-            hidden_states_mask = None
-        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
-            encoder_hidden_states_mask = None
-
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -717,6 +818,42 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["QwenImageTransformerBlock"]
+    _layerwise_offload_blocks_attr = "transformer_blocks"
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
+
+    # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
+    # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
+    # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.
+    #
+    # Key insight: hidden_states and vid_freqs MUST be sharded together to maintain
+    # dimension alignment for RoPE computation in attention layers.
+    #
+    # auto_pad=True enables automatic padding when sequence length is not divisible
+    # by SP world size. This creates an attention mask stored in ForwardContext
+    # that attention layers can use to ignore padding positions.
+    #
+    # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
+    _sp_plan = {
+        # Shard ImageRopePrepare outputs (hidden_states and vid_freqs must be sharded together)
+        "image_rope_prepare": {
+            # hidden_states: auto_pad=True for variable sequence length support
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            # vid_freqs: auto_pad=True to match hidden_states padding
+            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+            # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
+        },
+        # Shard ModulateIndexPrepare output (modulate_index must be sharded to match hidden_states)
+        # This is only active when zero_cond_t=True (image editing models)
+        # Output index 1 is modulate_index [batch, seq_len], needs sharding along dim=1
+        "modulate_index_prepare": {
+            1: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
+        },
+        # Gather output at proj_out
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -773,6 +910,15 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
 
+        # ImageRopePrepare module for _sp_plan to shard hidden_states and vid_freqs together
+        # This ensures RoPE dimensions align with hidden_states after sharding
+        self.image_rope_prepare = ImageRopePrepare(self.img_in, self.pos_embed)
+
+        # ModulateIndexPrepare module for _sp_plan to shard modulate_index
+        # This ensures modulate_index dimensions align with hidden_states after sharding
+        # Only active when zero_cond_t=True (image editing models)
+        self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -816,62 +962,25 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # else:
         #     lora_scale = 1.0
 
-        original_seq_len = None
-        seq_padding = 0
-        hidden_states_mask = None
-
+        # Set split_text_embed_in_sp = False for dual-stream attention
+        # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
+        # Text embeddings must be replicated across SP ranks for correctness.
         if self.parallel_config.sequence_parallel_size > 1:
-            batch_size, seq_len, channels = hidden_states.shape
-            sp_size = get_sequence_parallel_world_size()
-
-            if seq_len % sp_size != 0:
-                #  ring_attn, sage_attn do not support attention_mask
-                if get_attn_backend(-1).get_name() not in _BACKENDS_SUPPORT_ATTENTION_MASK:
-                    raise ValueError(
-                        f"When generating image shape that the sequence length is NOT divisible by sp_size={sp_size},"
-                        f"cannot use {get_attn_backend(-1).get_name()} which does not support attention_mask."
-                        f"Please switch to SDPA or Ascend attention backend."
-                    )
-                # ring attention does not support attention_mask
-                if get_ring_parallel_world_size() > 1:
-                    raise ValueError(
-                        f"When generating image shape that the sequence length is NOT divisible by sp_size={sp_size},"
-                        f"cannot use ring attention which does not support attention_mask."
-                        f"Please switch to Ulysses SP only."
-                    )
-
-                seq_padding = sp_size - (seq_len % sp_size)
-                original_seq_len = seq_len
-
-                hidden_states_mask = torch.ones(
-                    batch_size, seq_len + seq_padding, dtype=torch.bool, device=hidden_states.device
-                )
-                hidden_states_mask[:, seq_len:] = False
-                padding_tensor = torch.zeros(
-                    batch_size, seq_padding, channels, dtype=hidden_states.dtype, device=hidden_states.device
-                )
-                hidden_states = torch.cat([hidden_states, padding_tensor], dim=1)
-
-            hidden_states = torch.chunk(hidden_states, sp_size, dim=-2)[get_sequence_parallel_rank()]
-            # NOTE:
-            # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
-            # text embeddings to be replicated across SP ranks for correctness.
             get_forward_context().split_text_embed_in_sp = False
 
-        hidden_states = self.img_in(hidden_states)
+        # Prepare hidden_states and RoPE via ImageRopePrepare module
+        # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
+        # txt_freqs is kept replicated for dual-stream attention
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+        image_rotary_emb = (vid_freqs, txt_freqs)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
-        if self.zero_cond_t:
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
-            modulate_index = torch.tensor(
-                [[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in img_shapes],
-                device=timestep.device,
-                dtype=torch.int,
-            )
-        else:
-            modulate_index = None
+        # Prepare timestep and modulate_index via ModulateIndexPrepare module
+        # _sp_plan will shard modulate_index via split_output=True (when zero_cond_t=True)
+        # This ensures modulate_index sequence dimension matches sharded hidden_states
+        timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -885,22 +994,29 @@ class QwenImageTransformer2DModel(CachedTransformer):
             else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
         )
 
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        # Check for SP auto_pad: create attention mask dynamically if padding was applied
+        # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
+        hidden_states_mask = None  # default
+        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                # Create mask for the full (padded) sequence
+                # valid positions = True, padding positions = False
+                batch_size = hidden_states.shape[0]
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    batch_size,
+                    padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
 
-        def get_rotary_emb_chunk(freqs, padding=0):
-            # Pad rotary embeddings if needed
-            if padding > 0:
-                padding_tensor = torch.zeros(padding, freqs.shape[-1], dtype=freqs.dtype, device=freqs.device)
-                freqs = torch.cat([freqs, padding_tensor], dim=0)
-            freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[get_sequence_parallel_rank()]
-            return freqs
-
-        if self.parallel_config.sequence_parallel_size > 1:
-            img_freqs, txt_freqs = image_rotary_emb
-            img_freqs = get_rotary_emb_chunk(img_freqs, seq_padding)
-            if get_forward_context().split_text_embed_in_sp:
-                txt_freqs = get_rotary_emb_chunk(txt_freqs)
-            image_rotary_emb = (img_freqs, txt_freqs)
+        # if mask is all true, set it to None
+        if hidden_states_mask is not None and hidden_states_mask.all():
+            hidden_states_mask = None
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -920,14 +1036,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
-        if self.parallel_config.sequence_parallel_size > 1:
-            output = get_sp_group().all_gather(output, dim=-2)
-
-            # Remove padding if it was added
-            if original_seq_len is not None:
-                output = output[:, :original_seq_len, :]
-
-        torch.cuda.empty_cache()
+        # Note: SP gather is handled automatically by _sp_plan's SequenceParallelGatherHook
+        # on proj_out output. No manual all_gather needed here.
 
         return Transformer2DModelOutput(sample=output)
 

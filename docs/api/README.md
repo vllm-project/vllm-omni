@@ -36,7 +36,6 @@ Input data structures for multi-modal inputs.
 
 Engine classes for offline and online inference.
 
-- [vllm_omni.diffusion.diffusion_engine.BackgroundResources][]
 - [vllm_omni.diffusion.diffusion_engine.DiffusionEngine][]
 - [vllm_omni.engine.AdditionalInformationEntry][]
 - [vllm_omni.engine.AdditionalInformationPayload][]
@@ -54,41 +53,16 @@ Engine classes for offline and online inference.
 
 Core scheduling and caching components.
 
+- [vllm_omni.core.sched.omni_ar_scheduler.KVCacheTransferData][]
 - [vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler][]
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
+- [vllm_omni.core.sched.output.OmniCachedRequestData][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
-
-## Model Executor
-
-Model execution components.
-
-- [vllm_omni.model_executor.custom_process_mixin.CustomProcessMixin][]
-- [vllm_omni.model_executor.models.output_templates.OmniOutput][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni.Qwen2_5OmniForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_talker.Qwen2_5OmniTalkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniConditionalGenerationMixin][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.Qwen2_5OmniThinkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavBigVGANModel][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavDiTModel][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavForConditionalGenerationVLLM][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav.Qwen2_5OmniToken2WavModel][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_old.Qwen2EmbeddingModel][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_old.Qwen2ForCausalLM][]
-- [vllm_omni.model_executor.models.qwen2_5_omni.qwen2_old.Qwen2Model][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_moe.Qwen3MoeForCausalLM][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni.Qwen3OmniMoeForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav.Qwen3OmniMoeCode2Wav][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp.Qwen3OmniCodePredictorBaseModel][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp.Qwen3OmniMoeTalkerCodePredictor][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker.Qwen3OmniMoeModel][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker.Qwen3OmniMoeTalkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_talker.Qwen3OmniMoeTalkerSharedExpertWrapper][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3MoeLLMForCausalLM][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3MoeLLMModel][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeConditionalGenerationMixin][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerForConditionalGeneration][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerMultiModalProcessor][]
-- [vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker.Qwen3OmniMoeThinkerProcessingInfo][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedGroupResidualVectorQuantization][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedResidualVectorQuantization][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.EuclideanCodebook][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.VectorQuantization][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.preprocess][]
 
 ## Configuration
 
@@ -98,6 +72,17 @@ Configuration classes.
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSSpeakerEncoderConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerCodePredictorConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2Config][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2.Qwen3TTSTokenizerV2DecoderConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1Config][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderBigVGANConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
+- [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
 
 ## Workers
 
