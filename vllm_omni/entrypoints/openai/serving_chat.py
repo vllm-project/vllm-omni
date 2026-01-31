@@ -286,8 +286,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 generators.append(generator)
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert len(generators) == 1
         (result_generator,) = generators
@@ -315,8 +314,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
             )
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def _preprocess_chat(
         self,
@@ -1285,9 +1283,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
 
         except Exception as e:
-            # TODO: Use a vllm-specific Validation Error
             logger.exception("Error in chat completion stream generator.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
@@ -1312,8 +1309,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert final_outputs is not None
 
