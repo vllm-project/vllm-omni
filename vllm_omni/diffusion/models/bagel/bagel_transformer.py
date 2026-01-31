@@ -1076,12 +1076,14 @@ class Bagel(torch.nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         num_timesteps: int = 24,
         timestep_shift: float = 1.0,
+        guidance_scale: float = 1.0,
     ):
         model_pred_cache_dic, model_pred_current = None, None
         model_pred_text_cache_dic, model_pred_text_current = None, None
         model_pred_img_cache_dic, model_pred_img_current = None, None
 
         x_t = packed_init_noises
+        do_classifier_free_guidance = guidance_scale > 1.0
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
@@ -1112,9 +1114,29 @@ class Bagel(torch.nn.Module):
                 model_pred_img_current=model_pred_img_current,
             )
 
+            if do_classifier_free_guidance:
+                # Batch Parallel CFG:
+                # Input batch is [Cond, Uncond] (concatenated in packed dim 0)
+                # v_t shape: [Total_Tokens, Hidden]
+                # We assume the batch is perfectly split in half.
+                
+                # NOTE: v_t is flattened packed tensor. We need to split it carefully.
+                # Since packed_seqlens has 2 elements, we can use chunk(2) IF the image tokens are equal length.
+                # In Bagel pipeline, we duplicated the input, so they should be equal length.
+                v_cond, v_uncond = v_t.chunk(2, dim=0)
+                v_pred = v_uncond + guidance_scale * (v_cond - v_uncond)
+                
+                # Re-construct the full batch to maintain consistency for next step
+                v_t = torch.cat([v_pred, v_pred], dim=0)
+
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+        
+        if do_classifier_free_guidance:
+             # Return only the Conditional branch result (first half)
+             unpacked_latent = unpacked_latent[:len(unpacked_latent)//2]
+             
         return unpacked_latent
 
     def _forward_flow(

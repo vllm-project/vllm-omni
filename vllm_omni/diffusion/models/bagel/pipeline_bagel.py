@@ -38,6 +38,7 @@ logger = init_logger(__name__)
 class BagelGenParams:
     num_timesteps: int = 50
     timestep_shift: float = 1.0
+    guidance_scale: float = 1.0
 
 
 def add_special_tokens(tokenizer):
@@ -297,14 +298,27 @@ class BagelPipeline(nn.Module):
         image_shape = (height, width)
 
         # Map request params to Bagel gen params (defaults follow Bagel inferencer)
+        guidance_scale = req.sampling_params.guidance_scale or 1.0
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        prompts = [prompt]
+        if do_classifier_free_guidance:
+            neg_prompt = None
+            if isinstance(first_prompt, str):
+                 neg_prompt = req.sampling_params.negative_prompt
+            else:
+                 neg_prompt = first_prompt.get("negative_prompt")
+            prompts.append(neg_prompt or "")
+
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
+            guidance_scale=guidance_scale,
         )
 
         gen_context = {
-            "kv_lens": [0],
-            "ropes": [0],
+            "kv_lens": [0] * len(prompts),
+            "ropes": [0] * len(prompts),
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
 
@@ -318,8 +332,8 @@ class BagelPipeline(nn.Module):
             # User requested: kv_lens and ropes set to [gen_context["past_key_values"].key_cache[0].shape[0]]
             # Assuming injected_kv is compatible and has key_cache[0]
             seq_len = injected_kv.key_cache[0].shape[0]
-            gen_context["kv_lens"] = [seq_len]
-            gen_context["ropes"] = [seq_len]
+            gen_context["kv_lens"] = [seq_len] * len(prompts)
+            gen_context["ropes"] = [seq_len] * len(prompts)
 
         else:
             image_input = (
@@ -329,6 +343,9 @@ class BagelPipeline(nn.Module):
                 image_input = [image_input]
             if image_input:
                 image_input = [Image.open(image) if isinstance(image, str) else image for image in image_input]
+            
+            if image_input and do_classifier_free_guidance:
+                image_input = image_input * len(prompts)
 
             if image_input:
                 # If we have an image, we prefill with it
@@ -396,7 +413,7 @@ class BagelPipeline(nn.Module):
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
-                prompts=[prompt],
+                prompts=prompts,
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
@@ -433,9 +450,15 @@ class BagelPipeline(nn.Module):
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
-            image_sizes=[image_shape],
+            image_sizes=[image_shape] * len(prompts),
             new_token_ids=self.new_token_ids,
         )
+        
+        if do_classifier_free_guidance:
+            packed_init_noises = generation_input["packed_init_noises"]
+            half = packed_init_noises.shape[0] // 2
+            packed_init_noises[half:] = packed_init_noises[:half]
+            generation_input["packed_init_noises"] = packed_init_noises
         # Fail fast for special tokens used by the image path as well.
         max_tid_img = int(generation_input["packed_text_ids"].max().item())
         emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
@@ -471,6 +494,7 @@ class BagelPipeline(nn.Module):
                 past_key_values=gen_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
+                guidance_scale=gen_params.guidance_scale,
                 **generation_input,
             )
 
