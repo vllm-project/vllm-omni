@@ -157,6 +157,7 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "--cov=vllm_omni",
+    "--cov-branch",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
