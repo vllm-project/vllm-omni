@@ -10,25 +10,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 
-# Import flash attention functions with fallback chain from utils/fa.py
-# FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn)
-from vllm_omni.diffusion.attention.backends.utils.fa import (
-    HAS_FLASH_ATTN,
-    _pad_input,
-    _unpad_input,
-    _upad_input,
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
-
 logger = init_logger(__name__)
-
-if not HAS_FLASH_ATTN:
-    raise ImportError(
-        "FlashAttentionBackend requires Flash Attention. "
-        "Please install one of: fa3-fwd, flash-attention, or flash-attn. "
-        "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-    )
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -74,6 +56,24 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """CUDA/ROCm flash attention implementation."""
+        # Import flash attention functions with fallback chain from utils/fa.py
+        # FA3 (fa3_fwd_interface) -> FA3 (flash_attn_interface) -> FA2 (flash_attn)
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            HAS_FLASH_ATTN,
+            _pad_input,
+            _unpad_input,
+            _upad_input,
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+
+        if not HAS_FLASH_ATTN:
+            raise ImportError(
+                "FlashAttentionBackend requires Flash Attention. "
+                "Please install one of: fa3-fwd, flash-attention, or flash-attn. "
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+
         query_length = query.size(1)
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         #  Contains at least one padding token in the sequence
@@ -122,7 +122,15 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
-        from mindiesd import attention_forward
+        try:
+            from mindiesd import attention_forward
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
         output = attention_forward(
