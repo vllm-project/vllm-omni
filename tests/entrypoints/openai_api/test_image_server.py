@@ -9,6 +9,7 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 
 import base64
 import io
+from argparse import Namespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -115,9 +116,11 @@ class FakeAsyncOmni:
         self.stage_list = ["llm", "diffusion"]
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
+        self.captured_prompt = None
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_sampling_params_list = sampling_params_list
+        self.captured_prompt = prompt
         images = [Image.new("RGB", (64, 64), color="green")]
         yield MockGenerationResult(images)
 
@@ -133,6 +136,8 @@ def mock_async_diffusion():
         # Return n PIL images wrapped in result object
         print("!!!!!!!!!!!!!!!!!!!!! kwargs", kwargs)
         n = kwargs["sampling_params_list"][0].num_outputs_per_prompt
+        mock.captured_sampling_params_list = kwargs["sampling_params_list"]
+        mock.captured_prompt = kwargs["prompt"]
         images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
         return MockGenerationResult(images)
 
@@ -155,6 +160,10 @@ def test_client(mock_async_diffusion):
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [{"stage_type": "diffusion"}]
     app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
+    app.state.args = Namespace(
+        default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        max_generated_image_size=4096,  # 64*64
+    )
 
     return TestClient(app)
 
@@ -171,7 +180,10 @@ def async_omni_test_client():
 
     app.state.engine_client = FakeAsyncOmni()
     app.state.stage_configs = [{"stage_type": "llm"}, {"stage_type": "diffusion"}]
-
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        max_generated_image_size=4096,  # 64*64
+    )
     return TestClient(app)
 
 
@@ -526,3 +538,279 @@ def test_model_field_omitted_works(test_client):
         },
     )
     assert response.status_code == 200
+
+
+def make_test_image_bytes(size=(64, 64)) -> bytes:
+    img = Image.new(
+        "RGB",
+        size,
+    )
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_image_edit_images_processing(async_omni_test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+    img_bytes_2 = make_test_image_bytes((32, 32))
+
+    # uploadfile with image key
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", img_bytes_1),
+            ("image", img_bytes_2),
+        ],
+        data={"prompt": "hello world."},
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    processed_images = captured_prompt["multi_modal_data"]["image"]
+    assert len(processed_images) == 2
+    assert isinstance(processed_images[0], Image.Image)
+    assert isinstance(processed_images[1], Image.Image)
+    assert processed_images[0].size == (16, 16)
+    assert processed_images[1].size == (32, 32)
+
+    # uploadfile with image[] key
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image[]", img_bytes_2),
+            ("image[]", img_bytes_1),
+        ],
+        data={"prompt": "hello world."},
+    )
+
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    processed_images = captured_prompt["multi_modal_data"]["image"]
+    assert len(processed_images) == 2
+    assert isinstance(processed_images[0], Image.Image)
+    assert isinstance(processed_images[1], Image.Image)
+    assert processed_images[0].size == (32, 32)
+    assert processed_images[1].size == (16, 16)
+
+    # base64 url
+    buf1 = io.BytesIO()
+    img1 = Image.new("RGB", (16, 16))
+    img1.save(buf1, format="PNG")
+    b64_1 = "data:image/png;base64," + base64.b64encode(buf1.getvalue()).decode()
+
+    buf2 = io.BytesIO()
+    img2 = Image.new("RGB", (24, 24))
+    img2.save(buf2, format="PNG")
+    b64_2 = "data:image/png;base64," + base64.b64encode(buf2.getvalue()).decode()
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "hello from base64",
+            "url": [b64_1, b64_2],
+        },
+    )
+    assert response.status_code == 200
+    processed_images = engine.captured_prompt["multi_modal_data"]["image"]
+    assert len(processed_images) == 2
+    assert isinstance(processed_images[0], Image.Image)
+    assert isinstance(processed_images[1], Image.Image)
+    assert processed_images[0].size == (16, 16)
+    assert processed_images[1].size == (24, 24)
+
+
+def test_image_edit_parameter_pass(async_omni_test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+
+    # uploadfile with image key
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "size": "16x24",
+            "output_format": "jpeg",
+            "num_inference_steps": 20,
+            "guidance_scale": 8.0,
+            "seed": 1234,
+            "negative_prompt": "negative",
+            "n": 2,
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+
+    assert captured_prompt["prompt"] == "hello world."
+    assert captured_prompt["negative_prompt"] == "negative"
+    assert captured_sampling_params.num_inference_steps == 20
+    assert captured_sampling_params.guidance_scale == 8.0
+    assert captured_sampling_params.seed == 1234
+    assert captured_sampling_params.num_outputs_per_prompt == 2
+    assert captured_sampling_params.width == 16
+    assert captured_sampling_params.height == 24
+
+    data = response.json()
+    # All images should be valid
+    for img_data in data["data"]:
+        assert "b64_json" in img_data
+        img_bytes = base64.b64decode(img_data["b64_json"])
+        img = Image.open(io.BytesIO(img_bytes))
+        assert img.format.lower() == "jpeg"
+        assert data["output_format"] == "jpeg"
+        assert data["size"] == "16x24"
+
+
+def test_image_edit_parameter_default(async_omni_test_client):
+    img_bytes_1 = make_test_image_bytes((24, 16))
+
+    # uploadfile with image key
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "size": "auto",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+
+    assert captured_sampling_params.width == 24
+    assert captured_sampling_params.height == 16
+    assert captured_sampling_params.num_outputs_per_prompt == 1
+    assert captured_sampling_params.num_inference_steps == 4
+    assert captured_sampling_params.guidance_scale == 7.5
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "size": "96x96",
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_image_edit_parameter_default_single_stage(test_client):
+    img_bytes_1 = make_test_image_bytes((24, 16))
+
+    # uploadfile with image key
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+        },
+    )
+    assert response.status_code == 200
+    engine = test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[0]
+
+    assert captured_sampling_params.width == 24
+    assert captured_sampling_params.height == 16
+    assert captured_sampling_params.num_outputs_per_prompt == 1
+    assert captured_sampling_params.num_inference_steps == 4
+    assert captured_sampling_params.guidance_scale == 7.5
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "size": "96x96",
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_image_edit_compression_jpeg(test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+    # uploadfile with image key
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={"prompt": "hello world.", "output_format": "jpeg", "output_compression": 100},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    img_bytes_100 = base64.b64decode(data["data"][0]["b64_json"])
+    img = Image.open(io.BytesIO(img_bytes_100))
+    assert img.format.lower() == "jpeg"
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "output_format": "jpeg",
+            "output_compression": 50,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    img_bytes_50 = base64.b64decode(data["data"][0]["b64_json"])
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "output_format": "jpeg",
+            "output_compression": 10,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    img_bytes_10 = base64.b64decode(data["data"][0]["b64_json"])
+
+    assert len(img_bytes_10) < len(img_bytes_50)
+    assert len(img_bytes_50) < len(img_bytes_100)
+
+
+def test_image_edit_compression_png(async_omni_test_client):
+    img_bytes_1 = make_test_image_bytes((16, 16))
+    # uploadfile with image key
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={"prompt": "hello world.", "output_format": "PNG", "output_compression": 100},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    img_bytes_100 = base64.b64decode(data["data"][0]["b64_json"])
+    img = Image.open(io.BytesIO(img_bytes_100))
+    assert img.format.lower() == "png"
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "output_format": "PNG",
+            "output_compression": 50,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    img_bytes_50 = base64.b64decode(data["data"][0]["b64_json"])
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "hello world.",
+            "output_format": "PNG",
+            "output_compression": 10,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    img_bytes_10 = base64.b64decode(data["data"][0]["b64_json"])
+
+    assert len(img_bytes_10) < len(img_bytes_50)
+    assert len(img_bytes_50) < len(img_bytes_100)
