@@ -1,4 +1,5 @@
-# Stage 0: Thinker (multimodal understanding + text generation)
+# stage config for running BAGEL with SharedMemory connector for CI e2e tests.
+# This config is optimized for single GPU tests with SharedMemory inter-stage communication.
 
 stage_args:
   - stage_id: 0
@@ -11,7 +12,7 @@ stage_args:
       model_arch: BagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.35
+      gpu_memory_utilization: 0.65
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
@@ -34,9 +35,6 @@ stage_args:
       seed: 52
       detokenize: True
       repetition_penalty: 1.05
-    output_connectors:
-      to_stage_1: mooncake_connector
-
 
   - stage_id: 1
     stage_type: diffusion
@@ -45,7 +43,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      gpu_memory_utilization: 0.55
+      gpu_memory_utilization: 0.4
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: image
@@ -62,9 +60,6 @@ stage_args:
     is_comprehension: false
     default_sampling_params:
       seed: 52
-    input_connectors:
-      from_stage_0: mooncake_connector
-
 
 # Runtime edges
 runtime:
@@ -76,16 +71,10 @@ runtime:
   # Distributed connectors configuration (optional)
   # More connectors will be supported in the future.
   connectors:
-    # Mooncake connector for cross-node/intra-node communication
-    mooncake_connector:
-      name: MooncakeConnector
+    shared_memory_connector:
+      name: SharedMemoryConnector
       extra:
-        host: "127.0.0.1"
-        metadata_server: "http://10.90.67.86:8080/metadata"
-        master: "10.90.67.86:50051"
-        segment: 512000000    # 512MB
-        localbuf: 64000000     # 64MB
-        proto: "tcp"
+        shm_threshold_bytes: 65536 # 64KB threshold
 
 
   edges:
