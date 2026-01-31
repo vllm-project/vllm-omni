@@ -75,6 +75,9 @@ curl -X POST http://localhost:8000/v1/audio/speech \
         "voice": "Vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
+
+# List available voices in CustomVoice models
+curl http://localhost:8000/v1/audio/voices
 ```
 
 ## API Reference
