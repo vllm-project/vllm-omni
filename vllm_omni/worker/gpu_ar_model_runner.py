@@ -121,6 +121,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+            self._sync_additional_information_with_worker(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -507,9 +508,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 dtype=np.int32,
             )
 
-        self._process_additional_information_updates(
-            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
-        )
+        self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
 
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:

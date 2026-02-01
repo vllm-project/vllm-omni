@@ -1,5 +1,4 @@
 import warnings
-from dataclasses import field
 from typing import Any
 
 import torch
@@ -40,7 +39,7 @@ class OmniModelConfig(ModelConfig):
 
     Attributes:
         stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
-        async_chunk: If set to True, perform async chunk
+        async_chunk_stream: If set to True, perform async chunk transfer between stages
         model_stage: Stage type identifier, e.g., "thinker" or "talker"
             (default: "thinker")
         model_arch: Model architecture name
@@ -48,8 +47,6 @@ class OmniModelConfig(ModelConfig):
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
             "audio", "latents"). If None, output type is inferred.
-        stage_connector_config: Stage connector configuration dictionary.
-            Contains "name" (connector name), "extra" (extra connector config).
 
     Example:
         >>> config = OmniModelConfig(
@@ -60,18 +57,12 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
-    async_chunk: bool = False
+    async_chunk_stream: bool = False
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: str | None = None
     hf_config_name: str | None = None
-    custom_process_next_stage_input_func: str | None = None
-    stage_connector_config: dict[str, Any] = field(
-        default_factory=lambda: {
-            "name": "SharedMemoryConnector",
-            "extra": {},
-        }
-    )
+    chunk_processor: str | None = None
     omni_kv_config: dict | None = None
 
     @property

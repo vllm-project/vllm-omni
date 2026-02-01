@@ -66,4 +66,4 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[int, list[int]]
+    prompt_token_ids: dict[str, list[int]]

@@ -222,7 +222,6 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     """
     payload = serialize_obj(obj)
     if len(payload) > threshold:
-        logger.debug(f"Dumping object to SHM with size: {len(payload)}")
         return True, shm_write_bytes(payload, name=None)
     return False, obj
 

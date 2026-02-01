@@ -671,11 +671,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # when handling audio/image responses
                 role = self.get_chat_request_role(request)
 
+                # Initialize role before conditional blocks to avoid UnboundLocalError
+                # when handling audio/image responses
+                role = self.get_chat_request_role(request)
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
                     num_cached_tokens = res.num_cached_tokens
+                    # Send first response for each choice with role
+                    # NOTE: num_choices defaults to 1 so this usually executes once per request
                     # Send first response for each choice with role
                     # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
@@ -1659,7 +1665,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         audio_data = final_res.multimodal_output.get("audio")
         if stream:
-            audio_tensor = audio_data[-1].float().detach().cpu().numpy()
+            if isinstance(final_res.multimodal_output["audio"], list):
+                audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+            else:
+                audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
         else:
             if isinstance(audio_data, list):
                 audio_data = torch.cat(audio_data, dim=-1)

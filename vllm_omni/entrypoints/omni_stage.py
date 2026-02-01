@@ -111,6 +111,7 @@ class OmniStage:
         self.requires_multimodal_data = getattr(stage_config.runtime, "requires_multimodal_data", False)
         self.engine_input_source = getattr(stage_config, "engine_input_source", [])
         self.engine_output_type = getattr(stage_config.engine_args, "engine_output_type", None)
+        self.async_chunk_stream = getattr(stage_config.engine_args, "async_chunk_stream", False)
         self.engine_outputs = None
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
@@ -677,15 +678,12 @@ def _stage_worker(
             e,
         )
     # Init engine based on stage_type
-    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
-    if engine_args.get("async_chunk", False):
-        logger.debug("[Stage-%s] Async chunk enabled, injecting connectors config", stage_id)
-        stage_connector_spec = {}
-        for v in connectors_config.values():
-            stage_connector_spec = dict(v.get("spec", {}))
-            break
-        engine_args["stage_connector_spec"] = stage_connector_spec
-        engine_args["stage_id"] = stage_id
+    logger.debug(
+        "[Stage-%s] Initializing %s engine with args keys=%s",
+        stage_id,
+        stage_type,
+        list(engine_args.keys()),
+    )
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage", None)
@@ -1217,8 +1215,8 @@ async def _stage_worker_async(
         stage_type,
         list(engine_args.keys()),
     )
-    if engine_args.get("async_chunk", False):
-        logger.debug("[Stage-%s] Async chunk enabled, injecting connectors config", stage_id)
+    if engine_args.get("async_chunk_stream", False):
+        logger.debug("[Stage-%s] async_chunk_stream enabled, injecting connectors config", stage_id)
         stage_connector_spec = {}
         for v in connectors_config.values():
             stage_connector_spec = dict(v.get("spec", {}))
@@ -1467,7 +1465,9 @@ async def _stage_worker_async(
             batch_request_ids, batch_request_outputs, _gen_ms_list, batch_metrics
         ):
             try:
-                r_outputs = [output_strip(output, omni_stage)]
+                # TODO: Bypassing stripping for now but I will fix it before merge
+                # r_outputs = [output_strip(output, omni_stage)]
+                r_outputs = [output]
                 use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
                 if use_shm:
                     out_q.put(

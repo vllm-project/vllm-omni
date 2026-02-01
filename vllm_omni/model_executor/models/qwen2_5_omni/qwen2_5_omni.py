@@ -71,6 +71,7 @@ class Qwen2_5OmniForConditionalGeneration(
         talker_config: Qwen2_5OmniTalkerConfig = config.talker_config
         self.talker_config = talker_config
 
+        self.async_chunk_stream = vllm_config.model_config.async_chunk_stream
         self.model_stage = vllm_config.model_config.model_stage
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing)
@@ -336,6 +337,9 @@ class Qwen2_5OmniForConditionalGeneration(
                     device=inputs_embeds.device,
                 )
             )
+
+            logger.info(f"code length: {len(code)}")
+            logger.info(f"code: {code}")
 
             code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
@@ -938,7 +942,7 @@ class Qwen2_5OmniForConditionalGeneration(
         # Prepare initial noise for the whole sequence
         y_all = torch.randn((1, total_mel, mel_dim), dtype=ref_mel.dtype, device=token2wav_dev)
 
-        logger.info(
+        logger.debug(
             "Currently, we do not use the chunked process, we only use the "
             "token2wav.process_chunk for the whole sequence. "
             "The stream mode will be implemented in the future."

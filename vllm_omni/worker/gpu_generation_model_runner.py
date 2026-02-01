@@ -7,14 +7,13 @@ This is a non-autoregressive model that doesn't require sampling or logits compu
 from __future__ import annotations
 
 import gc
-import logging
-from copy import copy
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -25,7 +24,6 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_run
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
-    EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
     IntermediateTensors,
     PerLayerAttnMetadata,
@@ -39,7 +37,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class GPUGenerationModelRunner(OmniGPUModelRunner):
@@ -50,16 +48,60 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     - Executes generation process and returns tensors via `pooler_output`.
     """
 
-    def _update_request_states(self, scheduler_output: SchedulerOutput):
+    def _make_empty_output(self) -> OmniModelRunnerOutput:
+        return OmniModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=None,
+            num_nans_in_logits={},
+            cudagraph_stats=None,
+            ec_connector_output=None,
+        )
+
+    def _update_request_states(self, scheduler_output: SchedulerOutput) -> None:
+        """Update cached states with scheduler output.
+
+        Extends the base implementation to handle updated prompt_token_ids
+        from chunk-updated requests. For generation models (like Code2Wav),
+        each chunk represents a fresh input that should replace the previous
+        prompt_token_ids entirely.
+        """
+        # Call the base implementation first
+        super()._update_states(scheduler_output)
+
+        # Check if the scheduler output contains updated prompt_token_ids
+        # (from OmniCachedRequestData)
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        for _, req_id in enumerate(cached_reqs.req_ids):
+        updated_prompt_token_ids = getattr(cached_reqs, "prompt_token_ids", {}) or {}
+        # Iterate ALL scheduled cached requests to ensure state consistency
+        for req_id in cached_reqs.req_ids:
             req_state = self.requests.get(req_id)
-            assert req_state is not None
-            req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
-            self.input_batch.remove_request(req_id)
-            # update the request state in self.input_batch
-            self.input_batch.add_request(req_state)
-            self._init_mrope_positions(req_state)
+            if req_state is None:
+                continue
+
+            # Check for updates
+            new_token_ids = updated_prompt_token_ids.get(req_id)
+            if new_token_ids is not None:
+                req_state.prompt_token_ids = new_token_ids
+
+                # Update the input_batch to reflect the new prompt tokens
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    num_new_tokens = len(new_token_ids)
+                    # Update token_ids_cpu
+                    self.input_batch.token_ids_cpu[req_index, :num_new_tokens] = new_token_ids
+                    self.input_batch.is_token_ids[req_index, :num_new_tokens] = True
+
+                    # Update length metadata
+                    self.input_batch.num_prompt_tokens[req_index] = num_new_tokens
+                    self.input_batch.num_tokens_no_spec[req_index] = num_new_tokens
+
+                    # Reset computed tokens to force prefill behavior for the new chunk
+                    self.input_batch.num_computed_tokens_cpu[req_index] = 0
 
     @torch.inference_mode()
     def execute_model(
@@ -85,11 +127,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            if self.model_config.async_chunk:
-                self._update_request_states(scheduler_output)
-            self._update_states(scheduler_output)
+            self._update_request_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self._make_empty_output()
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -113,7 +153,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
+                    return self._make_empty_output()
 
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
@@ -283,9 +323,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self._make_empty_output()
 
-            output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+            output = self._make_empty_output()
             output.kv_connector_output = kv_connector_output
             return output
 
@@ -321,11 +361,43 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
-            mm_payload = {}
-            for key, out in multimodal_outputs.items():
-                if out is not None and isinstance(out, torch.Tensor):
-                    mm_payload[key] = out.detach().to("cpu").contiguous()
-            pooler_output.append(mm_payload)
+            num_reqs = self.input_batch.num_reqs
+
+            # Pre-calculate token offsets for robust slicing of sequence outputs
+            req_ids = self.input_batch.req_ids
+            # Ensure we default to 0 if not found, though it should be there for scheduled requests
+            req_tokens = [scheduler_output.num_scheduled_tokens.get(rid, 0) for rid in req_ids]
+            token_offsets = [0]
+            current_offset = 0
+            for n in req_tokens:
+                current_offset += n
+                token_offsets.append(current_offset)
+            total_input_tokens = current_offset
+
+            for i in range(num_reqs):
+                mm_payload = {}
+                for key, out in multimodal_outputs.items():
+                    if out is not None and isinstance(out, torch.Tensor):
+                        if out.shape[0] == num_reqs:
+                            # Case 1: Batch-aligned (1:1 mapping, e.g. one image per request)
+                            mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                        elif total_input_tokens > 0 and out.shape[0] % total_input_tokens == 0:
+                            # Case 2: Sequence-aligned (scaled mapping, e.g. audio samples per token)
+                            ratio = out.shape[0] // total_input_tokens
+                            start = token_offsets[i] * ratio
+                            end = token_offsets[i + 1] * ratio
+                            mm_payload[key] = out[start:end].detach().to("cpu").contiguous()
+                        elif num_reqs == 1:
+                            # Case 3: Single request fallback (take everything)
+                            mm_payload[key] = out.detach().to("cpu").contiguous()
+                        else:
+                            # Case 4: Mismatch fallback
+                            raise RuntimeError(
+                                f"Multimodal output shape for key '{key}' does not match num_reqs ({num_reqs}) "
+                                f"or linear scaling of tokens ({total_input_tokens}). "
+                                "Cannot automatically slice"
+                            )
+                pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
         output = OmniModelRunnerOutput(
