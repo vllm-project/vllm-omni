@@ -44,7 +44,7 @@ stage_args:
        worker_type: ar
        scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
        gpu_memory_utilization: 0.2
-       enforce_eager: false
+       enforce_eager: true # haven't supported talker ACL graph on NPU
        trust_remote_code: true
        engine_output_type: latent  # Output codec codes for code2wav
        # tensor_parallel_size: 2

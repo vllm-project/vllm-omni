@@ -26,6 +26,7 @@ import numpy as np
 import PIL.Image
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -74,6 +75,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable CPU offloading for diffusion models.",
     )
+    parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
+    parser.add_argument(
+        "--layerwise-num-gpu-layers",
+        type=int,
+        default=1,
+        help="Number of ready layers (blocks) to keep on GPU during generation.",
+    )
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+    parser.add_argument(
+        "--enforce_eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
     return parser.parse_args()
 
 
@@ -109,19 +133,35 @@ def main():
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-
+    parallel_config = DiffusionParallelConfig(
+        cfg_parallel_size=args.cfg_parallel_size,
+    )
     omni = Omni(
         model=args.model,
+        enable_layerwise_offload=args.enable_layerwise_offload,
+        layerwise_num_gpu_layers=args.layerwise_num_gpu_layers,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
         enable_cpu_offload=args.enable_cpu_offload,
+        parallel_config=parallel_config,
+        enforce_eager=args.enforce_eager,
     )
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
         omni.start_profile()
+
+    # Print generation configuration
+    print(f"\n{'=' * 60}")
+    print("Generation Configuration:")
+    print(f"  Model: {args.model}")
+    print(f"  Inference steps: {args.num_inference_steps}")
+    print(f"  Frames: {args.num_frames}")
+    print(f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size}")
+    print(f"  Video size: {args.width}x{args.height}")
+    print(f"{'=' * 60}\n")
 
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(

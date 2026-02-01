@@ -9,6 +9,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Final, Optional, cast
 
 import jinja2
+import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
@@ -666,17 +667,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
+                # Initialize role before conditional blocks to avoid UnboundLocalError
+                # when handling audio/image responses
+                role = self.get_chat_request_role(request)
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
                     num_cached_tokens = res.num_cached_tokens
-                    # Send first response for each request.n (index) with
-                    # the role
-                    role = self.get_chat_request_role(request)
-
-                    # NOTE num_choices defaults to 1 so this usually executes
-                    # once per request
+                    # Send first response for each choice with role
+                    # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -1656,10 +1657,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
+        audio_data = final_res.multimodal_output.get("audio")
         if stream:
-            audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+            audio_tensor = audio_data[-1].float().detach().cpu().numpy()
         else:
-            audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+            if isinstance(audio_data, list):
+                audio_data = torch.cat(audio_data, dim=-1)
+            audio_tensor = audio_data.float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:

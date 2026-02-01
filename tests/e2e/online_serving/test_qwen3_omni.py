@@ -25,6 +25,7 @@ from tests.conftest import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
+    merge_base64_and_convert_to_text,
     modify_stage_config,
 )
 from vllm_omni.platforms import current_omni_platform
@@ -154,11 +155,6 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     Input Setting: stream=True
     Datasets: single request
     """
-    # TODO：This skip will be removed when the chunk scenario supports multimodal input.
-    param = request.node.callspec.params.get("omni_server")
-
-    if param[1] == CHUNK_CONFIG_PATH:
-        pytest.skip("The current chunk scenario does not support multimodal.")
 
     # Test single completion
     e2e_list = list()
@@ -178,7 +174,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     chat_completion = client.chat.completions.create(model=omni_server.model, messages=messages, stream=True)
 
     text_content = ""
-    audio_data = None
+    audio_data = []
     for chunk in chat_completion:
         for choice in chunk.choices:
             if hasattr(choice, "delta"):
@@ -189,11 +185,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
             modality = getattr(chunk, "modality", None)
 
             if modality == "audio" and content:
-                # Audio chunk - content
-                if audio_data is None:
-                    audio_data = content
-                else:
-                    audio_data += content
+                audio_data.append(content)
             elif modality == "text" and content:
                 # Text chunk - accumulate text content
                 text_content += content if content else ""
@@ -215,7 +207,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     ), "The output does not contain any of the keywords."
 
     # Verify text output same as audio output
-    audio_content = convert_audio_to_text(audio_data)
+    audio_content = merge_base64_and_convert_to_text(audio_data)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())

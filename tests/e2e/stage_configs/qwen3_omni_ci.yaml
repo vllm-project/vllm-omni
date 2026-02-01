@@ -7,14 +7,14 @@
 stage_args:
 - stage_id: 0
   runtime:
-    devices: "0,1"
+    devices: "0"
     max_batch_size: 5
   engine_args:
     model_stage: thinker
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: ar
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.9
     enforce_eager: false
     trust_remote_code: true
     engine_output_type: latent  # Output hidden states for talker
@@ -23,7 +23,7 @@ stage_args:
     max_model_len: 32768
     enable_prefix_caching: false
     hf_config_name: thinker_config
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
   final_output: true
   final_output_type: text
   is_comprehension: true
@@ -46,7 +46,7 @@ stage_args:
     model_arch: Qwen3OmniMoeForConditionalGeneration
     worker_type: ar
     scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.6
     enforce_eager: false
     trust_remote_code: true
     engine_output_type: latent  # Output codec codes for code2wav
@@ -68,7 +68,7 @@ stage_args:
 
 - stage_id: 2
   runtime:
-    devices: "0"
+    devices: "1"
     max_batch_size: 1
   engine_args:
     model_stage: code2wav

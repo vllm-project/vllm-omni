@@ -26,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -215,7 +216,7 @@ def split_quotation(prompt, quote_pairs=None):
     return result
 
 
-class LongCatImageEditPipeline(nn.Module, SupportImageInput):
+class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     def __init__(
         self,
         *,
@@ -652,38 +653,39 @@ class LongCatImageEditPipeline(nn.Module, SupportImageInput):
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
 
             timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+            do_true_cfg = guidance_scale > 1
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_image_ids,
+                "return_dict": False,
+            }
 
-            noise_pred_text = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                return_dict=False,
-            )[0]
-            noise_pred_text = noise_pred_text[:, :image_seq_len]
-            if guidance_scale > 1:
-                noise_pred_uncond = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    return_dict=False,
-                )[0]
-                noise_pred_uncond = noise_pred_uncond[:, :image_seq_len]
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_image_ids,
+                    "return_dict": False,
+                }
             else:
-                noise_pred = noise_pred_text
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                negative_kwargs = None
 
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                    latents = latents.to(latents_dtype)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+                output_slice=image_seq_len,
+            )
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
         self._current_timestep = None
 

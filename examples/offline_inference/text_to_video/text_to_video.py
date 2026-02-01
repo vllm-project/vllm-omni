@@ -32,7 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames (Wan default is 81).")
     parser.add_argument("--num_inference_steps", type=int, default=40, help="Sampling steps.")
-    parser.add_argument("--boundary_ratio", type=float, default=0.875, help="Boundary split ratio for low/high DiT.")
+    parser.add_argument(
+        "--boundary_ratio",
+        type=float,
+        default=0.875,
+        help="Boundary split ratio for low/high DiT. Default 0.875 uses both transformers for best quality. Set to 1.0 to load only the low-noise transformer (saves noticeable memory with good quality, recommended if memory is limited).",
+    )
     parser.add_argument(
         "--flow_shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )
@@ -75,6 +80,17 @@ def parse_args() -> argparse.Namespace:
         help="Enable CPU offloading for diffusion models.",
     )
     parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
+    parser.add_argument(
+        "--layerwise-num-gpu-layers",
+        type=int,
+        default=1,
+        help="Number of ready layers (blocks) to keep on GPU during generation.",
+    )
+    parser.add_argument(
         "--ulysses_degree",
         type=int,
         default=1,
@@ -86,6 +102,14 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+
     return parser.parse_args()
 
 
@@ -116,6 +140,7 @@ def main():
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     # Check if profiling is requested via environment variable
@@ -123,6 +148,8 @@ def main():
 
     omni = Omni(
         model=args.model,
+        enable_layerwise_offload=args.enable_layerwise_offload,
+        layerwise_num_gpu_layers=args.layerwise_num_gpu_layers,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
@@ -145,7 +172,9 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
+    print(
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+    )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
