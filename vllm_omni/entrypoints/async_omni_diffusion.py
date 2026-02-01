@@ -9,6 +9,8 @@ enabling concurrent request handling and streaming generation.
 """
 
 import asyncio
+import json
+from pathlib import Path
 import uuid
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +27,15 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _load_local_json(model_path: Path, relative_path: str | Path) -> dict[str, Any] | None:
+    """Load JSON from a local model directory if the file exists."""
+    candidate = model_path / Path(relative_path)
+    if not candidate.is_file():
+        return None
+    with candidate.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 class AsyncOmniDiffusion:
@@ -80,24 +91,46 @@ class AsyncOmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
-        try:
-            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
+        model_path = Path(od_config.model)
+        is_local_model = model_path.exists()
+
+        if is_local_model:
+            config_dict = (
+                _load_local_json(model_path, "model_index.json")
+                or _load_local_json(model_path, "config.json")
+            )
+            if config_dict is None:
+                raise ValueError(
+                    f"Local model directory '{model_path}' is missing model_index.json or config.json"
+                )
             od_config.model_class_name = config_dict.get("_class_name", None)
             od_config.update_multimodal_support()
 
-            tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+            tf_config_dict = _load_local_json(model_path, Path("transformer") / "config.json")
+            if tf_config_dict is None:
+                raise ValueError(
+                    f"Local model directory '{model_path}' is missing transformer/config.json"
+                )
             od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-        except (AttributeError, OSError, ValueError):
-            cfg = get_hf_file_to_dict("config.json", od_config.model)
-            if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
-
-            model_type = cfg.get("model_type")
-            architectures = cfg.get("architectures") or []
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
+        else:
+            try:
+                config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
+                od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
+
+                tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            except (AttributeError, OSError, ValueError):
+                cfg = get_hf_file_to_dict("config.json", od_config.model)
+                if cfg is None:
+                    raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+
+                model_type = cfg.get("model_type")
+                architectures = cfg.get("architectures") or []
+                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                    od_config.model_class_name = "BagelPipeline"
+                    od_config.tf_model_config = TransformerConfig()
+                    od_config.update_multimodal_support()
 
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
