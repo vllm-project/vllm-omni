@@ -201,6 +201,13 @@ def test_app():
     app = FastAPI()
     app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
 
+    # Add list_voices endpoint
+    async def list_voices():
+        speakers = sorted(speech_server.supported_speakers) if speech_server.supported_speakers else []
+        return {"voices": speakers}
+
+    app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
+
     return app
 
 
@@ -268,6 +275,11 @@ class TestSpeechAPI:
         assert isinstance(audio_obj, CreateAudio)
         assert audio_obj.speed == 2.5
 
+    def test_list_voices_endpoint(self, client):
+        response = client.get("/v1/audio/voices")
+        assert response.status_code == 200
+        assert "voices" in response.json()
+
 
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
@@ -311,9 +323,9 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", language="InvalidLang")
         assert "Invalid language" in speech_server._validate_tts_request(req)
 
-        # Invalid speaker
+        # When no speakers loaded, any voice is accepted (unconstrained)
         req = OpenAICreateSpeechRequest(input="Hello", voice="Invalid")
-        assert "Invalid speaker" in speech_server._validate_tts_request(req)
+        assert speech_server._validate_tts_request(req) is None
 
         # Valid request
         req = OpenAICreateSpeechRequest(input="Hello", voice="Vivian")
@@ -342,3 +354,26 @@ class TestTTSMethods:
         assert params["speaker"] == ["Ryan"]
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
+
+    def test_load_supported_speakers(self):
+        """Test _load_supported_speakers."""
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_list = None
+
+        # Mock talker_config with mixed-case speaker names
+        mock_talker_config = MagicMock()
+        mock_talker_config.spk_id = {"Ryan": 0, "Vivian": 1, "Aiden": 2}
+        mock_engine_client.model_config.hf_config.talker_config = mock_talker_config
+
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+
+        # Verify speakers are normalized to lowercase
+        assert server.supported_speakers == {"ryan", "vivian", "aiden"}

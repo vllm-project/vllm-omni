@@ -55,6 +55,7 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -288,6 +289,12 @@ class OmniDiffusionConfig:
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
     enable_cpu_offload: bool = False
+
+    # Layer-wise offloading (block-level offloading) parameters
+    enable_layerwise_offload: bool = False
+    # Number of transformer blocks ready for computation to keep on GPU
+    layerwise_num_gpu_layers: int = 1
+
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 

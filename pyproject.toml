@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni"
-version = "0.14.0rc1"
+version = "0.14.0"
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -59,7 +59,8 @@ dev = [
     "psutil>=7.2.0",
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=0.6.0",
-    "opencv-python>=4.12.0.88"
+    "opencv-python>=4.12.0.88",
+    "mooncake-transfer-engine==0.3.8.post1"
 ]
 
 docs = [

@@ -25,13 +25,11 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
+    QwenImageCFGParallelMixin,
+)
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -239,9 +237,7 @@ def apply_rotary_emb_qwen(
         return x_out.type_as(x)
 
 
-class QwenImagePipeline(
-    nn.Module,
-):
+class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
     def __init__(
         self,
         *,
@@ -536,109 +532,6 @@ class QwenImagePipeline(
     def interrupt(self):
         return self._interrupt
 
-    def diffuse(
-        self,
-        prompt_embeds,
-        prompt_embeds_mask,
-        negative_prompt_embeds,
-        negative_prompt_embeds_mask,
-        latents,
-        img_shapes,
-        txt_seq_lens,
-        negative_txt_seq_lens,
-        timesteps,
-        do_true_cfg,
-        guidance,
-        true_cfg_scale,
-    ):
-        self.scheduler.set_begin_index(0)
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
-            self._current_timestep = t
-
-            # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
-            # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
-
-            self.transformer.do_true_cfg = do_true_cfg
-
-            if cfg_parallel_ready:
-                cfg_group = get_cfg_group()
-                cfg_rank = get_classifier_free_guidance_rank()
-
-                if cfg_rank == 0:
-                    local_pred = self.transformer(
-                        hidden_states=latents,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=prompt_embeds_mask,
-                        encoder_hidden_states=prompt_embeds,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=txt_seq_lens,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                else:
-                    local_pred = self.transformer(
-                        hidden_states=latents,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=negative_txt_seq_lens,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-
-                gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
-                if cfg_rank == 0:
-                    noise_pred = gathered[0]
-                    neg_noise_pred = gathered[1]
-                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred = comb_pred * (cond_norm / noise_norm)
-                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-                cfg_group.broadcast(latents, src=0)
-
-            else:
-                # Forward pass for positive prompt (or unconditional if no CFG)
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=prompt_embeds_mask,
-                    encoder_hidden_states=prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=txt_seq_lens,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-                # Forward pass for negative prompt (CFG)
-                if do_true_cfg:
-                    neg_noise_pred = self.transformer(
-                        hidden_states=latents,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        img_shapes=img_shapes,
-                        txt_seq_lens=negative_txt_seq_lens,
-                        attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_pred = comb_pred * (cond_norm / noise_norm)
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        return latents
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -720,6 +613,8 @@ class QwenImagePipeline(
         )
 
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
@@ -790,6 +685,12 @@ class QwenImagePipeline(
             do_true_cfg,
             guidance,
             true_cfg_scale,
+            image_latents=None,
+            cfg_normalize=True,
+            additional_transformer_kwargs={
+                "return_dict": False,
+                "attention_kwargs": self.attention_kwargs,
+            },
         )
 
         self._current_timestep = None

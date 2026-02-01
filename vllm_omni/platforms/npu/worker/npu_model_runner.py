@@ -54,12 +54,13 @@ class OmniNPUModelRunner(NPUModelRunner):
                     self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
                 )
             hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
-            self.talker_mtp_input_ids = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
-                self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False
+                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
             )
-            self.last_talker_hidden = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
+            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         image_grid_thw = []
@@ -590,12 +591,16 @@ class OmniNPUModelRunner(NPUModelRunner):
                 model_instance=self.model,
             ):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
+                    num_tokens_padded_talker_mtp = num_tokens_padded
+                    if num_tokens_padded_talker_mtp == self.max_num_tokens:
+                        num_tokens_padded_talker_mtp = self.talker_mtp_input_ids.gpu.shape[0]
                     hidden_states = self.talker_mtp(
-                        self.talker_mtp_input_ids.gpu[:num_tokens_padded],
-                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
-                        self.last_talker_hidden.gpu[:num_tokens_padded],
-                        self.text_step.gpu[:num_tokens_padded],
+                        self.talker_mtp_input_ids.gpu[:num_tokens_padded_talker_mtp],
+                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded_talker_mtp],
+                        self.last_talker_hidden.gpu[:num_tokens_padded_talker_mtp],
+                        self.text_step.gpu[:num_tokens_padded_talker_mtp],
                     )
+                    self.compilation_config.cache_dir = None
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded, intermediate_tensors, inputs_embeds
                 )

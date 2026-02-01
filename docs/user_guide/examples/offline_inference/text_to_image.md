@@ -95,6 +95,7 @@ Key arguments:
 - `--prompt`: text description (string).
 - `--seed`: integer seed for deterministic sampling.
 - `--cfg_scale`: true CFG scale (model-specific guidance strength).
+- `--cfg_parallel_size`: the number of devices to run CFG Parallel. CFG Parallel is valid only if classifier-free guidance is enabled and `cfg_parallel_size` is set to 2.
 - `--num_images_per_prompt`: number of images to generate per prompt (saves as `output`, `output_1`, ...).
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--height/--width`: output resolution (defaults 1024x1024).

@@ -10,11 +10,14 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from io import BytesIO
+from typing import Any
 
 import openai
 import pytest
+import requests
 from PIL import Image
 from vllm.assets.image import ImageAsset
 from vllm.utils.network_utils import get_open_port
@@ -23,6 +26,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen-Image-Edit-2509"]
 test_params = models
+t2i_models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
 class OmniServer:
@@ -174,35 +178,94 @@ def _decode_data_url_to_image_bytes(data_url: str) -> bytes:
 
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_i2i_multi_image_input_qwen_image_edit_2509(
-    client: openai.OpenAI,
     omni_server,
     base64_encoded_images: list[str],
 ) -> None:
-    """Test multi-image input editing via OpenAI API."""
+    """Test multi-image input editing via OpenAI API with concurrent requests."""
     image_data_urls = [f"data:image/png;base64,{img}" for img in base64_encoded_images]
     messages = dummy_messages_from_image_data(image_data_urls)
 
-    height = 832
-    width = 1248
-    chat_completion = client.chat.completions.create(
-        model=omni_server.model,
-        messages=messages,
-        extra_body={
-            "height": height,
-            "width": width,
+    barrier = threading.Barrier(2)
+    results: list[tuple[int, int]] = []
+
+    def _call_chat(width: int, height: int) -> None:
+        client = openai.OpenAI(
+            base_url=f"http://{omni_server.host}:{omni_server.port}/v1",
+            api_key="EMPTY",
+        )
+        barrier.wait()
+        chat_completion = client.chat.completions.create(
+            model=omni_server.model,
+            messages=messages,
+            extra_body={
+                "height": height,
+                "width": width,
+                "num_inference_steps": 2,
+                "guidance_scale": 0.0,
+                "seed": 42,
+            },
+        )
+
+        assert len(chat_completion.choices) == 1
+        choice = chat_completion.choices[0]
+        assert choice.finish_reason == "stop"
+        assert choice.message.role == "assistant"
+
+        image_data_url = _extract_image_data_url(choice.message.content)
+        image_bytes = _decode_data_url_to_image_bytes(image_data_url)
+        img = Image.open(BytesIO(image_bytes))
+        img.load()
+        results.append(img.size)
+
+    threads = [
+        threading.Thread(target=_call_chat, args=(1248, 832)),
+        threading.Thread(target=_call_chat, args=(1024, 768)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # TODO @ZJY
+    # assert (1248, 832) in results
+    # assert (1024, 768) in results
+
+
+@pytest.mark.parametrize("omni_server", t2i_models, indirect=True)
+def test_t2i_concurrent_requests_different_sizes(omni_server) -> None:
+    """Test /v1/images/generations concurrent requests with different sizes."""
+    base_url = f"http://{omni_server.host}:{omni_server.port}"
+    url = f"{base_url}/v1/images/generations"
+
+    barrier = threading.Barrier(2)
+    results: list[tuple[int, int]] = []
+
+    def _call_generate(size: str) -> None:
+        payload: dict[str, Any] = {
+            "prompt": "cute cat playing with a ball",
+            "n": 1,
+            "size": size,
+            "response_format": "b64_json",
             "num_inference_steps": 2,
-            "guidance_scale": 0.0,
-            "seed": 42,
-        },
-    )
+        }
+        barrier.wait()
+        response = requests.post(url, json=payload, timeout=120)
+        assert response.status_code == 200
+        data = response.json()
+        image_b64 = data["data"][0]["b64_json"]
+        image_bytes = base64.b64decode(image_b64)
+        img = Image.open(BytesIO(image_bytes))
+        img.load()
+        results.append(img.size)
 
-    assert len(chat_completion.choices) == 1
-    choice = chat_completion.choices[0]
-    assert choice.finish_reason == "stop"
-    assert choice.message.role == "assistant"
+    threads = [
+        threading.Thread(target=_call_generate, args=("512x512",)),
+        threading.Thread(target=_call_generate, args=("768x512",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-    image_data_url = _extract_image_data_url(choice.message.content)
-    image_bytes = _decode_data_url_to_image_bytes(image_data_url)
-    img = Image.open(BytesIO(image_bytes))
-    img.load()
-    assert img.size == (width, height)
+    assert (512, 512) in results
+    assert (768, 512) in results

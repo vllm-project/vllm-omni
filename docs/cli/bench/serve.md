@@ -128,7 +128,7 @@ Specify to save benchmark results to a json file
   Second item: videos with resolution 720x1280 and 16 frames
   Third item: audios with 1s duration and 5 channels w.p. 0.1
   OBS.: If the probabilities do not sum to 1, they are normalized.
-  Only the random-mm mode supports this parameter.
+  Only the random-mm mode supports this parameter
 
 ## Usage Examples
 

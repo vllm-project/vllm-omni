@@ -29,6 +29,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -76,7 +77,9 @@ class DiffusionModelRunner:
             memory_pool_context_fn: Optional function that returns a context manager
                 for memory pool allocation (used for sleep mode).
         """
-        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        load_device = (
+            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+        )
 
         def get_memory_context():
             if memory_pool_context_fn is not None:
@@ -104,29 +107,26 @@ class DiffusionModelRunner:
         )
         logger.info("Model runner: Model loaded successfully.")
 
-        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
-        if self.od_config.enable_cpu_offload:
-            for name in ["vae"]:
-                module = getattr(self.pipeline, name, None)
-                if module is None:
-                    continue
-                try:
-                    module.to(self.device, non_blocking=True)
-                except Exception as exc:
-                    logger.debug("Failed to move %s to GPU: %s", name, exc)
-
+        # Apply CPU offloading
+        if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
             apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
-            try:
-                self.pipeline.transformer = regionally_compile(
-                    self.pipeline.transformer,
-                    dynamic=True,
+            if current_omni_platform.supports_torch_inductor():
+                try:
+                    self.pipeline.transformer = regionally_compile(
+                        self.pipeline.transformer,
+                        dynamic=True,
+                    )
+                    logger.info("Model runner: Model compiled with torch.compile.")
+                except Exception as e:
+                    logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
+            else:
+                logger.warning(
+                    "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
+                    current_omni_platform.get_torch_device(),
                 )
-                logger.info("Model runner: Model compiled with torch.compile.")
-            except Exception as e:
-                logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)

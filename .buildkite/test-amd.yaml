@@ -113,4 +113,4 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/online_serving/test_i2i_multi_image_input.py
+    - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
