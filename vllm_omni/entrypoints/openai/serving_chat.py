@@ -287,8 +287,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 generators.append(generator)
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert len(generators) == 1
         (result_generator,) = generators
@@ -316,8 +315,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
             )
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def _preprocess_chat(
         self,
@@ -634,7 +632,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -646,7 +644,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_parsers = [None] * num_choices
         except Exception as e:
             logger.exception("Error in tool parser creation.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -1286,9 +1284,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
 
         except Exception as e:
-            # TODO: Use a vllm-specific Validation Error
             logger.exception("Error in chat completion stream generator.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
@@ -1313,8 +1310,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert final_outputs is not None
 
@@ -1487,7 +1483,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")
-                    return self.create_error_response(str(e))
+                    return self.create_error_response(e)
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning_content, content = reasoning_parser.extract_reasoning(output.text, request=request)
@@ -1572,7 +1568,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tool_parser = self.tool_parser(tokenizer)
                 except RuntimeError as e:
                     logger.exception("Error in tool parser creation.")
-                    return self.create_error_response(str(e))
+                    return self.create_error_response(e)
 
                 tool_call_info = tool_parser.extract_tool_calls(content if content is not None else "", request=request)
                 # In the OpenAI API the finish_reason is "tools_called"
