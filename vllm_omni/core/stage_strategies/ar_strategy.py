@@ -9,7 +9,7 @@ class ARStrategy(StageStrategy):
     """Strategy for AR stages (Thinker, Talker)."""
 
     def should_send_chunk(self, request, pooler_output, token_ids, processor, state_manager) -> bool:
-        req_id = state_manager.normalize_request_id(request.request_id)
+        req_id = state_manager.get_global_request_id(request.request_id)
         state = state_manager.get_state(req_id)
 
         # Skip during prefill
@@ -30,7 +30,7 @@ class ARStrategy(StageStrategy):
         prev_stage = stage_id - 1
 
         for request in active_requests:
-            req_id = state_manager.normalize_request_id(request.request_id)
+            req_id = state_manager.get_global_request_id(request.request_id)
             state = state_manager.get_state(req_id)
 
             # AR stages: when upstream finishes, just keep running

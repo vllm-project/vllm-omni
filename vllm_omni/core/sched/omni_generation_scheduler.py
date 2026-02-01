@@ -105,14 +105,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # independent of pooling_params)
         while self.waiting and token_budget > 0 and len(self.running) < self.max_num_running_reqs:
             request = self.waiting.peek_request()
-            logger.info(f"token_budget: {token_budget}")
             # Uniformly treat as diffusion. A feature flag can be added later
             # via config or request tag.
 
             # Allocate all input tokens for the request in one shot
             # (allocate 1 placeholder if zero)
             required_tokens = max(getattr(request, "num_prompt_tokens", 0), 1)
-            logger.info(f"required_tokens: {required_tokens}")
             if required_tokens > token_budget:
                 # Insufficient budget to process all inputs at once;
                 # stop fast path attempt
@@ -322,11 +320,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 for req in self.requests.values()
                 if req.status in (RequestStatus.RUNNING, RequestStatus.WAITING_FOR_CHUNK) and not req.is_finished()
             ]
-            logger.info(f"[receive_chunks] Stage {self.stage_id} - active_requests: {len(active_requests)}")
             result = self.chunk_manager.receive_chunk(active_requests)
             stopped_running_reqs = result.stopped_running
             stopped_preempted_reqs = result.stopped_preempted
-            logger.info(f"[receive_chunks] Stage {self.stage_id} - received_count: {result.received_count}")
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

@@ -8,9 +8,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.request import Request
 
 from vllm_omni.core.chunk_processor import BaseChunkProcessor
+
+logger = init_logger(__name__)
 
 
 def _ensure_list(x):
@@ -52,9 +55,6 @@ class Qwen25ThinkerChunkProcessor(BaseChunkProcessor):
             return None
 
         thinker_output = pooler_output["hidden"]
-
-        if thinker_output.shape[0] <= 0:
-            return None
 
         all_token_ids = _ensure_list(request.all_token_ids)
         all_token_ids_len = len(all_token_ids)
@@ -160,8 +160,7 @@ class Qwen25Code2WavChunkProcessor(BaseChunkProcessor):
     def apply_incoming_chunk(self, chunk: dict, request: Request, request_state: Any) -> None:
         """Apply codec tokens to request."""
         if "tokens" in chunk:
-            request.prompt_token_ids = chunk["tokens"]
-            request.num_computed_tokens = 0
+            request.pending_chunk = chunk["tokens"]
 
     def map_chunk_to_worker(self, chunk: dict) -> dict:
         return {}

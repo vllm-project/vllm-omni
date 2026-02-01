@@ -338,9 +338,6 @@ class Qwen2_5OmniForConditionalGeneration(
                 )
             )
 
-            logger.info(f"code length: {len(code)}")
-            logger.info(f"code: {code}")
-
             code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
             code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
 

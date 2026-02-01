@@ -97,6 +97,11 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
         if raw_codes is None or (hasattr(raw_codes, "shape") and raw_codes.shape[0] <= 0):
             return None
 
+        # Skip prefill output - prefill produces batch with shape[0] > 1
+        # Decode produces single token at a time with shape[0] == 1
+        if hasattr(raw_codes, "shape") and raw_codes.shape[0] > 1:
+            return None
+
         if isinstance(raw_codes, torch.Tensor):
             codec_codes = raw_codes.to(torch.long).transpose(0, 1).cpu().reshape(-1).tolist()
             return {"tokens": codec_codes}
@@ -156,5 +161,4 @@ class Qwen3Code2WavChunkProcessor(BaseChunkProcessor):
     def apply_incoming_chunk(self, chunk: dict, request: Request, request_state: Any) -> None:
         """Apply codec tokens to request."""
         if "tokens" in chunk:
-            request.prompt_token_ids = chunk["tokens"]
-            request.num_computed_tokens = 0
+            request.pending_chunk = chunk["tokens"]

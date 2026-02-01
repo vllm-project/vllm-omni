@@ -48,12 +48,18 @@ class RequestChunkStateManager:
         if request_id in self._states:
             del self._states[request_id]
 
-    def normalize_request_id(self, request_id: str) -> str:
+    def get_global_request_id(self, request_id: str) -> str:
         """Remove stage suffix from request ID if present.
 
-        Example: "scheduler-req-123-0" -> "scheduler-req-123" if needed,
-        but typically helps if IDs are modified by previous stages.
-        For now, returns as is or strips suffix if standard format used.
+        Example: Each stage gets appended with a stage specific UUID
+        at the end of the request ID. This is used for intra stage operations.
+        But for inter-stage comm, this has to be stripped off so that all the stages
+        within same request share the same global request id
+        Ex: stage-0 - chatcmpl-bk45hkj478-jhb45, stage-1 - chatcmpl-bk45hkj478-84g45
+        stage-2 - chatcmpl-bk45hkj478-9gjh43
+        Strip off the last part.
         """
-        # Implementation depends on ID format. Assuming standard for now.
+        # If request_id has 3 parts (e.g., "chatcmpl-xxx-stageuuid"), strip the stage suffix
+        if len(request_id.split("-")) == 3:
+            return "-".join(request_id.split("-")[:-1])
         return request_id

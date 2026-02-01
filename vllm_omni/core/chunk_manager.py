@@ -52,7 +52,7 @@ class ChunkManager:
         if not chunk:
             return False
 
-        req_id = self.state_manager.normalize_request_id(request.request_id)
+        req_id = self.state_manager.get_global_request_id(request.request_id)
         state = self.state_manager.get_state(req_id)
 
         # Handle batching if configured
@@ -102,7 +102,7 @@ class ChunkManager:
         )
 
     def cleanup_request(self, request_id: str) -> None:
-        req_id = self.state_manager.normalize_request_id(request_id)
+        req_id = self.state_manager.get_global_request_id(request_id)
         self.state_manager.cleanup_request(req_id)
         self.chunk_processor.on_request_complete(req_id)
 
