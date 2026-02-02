@@ -9,6 +9,7 @@ to DiffusionModelRunner.
 
 import multiprocessing as mp
 import os
+import signal
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
@@ -66,6 +67,21 @@ class DiffusionWorker:
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
+        # Registry signal
+        signal.signal(signal.SIGUSR1, self._on_interrupt)
+
+    def _on_interrupt(self, signum, frame):
+        # Set interrupt flag on the pipeline
+        # The pipeline checks this flag in the diffuse loop
+        if (
+            self.model_runner is not None
+            and self.model_runner.pipeline is not None
+            and hasattr(self.model_runner.pipeline, "_interrupt")
+        ):
+            self.model_runner.pipeline._interrupt = True
+            logger.info("Worker: Interrupt flag set for current Running Request")
+        else:
+            logger.warning("Worker: Cannot set interrupt flag - model_runner or pipeline is None")
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""

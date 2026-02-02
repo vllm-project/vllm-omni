@@ -991,6 +991,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
+@with_cancellation
 async def edit_images(
     raw_request: Request,
     image: list[UploadFile] | None = File(None),
@@ -1014,7 +1015,7 @@ async def edit_images(
     seed: int | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
-) -> ImageGenerationResponse:
+) -> ImageGenerationResponse | None:
     """
     OpenAI-compatible image edit endpoint.
     """

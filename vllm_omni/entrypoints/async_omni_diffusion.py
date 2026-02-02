@@ -9,8 +9,9 @@ enabling concurrent request handling and streaming generation.
 """
 
 import asyncio
+import threading
 import uuid
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -106,7 +107,23 @@ class AsyncOmniDiffusion:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
 
+        # Track active requests for abort functionality
+        self._active_generate_task: dict[str, asyncio.Task] = {}
+        self._active_engine_step_task: dict[str, asyncio.Task] = {}
+        self._running_lock = threading.Lock()
+        self._running_requests: set[str] = set()
+
         logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+
+    def _engine_step_wrapper(self, request, request_id):
+        with self._running_lock:
+            self._running_requests.add(request_id)
+
+        try:
+            return self.engine.step(request)
+        finally:
+            with self._running_lock:
+                self._running_requests.discard(request_id)
 
     async def generate(
         self,
@@ -137,6 +154,10 @@ class AsyncOmniDiffusion:
         if lora_request is not None:
             sampling_params.lora_request = lora_request
 
+        # Register this task for tracking
+        current_task = asyncio.current_task()
+        self._active_generate_task[request_id] = current_task
+
         request = OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=sampling_params,
@@ -148,12 +169,17 @@ class AsyncOmniDiffusion:
         # Run engine in thread pool
         loop = asyncio.get_event_loop()
         # In async mode, only a single request is submitted at a time
-        result = await loop.run_in_executor(
-            self._executor,
-            self.engine.step,
-            request,
-        )
-        result = result[0]
+        try:
+            # In async mode, only a single request is submitted at a time
+            step_task = loop.run_in_executor(self._executor, self._engine_step_wrapper, request, request_id)
+            self._active_engine_step_task[request_id] = step_task
+            result = await step_task
+            result = result[0]
+        finally:
+            # Unregister the request
+            self._active_generate_task.pop(request_id, None)
+            self._active_engine_step_task.pop(request_id, None)
+            logger.debug(f"{request_id} finished")
 
         # Update request_id if needed
         if not result.request_id:
@@ -215,9 +241,26 @@ class AsyncOmniDiffusion:
         except Exception:
             pass
 
-    async def abort(self, request_id: str | Iterable[str]) -> None:
-        """Abort a request."""
-        self.engine.abort(request_id)
+    async def abort(self, request_id: str):
+        logger.info(f"Aborting {request_id}.")
+        with self._running_lock:
+            is_running = request_id in self._running_requests
+            if is_running:
+                self.engine.abort()
+            else:
+                step_task = self._active_engine_step_task.get(request_id)
+                if step_task and not step_task.done():
+                    step_task.cancel()
+        if is_running:
+            logger.info(f"{request_id} engine step is running, sending interrupt")
+        else:
+            logger.info(f"{request_id} engine step not running, cancel in queue")
+
+        gen_task = self._active_generate_task.get(request_id)
+        if gen_task and not gen_task.done():
+            gen_task.cancel()
+        self._active_engine_step_task.pop(request_id, None)
+        self._active_generate_task.pop(request_id, None)
 
     @property
     def is_running(self) -> bool:

@@ -130,6 +130,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         return self.scheduler.add_req(request)
 
+    def get_worker_pids(self):
+        return [process.pid for process in self._processes]
+
     def collective_rpc(
         self,
         method: str,

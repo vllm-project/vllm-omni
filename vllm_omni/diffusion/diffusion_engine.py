@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import signal
 import time
-from collections.abc import Iterable
 from typing import Any
 
 import PIL.Image
@@ -371,7 +371,13 @@ class DiffusionEngine:
         if hasattr(self, "executor"):
             self.executor.shutdown()
 
-    def abort(self, request_id: str | Iterable[str]) -> None:
-        # TODO implement it
-        logger.warning("DiffusionEngine abort is not implemented yet")
-        pass
+    def abort(self) -> None:
+        """
+        Abort diffusion generation requests.
+        """
+        try:
+            for worker_pid in self.executor.get_worker_pids():
+                os.kill(worker_pid, signal.SIGUSR1)
+                logger.info("Interrupt signal sent to worker.")
+        except Exception as e:
+            logger.error(f"Failed to interrupt current diffusion forward: {e}")

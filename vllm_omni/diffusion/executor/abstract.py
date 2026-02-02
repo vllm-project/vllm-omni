@@ -84,3 +84,8 @@ class DiffusionExecutor(ABC):
     def shutdown(self) -> None:
         """Shutdown the executor and release resources."""
         pass
+
+    @abstractmethod
+    def get_worker_pids(self) -> None:
+        """Get worker pid."""
+        pass
