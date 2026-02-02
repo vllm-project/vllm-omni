@@ -585,22 +585,32 @@ class ZImagePipeline(nn.Module):
             )[0]
 
             if apply_cfg:
-                # Perform CFG (batched to reduce Python loop and kernel launch overhead)
-                pos_out = torch.stack(model_out_list[:actual_batch_size], dim=0).float()
-                neg_out = torch.stack(model_out_list[actual_batch_size:], dim=0).float()
-                pred = pos_out + current_guidance_scale * (pos_out - neg_out)
-                if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
-                    ori_pos_norm = torch.linalg.vector_norm(pos_out, dim=tuple(range(1, pred.dim())))
-                    new_pos_norm = torch.linalg.vector_norm(pred, dim=tuple(range(1, pred.dim())))
-                    max_new_norm = ori_pos_norm * float(self._cfg_normalization)
-                    scale = torch.where(
-                        new_pos_norm > max_new_norm,
-                        (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
-                        pred.new_ones(actual_batch_size, device=pred.device, dtype=pred.dtype),
-                    )
-                    scale = scale.view(actual_batch_size, *([1] * (pred.dim() - 1)))
-                    pred = pred * scale
-                noise_pred = pred
+                # Perform CFG
+                pos_out = model_out_list[:actual_batch_size]
+                neg_out = model_out_list[actual_batch_size:]
+
+                noise_pred = []
+                for j in range(actual_batch_size):
+                    pos = pos_out[j].float()
+                    neg = neg_out[j].float()
+
+                    pred = pos + current_guidance_scale * (pos - neg)
+
+                    # Renormalization (torch.where avoids GPU->CPU sync from Python if/scalar comparison)
+                    if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
+                        ori_pos_norm = torch.linalg.vector_norm(pos)
+                        new_pos_norm = torch.linalg.vector_norm(pred)
+                        max_new_norm = ori_pos_norm * float(self._cfg_normalization)
+                        scale = torch.where(
+                            new_pos_norm > max_new_norm,
+                            (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
+                            pred.new_tensor(1.0),
+                        )
+                        pred = pred * scale
+
+                    noise_pred.append(pred)
+
+                noise_pred = torch.stack(noise_pred, dim=0)
             else:
                 noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
 
