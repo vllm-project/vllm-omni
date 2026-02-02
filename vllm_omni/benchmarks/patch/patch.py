@@ -114,7 +114,6 @@ async def async_request_openai_chat_omni_completions(
     output.start_time = st
     most_recent_timestamp = st
     audio_generate_time = 0.0
-    audio_first_timestamp = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -133,7 +132,6 @@ async def async_request_openai_chat_omni_completions(
                             continue
 
                         chunk = message.removeprefix("data: ")
-
                         if chunk != "[DONE]":
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
@@ -148,11 +146,11 @@ async def async_request_openai_chat_omni_completions(
                                     else:
                                         output.itl.append(timestamp - most_recent_timestamp)
                                     generated_text += content or ""
+                                    most_recent_timestamp = timestamp
                                 elif modality == "audio":
                                     if output.audio_ttfp == 0.0:
-                                        audio_first_timestamp = timestamp
                                         output.audio_ttfp = timestamp - st
-                                    audio_generate_time = timestamp - audio_first_timestamp
+                                    audio_generate_time = timestamp - st
                                     if content != "":
                                         audio_bytes = base64.b64decode(content)
                                         seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
@@ -164,7 +162,6 @@ async def async_request_openai_chat_omni_completions(
 
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
-                            most_recent_timestamp = timestamp
 
                 output.generated_text = generated_text
                 if generated_audio is not None:
