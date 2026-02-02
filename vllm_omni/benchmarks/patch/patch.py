@@ -163,6 +163,7 @@ async def async_request_openai_chat_omni_completions(
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
 
+                output.latency = timestamp - st
                 output.generated_text = generated_text
                 if generated_audio is not None:
                     output.audio_duration = len(generated_audio) / 1000.0
@@ -178,9 +179,7 @@ async def async_request_openai_chat_omni_completions(
                     else:
                         output.audio_rtf = 0
                         logger.warning("Audio duration is zero")
-
                 output.success = True
-                output.latency = most_recent_timestamp - st
             else:
                 output.error = response.reason or ""
                 output.success = False
