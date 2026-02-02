@@ -5,13 +5,15 @@ Model teams: This is the ONLY file you need to modify to add chunk support.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
 from vllm.logger import init_logger
 from vllm.v1.request import Request
 
 from vllm_omni.core.chunk_processor import BaseChunkProcessor
+
+if TYPE_CHECKING:
+    from vllm_omni.core.request_chunk_state import ChunkState
 
 logger = init_logger(__name__)
 
@@ -56,22 +58,8 @@ class Qwen25ThinkerChunkProcessor(BaseChunkProcessor):
 
         thinker_output = pooler_output["hidden"]
 
-        all_token_ids = _ensure_list(request.all_token_ids)
-        all_token_ids_len = len(all_token_ids)
-        prompt_token_ids = _ensure_list(request.prompt_token_ids)
-        prompt_token_ids_len = len(prompt_token_ids)
-
-        # Prefill mode: prompt_token_ids_len >= all_token_ids_len
-        if prompt_token_ids_len >= all_token_ids_len:
-            return {
-                "thinker_result": thinker_output[prompt_token_ids_len:].to(torch.float32),
-                "prompt_embeds": thinker_output[:prompt_token_ids_len].to(torch.float32),
-                "prompt_token_ids": prompt_token_ids,
-                "thinker_output_token_ids": all_token_ids[prompt_token_ids_len:],
-            }
-        else:
-            # Decode mode: just send the hidden states
-            return {"thinker_result": thinker_output}
+        # Decode mode: just send the hidden states
+        return {"thinker_result": thinker_output}
 
     def map_chunk_to_worker(self, chunk: dict) -> dict:
         """Process chunk for worker consumption (key mapping/filtering)."""
@@ -88,6 +76,9 @@ class Qwen25TalkerChunkProcessor(BaseChunkProcessor):
     """Chunk processor for Qwen2.5-Omni Talker stage.
 
     Batches codec tokens for Code2Wav stage.
+
+    IMPORTANT: Qwen2.5 accumulates token IDs directly (already transformed).
+    This is different from Qwen3 which accumulates raw tensors.
     """
 
     stage_type: str = "ar"
@@ -101,11 +92,50 @@ class Qwen25TalkerChunkProcessor(BaseChunkProcessor):
     def prepare_outgoing_chunk(
         self, request: Request, pooler_output: Any = None, new_token_ids: list[int] | None = None
     ) -> dict | None:
-        """Prepare codec tokens for Code2Wav."""
-        token_ids = new_token_ids
-        if not token_ids:
+        """Not used for batched sends - use accumulate_and_prepare_batch instead."""
+        return None
+
+    def accumulate_and_prepare_batch(
+        self, request: Request, state: "ChunkState", pooler_output: Any = None, new_token_ids: list[int] | None = None
+    ) -> dict | None:
+        """Qwen2.5-specific: Accumulate token IDs and batch.
+
+        This matches the old _process_chunk_for_generation logic:
+        1. Extend accumulated_data with new output_token_ids
+        2. When batch_size reached OR request finished:
+           - Send accumulated tokens
+           - Clear accumulator
+        3. Skip first batch if should_skip_first_chunk is True
+        """
+        if not new_token_ids or len(new_token_ids) == 0:
             return None
-        return {"tokens": token_ids}
+
+        # Accumulate token IDs in state
+        state.accumulated_data.extend(new_token_ids)
+
+        is_finished = request.is_finished()
+        accumulated_count = len(state.accumulated_data)
+
+        # Check if batch is ready
+        if accumulated_count >= self.chunk_batch_size or is_finished:
+            # Skip first batch if configured
+            if self.should_skip_first_chunk and not state.first_batch_skipped:
+                if not is_finished:  # Don't skip if it's the last chunk
+                    state.first_batch_skipped = True
+                    state.accumulated_data = []
+                    return None
+
+            # Get accumulated tokens
+            tokens = list(state.accumulated_data)
+            if not tokens:
+                return None
+
+            # Clear accumulator
+            state.accumulated_data = []
+
+            return {"tokens": tokens}
+
+        return None
 
     def apply_incoming_chunk(self, chunk: dict, request: Request, request_state: Any) -> None:
         """Apply incoming chunk to request."""

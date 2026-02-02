@@ -6,9 +6,12 @@ WITHOUT modifying scheduler, chunk_manager, or workers.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm_omni.core.request_chunk_state import ChunkState
 
 
 @dataclass
@@ -26,8 +29,23 @@ class BaseChunkProcessor:
     def prepare_outgoing_chunk(
         self, request: Request, pooler_output: Any = None, new_token_ids: list[int] | None = None
     ) -> dict | None:
-        """Default: pass through pooler output as-is."""
+        """Prepare a single chunk from current output.
+
+        For non-batched stages, this returns the chunk to send.
+        For batched stages, override accumulate_and_prepare_batch instead.
+        """
         return pooler_output
+
+    def accumulate_and_prepare_batch(
+        self, request: Request, state: "ChunkState", pooler_output: Any = None, new_token_ids: list[int] | None = None
+    ) -> dict | None:
+        """Accumulate data and return batch when ready.
+
+        Override this for model-specific batching logic.
+        Returns None if batch not ready, or the batch dict to send.
+        """
+        # Default implementation: no batching, just prepare and return
+        return self.prepare_outgoing_chunk(request, pooler_output, new_token_ids)
 
     def apply_incoming_chunk(self, chunk: dict, request: Request, request_state: Any) -> None:
         """Default: store chunk on request.pending_chunk."""

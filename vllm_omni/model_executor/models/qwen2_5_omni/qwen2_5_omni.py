@@ -679,6 +679,15 @@ class Qwen2_5OmniForConditionalGeneration(
         prompt_token_ids = info_dict.get("prompt_token_ids")  # list[int]
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids")  # list[int]
 
+        # Only accept first tensor of thinker_result
+        # This comes from orchestrator (async_omni.py)
+        # It is possible that orchestrator can send thinker_result
+        # of length > 1 as first chunk
+        # We ignore this and accept rest of the thinker_result from
+        # scheduler-scheduler via chunk_manager.py
+        if self.async_chunk_stream:
+            thinker_result = thinker_result[:1, :]
+
         if not isinstance(prompt_embeds, torch.Tensor):
             prompt_embeds = torch.zeros(
                 0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)

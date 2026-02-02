@@ -1,8 +1,11 @@
 """Auto-Regressive stage strategy."""
 
+from vllm.logger import init_logger
 from vllm.v1.request import RequestStatus
 
 from .base import ReceiveOutput, StageStrategy
+
+logger = init_logger(__name__)
 
 
 class ARStrategy(StageStrategy):
@@ -33,6 +36,11 @@ class ARStrategy(StageStrategy):
             req_id = state_manager.get_global_request_id(request.request_id)
             state = state_manager.get_state(req_id)
 
+            # This means it is in prefill-mode
+            # Shouldn't receive chunks during prefill mode
+            if len(request.prompt_token_ids) > request.num_computed_tokens:
+                continue
+
             # AR stages: when upstream finishes, just keep running
             # (AR stages like Talker continue independently after Thinker is done)
             if state.upstream_finished:
@@ -48,7 +56,7 @@ class ARStrategy(StageStrategy):
             key = self.prepare_connector_key(state.received_chunks, prev_stage, req_id)
             chunk = connector.get_chunk(str(prev_stage), str(stage_id), key)
 
-            if chunk:
+            if chunk and chunk[0]:
                 payload, _ = chunk
                 if payload:
                     # Apply incoming chunk using processor logic

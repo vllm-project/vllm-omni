@@ -48,7 +48,7 @@ class GenerationStrategy(StageStrategy):
             key = self.prepare_connector_key(state.received_chunks, prev_stage, req_id)
             chunk = connector.get_chunk(str(prev_stage), str(stage_id), key)
 
-            if chunk:
+            if chunk and chunk[0]:
                 payload, _ = chunk
                 if payload:
                     processor.apply_incoming_chunk(payload, request, None)

@@ -5,12 +5,15 @@ Model teams: This is the ONLY file you need to modify to add chunk support.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.request import Request
 
 from vllm_omni.core.chunk_processor import BaseChunkProcessor
+
+if TYPE_CHECKING:
+    from vllm_omni.core.request_chunk_state import ChunkState
 
 
 @dataclass
@@ -81,10 +84,21 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
     def prepare_outgoing_chunk(
         self, request: Request, pooler_output: Any = None, new_token_ids: list[int] | None = None
     ) -> dict | None:
-        """Prepare codec codes for Code2Wav.
+        """Not used for Qwen3 Talker - use accumulate_and_prepare_batch instead."""
+        return None
 
-        Transposes and flattens code_predictor_codes tensor:
-        [seq, 8] -> transpose -> [8, seq] -> flatten -> [seq*8]
+    def accumulate_and_prepare_batch(
+        self, request: Request, state: "ChunkState", pooler_output: Any = None, new_token_ids: list[int] | None = None
+    ) -> dict | None:
+        """Qwen3-specific: Accumulate raw tensors, batch, then transform.
+
+        This matches the old _process_chunk_for_generation_qwen3 logic:
+        1. Accumulate code_predictor_codes tensors (not transformed)
+        2. When batch_size reached OR request finished:
+           - torch.cat the accumulated tensors
+           - Transform the concatenated result
+           - Clear accumulator
+        3. Skip first batch if should_skip_first_chunk is True
         """
         if pooler_output is None:
             return None
@@ -98,12 +112,31 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
             return None
 
         # Skip prefill output - prefill produces batch with shape[0] > 1
-        # Decode produces single token at a time with shape[0] == 1
         if hasattr(raw_codes, "shape") and raw_codes.shape[0] > 1:
             return None
 
-        if isinstance(raw_codes, torch.Tensor):
-            codec_codes = raw_codes.to(torch.long).transpose(0, 1).cpu().reshape(-1).tolist()
+        state.accumulated_data.append(raw_codes)
+
+        is_finished = request.is_finished()
+        accumulated_count = len(state.accumulated_data)
+
+        if accumulated_count >= self.chunk_batch_size or is_finished:
+            if self.should_skip_first_chunk and not state.first_batch_skipped:
+                if not is_finished:  # Don't skip if it's the last chunk
+                    state.first_batch_skipped = True
+                    state.accumulated_data = []
+                    return None
+
+            tensors = state.accumulated_data
+            if not tensors:
+                return None
+
+            concatenated = torch.cat(tensors, dim=0)
+
+            codec_codes = concatenated.to(torch.long).transpose(0, 1).cpu().reshape(-1).tolist()
+
+            state.accumulated_data = []
+
             return {"tokens": codec_codes}
 
         return None

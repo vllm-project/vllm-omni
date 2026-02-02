@@ -714,7 +714,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_pad_thinker=tts_pad_thinker,
         )
 
-        # Queue tailing_text_hidden for decode (drop first for next steps),
+        # Queue trailing_text_hidden for decode (drop first for next steps),
         try:
             if isinstance(trailing_text_hidden, torch.Tensor) and trailing_text_hidden.numel() > 0:
                 if trailing_text_hidden.ndim == 2:
@@ -730,7 +730,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     # compatible with old shape [1,S,D]
                     rem_tail = trailing_text_hidden.squeeze(0)
                 if rem_tail.shape[0] > 0:
-                    update_dict["tailing_text_hidden"] = rem_tail.detach().to("cpu").contiguous()
+                    update_dict["trailing_text_hidden"] = rem_tail.detach().to("cpu").contiguous()
             # Also persist projected tts_pad for decode fallback if needed
             if isinstance(tts_pad_thinker, torch.Tensor):
                 pad_in = tts_pad_thinker
@@ -854,23 +854,23 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_decode(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         update_dict: dict[str, dict] = {}
         try:
-            tailing_text_hidden = info_dict.get("tailing_text_hidden")
+            trailing_text_hidden = info_dict.get("trailing_text_hidden")
 
             if self.async_chunk_stream:
                 thinker_embeddings = info_dict.get("thinker_embeddings")
                 tts_eos_embed = info_dict.get("tts_eos_embed")
 
-                queue_empty = tailing_text_hidden is None or (
-                    isinstance(tailing_text_hidden, torch.Tensor) and tailing_text_hidden.numel() == 0
+                queue_empty = trailing_text_hidden is None or (
+                    isinstance(trailing_text_hidden, torch.Tensor) and trailing_text_hidden.numel() == 0
                 )
                 thinker_eos = info_dict.get("last_chunk", False)
 
                 if queue_empty and thinker_embeddings is not None:
-                    tailing_text_hidden = self._get_talker_assistant_parts_for_decode(
+                    trailing_text_hidden = self._get_talker_assistant_parts_for_decode(
                         thinker_embeddings.to(input_embeds.device), tts_eos_embed, thinker_end_token=thinker_eos
                     )
 
-            q_tail = tailing_text_hidden
+            q_tail = trailing_text_hidden
             if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                 use_vec = q_tail[0:1, :]
                 new_q_tail = (
@@ -879,7 +879,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     else self.tts_pad_embed.to(input_embeds.device, dtype=input_embeds.dtype)
                 )
                 text_step = use_vec.to(input_embeds.device, dtype=input_embeds.dtype)
-                update_dict["tailing_text_hidden"] = new_q_tail
+                update_dict["trailing_text_hidden"] = new_q_tail
             else:
                 text_step = self.tts_pad_embed.to(input_embeds.device, dtype=input_embeds.dtype)
 
@@ -898,7 +898,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         user_mm_mask = multimodal_mask[im_start_index:segment_end_index]
-
         # Multimodal data exists
         if user_mm_mask.any():
             user_thinker_hidden_mm = thinker_hidden[im_start_index:segment_end_index][user_mm_mask]

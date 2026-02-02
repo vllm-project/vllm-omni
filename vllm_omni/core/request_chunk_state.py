@@ -15,8 +15,8 @@ class ChunkState:
     first_chunk_after_prefill: bool = True
     first_chunk_for_generation: bool = True
     upstream_finished: bool = False
-    accumulated_tokens: list[int] = field(default_factory=list)
-    accumulated_outputs: list[Any] = field(default_factory=list)
+    accumulated_data: list[Any] = field(default_factory=list)
+    first_batch_skipped: bool = False
 
 
 class RequestChunkStateManager:

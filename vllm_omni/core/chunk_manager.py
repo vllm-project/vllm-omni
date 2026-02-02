@@ -48,50 +48,31 @@ class ChunkManager:
         ):
             return False
 
-        chunk = self.chunk_processor.prepare_outgoing_chunk(request, pooler_output, token_ids)
-        if not chunk:
-            return False
-
         req_id = self.state_manager.get_global_request_id(request.request_id)
         state = self.state_manager.get_state(req_id)
 
-        # Handle batching if configured
-        batch_size = self.chunk_processor.chunk_batch_size
-        if batch_size is not None:
-            return self._send_with_batching(request, req_id, state, chunk, batch_size)
+        if self.chunk_processor.chunk_batch_size is not None:
+            chunk = self.chunk_processor.accumulate_and_prepare_batch(request, state, pooler_output, token_ids)
         else:
-            return self._send_immediate(request, req_id, state, chunk)
+            chunk = self.chunk_processor.prepare_outgoing_chunk(request, pooler_output, token_ids)
 
-    def _send_immediate(self, request, req_id, state, chunk) -> bool:
+        if not chunk:
+            return False
+
         chunk["last_chunk"] = request.is_finished()
-        key = self.stage_strategy.prepare_connector_key(state.sent_chunks_ar, self.stage_id, req_id)
-        success, _, _ = self.connector.put_chunk(str(self.stage_id), str(self.next_stage_id), key, chunk)
-        if success:
-            self.state_manager.increment_chunk_sent(req_id, generation=False)
-        return success
 
-    def _send_with_batching(self, request, req_id, state, chunk, batch_size) -> bool:
-        if "tokens" in chunk:
-            state.accumulated_tokens.extend(chunk["tokens"])
-        else:
-            state.accumulated_outputs.append(chunk)
-
-        is_finished = request.is_finished()
-        if len(state.accumulated_tokens) >= batch_size or is_finished:
-            # Skip first batch if configured
-            if self.chunk_processor.should_skip_first_chunk and state.first_chunk_for_generation:
-                state.first_chunk_for_generation = False
-                state.accumulated_tokens = []
-                return False
-
-            batched = {"tokens": list(state.accumulated_tokens), "last_chunk": is_finished}
+        if self.chunk_processor.chunk_batch_size is not None:
             key = self.stage_strategy.prepare_connector_key(state.sent_chunks_generation, self.stage_id, req_id)
-            success, _, _ = self.connector.put_chunk(str(self.stage_id), str(self.next_stage_id), key, batched)
+            success, _, _ = self.connector.put_chunk(str(self.stage_id), str(self.next_stage_id), key, chunk)
             if success:
                 self.state_manager.increment_chunk_sent(req_id, generation=True)
-                state.accumulated_tokens = []
-            return success
-        return False
+        else:
+            key = self.stage_strategy.prepare_connector_key(state.sent_chunks_ar, self.stage_id, req_id)
+            success, _, _ = self.connector.put_chunk(str(self.stage_id), str(self.next_stage_id), key, chunk)
+            if success:
+                self.state_manager.increment_chunk_sent(req_id, generation=False)
+
+        return success
 
     def receive_chunk(self, active_requests: list) -> ReceiveOutput:
         """Receive chunks for active requests."""
