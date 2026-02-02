@@ -867,9 +867,9 @@ class ZImageTransformer2DModel(CachedTransformer):
         x = pad_sequence(x, batch_first=True, padding_value=0.0)
         x_cos = pad_sequence(x_cos, batch_first=True, padding_value=0.0)
         x_sin = pad_sequence(x_sin, batch_first=True, padding_value=0.0)
-        x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(x_item_seqlens):
-            x_attn_mask[i, :seq_len] = 1
+        # Build mask without Python loop to avoid per-row index_put_ and kernel launch overhead
+        x_seqlens = torch.tensor(x_item_seqlens, device=device, dtype=torch.long)
+        x_attn_mask = torch.arange(x_max_item_seqlen, device=device).unsqueeze(0) < x_seqlens.unsqueeze(1)
 
         for layer in self.noise_refiner:
             x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
@@ -896,9 +896,9 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
         cap_cos = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
         cap_sin = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
-        cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(cap_item_seqlens):
-            cap_attn_mask[i, :seq_len] = 1
+        # Build mask without Python loop to avoid per-row index_put_ and kernel launch overhead
+        cap_seqlens = torch.tensor(cap_item_seqlens, device=device, dtype=torch.long)
+        cap_attn_mask = torch.arange(cap_max_item_seqlen, device=device).unsqueeze(0) < cap_seqlens.unsqueeze(1)
 
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
