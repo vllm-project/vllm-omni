@@ -45,6 +45,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
+        # TODO: Enable this when torch compile bugs are resolved
         return False
 
     @classmethod
