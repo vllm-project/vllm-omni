@@ -36,7 +36,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.platforms import current_omni_platform
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -247,7 +247,7 @@ class Qwen2_5OmniForConditionalGeneration(
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
 
-            if is_npu():
+            if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
                 # For MRoPE, positions shape is [3, num_tokens] (T/H/W), don't slice it

@@ -11,7 +11,7 @@ stage_args:
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       max_model_len: 896
       max_num_batched_tokens: 896
@@ -41,7 +41,7 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       max_model_len: 896
       max_num_batched_tokens: 896
@@ -71,7 +71,7 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.15
       enforce_eager: true

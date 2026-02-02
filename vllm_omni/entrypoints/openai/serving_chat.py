@@ -6,12 +6,16 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Final, Optional
+from typing import TYPE_CHECKING, Any, Final, Optional, cast
 
 import jinja2
+import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
+
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
     import soundfile
@@ -274,22 +278,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     lora_request=lora_request,
                 )
 
-                trace_headers = None if raw_request is None else await self._get_trace_headers(raw_request.headers)
-
                 generator = self.engine_client.generate(
                     prompt=engine_prompt,
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=request.priority,
                 )
 
                 generators.append(generator)
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert len(generators) == 1
         (result_generator,) = generators
@@ -317,8 +315,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
             )
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def _preprocess_chat(
         self,
@@ -635,7 +632,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -647,7 +644,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_parsers = [None] * num_choices
         except Exception as e:
             logger.exception("Error in tool parser creation.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -668,17 +665,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
+                # Initialize role before conditional blocks to avoid UnboundLocalError
+                # when handling audio/image responses
+                role = self.get_chat_request_role(request)
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
                     num_cached_tokens = res.num_cached_tokens
-                    # Send first response for each request.n (index) with
-                    # the role
-                    role = self.get_chat_request_role(request)
-
-                    # NOTE num_choices defaults to 1 so this usually executes
-                    # once per request
+                    # Send first response for each choice with role
+                    # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -1287,9 +1284,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
 
         except Exception as e:
-            # TODO: Use a vllm-specific Validation Error
             logger.exception("Error in chat completion stream generator.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
@@ -1314,8 +1310,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert final_outputs is not None
 
@@ -1488,7 +1483,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")
-                    return self.create_error_response(str(e))
+                    return self.create_error_response(e)
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning_content, content = reasoning_parser.extract_reasoning(output.text, request=request)
@@ -1573,7 +1568,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tool_parser = self.tool_parser(tokenizer)
                 except RuntimeError as e:
                     logger.exception("Error in tool parser creation.")
-                    return self.create_error_response(str(e))
+                    return self.create_error_response(e)
 
                 tool_call_info = tool_parser.extract_tool_calls(content if content is not None else "", request=request)
                 # In the OpenAI API the finish_reason is "tools_called"
@@ -1658,10 +1653,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
+        audio_data = final_res.multimodal_output.get("audio")
         if stream:
-            audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+            audio_tensor = audio_data[-1].float().detach().cpu().numpy()
         else:
-            audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+            if isinstance(audio_data, list):
+                audio_data = torch.cat(audio_data, dim=-1)
+            audio_tensor = audio_data.float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -1904,29 +1902,30 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning("Failed to decode reference image: %s", e)
 
             # Build generation kwargs
-            gen_kwargs: dict[str, Any] = {
+            gen_prompt: OmniTextPrompt = {
                 "prompt": prompt,
-                "request_id": request_id,
-                "num_inference_steps": num_inference_steps,
-                "height": height,
-                "width": width,
                 "negative_prompt": negative_prompt,
-                "num_outputs_per_prompt": num_outputs_per_prompt,
-                "seed": seed,
             }
+            gen_params = OmniDiffusionSamplingParams(
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                num_outputs_per_prompt=num_outputs_per_prompt,
+                seed=seed,
+            )
 
             if guidance_scale is not None:
-                gen_kwargs["guidance_scale"] = guidance_scale
+                gen_params.guidance_scale = guidance_scale
 
             # Add Qwen-Image specific parameter
             if true_cfg_scale is not None:
-                gen_kwargs["true_cfg_scale"] = true_cfg_scale
+                gen_params.true_cfg_scale = true_cfg_scale
 
             # Add video generation parameters if set
             if num_frames is not None:
-                gen_kwargs["num_frames"] = num_frames
+                gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
-                gen_kwargs["guidance_scale_2"] = guidance_scale_2
+                gen_params.guidance_scale_2 = guidance_scale_2
 
             # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
             if lora_body and isinstance(lora_body, dict):
@@ -1949,16 +1948,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         lora_int_id = stable_lora_int_id(str(lora_path))
                     if lora_name and lora_path:
                         lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
-                        gen_kwargs["lora_request"] = lora_req
+                        gen_params.lora_request = lora_req
                         if lora_scale is not None:
-                            gen_kwargs["lora_scale"] = float(lora_scale)
+                            gen_params.lora_scale = float(lora_scale)
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
             # Add reference image if provided
             if pil_images:
                 if len(pil_images) == 1:
-                    gen_kwargs["pil_image"] = pil_images[0]
+                    gen_prompt["multi_modal_data"] = {}
+                    gen_prompt["multi_modal_data"]["image"] = pil_images[0]
                 else:
                     od_config = getattr(self._diffusion_engine, "od_config", None)
                     supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
@@ -1966,7 +1966,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # TODO: entry is asyncOmni. We hack the od config here.
                         supports_multimodal_inputs = True
                     if supports_multimodal_inputs:
-                        gen_kwargs["pil_image"] = pil_images
+                        gen_prompt["multi_modal_data"] = {}
+                        gen_prompt["multi_modal_data"]["image"] = pil_images
                     else:
                         return self._create_error_response(
                             "Multiple input images are not supported by the current diffusion model. "
@@ -1979,18 +1980,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
             if hasattr(self._diffusion_engine, "stage_list"):
                 # AsyncOmni: iterate through async generator to get final output
+                diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
                 result = None
-                async for output in self._diffusion_engine.generate(
-                    prompt=gen_kwargs["prompt"],
-                    request_id=gen_kwargs.get("request_id"),
-                    sampling_params_list=[gen_kwargs],  # Pass as single-stage params
+                async for output in diffusion_engine.generate(
+                    prompt=gen_prompt,
+                    sampling_params_list=[gen_params],  # Pass as single-stage params
+                    request_id=request_id,
                 ):
                     result = output
                 if result is None:
                     return self._create_error_response("No output generated from AsyncOmni")
             else:
                 # AsyncOmniDiffusion: direct call
-                result = await self._diffusion_engine.generate(**gen_kwargs)
+                diffusion_engine = cast(AsyncOmniDiffusion, self._diffusion_engine)
+                result = await diffusion_engine.generate(
+                    prompt=gen_prompt,
+                    sampling_params=gen_params,
+                    request_id=request_id,
+                )
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])

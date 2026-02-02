@@ -5,8 +5,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import is_npu, is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,12 +21,11 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
-# NPU still can't run Tongyi-MAI/Z-Image-Turbo properly
 # Modelscope can't find riverclouds/qwen_image_random
 # TODO: When NPU support is ready, remove this branch.
-if is_npu():
-    models = ["Qwen/Qwen-Image"]
-elif is_rocm():
+if current_omni_platform.is_npu():
+    models = ["Tongyi-MAI/Z-Image-Turbo", "Qwen/Qwen-Image"]
+elif current_omni_platform.is_rocm():
     # TODO: When ROCm support is ready, remove this branch.
     # vLLM V0.11.0 has issues running riverclouds/qwen_image_random
     # on ROCm
@@ -42,12 +42,14 @@ def test_diffusion_model(model_name: str):
         width = 256
         outputs = m.generate(
             "a photo of a cat sitting on a laptop keyboard",
-            height=height,
-            width=width,
-            num_inference_steps=2,
-            guidance_scale=0.0,
-            generator=torch.Generator("cuda").manual_seed(42),
-            num_outputs_per_prompt=2,
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=2,
+                guidance_scale=0.0,
+                generator=torch.Generator("cuda").manual_seed(42),
+                num_outputs_per_prompt=2,
+            ),
         )
         # Extract images from request_output[0]['images']
         first_output = outputs[0]

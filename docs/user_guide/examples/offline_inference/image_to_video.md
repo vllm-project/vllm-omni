@@ -52,6 +52,7 @@ Key arguments:
 - `--num_frames`: Number of frames (default 81).
 - `--guidance_scale` and `--guidance_scale_high`: CFG scale (applied to low/high-noise stages for MoE).
 - `--negative_prompt`: Optional list of artifacts to suppress.
+- `--cfg_parallel_size`: the number of devices to run CFG Parallel. CFG Parallel is valid only if classifier-free guidance is enabled and `cfg_parallel_size` is set to 2.
 - `--boundary_ratio`: Boundary split ratio for two-stage MoE models.
 - `--flow_shift`: Scheduler flow shift (5.0 for 720p, 12.0 for 480p).
 - `--num_inference_steps`: Number of denoising steps (default 50).

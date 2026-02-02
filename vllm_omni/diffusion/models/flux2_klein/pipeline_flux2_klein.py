@@ -19,7 +19,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -36,6 +36,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
@@ -178,7 +179,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(mu)
 
 
-class Flux2KleinPipeline(nn.Module, SupportImageInput):
+class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     """Flux2 klein pipeline for text-to-image generation."""
 
     support_image_input = True
@@ -742,27 +743,54 @@ class Flux2KleinPipeline(nn.Module, SupportImageInput):
             `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
             generated images.
         """
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
-        prompt = req.prompt if req.prompt is not None else prompt
-        image = req.pil_image if req.pil_image is not None else image
-        height = req.height or height
-        width = req.width or width
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        guidance_scale = req.guidance_scale if req.guidance_scale is not None else guidance_scale
-        generator = req.generator or generator
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        if (
+            raw_image := None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("multi_modal_data", {}).get("image")
+        ) is None:
+            pass  # use image from param list
+        elif isinstance(raw_image, list):
+            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
+        else:
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        if isinstance(req.prompt_embeds, torch.Tensor):
-            prompt_embeds = req.prompt_embeds
-        if isinstance(req.negative_prompt_embeds, torch.Tensor):
-            negative_prompt_embeds = req.negative_prompt_embeds
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+        )
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
 
-        if req.max_sequence_length is not None:
-            max_sequence_length = req.max_sequence_length
-        if getattr(req, "text_encoder_out_layers", None) is not None:
-            text_encoder_out_layers = req.text_encoder_out_layers
+        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        if any(p is not None for p in req_prompt_embeds):
+            # If at list one prompt is provided as an embedding,
+            # Then assume that the user wants to provide embeddings for all prompts, and enter this if block
+            # If the user in fact provides mixed input format, req_prompt_embeds will have some None's
+            # And `torch.stack` automatically raises an exception for us
+            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
+
+        req_negative_prompt_embeds = [
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+        ]
+        if any(p is not None for p in req_negative_prompt_embeds):
+            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -896,38 +924,44 @@ class Flux2KleinPipeline(nn.Module, SupportImageInput):
                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
                 latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                guidance=None,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                joint_attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-
-            noise_pred = noise_pred[:, : latents.size(1) :]
-
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep / 1000,
+                "guidance": None,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_image_ids,
+                "joint_attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
+            }
             if self.do_classifier_free_guidance:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=None,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    joint_attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-                neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
-                noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": None,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_image_ids,
+                    "joint_attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
 
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            # For editing pipelines, we need to slice the output to remove condition latents
+            output_slice = latents.size(1) if image_latents is not None else None
 
-            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=self.do_classifier_free_guidance,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+                output_slice=output_slice,
+            )
+
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}

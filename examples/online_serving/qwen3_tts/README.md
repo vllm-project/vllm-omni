@@ -41,12 +41,14 @@ python openai_speech_client.py \
 
 # VoiceDesign: Describe the voice style
 python openai_speech_client.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --task-type VoiceDesign \
     --text "哥哥，你回来啦" \
     --instructions "体现撒娇稚嫩的萝莉女声，音调偏高"
 
 # Base: Voice cloning
 python openai_speech_client.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
     --task-type Base \
     --text "Hello, this is a cloned voice" \
     --ref-audio /path/to/reference.wav \
@@ -73,6 +75,9 @@ curl -X POST http://localhost:8000/v1/audio/speech \
         "voice": "Vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
+
+# List available voices in CustomVoice models
+curl http://localhost:8000/v1/audio/voices
 ```
 
 ## API Reference

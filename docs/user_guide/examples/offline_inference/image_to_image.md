@@ -47,6 +47,7 @@ Key arguments:
 - `--image`: path(s) to the source image(s) (PNG/JPG, converted to RGB). Can specify multiple images.
 - `--prompt` / `--negative_prompt`: text description (string).
 - `--cfg_scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.
+- `--cfg_parallel_size`: the number of devices to run CFG Parallel. CFG Parallel is valid only if classifier-free guidance is enabled and `cfg_parallel_size` is set to 2.
 - `--guidance_scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--output`: path to save the generated PNG.

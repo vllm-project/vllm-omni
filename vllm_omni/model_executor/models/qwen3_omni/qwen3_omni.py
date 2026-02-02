@@ -35,7 +35,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
-from vllm_omni.utils.platform_utils import is_npu
+from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -269,7 +269,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 1: Thinker ==========
         if self.model_stage == "thinker":
             thinker_dev = self._module_device(self.thinker)
-            if is_npu():
+            if current_omni_platform.is_npu():
                 # Normalize to batched inputs if needed
                 _added_batch_dim = False
                 if input_ids is not None and input_ids.ndim == 1:
@@ -308,7 +308,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     "capture_layer_indices": [0, int(accept_layer)],
                     "return_hidden_states": True,
                 }
-            if is_npu():
+            if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and _added_batch_dim else input_ids
                 thinker_inputs_embeds = (

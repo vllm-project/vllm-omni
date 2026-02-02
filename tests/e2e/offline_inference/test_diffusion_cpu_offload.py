@@ -6,7 +6,8 @@ import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.utils import GPUMemoryMonitor
-from vllm_omni.utils.platform_utils import is_npu, is_rocm
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +20,7 @@ models = ["riverclouds/qwen_image_random"]
 
 
 def inference(model_name: str, offload: bool = True):
-    torch.cuda.empty_cache()
+    current_omni_platform.empty_cache()
     device_index = torch.cuda.current_device()
     monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
@@ -30,11 +31,13 @@ def inference(model_name: str, offload: bool = True):
 
     m.generate(
         "a photo of a cat sitting on a laptop keyboard",
-        height=height,
-        width=width,
-        num_inference_steps=9,
-        guidance_scale=0.0,
-        generator=torch.Generator("cuda").manual_seed(42),
+        OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            num_inference_steps=9,
+            guidance_scale=0.0,
+            generator=torch.Generator("cuda").manual_seed(42),
+        ),
     )
     peak = monitor.peak_used_mb
     monitor.stop()
@@ -42,7 +45,7 @@ def inference(model_name: str, offload: bool = True):
     return peak
 
 
-@pytest.mark.skipif(is_npu() or is_rocm(), reason="Hardware not supported")
+@pytest.mark.skipif(current_omni_platform.is_npu() or current_omni_platform.is_rocm(), reason="Hardware not supported")
 @pytest.mark.parametrize("model_name", models)
 def test_cpu_offload_diffusion_model(model_name: str):
     try:

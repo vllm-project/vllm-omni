@@ -47,4 +47,9 @@ Key arguments:
 - `--guidance_scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--output`: path to save the generated PNG.
+- `--vae_use_slicing`: enable VAE slicing for memory optimization.
+- `--vae_use_tiling`: enable VAE tiling for memory optimization.
+- `--cfg_parallel_size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+
+> ℹ️ If you encounter OOM errors, try using `--vae_use_slicing` and `--vae_use_tiling` to reduce memory usage.

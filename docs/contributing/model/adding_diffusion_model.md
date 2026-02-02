@@ -204,7 +204,151 @@ Key point for writing the example:
 
 + Save or display the generated results so users can validate the integration.
 
-## Step 5: Open a Pull Request
+## Step 5: TeaCache Coefficient Estimation (Optional)
+
+If your model supports TeaCache acceleration, you need to estimate the polynomial coefficients for optimal caching performance.
+
+### 5.1 Add Extractor Function
+
+First, implement an extractor function in `vllm_omni/diffusion/cache/teacache/extractors.py`. The extractor extracts the modulated input and defines how to run transformer blocks:
+
+```python
+def extract_your_model_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    **kwargs: Any,
+) -> CacheContext:
+    # 1. Preprocessing
+    temb = module.time_embed(timestep)
+
+    # 2. Extract modulated input (for cache decision)
+    modulated_input = module.transformer_blocks[0].norm1(hidden_states, temb)
+
+    # 3. Define transformer execution
+    def run_transformer_blocks():
+        h = hidden_states
+        for block in module.transformer_blocks:
+            h = block(h, temb=temb)
+        return (h,)
+
+    # 4. Define postprocessing
+    def postprocess(h):
+        return module.proj_out(module.norm_out(h, temb))
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+```
+
+Register it in `EXTRACTOR_REGISTRY`:
+```python
+EXTRACTOR_REGISTRY = {
+    ...
+    "YourTransformer2DModel": extract_your_model_context,
+}
+```
+
+### 5.2 Add Adapter for Coefficient Estimation
+
+Add an adapter in `vllm_omni/diffusion/cache/teacache/coefficient_estimator.py`:
+
+```python
+class YourModelAdapter:
+    @staticmethod
+    def load_pipeline(model_path: str, device: str, dtype: torch.dtype) -> Any:
+        # Load your pipeline
+        ...
+
+    @staticmethod
+    def get_transformer(pipeline: Any) -> tuple[Any, str]:
+        return pipeline.transformer, "YourTransformer2DModel"
+
+    @staticmethod
+    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
+        registry = HookRegistry.get_or_create(transformer)
+        registry.register_hook(hook._HOOK_NAME, hook)
+
+_MODEL_ADAPTERS["YourModel"] = YourModelAdapter
+```
+
+### 5.3 Run Coefficient Estimation
+
+Use the provided script to estimate coefficients:
+
+```python
+from vllm_omni.diffusion.cache.teacache.coefficient_estimator import (
+    TeaCacheCoefficientEstimator,
+)
+from datasets import load_dataset
+from tqdm import tqdm
+
+# Load model
+estimator = TeaCacheCoefficientEstimator(
+    model_path="/path/to/model",
+    model_type="Bagel",  # Your model type
+    device="cuda",
+)
+
+# Load prompts (paper suggests ~70 prompts)
+dataset = load_dataset("nateraw/parti-prompts", split="train")
+prompts = dataset["Prompt"][:70]
+
+# Collect data
+for prompt in tqdm(prompts):
+    estimator.collect_from_prompt(prompt, num_inference_steps=50)
+
+# Estimate coefficients
+coeffs = estimator.estimate(poly_order=4)
+print(f"Coefficients: {coeffs}")
+```
+
+### 5.4 Interpreting Coefficient Estimation Results
+
+The estimator outputs statistics and polynomial coefficients. Here's how to interpret them:
+
+**Example Output:**
+```
+Data statistics:
+Count: 48
+Input Diffs (x): min=1.1089e-02, max=5.2555e-02, mean=2.8435e-02
+Output Diffs (y): min=2.8242e-02, max=2.9792e-01, mean=7.0312e-02
+Coefficients: [1333131.29, -168644.23, 7950.51, -163.75, 1.26]
+```
+
+**What to Check:**
+- **Count**: Number of timestep pairs analyzed. Should be at least 30-50 for reliable estimation. Low count suggests insufficient prompts or inference steps.
+- **Input/Output Ranges**: Verify output differences correlate with input differences. If ranges seem unusual, check your prompt diversity.
+- **Coefficient Magnitude**: Extremely large values (>1e8) may indicate numerical instability - try collecting more diverse data.
+
+**Troubleshooting:**
+- If results seem unreliable, try:
+  - Increasing number of prompts (100+ recommended)
+  - Using more diverse prompts from multiple datasets
+  - Adjusting `num_inference_steps` (try 20, 50, 100)
+
+### 5.5 Add Coefficients to Config
+
+Add the estimated coefficients to `vllm_omni/diffusion/cache/teacache/config.py`:
+
+```python
+_MODEL_COEFFICIENTS = {
+    ...
+    "YourTransformer2DModel": [
+        1.04730573e+06,  # a4
+        -1.34150749e+05, # a3
+        6.51517806e+03,  # a2
+        -1.41209108e+02, # a1
+        1.17241808e+00,  # a0
+    ],
+}
+```
+## Step 6: Open a Pull Request
 
 When submitting a pull request to add support for a new model, please include the following information in the PR description:
 

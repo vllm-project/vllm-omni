@@ -272,16 +272,22 @@ class BagelPipeline(nn.Module):
 
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        prompt = req.prompt or ""
-        if isinstance(prompt, list):
-            # vllm-omni request supports list; Bagel pipeline currently supports first prompt.
-            prompt = prompt[0] if prompt else ""
+        if len(req.prompts) > 1:
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
+        # TODO: In online mode, sometimes it receives [{"prompts": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        first_prompt = req.prompts[0]
+        prompt = first_prompt if isinstance(req.prompts[0], str) else (req.prompts[0].get("prompt") or "")
+
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
-        if req.height is None and req.width is None:
+        if req.sampling_params.height is None and req.sampling_params.width is None:
             height = width = max_hw
         else:
-            height = int(req.height) if req.height is not None else max_hw
-            width = int(req.width) if req.width is not None else max_hw
+            height = int(req.sampling_params.height) if req.sampling_params.height is not None else max_hw
+            width = int(req.sampling_params.width) if req.sampling_params.width is not None else max_hw
         if height > max_hw or width > max_hw:
             raise ValueError(
                 f"Requested resolution {height}x{width} exceeds Bagel checkpoint limit "
@@ -292,7 +298,7 @@ class BagelPipeline(nn.Module):
 
         # Map request params to Bagel gen params (defaults follow Bagel inferencer)
         gen_params = BagelGenParams(
-            num_timesteps=int(req.num_inference_steps or 50),
+            num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
         )
 
@@ -304,7 +310,7 @@ class BagelPipeline(nn.Module):
 
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
-        injected_kv = getattr(req, "past_key_values", None)
+        injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
             gen_context["past_key_values"] = injected_kv
@@ -316,9 +322,13 @@ class BagelPipeline(nn.Module):
             gen_context["ropes"] = [seq_len]
 
         else:
-            image_input = getattr(req, "pil_image", None)
+            image_input = (
+                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+            )
             if image_input and not isinstance(image_input, list):
                 image_input = [image_input]
+            if image_input:
+                image_input = [Image.open(image) if isinstance(image, str) else image for image in image_input]
 
             if image_input:
                 # If we have an image, we prefill with it
@@ -414,10 +424,10 @@ class BagelPipeline(nn.Module):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
-        if req.seed is not None:
-            torch.manual_seed(req.seed)
+        if req.sampling_params.seed is not None:
+            torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
-                torch.cuda.manual_seed(req.seed)
+                torch.cuda.manual_seed(req.sampling_params.seed)
 
         # Prepare latent query and run flow
         generation_input = self.bagel.prepare_vae_latent(

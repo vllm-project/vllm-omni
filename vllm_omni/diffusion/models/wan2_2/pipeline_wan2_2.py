@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Iterable
+from typing import Any, cast
 
 import PIL.Image
 import torch
@@ -16,11 +18,16 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.platforms import current_omni_platform
+
+logger = logging.getLogger(__name__)
 
 
 def retrieve_latents(
@@ -127,44 +134,59 @@ def get_wan22_pre_process_func(
 
     video_processor = VideoProcessor(vae_scale_factor=8)
 
-    def pre_process_func(requests: list[OmniDiffusionRequest]) -> list[OmniDiffusionRequest]:
-        for req in requests:
-            # Load image if path is provided
-            if req.image_path is not None and req.pil_image is None:
-                req.pil_image = PIL.Image.open(req.image_path).convert("RGB")
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        for i, prompt in enumerate(request.prompts):
+            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
+            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
 
-            if req.pil_image is not None:
-                image = req.pil_image
+            if raw_image is None:
+                continue
 
-                # Calculate dimensions based on aspect ratio if not provided
-                if req.height is None or req.width is None:
-                    # Default max area for 720P
-                    max_area = 720 * 1280
-                    aspect_ratio = image.height / image.width
+            if not isinstance(raw_image, (str, PIL.Image.Image)):
+                raise TypeError(
+                    f"""Unsupported image format {raw_image.__class__}.""",
+                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
+                )
+            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
 
-                    # Calculate dimensions maintaining aspect ratio
-                    mod_value = 16  # Must be divisible by 16
-                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            # Calculate dimensions based on aspect ratio if not provided
+            if request.sampling_params.height is None or request.sampling_params.width is None:
+                # Default max area for 720P
+                max_area = 720 * 1280
+                aspect_ratio = image.height / image.width
 
-                    if req.height is None:
-                        req.height = height
-                    if req.width is None:
-                        req.width = width
+                # Calculate dimensions maintaining aspect ratio
+                mod_value = 16  # Must be divisible by 16
+                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-                # Resize image to target dimensions
-                image = image.resize((req.width, req.height), PIL.Image.Resampling.LANCZOS)
-                req.pil_image = image
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = height
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = width
 
-                # Preprocess for VAE
-                req.preprocessed_image = video_processor.preprocess(image, height=req.height, width=req.width)
+            # Resize image to target dimensions
+            image = image.resize(
+                (request.sampling_params.width, request.sampling_params.height),  # type: ignore # Above has ensured that width & height are not None
+                PIL.Image.Resampling.LANCZOS,
+            )
+            prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
-        return requests
+            # Preprocess for VAE
+            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
+                image, height=request.sampling_params.height, width=request.sampling_params.width
+            )
+            request.prompts[i] = prompt
+        return request
 
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module):
+class Wan22Pipeline(nn.Module, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -207,17 +229,30 @@ class Wan22Pipeline(nn.Module):
             except Exception:
                 pass
 
+        self.boundary_ratio = od_config.boundary_ratio
+
+        # Determine which transformers to load based on boundary_ratio
+        # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
+        # boundary_ratio=0.0: only load transformer (high-noise stage only)
+        # otherwise: load both transformers
+        load_transformer = self.boundary_ratio != 1.0 if self.boundary_ratio is not None else True
+        load_transformer_2 = self.has_transformer_2 and (
+            self.boundary_ratio != 0.0 if self.boundary_ratio is not None else True
+        )
+
         # Set up weights sources for transformer(s)
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            ),
-        ]
-        if self.has_transformer_2:
+        self.weights_sources = []
+        if load_transformer:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
+            )
+        if load_transformer_2:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
@@ -237,13 +272,25 @@ class Wan22Pipeline(nn.Module):
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
-        if self.has_transformer_2:
+        if load_transformer:
+            transformer_config = load_transformer_config(model, "transformer", local_files_only)
+            self.transformer = create_transformer_from_config(transformer_config)
+        else:
+            self.transformer = None
+
+        if load_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
             self.transformer_2 = create_transformer_from_config(transformer_2_config)
         else:
             self.transformer_2 = None
+
+        # Store the active transformer config
+        if load_transformer:
+            self.transformer_config = self.transformer.config
+        elif load_transformer_2:
+            self.transformer_config = self.transformer_2.config
+        else:
+            raise RuntimeError("No transformer loaded")
 
         # Initialize UniPC scheduler
         flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
@@ -255,7 +302,6 @@ class Wan22Pipeline(nn.Module):
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
-        self.boundary_ratio = od_config.boundary_ratio
 
         self._guidance_scale = None
         self._guidance_scale_2 = None
@@ -289,37 +335,44 @@ class Wan22Pipeline(nn.Module):
         guidance_scale: float | tuple[float, float] = 4.0,
         frame_num: int = 81,
         output_type: str | None = "np",
-        generator: torch.Generator | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
         **kwargs,
     ) -> DiffusionOutput:
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        # Get parameters from request or arguments
+        if len(req.prompts) > 1:
+            raise ValueError(
+                """This model only supports a single prompt, not a batched request.""",
+                """Please pass in a single prompt object or string, or a single-item list.""",
+            )
+        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
+            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
+            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
-        height = req.height or height
-        width = req.width or width
-        num_frames = req.num_frames if req.num_frames else frame_num
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
-        patch_size = self.transformer.config.patch_size
+        patch_size = self.transformer_config.patch_size
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = req.num_inference_steps or num_inference_steps
+        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
 
         # Respect per-request guidance_scale when explicitly provided.
-        if req.guidance_scale_provided:
-            guidance_scale = req.guidance_scale
+        if req.sampling_params.guidance_scale_provided:
+            guidance_scale = req.sampling_params.guidance_scale
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
-            req.guidance_scale_2
-            if req.guidance_scale_2 is not None
+            req.sampling_params.guidance_scale_2
+            if req.sampling_params.guidance_scale_2 is not None
             else (
                 guidance_scale[1]
                 if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
@@ -347,13 +400,20 @@ class Wan22Pipeline(nn.Module):
         num_frames = max(num_frames, 1)
 
         device = self.device
-        dtype = self.transformer.dtype
+        # Get dtype from whichever transformer is loaded
+        if self.transformer is not None:
+            dtype = self.transformer.dtype
+        elif self.transformer_2 is not None:
+            dtype = self.transformer_2.dtype
+        else:
+            # Fallback to text_encoder dtype if no transformer loaded
+            dtype = self.text_encoder.dtype
 
         # Seed / generator
         if generator is None:
-            generator = req.generator
-        if generator is None and req.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.seed)
+            generator = req.sampling_params.generator
+        if generator is None and req.sampling_params.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
         # Encode prompts
         if prompt_embeds is None:
@@ -361,8 +421,8 @@ class Wan22Pipeline(nn.Module):
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.num_outputs_per_prompt or 1,
-                max_sequence_length=req.max_sequence_length or 512,
+                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                max_sequence_length=req.sampling_params.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
@@ -384,7 +444,22 @@ class Wan22Pipeline(nn.Module):
             boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Handle I2V mode when expand_timesteps=True and image is provided
-        image = req.pil_image
+        multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
+        raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
+        if isinstance(raw_image, list):
+            if len(raw_image) > 1:
+                logger.warning(
+                    """Received a list of image. Only a single image is supported by this model."""
+                    """Taking only the first image for now."""
+                )
+            raw_image = raw_image[0]
+        if raw_image is None:
+            image = None
+        elif isinstance(raw_image, str):
+            image = PIL.Image.open(raw_image)
+        else:
+            image = cast(PIL.Image.Image | torch.Tensor, raw_image)
+
         latent_condition = None
         first_frame_mask = None
 
@@ -402,7 +477,7 @@ class Wan22Pipeline(nn.Module):
                 image_tensor = image
 
             # Use out_channels for noise latents (not in_channels which includes condition)
-            num_channels_latents = self.transformer.config.out_channels
+            num_channels_latents = self.transformer_config.out_channels
             batch_size = prompt_embeds.shape[0]
 
             # Prepare noise latents
@@ -415,7 +490,7 @@ class Wan22Pipeline(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.latents,
+                latents=req.sampling_params.latents,
             )
 
             # Encode image condition
@@ -447,7 +522,7 @@ class Wan22Pipeline(nn.Module):
             first_frame_mask[:, :, 0] = 0
         else:
             # T2V mode: standard latent preparation
-            num_channels_latents = self.transformer.config.in_channels
+            num_channels_latents = self.transformer_config.in_channels
             latents = self.prepare_latents(
                 batch_size=prompt_embeds.shape[0],
                 num_channels_latents=num_channels_latents,
@@ -457,7 +532,7 @@ class Wan22Pipeline(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.latents,
+                latents=req.sampling_params.latents,
             )
 
         if attention_kwargs is None:
@@ -466,11 +541,30 @@ class Wan22Pipeline(nn.Module):
         # Denoising
         for t in timesteps:
             self._current_timestep = t
-            current_model = self.transformer
-            current_guidance_scale = guidance_low
-            if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                current_model = self.transformer_2
+
+            # Select model based on timestep and boundary_ratio
+            # High noise stage (t >= boundary_timestep): use transformer
+            # Low noise stage (t < boundary_timestep): use transformer_2
+            if boundary_timestep is not None and t < boundary_timestep:
+                # Low noise stage - always use guidance_high for this stage
                 current_guidance_scale = guidance_high
+                if self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                elif self.transformer is not None:
+                    # Fallback to transformer if transformer_2 not loaded
+                    current_model = self.transformer
+                else:
+                    raise RuntimeError("No transformer available for low-noise stage")
+            else:
+                # High noise stage - always use guidance_low for this stage
+                current_guidance_scale = guidance_low
+                if self.transformer is not None:
+                    current_model = self.transformer
+                elif self.transformer_2 is not None:
+                    # Fallback to transformer_2 if transformer not loaded
+                    current_model = self.transformer_2
+                else:
+                    raise RuntimeError("No transformer available for high-noise stage")
 
             if self.expand_timesteps and latent_condition is not None:
                 # I2V mode: blend condition with latents using mask
@@ -478,7 +572,7 @@ class Wan22Pipeline(nn.Module):
                 latent_model_input = latent_model_input.to(dtype)
 
                 # Expand timesteps per patch - use floor division to match patch embedding
-                patch_size = self.transformer.config.patch_size
+                patch_size = self.transformer_config.patch_size
                 num_latent_frames = latents.shape[2]
                 patch_height = latents.shape[3] // patch_size[1]
                 patch_width = latents.shape[4] // patch_size[2]
@@ -493,26 +587,44 @@ class Wan22Pipeline(nn.Module):
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
 
-            noise_pred = current_model(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                attention_kwargs=attention_kwargs,
-                return_dict=False,
-            )[0]
+            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+            # Prepare kwargs for positive and negative predictions
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep,
+                "encoder_hidden_states": prompt_embeds,
+                "attention_kwargs": attention_kwargs,
+                "return_dict": False,
+                "current_model": current_model,
+            }
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+            else:
+                negative_kwargs = None
 
-            if current_guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                noise_uncond = current_model(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
+            # Predict noise with automatic CFG parallel handling
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=current_guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
 
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+        # Wan2.2 is prone to out of memory errors when predicting large videos
+        # so we empty the cache here to avoid OOM before vae decoding.
+        if current_omni_platform.is_available():
+            current_omni_platform.empty_cache()
         self._current_timestep = None
 
         # For I2V mode: blend final latents with condition
@@ -536,6 +648,21 @@ class Wan22Pipeline(nn.Module):
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
+
+    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+        """
+        Forward pass through transformer to predict noise.
+
+        Args:
+            current_model: The transformer model to use (transformer or transformer_2)
+            **kwargs: Arguments to pass to the transformer
+
+        Returns:
+            Predicted noise tensor
+        """
+        if current_model is None:
+            current_model = self.transformer
+        return current_model(**kwargs)[0]
 
     def encode_prompt(
         self,
