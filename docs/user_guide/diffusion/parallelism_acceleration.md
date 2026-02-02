@@ -18,20 +18,19 @@ The following table shows which models are currently supported by parallelism me
 
 ### ImageGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel |
-|-------|------------------|------------|---------|--------------|--------------------------|
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ✅ | ✅ | ❌ | ❌ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ✅ | ✅ | ❌ | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ❌ | ❌ | ❌ |
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ✅ (TP=2 only) |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
-| **FLUX.2-klein** | `black-forest-labs/FLUX.2-klein-4B` | ❌ | ❌ | ❌ | ✅ |
-| **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ❌ | ❌ | ✅ |
-
+| Model                    | Model Identifier                     | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel |
+|--------------------------|--------------------------------------|:----------:|:-------:|:------------:|:---------------:|
+| **LongCat-Image**        | `meituan-longcat/LongCat-Image`      |     ✅      |    ✅    |      ❌       |        ✅        |
+| **LongCat-Image-Edit**   | `meituan-longcat/LongCat-Image-Edit` |     ✅      |    ✅    |      ❌       |        ✅        |
+| **Ovis-Image**           | `OvisAI/Ovis-Image`                  |     ❌      |    ❌    |      ❌       |        ❌        |
+| **Qwen-Image**           | `Qwen/Qwen-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |
+| **Qwen-Image-Edit**      | `Qwen/Qwen-Image-Edit`               |     ✅      |    ✅    |      ✅       |        ✅        |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509`          |     ✅      |    ✅    |      ✅       |        ✅        |
+| **Qwen-Image-Layered**   | `Qwen/Qwen-Image-Layered`            |     ✅      |    ✅    |      ✅       |        ✅        |
+| **Z-Image**              | `Tongyi-MAI/Z-Image-Turbo`           |     ✅      |    ✅    |      ❌       |  ✅ (TP=2 only)  |
+| **Stable-Diffusion3.5**  | `stabilityai/stable-diffusion-3.5`   |     ❌      |    ❌    |      ❌       |        ❌        |
+| **FLUX.2-klein**         | `black-forest-labs/FLUX.2-klein-4B`  |     ❌      |    ❌    |      ❌       |        ✅        |
+| **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |
 
 !!! note "TP Limitations for Diffusion Models"
     We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
