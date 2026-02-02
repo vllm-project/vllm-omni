@@ -113,6 +113,7 @@ async def async_request_openai_chat_omni_completions(
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
+    timestamp = st
     audio_generate_time = 0.0
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:

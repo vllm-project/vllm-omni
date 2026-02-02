@@ -220,44 +220,44 @@ If successful, you will see the following output:
 ============ Serving Benchmark Result ============
 Successful requests:                     2
 Failed requests:                         0
-Benchmark duration (s):                  3.97
-Request throughput (req/s):              0.50
+Benchmark duration (s):                  3.89
+Request throughput (req/s):              0.51
 Peak concurrent requests:                2.00
 ----------------End-to-end Latency----------------
-Mean E2EL (ms):                          1773.69
-Median E2EL (ms):                        1773.69
-P99 E2EL (ms):                           1780.26
+Mean E2EL (ms):                          3824.76
+Median E2EL (ms):                        3824.76
+P99 E2EL (ms):                           3888.54
 ================== Text Result ===================
 Total input tokens:                      30
 Total generated tokens:                  10101
-Output token throughput (tok/s):         2544.99
+Output token throughput (tok/s):         2595.57
 Peak output token throughput (tok/s):    111.00
 Peak concurrent requests:                2.00
-Total Token throughput (tok/s):          2552.55
+Total Token throughput (tok/s):          2603.28
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          115.43
-Median TTFT (ms):                        115.43
-P99 TTFT (ms):                           142.85
+Mean TTFT (ms):                          117.15
+Median TTFT (ms):                        117.15
+P99 TTFT (ms):                           142.69
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          0.33
-Median TPOT (ms):                        0.33
-P99 TPOT (ms):                           0.33
+Mean TPOT (ms):                          0.73
+Median TPOT (ms):                        0.73
+P99 TPOT (ms):                           0.74
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           16.58
-Median ITL (ms):                         16.15
-P99 ITL (ms):                            55.99
+Mean ITL (ms):                           16.47
+Median ITL (ms):                         16.19
+P99 ITL (ms):                            52.55
 ================== Audio Result ==================
 Total audio duration generated(s):       15.79
 Total audio frames generated:            379050
-Audio throughput(audio duration/s):      3.98
+Audio throughput(audio duration/s):      4.06
 ---------------Time to First Packet---------------
-Mean AUDIO_TTFP (ms):                    3760.98
-Median AUDIO_TTFP (ms):                  3760.98
-P99 AUDIO_TTFP (ms):                     3834.66
+Mean AUDIO_TTFP (ms):                    3701.37
+Median AUDIO_TTFP (ms):                  3701.37
+P99 AUDIO_TTFP (ms):                     3762.25
 -----------------Real Time Factor-----------------
-Mean AUDIO_RTF:                          0.48
-Median AUDIO_RTF:                        0.48
-P99 AUDIO_RTF:                           0.49
+Mean AUDIO_RTF:                          0.47
+Median AUDIO_RTF:                        0.47
+P99 AUDIO_RTF:                           0.48
 ==================================================
 ```
 Notes:
