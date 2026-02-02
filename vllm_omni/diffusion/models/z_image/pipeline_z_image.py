@@ -529,13 +529,10 @@ class ZImagePipeline(nn.Module):
 
         # Precompute normalized timesteps once to avoid per-step GPU->CPU sync (.item() causes cudaStreamSynchronize)
         if isinstance(timesteps, torch.Tensor):
-            norm_timesteps = (1000 - timesteps) / 1000
+            timesteps_tensor = timesteps.to(device=device, dtype=torch.float32)
         else:
-            ts = [
-                t if isinstance(t, torch.Tensor) else torch.as_tensor(t, device=device, dtype=torch.float32)
-                for t in timesteps
-            ]
-            norm_timesteps = (1000 - torch.stack(ts)) / 1000
+            timesteps_tensor = torch.as_tensor(timesteps, device=device, dtype=torch.float32)
+        norm_timesteps = (1000 - timesteps_tensor) / 1000
         t_norm_list = norm_timesteps.cpu().tolist()
         if not isinstance(t_norm_list, list):
             t_norm_list = [t_norm_list]
