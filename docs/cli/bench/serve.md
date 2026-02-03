@@ -52,7 +52,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
 - `--percentile-metrics`  
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
-                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf". '
+                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
 - `--save-result`  
 Specify to save benchmark results to a json file
