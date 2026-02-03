@@ -221,8 +221,8 @@ class OmniStage:
 
         # Wait for result from worker
         try:
-            # Profiling stop might take time to flush files, give it 180s
-            response = self._out_q.get(timeout=60000)
+            # Profiling stop might take time to flush files, give it 600s
+            response = self._out_q.get(timeout=600)
 
             if isinstance(response, dict):
                 if response.get("type") == "profiler_result":
@@ -670,12 +670,22 @@ def _stage_worker(
                     break
 
         lock_files = acquired_lock_fds
+
+        # Set FD_CLOEXEC on all lock file descriptors to prevent child processes
+        # (e.g., EngineCore) from inheriting them, which would cause deadlock
+        for lock_fd in acquired_lock_fds:
+            try:
+                flags = fcntl.fcntl(lock_fd, fcntl.F_GETFD)
+                fcntl.fcntl(lock_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+            except (OSError, ValueError):
+                pass
     except Exception as e:
         logger.debug(
             "[Stage-%s] Failed to set up sequential initialization lock: %s",
             stage_id,
             e,
         )
+
     # Init engine based on stage_type
     logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
     if engine_args.get("async_chunk", False):
@@ -686,30 +696,29 @@ def _stage_worker(
             break
         engine_args["stage_connector_spec"] = stage_connector_spec
         engine_args["stage_id"] = stage_id
-    try:
-        if stage_type == "diffusion":
-            engine_args.pop("model_stage", None)
-            engine_args.pop("model", None)
-            stage_engine = OmniDiffusion(
-                model=model,
-                stage_id=stage_id,
-                engine_input_source=stage_payload.get("engine_input_source", []),
-                **engine_args,
-            )
-        else:
-            # Default to LLM engine
-            stage_engine = OmniLLM(model=model, **engine_args)
-    finally:
-        # Release all locks by closing file descriptors
-        # Locks are automatically released when file descriptors are closed
-        # or when process dies
-        for lock_fd in lock_files:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                _os.close(lock_fd)
-                logger.debug("Released initialization lock (fd=%s)", lock_fd)
-            except (OSError, ValueError):
-                pass
+    if stage_type == "diffusion":
+        engine_args.pop("model_stage", None)
+        engine_args.pop("model", None)
+        stage_engine = OmniDiffusion(
+            model=model,
+            stage_id=stage_id,
+            engine_input_source=stage_payload.get("engine_input_source", []),
+            **engine_args,
+        )
+    else:
+        # Default to LLM engine
+        stage_engine = OmniLLM(model=model, **engine_args)
+
+    # Release all locks AFTER engine initialization completes
+    for lock_fd in lock_files:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _os.close(lock_fd)
+            logger.debug("Released initialization lock (fd=%s)", lock_fd)
+        except (OSError, ValueError):
+            pass
+    lock_files = []  # Clear after release
+
     logger.debug("Engine initialized")
     # Initialize OmniConnectors if configured
     connectors: dict[tuple[str, str], OmniConnectorBase] | None = {}

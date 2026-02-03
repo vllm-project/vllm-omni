@@ -59,7 +59,7 @@ class OmniRequestOutput:
     prompt: OmniPromptType | None = None
     latents: torch.Tensor | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
-    multimodal_output: dict[str, Any] = field(default_factory=dict)
+    _multimodal_output: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_pipeline(
@@ -116,9 +116,20 @@ class OmniRequestOutput:
             prompt=prompt,
             latents=latents,
             metrics=metrics or {},
-            multimodal_output=multimodal_output or {},
+            _multimodal_output=multimodal_output or {},
             finished=True,
         )
+
+    @property
+    def multimodal_output(self) -> dict[str, Any]:
+        """Return multimodal output from the underlying request output or local field.
+
+        For pipeline outputs, this proxies to request_output.multimodal_output.
+        For diffusion outputs, this returns the local _multimodal_output field.
+        """
+        if self.request_output is not None:
+            return getattr(self.request_output, "multimodal_output", {})
+        return self._multimodal_output
 
     @property
     def num_images(self) -> int:
@@ -229,7 +240,7 @@ class OmniRequestOutput:
             f"prompt={self.prompt!r}",
             f"latents={self.latents}",
             f"metrics={self.metrics}",
-            f"multimodal_output={self.multimodal_output}",
+            f"multimodal_output={self._multimodal_output}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"

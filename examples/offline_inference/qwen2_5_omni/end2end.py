@@ -410,7 +410,7 @@ def main(args):
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
                 request_id = output.request_id
-                audio_tensor = output.multimodal_output["audio"]
+                audio_tensor = output.outputs[0].multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")

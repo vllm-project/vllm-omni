@@ -111,6 +111,10 @@ def run_tts_generation(args) -> None:
         print(response.text)
         return
 
+    if response.content.decode("utf-8").startswith('{"error"'):
+        print(f"Error: {response.content.decode('utf-8')}")
+        return
+
     # Save audio response
     output_path = args.output or "tts_output.wav"
     with open(output_path, "wb") as f:
