@@ -47,10 +47,15 @@ Key arguments:
 - `--image`: path(s) to the source image(s) (PNG/JPG, converted to RGB). Can specify multiple images.
 - `--prompt` / `--negative_prompt`: text description (string).
 - `--cfg_scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.
-- `--cfg_parallel_size`: the number of devices to run CFG Parallel. CFG Parallel is valid only if classifier-free guidance is enabled and `cfg_parallel_size` is set to 2.
 - `--guidance_scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--output`: path to save the generated PNG.
+- `--vae_use_slicing`: enable VAE slicing for memory optimization.
+- `--vae_use_tiling`: enable VAE tiling for memory optimization.
+- `--cfg_parallel_size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+
+> ℹ️ If you encounter OOM errors, try using `--vae_use_slicing` and `--vae_use_tiling` to reduce memory usage.
 
 ## Example materials
 
