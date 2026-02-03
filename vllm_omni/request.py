@@ -1,6 +1,8 @@
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import numpy as np
+import torch
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -25,20 +27,34 @@ class OmniRequest(Request):
 
     def __init__(
         self,
-        prompt_embeds: PromptEmbedsPayload | None = None,
+        prompt_embeds: PromptEmbedsPayload | torch.Tensor | None = None,
         # Optional external request ID for tracking
         external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         *args,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
-        # Serialized prompt embeddings payload (optional)
-        self.prompt_embeds: PromptEmbedsPayload | None = prompt_embeds
+        prompt_embeds_tensor = self._maybe_decode_prompt_embeds(prompt_embeds)
+        super().__init__(prompt_embeds=prompt_embeds_tensor, *args, **kwargs)
+        # Preserve serialized prompt embeddings payload (optional)
+        self.prompt_embeds_payload: PromptEmbedsPayload | None = (
+            prompt_embeds if isinstance(prompt_embeds, PromptEmbedsPayload) else None
+        )
         # Optional external request ID for tracking
         self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
+
+    @staticmethod
+    def _maybe_decode_prompt_embeds(
+        prompt_embeds: PromptEmbedsPayload | torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if isinstance(prompt_embeds, PromptEmbedsPayload):
+            dtype = getattr(np, prompt_embeds.dtype)
+            arr = np.frombuffer(prompt_embeds.data, dtype=dtype)
+            arr = arr.reshape(prompt_embeds.shape)
+            return torch.from_numpy(arr)
+        return prompt_embeds
 
     @classmethod
     def from_engine_core_request(
@@ -74,4 +90,5 @@ class OmniRequest(Request):
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             additional_information=request.additional_information,
+            resumable=request.resumable,
         )

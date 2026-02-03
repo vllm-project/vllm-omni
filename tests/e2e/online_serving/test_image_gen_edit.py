@@ -23,6 +23,8 @@ from vllm.assets.image import ImageAsset
 from vllm.utils.network_utils import get_open_port
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+# Increase timeout for downloading assets from S3 (default 5s is too short for CI)
+os.environ.setdefault("VLLM_IMAGE_FETCH_TIMEOUT", "60")
 
 models = ["Qwen/Qwen-Image-Edit-2509"]
 test_params = models
