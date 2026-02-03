@@ -19,40 +19,41 @@ from typing import Annotated, Any, cast
 
 import httpx
 import vllm.envs as envs
-from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
 from starlette.routing import Route
 from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.anthropic.serving_messages import AnthropicServingMessages
+from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.api_server import (
-    base,
-    build_app,
-    load_log_config,
-    router,
-    setup_server,
-)
-from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.protocol import (
+from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
+from vllm.entrypoints.openai.api_server import base, load_log_config
+from vllm.entrypoints.openai.api_server import build_app as build_openai_app
+from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
-    ErrorResponse,
-    ModelCard,
-    ModelList,
-    ModelPermission,
 )
 
 # yapf conflicts with isort for this block
 # yapf: disable
 # yapf: enable
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-from vllm.entrypoints.openai.serving_responses import OpenAIServingResponses
-from vllm.entrypoints.openai.serving_transcription import (
+from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+from vllm.entrypoints.openai.engine.protocol import (
+    ErrorResponse,
+    ModelCard,
+    ModelList,
+    ModelPermission,
+)
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.orca_metrics import metrics_header
+from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+from vllm.entrypoints.openai.translations.serving import (
     OpenAIServingTranscription,
     OpenAIServingTranslation,
 )
@@ -63,10 +64,8 @@ from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
 from vllm.entrypoints.pooling.score.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
-from vllm.entrypoints.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.utils import (
     load_aware_call,
-    process_chat_template,
     process_lora_modules,
     with_cancellation,
 )
@@ -93,29 +92,41 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
+router = APIRouter()
+
+
+def _remove_route_from_router(
+    router: APIRouter,
+    path: str,
+    methods: set[str] | None = None,
+) -> None:
+    methods_set = {method.upper() for method in methods} if methods else None
+    for route in list(router.routes):
+        if getattr(route, "path", None) != path:
+            continue
+        if methods_set is not None:
+            route_methods = {method.upper() for method in (getattr(route, "methods", None) or set())}
+            if not (route_methods & methods_set):
+                continue
+        router.routes.remove(route)
+
 
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
-def _remove_route_from_router(router_obj, path: str, methods: set[str] | None = None):
-    """Remove a route from the router by path and optionally by methods.
+def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
+    """Remove a route from the app by path and optionally by methods.
 
-    This is needed because vllm's api_server registers routes when imported,
-    and we need to override some routes (like /v1/chat/completions) with
-    omni-specific implementations.
+    OMNI: used to override upstream /v1/chat/completions with omni behavior.
     """
     routes_to_remove = []
-    for route in router_obj.routes:
+    for route in app.routes:
         if isinstance(route, Route) and route.path == path:
             if methods is None or (hasattr(route, "methods") and route.methods & methods):
                 routes_to_remove.append(route)
 
     for route in routes_to_remove:
-        router_obj.routes.remove(route)
-
-
-# Remove vllm's /v1/chat/completions route so we can register our own omni version
-_remove_route_from_router(router, "/v1/chat/completions", {"POST"})
+        app.routes.remove(route)
 
 
 class _DiffusionServingModels:
@@ -162,7 +173,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     # Add process-specific prefix to stdout and stderr.
     decorate_logs("APIServer")
 
-    listen_address, sock = setup_server(args)
+    listen_address, sock = setup_openai_server(args)
 
     # Unified use of omni_run_server_worker, AsyncOmni automatically handles LLM and Diffusion models
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
@@ -179,7 +190,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
     # Load logging config for uvicorn if specified
-    log_config = load_log_config(args.log_config_file)
+    log_config = load_log_config(getattr(args, "log_config_file", None))
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
@@ -187,7 +198,19 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         args,
         client_config=client_config,
     ) as engine_client:
-        app = build_app(args)
+        supported_tasks: tuple[str, ...]
+        if hasattr(engine_client, "get_supported_tasks"):
+            supported_tasks = tuple(await engine_client.get_supported_tasks())
+        else:
+            supported_tasks = ("generate",)
+        if not supported_tasks:
+            supported_tasks = ("generate",)
+
+        app = build_openai_app(args)
+        # OMNI: Remove upstream routes that we override with omni-specific handlers
+        _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+        _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        app.include_router(router)
 
         await omni_init_app_state(engine_client, app.state, args)
 
@@ -374,6 +397,8 @@ async def omni_init_app_state(
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
+        # OMNI: tokenization endpoints are not supported in pure diffusion mode.
+        state.openai_serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
@@ -401,11 +426,7 @@ async def omni_init_app_state(
         supported_tasks = set(await engine_client.get_supported_tasks())
     logger.info("Supported tasks: %s", supported_tasks)
 
-    resolved_chat_template = await process_chat_template(
-        args.chat_template,
-        engine_client,
-        vllm_config.model_config if vllm_config is not None else None,
-    )
+    resolved_chat_template = load_chat_template(args.chat_template)
 
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()
@@ -444,10 +465,10 @@ async def omni_init_app_state(
                 tokenizer = await engine_client.get_tokenizer()
                 if tokenizer is not None:
                     # Initialize input_processor
+                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
                         engine_client.input_processor = OmniInputProcessor(
                             vllm_config=vllm_config,
-                            tokenizer=tokenizer,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
 
@@ -691,7 +712,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Chat Completions API")
+        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Chat Completions API",
+            )
+        return base_server.create_error_response(message="The model does not support Chat Completions API")
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except Exception as e:
@@ -760,7 +787,13 @@ _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Speech API",
+            )
+        return base_server.create_error_response(message="The model does not support Speech API")
     try:
         return await handler.create_speech(request, raw_request)
     except Exception as e:

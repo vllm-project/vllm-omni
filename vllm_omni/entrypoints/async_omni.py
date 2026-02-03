@@ -196,11 +196,10 @@ class AsyncOmni(OmniBase):
             if stage.vllm_config is not None and stage.tokenizer is not None:
                 try:
                     vllm_config = stage.vllm_config
-                    tokenizer = stage.tokenizer
                     # Initialize input_processor
+                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     self.input_processor = OmniInputProcessor(
                         vllm_config=vllm_config,
-                        tokenizer=tokenizer,
                     )
                     # Initialize model_config
                     self.model_config = vllm_config.model_config
@@ -674,6 +673,15 @@ class AsyncOmni(OmniBase):
             if stage.is_comprehension:
                 return stage.is_tracing_enabled
         return False
+
+    @property
+    def renderer(self):
+        """Return the renderer from input_processor if available.
+
+        OMNI: Required by upstream OpenAIServingModels.__init__ which
+        accesses engine_client.renderer.
+        """
+        return self.input_processor.renderer
 
     async def do_log_stats(self) -> None:
         pass

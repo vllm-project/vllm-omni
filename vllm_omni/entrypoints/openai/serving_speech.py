@@ -3,7 +3,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import Response
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
 
@@ -258,17 +258,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             # Extract audio from output
             # Audio can be in final_output.multimodal_output or final_output.request_output.multimodal_output
+            # Support both "audio" and "model_outputs" keys for compatibility with different models
             audio_output = None
             if hasattr(final_output, "multimodal_output") and final_output.multimodal_output:
                 audio_output = final_output.multimodal_output
-            if (not audio_output or "audio" not in audio_output) and hasattr(final_output, "request_output"):
+            if not audio_output and hasattr(final_output, "request_output"):
                 if final_output.request_output and hasattr(final_output.request_output, "multimodal_output"):
                     audio_output = final_output.request_output.multimodal_output
 
-            if not audio_output or "audio" not in audio_output:
+            # Check for audio data using either "audio" or "model_outputs" key
+            audio_key = None
+            if audio_output:
+                if "audio" in audio_output:
+                    audio_key = "audio"
+                elif "model_outputs" in audio_output:
+                    audio_key = "model_outputs"
+
+            if not audio_output or audio_key is None:
                 return self.create_error_response("TTS model did not produce audio output.")
 
-            audio_tensor = audio_output["audio"]
+            audio_tensor = audio_output[audio_key]
             sample_rate = audio_output.get("sr", 24000)
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
