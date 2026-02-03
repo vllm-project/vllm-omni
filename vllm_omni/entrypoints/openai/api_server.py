@@ -246,19 +246,6 @@ class _DiffusionServingModels:
 # Server entry points
 
 
-def _register_profiling_routes(app) -> None:
-    """Unconditionally register /start_profile and /stop_profile on the app.
-
-    vllm's build_app() only registers these routes when a profiler_config
-    is explicitly provided (e.g. --profiler-config).  For omni we always
-    want them available so that nsys profiling can be triggered via HTTP
-    without extra CLI flags.
-    """
-    from vllm.entrypoints.serve.profile.api_router import router as profile_router
-
-    app.include_router(profile_router)
-
-
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server.
 
@@ -317,10 +304,6 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
         app.include_router(router)
-
-        # Register profiling endpoints directly on the app so they are
-        # available regardless of how vllm's build_app handles routers.
-        _register_profiling_routes(app)
 
         await omni_init_app_state(engine_client, app.state, args)
 
