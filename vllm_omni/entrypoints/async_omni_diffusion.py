@@ -12,16 +12,16 @@ import asyncio
 import uuid
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
 from typing import Any
 
-from PIL import Image
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -108,64 +108,19 @@ class AsyncOmniDiffusion:
 
         logger.info("AsyncOmniDiffusion initialized with model: %s", model)
 
-    def _prepare_request(
-        self,
-        prompt: str,
-        request_id: str | None = None,
-        **kwargs: Any,
-    ) -> OmniDiffusionRequest:
-        """Prepare a diffusion request from prompt and parameters.
-
-        Args:
-            prompt: Text prompt for image generation
-            request_id: Optional unique identifier for the request
-            **kwargs: Additional generation parameters
-
-        Returns:
-            OmniDiffusionRequest ready for processing
-        """
-        if request_id is None:
-            request_id = f"diff-{uuid.uuid4().hex[:16]}"
-
-        field_names = {f.name for f in fields(OmniDiffusionRequest)}
-
-        init_kwargs = {
-            "prompt": prompt,
-            "request_id": request_id,
-        }
-
-        for key, value in kwargs.items():
-            if key in field_names:
-                init_kwargs[key] = value
-
-        return OmniDiffusionRequest(**init_kwargs)
-
     async def generate(
         self,
-        prompt: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        negative_prompt: str | None = None,
-        num_outputs_per_prompt: int = 1,
-        seed: int | None = None,
-        **kwargs: Any,
+        lora_request: LoRARequest | None = None,
     ) -> OmniRequestOutput:
         """Generate images asynchronously from a text prompt.
 
         Args:
             prompt: Text prompt describing the desired image
+            sampling_params: Sampling parameters
             request_id: Optional unique identifier for tracking the request
-            num_inference_steps: Number of denoising steps (default: 50)
-            guidance_scale: Classifier-free guidance scale (optional, uses model defaults if omitted)
-            height: Optional image height in pixels
-            width: Optional image width in pixels
-            negative_prompt: Optional negative prompt for guidance
-            num_outputs_per_prompt: Number of images to generate (default: 1)
-            seed: Optional random seed for reproducibility
-            **kwargs: Additional generation parameters
 
         Returns:
             OmniRequestOutput containing generated images
@@ -176,63 +131,38 @@ class AsyncOmniDiffusion:
         if request_id is None:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
 
-        # Prepare request
-        request_kwargs = {
-            "prompt": prompt,
-            "request_id": request_id,
-            "num_inference_steps": num_inference_steps,
-            "height": height,
-            "width": width,
-            "negative_prompt": negative_prompt,
-            "num_outputs_per_prompt": num_outputs_per_prompt,
-            "seed": seed,
-            **kwargs,
-        }
-        if guidance_scale is not None:
-            request_kwargs["guidance_scale"] = guidance_scale
+        if sampling_params.guidance_scale:
+            sampling_params.guidance_scale_provided = True
 
-        request = self._prepare_request(**request_kwargs)
+        if lora_request is not None:
+            sampling_params.lora_request = lora_request
+
+        request = OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sampling_params,
+            request_ids=[request_id],
+        )
 
         logger.debug("Starting generation for request %s", request_id)
 
         # Run engine in thread pool
         loop = asyncio.get_event_loop()
         try:
+            # In async mode, only a single request is submitted at a time
             result = await loop.run_in_executor(
                 self._executor,
                 self.engine.step,
-                [request],
+                request,
             )
+            result = result[0]
         except Exception as e:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
 
-        # Check if result is already OmniRequestOutput
-        if isinstance(result, OmniRequestOutput):
-            # Update request_id if needed
-            if not result.request_id:
-                result.request_id = request_id
-            return result
-
-        # Process results if not OmniRequestOutput
-        images: list[Image.Image] = []
-        if result is not None:
-            if isinstance(result, list):
-                for item in result:
-                    if isinstance(item, Image.Image):
-                        images.append(item)
-            elif isinstance(result, Image.Image):
-                images.append(result)
-
-        return OmniRequestOutput.from_diffusion(
-            request_id=request_id,
-            images=images,
-            prompt=prompt,
-            metrics={
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": request.guidance_scale,
-            },
-        )
+        # Update request_id if needed
+        if not result.request_id:
+            result.request_id = request_id
+        return result
 
     async def generate_stream(
         self,
@@ -302,3 +232,65 @@ class AsyncOmniDiffusion:
     def is_stopped(self) -> bool:
         """Check if the engine is stopped."""
         return self._closed
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA"""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "remove_lora",
+            None,
+            (adapter_id,),
+            {},
+            None,
+        )
+        return all(results) if isinstance(results, list) else results
+
+    async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+        """Add a LoRA adapter"""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "add_lora",
+            None,
+            (),
+            {"lora_request": lora_request, "lora_scale": lora_scale},
+            None,
+        )
+        return all(results) if isinstance(results, list) else results
+
+    async def list_loras(self) -> list[int]:
+        """List all registered LoRA adapter IDs."""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "list_loras",
+            None,
+            (),
+            {},
+            None,
+        )
+        # collective_rpc returns list from workers; flatten unique ids
+        if not isinstance(results, list):
+            return results or []
+        merged: set[int] = set()
+        for part in results:
+            merged.update(part or [])
+        return sorted(merged)
+
+    async def pin_lora(self, lora_id: int) -> bool:
+        """Prevent an adapter from being evicted."""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "pin_lora",
+            None,
+            (),
+            {"adapter_id": lora_id},
+            None,
+        )
+        return all(results) if isinstance(results, list) else results

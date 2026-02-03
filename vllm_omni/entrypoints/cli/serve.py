@@ -175,6 +175,11 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
         )
+        omni_config_group.add_argument(
+            "--enable-cache-dit-summary",
+            action="store_true",
+            help="Enable cache-dit summary logging after diffusion forward passes.",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(
@@ -194,6 +199,17 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable CPU offloading for diffusion models.",
         )
+        serve_parser.add_argument(
+            "--enable-layerwise-offload",
+            action="store_true",
+            help="Enable layerwise (blockwise) offloading on DiT modules.",
+        )
+        serve_parser.add_argument(
+            "--layerwise-num-gpu-layers",
+            type=int,
+            default=1,
+            help="Number of layers (blocks) to keep on GPU during generation.",
+        )
 
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
@@ -209,7 +225,28 @@ class OmniServeCommand(CLISubcommand):
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
         omni_config_group.add_argument(
-            "--cfg-parallel-size", type=int, default=1, help="Number of GPUs for CFG parallel computation"
+            "--cfg-parallel-size",
+            type=int,
+            default=1,
+            choices=[1, 2],
+            help="Number of devices for CFG parallel computation for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
+        )
+
+        # Default sampling parameters
+        omni_config_group.add_argument(
+            "--default-sampling-params",
+            type=str,
+            help="Json str for Default sampling parameters, \n"
+            'Structure: {"<stage_id>": {<sampling_param>: value, ...}, ...}\n'
+            'e.g., \'{"0": {"num_inference_steps":50, "guidance_scale":1}}\'. '
+            "Currently only supports diffusion models.",
+        )
+        # Diffusion model mixed precision
+        omni_config_group.add_argument(
+            "--max-generated-image-size",
+            type=float,
+            help="The max size of generate image (height * width).",
         )
         return serve_parser
 

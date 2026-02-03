@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -33,13 +35,15 @@ def test_video_diffusion_model(model_name: str):
     width = 640
     num_frames = 5
     outputs = m.generate(
-        "A cat sitting on a table",
-        height=height,
-        width=width,
-        num_frames=num_frames,
-        num_inference_steps=2,
-        guidance_scale=1.0,
-        generator=torch.Generator("cuda").manual_seed(42),
+        prompts="A cat sitting on a table",
+        sampling_params_list=OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=2,
+            guidance_scale=1.0,
+            generator=torch.Generator("cuda").manual_seed(42),
+        ),
     )
     first_output = outputs[0]
     assert first_output.final_output_type == "image"

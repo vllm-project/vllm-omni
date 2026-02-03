@@ -2,27 +2,25 @@
 # Stage 0: Thinker (multimodal understanding + text generation)
 # Stage 1: Talker (text embeddings → 16-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
-
 # The following config has been verified on 2x H100-80G GPUs.
 stage_args:
   - stage_id: 0
     runtime:
-      devices: "0,1"
+      devices: "0"
       max_batch_size: 5
     engine_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.9
       enforce_eager: false
       trust_remote_code: true
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       hf_config_name: thinker_config
-      tensor_parallel_size: 2
-      load_format: dummy
+      tensor_parallel_size: 1
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -42,9 +40,9 @@ stage_args:
     engine_args:
        model_stage: talker
        model_arch: Qwen3OmniMoeForConditionalGeneration
-       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+       worker_type: ar
        scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-       gpu_memory_utilization: 0.3
+       gpu_memory_utilization: 0.6
        enforce_eager: true
        trust_remote_code: true
        engine_output_type: latent  # Output codec codes for code2wav
@@ -52,7 +50,6 @@ stage_args:
        enable_prefix_caching: false
        distributed_executor_backend: "mp"
        hf_config_name: talker_config
-       load_format: dummy
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
@@ -60,7 +57,7 @@ stage_args:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      max_tokens: 100
+      max_tokens: 1000
       seed: 42
       detokenize: False
       repetition_penalty: 1.05
@@ -68,12 +65,12 @@ stage_args:
 
   - stage_id: 2
     runtime:
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
@@ -83,7 +80,6 @@ stage_args:
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
-      load_format: dummy
       async_scheduling: false
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
@@ -93,7 +89,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 200
+      max_tokens: 2000
       seed: 42
       detokenize: True
       repetition_penalty: 1.1

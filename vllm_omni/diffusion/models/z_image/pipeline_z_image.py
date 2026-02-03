@@ -312,20 +312,19 @@ class ZImagePipeline(nn.Module):
     def interrupt(self):
         return self._interrupt
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
+        height: int = 1024,
+        width: int = 1024,
         num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 5.0,
         cfg_normalization: bool = False,
         cfg_truncation: float = 1.0,
         negative_prompt: str | list[str] | None = None,
-        num_images_per_prompt: int | None = 1,
+        num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
         prompt_embeds: list[torch.FloatTensor] | None = None,
@@ -414,16 +413,28 @@ class ZImagePipeline(nn.Module):
             `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
             generated images.
         """
-        prompt = req.prompt
-        negative_prompt = req.negative_prompt
-        height: int = req.height or 1024
-        width: int = req.width or 1024
-        num_inference_steps = req.num_inference_steps or 50
-        generator = req.generator
-        guidance_scale = req.guidance_scale if req.guidance_rescale is not None else guidance_scale
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+            negative_prompt = None
+        elif req.prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        generator = req.sampling_params.generator
+        sigmas = req.sampling_params.sigmas or sigmas
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_rescale is not None else guidance_scale
+        )
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:

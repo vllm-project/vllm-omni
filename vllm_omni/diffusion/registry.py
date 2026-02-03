@@ -90,6 +90,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "FluxPipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxPipeline",
+    ),
 }
 
 
@@ -164,7 +169,10 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             return
 
         # Find transformer model(s) in the pipeline that have _sp_plan
-        transformer_attrs = ["transformer", "dit", "unet"]
+        # Include transformer_2 for two-stage models (e.g., Wan MoE)
+        transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
+        applied_count = 0
+
         for attr in transformer_attrs:
             if not hasattr(model, attr):
                 continue
@@ -190,11 +198,17 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
                 else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
             )
             logger.info(
-                f"Applying sequence parallelism to {transformer.__class__.__name__} "
+                f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
                 f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
             )
             apply_sequence_parallel(transformer, sp_config, plan)
-            return  # Only apply to first transformer found
+            applied_count += 1
+
+        if applied_count == 0:
+            logger.warning(
+                f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
+                "SP hooks not applied. Consider adding _sp_plan to your transformer model."
+            )
 
     except Exception as e:
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
@@ -218,6 +232,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "FluxPipeline": "get_flux_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

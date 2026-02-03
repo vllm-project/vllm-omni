@@ -41,14 +41,14 @@ class Scheduler:
     def get_broadcast_handle(self):
         return self.mq.export_handle()
 
-    def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
         try:
             # Prepare RPC request for generation
             rpc_request = {
                 "type": "rpc",
                 "method": "generate",
-                "args": (requests,),
+                "args": (request,),
                 "kwargs": {},
                 "output_rank": 0,
                 "exec_all_ranks": True,
@@ -62,6 +62,9 @@ class Scheduler:
                 raise RuntimeError("Result queue not initialized")
 
             output = self.result_mq.dequeue()
+            # {"status": "error", "error": str(e)}
+            if isinstance(output, dict) and output.get("status") == "error":
+                raise RuntimeError("worker error")
             return output
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")

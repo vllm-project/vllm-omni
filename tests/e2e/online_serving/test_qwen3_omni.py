@@ -7,8 +7,10 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import concurrent.futures
+import threading
 import time
 from pathlib import Path
 
@@ -23,20 +25,50 @@ from tests.conftest import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
+    merge_base64_and_convert_to_text,
+    modify_stage_config,
 )
-from vllm_omni.utils import is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
+
+def get_default_config():
+    return str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+
+
+def get_chunk_config():
+    path = modify_stage_config(
+        get_default_config(),
+        updates={
+            "async_chunk": True,
+            "stage_args": {
+                0: {
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                },
+                1: {
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
+                },
+            },
+        },
+        deletes={"stage_args": {2: ["custom_process_input_func"]}},
+    )
+    return path
+
+
+CHUNK_CONFIG_PATH = get_chunk_config()
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
-if is_rocm():
+if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+    stage_configs = [get_default_config(), CHUNK_CONFIG_PATH]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+
+
+_omni_server_lock = threading.Lock()
 
 
 @pytest.fixture(scope="module")
@@ -45,14 +77,16 @@ def omni_server(request):
     Uses session scope so the server starts only once for the entire test session.
     Multi-stage initialization can take 10-20+ minutes.
     """
-    model, stage_config_path = request.param
+    with _omni_server_lock:
+        model, stage_config_path = request.param
 
-    print(f"Starting OmniServer with model: {model}")
-    print("This may take 10-20+ minutes for initialization...")
+        print(f"Starting OmniServer with model: {model}")
 
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
-        print("OmniServer started successfully")
-        yield server
+        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+            print("OmniServer started successfully")
+            yield server
+            print("OmniServer stopping...")
+
         print("OmniServer stopped")
 
 
@@ -100,7 +134,7 @@ def dummy_messages_from_video_data(
 
 def get_prompt(prompt_type="text_only"):
     prompts = {
-        "text_only": "What is the capital of China?",
+        "text_only": "What is the capital of China? Answer in 20 words.",
         "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
@@ -111,9 +145,8 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.skipif(is_rocm(), reason="Test skipped on AMD environment due to known output issues")
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
+def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -141,7 +174,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     chat_completion = client.chat.completions.create(model=omni_server.model, messages=messages, stream=True)
 
     text_content = ""
-    audio_data = None
+    audio_data = []
     for chunk in chat_completion:
         for choice in chunk.choices:
             if hasattr(choice, "delta"):
@@ -152,11 +185,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
             modality = getattr(chunk, "modality", None)
 
             if modality == "audio" and content:
-                # Audio chunk - content
-                if audio_data is None:
-                    audio_data = content
-                else:
-                    audio_data += content
+                audio_data.append(content)
             elif modality == "text" and content:
                 # Text chunk - accumulate text content
                 text_content += content if content else ""
@@ -178,7 +207,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     ), "The output does not contain any of the keywords."
 
     # Verify text output same as audio output
-    audio_content = convert_audio_to_text(audio_data)
+    audio_content = merge_base64_and_convert_to_text(audio_data)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
@@ -186,7 +215,6 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     assert similarity > 0.9, "The audio content is not same as the text"
 
 
-@pytest.mark.skipif(is_rocm(), reason="Test skipped on AMD environment due to known output issues")
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     """
@@ -223,16 +251,18 @@ def test_text_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
     for chat_completion in chat_completions:
         # Verify audio output success
-        audio_message = chat_completion.choices[1].message
-        audio_data = audio_message.audio.data
-        assert audio_data is not None, "No audio output is generated"
-        assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
+        audio_data = None
+        text_content = None
+        for choice in chat_completion.choices:
+            if choice.message.audio is not None:
+                audio_message = choice.message
+                audio_data = audio_message.audio.data
+                assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
 
-        # Verify text output success
-        text_choice = chat_completion.choices[0]
-        text_content = text_choice.message.content
-        assert text_choice.message.content is not None, "No text output is generated"
-        assert "beijing" in text_choice.message.content.lower(), "The output do not contain keywords."
+            if choice.message.content is not None:
+                # Verify text output success
+                text_content = choice.message.content
+                assert "beijing" in text_content.lower(), "The output do not contain keywords."
 
         # Verify text output same as audio output
         audio_content = convert_audio_to_text(audio_data)

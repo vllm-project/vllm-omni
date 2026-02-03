@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 # ruff: noqa: E402
@@ -29,30 +30,33 @@ def test_stable_audio_model(model_name: str):
     sample_rate = 44100  # Stable Audio uses 44100 Hz
 
     outputs = m.generate(
-        "The sound of a dog barking",
-        negative_prompt="Low quality.",
-        num_inference_steps=4,  # Minimal steps for speed
-        guidance_scale=7.0,
-        generator=torch.Generator("cuda").manual_seed(42),
-        num_outputs_per_prompt=1,
-        extra={
-            "audio_start_in_s": audio_start_in_s,
-            "audio_end_in_s": audio_end_in_s,
+        prompts={
+            "prompt": "The sound of a dog barking",
+            "negative_prompt": "Low quality.",
         },
+        sampling_params_list=OmniDiffusionSamplingParams(
+            num_inference_steps=4,  # Minimal steps for speed
+            guidance_scale=7.0,
+            generator=torch.Generator("cuda").manual_seed(42),
+            num_outputs_per_prompt=1,
+            extra_args={
+                "audio_start_in_s": audio_start_in_s,
+                "audio_end_in_s": audio_end_in_s,
+            },
+        ),
     )
 
     # Extract audio from OmniRequestOutput
     assert outputs is not None
     first_output = outputs[0]
-    assert first_output.final_output_type == "image"  # Generic output type
+    assert first_output.final_output_type == "image"
     assert hasattr(first_output, "request_output") and first_output.request_output
 
     req_out = first_output.request_output[0]
     assert isinstance(req_out, OmniRequestOutput)
-    assert hasattr(req_out, "images") and len(req_out.images) >= 1
-
-    # For stable audio, the "images" field contains audio numpy arrays
-    audio = req_out.images[0]
+    assert req_out.final_output_type == "audio"
+    assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
+    audio = req_out.multimodal_output.get("audio")
     assert isinstance(audio, np.ndarray)
     # audio shape: (batch, channels, samples)
     # For stable-audio-open-1.0: sample_rate=44100, so 2 seconds = 88200 samples

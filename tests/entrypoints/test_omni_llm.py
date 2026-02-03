@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
 
@@ -82,8 +83,9 @@ class _FakeStage:
         self.stage_id = getattr(config, "stage_id", 0)
         self.engine_args = config.engine_args
         self.model_stage = getattr(config.engine_args, "model_stage", None)
+        self.stage_type = "llm"
         # set default sampling params
-        self.default_sampling_params = {"temperature": 1.0}
+        self.default_sampling_params = SamplingParams(temperature=1.0)
         # Allow configuring final_output and final_output_type
         self.final_output = config.final_output if hasattr(config, "final_output") else False
         self.final_output_type = getattr(config, "final_output_type", None)
@@ -637,8 +639,10 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         }
     )
 
-    # Use dicts instead of object() for serializable sampling params
-    sampling_params_list = [{"temperature": 0.7}, {"temperature": 0.8}]
+    sampling_params_list = [
+        SamplingParams(temperature=0.7),
+        SamplingParams(temperature=0.8),
+    ]
     prompts = ["hi"]
     outputs = omni.generate(prompts=prompts, sampling_params_list=sampling_params_list)
 
@@ -722,8 +726,13 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
         }
     )
 
-    # Use dicts instead of object() for serializable sampling params
-    outputs = omni.generate(prompts=["p"], sampling_params_list=[{"temperature": 0.7}, {"temperature": 0.8}])
+    outputs = omni.generate(
+        prompts=["p"],
+        sampling_params_list=[
+            SamplingParams(temperature=0.7),
+            SamplingParams(temperature=0.8),
+        ],
+    )
     assert outputs == []
 
 
@@ -922,8 +931,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     )
 
     # Generate should handle error gracefully (log but continue)
-    # Use dict instead of object() for serializable sampling params
-    sampling_params_list = [{"temperature": 0.7}]
+    sampling_params_list = [SamplingParams(temperature=0.7)]
     outputs = omni.generate(prompts=["hi"], sampling_params_list=sampling_params_list)
     # Should return final output (error was logged but didn't stop processing)
     assert isinstance(outputs, list)

@@ -6,7 +6,6 @@ import tempfile
 
 import pytest
 import torch
-from vllm.platforms import current_platform
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import (
@@ -19,15 +18,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.utils.platform_utils import detect_device_type
-
-device_type = detect_device_type()
-if device_type == "cuda":
-    torch_device = torch.cuda
-elif device_type == "npu":
-    torch_device = torch.npu
-else:
-    raise ValueError(f"Unsupported device type: {device_type} for this test script! Expected GPU or NPU.")
+from vllm_omni.platforms import current_omni_platform
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -171,7 +162,7 @@ def test_sequence_parallel(
     sequence_parallel_size = ulysses_degree * ring_degree
 
     # Skip if not enough GPUs available
-    available_gpus = torch_device.device_count()
+    available_gpus = current_omni_platform.get_device_count()
     if available_gpus < sequence_parallel_size:
         pytest.skip(f"Test requires {sequence_parallel_size} GPUs but only {available_gpus} available")
 
@@ -338,13 +329,13 @@ def ulysses_attention_on_test_model(
     """Run Ulysses attention test on a test model and save results for comparison."""
     # Use fixed seed for reproducibility across baseline and SP runs
     RANDOM_SEED = 42
-    current_platform.seed_everything(RANDOM_SEED)
+    current_omni_platform.seed_everything(RANDOM_SEED)
 
     mode_str = "Baseline (no SP)" if is_baseline else f"SP (ulysses={ulysses_degree}, ring={ring_degree})"
     print(f"\n[{mode_str}] Rank {local_rank}/{world_size} - Random seed set to {RANDOM_SEED}")
 
-    device = torch.device(f"{device_type}:{local_rank}")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
 
@@ -423,7 +414,7 @@ def ulysses_attention_on_test_model(
             # Generate and save full input data with fixed seed
             # Reinitialize RNG to ensure reproducibility
             torch.manual_seed(42)
-            torch_device.manual_seed_all(42)
+            current_omni_platform.seed_everything(42)
             full_hidden_states = torch.randn(
                 (batch_size, seq_len, hidden_size),
                 dtype=dtype,

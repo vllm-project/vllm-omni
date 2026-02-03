@@ -7,19 +7,21 @@ E2E offline tests for Omni model with video input and audio output.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
 from pathlib import Path
 
 import pytest
 from vllm.assets.video import VideoAsset
 
-from vllm_omni.utils import is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 from .conftest import OmniRunner
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
-if is_rocm():
+if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:

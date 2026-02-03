@@ -55,6 +55,7 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -258,6 +259,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    enable_cache_dit_summary: bool = False
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -276,12 +278,9 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
-    lora_nickname: str = "default"  # for swapping adapters in the pipeline
-    # can restrict layers to adapt, e.g. ["q_proj"]
-    # Will adapt only q, k, v, o by default.
-    lora_target_modules: list[str] | None = None
+    lora_scale: float = 1.0
+    max_cpu_loras: int | None = None
 
     output_type: str = "pil"
 
@@ -290,6 +289,12 @@ class OmniDiffusionConfig:
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
     enable_cpu_offload: bool = False
+
+    # Layer-wise offloading (block-level offloading) parameters
+    enable_layerwise_offload: bool = False
+    # Number of transformer blocks ready for computation to keep on GPU
+    layerwise_num_gpu_layers: int = 1
+
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -446,11 +451,24 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        if self.max_cpu_loras is None:
+            self.max_cpu_loras = 1
+        elif self.max_cpu_loras < 1:
+            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        # Backwards-compatibility: older callers may use a diffusion-specific
+        # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale"
+        # before constructing the dataclass to avoid TypeError on unknown fields.
+        if "static_lora_scale" in kwargs:
+            if "lora_scale" not in kwargs:
+                kwargs["lora_scale"] = kwargs["static_lora_scale"]
+            kwargs.pop("static_lora_scale", None)
+
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
         if "cache_backend" not in kwargs:

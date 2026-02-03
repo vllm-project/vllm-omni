@@ -26,6 +26,8 @@ class OmniRequest(Request):
     def __init__(
         self,
         prompt_embeds: PromptEmbedsPayload | None = None,
+        # Optional external request ID for tracking
+        external_req_id: str | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         *args,
         **kwargs,
@@ -33,6 +35,8 @@ class OmniRequest(Request):
         super().__init__(*args, **kwargs)
         # Serialized prompt embeddings payload (optional)
         self.prompt_embeds: PromptEmbedsPayload | None = prompt_embeds
+        # Optional external request ID for tracking
+        self.external_req_id: str | None = external_req_id
         # Serialized additional information payload (optional)
         self.additional_information: AdditionalInformationPayload | None = additional_information
 
@@ -54,6 +58,8 @@ class OmniRequest(Request):
         """
         return cls(
             request_id=request.request_id,
+            # Optional external request ID for tracking
+            external_req_id=request.external_req_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
             prompt_embeds=request.prompt_embeds,
