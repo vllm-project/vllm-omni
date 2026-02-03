@@ -80,7 +80,7 @@ docker run --rm \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
-  vllm/vllm-omni-rocm:v0.14.0rc1 \
+  vllm/vllm-omni-rocm:v0.14.0 \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
@@ -99,7 +99,7 @@ docker run --rm -it \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   --entrypoint bash \
-  vllm/vllm-omni-rocm:v0.14.0rc1
+  vllm/vllm-omni-rocm:v0.14.0
 ```
 
 # --8<-- [end:pre-built-images]

@@ -2,6 +2,7 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/bagel>.
 
+
 ## Set up
 
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
@@ -99,7 +100,7 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
 
 BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
 
-The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
+The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/model_executor/stage_configs/bagel.yaml)
 
 #### 📌 Command Line Arguments (end2end.py)
 
@@ -177,3 +178,10 @@ sudo apt install ffmpeg
 | Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
 | Stage-1 (DiT)       | **26.50 GiB**                |
 | Total               | **~42 GiB + KV Cache**       |
+
+## Example materials
+
+??? abstract "end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/bagel/end2end.py"
+    ``````

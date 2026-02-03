@@ -1,8 +1,9 @@
-# LoRA-Inference
+# LoRA Inference Examples
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/lora_inference>.
 
-This contains examples for using LoRA (Low-Rank Adaptation) adapters with vLLM-omni diffusion models for offline inference.
+
+This directory contains examples for using LoRA (Low-Rank Adaptation) adapters with vLLM-omni diffusion models for offline inference.
 The example uses the  `stabilityai/stable-diffusion-3.5-medium` as the default model, but you can replace it with other models in vLLM-omni.
 
 ## Overview

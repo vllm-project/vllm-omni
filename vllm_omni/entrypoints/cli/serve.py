@@ -97,7 +97,7 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--init-timeout",
             type=int,
-            default=60000,
+            default=600,
             help="The timeout for initializing the stages.",
         )
         omni_config_group.add_argument(

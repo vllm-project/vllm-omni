@@ -161,9 +161,7 @@ class OmniLLM(LLM):
             log_stats=self.llm_engine.log_stats,
             engine_core_output_type=engine_args.engine_output_type,
         )
-        self.llm_engine.input_processor = OmniInputProcessor(
-            vllm_config=self.llm_engine.vllm_config, tokenizer=self.llm_engine.tokenizer
-        )
+        self.llm_engine.input_processor = OmniInputProcessor(vllm_config=self.llm_engine.vllm_config)
         self.engine_class = type(self.llm_engine)
 
         self.request_counter = Counter()

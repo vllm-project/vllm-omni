@@ -1,6 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
@@ -66,4 +66,11 @@ class OmniCachedRequestData(CachedRequestData):
         prompt_token_ids: Mapping from request ID to list of prompt token IDs
     """
 
-    prompt_token_ids: dict[int, list[int]]
+    prompt_token_ids: dict[str, list[int]]
+
+
+@dataclass
+class OmniSchedulerOutput(SchedulerOutput):
+    """Scheduler output with omni-specific transfer metadata."""
+
+    finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)

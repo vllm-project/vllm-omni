@@ -1,136 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Omni-extended MRotaryEmbedding with multimodal position computation methods.
+
+This module extends the upstream vLLM MRotaryEmbedding with additional methods
+for computing input positions for various multimodal scenarios including:
+- Image/Video inputs (Qwen2.5-VL style)
+- Audio inputs (Qwen2.5-Omni style)
+- Audio-in-video interleaved inputs
+- GLM4V style inputs
+"""
+
 import itertools
 
-import numpy as np
 import torch
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 logger = init_logger(__name__)
 
 
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
+class OmniMRotaryEmbedding(MRotaryEmbedding):
+    """Omni-extended MRotaryEmbedding with multimodal position computation.
+
+    Extends the upstream MRotaryEmbedding with additional class methods for
+    computing input positions for various multimodal scenarios.
     """
-    Args:
-        x: [num_tokens, num_heads, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-    else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
-    else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-
-class MRotaryEmbedding(RotaryEmbedding):
-    """Rotary Embedding with Multimodal Sections."""
-
-    def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
-        is_neox_style: bool,
-        dtype: torch.dtype,
-        mrope_section: list[int] | None = None,
-        mrope_interleaved: bool = False,
-        # YaRN parameters.
-        *,
-        scaling_factor: float | None = None,
-        extrapolation_factor: float = 1,
-        attn_factor: float = 1,
-        beta_fast: int = 32,
-        beta_slow: int = 1,
-    ) -> None:
-        # In Qwen2.5-VL, the maximum index value is related to the duration of
-        # the input video. We enlarge max_position_embeddings to 4 times to get
-        # a larger the cos and sin cache.
-        self.cache_max_position_num = max_position_embeddings * 4
-        super().__init__(
-            head_size,
-            rotary_dim,
-            self.cache_max_position_num,
-            base,
-            is_neox_style,
-            dtype,
-        )
-
-        self.mrope_section = mrope_section
-        if self.mrope_section:
-            print(
-                "Warning: mrope_section check is disabled in Qwen2.5-Omni, "
-                "this may cause errors, and should be restored in the future."
-            )
-            # assert sum(self.mrope_section) == rotary_dim // 2
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """PyTorch-native implementation equivalent to forward().
-
-        Args:
-            positions:
-                [num_tokens,] (text only) or
-                [3, num_tokens] (T/H/W positions with multimodal inputs)
-            query: [num_tokens, num_heads * head_size]
-            key: [num_tokens, num_kv_heads * head_size]
-        """
-        assert positions.ndim == 1 or positions.ndim == 2
-        assert key is not None
-
-        num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
-            assert self.mrope_section
-
-            cos = torch.cat(
-                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
-            sin = torch.cat(
-                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                dim=-1,
-            )
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        # query_rot = apply_rotary_emb_dispatch(query_rot, cos, sin,
-        #                                       self.is_neox_style)
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        # key_rot = apply_rotary_emb_dispatch(key_rot, cos, sin,
-        #                                     self.is_neox_style)
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
 
     @classmethod
     def get_input_positions(
@@ -440,9 +336,6 @@ class MRotaryEmbedding(RotaryEmbedding):
             |vision chunk 1|audio chunk 1|vision chunk 2|audio chunk 2 |...
         """
 
-        # TODO(fyabc): refactor and share more code with
-        #  _vl_get_input_positions_tensor.
-
         thinker_config = hf_config.thinker_config
         try:
             audio_token_id = thinker_config.audio_token_index
@@ -612,29 +505,6 @@ class MRotaryEmbedding(RotaryEmbedding):
             index = num // interval
             ranges[index].append(num)
         return ranges
-
-    @staticmethod
-    def get_next_input_positions(
-        mrope_position_delta: int,
-        context_len: int,
-        seq_len: int,
-    ) -> list[list[int]]:
-        return [list(range(context_len + mrope_position_delta, seq_len + mrope_position_delta)) for _ in range(3)]
-
-    @staticmethod
-    def get_next_input_positions_tensor(
-        out: np.ndarray,
-        out_offset: int,
-        mrope_position_delta: int,
-        context_len: int,
-        num_new_tokens: int,
-    ):
-        values = np.arange(
-            mrope_position_delta + context_len,
-            mrope_position_delta + context_len + num_new_tokens,
-            dtype=out.dtype,
-        )
-        out[:, out_offset : out_offset + num_new_tokens] = values
 
     @classmethod
     def omni_get_updates_use_audio_in_video(

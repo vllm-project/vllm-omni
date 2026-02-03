@@ -88,7 +88,7 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
         assert len(audio_output.request_output) > 0
 
         # Verify audio tensor exists and has content
-        audio_tensor = audio_output.request_output[0].multimodal_output["audio"]
+        audio_tensor = audio_output.request_output[0].outputs[0].multimodal_output["audio"]
         assert audio_tensor is not None
         assert audio_tensor.numel() > 0
 

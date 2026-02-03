@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
 from vllm.engine.arg_utils import EngineArgs
@@ -70,7 +71,7 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_spec: dict[str, any] = field(default_factory=dict)
+    stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     async_chunk: bool = False
     omni_kv_config: dict | None = None
 
@@ -172,7 +173,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_spec: dict[str, any] = field(default_factory=dict)
+    stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     async_chunk: bool = False
     omni_kv_config: dict | None = None
 
