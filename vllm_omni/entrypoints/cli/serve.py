@@ -295,7 +295,7 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--tts-max-instructions-length",
             type=int,
-            default=500,
+            default=None,
             help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
         )
         return serve_parser
