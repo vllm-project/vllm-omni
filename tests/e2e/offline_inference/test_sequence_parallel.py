@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-System test for Ulysses sequence parallel backend.
+System test for Sequence Parallel (SP) backends: Ulysses and Ring attention.
 
-This test verifies that Ulysses-SP (DeepSpeed Ulysses Sequence Parallel) works
-correctly with diffusion models. It uses minimal settings to keep test time
-short for CI.
+Tests verify that SP inference produces correct outputs compared to baseline.
 """
 
 import gc
@@ -14,6 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pytest
@@ -32,24 +31,22 @@ from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.platforms import current_omni_platform
 
-models = ["riverclouds/qwen_image_random"]
-
+# Test configuration
+MODELS = ["riverclouds/qwen_image_random"]
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
+DEFAULT_HEIGHT = 256
+DEFAULT_WIDTH = 256
+DEFAULT_SEED = 42
+DEFAULT_STEPS = 4
+DIFF_MEAN_THRESHOLD = 2e-2
+DIFF_MAX_THRESHOLD = 2e-1
 
 
-def _pil_to_float_rgb_tensor(img: Image.Image) -> torch.Tensor:
-    """Convert PIL image to float32 RGB tensor in [0, 1] with shape [H, W, 3]."""
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(arr)
+class InferenceResult(NamedTuple):
+    """Result of an inference run."""
 
-
-def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
-    """Return (mean_abs_diff, max_abs_diff) over RGB pixels in [0, 1]."""
-    ta = _pil_to_float_rgb_tensor(a)
-    tb = _pil_to_float_rgb_tensor(b)
-    assert ta.shape == tb.shape, f"Image shapes differ: {ta.shape} vs {tb.shape}"
-    abs_diff = torch.abs(ta - tb)
-    return abs_diff.mean().item(), abs_diff.max().item()
+    images: list[Image.Image]
+    elapsed_ms: float
 
 
 def _cleanup_distributed():
@@ -61,7 +58,6 @@ def _cleanup_distributed():
         os.environ.pop(key, None)
 
     gc.collect()
-
     if current_omni_platform.is_available():
         current_omni_platform.empty_cache()
         current_omni_platform.synchronize()
@@ -69,199 +65,216 @@ def _cleanup_distributed():
     time.sleep(5)
 
 
-def _run_baseline(model_name: str, dtype: torch.dtype, attn_backend: str, height: int, width: int, seed: int):
-    """Run baseline inference (no SP)."""
-    baseline_parallel_config = DiffusionParallelConfig(ulysses_degree=1, ring_degree=1)
-    baseline = Omni(
+def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
+    """Return (mean_abs_diff, max_abs_diff) over RGB pixels in [0, 1]."""
+    ta = torch.from_numpy(np.asarray(a.convert("RGB"), dtype=np.float32) / 255.0)
+    tb = torch.from_numpy(np.asarray(b.convert("RGB"), dtype=np.float32) / 255.0)
+    assert ta.shape == tb.shape, f"Image shapes differ: {ta.shape} vs {tb.shape}"
+    abs_diff = torch.abs(ta - tb)
+    return abs_diff.mean().item(), abs_diff.max().item()
+
+
+def _run_inference(
+    model_name: str,
+    dtype: torch.dtype,
+    attn_backend: str,
+    ulysses_degree: int = 1,
+    ring_degree: int = 1,
+    height: int = DEFAULT_HEIGHT,
+    width: int = DEFAULT_WIDTH,
+    seed: int = DEFAULT_SEED,
+    warmup: bool = True,
+) -> InferenceResult:
+    """Run inference with specified configuration.
+
+    Args:
+        warmup: If True, run one warmup iteration before the timed run.
+    """
+    parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
+    omni = Omni(
         model=model_name,
-        parallel_config=baseline_parallel_config,
+        parallel_config=parallel_config,
         dtype=dtype,
         attention_backend=attn_backend,
     )
 
     try:
-        outputs = baseline.generate(
+        # Warmup run (not timed)
+        if warmup:
+            _ = omni.generate(
+                PROMPT,
+                OmniDiffusionSamplingParams(
+                    height=height,
+                    width=width,
+                    num_inference_steps=DEFAULT_STEPS,
+                    guidance_scale=0.0,
+                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed + 1000),
+                    num_outputs_per_prompt=1,
+                ),
+            )
+
+        # Timed run
+        start = time.time()
+        outputs = omni.generate(
             PROMPT,
             OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=4,
+                num_inference_steps=DEFAULT_STEPS,
                 guidance_scale=0.0,
                 generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
                 num_outputs_per_prompt=1,
             ),
         )
-        return outputs[0].request_output[0].images
+        elapsed_ms = (time.time() - start) * 1000
+
+        return InferenceResult(
+            images=outputs[0].request_output[0].images,
+            elapsed_ms=elapsed_ms,
+        )
     finally:
-        baseline.close()
+        omni.close()
         _cleanup_distributed()
 
 
-def _run_sp(
-    model_name: str,
-    dtype: torch.dtype,
-    attn_backend: str,
-    height: int,
-    width: int,
-    seed: int,
-    ulysses_degree: int,
-    ring_degree: int,
-):
-    """Run SP inference."""
-    sp_parallel_config = DiffusionParallelConfig(ulysses_degree=ulysses_degree, ring_degree=ring_degree)
-    sp = Omni(
-        model=model_name,
-        parallel_config=sp_parallel_config,
-        dtype=dtype,
-        attention_backend=attn_backend,
-    )
+# =============================================================================
+# Correctness & Performance Tests
+# =============================================================================
 
-    try:
-        outputs = sp.generate(
-            PROMPT,
-            OmniDiffusionSamplingParams(
+# SP configurations: (ulysses_degree, ring_degree, height, width, warmup, is_perf_test)
+# - warmup: whether to run warmup for this SP config
+# - is_perf_test: whether this is a performance test (show speedup metrics)
+SP_CONFIGS = [
+    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ulysses-2 - performance test
+    (1, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ring-2 - performance test
+    (2, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, False, False),  # Hybrid - correctness only
+    (4, 1, 272, 272, False, False),  # Ulysses-4 - shape and correctness
+]
+
+
+def _get_sp_mode(ulysses_degree: int, ring_degree: int) -> str:
+    """Get SP mode name for logging."""
+    if ulysses_degree > 1 and ring_degree == 1:
+        return f"ulysses-{ulysses_degree}"
+    elif ring_degree > 1 and ulysses_degree == 1:
+        return f"ring-{ring_degree}"
+    else:
+        return f"hybrid-{ulysses_degree}x{ring_degree}"
+
+
+@pytest.mark.parametrize("model_name", MODELS)
+def test_sp_correctness(model_name: str):
+    """Test that SP inference produces correct outputs and measure performance.
+
+    Runs baseline once per unique (height, width), then tests all SP configs.
+
+    Note: Run with `pytest -v -s` to see detailed output.
+    """
+    device_count = current_omni_platform.get_device_count()
+
+    # Cache baseline results by (height, width)
+    # Key: (height, width), Value: (result, warmup_used)
+    baseline_cache: dict[tuple[int, int], InferenceResult] = {}
+
+    # Collect results for summary
+    results: list[dict] = []
+
+    print("\n" + "=" * 70)
+    print(f"Sequence Parallel Test - Model: {model_name}")
+    print(f"Available GPUs: {device_count}")
+    print("=" * 70)
+
+    for ulysses_degree, ring_degree, height, width, sp_warmup, is_perf_test in SP_CONFIGS:
+        sp_size = ulysses_degree * ring_degree
+        sp_mode = _get_sp_mode(ulysses_degree, ring_degree)
+
+        if device_count < sp_size:
+            print(f"\n[{sp_mode}] SKIPPED (requires {sp_size} GPUs)")
+            continue
+
+        # Determine baseline warmup: only for default size (performance tests)
+        cache_key = (height, width)
+        baseline_warmup = height == DEFAULT_HEIGHT and width == DEFAULT_WIDTH
+
+        # Get or compute baseline for this (height, width)
+        if cache_key not in baseline_cache:
+            print(f"\n--- Running baseline {height}x{width} (warmup={baseline_warmup}) ---")
+            baseline = _run_inference(
+                model_name,
+                torch.bfloat16,
+                "sdpa",
                 height=height,
                 width=width,
-                num_inference_steps=4,
-                guidance_scale=0.0,
-                generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
-                num_outputs_per_prompt=1,
-            ),
+                warmup=baseline_warmup,
+            )
+            assert len(baseline.images) == 1
+            baseline_cache[cache_key] = baseline
+            print(f"[baseline] {height}x{width}: {baseline.elapsed_ms:.0f}ms")
+        else:
+            baseline = baseline_cache[cache_key]
+
+        # Run SP
+        print(f"\n--- Running {sp_mode} (warmup={sp_warmup}) ---")
+        sp_result = _run_inference(
+            model_name,
+            torch.bfloat16,
+            "sdpa",
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            height=height,
+            width=width,
+            warmup=sp_warmup,
         )
-        return outputs[0].request_output[0].images
-    finally:
-        sp.close()
-        _cleanup_distributed()
+        assert len(sp_result.images) == 1
 
+        # Compare outputs (correctness)
+        mean_diff, max_diff = _diff_metrics(baseline.images[0], sp_result.images[0])
 
-@pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_baseline_only(model_name: str, dtype: torch.dtype, attn_backend: str):
-    """Test baseline inference only (no SP)."""
-    height = 256
-    width = 256
-    seed = 42
+        # Build result entry
+        result = {
+            "mode": sp_mode,
+            "sp_size": sp_size,
+            "height": height,
+            "width": width,
+            "baseline_ms": baseline.elapsed_ms,
+            "sp_ms": sp_result.elapsed_ms,
+            "mean_diff": mean_diff,
+            "max_diff": max_diff,
+            "is_perf_test": is_perf_test,
+        }
+        results.append(result)
 
-    images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
+        # Output based on test type
+        if is_perf_test:
+            speedup = baseline.elapsed_ms / sp_result.elapsed_ms if sp_result.elapsed_ms > 0 else 0
+            result["speedup"] = speedup
+            print(
+                f"[{sp_mode}] {sp_size} GPUs | "
+                f"baseline: {baseline.elapsed_ms:.0f}ms, sp: {sp_result.elapsed_ms:.0f}ms, "
+                f"speedup: {speedup:.2f}x"
+            )
+        else:
+            print(f"[{sp_mode}] {sp_size} GPUs | sp: {sp_result.elapsed_ms:.0f}ms (correctness only)")
 
-    assert images is not None
-    assert len(images) == 1
-    assert images[0].width == width
-    assert images[0].height == height
+        print(f"[{sp_mode}] diff: mean={mean_diff:.6e}, max={max_diff:.6e}")
 
-
-@pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sp_ulysses2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
-    """Test SP inference only (ulysses=2)."""
-    if current_omni_platform.get_device_count() < 2:
-        pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
-
-    height = 256
-    width = 256
-    seed = 42
-
-    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=2, ring_degree=1)
-
-    assert images is not None
-    assert len(images) == 1
-    assert images[0].width == width
-    assert images[0].height == height
-
-
-@pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sp_ring2_only(model_name: str, dtype: torch.dtype, attn_backend: str):
-    """Test SP inference only (ring=2)."""
-    if current_omni_platform.get_device_count() < 2:
-        pytest.skip(f"Test requires 2 GPUs but only {current_omni_platform.get_device_count()} available")
-
-    height = 256
-    width = 256
-    seed = 42
-
-    images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree=1, ring_degree=2)
-
-    assert images is not None
-    assert len(images) == 1
-    assert images[0].width == width
-    assert images[0].height == height
-
-
-@pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("ulysses_degree", [1, 2])
-@pytest.mark.parametrize("ring_degree", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sequence_parallel(
-    model_name: str,
-    ulysses_degree: int,
-    ring_degree: int,
-    dtype: torch.dtype,
-    attn_backend: str,
-):
-    """Compare baseline (ulysses_degree=1) vs SP (ulysses_degree>1) outputs."""
-    if ulysses_degree <= 1 and ring_degree <= 1:
-        pytest.skip(
-            "This test compares ulysses_degree * ring_degree = 1 vs ulysses_degree * ring_degree > 1; "
-            "provide ulysses_degree or ring_degree>1."
+        # Assert correctness
+        assert mean_diff <= DIFF_MEAN_THRESHOLD and max_diff <= DIFF_MAX_THRESHOLD, (
+            f"[{sp_mode}] SP output differs from baseline: mean={mean_diff:.6e}, max={max_diff:.6e}"
         )
 
-    sp_size = ulysses_degree * ring_degree
-    if current_omni_platform.get_device_count() < sp_size:
-        pytest.skip(f"Test requires {sp_size} GPUs but only {current_omni_platform.get_device_count()} available")
-
-    height = 256
-    width = 256
-    seed = 42
-
-    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
-    assert baseline_images is not None and len(baseline_images) == 1
-
-    sp_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree, ring_degree)
-    assert sp_images is not None and len(sp_images) == 1
-
-    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
-
-    mean_threshold = 2e-2
-    max_threshold = 2e-1
-
-    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-        f"Image diff exceeded threshold: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}"
-    )
-
-
-@pytest.mark.parametrize("model_name", models)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("attn_backend", ["sdpa"])
-def test_sequence_parallel_ulysses4(model_name: str, dtype: torch.dtype, attn_backend: str):
-    """Test SP with ulysses_degree=4."""
-    ulysses_degree = 4
-    ring_degree = 1
-
-    if current_omni_platform.get_device_count() < ulysses_degree * ring_degree:
-        pytest.skip(
-            f"Test requires {ulysses_degree * ring_degree} GPUs but only {current_omni_platform.get_device_count()} available"
+    # Summary
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"{'Mode':<15} {'GPUs':<6} {'Size':<10} {'Baseline':<12} {'SP':<12} {'Speedup':<10} {'Status'}")
+    print("-" * 70)
+    for r in results:
+        speedup_str = f"{r['speedup']:.2f}x" if r.get("speedup") else "N/A"
+        baseline_str = f"{r['baseline_ms']:.0f}ms" if r["is_perf_test"] else "N/A"
+        status = "PASS" if r["mean_diff"] <= DIFF_MEAN_THRESHOLD else "FAIL"
+        print(
+            f"{r['mode']:<15} {r['sp_size']:<6} {r['height']}x{r['width']:<5} "
+            f"{baseline_str:<12} {r['sp_ms']:.0f}ms{'':<7} {speedup_str:<10} {status}"
         )
-
-    height = 272
-    width = 272
-    seed = 42
-
-    baseline_images = _run_baseline(model_name, dtype, attn_backend, height, width, seed)
-    assert baseline_images is not None and len(baseline_images) == 1
-
-    sp_images = _run_sp(model_name, dtype, attn_backend, height, width, seed, ulysses_degree, ring_degree)
-    assert sp_images is not None and len(sp_images) == 1
-
-    mean_abs_diff, max_abs_diff = _diff_metrics(baseline_images[0], sp_images[0])
-
-    mean_threshold = 2e-2
-    max_threshold = 2e-1
-
-    assert mean_abs_diff <= mean_threshold and max_abs_diff <= max_threshold, (
-        f"Image diff exceeded threshold: mean={mean_abs_diff:.6e}, max={max_abs_diff:.6e}"
-    )
+    print("=" * 70)
