@@ -30,7 +30,7 @@ def generate_image(
     messages = [{"role": "user", "content": prompt}]
 
     # Build extra_body with generation parameters
-    extra_body = {
+    extra_body: dict[str, int | float | str] = {
         "height": height,
         "width": width,
         "num_inference_steps": steps,
@@ -71,10 +71,11 @@ def generate_image(
         raise gr.Error(f"Generation failed: {e}")
 
 
-def create_demo(server_url: str):
+def create_demo(server_url: str) -> gr.Blocks:
     """Create Gradio demo interface."""
 
-    with gr.Blocks(title="Qwen-Image Demo") as demo:
+    demo = gr.Blocks(title="Qwen-Image Demo")
+    with demo:
         gr.Markdown("# Qwen-Image Online Generation")
         gr.Markdown("Generate images using Qwen-Image model")
 
@@ -169,7 +170,7 @@ def create_demo(server_url: str):
     return demo
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen-Image Gradio Demo")
     parser.add_argument("--server", default="http://localhost:8091", help="Server URL")
     parser.add_argument("--port", type=int, default=7860, help="Gradio port")

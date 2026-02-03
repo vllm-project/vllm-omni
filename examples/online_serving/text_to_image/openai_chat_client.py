@@ -10,6 +10,7 @@ Usage:
 import argparse
 import base64
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -64,16 +65,16 @@ def generate_image(
         payload["seed"] = seed
 
     try:
-        response = requests.post(
+        response: requests.Response = requests.post(
             f"{server_url}/v1/images/generations",
             headers={"Content-Type": "application/json"},
             json=payload,
             timeout=300,
         )
         response.raise_for_status()
-        data = response.json()
+        data: dict[str, Any] = response.json()
 
-        items = data.get("data")
+        items: list[Any] | None = data.get("data")
         if isinstance(items, list) and items:
             first = items[0].get("b64_json") if isinstance(items[0], dict) else None
             if isinstance(first, str):
@@ -87,7 +88,7 @@ def generate_image(
         return None
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen-Image chat client")
     parser.add_argument("--prompt", "-p", default="a cup of coffee on the table", help="Text prompt")
     parser.add_argument("--output", "-o", default="qwen_image_output.png", help="Output file")
@@ -99,7 +100,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
-    args = parser.parse_args()
+    args: argparse.Namespace = parser.parse_args()
 
     print(f"Generating image for: {args.prompt}")
 
