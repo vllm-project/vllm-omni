@@ -20,6 +20,7 @@ import zmq
 from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
+from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -83,15 +84,7 @@ class DiffusionWorker:
             od_config=self.od_config,
             device=self.device,
         )
-        # Initialize profiler if configured
-        self.profiler: OmniTorchProfilerWrapper | None = None
-        profiler_config = self.od_config.profiler_config
-        if profiler_config and profiler_config.profiler == "torch":
-            self.profiler = create_omni_profiler(
-                profiler_config=profiler_config,
-                worker_name=f"diffusion_worker_{self.rank}",
-                local_rank=self.local_rank,
-            )
+        self.profiler: WorkerProfiler | None = self._create_profiler()
         if not skip_load_model:
             self.load_model(load_format=self.od_config.diffusion_load_format)
             self.init_lora_manager()
@@ -122,6 +115,7 @@ class DiffusionWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
+        vllm_config.profiler_config = self.od_config.profiler_config
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
@@ -146,6 +140,41 @@ class DiffusionWorker:
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
+
+    def _create_profiler(self) -> WorkerProfiler | None:
+        profiler_config = getattr(self.od_config, "profiler_config", None)
+        if self.vllm_config is not None:
+            self.vllm_config.profiler_config = profiler_config
+
+        profiler_type = getattr(profiler_config, "profiler", None)
+        if profiler_type == "torch":
+            return create_omni_profiler(
+                profiler_config=profiler_config,
+                worker_name=f"diffusion-rank-{self.rank}",
+                local_rank=self.local_rank,
+            )
+        if profiler_type == "cuda":
+            try:
+                return CudaProfilerWrapper(profiler_config)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize CUDA profiler on diffusion worker %s: %s",
+                    self.rank,
+                    exc,
+                )
+                return None
+        if profiler_type is not None:
+            logger.warning("Unknown profiler backend %r on diffusion worker %s", profiler_type, self.rank)
+        return None
+
+    def _profiler_context(self, name: str) -> AbstractContextManager:
+        if self.profiler is None:
+            return nullcontext()
+        return self.profiler.annotate_context_manager(name)
+
+    def _step_profiler(self) -> None:
+        if self.profiler is not None:
+            self.profiler.step()
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
@@ -187,7 +216,7 @@ class DiffusionWorker:
         """Generate output for the given requests."""
         return self.execute_model(request, self.od_config)
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> dict[str, Any] | None:
         """Start or stop profiling for this GPU worker.
 
         Args:
@@ -203,16 +232,18 @@ class DiffusionWorker:
             return
 
         if is_start:
-            from vllm_omni.profiler import OmniTorchProfilerWrapper
-
             if isinstance(self.profiler, OmniTorchProfilerWrapper):
                 import time
 
-                filename = profile_prefix or f"diffusion_{int(time.time())}"
+                filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
             self.profiler.start()
-        else:
-            self.profiler.stop()
+            return None
+
+        self.profiler.stop()
+        if isinstance(self.profiler, OmniTorchProfilerWrapper):
+            return self.profiler.get_results()
+        return None
 
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
@@ -224,7 +255,10 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
-        return self.model_runner.execute_model(req)
+        with self._profiler_context("diffusion_forward"):
+            output = self.model_runner.execute_model(req)
+        self._step_profiler()
+        return output
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
@@ -236,8 +270,10 @@ class DiffusionWorker:
 
         if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
             raise ValueError("Step mode does not support LoRA yet.")
-
-        return self.model_runner.execute_stepwise(scheduler_output)
+        with self._profiler_context("diffusion_step"):
+            output = self.model_runner.execute_stepwise(scheduler_output)
+        self._step_profiler()
+        return output
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
