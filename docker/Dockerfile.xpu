@@ -1,0 +1,28 @@
+ARG BASE_IMAGE=gar-registry.caas.intel.com/pytorch/pytorch-ipex-spr:multi-bmg_release_2601_py2.10_ww2605.5
+FROM ${BASE_IMAGE} AS final
+
+ARG COMMON_WORKDIR=/workspace
+
+WORKDIR ${COMMON_WORKDIR}
+
+RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
+
+COPY . ${COMMON_WORKDIR}/vllm-omni
+
+RUN cd ${COMMON_WORKDIR}/vllm-omni && python -m pip install --no-cache-dir ".[dev]" --no-build-isolation
+
+# FIX triton
+RUN --mount=type=cache,target=/root/.cache/pip pip uninstall triton triton-xpu -y && pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+CMD ["/bin/bash"]
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+ENTRYPOINT []
+
+#Set entrypoint for vllm-openai official images
+FROM final AS vllm-openai
+RUN cd ${COMMON_WORKDIR}/vllm-omni
+ENTRYPOINT ["vllm", "serve", "--omni"]

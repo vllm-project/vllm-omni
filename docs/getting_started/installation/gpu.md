@@ -18,6 +18,10 @@ vLLM-Omni is a Python library that supports the following GPU variants. The libr
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:requirements"
 
+=== "Intel XPU"
+
+    --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:requirements"
+
 ## Set up using Python
 
 ### Create a new Python environment
@@ -32,10 +36,13 @@ Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.1
 
     --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:pre-built-wheels"
 
-
 === "AMD ROCm"
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:pre-built-wheels"
+
+=== "Intel XPU"
+
+    --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:pre-built-wheels"
 
 [](){ #build-from-source }
 
@@ -49,6 +56,10 @@ Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.1
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:build-wheel-from-source"
 
+=== "Intel XPU"
+
+    --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:build-wheel-from-source"
+
 ## Set up using Docker
 
 ### Pre-built images
@@ -61,8 +72,16 @@ Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.1
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:pre-built-images"
 
+=== "Intel XPU"
+
+    --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:pre-built-images"
+
 ### Build your own docker image
 
 === "AMD ROCm"
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:build-docker"
+
+=== "Intel XPU"
+
+    --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:build-docker"
