@@ -3,19 +3,18 @@ ARG VLLM_BASE_TAG=v0.15.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
+
 COPY . .
+
 # Install system dependencies
 RUN apt-get update && \
-  apt-get install -y ffmpeg && \
-  apt-get clean && \
-  rm -rf /var/lib/apt/lists/*
-
-# Install vLLM wheel for the specific commit
-# URL format: https://wheels.vllm.ai/<commit_hash>/
-# Current vLLM commit: f176443446f659dbab5315e056e605d8984fd976 (v0.15.0)
-RUN uv pip install --system --upgrade --force-reinstall vllm --extra-index-url https://wheels.vllm.ai/f176443446f659dbab5315e056e605d8984fd976
+    apt-get install -y ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install vllm-omni into the same uv-managed Python environment used by the base image.
-RUN uv pip install --system --no-cache-dir ".[dev]"
+RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]"
+
 RUN ln -sf /usr/bin/python3 /usr/bin/python
+
 ENTRYPOINT []
