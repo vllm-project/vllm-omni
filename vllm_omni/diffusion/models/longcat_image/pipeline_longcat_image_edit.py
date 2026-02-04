@@ -72,11 +72,15 @@ def get_longcat_image_edit_pre_process_func(
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
 
-            if raw_image is None or isinstance(raw_image, list):
-                raise ValueError(
-                    """Received no image or a list of image. Only a single image is supported by this model."""
-                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`"""
-                )
+            if not raw_image:  # None or empty list
+                raise ValueError("""Received no input image. This model requires one input image to run.""")
+            elif isinstance(raw_image, list):
+                if len(raw_image) > 1:
+                    raise ValueError(
+                        """Received multiple input images. Only a single image is supported by this model."""
+                    )
+                else:
+                    raw_image = raw_image[0]
 
             if isinstance(raw_image, str):
                 image = PIL.Image.open(raw_image)
