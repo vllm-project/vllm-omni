@@ -77,11 +77,36 @@ def wait_for_gpu_memory_to_clear(
     threshold_ratio: float | None = None,
     timeout_s: float = 120,
 ) -> None:
+    import gc
+
     assert threshold_bytes is not None or threshold_ratio is not None
     # Use nvml instead of pytorch to reduce measurement error from torch cuda
     # context.
     devices = get_physical_device_indices(devices)
     start_time = time.time()
+
+    # Print waiting start information
+    device_list = ", ".join(str(d) for d in devices)
+    if threshold_bytes is not None:
+        threshold_str = f"{threshold_bytes / 2**30:.2f} GiB"
+        condition_str = f"Memory usage ≤ {threshold_str}"
+    else:
+        threshold_percent = threshold_ratio * 100
+        threshold_str = f"{threshold_percent:.1f}%"
+        condition_str = f"Memory usage ratio ≤ {threshold_str}"
+
+    print(f"[GPU Memory Monitor] Waiting for GPU {device_list} to free memory, Condition: {condition_str}")
+
+    # Define the is_free function based on threshold type
+    if threshold_bytes is not None:
+
+        def is_free(used, total):
+            return used <= threshold_bytes / 2**30
+    else:
+
+        def is_free(used, total):
+            return used / total <= threshold_ratio
+
     while True:
         output: dict[int, str] = {}
         output_raw: dict[int, tuple[float, float]] = {}
@@ -97,33 +122,44 @@ def wait_for_gpu_memory_to_clear(
                 gb_used = mem_info.used / 2**30
                 gb_total = mem_info.total / 2**30
             output_raw[device] = (gb_used, gb_total)
-            output[device] = f"{gb_used:.02f}/{gb_total:.02f}"
+            # Format to more readable form
+            usage_percent = (gb_used / gb_total) * 100 if gb_total > 0 else 0
+            output[device] = f"{gb_used:.1f}GiB/{gb_total:.1f}GiB ({usage_percent:.1f}%)"
 
-        print("gpu memory used/total (GiB): ", end="")
-        for k, v in output.items():
-            print(f"{k}={v}; ", end="")
-        print("")
+        # Optimized GPU memory status print
+        print("[GPU Memory Status] Current usage:")
+        for device_id, mem_info in output.items():
+            print(f"  GPU {device_id}: {mem_info}")
 
-        if threshold_bytes is not None:
-
-            def is_free(used, total):
-                return used <= threshold_bytes / 2**30  # noqa E731
-
-            threshold = f"{threshold_bytes / 2**30} GiB"
-        else:
-
-            def is_free(used, total):
-                return used / total <= threshold_ratio  # noqa E731
-
-            threshold = f"{threshold_ratio:.2f}"
-
+        # Calculate waiting duration
         dur_s = time.time() - start_time
+        elapsed_minutes = dur_s / 60
+
+        # Check if all devices meet the condition
         if all(is_free(used, total) for used, total in output_raw.values()):
-            print(f"Done waiting for free GPU memory on devices {devices=} ({threshold=}) {dur_s=:.02f}")
+            # Optimized completion message
+            print(f"[GPU Memory Freed] Devices {device_list} meet memory condition")
+            print(f"   Condition: {condition_str}")
+            print(f"   Wait time: {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
+            print("   Final status:")
+            for device_id, mem_info in output.items():
+                print(f"     GPU {device_id}: {mem_info}")
             break
 
+        # Check timeout
         if dur_s >= timeout_s:
-            raise ValueError(f"Memory of devices {devices=} not free after {dur_s=:.02f} ({threshold=})")
+            raise ValueError(
+                f"[GPU Memory Timeout] Devices {device_list} still don't meet memory condition after {dur_s:.1f} seconds\n"
+                f"Condition: {condition_str}\n"
+                f"Current status:\n" + "\n".join(f"  GPU {device}: {output[device]}" for device in devices)
+            )
+
+        # Add waiting hint (optional)
+        if dur_s > 10 and int(dur_s) % 10 == 0:  # Show hint every 10 seconds
+            print(f"Waiting... Already waited {dur_s:.1f} seconds ({elapsed_minutes:.1f} minutes)")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         time.sleep(5)
 

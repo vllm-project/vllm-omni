@@ -91,6 +91,11 @@ class GPUARWorker(OmniWorkerMixin, GPUWorker):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
+        if self.use_v2_model_runner:
+            # OMNI: v2 model runner does not yet include omni hooks.
+            logger.warning("OMNI GPUARWorker forces v1 model runner for omni hooks.")
+            self.use_v2_model_runner = False
+
         # Construct the model runner
         self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
 

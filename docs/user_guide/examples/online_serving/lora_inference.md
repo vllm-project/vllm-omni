@@ -1,6 +1,7 @@
-# LoRA-Inference
+# LoRA Inference(Diffusion)
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/lora_inference>.
+
 
 This example shows how to use **per-request LoRA** with vLLM-Omni diffusion models via the OpenAI-compatible Chat Completions API.
 
@@ -55,15 +56,17 @@ lora_adapter/
 └── adapter_model.safetensors
 ```
 
+## Example materials
+
 ??? abstract "openai_chat_client.py"
     ``````py
     --8<-- "examples/online_serving/lora_inference/openai_chat_client.py"
     ``````
 ??? abstract "run_curl_lora_inference.sh"
-    ``````py
+    ``````sh
     --8<-- "examples/online_serving/lora_inference/run_curl_lora_inference.sh"
     ``````
 ??? abstract "run_server.sh"
-    ``````py
+    ``````sh
     --8<-- "examples/online_serving/lora_inference/run_server.sh"
     ``````

@@ -31,6 +31,15 @@ class OmniPlatform(Platform):
     def is_npu(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.NPU
 
+    def is_xpu(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.XPU
+
+    def is_cuda(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.CUDA
+
+    def is_rocm(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.ROCM
+
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         raise NotImplementedError
@@ -62,6 +71,11 @@ class OmniPlatform(Platform):
         Returns:
             Fully qualified class path of the selected backend.
         """
+        raise NotImplementedError
+
+    @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
 
     @classmethod

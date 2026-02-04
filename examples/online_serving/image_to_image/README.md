@@ -12,6 +12,9 @@ For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPl
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 ```
 
+!!! note
+    If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
+
 ### Multi-Image Edit (Qwen-Image-Edit-2509)
 
 ```bash

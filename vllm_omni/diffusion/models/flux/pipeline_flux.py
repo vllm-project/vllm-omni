@@ -22,6 +22,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
@@ -554,13 +555,28 @@ class FluxPipeline(
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
         return latents
 
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):
+        if get_classifier_free_guidance_world_size() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True
+
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: str | list[str] = None,
-        prompt_2: str | list[str] = None,
-        negative_prompt: str | list[str] = None,
-        negative_prompt_2: str | list[str] = None,
+        prompt: str | list[str] | None = None,
+        prompt_2: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        negative_prompt_2: str | list[str] | None = None,
         true_cfg_scale: float = 1.0,
         height: int | None = None,
         width: int | None = None,
@@ -581,16 +597,27 @@ class FluxPipeline(
         max_sequence_length: int = 512,
     ):
         """Forward pass for flux."""
-        prompt = req.prompt if req.prompt is not None else prompt
-        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
-        height = req.height or self.default_sample_size * self.vae_scale_factor
-        width = req.width or self.default_sample_size * self.vae_scale_factor
-        sigmas = req.sigmas or sigmas
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        generator = req.generator or generator
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+            negative_prompt = None
+        elif req.prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+
+        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+        )
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -625,6 +652,8 @@ class FluxPipeline(
             negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
         (
             prompt_embeds,

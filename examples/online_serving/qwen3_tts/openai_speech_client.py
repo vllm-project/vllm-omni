@@ -90,6 +90,7 @@ def run_tts_generation(args) -> None:
     if args.x_vector_only:
         payload["x_vector_only_mode"] = True
 
+    print(f"Model: {args.model}")
     print(f"Task type: {args.task_type or 'CustomVoice'}")
     print(f"Text: {args.text}")
     print(f"Voice: {args.voice}")
@@ -108,6 +109,10 @@ def run_tts_generation(args) -> None:
     if response.status_code != 200:
         print(f"Error: {response.status_code}")
         print(response.text)
+        return
+
+    if response.content.decode("utf-8").startswith('{"error"'):
+        print(f"Error: {response.content.decode('utf-8')}")
         return
 
     # Save audio response

@@ -599,11 +599,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["code_predictor_codes"] = code_predictor_codes
         else:
+            # decode
+            if info_dict.get("num_processed_tokens", 0) < len(info_dict.get("thinker_input_ids", [])):
+                info_dict["num_processed_tokens"] = len(info_dict.get("thinker_input_ids", [])) + 1
+
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
                 input_ids, input_embeds, **info_dict
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
+        update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + span_len
         return input_ids, input_embeds, update_dict
 
     def talker_mtp(
@@ -662,7 +667,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict: dict[str, dict] = {}
         # TODO(Peiqi): add voice_type support
         voice_type = self.voice_type
-
+        start_index = info_dict.get("num_processed_tokens", 0)
+        end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
         thinker_sequence_embeds = info_dict.get("thinker_embeddings").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
@@ -762,7 +768,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         except Exception:
             pass
 
-        return req_input_ids, req_embeds, update_dict
+        return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
 
     def _thinker_to_talker_prefill(
         self,
@@ -858,13 +864,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             (input_ids, input_embeds) for talker
         """
         thinker_embed = info_dict.get("thinker_embeddings", None)
-        if thinker_embed is None:
+        start_index = info_dict.get("num_processed_tokens", 0)
+        if start_index >= thinker_embed.shape[0]:
             if info_dict.get("finished_flag"):
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
             return self.tts_eos_embed.to(device)
 
-        thinker_embed = thinker_embed.to(device)
+        thinker_embed = thinker_embed[start_index : start_index + 1].to(device)
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):

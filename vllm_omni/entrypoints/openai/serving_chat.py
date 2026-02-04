@@ -9,9 +9,11 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Final, Optional, cast
 
 import jinja2
+import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
+from vllm.renderers import RendererLike
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -27,17 +29,10 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
-    apply_hf_chat_template,
-    apply_mistral_chat_template,
     get_history_tool_calls_cnt,
     make_tool_call_id,
-    resolve_chat_template_content_format,
 )
-from vllm.entrypoints.openai.parser.harmony_utils import (
-    get_streamable_parser_for_assistant,
-    parse_chat_output,
-)
-from vllm.entrypoints.openai.protocol import (
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -45,6 +40,9 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+)
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -54,20 +52,29 @@ from vllm.entrypoints.openai.protocol import (
     FunctionDefinition,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
-    ResponsesRequest,
     ToolCall,
     UsageInfo,
 )
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_engine import (
-    ChatLikeRequest,
-    clamp_prompt_logprobs,
+from vllm.entrypoints.openai.engine.serving import ChatLikeRequest, clamp_prompt_logprobs
+from vllm.entrypoints.openai.parser.harmony_utils import (
+    get_streamable_parser_for_assistant,
+    parse_chat_output,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import should_include_usage
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
+from vllm.renderers.hf import (
+    resolve_chat_template_content_format,
+)
+from vllm.renderers.hf import (
+    safe_apply_chat_template as apply_hf_chat_template,
+)
+from vllm.renderers.mistral import (
+    safe_apply_chat_template as apply_mistral_chat_template,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.mistral import (
@@ -170,7 +177,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             model_name = self.models.model_name(lora_request)
 
-            tokenizer = await self.engine_client.get_tokenizer()
+            renderer = self.renderer
+            tokenizer = renderer.get_tokenizer()
+            if tokenizer is None:
+                tokenizer = await self.engine_client.get_tokenizer()
 
             tool_parser = self.tool_parser
 
@@ -227,7 +237,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     engine_prompts,
                 ) = await self._preprocess_chat(
                     request,
-                    tokenizer,
+                    renderer,
                     request.messages,
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_content_format=self.chat_template_content_format,
@@ -286,8 +296,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 generators.append(generator)
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert len(generators) == 1
         (result_generator,) = generators
@@ -315,13 +324,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 request_metadata,
             )
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
     async def _preprocess_chat(
         self,
         request: ChatLikeRequest | ResponsesRequest,
-        tokenizer: TokenizerLike,
+        renderer: RendererLike,
         messages: list[ChatCompletionMessageParam],
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
@@ -339,15 +347,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         list[TokensPrompt],
     ]:
         model_config = self.model_config
+        tokenizer = renderer.get_tokenizer() if renderer is not None else None
 
-        resolved_content_format = resolve_chat_template_content_format(
-            chat_template,
-            tool_dicts,
-            chat_template_content_format,
-            tokenizer,
-            model_config=model_config,
-        )
-        conversation, mm_data_future, mm_uuids = parse_chat_messages_futures(
+        if tokenizer is None or isinstance(tokenizer, MistralTokenizer):
+            resolved_content_format = (
+                chat_template_content_format if chat_template_content_format != "auto" else "string"
+            )
+        else:
+            resolved_content_format = resolve_chat_template_content_format(
+                chat_template,
+                tool_dicts,
+                chat_template_content_format,
+                tokenizer,
+                model_config=model_config,
+            )
+        # OMNI: Updated for vLLM v0.15.0 API - resolve_items() returns (mm_data, mm_uuids) tuple
+        conversation, mm_future = parse_chat_messages_futures(
             messages,
             model_config,
             content_format=resolved_content_format,
@@ -381,14 +396,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 **_chat_template_kwargs,
             )
         else:
+            hf_chat_template_kwargs = dict(_chat_template_kwargs)
+            hf_chat_template_kwargs.pop("tools", None)
+            hf_chat_template_kwargs.pop("chat_template", None)
             request_prompt = apply_hf_chat_template(
+                model_config=model_config,
                 tokenizer=tokenizer,
                 conversation=conversation,
-                model_config=model_config,
-                **_chat_template_kwargs,
+                tools=tool_dicts,
+                chat_template=chat_template,
+                tokenize=False,
+                **hf_chat_template_kwargs,
             )
 
-        mm_data = await mm_data_future
+        # OMNI: Await the combined future to get both mm_data and mm_uuids
+        mm_data, mm_uuids = await mm_future
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -633,7 +655,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -645,7 +667,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_parsers = [None] * num_choices
         except Exception as e:
             logger.exception("Error in tool parser creation.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -666,17 +688,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
 
+                # Initialize role before conditional blocks to avoid UnboundLocalError
+                # when handling audio/image responses
+                role = self.get_chat_request_role(request)
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
                     num_cached_tokens = res.num_cached_tokens
-                    # Send first response for each request.n (index) with
-                    # the role
-                    role = self.get_chat_request_role(request)
-
-                    # NOTE num_choices defaults to 1 so this usually executes
-                    # once per request
+                    # Send first response for each choice with role
+                    # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
@@ -1285,9 +1307,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
 
         except Exception as e:
-            # TODO: Use a vllm-specific Validation Error
             logger.exception("Error in chat completion stream generator.")
-            data = self.create_streaming_error_response(str(e))
+            data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
@@ -1312,8 +1333,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except ValueError as e:
-            # TODO: Use a vllm-specific Validation Error
-            return self.create_error_response(str(e))
+            return self.create_error_response(e)
 
         assert final_outputs is not None
 
@@ -1486,7 +1506,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")
-                    return self.create_error_response(str(e))
+                    return self.create_error_response(e)
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning_content, content = reasoning_parser.extract_reasoning(output.text, request=request)
@@ -1571,7 +1591,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tool_parser = self.tool_parser(tokenizer)
                 except RuntimeError as e:
                     logger.exception("Error in tool parser creation.")
-                    return self.create_error_response(str(e))
+                    return self.create_error_response(e)
 
                 tool_call_info = tool_parser.extract_tool_calls(content if content is not None else "", request=request)
                 # In the OpenAI API the finish_reason is "tools_called"
@@ -1656,10 +1676,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
+        # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
+        # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
+        audio_data = final_res.outputs[0].multimodal_output.get("audio")
         if stream:
-            audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+            audio_tensor = audio_data[-1].float().detach().cpu().numpy()
         else:
-            audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+            if isinstance(audio_data, list):
+                audio_data = torch.cat(audio_data, dim=-1)
+            audio_tensor = audio_data.float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -1739,9 +1764,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if omni_outputs.images:
             images = omni_outputs.images
         # Fall back to request_output for pipeline mode
-        elif final_res is not None:
-            if hasattr(final_res, "multimodal_output") and final_res.multimodal_output:
-                image_data = final_res.multimodal_output.get("image")
+        # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
+        elif final_res is not None and final_res.outputs:
+            completion_output = final_res.outputs[0]
+            if hasattr(completion_output, "multimodal_output") and completion_output.multimodal_output:
+                image_data = completion_output.multimodal_output.get("image")
                 if image_data is not None:
                     if isinstance(image_data, Image.Image):
                         images.append(image_data)

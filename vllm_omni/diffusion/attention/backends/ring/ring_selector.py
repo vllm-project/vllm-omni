@@ -10,7 +10,6 @@ from functools import partial
 import torch
 
 from .ring_globals import (
-    HAS_NPU,
     HAS_SAGE_ATTENTION,
     HAS_SPARSE_SAGE_ATTENTION,
 )
@@ -28,9 +27,6 @@ if HAS_SAGE_ATTENTION:
 if HAS_SPARSE_SAGE_ATTENTION:
     from spas_sage_attn.autotune import SparseAttentionMeansim
 
-if HAS_NPU:
-    from torch_npu import npu_fused_infer_attention_score
-
 
 class AttnType(Enum):
     AITER = "aiter"
@@ -44,7 +40,6 @@ class AttnType(Enum):
     SAGE_FP8 = "sage_fp8"
     SAGE_FP8_SM90 = "sage_fp8_sm90"
     SPARSE_SAGE = "sparse_sage"
-    NPU = "npu"
 
     @classmethod
     def from_string(cls, s: str):
@@ -156,11 +151,6 @@ def select_flash_attn_impl(
             )
 
         return fn
-
-    elif impl_type == AttnType.NPU:
-        if not HAS_NPU:
-            raise ImportError("torch_npu is not available!")
-        return npu_fused_infer_attention_score
 
     elif attn_processor is not None:
         return attn_processor

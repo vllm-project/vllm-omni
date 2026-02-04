@@ -221,8 +221,8 @@ class OmniStage:
 
         # Wait for result from worker
         try:
-            # Profiling stop might take time to flush files, give it 180s
-            response = self._out_q.get(timeout=60000)
+            # Profiling stop might take time to flush files, give it 600s
+            response = self._out_q.get(timeout=600)
 
             if isinstance(response, dict):
                 if response.get("type") == "profiler_result":
@@ -670,12 +670,22 @@ def _stage_worker(
                     break
 
         lock_files = acquired_lock_fds
+
+        # Set FD_CLOEXEC on all lock file descriptors to prevent child processes
+        # (e.g., EngineCore) from inheriting them, which would cause deadlock
+        for lock_fd in acquired_lock_fds:
+            try:
+                flags = fcntl.fcntl(lock_fd, fcntl.F_GETFD)
+                fcntl.fcntl(lock_fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+            except (OSError, ValueError):
+                pass
     except Exception as e:
         logger.debug(
             "[Stage-%s] Failed to set up sequential initialization lock: %s",
             stage_id,
             e,
         )
+
     # Init engine based on stage_type
     logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
     if engine_args.get("async_chunk", False):
@@ -686,30 +696,29 @@ def _stage_worker(
             break
         engine_args["stage_connector_spec"] = stage_connector_spec
         engine_args["stage_id"] = stage_id
-    try:
-        if stage_type == "diffusion":
-            engine_args.pop("model_stage", None)
-            engine_args.pop("model", None)
-            stage_engine = OmniDiffusion(
-                model=model,
-                stage_id=stage_id,
-                engine_input_source=stage_payload.get("engine_input_source", []),
-                **engine_args,
-            )
-        else:
-            # Default to LLM engine
-            stage_engine = OmniLLM(model=model, **engine_args)
-    finally:
-        # Release all locks by closing file descriptors
-        # Locks are automatically released when file descriptors are closed
-        # or when process dies
-        for lock_fd in lock_files:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                _os.close(lock_fd)
-                logger.debug("Released initialization lock (fd=%s)", lock_fd)
-            except (OSError, ValueError):
-                pass
+    if stage_type == "diffusion":
+        engine_args.pop("model_stage", None)
+        engine_args.pop("model", None)
+        stage_engine = OmniDiffusion(
+            model=model,
+            stage_id=stage_id,
+            engine_input_source=stage_payload.get("engine_input_source", []),
+            **engine_args,
+        )
+    else:
+        # Default to LLM engine
+        stage_engine = OmniLLM(model=model, **engine_args)
+
+    # Release all locks AFTER engine initialization completes
+    for lock_fd in lock_files:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            _os.close(lock_fd)
+            logger.debug("Released initialization lock (fd=%s)", lock_fd)
+        except (OSError, ValueError):
+            pass
+    lock_files = []  # Clear after release
+
     logger.debug("Engine initialized")
     # Initialize OmniConnectors if configured
     connectors: dict[tuple[str, str], OmniConnectorBase] | None = {}
@@ -1467,7 +1476,7 @@ async def _stage_worker_async(
             batch_request_ids, batch_request_outputs, _gen_ms_list, batch_metrics
         ):
             try:
-                r_outputs = [output]
+                r_outputs = [output_strip(output, omni_stage)]
                 use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
                 if use_shm:
                     out_q.put(
@@ -1553,3 +1562,32 @@ def make_stage_stats(_agg_total_tokens: int, _agg_total_gen_time_ms: float):
     from vllm_omni.entrypoints.log_utils import StageStats
 
     return StageStats(total_token=_agg_total_tokens, total_gen_time=_agg_total_gen_time_ms)
+
+
+def output_strip(r_output: RequestOutput | OmniRequestOutput, omni_stage: OmniStage):
+    """
+    Strip unnecessary multimodal outputs from stages results,
+    in order to:
+    - reduce memory usage
+    - reduce transfer & serialization overhead
+    """
+
+    # check multimodal data is required by stage output config.
+    if omni_stage.final_output and omni_stage.final_output_type != "text":
+        return r_output
+
+    # If the request has already finished, should not be altered.
+    if getattr(r_output, "finished", False):
+        return r_output
+
+    mm_output = getattr(r_output, "multimodal_output", None)
+    if mm_output is not None:
+        r_output.multimodal_output = {}
+
+    outputs = getattr(r_output, "outputs", None)
+    if outputs is not None:
+        for out in outputs:
+            if getattr(out, "multimodal_output", None):
+                out.multimodal_output = {}
+
+    return r_output

@@ -491,7 +491,7 @@ class GlmImagePipeline(nn.Module):
             condition_grid = image_grid_thw[:-1]
             prior_token_image_embed = self.vision_language_encoder.get_image_features(
                 inputs["pixel_values"], condition_grid
-            )
+            ).pooler_output
             prior_token_image_embed = torch.cat(prior_token_image_embed, dim=0)
             flat_prior_token_image_ids = self.vision_language_encoder.get_image_tokens(
                 prior_token_image_embed, condition_grid
@@ -859,7 +859,7 @@ class GlmImagePipeline(nn.Module):
         preprocessed_images = (
             None
             if isinstance(first_prompt, str)
-            else first_prompt.get("additional_information", {}).get("preprocessed_image")
+            else [first_prompt.get("additional_information", {}).get("preprocessed_image")]
         )
         condition_images = (
             None

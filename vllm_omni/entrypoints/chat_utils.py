@@ -11,11 +11,11 @@ from vllm.entrypoints.chat_utils import (
     BaseMultiModalItemTracker,
     ChatCompletionContentPartParam,
     ChatCompletionMessageParam,
+    ChatTemplateContentFormat,
     ConversationMessage,
     MultiModalDataDict,
     MultiModalUUIDDict,
     _AssistantParser,
-    _ChatTemplateContentFormat,
     _ContentPart,
     _get_full_multimodal_text_prompt,
     _parse_chat_message_content_part,
@@ -39,16 +39,26 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
         self._mm_processor_kwargs = mm_processor_kwargs
 
     def parse_video(self, video_url: str | None, uuid: str | None = None) -> None:
-        video = self._connector.fetch_video_async(video_url=video_url) if video_url else None
-
-        placeholder = self._tracker.add("video", video, uuid)
+        # OMNI: Follow upstream async pattern - create coroutine that resolves to (data, uuid)
+        coro = self._video_with_uuid_async(video_url, uuid)
+        placeholder = self._tracker.add("video", coro)
         self._add_placeholder("video", placeholder)
 
         # Extract audio from video if use_audio_in_video is True
         if video_url and self._mm_processor_kwargs and self._mm_processor_kwargs.get("use_audio_in_video", False):
-            audio_coro = self._extract_audio_from_video_async(video_url)
-            audio_placeholder = self._tracker.add("audio", audio_coro, uuid)
+            audio_coro = self._audio_from_video_with_uuid_async(video_url, uuid)
+            audio_placeholder = self._tracker.add("audio", audio_coro)
             self._add_placeholder("audio", audio_placeholder)
+
+    async def _video_with_uuid_async(self, video_url: str | None, uuid: str | None):
+        """Fetch video and return (video, uuid) tuple."""
+        video = await self._connector.fetch_video_async(video_url=video_url) if video_url else None
+        return video, uuid
+
+    async def _audio_from_video_with_uuid_async(self, video_url: str, uuid: str | None):
+        """Extract audio from video and return (audio, uuid) tuple."""
+        audio = await self._extract_audio_from_video_async(video_url)
+        return audio, uuid
 
     async def _extract_audio_from_video_async(self, video_url: str) -> tuple[np.ndarray, int | float]:
         """
@@ -128,13 +138,21 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
 def parse_chat_messages_futures(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
-    content_format: _ChatTemplateContentFormat,
+    content_format: ChatTemplateContentFormat,
     mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
-    Awaitable[MultiModalDataDict | None],
-    MultiModalUUIDDict | None,
+    Awaitable[tuple[MultiModalDataDict | None, MultiModalUUIDDict | None]],
 ]:
+    """Parse chat messages and return conversation with multimodal data future.
+
+    OMNI: Updated to use upstream vLLM v0.15.0 API where resolve_items()
+    returns both mm_data and mm_uuids together as a tuple.
+
+    Returns:
+        Tuple of (conversation, mm_future) where mm_future resolves to
+        (mm_data, mm_uuids) when awaited.
+    """
     conversation: list[ConversationMessage] = []
     mm_tracker = OmniAsyncMultiModalItemTracker(model_config)
 
@@ -155,13 +173,14 @@ def parse_chat_messages_futures(
 
     _postprocess_messages(conversation)
 
-    return conversation, mm_tracker.all_mm_data(), mm_tracker.all_mm_uuids()
+    # OMNI: Use upstream resolve_items() which returns (mm_data, mm_uuids) tuple
+    return conversation, mm_tracker.resolve_items()
 
 
 def _parse_chat_message_content(
     message: ChatCompletionMessageParam,
     mm_tracker: BaseMultiModalItemTracker,
-    content_format: _ChatTemplateContentFormat,
+    content_format: ChatTemplateContentFormat,
     interleave_strings: bool,
     mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> list[ConversationMessage]:

@@ -30,6 +30,11 @@ def supports_image_input(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_image_input", False))
 
 
+def image_color_format(model_class_name: str) -> str:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    return getattr(model_cls, "color_format", "RGB")
+
+
 def supports_audio_output(model_class_name: str) -> bool:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:
@@ -248,7 +253,7 @@ class DiffusionEngine:
 
         try:
             # Give worker enough time — export + compression + table can be slow
-            results = self.collective_rpc(method="stop_profile", timeout=60000)
+            results = self.collective_rpc(method="stop_profile", timeout=600)
         except Exception:
             logger.error("Failed to stop profiling on workers", exc_info=True)
             return {"traces": [], "tables": []}
@@ -315,8 +320,8 @@ class DiffusionEngine:
         width = 1024
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
-
-            dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
+            color_format = image_color_format(self.od_config.model_class_name)
+            dummy_image = PIL.Image.new(color_format, (width, height))
         else:
             dummy_image = None
         prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
