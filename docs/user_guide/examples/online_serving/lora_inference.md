@@ -1,4 +1,4 @@
-# Online LoRA Inference (Diffusion)
+# LoRA Inference(Diffusion)
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/lora_inference>.
 

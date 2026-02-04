@@ -1,4 +1,4 @@
-# Qwen3-TTS Offline Inference
+# Qwen3-TTS
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/qwen3_tts>.
 
