@@ -64,7 +64,6 @@ def clean_gpu_memory_between_tests():
 def log_test_name_before_test(request):
     print(f"--- Running test: {request.node.name}")
     yield
-    print("+++ Test completed")
 
 
 def _run_pre_test_cleanup(enable_force=False):
