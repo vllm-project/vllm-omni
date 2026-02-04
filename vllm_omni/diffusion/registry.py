@@ -171,9 +171,9 @@ def initialize_model(
             and od_config.vae_use_tiling
         ):
             from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_install_vae_patch_parallelism
+            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_wrap_vae_decode_with_patch_parallelism
 
-            maybe_install_vae_patch_parallelism(
+            maybe_wrap_vae_decode_with_patch_parallelism(
                 model,
                 vae_patch_parallel_size=vae_pp_size,
                 group_getter=get_dit_group,

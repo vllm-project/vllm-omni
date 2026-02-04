@@ -348,7 +348,7 @@ def _distributed_patch_decode(
 class VaePatchParallelism:
     """Patch/tile-parallel VAE decode wrapper.
 
-    This is meant to be installed as an instance-level override of `vae.decode`
+    This is meant to wrap `vae.decode` as an instance-level override
     so pipelines don't need model-specific code paths.
     """
 
@@ -443,13 +443,13 @@ class VaePatchParallelism:
         return DecoderOutput(sample=decoded)
 
 
-def maybe_install_vae_patch_parallelism(
+def maybe_wrap_vae_decode_with_patch_parallelism(
     pipeline: Any,
     *,
     vae_patch_parallel_size: int,
     group_getter: Callable[[], dist.ProcessGroup],
 ) -> None:
-    """Install patch-parallel VAE decode wrapper onto a diffusers-style pipeline."""
+    """Wrap a diffusers-style pipeline's `vae.decode` with patch/tile parallel decode."""
     if vae_patch_parallel_size <= 1:
         return
 
