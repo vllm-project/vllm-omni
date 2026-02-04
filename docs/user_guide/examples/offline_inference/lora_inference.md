@@ -1,4 +1,4 @@
-# LoRA Inference Examples
+# LoRA Inference(Diffusion)
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/lora_inference>.
 

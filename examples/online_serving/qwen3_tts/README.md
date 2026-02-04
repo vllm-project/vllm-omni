@@ -1,4 +1,4 @@
-# Qwen3-TTS Online Serving
+# Qwen3-TTS
 
 This directory contains examples for running Qwen3-TTS models with vLLM-Omni's online serving API.
 
