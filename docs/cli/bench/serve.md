@@ -52,7 +52,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
 - `--percentile-metrics`  
         "Comma-separated list of selected metrics to report percentiles."
                     "This argument specifies the metrics to report percentiles."
-                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf". '
+                    'Allowed metric names are "ttft", "tpot", "itl", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
 - `--save-result`  
 Specify to save benchmark results to a json file
@@ -220,48 +220,48 @@ If successful, you will see the following output:
 ============ Serving Benchmark Result ============
 Successful requests:                     2
 Failed requests:                         0
-Benchmark duration (s):                  24.35
-Request throughput (req/s):              0.08
+Benchmark duration (s):                  3.89
+Request throughput (req/s):              0.51
 Peak concurrent requests:                2.00
 ----------------End-to-end Latency----------------
-Mean E2EL (ms):                          22576.23
-Median E2EL (ms):                        22576.23
-P99 E2EL (ms):                           24205.72
+Mean E2EL (ms):                          3824.76
+Median E2EL (ms):                        3824.76
+P99 E2EL (ms):                           3888.54
 ================== Text Result ===================
 Total input tokens:                      30
-Total generated tokens:                  8973
-Output token throughput (tok/s):         368.52
-Peak output token throughput (tok/s):    81.00
+Total generated tokens:                  10101
+Output token throughput (tok/s):         2595.57
+Peak output token throughput (tok/s):    111.00
 Peak concurrent requests:                2.00
-Total Token throughput (tok/s):          369.76
+Total Token throughput (tok/s):          2603.28
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          125.16
-Median TTFT (ms):                        125.16
-P99 TTFT (ms):                           155.88
+Mean TTFT (ms):                          117.15
+Median TTFT (ms):                        117.15
+P99 TTFT (ms):                           142.69
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          5.01
-Median TPOT (ms):                        5.01
-P99 TPOT (ms):                           5.42
+Mean TPOT (ms):                          0.73
+Median TPOT (ms):                        0.73
+P99 TPOT (ms):                           0.74
 ---------------Inter-token Latency----------------
-Mean ITL (ms):                           34.15
-Median ITL (ms):                         0.01
-P99 ITL (ms):                            376.19
+Mean ITL (ms):                           16.47
+Median ITL (ms):                         16.19
+P99 ITL (ms):                            52.55
 ================== Audio Result ==================
-Total audio duration generated(s):       3.95
-Total audio frames generated:            94890
-Audio throughput(audio duration/s):      0.16
+Total audio duration generated(s):       15.79
+Total audio frames generated:            379050
+Audio throughput(audio duration/s):      4.06
 ---------------Time to First Packet---------------
-Mean AUDIO_TTFP (ms):                    11756.89
-Median AUDIO_TTFP (ms):                  11756.89
-P99 AUDIO_TTFP (ms):                     20854.25
+Mean AUDIO_TTFP (ms):                    3701.37
+Median AUDIO_TTFP (ms):                  3701.37
+P99 AUDIO_TTFP (ms):                     3762.25
 -----------------Real Time Factor-----------------
-Mean AUDIO_RTF:                          3.75
-Median AUDIO_RTF:                        3.75
-P99 AUDIO_RTF:                           7.39
+Mean AUDIO_RTF:                          0.47
+Median AUDIO_RTF:                        0.47
+P99 AUDIO_RTF:                           0.48
 ==================================================
 ```
 Notes:
-We use (audio generation time - first packet latency) / audio duration to calculate RTF.
+We use audio generation time / audio duration to calculate RTF.
 
 </details>
 
