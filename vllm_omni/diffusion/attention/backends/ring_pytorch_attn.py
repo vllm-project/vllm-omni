@@ -7,10 +7,13 @@
 
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.ring.ring_kernels import pytorch_attn_forward
 from vllm_omni.diffusion.attention.backends.ring.ring_utils import update_out_and_lse
 from vllm_omni.diffusion.distributed.comm import RingComm
+
+logger = init_logger(__name__)
 
 
 def ring_pytorch_attn_func(

@@ -244,9 +244,9 @@ def main(args):
     for stage_outputs in omni_generator:
         for output in stage_outputs.request_output:
             request_id = output.request_id
-            audio_tensor = output.multimodal_output["audio"]
+            audio_tensor = output.outputs[0].multimodal_output["audio"]
             output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-            audio_samplerate = output.multimodal_output["sr"].item()
+            audio_samplerate = output.outputs[0].multimodal_output["sr"].item()
             # Convert to numpy array and ensure correct format
             audio_numpy = audio_tensor.float().detach().cpu().numpy()
 

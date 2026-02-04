@@ -8,7 +8,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.models.interfaces import supports_mm_encoder_only, supports_mrope
+from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
 from vllm.utils.import_utils import LazyLoader
@@ -448,7 +448,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
-        if supports_mm_encoder_only(self.model):
+        mm_config = self.vllm_config.model_config.multimodal_config
+        if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
@@ -552,6 +553,13 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+        )
+
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
@@ -577,6 +585,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
+                slot_mappings=slot_mappings_by_group,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -641,6 +650,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
                 ),
             ):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
@@ -688,6 +698,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
+                    slot_mappings=slot_mappings,
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is

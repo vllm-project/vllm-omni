@@ -1,7 +1,9 @@
 import time
 from collections import defaultdict
 
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -9,6 +11,7 @@ from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -56,10 +59,21 @@ class OmniGenerationScheduler(VLLMScheduler):
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
+        # OMNI: Track requests that are already finished (e.g., marked by connector)
+        # These should be removed from running and not scheduled
+        already_finished_reqs: set[Request] = set()
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if self.omni_connector is not None:
                 get_chunk_for_generation(self.omni_connector, request)
+
+            # OMNI: Skip requests that are already finished or not in self.requests
+            # This can happen when connector marks request as finished
+            if request.status == RequestStatus.FINISHED_STOPPED or request.request_id not in self.requests:
+                already_finished_reqs.add(request)
+                req_index += 1
+                continue
+
             num_computed_tokens = request.num_computed_tokens
             required_tokens = max(len(request.prompt_token_ids) - num_computed_tokens, 1)
             num_new_tokens = min(required_tokens, token_budget)
@@ -83,12 +97,24 @@ class OmniGenerationScheduler(VLLMScheduler):
             scheduled_running_reqs.append(request)
             req_index += 1
 
+        # OMNI: Remove already finished requests from running queue
+        if already_finished_reqs:
+            self.running = remove_all(self.running, already_finished_reqs)
+
         # Fast path selection and scheduling (treat all as diffusion requests,
         # independent of pooling_params)
         while self.waiting and token_budget > 0 and len(self.running) < self.max_num_running_reqs:
             request = self.waiting.peek_request()
             if self.omni_connector is not None:
                 get_chunk_for_generation(self.omni_connector, request)
+
+            # OMNI: Skip requests that are already finished or not in self.requests
+            # This can happen when connector marks request as finished
+            if request.status == RequestStatus.FINISHED_STOPPED or request.request_id not in self.requests:
+                # Pop the finished request from waiting queue and don't schedule it
+                self.waiting.pop_request()
+                continue
+
             # Uniformly treat as diffusion. A feature flag can be added later
             # via config or request tag.
 
@@ -257,9 +283,16 @@ class OmniGenerationScheduler(VLLMScheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
 
+        cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+        perf_stats: PerfStats | None = None
+        if self.perf_metrics and self.perf_metrics.is_enabled():
+            perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
+
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
-        kv_connector_stats = kv_connector_output.kv_connector_stats if kv_connector_output else None
+        kv_connector_stats: KVConnectorStats | None = (
+            kv_connector_output.kv_connector_stats if kv_connector_output else None
+        )
         # Merge connector-side stats (align with v0.14.0)
         if kv_connector_stats and self.connector:
             kv_stats = self.connector.get_kv_connector_stats()
@@ -308,12 +341,14 @@ class OmniGenerationScheduler(VLLMScheduler):
                     num_accepted_tokens=num_accepted,
                 )
 
+            stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
             kv_transfer_params = None
-            pooler_output = None
-            if pooler_outputs:
-                pooler_output = pooler_outputs[req_index]
+            pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            status_before_stop = request.status
+            finish_reason = None
+            routed_experts = None
 
             # Diffusion request: completes in one step; mark finished and free resources
             if request.status == RequestStatus.FINISHED_STOPPED or (
@@ -323,8 +358,18 @@ class OmniGenerationScheduler(VLLMScheduler):
                 # Optional: set a stop_reason for front-end clarity
                 # (does not affect protocol)
                 request.stop_reason = request.stop_reason  # or "generation_done"
-                kv_transfer_params = self._free_request(request)
-                stopped_running_reqs.add(request)
+                stopped = True
+
+            if stopped:
+                routed_experts = self._get_routed_experts(request)
+                finish_reason = request.get_finished_reason()
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
@@ -344,13 +389,13 @@ class OmniGenerationScheduler(VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
-                        finish_reason=request.get_finished_reason(),
+                        finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
@@ -359,6 +404,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
+                        routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
@@ -406,7 +452,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
-        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats)) is not None:
+        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request
