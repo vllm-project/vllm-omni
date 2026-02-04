@@ -291,6 +291,7 @@ class TestTTSMethods:
         mock_engine_client = MagicMock()
         mock_engine_client.errored = False
         mock_engine_client.stage_list = None
+        mock_engine_client.tts_max_instructions_length = None
         mock_models = MagicMock()
         mock_models.is_base_model.return_value = True
         return OmniOpenAIServingSpeech(
