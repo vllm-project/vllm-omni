@@ -22,7 +22,7 @@ Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.1
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.14.0 --torch-backend=auto
+uv pip install vllm==0.15.0 --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
@@ -36,10 +36,10 @@ uv pip install vllm-omni
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.14.0 release version of the library
+If you do not need to modify source code of vLLM, you can directly install the stable 0.15.0 release version of the library
 
 ```bash
-uv pip install vllm==0.14.0 --torch-backend=auto
+uv pip install vllm==0.15.0 --torch-backend=auto
 ```
 
 The release 0.14.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
@@ -58,11 +58,11 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.14.0
+git checkout v0.15.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.14.0/vllm-0.14.0-cp38-abi3-manylinux_2_31_x86_64.whl
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.15.0/vllm-0.15.0-cp38-abi3-manylinux_2_31_x86_64.whl
 ```
 Install vllm with command below (If you have no existing PyTorch).
 ```bash
