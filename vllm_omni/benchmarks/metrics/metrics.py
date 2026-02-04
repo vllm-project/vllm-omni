@@ -14,7 +14,7 @@ class MultiModalsBenchmarkMetrics(BenchmarkMetrics):
     median_audio_ttfp_ms: float = 0.0
     std_audio_ttfp_ms: float = 0.0
     percentiles_audio_ttfp_ms: list[tuple[float, float]] = None
-    total_audio_duration_ms: float = 0.0
+    total_audio_duration_s: float = 0.0
     total_audio_frames: int = 0
     audio_throughput: float = 0.0
     mean_audio_rtf: float = 0.0
@@ -77,7 +77,7 @@ def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiMod
 
 def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
     print("{s:{c}^{n}}".format(s=" Audio Result ", n=50, c="="))
-    print("{:<40} {:<10.2f}".format("Total audio duration generated(s):", metrics.total_audio_duration_ms))
+    print("{:<40} {:<10.2f}".format("Total audio duration generated(s):", metrics.total_audio_duration_s))
     print("{:<40} {:<10}".format("Total audio frames generated:", metrics.total_audio_frames))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", metrics.audio_throughput))
     for metric in selected_percentile_metrics:
@@ -223,6 +223,9 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
+        warnings.formatwarning = (
+            lambda msg, category, filename, lineno, line=None: f"{filename}:{lineno}: {category.__name__}: {msg}\n"
+        )
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration on the benchmark arguments.",
             stacklevel=2,
@@ -311,7 +314,7 @@ def calculate_metrics(
         std_audio_duration_s=np.std(audio_duration or 0),
         median_audio_duration_s=np.median(audio_duration or 0),
         percentiles_audio_duration_s=[(p, np.percentile(audio_duration or 0, p)) for p in selected_percentiles],
-        total_audio_duration_ms=sum(audio_duration),
+        total_audio_duration_s=sum(audio_duration),
         total_audio_frames=sum(audio_frames),
         audio_throughput=sum(audio_duration) / dur_s,
         mean_audio_rtf=np.mean(audio_rtfs or 0),
