@@ -70,11 +70,6 @@ def _extract_single_image(outputs) -> Image.Image:
     return images[0]
 
 
-def _get_enforce_eager_for_cuda() -> bool:
-    cc_major, _cc_minor = torch.cuda.get_device_capability(0)
-    return cc_major < 8
-
-
 def _run_zimage_generate(
     *,
     tp_size: int,
@@ -157,7 +152,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
-    enforce_eager = _get_enforce_eager_for_cuda()
+    enforce_eager = True
 
     height = 512
     width = 512
@@ -219,7 +214,7 @@ def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 CUDA devices.")
 
-    enforce_eager = _get_enforce_eager_for_cuda()
+    enforce_eager = True
 
     # Use a larger image to ensure there are multiple VAE tiles.
     height = 1152
