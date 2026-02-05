@@ -17,8 +17,6 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 # --8<-- [start:pre-built-wheels]
 
 #### Installation of vLLM
-Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.12.0rc1, 0.14.0rc1, 0.14.0. For the latest version, please [build from source](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/gpu/#build-wheel-from-source).
-
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash

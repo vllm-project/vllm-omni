@@ -15,11 +15,7 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install without uv
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]"
-
-# When we are installing onnxruntime-rocm, we need to uninstall the system-installed onnxruntime first.
-# These are the dependencies of Qwen3-TTS.
-RUN uv pip uninstall onnxruntime --system && uv pip install --no-cache-dir onnxruntime-rocm sox --system
+RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]" --no-build-isolation
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
