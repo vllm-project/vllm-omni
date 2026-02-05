@@ -1,0 +1,19 @@
+ARG VLLM_ASCEND_IMAGE=quay.io/ascend/vllm-ascend
+ARG VLLM_ASCEND_TAG=v0.14.0rc1-a3
+FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
+
+ARG APP_DIR=/vllm-workspace/vllm-omni
+WORKDIR ${APP_DIR}
+
+COPY . .
+
+# Remove this replace when the dispatch of requirements is ready
+RUN sed -i -E 's/^([[:space:]]*)"fa3-fwd==0\.0\.1",/\1# "fa3-fwd==0.0.1",/' pyproject.toml \
+ && sed -i -E 's/\bonnxruntime\b/onnxruntime-cann/g' pyproject.toml
+
+# Install vllm-omni with dev dependencies
+RUN pip install --no-cache-dir -e .
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+ENTRYPOINT []

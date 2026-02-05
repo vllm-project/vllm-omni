@@ -308,19 +308,24 @@ def get_multi_audios_query(custom_prompt: str | None = None):
 
 def get_use_audio_in_video_query(
     video_path: str | None = None,
-    audio_path: str | None = None,
     custom_prompt: str | None = None,
 ):
+    """Query for use_audio_in_video mode.
+
+    When use_audio_in_video=True, audio is automatically extracted from the video
+    by the server. Do NOT send a separate audio_url - this would cause a mismatch
+    between the number of audio and video items.
+    """
     question = custom_prompt or (
         "Describe the content of the video in details, then convert what the baby say into text."
     )
     video_url = get_video_url_from_path(video_path)
-    audio_url = get_audio_url_from_path(audio_path)
+    # Note: audio is extracted from video automatically when use_audio_in_video=True
+    # Do not include a separate audio_url here
     return {
         "role": "user",
         "content": [
             {"type": "video_url", "video_url": {"url": video_url}},
-            {"type": "audio_url", "audio_url": {"url": audio_url}},
             {"type": "text", "text": question},
         ],
     }
@@ -397,7 +402,6 @@ def run_multimodal_generation(args) -> None:
     elif args.query_type == "use_audio_in_video":
         prompt = query_func(
             video_path=video_path,
-            audio_path=audio_path,
             custom_prompt=custom_prompt,
         )
     else:
@@ -484,7 +488,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="use_mixed_modalities",
+        default="use_audio_in_video",
         choices=query_map.keys(),
         help="Query type.",
     )
