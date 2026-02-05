@@ -67,9 +67,11 @@ class OmniGenerationScheduler(VLLMScheduler):
             if self.omni_connector is not None:
                 get_chunk_for_generation(self.omni_connector, request)
 
-            # OMNI: Skip requests that are already finished or not in self.requests
-            # This can happen when connector marks request as finished
-            if request.status == RequestStatus.FINISHED_STOPPED or request.request_id not in self.requests:
+            # OMNI: Skip requests that are not in self.requests
+            # This can happen when connector marks request as finished and it's removed from requests
+            if request.request_id not in self.requests or (
+                self.omni_connector is None and request.status == RequestStatus.FINISHED_STOPPED
+            ):
                 already_finished_reqs.add(request)
                 req_index += 1
                 continue
@@ -108,9 +110,10 @@ class OmniGenerationScheduler(VLLMScheduler):
             if self.omni_connector is not None:
                 get_chunk_for_generation(self.omni_connector, request)
 
-            # OMNI: Skip requests that are already finished or not in self.requests
-            # This can happen when connector marks request as finished
-            if request.status == RequestStatus.FINISHED_STOPPED or request.request_id not in self.requests:
+            # OMNI: Skip requests that are not in self.requests
+            if request.request_id not in self.requests or (
+                self.omni_connector is None and request.status == RequestStatus.FINISHED_STOPPED
+            ):
                 # Pop the finished request from waiting queue and don't schedule it
                 self.waiting.pop_request()
                 continue
