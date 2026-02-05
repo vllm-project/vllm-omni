@@ -20,12 +20,19 @@ steps:
   - label: "Simple Unit Test"
     depends_on: image-build
     commands:
-      - pytest -v -s tests/entrypoints/
-      - pytest -v -s tests/diffusion/cache/
-      - pytest -v -s tests/diffusion/lora/
-      - pytest -v -s tests/model_executor/models/qwen2_5_omni/test_audio_length.py
-      - pytest -v -s tests/worker/
-      - pytest -v -s tests/distributed/omni_connectors/test_kv_flow.py
+    - |
+      pytest -v -s \
+        tests/entrypoints/ \
+        tests/diffusion/cache/ \
+        tests/diffusion/lora/ \
+        tests/model_executor/models/qwen2_5_omni/test_audio_length.py \
+        tests/worker/ \
+        tests/distributed/omni_connectors/test_kv_flow.py \
+        --cov=vllm_omni \
+        --cov-branch \
+        --cov-report=term-missing \
+        --cov-report=html \
+        --cov-report=xml
     agents:
       queue: "gpu_1_queue"
     plugins:
