@@ -25,6 +25,12 @@ class GenerationStrategy(StageStrategy):
             req_id = state_manager.get_global_request_id(request.request_id)
             state = state_manager.get_state(req_id)
 
+            # If the model_executor is slow and hasn't consumed the chunk yet
+            pending = getattr(request, "pending_chunk", None)
+            if pending is not None and len(pending) > 0:
+                request.status = RequestStatus.RUNNING
+                continue
+
             if state.upstream_finished:
                 # If upstream is finished, mark request as finished
                 should_stop = processor.on_upstream_finished(request)
@@ -36,12 +42,6 @@ class GenerationStrategy(StageStrategy):
                         stopped_preempted.add(request)
 
                     request.status = RequestStatus.FINISHED_STOPPED
-                continue
-
-            # If the model_executor is slow and hasn't consumed the chunk yet
-            pending = getattr(request, "pending_chunk", None)
-            if pending is not None and len(pending) > 0:
-                request.status = RequestStatus.RUNNING
                 continue
 
             # Try to retrieve chunk

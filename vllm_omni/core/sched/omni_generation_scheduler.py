@@ -52,7 +52,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # These are requests that were previously WAITING_FOR_CHUNK.
         # They received chunks and were marked back to RUNNING by self.chunk_manager.
         # These should go through the "running" path, NOT the "new" path.
-        if hasattr(self, "chunk_manager"):
+        if self.chunk_manager is not None:
             req_index = 0
             while req_index < len(self.running) and token_budget > 0:
                 request = self.running[req_index]
@@ -314,7 +314,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # IMPORTANT: Call this BEFORE creating outputs so finish_reason is set correctly
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        if hasattr(self, "chunk_manager"):
+        if self.chunk_manager is not None:
             active_requests = [
                 req
                 for req in self.requests.values()
@@ -372,7 +372,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if not pooler_output:
                     pooler_output = None
 
-            if not hasattr(self, "chunk_manager"):
+            if self.chunk_manager is None:
                 # Diffusion request: completes in one step; mark finished and free resources
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity

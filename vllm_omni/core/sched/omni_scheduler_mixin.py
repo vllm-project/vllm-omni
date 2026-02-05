@@ -64,5 +64,5 @@ class OmniSchedulerMixin:
 
     def cleanup_request_chunk_state(self, request_id: str) -> None:
         """Cleanup chunk state for a finished request."""
-        if self.chunk_manager:
+        if self.chunk_manager is not None:
             self.chunk_manager.cleanup_request(request_id)

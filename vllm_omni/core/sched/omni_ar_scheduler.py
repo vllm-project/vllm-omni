@@ -390,7 +390,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
-                if hasattr(self, "chunk_manager"):
+                if self.chunk_manager is not None:
                     # Use new ChunkManager API
                     self.chunk_manager.send_chunk(request, pooler_output, new_token_ids)
             else:
@@ -398,7 +398,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 assert not prompt_logprobs_tensors
 
         # Receive chunks for all active requests (RUNNING or WAITING_FOR_CHUNK)
-        if hasattr(self, "chunk_manager"):
+        if self.chunk_manager is not None:
             active_requests = [
                 req
                 for req in self.requests.values()

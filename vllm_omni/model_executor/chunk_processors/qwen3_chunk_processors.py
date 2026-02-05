@@ -74,8 +74,10 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
     """
 
     stage_type: str = "ar"
-    chunk_batch_size: int = 36  # Code2Wav frame size
-    should_skip_first_chunk: bool = True
+    # The chunk batch size is 50 (25 for left context and 25 for current chunks)
+    # We want to preserve previous 25 tokens as context for code2wav (chunked_decode_streaming)
+    chunk_batch_size: int = 50
+    should_skip_first_chunk: bool = False
 
     def is_prefill(self, pooler_output: Any, request: Request) -> bool:
         """Always false for generation output streaming."""
@@ -90,16 +92,7 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
     def accumulate_and_prepare_batch(
         self, request: Request, state: "ChunkState", pooler_output: Any = None, new_token_ids: list[int] | None = None
     ) -> dict | None:
-        """Qwen3-specific: Accumulate raw tensors, batch, then transform.
-
-        This matches the old _process_chunk_for_generation_qwen3 logic:
-        1. Accumulate code_predictor_codes tensors (not transformed)
-        2. When batch_size reached OR request finished:
-           - torch.cat the accumulated tensors
-           - Transform the concatenated result
-           - Clear accumulator
-        3. Skip first batch if should_skip_first_chunk is True
-        """
+        """Qwen3-specific: Accumulate raw tensors, batch, then transform."""
         if pooler_output is None:
             return None
 
@@ -121,12 +114,6 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
         accumulated_count = len(state.accumulated_data)
 
         if accumulated_count >= self.chunk_batch_size or is_finished:
-            if self.should_skip_first_chunk and not state.first_batch_skipped:
-                if not is_finished:  # Don't skip if it's the last chunk
-                    state.first_batch_skipped = True
-                    state.accumulated_data = []
-                    return None
-
             tensors = state.accumulated_data
             if not tensors:
                 return None

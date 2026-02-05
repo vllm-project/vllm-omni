@@ -96,26 +96,19 @@ def thinker2talker(
     device = torch.device(current_platform.device_type)
 
     # Process each thinker output
-    for i, thinker_output in enumerate(thinker_outputs):
+    for _, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
         thinker_embeddings = (
             torch.cat(output.multimodal_output["0"], dim=0).detach().to(device=device, dtype=torch.float)
             if isinstance(output.multimodal_output["0"], list)
             else output.multimodal_output["0"].detach().to(device=device, dtype=torch.float)
         )
-        # I am using a dummy Qwen3 model weights with less number of layers to fit in my GPU
-        # So, mocking 24th layer output with random tensor as a workaround for debugging purposes
-        # I will remove this code before merging it into main
-        if "24" not in output.multimodal_output.keys():
-            # Seed the random number generator to ensure consistent output across runs
-            generator = torch.Generator(device="cpu")
-            generator.manual_seed(42)
-            randn_24 = torch.randn((1, 2048), generator=generator).repeat(len(output.token_ids), 1)
-            scales = torch.arange(1, len(output.token_ids) + 1, dtype=randn_24.dtype) * 0.1
-            result = randn_24 * scales[:, None]
-            output.multimodal_output["24"] = result
 
-        thinker_hidden_states = output.multimodal_output["24"].detach().to(device=device, dtype=torch.float)
+        thinker_hidden_states = (
+            torch.cat(output.multimodal_output["24"], dim=0).detach().to(device=device, dtype=torch.float)
+            if isinstance(output.multimodal_output["24"], list)
+            else output.multimodal_output["24"].detach().to(device=device, dtype=torch.float)
+        )
         info = {
             "thinker_embeddings": thinker_embeddings,
             "thinker_hidden_states": thinker_hidden_states,
@@ -144,7 +137,9 @@ def thinker2talker(
                 if isinstance(output.multimodal_output["tts_pad_embed"], list)
                 else output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float)
             ),
-            "is_prefill": [True] if len(output.token_ids) < 3 else [False],
+            # Qwen3 needs at least 3 output tokens before leaving prefill.
+            # Keep this aligned with Qwen3ThinkerChunkProcessor.min_tokens_for_decode.
+            "is_prefill": [True] if len(output.token_ids) <= 4 else [False],
         }
         talker_inputs.append(
             OmniTokensPrompt(
@@ -194,29 +189,32 @@ def talker2code2wav(
     talker_outputs = stage_list[source_stage_id].engine_outputs
     code2wav_inputs = []
 
+    # The number of talker output tokens to accumulate
+    # before invoking code2wav stage
+    talker_tokens_batch_size = 25
+
     # Process each talker output
     for i, talker_output in enumerate(talker_outputs):
         output = talker_output.outputs[0]
         prefill_len = len(talker_output.prompt_token_ids)
         seq_len = len(output.token_ids)
 
-        additional_information = {"is_prefill": [True] if seq_len < 36 else [False]}
+        additional_information = {"is_prefill": [True] if seq_len <= talker_tokens_batch_size else [False]}
 
         code_predictor_codes = output.multimodal_output["code_predictor_codes"]
 
         if isinstance(code_predictor_codes, list):
             code_predictor_codes = torch.cat(code_predictor_codes, dim=0)
 
-        # Extract codec codes from talker output
-        codec_codes = (
-            code_predictor_codes[prefill_len:36]
-            .to(torch.long)
-            .transpose(0, 1)
-            .cpu()
-            .to(torch.long)
-            .reshape(-1)
-            .tolist()
-        )  # 16, seq_len
+        # Accumulate talker output tokens before invoking code2wav stage
+        # This helps
+        code_predictor_codes = code_predictor_codes[prefill_len : prefill_len + talker_tokens_batch_size]
+
+        if code_predictor_codes.shape[0] > 0:
+            # Extract codec codes from talker output
+            codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
+        else:
+            codec_codes = []
 
         code2wav_inputs.append(
             OmniTokensPrompt(

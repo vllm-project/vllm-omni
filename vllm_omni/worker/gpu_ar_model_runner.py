@@ -522,8 +522,26 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 mm_payload: dict[str, object] = {}
                 for k, v in multimodal_outputs.items():
                     try:
-                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
-                            mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
+                        if isinstance(v, torch.Tensor):
+                            # Case 1: Token-level tensor (matches hidden_states size)
+                            if v.shape[0] == hidden_states_cpu.shape[0]:
+                                mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
+                            # Case 2: Request-level tensor (matches number of requests)
+                            # Note: req_ids_output_copy contains all requests in the current step
+                            elif v.shape[0] == len(req_ids_output_copy):
+                                # Use request index for slicing
+                                mm_payload[k] = v.detach().to("cpu")[idx : idx + 1].contiguous()
+                            # Case 3: Unknown shape but large enough to slice by tokens
+                            elif v.shape[0] >= end:
+                                mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
+                            # Case 4: Tensor too small - fallback
+                            else:
+                                logger.warning(
+                                    f"[gpu_ar_model_runner] Tensor '{k}' has shape {v.shape} which is too "
+                                    f"small to slice with indices [{start}:{end}] or request index [{idx}]. "
+                                    "Passing as-is (may cause data leakage between requests)."
+                                )
+                                mm_payload[k] = v.detach().to("cpu").contiguous()
                         elif isinstance(v, dict):
                             sub_dict: dict[str, torch.Tensor] = {}
                             for sk, sv in v.items():

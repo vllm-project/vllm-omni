@@ -671,17 +671,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # when handling audio/image responses
                 role = self.get_chat_request_role(request)
 
-                # Initialize role before conditional blocks to avoid UnboundLocalError
-                # when handling audio/image responses
-                role = self.get_chat_request_role(request)
-
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
                 if first_iteration_dict[final_output_type] and final_output_type == "text":
                     num_cached_tokens = res.num_cached_tokens
-                    # Send first response for each choice with role
-                    # NOTE: num_choices defaults to 1 so this usually executes once per request
                     # Send first response for each choice with role
                     # NOTE: num_choices defaults to 1 so this usually executes once per request
                     for i in range(num_choices):
