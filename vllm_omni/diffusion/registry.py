@@ -140,7 +140,7 @@ def initialize_model(
     if model_class is not None:
         model = model_class(od_config=od_config)
 
-        vae_pp_size = int(getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1))
+        vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
             logger.warning(
                 "vae_patch_parallel_size=%d is set but VAE patch parallelism is only enabled for %s; ignoring.",
