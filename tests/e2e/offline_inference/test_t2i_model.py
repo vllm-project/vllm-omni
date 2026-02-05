@@ -47,7 +47,7 @@ def test_diffusion_model(model_name: str):
                 width=width,
                 num_inference_steps=2,
                 guidance_scale=0.0,
-                generator=torch.Generator("cuda").manual_seed(42),
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                 num_outputs_per_prompt=2,
             ),
         )

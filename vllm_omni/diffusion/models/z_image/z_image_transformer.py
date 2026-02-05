@@ -852,7 +852,13 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         # Match t_embedder output dtype to x for layerwise casting compatibility
         adaln_input = t.type_as(x)
-        x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
+        # Use torch.where instead of x[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
+        x_pad_mask = torch.cat(x_inner_pad_mask)
+        x = torch.where(
+            x_pad_mask.unsqueeze(1).expand_as(x),
+            self.x_pad_token.expand(x.shape[0], -1),
+            x,
+        )
         x = list(x.split(x_item_seqlens, dim=0))
         x_cos, x_sin = self.rope_embedder(torch.cat(x_pos_ids, dim=0))
         x_cos = list(x_cos.split(x_item_seqlens, dim=0))
@@ -875,7 +881,13 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         cap_feats = torch.cat(cap_feats, dim=0)
         cap_feats = self.cap_embedder(cap_feats)
-        cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
+        # Use torch.where instead of cap_feats[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
+        cap_pad_mask = torch.cat(cap_inner_pad_mask)
+        cap_feats = torch.where(
+            cap_pad_mask.unsqueeze(1).expand_as(cap_feats),
+            self.cap_pad_token.expand(cap_feats.shape[0], -1),
+            cap_feats,
+        )
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
         cap_cos, cap_sin = self.rope_embedder(torch.cat(cap_pos_ids, dim=0))
         cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))

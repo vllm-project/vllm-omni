@@ -336,14 +336,19 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 mm_item_counts,
             )
         else:
-            if use_audio_in_video and "audio" in mm_prompt_updates:
+            if use_audio_in_video:
+                # When use_audio_in_video=True, audio is extracted from video and embedded
+                # in the video placeholder tokens. We should:
+                # 1. Filter out audio from prompt updates (audio has no separate placeholder)
+                # 2. Apply remaining updates (video, image, etc.)
+                # 3. Derive audio placeholders from video placeholders
                 filtered_updates = {k: v for k, v in mm_prompt_updates.items() if k != "audio"}
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
                     filtered_updates,
                 )
                 # Derive audio placeholders from video placeholders
-                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_prompt_updates)
+                mm_placeholders = self._derive_audio_from_video_placeholders(mm_placeholders, mm_item_counts)
             else:
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
@@ -508,18 +513,27 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
     def _derive_audio_from_video_placeholders(
         self,
         placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
-        mm_prompt_updates: MultiModalPromptUpdates,
+        mm_item_counts: Mapping[str, int],
     ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         """
         Helper to derive audio placeholders from video placeholders when
         use_audio_in_video=True.
+
+        In use_audio_in_video mode, audio is extracted from video and embedded
+        within the video placeholder tokens. This function creates audio placeholder
+        info by extracting the audio token positions from video placeholders.
+
+        Args:
+            placeholders: Current placeholders (should contain "video")
+            mm_item_counts: Counts of multimodal items from mm_items.get_all_counts()
         """
         if "video" not in placeholders:
             return placeholders
 
         # Validate audio and video counts match
+        # In use_audio_in_video mode, audio count comes from mm_items (extracted from video)
         num_videos = len(placeholders["video"])
-        num_audios = len(mm_prompt_updates.get("audio", []))
+        num_audios = mm_item_counts.get("audio", 0)
         if num_audios != num_videos:
             raise ValueError(
                 f"use_audio_in_video requires equal number of audio and video items, got {num_audios=}, {num_videos=}"

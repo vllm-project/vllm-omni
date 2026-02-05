@@ -13,14 +13,13 @@ logger = init_logger(__name__)
 
 class Scheduler:
     def initialize(self, od_config: OmniDiffusionConfig):
-        existing_context = getattr(self, "context", None)
-        if existing_context is not None and not existing_context.closed:
+        existing_mq = getattr(self, "mq", None)
+        if existing_mq is not None and not existing_mq.closed:
             logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
             self.close()
 
         self.num_workers = od_config.num_gpus
         self.od_config = od_config
-        self.context = zmq.Context()  # Standard synchronous context
 
         # Initialize single MessageQueue for all message types (generation & RPC)
         # Assuming all readers are local for now as per current launch_engine implementation
@@ -72,8 +71,5 @@ class Scheduler:
 
     def close(self):
         """Closes the socket and terminates the context."""
-        if hasattr(self, "context"):
-            self.context.term()
-        self.context = None
         self.mq = None
         self.result_mq = None

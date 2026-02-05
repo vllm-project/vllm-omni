@@ -1,4 +1,4 @@
-# Online LoRA Inference (Diffusion)
+# LoRA Inference(Diffusion)
 
 This example shows how to use **per-request LoRA** with vLLM-Omni diffusion models via the OpenAI-compatible Chat Completions API.
 
