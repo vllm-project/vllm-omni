@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Z-Image end-to-end tests for diffusion parallelism (TP and VAE patch parallelism)."""
+"""Z-Image end-to-end tests for diffusion parallelism.
+
+This file currently covers:
+- DiT tensor parallelism (TP=2) vs TP=1.
+- VAE patch parallelism (vae_patch_parallel_size=2) vs baseline on TP=2.
+
+Note: CUDA-only (>=2 GPUs). We use `enforce_eager=True` for stability.
+"""
 
 import os
 import sys
