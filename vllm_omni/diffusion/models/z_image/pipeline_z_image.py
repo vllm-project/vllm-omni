@@ -527,6 +527,16 @@ class ZImagePipeline(nn.Module):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+        # Precompute normalized timesteps once to avoid per-step GPU->CPU sync (.item() causes cudaStreamSynchronize)
+        if isinstance(timesteps, torch.Tensor):
+            timesteps_tensor = timesteps.to(device=device, dtype=torch.float32)
+        else:
+            timesteps_tensor = torch.as_tensor(timesteps, device=device, dtype=torch.float32)
+        norm_timesteps = (1000 - timesteps_tensor) / 1000
+        t_norm_list = norm_timesteps.cpu().tolist()
+        if not isinstance(t_norm_list, list):
+            t_norm_list = [t_norm_list]
+
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
             if self.interrupt:
@@ -535,8 +545,9 @@ class ZImagePipeline(nn.Module):
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(latents.shape[0])
             timestep = (1000 - timestep) / 1000
-            # Normalized time for time-aware config (0 at start, 1 at end)
-            t_norm = timestep[0].item()
+            # Normalized time for time-aware config (0 at start, 1 at end);
+            # use precomputed to avoid .item() sync per step
+            t_norm = t_norm_list[i]
 
             # Handle cfg truncation
             current_guidance_scale = self.guidance_scale
@@ -582,13 +593,17 @@ class ZImagePipeline(nn.Module):
 
                     pred = pos + current_guidance_scale * (pos - neg)
 
-                    # Renormalization
+                    # Renormalization (torch.where avoids GPU->CPU sync from Python if/scalar comparison)
                     if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
                         ori_pos_norm = torch.linalg.vector_norm(pos)
                         new_pos_norm = torch.linalg.vector_norm(pred)
                         max_new_norm = ori_pos_norm * float(self._cfg_normalization)
-                        if new_pos_norm > max_new_norm:
-                            pred = pred * (max_new_norm / new_pos_norm)
+                        scale = torch.where(
+                            new_pos_norm > max_new_norm,
+                            (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
+                            pred.new_tensor(1.0),
+                        )
+                        pred = pred * scale
 
                     noise_pred.append(pred)
 

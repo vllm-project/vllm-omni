@@ -1,7 +1,9 @@
+import os
 import time
 from collections.abc import Mapping
 from typing import Any, cast
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType
@@ -9,12 +11,13 @@ from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
+from vllm.multimodal.processing.context import set_request_id
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
-from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.engine import (
@@ -38,7 +41,6 @@ class OmniInputProcessor(InputProcessor):
 
     Args:
         vllm_config: Global vLLM configuration
-        tokenizer: Tokenizer instance for text processing
         mm_registry: Multi-modal registry for processing multimodal inputs
     """
 
@@ -75,13 +77,12 @@ class OmniInputProcessor(InputProcessor):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        tokenizer: TokenizerLike,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
-        super().__init__(vllm_config, tokenizer, mm_registry)
+        super().__init__(vllm_config, mm_registry)
         self.input_preprocessor = OmniInputPreprocessor(
             self.model_config,
-            self.tokenizer,
+            vllm_config.observability_config,
             mm_registry,
             mm_processor_cache=self.mm_processor_cache,
         )
@@ -97,7 +98,8 @@ class OmniInputProcessor(InputProcessor):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
-    ) -> tuple[str | None, OmniEngineCoreRequest]:
+        resumable: bool = False,
+    ) -> OmniEngineCoreRequest:
         """Process input prompt into an engine core request.
 
         Converts a prompt (text, tokens, or multimodal) into an
@@ -130,9 +132,12 @@ class OmniInputProcessor(InputProcessor):
         self._validate_lora(lora_request)
         self._validate_params(params)
 
-        data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
-        if data_parallel_rank is not None and not (0 <= data_parallel_rank < data_parallel_size):
-            raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {data_parallel_size}).")
+        parallel_config = self.vllm_config.parallel_config
+        dp_size = parallel_config.data_parallel_size
+        dp_local_size = parallel_config.data_parallel_size_local
+        num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
+        if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
+            raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {num_ranks}).")
 
         if arrival_time is None:
             arrival_time = time.time()
@@ -154,7 +159,7 @@ class OmniInputProcessor(InputProcessor):
         else:
             # Otherwise, use user-provided uuids as multimodal hash overrides
             # if provided.
-            self._validate_multi_modal_uuids(prompt)
+            self._validate_mm_uuids(prompt)
             if isinstance(prompt, dict):
                 mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
             else:
@@ -164,11 +169,19 @@ class OmniInputProcessor(InputProcessor):
         # 1. Tokenize text prompt, with LoRA request if one exists.
         # 2. For multimodal models with a merged preprocessor, preprocess
         #   multimodal data and expand prompt token ids accordingly.
-        processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
-            prompt,
-            tokenization_kwargs=tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
+        num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+        if "OMP_NUM_THREADS" not in os.environ:
+            logger.debug_once(
+                "OMP_NUM_THREADS is not set; defaulting Torch threads to %d for input preprocessing.",
+                num_threads,
+            )
+
+        with set_request_id(request_id), set_default_torch_num_threads(num_threads):
+            processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
+                prompt,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
 
         current_platform.validate_request(
             prompt=prompt,
@@ -181,13 +194,13 @@ class OmniInputProcessor(InputProcessor):
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
         self._validate_model_inputs(encoder_inputs, decoder_inputs)
 
-        # Mypy does not always properly infer the types of some elements of
-        # discriminated unions of TypedDicts, because of how it handles
-        # inheritance of TypedDict. If we explicitly extract the items we want
-        # we can avoid type errors from using `dict.get` later in the method.
-        _prompt_str: str | None = None if decoder_inputs["type"] == "embeds" else decoder_inputs.get("prompt")
-        prompt_token_ids = decoder_inputs["prompt_token_ids"] if decoder_inputs["type"] != "embeds" else None
-        prompt_embeds = decoder_inputs["prompt_embeds"] if decoder_inputs["type"] == "embeds" else None
+        # Normalize decoder prompt access across TypedDict variants.
+        if decoder_inputs["type"] == "embeds":
+            prompt_token_ids = None
+            prompt_embeds = decoder_inputs["prompt_embeds"]
+        else:
+            prompt_token_ids = decoder_inputs["prompt_token_ids"]
+            prompt_embeds = decoder_inputs.get("prompt_embeds")
 
         sampling_params = None
         pooling_params = None
@@ -219,35 +232,26 @@ class OmniInputProcessor(InputProcessor):
 
             mm_features = []
             for modality, idx in sorted_mm_idxs:
+                base_mm_hash = decoder_mm_hashes[modality][idx]
                 mm_features.append(
                     MultiModalFeatureSpec(
                         data=decoder_mm_inputs[modality][idx],
                         modality=modality,
-                        identifier=decoder_mm_hashes[modality][idx],
+                        identifier=self._get_mm_identifier(base_mm_hash, lora_request),
                         mm_position=decoder_mm_positions[modality][idx],
+                        mm_hash=base_mm_hash,
                     )
                 )
 
-        # Serialize prompt_embeds and additional_information if provided
-        # (direct-transfer path)
-        prompt_embeds_payload: PromptEmbedsPayload | None = None
+        # Compatibility: decode serialized prompt embeds if provided.
+        if isinstance(prompt_embeds, PromptEmbedsPayload):
+            prompt_embeds = self._decode_prompt_embeds(prompt_embeds)
+
         additional_information_payload: AdditionalInformationPayload | None = None
-        pe: torch.Tensor | None = decoder_inputs.get("prompt_embeds")  # type: ignore[operator]
-        if pe is not None:
-            if pe.ndim != 2:
-                raise ValueError("prompt_embeds must be of shape (seq_len, hidden_size)")
-            # Move to CPU and ensure contiguous memory for stable serialization
-            pe_cpu = pe.detach().to("cpu").contiguous()
-            seq_len, hidden_size = pe_cpu.shape
-            dtype_str = self._dtype_to_name(pe_cpu.dtype)
-            data_bytes = pe_cpu.numpy().tobytes()
-            prompt_embeds_payload = PromptEmbedsPayload(
-                data=data_bytes,
-                shape=[int(seq_len), int(hidden_size)],
-                dtype=dtype_str,
-            )
-        raw_info: dict[str, Any] | None = decoder_inputs.get("additional_information")  # type: ignore[operator]
-        if raw_info is not None:
+        raw_info: dict[str, Any] | AdditionalInformationPayload | None = decoder_inputs.get("additional_information")
+        if isinstance(raw_info, AdditionalInformationPayload):
+            additional_information_payload = raw_info
+        elif raw_info is not None:
             entries: dict[str, AdditionalInformationEntry] = {}
             for key, value in raw_info.items():
                 if isinstance(value, torch.Tensor):
@@ -279,6 +283,14 @@ class OmniInputProcessor(InputProcessor):
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
-            prompt_embeds=prompt_embeds_payload,
+            prompt_embeds=prompt_embeds,
             additional_information=additional_information_payload,
+            resumable=resumable,
         )
+
+    @staticmethod
+    def _decode_prompt_embeds(payload: PromptEmbedsPayload) -> torch.Tensor:
+        dtype = getattr(np, payload.dtype)
+        arr = np.frombuffer(payload.data, dtype=dtype)
+        arr = arr.reshape(payload.shape)
+        return torch.from_numpy(arr)

@@ -7,14 +7,19 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import FP32LayerNorm
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -49,6 +54,94 @@ def apply_rotary_emb_wan(
     out[..., 0::2] = x1 * cos - x2 * sin
     out[..., 1::2] = x1 * sin + x2 * cos
     return out.type_as(hidden_states)
+
+
+class DistributedRMSNorm(nn.Module):
+    """
+    RMSNorm that computes global RMS across tensor parallel ranks.
+    This ensures mathematically equivalent results to non-TP execution.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+
+        input_dtype = x.dtype
+        x_float = x.float()
+        local_sum_sq = (x_float**2).sum(dim=-1, keepdim=True)
+        local_count = x.shape[-1]
+
+        if tp_size > 1:
+            global_sum_sq = local_sum_sq.clone()
+            tensor_model_parallel_all_reduce(global_sum_sq)
+            global_count = local_count * tp_size
+        else:
+            global_sum_sq = local_sum_sq
+            global_count = local_count
+
+        rms = torch.sqrt(global_sum_sq / global_count + self.eps)
+
+        output = (x_float / rms) * self.weight.float()
+        return output.to(input_dtype)
+
+
+class ColumnParallelGELU(nn.Module):
+    """Column parallel linear with GELU activation."""
+
+    def __init__(self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True):
+        super().__init__()
+        self.proj = ColumnParallelLinear(
+            dim_in,
+            dim_out,
+            bias=bias,
+            gather_output=False,
+            return_bias=False,
+        )
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        return F.gelu(x, approximate=self.approximate)
+
+
+class WanFeedForward(nn.Module):
+    """
+    TP-enabled FeedForward network for WAN2.2.
+    Replaces diffusers FeedForward with ColumnParallel + RowParallel.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        inner_dim: int,
+        dim_out: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        dim_out = dim_out or dim
+
+        # ColumnParallel: scatter to each tp_rank
+        self.net_0 = ColumnParallelGELU(dim, inner_dim, approximate="tanh", bias=bias)
+        # Placeholder for weight loading compatibility
+        self.net_1 = nn.Identity()
+        # RowParallel: gather from each tp_rank
+        self.net_2 = RowParallelLinear(
+            inner_dim,
+            dim_out,
+            bias=bias,
+            input_is_parallel=True,
+            return_bias=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.net_0(hidden_states)
+        hidden_states = self.net_1(hidden_states)
+        hidden_states = self.net_2(hidden_states)
+        return hidden_states
 
 
 class WanRotaryPosEmbed(nn.Module):
@@ -97,8 +190,8 @@ class WanRotaryPosEmbed(nn.Module):
         t = torch.arange(max_seq_len, dtype=freqs_dtype)
         freqs = torch.outer(t, freqs)
         # Repeat interleave for real representation
-        freqs_cos = freqs.cos().repeat_interleave(2, dim=-1)
-        freqs_sin = freqs.sin().repeat_interleave(2, dim=-1)
+        freqs_cos = freqs.cos().float().repeat_interleave(2, dim=-1)
+        freqs_sin = freqs.sin().float().repeat_interleave(2, dim=-1)
         return freqs_cos.float(), freqs_sin.float()
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -229,25 +322,30 @@ class WanSelfAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             bias=True,
-            disable_tp=True,
         )
+
+        self.num_heads = self.to_qkv.num_heads
+        self.num_kv_heads = self.to_qkv.num_kv_heads
+        self.tp_inner_dim = self.num_heads * head_dim
 
         # QK normalization using vLLM's RMSNorm
-        self.norm_q = RMSNorm(self.inner_dim, eps=eps)
-        self.norm_k = RMSNorm(self.inner_dim, eps=eps)
+        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
 
-        # Output projection
-        self.to_out = nn.ModuleList(
-            [
-                ReplicatedLinear(self.inner_dim, dim, bias=True),
-                nn.Dropout(dropout),
-            ]
+        self.to_out = RowParallelLinear(
+            self.inner_dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
         )
+        self.dropout = nn.Dropout(dropout)
 
         # Unified attention layer
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             head_size=head_dim,
+            num_kv_heads=self.num_kv_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
         )
@@ -259,16 +357,19 @@ class WanSelfAttention(nn.Module):
     ) -> torch.Tensor:
         # Fused QKV projection
         qkv, _ = self.to_qkv(hidden_states)
-        query, key, value = qkv.chunk(3, dim=-1)
+
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
         # Apply QK normalization
         query = self.norm_q(query)
         key = self.norm_k(key)
 
         # Reshape for multi-head attention
-        query = query.unflatten(2, (self.num_heads, -1))
-        key = key.unflatten(2, (self.num_heads, -1))
-        value = value.unflatten(2, (self.num_heads, -1))
+        query = query.unflatten(2, (self.num_heads, self.head_dim))
+        key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
+        value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
 
         # Apply rotary embeddings
         if rotary_emb is not None:
@@ -282,8 +383,8 @@ class WanSelfAttention(nn.Module):
         hidden_states = hidden_states.type_as(query)
 
         # Output projection
-        hidden_states, _ = self.to_out[0](hidden_states)
-        hidden_states = self.to_out[1](hidden_states)
+        hidden_states = self.to_out(hidden_states)
+        hidden_states = self.dropout(hidden_states)
 
         return hidden_states
 
@@ -312,39 +413,77 @@ class WanCrossAttention(nn.Module):
         self.kv_inner_dim = head_dim * num_heads  # For cross-attention, K/V come from encoder
 
         # Query projection
-        self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_q = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+        )
 
         # Separate K and V projections for cross-attention
-        self.to_k = ReplicatedLinear(dim, self.kv_inner_dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, self.kv_inner_dim, bias=True)
+        self.to_k = ColumnParallelLinear(
+            dim,
+            self.kv_inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+        )
+
+        self.to_v = ColumnParallelLinear(
+            dim,
+            self.kv_inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+        )
+
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = num_heads // tp_size
+        self.tp_inner_dim = self.num_heads * head_dim
 
         # QK normalization
-        self.norm_q = RMSNorm(self.inner_dim, eps=eps)
-        self.norm_k = RMSNorm(self.kv_inner_dim, eps=eps)
+        self.norm_q = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
+        self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
 
         # Optional added KV projections for I2V (image embeddings)
         self.added_kv_proj_dim = added_kv_proj_dim
         if added_kv_proj_dim is not None:
-            self.add_k_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_dim, bias=True)
-            self.add_v_proj = ReplicatedLinear(added_kv_proj_dim, self.inner_dim, bias=True)
-            self.norm_added_k = RMSNorm(self.inner_dim, eps=eps)
+            self.add_k_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+            )
+            self.add_v_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+            )
+            self.norm_added_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps)
         else:
             self.add_k_proj = None
             self.add_v_proj = None
             self.norm_added_k = None
 
         # Output projection
-        self.to_out = nn.ModuleList(
-            [
-                ReplicatedLinear(self.inner_dim, dim, bias=True),
-                nn.Dropout(dropout),
-            ]
+        self.to_out = RowParallelLinear(
+            self.inner_dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
         )
+        self.dropout = nn.Dropout(dropout)
 
         # Unified attention layer
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             head_size=head_dim,
+            num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
         )
@@ -363,28 +502,28 @@ class WanCrossAttention(nn.Module):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
 
         # Query projection
-        query, _ = self.to_q(hidden_states)
+        query = self.to_q(hidden_states)
         query = self.norm_q(query)
 
         # KV projection from encoder
-        key, _ = self.to_k(encoder_hidden_states)
-        value, _ = self.to_v(encoder_hidden_states)
+        key = self.to_k(encoder_hidden_states)
+        value = self.to_v(encoder_hidden_states)
         key = self.norm_k(key)
 
         # Reshape for multi-head attention
-        query = query.unflatten(2, (self.num_heads, -1))
-        key = key.unflatten(2, (self.num_heads, -1))
-        value = value.unflatten(2, (self.num_heads, -1))
+        query = query.unflatten(2, (self.num_heads, self.head_dim))
+        key = key.unflatten(2, (self.num_heads, self.head_dim))
+        value = value.unflatten(2, (self.num_heads, self.head_dim))
 
         # I2V: Additional attention with image embeddings
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
-            key_img, _ = self.add_k_proj(encoder_hidden_states_img)
-            value_img, _ = self.add_v_proj(encoder_hidden_states_img)
+            key_img = self.add_k_proj(encoder_hidden_states_img)
+            value_img = self.add_v_proj(encoder_hidden_states_img)
             key_img = self.norm_added_k(key_img)
 
-            key_img = key_img.unflatten(2, (self.num_heads, -1))
-            value_img = value_img.unflatten(2, (self.num_heads, -1))
+            key_img = key_img.unflatten(2, (self.num_heads, self.head_dim))
+            value_img = value_img.unflatten(2, (self.num_heads, self.head_dim))
 
             hidden_states_img = self.attn(query, key_img, value_img)
             hidden_states_img = hidden_states_img.flatten(2, 3)
@@ -400,8 +539,8 @@ class WanCrossAttention(nn.Module):
             hidden_states = hidden_states + hidden_states_img
 
         # Output projection
-        hidden_states, _ = self.to_out[0](hidden_states)
-        hidden_states = self.to_out[1](hidden_states)
+        hidden_states = self.to_out(hidden_states)
+        hidden_states = self.dropout(hidden_states)
 
         return hidden_states
 
@@ -445,7 +584,7 @@ class WanTransformerBlock(nn.Module):
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
         # 3. Feed-forward
-        self.ffn = FeedForward(dim, inner_dim=ffn_dim, activation_fn="gelu-approximate")
+        self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
         # Scale-shift table for modulation
@@ -725,11 +864,13 @@ class WanTransformer3DModel(nn.Module):
         Returns:
             Set of parameter names that were successfully loaded.
         """
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
         # Stacked params mapping for self-attention QKV fusion
         # Format: (param_name, shard_name, shard_id)
         # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
         stacked_params_mapping = [
-            # self-attention QKV fusion (attn1 only)
+            # self-attention QKV fusion
             (".attn1.to_qkv", ".attn1.to_q", "q"),
             (".attn1.to_qkv", ".attn1.to_k", "k"),
             (".attn1.to_qkv", ".attn1.to_v", "v"),
@@ -739,18 +880,54 @@ class WanTransformer3DModel(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            original_name = name
+            lookup_name = name
+
+            # Handle QKV fusion
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in original_name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                lookup_name = original_name.replace(weight_name, param_name)
+                param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict[name]
+                # diffusers: ffn.net.0.proj.weight -> our: ffn.net_0.proj.weight
+                if ".ffn.net.0." in lookup_name:
+                    lookup_name = lookup_name.replace(".ffn.net.0.", ".ffn.net_0.")
+                elif ".ffn.net.2." in lookup_name:
+                    lookup_name = lookup_name.replace(".ffn.net.2.", ".ffn.net_2.")
+
+                if ".to_out.0." in lookup_name:
+                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+
+                if lookup_name not in params_dict:
+                    logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
+                    continue
+
+                param = params_dict[lookup_name]
+
+                # Handle RMSNorm weights that need to be sharded for TP
+                # These norms are applied after ColumnParallelLinear outputs,
+                # so their weights must be sharded to match the sharded hidden dim
+                if tp_size > 1 and any(
+                    norm_name in lookup_name
+                    for norm_name in [
+                        ".attn1.norm_q.",
+                        ".attn1.norm_k.",
+                        ".attn2.norm_q.",
+                        ".attn2.norm_k.",
+                        ".attn2.norm_added_k.",
+                    ]
+                ):
+                    shard_size = loaded_weight.shape[0] // tp_size
+                    loaded_weight = loaded_weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+
+            loaded_params.add(original_name)
+            loaded_params.add(lookup_name)
 
         return loaded_params

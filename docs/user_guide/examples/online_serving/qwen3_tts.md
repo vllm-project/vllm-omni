@@ -1,4 +1,7 @@
-# Qwen3-TTS
+# Qwen3-TTS Online Serving
+
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen3_tts>.
+
 
 This directory contains examples for running Qwen3-TTS models with vLLM-Omni's online serving API.
 
@@ -173,3 +176,14 @@ with open("output.wav", "wb") as f:
 2. **Out of memory**: Reduce `--gpu-memory-utilization` in run_server.sh
 3. **Unsupported speaker**: Check supported speakers via model documentation
 4. **Voice clone fails**: Ensure you're using the Base model variant for voice cloning
+
+## Example materials
+
+??? abstract "openai_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_tts/openai_speech_client.py"
+    ``````
+??? abstract "run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/qwen3_tts/run_server.sh"
+    ``````

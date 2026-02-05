@@ -45,7 +45,8 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
-        return True
+        # TODO: Enable this when torch compile bugs are resolved
+        return False
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
