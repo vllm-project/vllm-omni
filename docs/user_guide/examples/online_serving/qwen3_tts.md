@@ -1,4 +1,4 @@
-# Qwen3-TTS Online Serving
+# Qwen3-TTS
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/qwen3_tts>.
 
