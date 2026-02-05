@@ -10,11 +10,14 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
+import concurrent.futures
 import gc
 import socket
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +26,7 @@ import psutil
 import pytest
 import torch
 import yaml
+from openai import OpenAI
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
@@ -1003,3 +1007,282 @@ class OmniServer:
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
         cleanup_dist_env_and_memory()
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-level", action="store", default="L2", choices=["L2", "L3"], help="Test level to run: L2, L3"
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "L2: L2 level tests")
+    config.addinivalue_line("markers", "L3: L3 level tests")
+
+
+_omni_server_lock = threading.Lock()
+
+
+@pytest.fixture(scope="module")
+def omni_server(request):
+    """Start vLLM-Omni server as a subprocess with actual model weights.
+    Uses session scope so the server starts only once for the entire test session.
+    Multi-stage initialization can take 10-20+ minutes.
+    """
+    with _omni_server_lock:
+        run_level_option = request.config.getoption("--run-level")
+
+        model, stage_config_path = request.param
+
+        if run_level_option == "L3":
+            stage_config_path = modify_stage_config(
+                stage_config_path,
+                deletes={
+                    "stage_args": {
+                        0: ["engine_args.load_format"],
+                        1: ["engine_args.load_format"],
+                        2: ["engine_args.load_format"],
+                    }
+                },
+            )
+
+        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+            print("OmniServer started successfully")
+            yield server
+            print("OmniServer stopping...")
+
+        print("OmniServer stopped")
+
+
+@dataclass
+class OpenAIResponse:
+    text_content: str | None = None
+    audio_data: list[str] | None = None
+    audio_content: str | None = None
+    similarity: float | None = None
+    e2e_latency: float | None = None
+    success: bool = False
+    error_message: str | None = None
+
+
+class OpenAIClientHandler:
+    """
+    OpenAI client handler class, encapsulating both streaming and non-streaming response processing logic.
+
+    This class integrates OpenAI API request sending, response handling, and validation functionality,
+    supporting both single request and concurrent request modes.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = get_open_port(), api_key: str = "EMPTY"):
+        """
+        Initialize the OpenAI client.
+
+        Args:
+            host: vLLM-Omni server host address
+            port: vLLM-Omni server port
+            api_key: API key (defaults to "EMPTY")
+        """
+        self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
+
+    def _process_stream_response(self, chat_completion, request_config: dict[str, Any]) -> OpenAIResponse:
+        """
+        Process streaming responses.
+
+        Args:
+            chat_completion: OpenAI streaming response object
+            request_config: Request configuration dictionary
+
+        Returns:
+            OpenAIResponse: Processed response object
+        """
+        result = OpenAIResponse()
+        start_time = time.perf_counter()
+
+        try:
+            text_content = ""
+            audio_data = []
+
+            for chunk in chat_completion:
+                for choice in chunk.choices:
+                    # Get content data
+                    if hasattr(choice, "delta"):
+                        content = getattr(choice.delta, "content", None)
+                    else:
+                        content = None
+
+                    # Get modality type
+                    modality = getattr(chunk, "modality", None)
+
+                    # Process content based on modality type
+                    if modality == "audio" and content:
+                        audio_data.append(content)
+                    elif modality == "text" and content:
+                        text_content += content if content else ""
+
+            # Calculate end-to-end latency
+            result.e2e_latency = time.perf_counter() - start_time
+
+            # Process audio and text content
+            audio_content = None
+            similarity = None
+
+            if audio_data or text_content:
+                if audio_data:
+                    audio_content = self._merge_base64_and_convert_to_text(audio_data)
+                if audio_content and text_content:
+                    similarity = self._cosine_similarity_text(audio_content.lower(), text_content.lower())
+
+            # Populate result object
+            result.text_content = text_content
+            result.audio_data = audio_data
+            result.audio_content = audio_content
+            result.similarity = similarity
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Stream processing error: {str(e)}"
+            print(result.error_message)
+
+        return result
+
+    def _process_non_stream_response(self, chat_completion, request_config: dict[str, Any]) -> OpenAIResponse:
+        """
+        Process non-streaming responses.
+
+        Args:
+            chat_completion: OpenAI non-streaming response object
+            request_config: Request configuration dictionary
+
+        Returns:
+            OpenAIResponse: Processed response object
+        """
+        result = OpenAIResponse()
+        start_time = time.perf_counter()
+
+        try:
+            audio_data = None
+            text_content = None
+
+            # Iterate through all choices
+            for choice in chat_completion.choices:
+                # Process audio data
+                if hasattr(choice.message, "audio") and choice.message.audio is not None:
+                    audio_message = choice.message
+                    audio_data = audio_message.audio.data
+
+                # Process text content
+                if hasattr(choice.message, "content") and choice.message.content is not None:
+                    text_content = choice.message.content
+
+            # Calculate end-to-end latency
+            result.e2e_latency = time.perf_counter() - start_time
+
+            # Process audio and text content
+            audio_content = None
+            similarity = None
+
+            if audio_data or text_content:
+                if audio_data:
+                    audio_content = self._convert_audio_to_text(audio_data)
+                if audio_content and text_content:
+                    similarity = self._cosine_similarity_text(audio_content.lower(), text_content.lower())
+
+            # Populate result object
+            result.text_content = text_content
+            result.audio_data = [audio_data] if isinstance(audio_data, str) else audio_data
+            result.audio_content = audio_content
+            result.similarity = similarity
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Non-stream processing error: {str(e)}"
+            print(result.error_message)
+
+        return result
+
+    def _assert_response(self, response: OpenAIResponse):
+        """
+        Validate response results.
+
+        Args:
+            response: OpenAIResponse object
+
+        Raises:
+            AssertionError: When the response does not meet validation criteria
+        """
+        assert response.success, "The request failed."
+        print(f"the avg e2e is: {response.e2e_latency}")
+
+        assert response.audio_data is not None, "No audio output is generated"
+        print(f"audio content is: {response.audio_content}")
+
+        assert response.text_content is not None, "No text output is generated"
+        print(f"text content is: {response.text_content}")
+
+        # Verify keywords
+        keywords = ["square", "quadrate", "sphere", "globe", "circle", "round"]
+        assert any(keyword in response.text_content.lower() for keyword in keywords), (
+            "The output does not contain any of the keywords."
+        )
+
+        # Verify similarity
+        assert response.similarity > 0.9, "The audio content is not same as the text"
+        print(f"similarity is: {response.similarity}")
+
+    def send_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OpenAIResponse]:
+        """
+        Send OpenAI requests.
+
+        Args:
+            request_config: Request configuration dictionary containing parameters like model, messages, stream
+            request_num: Number of requests, defaults to 1 (single request)
+
+        Returns:
+            List[OpenAIResponse]: List of response objects
+        """
+
+        responses = []
+        stream = request_config.get("stream", False)
+
+        if request_num == 1:
+            # Send single request
+            chat_completion = self.client.chat.completions.create(
+                model=request_config.get("model"), messages=request_config.get("messages"), stream=stream
+            )
+
+            if stream:
+                response = self._process_stream_response(chat_completion, request_config)
+            else:
+                response = self._process_non_stream_response(chat_completion, request_config)
+
+            self._assert_response(response)
+            responses.append(response)
+
+        else:
+            # Send concurrent requests
+            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                futures = []
+
+                # Submit all request tasks
+                for _ in range(request_num):
+                    future = executor.submit(
+                        self.client.chat.completions.create,
+                        model=request_config.get("model"),
+                        messages=request_config.get("messages"),
+                        stream=stream,
+                    )
+                    futures.append(future)
+
+                # Process completed tasks
+                for future in concurrent.futures.as_completed(futures):
+                    chat_completion = future.result()
+
+                    if stream:
+                        response = self._process_stream_response(chat_completion, request_config)
+                    else:
+                        response = self._process_non_stream_response(chat_completion, request_config)
+
+                    self._assert_response(response)
+                    responses.append(response)
+
+        return responses
