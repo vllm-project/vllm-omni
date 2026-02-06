@@ -37,7 +37,6 @@ docker run -it -d --shm-size 10g \
   --device /dev/dri:/dev/dri \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
-  -p 8091:8091 \
   vllm-omni-xpu \
   --model Qwen/Qwen2.5-Omni-3B --port 8091
 ```
