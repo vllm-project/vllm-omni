@@ -10,10 +10,6 @@ This file currently covers:
 Note: CUDA-only (>=2 GPUs). We use `enforce_eager=False` (default) to enable
 `torch.compile` on supported GPUs. On pre-Ampere GPUs (e.g., V100), we force
 eager mode because `torch.compile` does not support bfloat16 compilation there.
-
-For stability, latency is measured after a warmup output (excluding one-time
-compilation/caching overhead). Peak memory is measured across the whole
-generate run.
 """
 
 import os
