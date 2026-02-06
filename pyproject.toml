@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=77.0.3,<81.0.0",
+    "wheel",
+    "setuptools-scm>=8.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,16 +12,16 @@ version = "0.14.0"
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [
     {name = "vLLM-Omni Team"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
+dynamic = ["dependencies"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -26,26 +30,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-
-dependencies = [
-    # Core runtime dependencies (required for actual usage)
-    "omegaconf>=2.3.0",
-    "librosa>=0.11.0",
-    "resampy>=0.4.3",
-    "diffusers>=0.36.0",
-    "accelerate==1.12.0",
-    "gradio==5.50",
-    "soundfile>=0.13.1",
-    "cache-dit==1.2.0",
-    "tqdm>=4.66.0",
-    "torchsde>=0.2.6",  # Required for Stable Audio scheduler
-    "fa3-fwd==0.0.1", # flash attention 3, maintained by @ZJY0516
-    "openai-whisper>=20250625",
-    "imageio[ffmpeg]>=2.37.2",
-    "onnxruntime>=1.19.0",
-    "sox>=1.5.0",
-    # "vllm==0.15.0",  # TODO: fix the entrypoints overwrite problem
-]
+# Dependencies are now managed dynamically via setup.py based on detected hardware platform.
+# This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
+# without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
+# Note: vllm is intentionally excluded due to entrypoints overwrite issue.
 
 [project.optional-dependencies]
 
@@ -155,11 +143,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
-    "--strict-config",
-    "--cov=vllm_omni",
-    "--cov-report=term-missing",
-    "--cov-report=html",
-    "--cov-report=xml",
+    "--strict-config"
 ]
 markers = [
     # ci/cd required
@@ -204,4 +188,5 @@ extend-ignore-identifiers-re = [
     ".*NOTHINK.*",
     ".*nin.*",
     "Ono_Anna",
+    ".*cann.*",
 ]

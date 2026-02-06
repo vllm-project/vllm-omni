@@ -38,12 +38,9 @@ docker run --rm \
 cd /vllm-workspace
 git clone -b v0.14.0 https://github.com/vllm-project/vllm-omni.git
 
-# Remove this replace when the dispatch of requirements is ready
-RUN sed -i -E 's/^([[:space:]]*)"fa3-fwd==0\.0\.1",/\1# "fa3-fwd==0.0.1",/' pyproject.toml \
- && sed -i -E 's/\bonnxruntime\b/onnxruntime-cann/g' pyproject.toml
-
 cd vllm-omni
-pip install -v -e .
+VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
+# OR pip install -v -e . --no-build-isolation
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 

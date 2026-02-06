@@ -9,9 +9,59 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 
 # --8<-- [start:pre-built-wheels]
 
+#### Installation of vLLM
+
+vLLM-Omni is built based on vLLM. Please install it with command below.
+```bash
+uv pip install vllm==0.14.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.14.0/rocm700
+```
+
+#### Installation of vLLM-Omni
+
+```bash
+# we need to add --no-build-isolation as the torch
+# is not obtained from pypi, we have to install using the
+# torch installed in our environment
+uv pip install vllm-omni
+
+# Optional if want to run Qwen3 TTS
+uv pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
+uv pip install onnxruntime-rocm sox
+```
+
 # --8<-- [end:pre-built-wheels]
 
 # --8<-- [start:build-wheel-from-source]
+
+#### Installation of vLLM
+If you do not need to modify source code of vLLM, you can directly install the stable 0.14.0 release version of the library
+
+```bash
+uv pip install vllm==0.14.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.14.0/rocm700
+```
+
+The release 0.14.0 of vLLM requires ROCm 7.0 environment.
+
+#### Installation of vLLM-Omni
+Since vllm-omni is rapidly evolving, it's recommended to install it from source
+```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm-omni
+VLLM_OMNI_TARGET_DEVICE=rocm uv pip install -e .
+# OR
+uv pip install -e . --no-build-isolation
+```
+
+<details><summary>(Optional) Installation of vLLM from source</summary>
+If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:
+
+```bash
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout v0.14.0
+python3 -m pip install -r requirements/rocm.txt
+python3 setup.py develop
+```
 
 # --8<-- [end:build-wheel-from-source]
 

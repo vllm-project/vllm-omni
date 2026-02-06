@@ -49,7 +49,7 @@ The following table shows which models are currently supported by parallelism me
 
 | Model | Model Identifier | Ulysses-SP | Ring-SP | Tensor-Parallel |
 |-------|------------------|------------|---------|--------------------------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ❌ |
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ |
 
 ### Tensor Parallelism
 
