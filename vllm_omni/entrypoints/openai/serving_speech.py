@@ -229,6 +229,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             sampling_params_list = self.engine_client.default_sampling_params_list
+            default_sr = 24000  # Default sample rate for TTS models
             if self._is_tts_model():
                 # Validate TTS parameters
                 validation_error = self._validate_tts_request(request)
@@ -245,6 +246,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif self._is_stable_audio_model():
                 # Handle Stable Audio models
                 # Stable Audio uses diffusion, needs different parameters
+                default_sr = 44100  # Default sample rate for Stable Audio
+                
                 # Build prompt for Stable Audio
                 prompt = {
                     "prompt": request.input,
@@ -326,8 +329,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self.create_error_response("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            # Default sample rate: 44100 for Stable Audio, 24000 for TTS
-            default_sr = 44100 if self._is_stable_audio_model() else 24000
             sample_rate = audio_output.get("sr", default_sr)
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
