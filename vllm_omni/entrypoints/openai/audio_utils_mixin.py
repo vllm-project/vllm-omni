@@ -44,6 +44,10 @@ class AudioMixin:
                 f"Unsupported audio tensor dimension: {audio_tensor.ndim}. "
                 "Only mono (1D) and stereo (2D) are supported."
             )
+        
+        if audio_tensor.ndim == 2 and audio_tensor.shape[0] == 2:
+            # Convert from [channels, samples] to [samples, channels]
+            audio_tensor = audio_tensor.T
 
         audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
 

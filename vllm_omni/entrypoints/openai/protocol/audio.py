@@ -49,6 +49,32 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Maximum tokens to generate",
     )
 
+    # Stable Audio specific parameters
+    audio_length: float | None = Field(
+        default=None,
+        description="Audio length in seconds (for Stable Audio models)",
+    )
+    audio_start: float | None = Field(
+        default=0.0,
+        description="Audio start time in seconds (for Stable Audio models)",
+    )
+    negative_prompt: str | None = Field(
+        default=None,
+        description="Negative prompt for classifier-free guidance (for Stable Audio models)",
+    )
+    guidance_scale: float | None = Field(
+        default=None,
+        description="Guidance scale for diffusion models (for Stable Audio models)",
+    )
+    num_inference_steps: int | None = Field(
+        default=None,
+        description="Number of inference steps (for Stable Audio models)",
+    )
+    seed: int | None = Field(
+        default=None,
+        description="Random seed for reproducibility (for Stable Audio models)",
+    )
+
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:

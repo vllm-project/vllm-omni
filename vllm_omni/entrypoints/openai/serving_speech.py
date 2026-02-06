@@ -3,6 +3,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import Response
+import torch
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
@@ -39,10 +40,18 @@ _TTS_MAX_NEW_TOKENS_MAX = 4096
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
+        self.model_name = kwargs.pop("model_name", None)
         super().__init__(*args, **kwargs)
+        self.diffusion_mode = False
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+
+    @classmethod
+    def for_diffusion(cls, *args, **kwargs) -> bool:
+        """Check if the current instance is in diffusion mode."""
+        cls.diffusion_mode = True
+        return cls(*args, **kwargs)
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -71,6 +80,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if model_stage in _TTS_MODEL_STAGES:
                     return True
         return False
+
+    def _is_stable_audio_model(self) -> bool:
+        """Check if the current model is a Stable Audio model."""
+        return "stabilityai/stable-audio-open" in self.model_name.lower()
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
@@ -215,6 +228,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
+            sampling_params_list = self.engine_client.default_sampling_params_list
             if self._is_tts_model():
                 # Validate TTS parameters
                 validation_error = self._validate_tts_request(request)
@@ -228,6 +242,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "prompt": prompt_text,
                     "additional_information": tts_params,
                 }
+            elif self._is_stable_audio_model():
+                # Handle Stable Audio models
+                # Stable Audio uses diffusion, needs different parameters
+                # Build prompt for Stable Audio
+                prompt = {
+                    "prompt": request.input,
+                }
+                if request.negative_prompt:
+                    prompt["negative_prompt"] = request.negative_prompt
+
+                # Build sampling params for diffusion
+                sampling_params_list[0].num_outputs_per_prompt = 1
+                
+                # Create generator if seed provided
+                if request.seed is not None:
+                    from vllm_omni.platforms import current_omni_platform
+                    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request.seed)
+                    sampling_params_list[0].generator = generator
+                
+                if request.guidance_scale is not None:
+                    sampling_params_list[0].guidance_scale = request.guidance_scale
+                
+                if request.num_inference_steps is not None:
+                    sampling_params_list[0].num_inference_steps = request.num_inference_steps
+                
+                # Set up audio duration parameters
+                if request.audio_length is not None:
+                    audio_length = request.audio_length
+                    audio_start = request.audio_start if request.audio_start is not None else 0.0
+                    audio_end_in_s = audio_start + audio_length
+                    sampling_params_list[0].extra_args = {
+                        "audio_start_in_s": audio_start,
+                        "audio_end_in_s": audio_end_in_s,
+                    }
+
+                tts_params = {}
             else:
                 # Fallback for unsupported models
                 tts_params = {}
@@ -239,8 +289,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 tts_params.get("task_type", ["unknown"])[0],
             )
-
-            sampling_params_list = self.engine_client.default_sampling_params_list
 
             generator = self.engine_client.generate(
                 prompt=prompt,
@@ -278,7 +326,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self.create_error_response("TTS model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = audio_output.get("sr", 24000)
+            # Default sample rate: 44100 for Stable Audio, 24000 for TTS
+            default_sr = 44100 if self._is_stable_audio_model() else 24000
+            sample_rate = audio_output.get("sr", default_sr)
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
 
