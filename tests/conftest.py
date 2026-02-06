@@ -1022,11 +1022,6 @@ def pytest_addoption(parser):
     )
 
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "L2: L2 level tests")
-    config.addinivalue_line("markers", "L3: L3 level tests")
-
-
 _omni_server_lock = threading.Lock()
 
 
@@ -1091,7 +1086,7 @@ class OpenAIClientHandler:
         """
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
 
-    def _process_stream_response(self, chat_completion, request_config: dict[str, Any]) -> OpenAIResponse:
+    def _process_stream_response(self, chat_completion) -> OpenAIResponse:
         """
         Process streaming responses.
 
@@ -1135,9 +1130,9 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = self._merge_base64_and_convert_to_text(audio_data)
+                    audio_content = self.merge_base64_and_convert_to_text(audio_data)
                 if audio_content and text_content:
-                    similarity = self._cosine_similarity_text(audio_content.lower(), text_content.lower())
+                    similarity = self.cosine_similarity_text(audio_content.lower(), text_content.lower())
 
             # Populate result object
             result.text_content = text_content
@@ -1152,7 +1147,7 @@ class OpenAIClientHandler:
 
         return result
 
-    def _process_non_stream_response(self, chat_completion, request_config: dict[str, Any]) -> OpenAIResponse:
+    def _process_non_stream_response(self, chat_completion) -> OpenAIResponse:
         """
         Process non-streaming responses.
 
@@ -1190,9 +1185,9 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = self._convert_audio_to_text(audio_data)
+                    audio_content = self.convert_audio_to_text(audio_data)
                 if audio_content and text_content:
-                    similarity = self._cosine_similarity_text(audio_content.lower(), text_content.lower())
+                    similarity = self.cosine_similarity_text(audio_content.lower(), text_content.lower())
 
             # Populate result object
             result.text_content = text_content
@@ -1258,9 +1253,9 @@ class OpenAIClientHandler:
             )
 
             if stream:
-                response = self._process_stream_response(chat_completion, request_config)
+                response = self._process_stream_response(chat_completion)
             else:
-                response = self._process_non_stream_response(chat_completion, request_config)
+                response = self._process_non_stream_response(chat_completion)
 
             self._assert_response(response)
             responses.append(response)
@@ -1285,9 +1280,9 @@ class OpenAIClientHandler:
                     chat_completion = future.result()
 
                     if stream:
-                        response = self._process_stream_response(chat_completion, request_config)
+                        response = self._process_stream_response(chat_completion)
                     else:
-                        response = self._process_non_stream_response(chat_completion, request_config)
+                        response = self._process_non_stream_response(chat_completion)
 
                     self._assert_response(response)
                     responses.append(response)
