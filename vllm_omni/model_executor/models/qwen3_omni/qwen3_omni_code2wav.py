@@ -22,6 +22,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     SnakeBeta,
 )
 from vllm.config import VllmConfig  # type: ignore
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger  # type: ignore
 from vllm.model_executor.models.utils import (  # type: ignore
     AutoWeightsLoader,
@@ -162,7 +163,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         codes: torch.Tensor,
         chunk_size: int = 300,
         left_context_size: int = 25,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         """
         Decode long sequences in chunks to avoid OOM.
 
@@ -176,6 +177,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         Returns:
             waveform: [batch, 1, waveform_len] - Complete waveform
         """
+        # TODO Support batch_size > 1
         wavs = []
         start_index = 0
 
@@ -194,14 +196,14 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
             start_index = end_index
 
-        return torch.cat(wavs, dim=-1)
+        return [torch.cat(wavs, dim=-1)]
 
     def chunked_decode_streaming(
         self,
         codes: torch.Tensor,
         chunk_size: int = 25,
         left_context_size: int = 25,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         """
         Decode long sequences in chunks to avoid OOM.
 
@@ -215,19 +217,25 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         Returns:
             waveform: [batch, 1, waveform_len] - Complete waveform
         """
-        wavs = []
-        end_index = codes.shape[-1]
-        # TODO: need to optimize algorithms, current only support
-        # chunk_size = left_context_size = 25
-        if end_index <= chunk_size:
-            context_size = 0
-        else:
-            context_size = left_context_size
         # Decode chunk
-        wav_chunk = self(codes)
-        # Remove context from output (context_size * total_upsample samples)
-        wavs.append(wav_chunk[..., context_size * self.total_upsample :])
-        return torch.cat(wavs, dim=-1)
+        wavs = []
+        batch_wav = self(codes)
+        ubatch_slices = get_forward_context().ubatch_slices
+        if ubatch_slices is not None:
+            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in ubatch_slices]
+        else:
+            code_seq_lens = [codes.shape[-1]]
+        for idx, code_seq_len in enumerate(code_seq_lens):
+            # TODO: need to optimize algorithms, current only support
+            # chunk_size = left_context_size = 25
+            if code_seq_len <= chunk_size:
+                context_size = 0
+            else:
+                context_size = left_context_size
+            # Remove context from output (context_size * total_upsample samples)
+            wav_chunk = batch_wav[idx, :, context_size * self.total_upsample : code_seq_len * self.total_upsample]
+            wavs.append(wav_chunk)
+        return wavs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""

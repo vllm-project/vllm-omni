@@ -15,6 +15,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
 )
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
@@ -170,6 +171,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             self.model = self.code2wav
             self.requires_raw_input_tokens = True
+            max_context_length = 50
+            self.codes_buffer = torch.zeros(
+                (self.vllm_config.scheduler_config.max_num_seqs, code2wav_config.num_quantizers, max_context_length),
+                device=self._module_device(self.code2wav),
+                dtype=torch.long,
+            )
         else:
             raise ValueError(
                 f"Invalid model_stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'"
@@ -355,9 +362,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 3: Code2Wav ==========
         elif self.model_stage == "code2wav":
             # Extract codec codes from input
-            codes = []
             if input_ids.shape[0] % 16 == 0:
-                codes.append(input_ids.reshape(1, 16, -1))
+                ubatch_slices = get_forward_context().ubatch_slices
+                if ubatch_slices is not None:
+                    max_seq_len = max(ubatch_slices) // 16
+                    batch_size = len(ubatch_slices)
+                    split_codes = torch.split(input_ids, ubatch_slices, dim=0)
+                    for idx, code in enumerate(split_codes):
+                        seq_len = code.shape[0] // 16
+                        self.codes_buffer[idx, :, :seq_len].copy_(code.reshape(16, -1))
+                    codes = self.codes_buffer[:batch_size, :, :max_seq_len]
+                else:
+                    codes = input_ids.reshape(1, 16, -1)
             else:
                 logger.warning(
                     (
@@ -373,17 +389,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                         torch.zeros(16 - input_ids.shape[0] % 16, dtype=torch.long, device=input_ids.device),
                     ]
                 )
-                codes.append(input_ids_flatten.reshape(1, 16, -1))
+                codes = input_ids_flatten.reshape(1, 16, -1)
 
             # Generate audio from codec codes
-            audio_tensors = []
-            for code in codes:
-                audio_tensor = self.generate_audio(code, voice_type)
-                audio_tensors.append(audio_tensor)
-            if len(audio_tensors) > 1:
-                logger.warning(
-                    "Batched input for code2wav is not supported yet, only the first audio tensor will be returned"
-                )
+            audio_tensors = self.generate_audio(codes, voice_type)
 
             return audio_tensors
 
@@ -448,14 +457,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             audio_tensors = model_outputs
             return OmniOutput(
                 text_hidden_states=None,
-                multimodal_outputs={"model_outputs": audio_tensors[0].reshape(1, -1)},
+                multimodal_outputs={"model_outputs": [audio_tensor.reshape(1, -1) for audio_tensor in audio_tensors]},
             )
 
         return model_outputs
 
     # ==================== Audio Generation ====================
 
-    def generate_audio(self, code: torch.Tensor, voice_type: str) -> torch.Tensor:
+    def generate_audio(self, code: torch.Tensor, voice_type: str) -> list[torch.Tensor]:
         """
         Generate audio waveform from codec codes.
 
@@ -484,20 +493,20 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_codes = talker_codes.expand(1, 16, -1)
 
         if self.vllm_config.model_config.async_chunk:
-            audio_tensor = self.code2wav.chunked_decode_streaming(
+            audio_tensors = self.code2wav.chunked_decode_streaming(
                 talker_codes,
                 chunk_size=25,
                 left_context_size=25,
             )
         else:
             # Use chunked decode for memory efficiency
-            audio_tensor = self.code2wav.chunked_decode(
+            audio_tensors = self.code2wav.chunked_decode(
                 talker_codes,
                 chunk_size=300,
                 left_context_size=25,
             )
 
-        return audio_tensor
+        return audio_tensors
 
     # ==================== Thinker-Talker Projection ====================
 

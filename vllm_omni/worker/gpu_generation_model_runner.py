@@ -50,12 +50,24 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     """
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
+        # remove requests
+        for req_id in scheduler_output.finished_req_ids:
+            self.input_batch.remove_request(req_id)
+        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        cached_req_ids = self.input_batch.req_id_to_index.keys()
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        for req_id in unscheduled_req_ids:
+            self.input_batch.remove_request(req_id)
         cached_reqs = scheduler_output.scheduled_cached_reqs
+        req_states = []
         for _, req_id in enumerate(cached_reqs.req_ids):
             req_state = self.requests.get(req_id)
             assert req_state is not None
             req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
+            req_states.append(req_state)
             self.input_batch.remove_request(req_id)
+        for req_state in req_states:
             # update the request state in self.input_batch
             self.input_batch.add_request(req_state)
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -244,6 +256,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        if self.model_config.async_chunk:
+            # reuse ubatch_slices_padded for async chunk
+            ubatch_slices_padded = tokens
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -342,11 +358,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
-            mm_payload = {}
-            for key, out in multimodal_outputs.items():
-                if out is not None and isinstance(out, torch.Tensor):
-                    mm_payload[key] = out.detach().to("cpu").contiguous()
-            pooler_output.append(mm_payload)
+            num_reqs = self.input_batch.num_reqs
+            for i in range(num_reqs):
+                mm_payload = {}
+                for key, out in multimodal_outputs.items():
+                    if isinstance(out, list) and len(out) == num_reqs:
+                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                    elif isinstance(out, torch.Tensor):
+                        mm_payload[key] = out.detach().to("cpu").contiguous()
+                pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
         output = OmniModelRunnerOutput(
