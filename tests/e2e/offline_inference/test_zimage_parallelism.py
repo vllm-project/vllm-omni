@@ -8,8 +8,7 @@ This file currently covers:
 - VAE patch parallelism (vae_patch_parallel_size=2) vs baseline on TP=2.
 
 Note: CUDA-only (>=2 GPUs). We use `enforce_eager=False` (default) to enable
-`torch.compile` on supported GPUs. On pre-Ampere GPUs (e.g., V100), we force
-eager mode because `torch.compile` does not support bfloat16 compilation there.
+`torch.compile`.
 """
 
 import os
@@ -77,13 +76,6 @@ def _extract_single_image(outputs) -> Image.Image:
     if images is None or len(images) != 1:
         raise ValueError(f"Expected 1 image, got {0 if images is None else len(images)}")
     return images[0]
-
-
-def _should_force_eager_for_compile() -> bool:
-    # The diffusion pipeline defaults to bfloat16 weights. Torch inductor does
-    # not support bfloat16 compilation on pre-Ampere GPUs.
-    major, _minor = torch.cuda.get_device_capability()
-    return major < 8
 
 
 def _run_zimage_generate(
@@ -169,7 +161,7 @@ def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image TP=2 requires >= 2 CUDA devices.")
 
-    enforce_eager = _should_force_eager_for_compile()
+    enforce_eager = False
 
     height = 512
     width = 512
@@ -231,7 +223,7 @@ def test_zimage_vae_patch_parallel_tp2(tmp_path: Path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("Z-Image VAE patch parallel TP=2 requires >= 2 CUDA devices.")
 
-    enforce_eager = _should_force_eager_for_compile()
+    enforce_eager = False
 
     # Use a larger image to ensure there are multiple VAE tiles.
     height = 1152
