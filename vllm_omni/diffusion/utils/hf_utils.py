@@ -18,13 +18,13 @@ def _looks_like_bagel(model_name: str) -> bool:
     """Best-effort detection for Bagel (non-diffusers) diffusion models."""
     try:
         cfg = get_hf_file_to_dict("config.json", model_name)
+        model_type = cfg.get("model_type")
+        if model_type == "bagel":
+            return True
+        architectures = cfg.get("architectures") or []
+        return "BagelForConditionalGeneration" in architectures
     except Exception:
         return False
-    model_type = cfg.get("model_type")
-    if model_type == "bagel":
-        return True
-    architectures = cfg.get("architectures") or []
-    return "BagelForConditionalGeneration" in architectures
 
 
 @lru_cache
