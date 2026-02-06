@@ -245,7 +245,7 @@ class OmniServeCommand(CLISubcommand):
         # Diffusion model mixed precision
         omni_config_group.add_argument(
             "--max-generated-image-size",
-            type=float,
+            type=int,
             help="The max size of generate image (height * width).",
         )
         return serve_parser
