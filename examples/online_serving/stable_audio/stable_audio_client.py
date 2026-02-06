@@ -29,9 +29,7 @@ import requests
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Generate audio with Stable Audio via OpenAI-compatible API"
-    )
+    parser = argparse.ArgumentParser(description="Generate audio with Stable Audio via OpenAI-compatible API")
     parser.add_argument(
         "--api_url",
         default="http://localhost:8000/v1/audio/speech",
@@ -93,7 +91,7 @@ def parse_args():
 
 def generate_audio(args):
     """Generate audio using the API."""
-    
+
     # Build request payload
     payload = {
         "input": args.text,
@@ -101,7 +99,7 @@ def generate_audio(args):
         "audio_start": args.audio_start,
         "response_format": args.response_format,
     }
-    
+
     # Add optional parameters
     if args.negative_prompt:
         payload["negative_prompt"] = args.negative_prompt
@@ -111,7 +109,7 @@ def generate_audio(args):
         payload["num_inference_steps"] = args.num_inference_steps
     if args.seed is not None:
         payload["seed"] = args.seed
-    
+
     print(f"\n{'=' * 60}")
     print("Stable Audio - Text-to-Audio Generation")
     print(f"{'=' * 60}")
@@ -125,7 +123,7 @@ def generate_audio(args):
         print(f"Seed: {args.seed}")
     print(f"Output: {args.output}")
     print(f"{'=' * 60}\n")
-    
+
     try:
         # Make the API request
         print("Generating audio...")
@@ -135,21 +133,21 @@ def generate_audio(args):
             headers={"Content-Type": "application/json"},
             timeout=300,  # 5 minute timeout for long generations
         )
-        
+
         # Check for errors
         if response.status_code != 200:
             print(f"Error: API returned status code {response.status_code}")
             print(f"Response: {response.text}")
             return False
-        
+
         # Save the audio
         with open(args.output, "wb") as f:
             f.write(response.content)
-        
+
         print(f"✓ Audio saved to {args.output}")
         print(f"  File size: {len(response.content) / 1024:.1f} KB")
         return True
-        
+
     except requests.exceptions.Timeout:
         print("Error: Request timed out. Try reducing inference steps or audio length.")
         return False

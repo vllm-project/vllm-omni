@@ -188,11 +188,11 @@ python stable_audio_client.py \
 ## Tips
 
 1. **Audio Length**: Keep under 47 seconds for `stable-audio-open-1.0`
-2. **Quality vs Speed**: 
+2. **Quality vs Speed**:
    - 50 steps: Fast, decent quality
    - 100 steps: Good balance (default)
    - 150+ steps: High quality, slower
-3. **Guidance Scale**: 
+3. **Guidance Scale**:
    - Lower (3-5): More creative/varied
    - Default (7): Good balance
    - Higher (10+): More literal to prompt

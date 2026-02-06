@@ -1,9 +1,9 @@
 import asyncio
 from typing import Any
 
+import torch
 from fastapi import Request
 from fastapi.responses import Response
-import torch
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.utils import random_uuid
@@ -247,7 +247,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Handle Stable Audio models
                 # Stable Audio uses diffusion, needs different parameters
                 default_sr = 44100  # Default sample rate for Stable Audio
-                
+
                 # Build prompt for Stable Audio
                 prompt = {
                     "prompt": request.input,
@@ -257,19 +257,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 # Build sampling params for diffusion
                 sampling_params_list[0].num_outputs_per_prompt = 1
-                
+
                 # Create generator if seed provided
                 if request.seed is not None:
                     from vllm_omni.platforms import current_omni_platform
+
                     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request.seed)
                     sampling_params_list[0].generator = generator
-                
+
                 if request.guidance_scale is not None:
                     sampling_params_list[0].guidance_scale = request.guidance_scale
-                
+
                 if request.num_inference_steps is not None:
                     sampling_params_list[0].num_inference_steps = request.num_inference_steps
-                
+
                 # Set up audio duration parameters
                 if request.audio_length is not None:
                     audio_length = request.audio_length

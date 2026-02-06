@@ -139,7 +139,8 @@ class _DiffusionServingModels:
     """
 
     class _NullModelConfig:
-        def __getattr__(self, name): return None
+        def __getattr__(self, name):
+            return None
 
     class _Unsupported:
         def __init__(self, name: str):
@@ -150,7 +151,6 @@ class _DiffusionServingModels:
 
         def __getattr__(self, attr):
             raise NotImplementedError(f"{self.name}.{attr} is not supported in diffusion mode")
-
 
     def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
         self._base_model_paths = base_model_paths
@@ -429,8 +429,8 @@ async def omni_init_app_state(
         )
 
         state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
-            engine_client, 
-            state.openai_serving_models, 
+            engine_client,
+            state.openai_serving_models,
             request_logger=request_logger,
             model_name=model_name,
         )
@@ -710,10 +710,7 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, 
-        state.openai_serving_models, 
-        request_logger=request_logger,
-        model_name=model_name
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
