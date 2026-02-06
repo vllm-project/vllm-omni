@@ -137,9 +137,10 @@ def thinker2talker(
                 if isinstance(output.multimodal_output["tts_pad_embed"], list)
                 else output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float)
             ),
-            # Qwen3 needs at least 3 output tokens before leaving prefill.
+            # Wait until atleast 2 output tokens before leaving prefill.
+            # Because 1st token will be generated during last step of prefill phase
             # Keep this aligned with Qwen3ThinkerChunkProcessor.min_tokens_for_decode.
-            "is_prefill": [True] if len(output.token_ids) <= 4 else [False],
+            "is_prefill": [True] if len(output.token_ids) < 2 else [False],
         }
         talker_inputs.append(
             OmniTokensPrompt(
@@ -207,7 +208,6 @@ def talker2code2wav(
             code_predictor_codes = torch.cat(code_predictor_codes, dim=0)
 
         # Accumulate talker output tokens before invoking code2wav stage
-        # This helps
         code_predictor_codes = code_predictor_codes[prefill_len : prefill_len + talker_tokens_batch_size]
 
         if code_predictor_codes.shape[0] > 0:

@@ -694,24 +694,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )
 
-        if self.async_chunk_stream:
-            # When async_chunk_stream is enabled, only consider prompt tokens +
-            # the first 3 *embedded* output tokens in the initial prefill payload.
-            #
-            # Note: thinker token_ids are typically 1 longer than thinker embeddings
-            # (the last sampled token is not embedded until the next step). We keep
-            # thinker_sequences 1 longer than thinker_embeddings accordingly.
-            #
-            # Additional output token embeddings will be streamed in via scheduler-scheduler
-            # communication in subsequent chunks.
-            truncate_len = len(thinker_chatml_ids) + 3
-            thinker_sequence_embeds = thinker_sequence_embeds[:truncate_len, :]
-            thinker_hidden_states = thinker_hidden_states[:truncate_len, :]
-            thinker_sequences = thinker_sequences[: truncate_len + 1]
-            tts_bos_thinker = tts_bos_thinker[: thinker_hidden_states.shape[0], :, :]
-            tts_eos_thinker = tts_eos_thinker[: thinker_hidden_states.shape[0], :, :]
-            tts_pad_thinker = tts_pad_thinker[: thinker_hidden_states.shape[0], :, :]
-
         if thinker_sequence_embeds is None or thinker_hidden_states is None:
             raise ValueError(
                 "additional_information_by_req_id must include "
@@ -961,6 +943,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             dim=0,
         )
 
+        # In chunk stream mode, we don;t want to add EOS token immediately,
+        # as there will more tokens coming as chunks later
         if self.async_chunk_stream:
             trailing_text_hidden = assistant_hidden[4:]
         else:

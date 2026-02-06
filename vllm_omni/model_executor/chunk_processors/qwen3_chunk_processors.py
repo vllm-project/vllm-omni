@@ -26,13 +26,13 @@ class Qwen3ThinkerChunkProcessor(BaseChunkProcessor):
     stage_type: str = "ar"
     chunk_batch_size: int | None = None
     should_skip_first_chunk: bool = True
-    min_tokens_for_decode: int = 3  # Qwen3-specific requirement
+    min_tokens_for_decode: int = 2  # Qwen3-specific requirement
 
     def is_prefill(self, pooler_output: Any, request: Request) -> bool:
-        """Qwen3 needs at least 3 tokens to leave prefill."""
+        """Qwen3 needs at least 2 tokens to leave prefill."""
         if not hasattr(request, "output_token_ids"):
             return True
-        return len(request.output_token_ids) <= self.min_tokens_for_decode
+        return len(request.output_token_ids) < self.min_tokens_for_decode
 
     def prepare_outgoing_chunk(
         self, request: Request, pooler_output: Any = None, new_token_ids: list[int] | None = None
@@ -114,15 +114,17 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
         accumulated_count = len(state.accumulated_data)
 
         if accumulated_count >= self.chunk_batch_size or is_finished:
-            tensors = state.accumulated_data
-            if not tensors:
+            raw_codes = state.accumulated_data
+            if not raw_codes:
                 return None
 
-            concatenated = torch.cat(tensors, dim=0)
+            code_tensor = torch.cat(raw_codes, dim=0)
 
-            codec_codes = concatenated.to(torch.long).transpose(0, 1).cpu().reshape(-1).tolist()
+            codec_codes = code_tensor.to(torch.long).transpose(0, 1).cpu().reshape(-1).tolist()
 
-            state.accumulated_data = []
+            # Retain the latter half of accumulated raw_codes to serve as left context
+            # for the next chunk during streaming decoding
+            state.accumulated_data = state.accumulated_data[self.chunk_batch_size // 2 :]
 
             return {"tokens": codec_codes}
 

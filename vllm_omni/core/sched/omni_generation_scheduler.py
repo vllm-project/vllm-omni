@@ -65,6 +65,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # In such scenarios, avoid scheduling that request until pending_chunk is received
                 if getattr(request, "pending_chunk", None) is not None and len(request.pending_chunk) > 0:
                     request.prompt_token_ids = request.pending_chunk
+                    request.num_prompt_tokens = len(request.pending_chunk)
                     request.pending_chunk = []
                 else:
                     req_index += 1

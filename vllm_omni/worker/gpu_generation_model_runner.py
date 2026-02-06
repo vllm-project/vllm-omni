@@ -95,6 +95,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     # Update token_ids_cpu
                     self.input_batch.token_ids_cpu[req_index, :num_new_tokens] = new_token_ids
                     self.input_batch.is_token_ids[req_index, :num_new_tokens] = True
+                    self.input_batch.is_token_ids[req_index, num_new_tokens:] = False
 
                     # Update length metadata
                     self.input_batch.num_prompt_tokens[req_index] = num_new_tokens
@@ -102,6 +103,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
                     # Reset computed tokens to force prefill behavior for the new chunk
                     self.input_batch.num_computed_tokens_cpu[req_index] = 0
+
+                    # Re-calculate RoPE positions for the new chunk sequence
+                    if self.uses_mrope:
+                        self._init_mrope_positions(req_state)
+                    if self.uses_xdrope_dim > 0:
+                        self._init_xdrope_positions(req_state)
 
     @torch.inference_mode()
     def execute_model(

@@ -1659,10 +1659,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         audio_data = final_res.multimodal_output.get("audio")
         if stream:
-            if isinstance(final_res.multimodal_output["audio"], list):
-                audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+            if isinstance(audio_data, list):
+                audio_tensor = audio_data[-1].float().detach().cpu().numpy()
             else:
-                audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+                audio_tensor = audio_data.float().detach().cpu().numpy()
         else:
             if isinstance(audio_data, list):
                 audio_data = torch.cat(audio_data, dim=-1)
