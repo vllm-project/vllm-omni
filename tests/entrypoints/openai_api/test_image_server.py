@@ -352,8 +352,7 @@ def test_with_seed_zero(test_client):
     captured = engine.captured_sampling_params_list[0]
     # Verify that seed=0 is correctly passed
     assert captured.seed == 0, (
-        f"Expected seed=0, but got seed={captured.seed}. "
-        "This indicates the bug where seed=0 is treated as falsy."
+        f"Expected seed=0, but got seed={captured.seed}. This indicates the bug where seed=0 is treated as falsy."
     )
 
 def test_with_custom_parameters(test_client):

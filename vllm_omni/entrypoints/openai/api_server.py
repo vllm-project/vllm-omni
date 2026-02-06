@@ -968,7 +968,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1))
+        _update_if_not_none(
+            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
+        )
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
