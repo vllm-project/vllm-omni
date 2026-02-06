@@ -337,6 +337,7 @@ def test_with_seed(test_client):
     )
     assert response.status_code == 200
 
+
 def test_with_seed_zero(test_client):
     """Test with seed=0 for reproducibility"""
     response = test_client.post(
@@ -354,6 +355,7 @@ def test_with_seed_zero(test_client):
     assert captured.seed == 0, (
         f"Expected seed=0, but got seed={captured.seed}. This indicates the bug where seed=0 is treated as falsy."
     )
+
 
 def test_with_custom_parameters(test_client):
     """Test with custom diffusion parameters"""
