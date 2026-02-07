@@ -102,11 +102,24 @@ class AsyncOmniDiffusion:
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
-        # Thread pool for running sync engine in async context
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Thread pool for running sync engine in async context.
+        # Use >1 workers so multiple requests can overlap at engine boundary,
+        # which enables in-engine step-level preemption to be observable.
+        executor_workers = kwargs.get("diffusion_async_executor_workers")
+        if executor_workers is None:
+            executor_workers = 8
+        try:
+            executor_workers = max(1, int(executor_workers))
+        except Exception:
+            executor_workers = 8
+        self._executor = ThreadPoolExecutor(max_workers=executor_workers)
         self._closed = False
 
-        logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+        logger.info(
+            "AsyncOmniDiffusion initialized with model: %s (executor_workers=%d)",
+            model,
+            executor_workers,
+        )
 
     async def generate(
         self,

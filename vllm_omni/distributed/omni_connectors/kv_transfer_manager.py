@@ -352,6 +352,10 @@ class OmniKVTransferManager:
         Returns:
             Tuple of (data dict, size) if successful, (None, 0) otherwise
         """
+        # Fast path: receiving is disabled in most pure-diffusion deployments.
+        if not self.config.need_recv_cache:
+            return None, 0
+
         if not self.connector:
             logger.warning("No connector available for receiving KV cache")
             return None, 0
@@ -359,11 +363,6 @@ class OmniKVTransferManager:
         from_stage, to_stage = self.recv_stages
         if not from_stage or not to_stage:
             logger.warning("Receive stages not configured")
-            return None, 0
-
-        # Check if we should receive KV cache based on config
-        if not self.config.need_recv_cache:
-            logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
             return None, 0
 
         timeout = self.config.recv_timeout
@@ -443,6 +442,9 @@ class OmniKVTransferManager:
         Returns:
             True if successful, False otherwise
         """
+        if not self.config.need_recv_cache:
+            return False
+
         request_id = getattr(req, "request_id", None)
         if not request_id and hasattr(req, "request_ids") and req.request_ids:
             # Adaptation for new OmniDiffusionRequest which has list of prompts/ids

@@ -25,7 +25,8 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 	--model Qwen/Qwen-Image \
 	--task t2i \
 	--dataset vbench \
-	--num-prompts 5
+	--num-prompts 2 \
+	--max-concurrency 2
 ```
 
 **Notes**
@@ -115,3 +116,19 @@ Traffic / concurrency flags:
 
 - `--request-rate`: Target request rate (requests/second). If set to `inf`, the script sends all requests immediately.
 - `--max-concurrency`: Max number of in-flight requests (default: `1`). This can hard-cap the achieved QPS: if it is too small, requests will queue behind the semaphore, and both achieved throughput and observed SLO attainment can be skewed.
+
+## 4. Qwen-Image Step-Level Preemption (Prototype)
+
+The diffusion worker now supports a step-level preemptive path for Qwen-Image family pipelines:
+
+- New requests preempt the currently running request at the next step boundary.
+- Worker uses LIFO-style resume for preempted requests: finish newest request first, then resume the most recently preempted request.
+- Preemption granularity is diffusion step chunk (`preempt_step_chunk_size`, default `1`).
+- Qwen-Image pipeline requests are resumable via in-memory execution state (`latents`, prompt embeds, scheduler timesteps, current step index).
+- State is kept on GPU/in-process memory (no default CPU offload).
+
+Current status:
+
+- Designed to reduce tail latency for mixed long/short Qwen-Image workloads.
+- Current policy is pure interrupt-first (arrival-driven), useful for validating preempt/resume correctness.
+- The mechanism is internal; external API remains one-request-in/one-result-out.

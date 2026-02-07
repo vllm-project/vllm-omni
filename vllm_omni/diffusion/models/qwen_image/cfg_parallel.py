@@ -9,6 +9,7 @@ Shared by
 """
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -41,7 +42,10 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
         image_latents: torch.Tensor | None = None,
         cfg_normalize: bool = True,
         additional_transformer_kwargs: dict[str, Any] | None = None,
-    ) -> torch.Tensor:
+        start_index: int = 0,
+        step_chunk_size: int | None = None,
+        should_yield: Callable[[int], bool] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, int, bool]:
         """
         Diffusion loop with optional classifier-free guidance.
 
@@ -65,11 +69,21 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
         Returns:
             Denoised latents
         """
-        self.scheduler.set_begin_index(0)
+        # Each request chunk (and resumed chunk) must restore scheduler cursor
+        # from the request-local step index; otherwise interleaved requests can
+        # leak scheduler step state into each other.
+        self.scheduler.set_begin_index(start_index)
+        if hasattr(self.scheduler, "_step_index"):
+            self.scheduler._step_index = None
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
-        for i, t in enumerate(timesteps):
+        end_index = len(timesteps)
+        if step_chunk_size is not None and step_chunk_size > 0:
+            end_index = min(end_index, start_index + step_chunk_size)
+
+        for i in range(start_index, end_index):
+            t = timesteps[i]
             if self.interrupt:
                 continue
             self._current_timestep = t
@@ -122,6 +136,10 @@ class QwenImageCFGParallelMixin(CFGParallelMixin):
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
+            if should_yield is not None and i + 1 < len(timesteps) and should_yield(i + 1):
+                return latents, i + 1, True
+        if start_index > 0 or step_chunk_size is not None or should_yield is not None:
+            return latents, end_index, end_index < len(timesteps)
         return latents
 
     def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):

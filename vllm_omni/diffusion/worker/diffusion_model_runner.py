@@ -177,4 +177,6 @@ class DiffusionModelRunner:
             if self.od_config.cache_backend == "cache_dit" and self.od_config.enable_cache_dit_summary:
                 cache_summary(self.pipeline, details=True)
 
+        if output.request_key is None:
+            output.request_key = req.request_key
         return output

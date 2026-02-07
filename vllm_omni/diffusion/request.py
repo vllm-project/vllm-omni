@@ -2,9 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import random
+import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+
+
+@dataclass
+class OmniDiffusionExecutionState:
+    """State for step-granularity resume."""
+
+    step_index: int = 0
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -25,6 +37,11 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
 
     request_ids: list[str] = field(default_factory=list)
+    priority: float | None = None
+    execution_state: OmniDiffusionExecutionState | None = None
+    preempt_step_chunk_size: int = 1
+    preempt_enabled: bool = False
+    _request_key: str = field(init=False, repr=False)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -42,3 +59,18 @@ class OmniDiffusionRequest:
             self.sampling_params.guidance_scale_provided = True
         else:
             self.sampling_params.guidance_scale = 1.0
+
+        self._request_key = self.request_ids[0] if self.request_ids else f"diff-{uuid.uuid4().hex[:16]}"
+
+    @property
+    def request_key(self) -> str:
+        return self._request_key
+
+    def get_or_assign_priority(self) -> float:
+        """Assign a reproducible random priority when not provided."""
+        if self.priority is not None:
+            return float(self.priority)
+
+        seed_hex = hashlib.sha256(self.request_key.encode("utf-8")).hexdigest()[:16]
+        self.priority = random.Random(int(seed_hex, 16)).random()
+        return float(self.priority)

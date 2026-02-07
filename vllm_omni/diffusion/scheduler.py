@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from threading import Lock
+
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
@@ -31,6 +33,8 @@ class Scheduler:
         )
 
         self.result_mq = None
+        self._result_lock = Lock()
+        self._pending_results: dict[str, DiffusionOutput] = {}
 
     def initialize_result_queue(self, handle):
         # Initialize MessageQueue for receiving results
@@ -44,28 +48,39 @@ class Scheduler:
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
         try:
-            # Prepare RPC request for generation
-            rpc_request = {
-                "type": "rpc",
-                "method": "generate",
-                "args": (request,),
-                "kwargs": {},
-                "output_rank": 0,
-                "exec_all_ranks": True,
-            }
-
-            # Broadcast RPC request to all workers
-            self.mq.enqueue(rpc_request)
-            # Wait for result from Rank 0 (or whoever sends it)
+            request_key = request.request_key
 
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")
 
-            output = self.result_mq.dequeue()
-            # {"status": "error", "error": str(e)}
-            if isinstance(output, dict) and output.get("status") == "error":
-                raise RuntimeError("worker error")
-            return output
+            # Broadcast generation request to all workers.
+            self.mq.enqueue(request)
+
+            while True:
+                with self._result_lock:
+                    if request_key in self._pending_results:
+                        return self._pending_results.pop(request_key)
+
+                    message = self.result_mq.dequeue()
+
+                    if isinstance(message, dict) and message.get("status") == "error":
+                        raise RuntimeError("worker error")
+
+                    if isinstance(message, dict) and message.get("type") == "generation_result":
+                        key = message.get("request_key")
+                        output = message.get("output")
+                        if not isinstance(output, DiffusionOutput):
+                            raise RuntimeError("Invalid generation result from worker")
+                        if key == request_key:
+                            return output
+                        if isinstance(key, str):
+                            self._pending_results[key] = output
+                            continue
+                        raise RuntimeError("Generation result missing request key")
+
+                    if isinstance(message, DiffusionOutput):
+                        return message
+                    raise RuntimeError("Unexpected response type from worker")
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
@@ -77,3 +92,4 @@ class Scheduler:
         self.context = None
         self.mq = None
         self.result_mq = None
+        self._pending_results = {}
