@@ -372,6 +372,4 @@ class DiffusionEngine:
             self.executor.shutdown()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
-        # TODO implement it
-        logger.warning("DiffusionEngine abort is not implemented yet")
-        pass
+        self.executor.abort(request_id)

@@ -276,6 +276,7 @@ class WorkerProc:
         self._current_req: OmniDiffusionRequest | None = None
         # Stack of preempted requests (LIFO): newest request runs first, then resume prior.
         self._preempted_reqs: list[OmniDiffusionRequest] = []
+        self._aborted_request_ids: set[str] = set()
 
     def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
@@ -303,6 +304,12 @@ class WorkerProc:
         req.preempt_enabled = self._supports_step_preemption()
         req.preempt_step_chunk_size = max(1, int(req.preempt_step_chunk_size))
         incoming_req_id = self._req_debug_id(req)
+        if incoming_req_id in self._aborted_request_ids:
+            print(
+                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={incoming_req_id} reason=aborted",
+                flush=True,
+            )
+            return
         print(
             f"[DiffusionArrive][{self._now_str()}][rank={self.gpu_id}] "
             f"req_id={incoming_req_id} preempt_enabled={req.preempt_enabled}",
@@ -323,17 +330,24 @@ class WorkerProc:
         self._current_req = req
 
     def _resume_preempted_request(self) -> OmniDiffusionRequest | None:
-        if not self._preempted_reqs:
-            return None
-        resumed_req = self._preempted_reqs.pop()
-        resumed_req_id = self._req_debug_id(resumed_req)
-        resume_step = self._req_step_index(resumed_req)
-        print(
-            f"[DiffusionResume][{self._now_str()}][rank={self.gpu_id}] "
-            f"resume req_id={resumed_req_id} from step={resume_step}",
-            flush=True,
-        )
-        return resumed_req
+        while self._preempted_reqs:
+            resumed_req = self._preempted_reqs.pop()
+            resumed_req_id = self._req_debug_id(resumed_req)
+            if resumed_req_id in self._aborted_request_ids:
+                print(
+                    f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] "
+                    f"req_id={resumed_req_id} reason=aborted",
+                    flush=True,
+                )
+                continue
+            resume_step = self._req_step_index(resumed_req)
+            print(
+                f"[DiffusionResume][{self._now_str()}][rank={self.gpu_id}] "
+                f"resume req_id={resumed_req_id} from step={resume_step}",
+                flush=True,
+            )
+            return resumed_req
+        return None
 
     @staticmethod
     def _req_debug_id(req: OmniDiffusionRequest) -> str:
@@ -348,6 +362,34 @@ class WorkerProc:
     @staticmethod
     def _now_str() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def _abort_requests(self, request_ids: list[str]) -> None:
+        if not request_ids:
+            return
+        for rid in request_ids:
+            if isinstance(rid, str):
+                self._aborted_request_ids.add(rid)
+                print(
+                    f"[DiffusionAbort][{self._now_str()}][rank={self.gpu_id}] req_id={rid}",
+                    flush=True,
+                )
+
+        if self._current_req is not None:
+            cur_id = self._req_debug_id(self._current_req)
+            if cur_id in self._aborted_request_ids:
+                aborted_req = self._current_req
+                self._current_req = self._resume_preempted_request()
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "request_key": aborted_req.request_key,
+                        "output": DiffusionOutput(
+                            error=f"request {cur_id} aborted",
+                            finished=True,
+                            request_key=aborted_req.request_key,
+                        ),
+                    }
+                )
 
     def _drain_incoming_messages(self) -> None:
         while self._running:
@@ -378,6 +420,10 @@ class WorkerProc:
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
                 self._running = False
                 return
+
+            if isinstance(msg, dict) and msg.get("type") == "abort":
+                self._abort_requests(msg.get("request_ids", []))
+                continue
 
             if isinstance(msg, OmniDiffusionRequest):
                 self._enqueue_generation_req(msg)
@@ -440,11 +486,30 @@ class WorkerProc:
                     logger.info("Worker %s: Received shutdown message", self.gpu_id)
                     self._running = False
                     break
+                elif isinstance(msg, dict) and msg.get("type") == "abort":
+                    self._abort_requests(msg.get("request_ids", []))
+                    continue
                 else:
                     logger.warning("Worker %s: Ignoring unsupported message type %s", self.gpu_id, type(msg))
                     continue
 
             if self._current_req is None:
+                continue
+
+            current_req_id = self._req_debug_id(self._current_req)
+            if current_req_id in self._aborted_request_ids:
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "request_key": self._current_req.request_key,
+                        "output": DiffusionOutput(
+                            error=f"request {current_req_id} aborted",
+                            finished=True,
+                            request_key=self._current_req.request_key,
+                        ),
+                    }
+                )
+                self._current_req = self._resume_preempted_request()
                 continue
 
             try:

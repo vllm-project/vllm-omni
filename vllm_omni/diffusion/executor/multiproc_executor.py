@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import time
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -195,3 +196,20 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def shutdown(self) -> None:
         self._closed = True
         self._finalizer()
+
+    def abort(self, request_id: str | Iterable[str]) -> None:
+        """Broadcast abort request IDs to all diffusion workers."""
+        if self._closed:
+            return
+        if isinstance(request_id, str):
+            request_ids = [request_id]
+        else:
+            request_ids = [rid for rid in request_id if isinstance(rid, str)]
+        if not request_ids:
+            return
+        self.scheduler.mq.enqueue(
+            {
+                "type": "abort",
+                "request_ids": request_ids,
+            }
+        )

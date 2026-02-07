@@ -683,6 +683,9 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
                 "true_cfg_scale": true_cfg_scale,
                 "height": height,
                 "width": width,
+                "num_inference_steps": num_inference_steps,
+                "sigmas": sigmas,
+                "image_seq_len": latents.shape[1],
             }
             req.execution_state = OmniDiffusionExecutionState(step_index=0, payload=state)
         else:
@@ -701,10 +704,29 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
             height = state["height"]
             width = state["width"]
 
-        timesteps = state["timesteps"]
+        # Restore scheduler internal state per request to avoid cross-request
+        # contamination of scheduler.sigmas when requests are interleaved.
+        timesteps, _ = self.prepare_timesteps(
+            state["num_inference_steps"],
+            state["sigmas"],
+            state["image_seq_len"],
+        )
+        state["timesteps"] = timesteps
         self._num_timesteps = len(timesteps)
         start_index = req.execution_state.step_index if req.execution_state is not None else 0
         chunk_size = max(1, req.preempt_step_chunk_size) if req.preempt_enabled else None
+        req_id = req.request_ids[0] if req.request_ids else req.request_key
+        print(
+            f"[DiffusionState] req_id={req_id} start_index={start_index} "
+            f"num_inference_steps={state['num_inference_steps']} timesteps_len={len(timesteps)} "
+            f"latents_shape={tuple(state['latents'].shape)}",
+            flush=True,
+        )
+        if start_index >= len(timesteps):
+            raise RuntimeError(
+                f"Invalid resume step for req_id={req_id}: "
+                f"start_index={start_index} >= timesteps_len={len(timesteps)}"
+            )
 
         diffuse_result = self.diffuse(
             state["prompt_embeds"],

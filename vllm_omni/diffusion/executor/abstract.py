@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -84,3 +85,7 @@ class DiffusionExecutor(ABC):
     def shutdown(self) -> None:
         """Shutdown the executor and release resources."""
         pass
+
+    def abort(self, request_id: str | Iterable[str]) -> None:
+        """Best-effort request abortion. Executors may override."""
+        return
