@@ -61,7 +61,6 @@ ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=bind,source=.git,target=.git \
     pip install --no-build-isolation .
 
 # install additional dependencies for openai api server
