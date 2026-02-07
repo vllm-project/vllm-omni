@@ -338,6 +338,25 @@ def test_with_seed(test_client):
     assert response.status_code == 200
 
 
+def test_with_seed_zero(test_client):
+    """Test with seed=0 for reproducibility"""
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a tree",
+            "seed": 0,
+            "size": "1024x1024",
+        },
+    )
+    assert response.status_code == 200
+    engine = test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list[0]
+    # Verify that seed=0 is correctly passed
+    assert captured.seed == 0, (
+        f"Expected seed=0, but got seed={captured.seed}. This indicates the bug where seed=0 is treated as falsy."
+    )
+
+
 def test_with_custom_parameters(test_client):
     """Test with custom diffusion parameters"""
     response = test_client.post(
@@ -814,3 +833,55 @@ def test_image_edit_compression_png(async_omni_test_client):
 
     assert len(img_bytes_10) < len(img_bytes_50)
     assert len(img_bytes_50) < len(img_bytes_100)
+
+
+def test_image_edit_with_seed_zero(async_omni_test_client):
+    """Test that seed=0 is correctly handled in image editing.
+
+    Previously, seed=0 was incorrectly replaced by a random seed due to the
+    falsy value check using `or` operator. This test ensures seed=0 is
+    properly passed through to the sampling parameters in image editing.
+    """
+    img_bytes_1 = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "edit this image",
+            "seed": 0,
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    # Verify that seed=0 is correctly passed
+    assert captured_sampling_params.seed == 0, (
+        f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
+        "This indicates the bug where seed=0 is treated as falsy."
+    )
+
+
+def test_image_edit_with_seed_zero_single_stage(test_client):
+    """Test that seed=0 is correctly handled in image editing (single stage).
+
+    Test seed=0 handling in image editing with single stage path.
+    """
+    img_bytes_1 = make_test_image_bytes((16, 16))
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes_1)],
+        data={
+            "prompt": "edit this image",
+            "seed": 0,
+        },
+    )
+    assert response.status_code == 200
+    engine = test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[0]
+    # Verify that seed=0 is correctly passed
+    assert captured_sampling_params.seed == 0, (
+        f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
+        "This indicates the bug where seed=0 is treated as falsy."
+    )
