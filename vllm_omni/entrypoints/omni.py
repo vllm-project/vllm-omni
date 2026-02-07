@@ -40,6 +40,7 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
+    resolve_model_type,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -202,11 +203,14 @@ class OmniBase:
         tokenizer = kwargs.get("tokenizer", None)
 
         base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+        self.model_type = resolve_model_type(model)
 
         # Load stage configurations from YAML
         if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
+            self.config_path = resolve_model_config_path(self.model_type)
+            self.stage_configs = load_stage_configs_from_model(
+                config_path=self.config_path, base_engine_args=base_engine_args
+            )
             if not self.stage_configs:
                 default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
                 self.stage_configs = OmegaConf.create(default_stage_cfg)

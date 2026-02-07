@@ -14,6 +14,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateSpeechRequest,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -82,8 +83,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return False
 
     def _is_stable_audio_model(self) -> bool:
-        """Check if the current model is a Stable Audio model."""
-        return "stabilityai/stable-audio-open" in self.model_name.lower()
+        return self.engine_client.model_type == "StableAudioPipeline"
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
@@ -256,7 +256,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     prompt["negative_prompt"] = request.negative_prompt
 
                 # Build sampling params for diffusion
-                sampling_params_list[0].num_outputs_per_prompt = 1
+                sampling_params_list = [OmniDiffusionSamplingParams(num_outputs_per_prompt=1)]
 
                 # Create generator if seed provided
                 if request.seed is not None:
