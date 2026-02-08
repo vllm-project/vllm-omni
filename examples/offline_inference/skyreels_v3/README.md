@@ -97,7 +97,7 @@ python image_to_video.py \
 1. **Image Quality**: Use high-quality reference images for best results
 2. **Aspect Ratio**: The model works best with 16:9 aspect ratio (e.g., 832x480)
 3. **Frame Count**: More frames = longer videos but slower generation
-4. **Guidance Scale**: 
+4. **Guidance Scale**:
    - Lower (3-5): More creative, less adherence to prompt
    - Medium (7-9): Balanced
    - Higher (10+): Strong prompt adherence, may reduce quality

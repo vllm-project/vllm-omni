@@ -98,7 +98,7 @@ def main():
         choices=["mp4", "gif", "frames"],
         help="Output format: mp4, gif, or frames (default: mp4)",
     )
-    
+
     args = parser.parse_args()
 
     # Create output directory
@@ -108,7 +108,7 @@ def main():
     # Load reference image
     if not os.path.exists(args.image):
         raise FileNotFoundError(f"Image not found: {args.image}")
-    
+
     image = Image.open(args.image).convert("RGB")
     print(f"Loaded reference image: {args.image} ({image.size})")
 
@@ -122,7 +122,7 @@ def main():
 
     # Prepare the request
     print(f"\nGenerating video with prompt: '{args.prompt}'")
-    print(f"Parameters:")
+    print("Parameters:")
     print(f"  - Resolution: {args.width}x{args.height}")
     print(f"  - Frames: {args.num_frames}")
     print(f"  - Steps: {args.num_inference_steps}")
@@ -150,21 +150,23 @@ def main():
     # Save the generated video
     for idx, output in enumerate(outputs):
         video_frames = output.outputs[0]  # Get the video frames
-        
+
         if args.output_format == "mp4":
             output_path = output_dir / f"video_{idx:04d}.mp4"
             # Save as MP4 video
             import imageio
+
             imageio.mimsave(output_path, video_frames, fps=24, codec="libx264")
             print(f"\nSaved video to: {output_path}")
-            
+
         elif args.output_format == "gif":
             output_path = output_dir / f"video_{idx:04d}.gif"
             # Save as GIF
             import imageio
+
             imageio.mimsave(output_path, video_frames, fps=12)
             print(f"\nSaved GIF to: {output_path}")
-            
+
         else:  # frames
             frames_dir = output_dir / f"video_{idx:04d}_frames"
             frames_dir.mkdir(exist_ok=True)

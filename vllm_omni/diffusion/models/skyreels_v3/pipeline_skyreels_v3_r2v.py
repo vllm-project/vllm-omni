@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -22,7 +21,6 @@ from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -345,7 +343,7 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         # Extract parameters
         prompt = [p["prompt"] if isinstance(p, dict) else p for p in request.prompts]
         batch_size = len(prompt)
-        
+
         # Get sampling parameters
         height = request.sampling_params.height or 480
         width = request.sampling_params.width or 832
@@ -372,10 +370,10 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
                 img = p["additional_information"].get("preprocessed_image")
                 if img is not None:
                     images.append(img)
-        
+
         if not images:
             raise ValueError("No preprocessed images found in request")
-        
+
         image_tensor = torch.cat(images, dim=0).to(device=device, dtype=dtype)
         image_embeds = self.encode_image(image_tensor, device, num_videos_per_prompt)
 
@@ -388,11 +386,11 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )
-        
+
         generator = torch.Generator(device=device)
         if request.sampling_params.seed is not None:
             generator.manual_seed(request.sampling_params.seed)
-        
+
         latents = randn_tensor(latents_shape, generator=generator, device=device, dtype=dtype)
 
         # Prepare scheduler
@@ -432,4 +430,3 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             output=video,
             request_id=request.request_id,
         )
-

@@ -11,16 +11,13 @@ a multimodal video generation model supporting:
 - Audio-to-Video (A2V)
 """
 
-import math
 from collections.abc import Iterable
-from typing import Any
 
 import torch
 import torch.nn as nn
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import FP32LayerNorm
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -540,7 +537,7 @@ class SkyReelsTransformer3DModel(nn.Module):
 
         # Project input
         hidden_states = self.proj_in(hidden_states)  # [B, inner_dim, T', H', W']
-        
+
         # Reshape to sequence
         t_out, h_out, w_out = (
             num_frames // self.patch_size[0],
@@ -611,4 +608,3 @@ class SkyReelsTransformer3DModel(nn.Module):
                 continue
             param = params_dict[name]
             default_weight_loader(param, loaded_weight)
-
