@@ -4,7 +4,6 @@
 # Stage 2: Code2Wav (16-layer RVQ codes → audio waveform)
 
 # The following config has been verified on 2x H100-80G GPUs.
-async_chunk: true
 stage_args:
   - stage_id: 0
     stage_type: llm  # Use llm stage type to launch OmniLLM
@@ -25,7 +24,9 @@ stage_args:
       max_num_batched_tokens: 32768
       hf_config_name: thinker_config
       tensor_parallel_size: 1
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk
+      async_chunk_stream: true
+      async_scheduling: false
+      chunk_processor: vllm_omni.model_executor.chunk_processors.qwen3_chunk_processors.Qwen3ThinkerChunkProcessor
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -56,10 +57,11 @@ stage_args:
       max_num_batched_tokens: 32768
       distributed_executor_backend: "mp"
       hf_config_name: talker_config
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk
+      async_chunk_stream: true
+      async_scheduling: false
+      chunk_processor: vllm_omni.model_executor.chunk_processors.qwen3_chunk_processors.Qwen3TalkerChunkProcessor
     engine_input_source: [0]
-    # final_output: true
-    # final_output_type: text
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -79,7 +81,7 @@ stage_args:
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       async_scheduling: false
       enable_prefix_caching: false
@@ -88,6 +90,8 @@ stage_args:
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 10000
       hf_config_name: thinker_config
+      async_chunk_stream: true
+      chunk_processor: vllm_omni.model_executor.chunk_processors.qwen3_chunk_processors.Qwen3Code2WavChunkProcessor
     engine_input_source: [1]
     final_output: true
     final_output_type: audio
