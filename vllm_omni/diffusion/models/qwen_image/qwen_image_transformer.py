@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
+from vllm._custom_ops import fused_qk_norm_rope
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -38,6 +40,11 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+
+@functools.cache
+def _has_fused_qknorm_rope():
+    return current_platform.is_cuda_alike()
 
 
 class ImageRopePrepare(nn.Module):
@@ -456,6 +463,7 @@ class QwenImageCrossAttention(nn.Module):
         pre_only: bool = False,
         context_pre_only: bool = False,
         out_dim: int | None = None,
+        use_fused_qk_rope: bool | None = None,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -525,47 +533,97 @@ class QwenImageCrossAttention(nn.Module):
         except Exception:
             self.parallel_config = None
 
+        self.use_fused_qk_rope = use_fused_qk_rope if use_fused_qk_rope is not None else False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         vid_freqs: torch.Tensor,
         txt_freqs: torch.Tensor,
+        vid_position_ids: torch.Tensor | None = None,
+        txt_position_ids: torch.Tensor | None = None,
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
-        img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
-
         txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
         add_q_size = self.add_query_num_heads * self.head_dim
         add_kv_size = self.add_kv_num_heads * self.head_dim
-        txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
 
-        img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
-        img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
-        img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
+        if not self.use_fused_qk_rope:
+            img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+            txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
 
-        txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
-        txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
-        txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+            img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+            img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+            img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
 
-        img_query = self.norm_q(img_query)
-        img_key = self.norm_k(img_key)
-        txt_query = self.norm_added_q(txt_query)
-        txt_key = self.norm_added_k(txt_key)
+            txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+            txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+            txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_cos = vid_freqs.real.to(img_query.dtype)
-        img_sin = vid_freqs.imag.to(img_query.dtype)
-        txt_cos = txt_freqs.real.to(txt_query.dtype)
-        txt_sin = txt_freqs.imag.to(txt_query.dtype)
+            img_query = self.norm_q(img_query)
+            img_key = self.norm_k(img_key)
+            txt_query = self.norm_added_q(txt_query)
+            txt_key = self.norm_added_k(txt_key)
 
-        img_query = self.rope(img_query, img_cos, img_sin)
-        img_key = self.rope(img_key, img_cos, img_sin)
-        txt_query = self.rope(txt_query, txt_cos, txt_sin)
-        txt_key = self.rope(txt_key, txt_cos, txt_sin)
+            img_cos = vid_freqs.real.to(img_qkv.dtype)
+            img_sin = vid_freqs.imag.to(img_qkv.dtype)
+            txt_cos = txt_freqs.real.to(txt_qkv.dtype)
+            txt_sin = txt_freqs.imag.to(txt_qkv.dtype)
+
+            img_query = self.rope(img_query, img_cos, img_sin)
+            img_key = self.rope(img_key, img_cos, img_sin)
+            txt_query = self.rope(txt_query, txt_cos, txt_sin)
+            txt_key = self.rope(txt_key, txt_cos, txt_sin)
+        else:
+            img_qkv_shape_ori = img_qkv.shape
+            txt_qkv_shape_ori = txt_qkv.shape
+            img_qkv = img_qkv.view(-1, img_qkv_shape_ori[-1])
+            txt_qkv = txt_qkv.view(-1, txt_qkv_shape_ori[-1])
+
+            # fused_qk_norm_rope applies qk rmsnorm and rope to qkv in-place
+            fused_qk_norm_rope(
+                qkv=img_qkv,
+                num_heads_q=self.query_num_heads,
+                num_heads_k=self.kv_num_heads,
+                num_heads_v=self.kv_num_heads,
+                head_dim=self.head_dim,
+                eps=self.eps,
+                q_weight=self.norm_q.weight,
+                k_weight=self.norm_k.weight,
+                cos_sin_cache=vid_freqs,
+                is_neox=False,
+                position_ids=vid_position_ids,
+            )
+            fused_qk_norm_rope(
+                qkv=txt_qkv,
+                num_heads_q=self.add_query_num_heads,
+                num_heads_k=self.add_kv_num_heads,
+                num_heads_v=self.add_kv_num_heads,
+                head_dim=self.head_dim,
+                eps=self.eps,
+                q_weight=self.norm_added_q.weight,
+                k_weight=self.norm_added_k.weight,
+                cos_sin_cache=txt_freqs,
+                is_neox=False,
+                position_ids=txt_position_ids,
+            )
+            img_qkv = img_qkv.view(img_qkv_shape_ori)
+            txt_qkv = txt_qkv.view(txt_qkv_shape_ori)
+            img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+            txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
+
+            img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+            img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+            img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
+
+            txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+            txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+            txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
@@ -637,6 +695,7 @@ class QwenImageTransformerBlock(nn.Module):
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
         zero_cond_t: bool = False,
+        use_fused_qk_rope: bool | None = None,
     ):
         super().__init__()
 
@@ -656,6 +715,7 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
+            use_fused_qk_rope=use_fused_qk_rope,
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = FeedForward(dim=dim, dim_out=dim)
@@ -715,6 +775,7 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states_mask: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        position_ids: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         modulate_index: list[int] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
@@ -748,6 +809,8 @@ class QwenImageTransformerBlock(nn.Module):
             encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
             vid_freqs=image_rotary_emb[0],
             txt_freqs=image_rotary_emb[1],
+            vid_position_ids=position_ids[0] if position_ids is not None else None,
+            txt_position_ids=position_ids[1] if position_ids is not None else None,
             hidden_states_mask=hidden_states_mask,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
         )
@@ -884,6 +947,9 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.img_in = nn.Linear(in_channels, self.inner_dim)
         self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
 
+        # The fused qk norm rope is only supported when head_dim is divisible by 64
+        self.use_fused_qk_rope = _has_fused_qknorm_rope() and attention_head_dim % 64 == 0
+
         self.transformer_blocks = nn.ModuleList(
             [
                 QwenImageTransformerBlock(
@@ -891,6 +957,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     zero_cond_t=zero_cond_t,
+                    use_fused_qk_rope=self.use_fused_qk_rope,
                 )
                 for _ in range(num_layers)
             ]
@@ -964,6 +1031,15 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # _sp_plan will shard hidden_states and vid_freqs together via split_output=True
         # txt_freqs is kept replicated for dual-stream attention
         hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
+        if self.use_fused_qk_rope:
+            vid_freqs = torch.cat([vid_freqs.real, vid_freqs.imag], dim=-1)
+            txt_freqs = torch.cat([txt_freqs.real, txt_freqs.imag], dim=-1)
+            position_ids = [
+                torch.arange(vid_freqs.shape[0], device=vid_freqs.device).repeat(hidden_states.shape[0]),
+                torch.arange(txt_freqs.shape[0], device=txt_freqs.device).repeat(encoder_hidden_states.shape[0]),
+            ]
+        else:
+            position_ids = None
         image_rotary_emb = (vid_freqs, txt_freqs)
 
         # Ensure timestep tensor is on the same device and dtype as hidden_states
@@ -1017,6 +1093,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
+                position_ids=position_ids,
                 joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
