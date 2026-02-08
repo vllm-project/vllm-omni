@@ -7,9 +7,15 @@ from vllm_omni.diffusion.worker.diffusion_worker import (
     DiffusionWorker,
     WorkerProc,
 )
+from vllm_omni.diffusion.worker.scheduling_policy import (
+    DiffusionSchedulingPolicy,
+    TargetFreeGlobalReorderPolicy,
+)
 
 __all__ = [
     "DiffusionModelRunner",
     "DiffusionWorker",
     "WorkerProc",
+    "DiffusionSchedulingPolicy",
+    "TargetFreeGlobalReorderPolicy",
 ]

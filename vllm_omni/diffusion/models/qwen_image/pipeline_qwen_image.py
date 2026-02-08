@@ -716,12 +716,6 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
         start_index = req.execution_state.step_index if req.execution_state is not None else 0
         chunk_size = max(1, req.preempt_step_chunk_size) if req.preempt_enabled else None
         req_id = req.request_ids[0] if req.request_ids else req.request_key
-        print(
-            f"[DiffusionState] req_id={req_id} start_index={start_index} "
-            f"num_inference_steps={state['num_inference_steps']} timesteps_len={len(timesteps)} "
-            f"latents_shape={tuple(state['latents'].shape)}",
-            flush=True,
-        )
         if start_index >= len(timesteps):
             raise RuntimeError(
                 f"Invalid resume step for req_id={req_id}: "

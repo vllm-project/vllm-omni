@@ -881,7 +881,9 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
+    # Disable aiohttp's default 300s total timeout so long diffusion requests
+    # are not marked failed on the client side.
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
         warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
         if args.warmup_requests and requests_list:
             print(
@@ -958,6 +960,15 @@ async def benchmark(args):
         print("{:<40} {:<15.2f}".format("Peak Memory Max (MB):", metrics["peak_memory_mb_max"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Mean (MB):", metrics["peak_memory_mb_mean"]))
         print("{:<40} {:<15.2f}".format("Peak Memory Median (MB):", metrics["peak_memory_mb_median"]))
+
+    failed_rows = [(req, out) for req, out in zip(requests_list, outputs) if not out.success]
+    if failed_rows:
+        print(f"{'-' * 50}")
+        print("Failed Request Details:")
+        for req, out in failed_rows:
+            req_id = req.request_id
+            err = out.error if out.error else "unknown error"
+            print(f"- request_id={req_id} error={err}")
 
     print("\n" + "=" * 60)
 

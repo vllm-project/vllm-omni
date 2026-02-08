@@ -33,6 +33,12 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.scheduling_policy import (
+    DiffusionSchedulingPolicy,
+    TargetFreeGlobalReorderPolicy,
+    req_debug_id,
+    req_step_index,
+)
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 
@@ -274,9 +280,7 @@ class WorkerProc:
         self.gpu_id = gpu_id
         self._running = True
         self._current_req: OmniDiffusionRequest | None = None
-        # Stack of preempted requests (LIFO): newest request runs first, then resume prior.
-        self._preempted_reqs: list[OmniDiffusionRequest] = []
-        self._aborted_request_ids: set[str] = set()
+        self._scheduling_policy: DiffusionSchedulingPolicy = TargetFreeGlobalReorderPolicy()
 
     def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
@@ -304,7 +308,7 @@ class WorkerProc:
         req.preempt_enabled = self._supports_step_preemption()
         req.preempt_step_chunk_size = max(1, int(req.preempt_step_chunk_size))
         incoming_req_id = self._req_debug_id(req)
-        if incoming_req_id in self._aborted_request_ids:
+        if self._scheduling_policy.is_aborted(incoming_req_id):
             print(
                 f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={incoming_req_id} reason=aborted",
                 flush=True,
@@ -315,49 +319,52 @@ class WorkerProc:
             f"req_id={incoming_req_id} preempt_enabled={req.preempt_enabled}",
             flush=True,
         )
-        if self._current_req is None:
-            self._current_req = req
-            return
-        # Always preempt current request when a new request arrives.
-        preempted_req_id = self._req_debug_id(self._current_req)
-        current_step = self._req_step_index(self._current_req)
-        print(
-            f"[DiffusionPreempt][{self._now_str()}][rank={self.gpu_id}] "
-            f"preempt req_id={preempted_req_id} at step={current_step}; switch_to req_id={incoming_req_id}",
-            flush=True,
-        )
-        self._preempted_reqs.append(self._current_req)
-        self._current_req = req
-
-    def _resume_preempted_request(self) -> OmniDiffusionRequest | None:
-        while self._preempted_reqs:
-            resumed_req = self._preempted_reqs.pop()
-            resumed_req_id = self._req_debug_id(resumed_req)
-            if resumed_req_id in self._aborted_request_ids:
-                print(
-                    f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] "
-                    f"req_id={resumed_req_id} reason=aborted",
-                    flush=True,
-                )
-                continue
-            resume_step = self._req_step_index(resumed_req)
+        decision = self._scheduling_policy.on_request_arrival(req, self._current_req)
+        for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
             print(
-                f"[DiffusionResume][{self._now_str()}][rank={self.gpu_id}] "
-                f"resume req_id={resumed_req_id} from step={resume_step}",
+                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
                 flush=True,
             )
-            return resumed_req
-        return None
+        if decision.preemption is not None:
+            preempted_req_id = self._req_debug_id(decision.preemption.preempted_req)
+            current_step = self._req_step_index(decision.preemption.preempted_req)
+            candidate_req_id = self._req_debug_id(decision.preemption.selected_req)
+            print(
+                f"[DiffusionPreempt][{self._now_str()}][rank={self.gpu_id}] "
+                f"preempt req_id={preempted_req_id} at step={current_step}; "
+                f"switch_to req_id={candidate_req_id} "
+                f"cost_cur={decision.preemption.preempted_cost:.0f} "
+                f"cost_new={decision.preemption.selected_cost:.0f}",
+                flush=True,
+            )
+        self._current_req = decision.current_req
+
+    def _schedule_next_after_finish(self) -> OmniDiffusionRequest | None:
+        # Global rescheduling decision point #2: current request finished.
+        next_req = self._scheduling_policy.on_request_finish()
+        for dropped_id in self._scheduling_policy.consume_recent_dropped_request_ids():
+            print(
+                f"[DiffusionDrop][{self._now_str()}][rank={self.gpu_id}] req_id={dropped_id} reason=aborted",
+                flush=True,
+            )
+        if next_req is None:
+            return None
+        next_req_id = self._req_debug_id(next_req)
+        next_step = self._req_step_index(next_req)
+        print(
+            f"[DiffusionResume][{self._now_str()}][rank={self.gpu_id}] "
+            f"resume req_id={next_req_id} from step={next_step}",
+            flush=True,
+        )
+        return next_req
 
     @staticmethod
     def _req_debug_id(req: OmniDiffusionRequest) -> str:
-        return req.request_ids[0] if req.request_ids else req.request_key
+        return req_debug_id(req)
 
     @staticmethod
     def _req_step_index(req: OmniDiffusionRequest) -> int:
-        if req.execution_state is None:
-            return 0
-        return int(req.execution_state.step_index)
+        return req_step_index(req)
 
     @staticmethod
     def _now_str() -> str:
@@ -366,19 +373,16 @@ class WorkerProc:
     def _abort_requests(self, request_ids: list[str]) -> None:
         if not request_ids:
             return
+        self._scheduling_policy.abort_request_ids(request_ids)
         for rid in request_ids:
             if isinstance(rid, str):
-                self._aborted_request_ids.add(rid)
-                print(
-                    f"[DiffusionAbort][{self._now_str()}][rank={self.gpu_id}] req_id={rid}",
-                    flush=True,
-                )
+                print(f"[DiffusionAbort][{self._now_str()}][rank={self.gpu_id}] req_id={rid}", flush=True)
 
         if self._current_req is not None:
             cur_id = self._req_debug_id(self._current_req)
-            if cur_id in self._aborted_request_ids:
+            if self._scheduling_policy.is_aborted(cur_id):
                 aborted_req = self._current_req
-                self._current_req = self._resume_preempted_request()
+                self._current_req = self._schedule_next_after_finish()
                 self.return_result(
                     {
                         "type": "generation_result",
@@ -497,7 +501,7 @@ class WorkerProc:
                 continue
 
             current_req_id = self._req_debug_id(self._current_req)
-            if current_req_id in self._aborted_request_ids:
+            if self._scheduling_policy.is_aborted(current_req_id):
                 self.return_result(
                     {
                         "type": "generation_result",
@@ -509,12 +513,19 @@ class WorkerProc:
                         ),
                     }
                 )
-                self._current_req = self._resume_preempted_request()
+                self._current_req = self._schedule_next_after_finish()
                 continue
 
             try:
                 output = self.worker.execute_model(self._current_req, self.od_config)
             except Exception as e:
+                failed_req_id = self._req_debug_id(self._current_req)
+                failed_step = self._req_step_index(self._current_req)
+                print(
+                    f"[DiffusionError][{self._now_str()}][rank={self.gpu_id}] "
+                    f"req_id={failed_req_id} step={failed_step} error={e}",
+                    flush=True,
+                )
                 logger.error(
                     "Error executing forward in event loop: %s",
                     e,
@@ -541,7 +552,7 @@ class WorkerProc:
                     )
                 except zmq.ZMQError as e:
                     logger.error("ZMQ error sending reply: %s", e)
-                self._current_req = self._resume_preempted_request()
+                self._current_req = self._schedule_next_after_finish()
                 continue
 
         logger.info("event loop terminated.")
