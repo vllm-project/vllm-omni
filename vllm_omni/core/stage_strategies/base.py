@@ -47,5 +47,5 @@ class StageStrategy(ABC):
         """Handle receiving chunks for active requests."""
         ...
 
-    def prepare_connector_key(self, chunk_id: int, stage_id: int, req_id: str) -> str:
+    def prepare_chunk_key(self, chunk_id: int, stage_id: int, req_id: str) -> str:
         return f"{req_id}_{stage_id}_{chunk_id}"

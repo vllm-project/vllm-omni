@@ -600,12 +600,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["code_predictor_codes"] = code_predictor_codes
         else:
+            # decode
+            if info_dict.get("num_processed_tokens", 0) < len(info_dict.get("thinker_input_ids", [])):
+                info_dict["num_processed_tokens"] = len(info_dict.get("thinker_input_ids", [])) + 1
+
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
                 input_ids, input_embeds, **info_dict
             )
-
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
+        update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + span_len
         return input_ids, input_embeds, update_dict
 
     def talker_mtp(
@@ -657,7 +661,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         self.tts_bos_embed = _proj_from_thinker(tts_bos_thinker)
         self.tts_eos_embed = _proj_from_thinker(tts_eos_thinker)
         self.tts_pad_embed = _proj_from_thinker(tts_pad_thinker)
-
         return self.tts_bos_embed, self.tts_eos_embed, self.tts_pad_embed
 
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
@@ -665,7 +668,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict: dict[str, dict] = {}
         # TODO(Peiqi): add voice_type support
         voice_type = self.voice_type
-
+        start_index = info_dict.get("num_processed_tokens", 0)
+        end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
         thinker_sequence_embeds = info_dict.get("thinker_embeddings").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
@@ -683,7 +687,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             if info_dict.get("thinker_input_ids") is None
             else torch.as_tensor(info_dict.get("thinker_input_ids"), device=self._module_device(self.talker))
         )
-        # Optional thinker-side TTS token embeddings (to be projected by talker)
+
         tts_bos_thinker = info_dict.get("tts_bos_embed").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )
@@ -765,7 +769,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         except Exception:
             pass
 
-        return req_input_ids, req_embeds, update_dict
+        return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
 
     def _thinker_to_talker_prefill(
         self,
@@ -909,6 +913,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         assistant_hidden = self.talker.text_projection(thinker_embed[im_start_index:segment_end_index]).to(
             tts_pad_embed.device
         )  # [t, d]
+
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
         assistant_text_hidden = torch.cat(
             (

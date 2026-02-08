@@ -75,11 +75,15 @@ def get_qwen_image_edit_pre_process_func(
                 prompt["additional_information"] = {}
 
             # Only handles single image
-            if raw_image is None or isinstance(raw_image, list):
-                raise ValueError(
-                    """Received no image or a list of image. Only a single image is supported by this model."""
-                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`"""
-                )
+            if not raw_image:  # None or empty list
+                raise ValueError("""Received no input image. This model requires one input image to run.""")
+            elif isinstance(raw_image, list):
+                if len(raw_image) > 1:
+                    raise ValueError(
+                        """Received multiple input images. Only a single image is supported by this model."""
+                    )
+                else:
+                    raw_image = raw_image[0]
 
             if isinstance(raw_image, str):
                 image = PIL.Image.open(raw_image)
@@ -628,6 +632,13 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
         negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
+        if negative_prompt is None:
+            logger.warning(
+                "negative_prompt is not set. The official Qwen-Image-Edit model "
+                "may produce lower-quality results without a negative_prompt. "
+                "Qwen official repository recommends to use whitespace string as negative_prompt. "
+                "Note: some distilled variants may not be affected by this."
+            )
 
         # Get preprocessed image from request (pre-processing is done in DiffusionEngine)
         if not isinstance(first_prompt, str) and "preprocessed_image" in (

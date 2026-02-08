@@ -13,11 +13,12 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
-from vllm.model_executor.models.interfaces import supports_mm_encoder_only
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
@@ -27,8 +28,6 @@ from vllm.v1.worker.gpu_model_runner import (
     AsyncGPUModelRunnerOutput,
     IntermediateTensors,
     PerLayerAttnMetadata,
-    get_pp_group,
-    set_forward_context,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
@@ -237,6 +236,24 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            # OMNI: True if any attention backend handles KV cache update separately
+            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
+            # slot_mappings must use padded dimensions to match the key/value tensors.
+            from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+
+            has_separate_kv_update = not all(
+                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
+                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+
             attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -248,6 +265,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings_by_group,
             )
 
             (
@@ -282,6 +300,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -352,24 +371,25 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         self.execute_model_state = None
 
         pooler_output: list[object] = []
+        num_reqs = self.input_batch.num_reqs
         if isinstance(multimodal_outputs, torch.Tensor):
-            assert multimodal_outputs.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
-            assert multimodal_outputs.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
+            if multimodal_outputs.shape[0] != num_reqs:
+                raise RuntimeError(
+                    f"Tensor multimodal output has shape[0]={multimodal_outputs.shape[0]} "
+                    f"but expected num_reqs={num_reqs}."
+                )
+            for i in range(num_reqs):
                 pooler_output.append({"model_outputs": multimodal_outputs[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs, list):
-            assert len(multimodal_outputs) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
+            if len(multimodal_outputs) != num_reqs:
+                raise RuntimeError(
+                    f"List multimodal output length ({len(multimodal_outputs)}) does not match num_reqs ({num_reqs})."
+                )
             for out in multimodal_outputs:
                 pooler_output.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
-            num_reqs = self.input_batch.num_reqs
-
             # Pre-calculate token offsets for robust slicing of sequence outputs
             req_ids = self.input_batch.req_ids
             # Ensure we default to 0 if not found, though it should be there for scheduled requests
@@ -384,7 +404,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             for i in range(num_reqs):
                 mm_payload = {}
                 for key, out in multimodal_outputs.items():
-                    if out is not None and isinstance(out, torch.Tensor):
+                    if out is None:
+                        mm_payload[key] = None
+                    elif isinstance(out, torch.Tensor):
                         if out.shape[0] == num_reqs:
                             # Case 1: Batch-aligned (1:1 mapping, e.g. one image per request)
                             mm_payload[key] = out[i].detach().to("cpu").contiguous()
@@ -404,6 +426,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                                 f"or linear scaling of tokens ({total_input_tokens}). "
                                 "Cannot automatically slice"
                             )
+                    elif isinstance(out, (list, tuple)):
+                        if len(out) == num_reqs:
+                            item = out[i]
+                            mm_payload[key] = (
+                                item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"Multimodal output list for key '{key}' has length {len(out)} but expected {num_reqs}."
+                            )
+                    else:
+                        mm_payload[key] = out
                 pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
@@ -514,7 +548,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
         """
-        if supports_mm_encoder_only(self.model):
+        mm_config = self.vllm_config.model_config.multimodal_config
+        if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
@@ -618,6 +653,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
+        # OMNI: Get slot mappings before building attention metadata
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+        )
+
         # If force_attention is True, we always capture attention. Otherwise,
         # it only happens for cudagraph_runtime_mode=FULL.
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
@@ -643,6 +686,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
+                slot_mappings=slot_mappings_by_group,
             )
 
         with self.maybe_dummy_run_with_lora(
@@ -707,6 +751,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
                 ),
             ):
                 outputs = self.model(

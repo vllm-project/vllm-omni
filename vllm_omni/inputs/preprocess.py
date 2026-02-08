@@ -1,12 +1,17 @@
 from typing import Any
 
 from typing_extensions import assert_never
-from vllm.inputs.data import SingletonInputs, SingletonPrompt, TextPrompt, TokensPrompt
+from vllm.inputs.data import SingletonInputs, SingletonPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
 
-from vllm_omni.inputs.data import OmniTokenInputs, token_inputs_omni
+from vllm_omni.inputs.data import (
+    OmniTextPrompt,
+    OmniTokenInputs,
+    OmniTokensPrompt,
+    token_inputs_omni,
+)
 from vllm_omni.inputs.parse import parse_singleton_prompt_omni
 
 logger = init_logger(__name__)
@@ -22,7 +27,7 @@ class OmniInputPreprocessor(InputPreprocessor):
 
     def _process_text(
         self,
-        parsed_content: TextPrompt,
+        parsed_content: OmniTextPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
@@ -62,7 +67,7 @@ class OmniInputPreprocessor(InputPreprocessor):
 
     def _process_tokens(
         self,
-        parsed_content: TokensPrompt,
+        parsed_content: OmniTokensPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
@@ -80,6 +85,10 @@ class OmniInputPreprocessor(InputPreprocessor):
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )
+            if prompt_embeds is not None:
+                inputs["prompt_embeds"] = prompt_embeds
+            if additional_information is not None:
+                inputs["additional_information"] = additional_information
         else:
             inputs = token_inputs_omni(
                 prompt_token_ids=prompt_token_ids,
@@ -114,8 +123,6 @@ class OmniInputPreprocessor(InputPreprocessor):
         """
         parsed = parse_singleton_prompt_omni(prompt)
 
-        if parsed["type"] == "embeds":
-            return self._process_embeds(parsed["content"])
         if parsed["type"] == "tokens":
             return self._process_tokens(
                 parsed["content"],
@@ -129,7 +136,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             )
         if parsed["type"] == "str":
             return self._process_text(
-                TextPrompt(prompt=parsed["content"]),
+                OmniTextPrompt(prompt=parsed["content"]),
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )

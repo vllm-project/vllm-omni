@@ -4,7 +4,6 @@ Chunk processors for Qwen3-Omni model.
 Model teams: This is the ONLY file you need to modify to add chunk support.
 """
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -16,12 +15,8 @@ if TYPE_CHECKING:
     from vllm_omni.core.request_chunk_state import ChunkState
 
 
-@dataclass
 class Qwen3ThinkerChunkProcessor(BaseChunkProcessor):
-    """Chunk processor for Qwen3-Omni Thinker stage.
-
-    Qwen3 requires at least 3 output tokens before leaving prefill.
-    """
+    """Chunk processor for Qwen3-Omni Thinker stage."""
 
     stage_type: str = "ar"
     chunk_batch_size: int | None = None
@@ -42,7 +37,7 @@ class Qwen3ThinkerChunkProcessor(BaseChunkProcessor):
             return None
         return {
             "thinker_embeddings": pooler_output["0"],
-            "thinker_hidden_states": pooler_output["hidden"],
+            "thinker_hidden_states": pooler_output["24"],
             "tts_bos_embed": pooler_output["tts_bos_embed"],
             "tts_eos_embed": pooler_output["tts_eos_embed"],
             "tts_pad_embed": pooler_output["tts_pad_embed"],
@@ -65,7 +60,6 @@ class Qwen3ThinkerChunkProcessor(BaseChunkProcessor):
         return info
 
 
-@dataclass
 class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
     """Chunk processor for Qwen3-Omni Talker stage.
 
@@ -161,7 +155,6 @@ class Qwen3TalkerChunkProcessor(BaseChunkProcessor):
         return info
 
 
-@dataclass
 class Qwen3Code2WavChunkProcessor(BaseChunkProcessor):
     """Chunk processor for Qwen3-Omni Code2Wav stage.
 

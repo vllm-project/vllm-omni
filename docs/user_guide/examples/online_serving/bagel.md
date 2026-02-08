@@ -2,9 +2,10 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/bagel>.
 
+
 ## 🛠️ Installation
 
-Please refer to [README.md](../../../README.md)
+Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
 
 ## Run examples (BAGEL-7B-MoT)
 
@@ -74,7 +75,7 @@ python openai_chat_client.py \
 
 BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
 
-The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
+The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/model_executor/stage_configs/bagel.yaml)
 
 | Modality    | Input        | Output | Description                            |
 | ----------- | ------------ | ------ | -------------------------------------- |
@@ -230,3 +231,14 @@ sudo apt install ffmpeg
 | Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
 | Stage-1 (DiT)       | **26.50 GiB**                |
 | Total               | **~42 GiB + KV Cache**       |
+
+## Example materials
+
+??? abstract "openai_chat_client.py"
+    ``````py
+    --8<-- "examples/online_serving/bagel/openai_chat_client.py"
+    ``````
+??? abstract "run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/bagel/run_server.sh"
+    ``````

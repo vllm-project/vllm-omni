@@ -12,7 +12,7 @@ stage_args:
       model_arch: BagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.60
+      gpu_memory_utilization: 0.35
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
@@ -44,7 +44,7 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      gpu_memory_utilization: 0.4
+      gpu_memory_utilization: 0.55
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: image

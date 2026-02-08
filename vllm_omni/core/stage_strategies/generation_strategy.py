@@ -45,8 +45,8 @@ class GenerationStrategy(StageStrategy):
                 continue
 
             # Try to retrieve chunk
-            key = self.prepare_connector_key(state.received_chunks, prev_stage, req_id)
-            chunk = connector.get_chunk(str(prev_stage), str(stage_id), key)
+            key = self.prepare_chunk_key(state.received_chunks, prev_stage, req_id)
+            chunk = connector.get_chunk(key, req_id)
 
             if chunk and chunk[0]:
                 payload, _ = chunk

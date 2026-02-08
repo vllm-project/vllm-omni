@@ -11,20 +11,29 @@ TALKER_CODEC_END_TOKEN_ID = 8294
 logger = init_logger(__name__)
 
 
+def _validate_stage_inputs(stage_list, engine_input_source):
+    if not engine_input_source:
+        raise ValueError("engine_input_source cannot be empty")
+
+    stage_id = engine_input_source[0]
+    if stage_id >= len(stage_list):
+        raise IndexError(f"Invalid stage_id: {stage_id}")
+
+    stage = stage_list[stage_id]
+    if stage.engine_outputs is None:
+        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
+
+    return stage.engine_outputs
+
+
 def thinker2talker(
     stage_list,
     engine_input_source,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
+    async_chunk_stream: bool = False,
 ):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-    thinker_outputs = stage_list[source_stage_id].engine_outputs
+    thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     talker_inputs = []
     if not isinstance(prompt, list):
         prompt = [prompt]
@@ -33,20 +42,11 @@ def thinker2talker(
     }
 
     for i, thinker_output in enumerate(thinker_outputs):
-        is_prefill = [False]
         output = thinker_output.outputs[0]
         prompt_token_ids = thinker_output.prompt_token_ids
         thinker_output_ids = output.token_ids
-        if len(thinker_output_ids) <= 1:
-            is_prefill = [True]
         prompt_token_ids_len = len(prompt_token_ids)
         latent = output.multimodal_output["latent"]
-        # PR 467 changed multimodal_output["latent"] to be a list
-        # and it is concatenated only when the stage is finished
-        # for performance gains.
-        # But this needs to be concatenated for each chunk to stream to next stage
-        # TODO: See if there is a robust approach for this that can preserve
-        # the performance gains of PR 467
         if isinstance(latent, list):
             latent = torch.cat(latent, dim=0)
         thinker_hidden_states = latent.clone().detach().to(latent.device)
@@ -57,8 +57,9 @@ def thinker2talker(
             "thinker_output_token_ids": thinker_output_ids,
             "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
             "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
-            "is_prefill": is_prefill,
         }
+        if async_chunk_stream:
+            additional_information["is_prefill"] = [True] if len(thinker_output_ids) <= 1 else [False]
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
@@ -81,31 +82,37 @@ def talker2codewav(
     engine_input_source,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
+    async_chunk_stream: bool = False,
 ):
-    engine_inputs = []
-    if len(engine_input_source) == 0:
-        raise ValueError("engine_input_source is empty")
-    source_stage_id = engine_input_source[0]
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-    source_outputs = stage_list[source_stage_id].engine_outputs
+    assert async_chunk_stream, (
+        "The talker2codewav function should be called only when async_chunk_stream is set to True"
+    )
+    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    code2wav_inputs = []
+
+    # The number of talker output tokens to accumulate
+    # before invoking code2wav stage
+    talker_tokens_batch_size = 36
+
     if not isinstance(prompt, list):
         prompt = [prompt]
     multi_modal_data = {
-        source_output.request_id: p.get("multi_modal_data", None) for source_output, p in zip(source_outputs, prompt)
+        talker_output.request_id: p.get("multi_modal_data", None) for talker_output, p in zip(talker_outputs, prompt)
     }
 
-    for source_output in source_outputs:
-        talker_output_token_ids = source_output.outputs[0].token_ids
+    for talker_output in talker_outputs:
+        talker_output_token_ids = talker_output.outputs[0].token_ids
 
-        additional_information = {"is_prefill": [True] if len(talker_output_token_ids) < 36 else [False]}
-        talker_output_token_ids = talker_output_token_ids[:36]
+        additional_information = {
+            "is_prefill": [True] if len(talker_output_token_ids) < talker_tokens_batch_size else [False]
+        }
+        talker_output_token_ids = talker_output_token_ids[:talker_tokens_batch_size]
         engine_input = OmniTokensPrompt(
             prompt_token_ids=talker_output_token_ids,
             additional_information=additional_information,
             multi_modal_data=(
-                multi_modal_data[source_output.request_id] if requires_multimodal_data and multi_modal_data else None
+                multi_modal_data[talker_output.request_id] if requires_multimodal_data and multi_modal_data else None
             ),
         )
-        engine_inputs.append(engine_input)
-    return engine_inputs
+        code2wav_inputs.append(engine_input)
+    return code2wav_inputs

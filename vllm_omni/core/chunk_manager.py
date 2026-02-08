@@ -62,13 +62,13 @@ class ChunkManager:
         chunk["last_chunk"] = request.is_finished()
 
         if self.chunk_processor.chunk_batch_size is not None:
-            key = self.stage_strategy.prepare_connector_key(state.sent_chunks_generation, self.stage_id, req_id)
-            success, _, _ = self.connector.put_chunk(str(self.stage_id), str(self.next_stage_id), key, chunk)
+            key = self.stage_strategy.prepare_chunk_key(state.sent_chunks_generation, self.stage_id, req_id)
+            success, _, _ = self.connector.put_chunk(key, req_id, chunk)
             if success:
                 self.state_manager.increment_chunk_sent(req_id, generation=True)
         else:
-            key = self.stage_strategy.prepare_connector_key(state.sent_chunks_ar, self.stage_id, req_id)
-            success, _, _ = self.connector.put_chunk(str(self.stage_id), str(self.next_stage_id), key, chunk)
+            key = self.stage_strategy.prepare_chunk_key(state.sent_chunks_ar, self.stage_id, req_id)
+            success, _, _ = self.connector.put_chunk(key, req_id, chunk)
             if success:
                 self.state_manager.increment_chunk_sent(req_id, generation=False)
 
@@ -84,8 +84,8 @@ class ChunkManager:
 
     def cleanup_request(self, request_id: str) -> None:
         req_id = self.state_manager.get_global_request_id(request_id)
+        self.connector.cleanup(req_id)
         self.state_manager.cleanup_request(req_id)
-        self.chunk_processor.on_request_complete(req_id)
 
 
 def create_chunk_manager(

@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
-from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -215,7 +214,7 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
 
         return omni_config
 
-    def create_engine_config(self, *args, **kwargs) -> VllmConfig:
+    def create_engine_config(self, *args, **kwargs):
         config = super().create_engine_config(*args, **kwargs)
 
         config.scheduler_config.async_chunk_stream = self.async_chunk_stream

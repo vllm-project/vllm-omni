@@ -36,8 +36,6 @@ from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 # Internal imports (our code)
 from vllm_omni.lora.request import LoRARequest
-
-# Internal imports (our code)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -197,11 +195,10 @@ class AsyncOmni(OmniBase):
             if stage.vllm_config is not None and stage.tokenizer is not None:
                 try:
                     vllm_config = stage.vllm_config
-                    tokenizer = stage.tokenizer
                     # Initialize input_processor
+                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     self.input_processor = OmniInputProcessor(
                         vllm_config=vllm_config,
-                        tokenizer=tokenizer,
                     )
                     # Initialize model_config
                     self.model_config = vllm_config.model_config
@@ -254,13 +251,6 @@ class AsyncOmni(OmniBase):
         sampling parameters from the sampling_params_list.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
-            request_id: Unique identifier for this request
-            sampling_params_list: List of SamplingParams, one for each stage.
-                Must have the same length as the number of stages.
-                If None, uses default sampling params for each stage.
-            output_modalities: Optional list of output modalities.
             prompt: Prompt to process. Can be a text string, token IDs,
                 or multimodal prompt.
             request_id: Unique identifier for this request
@@ -352,20 +342,20 @@ class AsyncOmni(OmniBase):
                 if isinstance(engine_outputs, list):
                     engine_outputs = engine_outputs[0]
                 finished = engine_outputs.finished
-
-                # Mark last output time for this stage whenever we receive outputs
-                metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-                try:
-                    _m = asdict(result.get("metrics"))
-                    if _m is not None:
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
-                except Exception as e:
-                    logger.exception(
-                        f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
+                if finished:
+                    # Mark last output time for this stage whenever we receive outputs
+                    metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+                    try:
+                        _m = asdict(result.get("metrics"))
+                        if _m is not None:
+                            metrics.on_stage_metrics(stage_id, req_id, _m)
+                    except Exception as e:
+                        logger.exception(
+                            f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
+                        )
+                    logger.debug(
+                        f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
                     )
-                logger.debug(
-                    f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
-                )
 
                 if getattr(stage, "final_output", False):
                     logger.debug(
@@ -597,6 +587,15 @@ class AsyncOmni(OmniBase):
             if stage.is_comprehension:
                 return stage.is_tracing_enabled
         return False
+
+    @property
+    def renderer(self):
+        """Return the renderer from input_processor if available.
+
+        OMNI: Required by upstream OpenAIServingModels.__init__ which
+        accesses engine_client.renderer.
+        """
+        return self.input_processor.renderer
 
     async def do_log_stats(self) -> None:
         pass

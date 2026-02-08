@@ -161,7 +161,7 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
 def test_bagel_text2img_shared_memory_connector():
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path)
+    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
 
     try:
         generated_image = _generate_bagel_image(omni)
@@ -288,7 +288,7 @@ def test_bagel_text2img_mooncake_connector():
             http_port=MOONCAKE_HTTP_PORT,
         )
 
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file)
+        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
 
         generated_image = _generate_bagel_image(omni)
         _validate_pixels(generated_image)

@@ -4,7 +4,6 @@ Chunk processors for Qwen2.5-Omni model.
 Model teams: This is the ONLY file you need to modify to add chunk support.
 """
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -18,16 +17,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _ensure_list(x):
-    """Convert ConstantList / tensor-like to Python list."""
-    if hasattr(x, "_x"):
-        return list(x._x)
-    elif not isinstance(x, list):
-        return x
-    return list(x)
-
-
-@dataclass
 class Qwen25ThinkerChunkProcessor(BaseChunkProcessor):
     """Chunk processor for Qwen2.5-Omni Thinker stage.
 
@@ -71,7 +60,6 @@ class Qwen25ThinkerChunkProcessor(BaseChunkProcessor):
         return info
 
 
-@dataclass
 class Qwen25TalkerChunkProcessor(BaseChunkProcessor):
     """Chunk processor for Qwen2.5-Omni Talker stage.
 
@@ -158,14 +146,12 @@ class Qwen25TalkerChunkProcessor(BaseChunkProcessor):
         if "thinker_result" in chunk:
             info["thinker_reply_part"] = chunk["thinker_result"]
 
-        # Pass through keys needed by Talker model
         for key in ["last_chunk", "prompt_embeds", "prompt_token_ids", "thinker_output_token_ids"]:
             if key in chunk:
                 info[key] = chunk[key]
         return info
 
 
-@dataclass
 class Qwen25Code2WavChunkProcessor(BaseChunkProcessor):
     """Chunk processor for Code2Wav (receiving) stage.
 

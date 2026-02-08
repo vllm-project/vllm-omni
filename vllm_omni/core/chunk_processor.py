@@ -5,7 +5,6 @@ New models can inherit this base class to add async chunk streaming support
 WITHOUT modifying scheduler, chunk_manager, or workers.
 """
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.v1.request import Request
@@ -14,7 +13,6 @@ if TYPE_CHECKING:
     from vllm_omni.core.request_chunk_state import ChunkState
 
 
-@dataclass
 class BaseChunkProcessor:
     stage_type: str = "ar"
     chunk_batch_size: int | None = None
@@ -54,10 +52,6 @@ class BaseChunkProcessor:
     def map_chunk_to_worker(self, chunk: dict) -> dict:
         """Default: pass through unchanged."""
         return chunk
-
-    def on_request_complete(self, request_id: str) -> None:
-        """Override if you have per-request state to clean."""
-        pass
 
     def on_upstream_finished(self, request: Request) -> bool:
         """Return True if request should stop when upstream finishes.
