@@ -21,6 +21,8 @@ from pathlib import Path
 from PIL import Image
 
 from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 
 def main():
@@ -137,19 +139,29 @@ def main():
                 "multi_modal_data": {"image": image},
             }
         ],
-        sampling_params={
-            "height": args.height,
-            "width": args.width,
-            "num_frames": args.num_frames,
-            "num_inference_steps": args.num_inference_steps,
-            "guidance_scale": args.guidance_scale,
-            "seed": args.seed,
-        },
+        sampling_params=OmniDiffusionSamplingParams(
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            seed=args.seed,
+        ),
     )
 
     # Save the generated video
     for idx, output in enumerate(outputs):
-        video_frames = output.outputs[0]  # Get the video frames
+        # Extract video frames from OmniRequestOutput
+        video_frames = None
+        if isinstance(output, OmniRequestOutput):
+            if hasattr(output, "images") and output.images:
+                video_frames = output.images[0]
+            elif hasattr(output, "multimodal_output") and output.multimodal_output:
+                video_frames = output.multimodal_output[0]
+            else:
+                raise ValueError("No video data found in diffusion output.")
+        else:
+            raise TypeError(f"Unexpected output type: {type(output)}")
 
         if args.output_format == "mp4":
             output_path = output_dir / f"video_{idx:04d}.mp4"

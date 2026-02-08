@@ -243,6 +243,9 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         # Load scheduler
         self.scheduler = loader.load_scheduler(FlowUniPCMultistepScheduler, "scheduler")
 
+        if hasattr(od_config, "flow_shift") and od_config.flow_shift is not None:
+            self.scheduler.config.shift = od_config.flow_shift
+
         # Move to device
         device = get_local_device()
         self.to(device)
@@ -422,9 +425,18 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             # Compute previous noisy sample
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
 
-        # Decode latents
-        latents = latents / self.vae.config.scaling_factor
-        video = self.vae.decode(latents).sample
+        # Decode latents using AutoencoderKLWan normalization
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        video = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(
             output=video,
