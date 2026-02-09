@@ -757,6 +757,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="data",
     )
+    vllm_parallel_state._DP = _DP
 
     global _CFG
     assert _CFG is None, "classifier_free_guidance group is already initialized"
@@ -774,6 +775,7 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="pipeline",
     )
+    vllm_parallel_state._PP = _PP
 
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
