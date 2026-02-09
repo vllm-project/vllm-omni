@@ -298,9 +298,9 @@ def _setup_log_mocks(monkeypatch):
     # Mock OrchestratorMetrics to be a simple class that doesn't require file operations
 
     class _FakeOrchestratorMetrics:
-        def __init__(self, num_stages, enable_stats, wall_start_ts):
+        def __init__(self, num_stages, log_stats, wall_start_ts):
             self.num_stages = num_stages
-            self.enable_stats = enable_stats
+            self.log_stats = log_stats
             self.stage_first_ts = [None] * num_stages
             self.stage_last_ts = [None] * num_stages
             self.e2e_done = set()
@@ -318,7 +318,7 @@ def _setup_log_mocks(monkeypatch):
             return "Fake summary"
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.omni.OrchestratorMetrics",
+        "vllm_omni.entrypoints.omni.OrchestratorAggregator",
         _FakeOrchestratorMetrics,
         raising=False,
     )
