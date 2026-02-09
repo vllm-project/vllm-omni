@@ -303,10 +303,21 @@ class BagelPipeline(nn.Module):
             )
         image_shape = (height, width)
 
+        # 从 request 中读取 CFG 参数（优先从 extra_args 中读取）
+        extra_args = getattr(req.sampling_params, 'extra_args', {}) or {}
+        cfg_text_scale = extra_args.get('cfg_text_scale', None)
+        cfg_img_scale = extra_args.get('cfg_img_scale', 1.5)
+        
+        # 如果 extra_args 中没有 cfg_text_scale，则使用 guidance_scale
+        if cfg_text_scale is None:
+            cfg_text_scale = getattr(req.sampling_params, 'guidance_scale', 4.0) or 4.0
+
         # Map request params to Bagel gen params (defaults follow Bagel inferencer)
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
         )
         # 初始化gen_context
         gen_context = {
