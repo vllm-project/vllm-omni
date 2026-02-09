@@ -27,7 +27,7 @@ test_params = [(model, stage_config) for model in models for stage_config in sta
 @pytest.fixture(scope="module")
 def omni_server(request):
     """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses session scope so the server starts only once for the entire test session.
+    Uses module scope so the server starts only once per test module.
     Multi-stage initialization can take 10-20+ minutes.
     """
     model, stage_config_path = request.param
@@ -62,9 +62,9 @@ def run_cmd(command):
 def extract_content_after_keyword(keywords, text):
     matches = re.findall(rf"{keywords}\s*(.+)", text, re.DOTALL)
 
-    if matches:
-        text_content = matches[0]
-    return text_content
+    if not matches:
+        raise AssertionError(f"Keywords {keywords} not found in provided text output")
+    return matches[0]
 
 
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)

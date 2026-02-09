@@ -604,8 +604,9 @@ def convert_audio_file_to_text(output_path):
         condition_on_previous_text=False,
     )["text"]
     del model
-    gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
     if text:
         return text
     else:
@@ -878,7 +879,7 @@ class OmniServer:
         model: str,
         serve_args: list[str],
         *,
-        port: int = None,
+        port: int | None = None,
         env_dict: dict[str, str] | None = None,
     ) -> None:
         _run_pre_test_cleanup(enable_force=True)
