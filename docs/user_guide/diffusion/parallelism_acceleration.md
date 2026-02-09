@@ -14,7 +14,7 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 4. [Tensor Parallelism](#tensor-parallelism): Tensor parallelism shards model weights across devices. This can reduce per-GPU memory usage. Note that for diffusion models we currently shard the majority of layers within the DiT.
 
-5. [VAE Patch Parallelism](#vae-patch-parallelism): VAE patch parallelism shards VAE decode/encode spatially across ranks. This can reduce the peak memory of VAE decode and (depending on resolution and communication overhead) speed up VAE decode.
+5. [VAE Patch Parallelism](#vae-patch-parallelism): VAE patch parallelism shards VAE decode spatially across ranks. This can reduce the peak memory of VAE decode and (depending on resolution and communication overhead) speed up VAE decode.
 
 The following table shows which models are currently supported by parallelism method:
 
@@ -80,7 +80,7 @@ outputs = omni.generate(
 
 ### VAE Patch Parallelism
 
-VAE patch parallelism distributes the VAE decode/encode workload across multiple ranks by splitting the latent spatially. It is configured via `DiffusionParallelConfig.vae_patch_parallel_size` and can be combined with other parallelism methods (e.g., TP).
+VAE patch parallelism distributes the VAE decode workload across multiple ranks by splitting the latent spatially. It is configured via `DiffusionParallelConfig.vae_patch_parallel_size` and can be combined with other parallelism methods (e.g., TP).
 
 !!! note "Enablement and feature gate"
     - VAE patch parallelism is currently **enabled only for validated pipelines** (currently: `Tongyi-MAI/Z-Image-Turbo`).
