@@ -20,16 +20,17 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
+from tests.utils import hardware_test
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vllm_omni import Omni
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.platforms import current_omni_platform
 
 # Test configuration
 MODELS = ["riverclouds/qwen_image_random"]
@@ -145,9 +146,11 @@ def _run_inference(
 # - warmup: whether to run warmup for this SP config
 # - is_perf_test: whether this is a performance test (show speedup metrics)
 SP_CONFIGS = [
-    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ulysses-2 - performance test
+    # Ulysses-2 - performance test
+    (2, 1, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),
     (1, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, True, True),  # Ring-2 - performance test
-    (2, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, False, False),  # Hybrid - correctness only
+    # Hybrid - correctness only
+    (2, 2, DEFAULT_HEIGHT, DEFAULT_WIDTH, False, False),
     (4, 1, 272, 272, False, False),  # Ulysses-4 - shape and correctness
 ]
 
@@ -162,6 +165,10 @@ def _get_sp_mode(ulysses_degree: int, ring_degree: int) -> str:
         return f"hybrid-{ulysses_degree}x{ring_degree}"
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("model_name", MODELS)
 def test_sp_correctness(model_name: str):
     """Test that SP inference produces correct outputs and measure performance.

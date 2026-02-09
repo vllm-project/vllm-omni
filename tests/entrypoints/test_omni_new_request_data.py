@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.core.sched.output import OmniNewRequestData
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_omni_new_request_data_copies_payloads():

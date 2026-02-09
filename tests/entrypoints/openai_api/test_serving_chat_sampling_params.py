@@ -11,6 +11,8 @@ from unittest.mock import MagicMock
 import pytest
 from vllm.sampling_params import SamplingParams
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 @pytest.fixture
 def mock_comprehension_stage():

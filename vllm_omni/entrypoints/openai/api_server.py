@@ -968,7 +968,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", random.randint(0, 2**32 - 1) if request.seed is None else request.seed)
+        _update_if_not_none(
+            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
+        )
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
@@ -1126,7 +1128,7 @@ async def edit_images(
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", seed or random.randint(0, 2**32 - 1))
+        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit_{int(time.time())}"
