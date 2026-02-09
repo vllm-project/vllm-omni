@@ -171,12 +171,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             self.model = self.code2wav
             self.requires_raw_input_tokens = True
-            max_context_length = 50
-            self.codes_buffer = torch.zeros(
-                (self.vllm_config.scheduler_config.max_num_seqs, code2wav_config.num_quantizers, max_context_length),
-                device=self._module_device(self.code2wav),
-                dtype=torch.long,
-            )
         else:
             raise ValueError(
                 f"Invalid model_stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'"
@@ -368,10 +362,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                     max_seq_len = max(ubatch_slices) // 16
                     batch_size = len(ubatch_slices)
                     split_codes = torch.split(input_ids, ubatch_slices, dim=0)
+                    codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
                     for idx, code in enumerate(split_codes):
                         seq_len = code.shape[0] // 16
-                        self.codes_buffer[idx, :, :seq_len].copy_(code.reshape(16, -1))
-                    codes = self.codes_buffer[:batch_size, :, :max_seq_len]
+                        codes[idx, :, :seq_len] = code.reshape(16, seq_len)
                 else:
                     codes = input_ids.reshape(1, 16, -1)
             else:

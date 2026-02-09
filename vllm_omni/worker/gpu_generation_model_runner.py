@@ -258,8 +258,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
-        if self.model_config.async_chunk:
-            # reuse ubatch_slices_padded for async chunk
+        if ubatch_slices_padded is None:
+            # reuse ubatch_slices_padded for code2wav batching
             ubatch_slices_padded = tokens
 
         # Run the model.
@@ -374,9 +374,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:
-                        raise TypeError(
-                            f"Unsupported multimodal output type for key '{key}': {type(out)}"
-                        )
+                        raise TypeError(f"Unsupported multimodal output type for key '{key}': {type(out)}")
                 pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")

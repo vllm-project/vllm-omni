@@ -179,7 +179,6 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        # TODO Support batch_size > 1
         wavs = []
         start_index = 0
 
@@ -198,7 +197,19 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
             start_index = end_index
 
-        return [torch.cat(wavs, dim=-1)]
+        ubatch_slices = get_forward_context().ubatch_slices
+        if ubatch_slices is not None:
+            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in ubatch_slices]
+        else:
+            # Fallback: assume all batch elements share the same sequence length.
+            # Create one entry per batch so that each element is processed.
+            code_seq_lens = [codes.shape[-1]] * codes.shape[0]
+        batch_wav = torch.cat(wavs, dim=-1)
+        wavs = []
+        for idx, code_seq_len in enumerate(code_seq_lens):
+            wav_chunk = batch_wav[idx, :, : code_seq_len * self.total_upsample]
+            wavs.append(wav_chunk)
+        return wavs
 
     def chunked_decode_streaming(
         self,
@@ -217,7 +228,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             left_context_size: Number of overlapping frames for context
 
         Returns:
-            waveform: [batch, 1, waveform_len] - Complete waveform
+            list[torch.Tensor]: Complete waveform decoded from the input
+                codes. For ``batch_size == 1``, this is a list containing a
+                single tensor with shape ``[1, waveform_len]``.
         """
         # Decode chunk
         wavs = []
@@ -226,7 +239,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         if ubatch_slices is not None:
             code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in ubatch_slices]
         else:
-            code_seq_lens = [codes.shape[-1]]
+            # Fallback: assume all batch elements share the same sequence length.
+            # Create one entry per batch so that each element is processed.
+            code_seq_lens = [codes.shape[-1]] * codes.shape[0]
         for idx, code_seq_len in enumerate(code_seq_lens):
             # TODO: need to optimize algorithms, current only support
             # chunk_size = left_context_size = 25
