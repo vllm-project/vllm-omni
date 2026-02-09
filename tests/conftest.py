@@ -609,6 +609,12 @@ def convert_audio_to_text(audio_data):
         audio_file.write(audio_data)
 
     print(f"audio data is saved: {output_path}")
+    text = convert_audio_file_to_text(output_path=output_path)
+    return text
+
+
+def convert_audio_file_to_text(output_path):
+    import whisper
 
     text = convert_audio_file_to_text(output_path=output_path)
     return text
@@ -625,8 +631,9 @@ def convert_audio_file_to_text(output_path):
         condition_on_previous_text=False,
     )["text"]
     del model
-    gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
     if text:
         return text
     else:
@@ -900,6 +907,7 @@ class OmniServer:
         model: str,
         serve_args: list[str],
         *,
+        port: int | None = None,
         env_dict: dict[str, str] | None = None,
     ) -> None:
         _run_pre_test_cleanup(enable_force=True)
@@ -910,7 +918,10 @@ class OmniServer:
         self.env_dict = env_dict
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
-        self.port = get_open_port()
+        if port is None:
+            self.port = get_open_port()
+        else:
+            self.port = port
 
     def _start_server(self) -> None:
         """Start the vLLM-Omni server subprocess."""

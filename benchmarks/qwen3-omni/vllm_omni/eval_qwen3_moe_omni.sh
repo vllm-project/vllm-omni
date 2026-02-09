@@ -23,7 +23,7 @@ else
     python $end2end_script_path --output-wav $outputs_dir \
                       --query-type text \
                       --txt-prompts $build_dataset_path \
-                      --enable-stats \
+                      --log-stats \
                       --log-dir $log_dir
     echo "Logs and outputs are saved in ${log_dir} and ${outputs_dir} respectively:"
     echo "  - omni_llm_pipeline_text                       run dir/base name"
