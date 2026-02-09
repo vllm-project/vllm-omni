@@ -38,6 +38,13 @@ logger = init_logger(__name__)
 class BagelGenParams:
     num_timesteps: int = 50
     timestep_shift: float = 1.0
+    # CFG 参数
+    cfg_text_scale: float = 4.0
+    cfg_img_scale: float = 1.5
+    cfg_interval: tuple = (0.4, 1.0)
+    cfg_renorm_min: float = 0.0
+    cfg_renorm_type: str = "global"
+
 
 
 def add_special_tokens(tokenizer):
@@ -301,12 +308,16 @@ class BagelPipeline(nn.Module):
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
         )
-
+        # 初始化gen_context
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
+        # 初始化 CFG contexts（用于无条件分支）
+        from copy import deepcopy
+        cfg_text_context = deepcopy(gen_context)  # 无文本条件
+        cfg_img_context = deepcopy(gen_context)   # 无图像条件
 
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
@@ -320,6 +331,17 @@ class BagelPipeline(nn.Module):
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
             gen_context["ropes"] = [seq_len]
+            
+            # 注意: 当使用注入的 KV Cache 时，CFG 分支无法正确工作
+            # 因为我们只有一个 KV Cache，而 CFG 需要三个不同的 KV Cache
+            # 这里禁用 CFG（设置 scale=1.0）
+            logger.warning("CFG is disabled when using injected KV Cache (single KV cache cannot support 3-branch CFG)")
+            gen_params = BagelGenParams(
+                num_timesteps=gen_params.num_timesteps,
+                timestep_shift=gen_params.timestep_shift,
+                cfg_text_scale=1.0,  # 禁用 CFG
+                cfg_img_scale=1.0,   # 禁用 CFG
+            )
 
         else:
             image_input = (
@@ -393,6 +415,50 @@ class BagelPipeline(nn.Module):
                         )
                     gen_context["kv_lens"] = newlens_img
                     gen_context["ropes"] = new_rope_img
+                    
+                    # CFG: cfg_text_context 也需要图像（有图像，无文本）
+                    # 需要重新准备 VAE 和 ViT 输入，因为 cfg_text_context 的 kv_lens 可能不同
+                    gen_input_vae_cfg, newlens_vae_cfg, new_rope_vae_cfg = self.bagel.prepare_vae_images(
+                        curr_kvlens=cfg_text_context["kv_lens"],
+                        curr_rope=cfg_text_context["ropes"],
+                        images=image_input,
+                        transforms=vae_transforms,
+                        new_token_ids=self.new_token_ids,
+                    )
+                    for k, v in gen_input_vae_cfg.items():
+                        if torch.is_tensor(v):
+                            gen_input_vae_cfg[k] = v.to(self.device)
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
+                        cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_vae(
+                            self.vae, cfg_text_context["past_key_values"], **gen_input_vae_cfg
+                        )
+                    cfg_text_context["kv_lens"] = newlens_vae_cfg
+                    cfg_text_context["ropes"] = new_rope_vae_cfg
+                    
+                    gen_input_img_cfg, newlens_img_cfg, new_rope_img_cfg = self.bagel.prepare_vit_images(
+                        curr_kvlens=cfg_text_context["kv_lens"],
+                        curr_rope=cfg_text_context["ropes"],
+                        images=image_input,
+                        transforms=vit_transforms,
+                        new_token_ids=self.new_token_ids,
+                    )
+                    for k, v in gen_input_img_cfg.items():
+                        if torch.is_tensor(v):
+                            gen_input_img_cfg[k] = v.to(self.device)
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type != "cpu",
+                        dtype=self.od_config.dtype,
+                    ):
+                        cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                            cfg_text_context["past_key_values"], **gen_input_img_cfg
+                        )
+                    cfg_text_context["kv_lens"] = newlens_img_cfg
+                    cfg_text_context["ropes"] = new_rope_img_cfg
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -413,6 +479,10 @@ class BagelPipeline(nn.Module):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(self.device)
+            
+            # CFG: 在处理文本前，保存 cfg_text_context（无文本条件）
+            cfg_text_context = deepcopy(gen_context)
+            
             with torch.autocast(
                 device_type=self.device.type,
                 enabled=self.device.type != "cpu",
@@ -423,6 +493,18 @@ class BagelPipeline(nn.Module):
                 )
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
+            
+            # CFG: cfg_img_context 也需要更新文本（有文本，无图像）
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                cfg_img_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    cfg_img_context["past_key_values"], **generation_input
+                )
+            cfg_img_context["kv_lens"] = newlens
+            cfg_img_context["ropes"] = new_rope
 
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
@@ -462,6 +544,24 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
+        # CFG: 为两个无条件分支准备 latent 输入
+        generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_text_context["kv_lens"],
+            curr_rope=cfg_text_context["ropes"],
+            image_sizes=[image_shape],
+        )
+        generation_input_cfg_img = self.bagel.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_img_context["kv_lens"],
+            curr_rope=cfg_img_context["ropes"],
+            image_sizes=[image_shape],
+        )
+        for k, v in generation_input_cfg_text.items():
+            if torch.is_tensor(v):
+                generation_input_cfg_text[k] = v.to(self.device)
+        for k, v in generation_input_cfg_img.items():
+            if torch.is_tensor(v):
+                generation_input_cfg_img[k] = v.to(self.device)
+
         with torch.autocast(
             device_type=self.device.type,
             enabled=self.device.type != "cpu",
@@ -469,9 +569,31 @@ class BagelPipeline(nn.Module):
         ):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
+                # CFG: 无文本条件的 KV Cache
+                cfg_text_past_key_values=cfg_text_context["past_key_values"],
+                # CFG: 无图像条件的 KV Cache
+                cfg_img_past_key_values=cfg_img_context["past_key_values"],
+                # 基础参数
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
+                # CFG 参数
+                cfg_text_scale=gen_params.cfg_text_scale,
+                cfg_img_scale=gen_params.cfg_img_scale,
+                cfg_interval=gen_params.cfg_interval,
+                cfg_renorm_min=gen_params.cfg_renorm_min,
+                cfg_renorm_type=gen_params.cfg_renorm_type,
+                # 主分支 latent 输入
                 **generation_input,
+                # CFG text 分支的位置索引
+                cfg_text_packed_position_ids=generation_input_cfg_text['cfg_packed_position_ids'],
+                cfg_text_packed_query_indexes=generation_input_cfg_text['cfg_packed_query_indexes'],
+                cfg_text_key_values_lens=generation_input_cfg_text['cfg_key_values_lens'],
+                cfg_text_packed_key_value_indexes=generation_input_cfg_text['cfg_packed_key_value_indexes'],
+                # CFG img 分支的位置索引
+                cfg_img_packed_position_ids=generation_input_cfg_img['cfg_packed_position_ids'],
+                cfg_img_packed_query_indexes=generation_input_cfg_img['cfg_packed_query_indexes'],
+                cfg_img_key_values_lens=generation_input_cfg_img['cfg_key_values_lens'],
+                cfg_img_packed_key_value_indexes=generation_input_cfg_img['cfg_packed_key_value_indexes'],
             )
 
         # Decode first sample
