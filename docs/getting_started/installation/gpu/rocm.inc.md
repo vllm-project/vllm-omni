@@ -81,6 +81,7 @@ DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .
 docker run --rm \
 --group-add=video \
 --ipc=host \
+--pid=host \
 --cap-add=SYS_PTRACE \
 --security-opt seccomp=unconfined \
 --device /dev/kfd \
