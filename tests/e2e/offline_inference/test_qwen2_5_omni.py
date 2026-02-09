@@ -13,9 +13,9 @@ from vllm.assets.video import VideoAsset
 from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.multimodal.image import convert_image_mode
 
+from tests.conftest import OmniRunner
 from vllm_omni.platforms import current_omni_platform
 
-from .conftest import OmniRunner
 from .utils import create_new_process_for_each_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]

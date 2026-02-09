@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
@@ -14,7 +12,6 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import (
-    OpenAIClientHandler,
     dummy_messages_from_mix_data,
     generate_synthetic_audio,
     generate_synthetic_image,
@@ -26,13 +23,9 @@ from vllm_omni.platforms import current_omni_platform
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 
-def get_default_config():
-    return str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
-
-
 def get_chunk_config():
     path = modify_stage_config(
-        get_default_config(),
+        str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml"),
         updates={
             "async_chunk": True,
             "stage_args": {
@@ -49,13 +42,12 @@ def get_chunk_config():
     return path
 
 
-CHUNK_CONFIG_PATH = get_chunk_config()
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
 if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
     stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:
-    stage_configs = [get_default_config(), CHUNK_CONFIG_PATH]
+    stage_configs = [get_chunk_config()]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
@@ -90,8 +82,10 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.core_model
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server) -> None:
+def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -112,16 +106,25 @@ def test_mix_to_text_audio_001(omni_server) -> None:
         content_text=get_prompt("mix"),
     )
 
-    handler = OpenAIClientHandler()
-
-    request_config = {"model": omni_server.model, "messages": messages, "stream": True}
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {
+            "audio": ["water", "cricket"],
+            "video": ["sphere", "globe", "circle", "round"],
+            "image": ["square", "quadrate"],
+        },
+    }
 
     # Test single completion
-    handler.send_request(request_config)
+    openai_client.send_request(request_config)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.core_model
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_audio_001(omni_server) -> None:
+def test_text_to_text_001(omni_server, openai_client) -> None:
     """
     Test text input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -131,8 +134,12 @@ def test_text_to_text_audio_001(omni_server) -> None:
     """
     messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
-    handler = OpenAIClientHandler()
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
 
-    request_config = {"model": omni_server.model, "messages": messages, "stream": False}
-
-    handler.send_request(request_config, request_num=get_max_batch_size())
+    openai_client.send_request(request_config, request_num=get_max_batch_size())
