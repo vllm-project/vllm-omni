@@ -194,17 +194,17 @@ class OmniServeCommand(CLISubcommand):
         )
 
         # diffusion model offload parameters
-        serve_parser.add_argument(
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Enable CPU offloading for diffusion models.",
         )
-        serve_parser.add_argument(
+        omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
-        serve_parser.add_argument(
+        omni_config_group.add_argument(
             "--layerwise-num-gpu-layers",
             type=int,
             default=1,
