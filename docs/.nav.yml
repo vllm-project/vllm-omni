@@ -44,6 +44,7 @@ nav:
       - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
       - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
+    - ComfyUI: features/comfyui.md
 - Developer Guide:
   - General:
     - contributing/README.md
