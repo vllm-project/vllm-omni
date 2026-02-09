@@ -61,7 +61,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             self.input_batch.remove_request(req_id)
         cached_reqs = scheduler_output.scheduled_cached_reqs
         req_states = []
-        for _, req_id in enumerate(cached_reqs.req_ids):
+        for req_id in cached_reqs.req_ids:
             req_state = self.requests.get(req_id)
             assert req_state is not None
             req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
