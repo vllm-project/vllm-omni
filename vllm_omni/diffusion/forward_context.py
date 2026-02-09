@@ -31,6 +31,16 @@ class ForwardContext:
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
 
+    # SP active scope tracking
+    # Tracks the depth of SP sharding - incremented on shard, decremented on gather
+    # Used by attention layers to determine if SP communication should be enabled
+    _sp_shard_depth: int = 0
+
+    @property
+    def sp_active(self) -> bool:
+        """Returns True when inside an SP sharded region (between shard and gather)."""
+        return self._sp_shard_depth > 0
+
     def __post_init__(self):
         pass
 
