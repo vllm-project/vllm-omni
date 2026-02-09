@@ -503,10 +503,50 @@ def init_vae_group(
 
 
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
-def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use_ulysses_low=True):
+def set_seq_parallel_pg(
+    sp_ulysses_degree: int,
+    sp_ring_degree: int,
+    rank: int,
+    world_size: int,
+    use_ulysses_low: bool = True,
+    sp_group_ranks: list[list[int]] | None = None,
+) -> tuple[torch.distributed.ProcessGroup, torch.distributed.ProcessGroup]:
     """
-    sp_ulysses_degree x sp_ring_degree = seq_parallel_size
-    (ulysses_degree, dp_size)
+    Initialize sequence-parallel Ulysses and Ring process groups.
+
+    This builds sequence-parallel (SP) subgroups inside each data-parallel (DP)
+    slice. The SP group size is sp_ulysses_degree * sp_ring_degree, and
+    world_size must be divisible by that size.
+
+    Args:
+        sp_ulysses_degree: Size of each Ulysses subgroup.
+        sp_ring_degree: Size of each Ring subgroup.
+        rank: Global rank of the current process.
+        world_size: Total number of processes.
+        use_ulysses_low: If True, Ulysses groups are contiguous chunks and Ring
+            groups are strided within each SP group. If False, the opposite.
+        sp_group_ranks: Optional explicit SP groups. Each entry must be a list
+            of length sp_ulysses_degree * sp_ring_degree. When provided, groups
+            are built from these ranks instead of auto-generated contiguous
+            ranges.
+
+    Returns:
+        ulyssess_pg (torch.distributed.ProcessGroup): The Ulysses process group
+            for this rank.
+        ring_pg (torch.distributed.ProcessGroup): The Ring process group for
+            this rank.
+
+    Raises:
+        ValueError: If sp_group_ranks length does not match world_size or any
+            entry has the wrong size.
+        AssertionError: If world_size is not divisible by sp_size.
+
+    Behavior:
+        - If sp_group_ranks is provided, groups are built per entry and each
+          entry is further split into Ulysses/Ring groups according to
+          use_ulysses_low.
+        - If sp_group_ranks is None, groups are auto-generated within each DP
+          slice using offsets of size sp_size.
     """
     sp_size = sp_ring_degree * sp_ulysses_degree
     dp_size = world_size // sp_size
@@ -516,40 +556,96 @@ def set_seq_parallel_pg(sp_ulysses_degree, sp_ring_degree, rank, world_size, use
     num_ulysses_pgs = sp_ring_degree  # world_size // sp_ulysses_degree
     num_ring_pgs = sp_ulysses_degree  # world_size // sp_ring_degree
 
-    if use_ulysses_low:
-        for dp_rank in range(dp_size):
-            offset = dp_rank * sp_size
-            for i in range(num_ulysses_pgs):
-                ulysses_ranks = list(
-                    range(
-                        i * sp_ulysses_degree + offset,
-                        (i + 1) * sp_ulysses_degree + offset,
-                    )
-                )
-                group = torch.distributed.new_group(ulysses_ranks)
-                if rank in ulysses_ranks:
-                    ulyssess_pg = group
-
-            for i in range(num_ring_pgs):
-                ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
-                group = torch.distributed.new_group(ring_ranks)
-                if rank in ring_ranks:
-                    ring_pg = group
-
+    if sp_group_ranks is not None:
+        if len(sp_group_ranks) * sp_size != world_size:
+            raise ValueError(
+                f"Invalid sp_group_ranks: expected {world_size // sp_size} groups of size {sp_size}, "
+                f"but got {len(sp_group_ranks)} groups."
+            )
+        logger.info(
+            "Building SP subgroups from explicit sp_group_ranks "
+            f"(sp_size={sp_size}, ulysses={sp_ulysses_degree}, ring={sp_ring_degree}, "
+            f"use_ulysses_low={use_ulysses_low})."
+        )
+        local_sp_group = None
+        local_ulysses = None
+        local_ring = None
+        for group_ranks in sp_group_ranks:
+            if len(group_ranks) != sp_size:
+                raise ValueError(f"Invalid sp_group_ranks entry: expected size {sp_size}, got {len(group_ranks)}.")
+            if rank in group_ranks:
+                local_sp_group = list(group_ranks)
+            if use_ulysses_low:
+                # Ulysses groups are contiguous chunks; Ring groups are strided.
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = group_ranks[i * sp_ulysses_degree : (i + 1) * sp_ulysses_degree]
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
+                        local_ulysses = list(ulysses_ranks)
+                for i in range(num_ring_pgs):
+                    ring_ranks = group_ranks[i::num_ring_pgs]
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+                        local_ring = list(ring_ranks)
+            else:
+                # Ring groups are contiguous chunks; Ulysses groups are strided.
+                for i in range(num_ring_pgs):
+                    ring_ranks = group_ranks[i * sp_ring_degree : (i + 1) * sp_ring_degree]
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+                        local_ring = list(ring_ranks)
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = group_ranks[i::num_ulysses_pgs]
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
+                        local_ulysses = list(ulysses_ranks)
+        if local_sp_group is not None:
+            logger.info(
+                "SP group details for rank %d: sp_group=%s, ulysses_group=%s, ring_group=%s",
+                rank,
+                local_sp_group,
+                local_ulysses,
+                local_ring,
+            )
     else:
-        for dp_rank in range(dp_size):
-            offset = dp_rank * sp_size
-            for i in range(num_ring_pgs):
-                ring_ranks = list(range(i * sp_ring_degree + offset, (i + 1) * sp_ring_degree + offset))
-                group = torch.distributed.new_group(ring_ranks)
-                if rank in ring_ranks:
-                    ring_pg = group
+        if use_ulysses_low:
+            for dp_rank in range(dp_size):
+                offset = dp_rank * sp_size
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = list(
+                        range(
+                            i * sp_ulysses_degree + offset,
+                            (i + 1) * sp_ulysses_degree + offset,
+                        )
+                    )
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
 
-            for i in range(num_ulysses_pgs):
-                ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
-                group = torch.distributed.new_group(ulysses_ranks)
-                if rank in ulysses_ranks:
-                    ulyssess_pg = group
+                for i in range(num_ring_pgs):
+                    ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+
+        else:
+            for dp_rank in range(dp_size):
+                offset = dp_rank * sp_size
+                for i in range(num_ring_pgs):
+                    ring_ranks = list(range(i * sp_ring_degree + offset, (i + 1) * sp_ring_degree + offset))
+                    group = torch.distributed.new_group(ring_ranks)
+                    if rank in ring_ranks:
+                        ring_pg = group
+
+                for i in range(num_ulysses_pgs):
+                    ulysses_ranks = list(range(i + offset, sp_size + offset, num_ulysses_pgs))
+                    group = torch.distributed.new_group(ulysses_ranks)
+                    if rank in ulysses_ranks:
+                        ulyssess_pg = group
 
     return ulyssess_pg, ring_pg
 
@@ -652,6 +748,7 @@ def initialize_model_parallel(
         data_parallel_size,
         "tp-sp-pp-cfg-dp",
     )
+    sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     _DP = init_model_parallel_group(
@@ -685,9 +782,10 @@ def initialize_model_parallel(
         sp_ring_degree=ring_degree,
         rank=get_world_group().rank_in_group,
         world_size=dit_parallel_size,
+        sp_group_ranks=sp_group_ranks,
     )
     _SP = init_model_parallel_group(
-        group_ranks=rank_generator.get_ranks("sp"),
+        group_ranks=sp_group_ranks,
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="sequence",

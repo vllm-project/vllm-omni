@@ -44,6 +44,11 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        # TODO: Enable this when torch compile bugs are resolved
+        return False
+
+    @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/platforms/xpu/stage_configs"
 

@@ -9,10 +9,11 @@ import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -35,9 +36,9 @@ class FeedForward(nn.Module):
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
 
-        self.w_in = ReplicatedLinear(dim, inner_dim, bias=bias, return_bias=False)
+        self.w_in = ColumnParallelLinear(dim, inner_dim, bias=bias, return_bias=False)
         self.act = get_act_fn("gelu_pytorch_tanh")
-        self.w_out = ReplicatedLinear(inner_dim, dim_out, bias=bias, return_bias=False)
+        self.w_out = RowParallelLinear(inner_dim, dim_out, bias=bias, return_bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w_in(hidden_states)
@@ -83,12 +84,11 @@ class LongCatImageAttention(nn.Module):
             hidden_size=query_dim,
             head_size=self.head_dim,
             total_num_heads=self.heads,
-            disable_tp=True,
             bias=bias,
         )
 
         if not self.pre_only:
-            self.to_out = torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias)
+            self.to_out = RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias)
 
         if self.added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
@@ -98,11 +98,10 @@ class LongCatImageAttention(nn.Module):
                 hidden_size=self.added_kv_proj_dim,
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
-                disable_tp=True,
                 bias=added_proj_bias,
             )
 
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(self.inner_dim, query_dim, bias=out_bias)
 
         self.attn = Attention(
             num_heads=heads,
@@ -185,22 +184,26 @@ class LongCatImageAttention(nn.Module):
         """
         qkv, _ = self.to_qkv(hidden_states)
 
-        query, key, value = qkv.chunk(3, dim=-1)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
+            q_size = self.add_kv_proj.num_heads * self.head_dim
+            kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
+            encoder_query, encoder_key, encoder_value = encoder_qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+            encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
 
             # Apply RMSNorm to text Q/K
             encoder_query = self.norm_added_q(encoder_query)
@@ -284,11 +287,14 @@ class LongCatImageAttention(nn.Module):
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
-            hidden_states = self.to_out(hidden_states)
+            hidden_states, _ = self.to_out(hidden_states)
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
             return hidden_states, encoder_hidden_states
         else:
+            # For single-stream blocks, there's no to_out (RowParallelLinear) to handle the reduction
+            if get_tensor_model_parallel_world_size() > 1:
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
 
 

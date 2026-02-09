@@ -1,4 +1,4 @@
-# Qwen3-TTS Online Serving
+# Qwen3-TTS
 
 This directory contains examples for running Qwen3-TTS models with vLLM-Omni's online serving API.
 
@@ -75,6 +75,9 @@ curl -X POST http://localhost:8000/v1/audio/speech \
         "voice": "Vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
+
+# List available voices in CustomVoice models
+curl http://localhost:8000/v1/audio/voices
 ```
 
 ## API Reference

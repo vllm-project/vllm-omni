@@ -125,6 +125,14 @@ class Qwen3TTSModelForGeneration(nn.Module):
             if isinstance(value, list) and len(value) > 0:
                 runtime_additional_information[key] = value[0]
 
+        # During profile/warmup runs, text is empty and no real inputs exist.
+        # Cap generation steps so the full pipeline executes (preserving
+        # KV-cache profiling behaviour) but exits quickly even if the model
+        # cannot converge from degenerate dummy inputs.
+        if not text:
+            logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
+            runtime_additional_information["max_new_tokens"] = 2
+
         # Call the appropriate generation method based on task_type
         if task_type == "CustomVoice":
             result = self.model.generate_custom_voice(
