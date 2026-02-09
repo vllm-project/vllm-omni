@@ -1,5 +1,5 @@
 """
-Example Online tests for Qwen3-Omni model.
+Example online tests for Qwen2.5-Omni-7B model.
 """
 
 import os
