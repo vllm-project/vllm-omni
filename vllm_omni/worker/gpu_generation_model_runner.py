@@ -362,10 +362,19 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             for i in range(num_reqs):
                 mm_payload = {}
                 for key, out in multimodal_outputs.items():
-                    if isinstance(out, list) and len(out) == num_reqs:
+                    if isinstance(out, list):
+                        if len(out) != num_reqs:
+                            raise ValueError(
+                                f"Multimodal output list for key '{key}' has length {len(out)} "
+                                f"but expected {num_reqs} (one entry per request)."
+                            )
                         mm_payload[key] = out[i].detach().to("cpu").contiguous()
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
+                    else:
+                        raise TypeError(
+                            f"Unsupported multimodal output type for key '{key}': {type(out)}"
+                        )
                 pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
