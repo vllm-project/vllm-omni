@@ -1464,7 +1464,7 @@ class Bagel(nn.Module):
             self.language_model.model.cache_dic = model_pred_cache_dic
             self.language_model.model.current = model_pred_current
 
-        output = self.language_model.forward_inference(
+        output = self.language_model.forward(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
@@ -1484,7 +1484,7 @@ class Bagel(nn.Module):
             if self.language_model.model.enable_taylorseer:
                 self.language_model.model.cache_dic = model_pred_text_cache_dic
                 self.language_model.model.current = model_pred_text_current
-            cfg_text_output = self.language_model.forward_inference(
+            cfg_text_output = self.language_model.forward(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
                 packed_query_position_ids=cfg_text_packed_position_ids,
@@ -1506,7 +1506,7 @@ class Bagel(nn.Module):
             if self.language_model.model.enable_taylorseer:
                 self.language_model.model.cache_dic = model_pred_img_cache_dic
                 self.language_model.model.current = model_pred_img_current
-            cfg_img_output = self.language_model.forward_inference(
+            cfg_img_output = self.language_model.forward(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
                 packed_query_position_ids=cfg_img_packed_position_ids,
