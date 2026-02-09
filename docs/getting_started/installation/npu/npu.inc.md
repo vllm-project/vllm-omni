@@ -20,7 +20,6 @@ export IMAGE=quay.io/ascend/vllm-ascend:v0.14.0rc1
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
-    --pid=host \
     --device $DEVICE0 \
     --device $DEVICE1 \
     --device /dev/davinci_manager \

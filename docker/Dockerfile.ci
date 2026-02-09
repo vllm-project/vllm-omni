@@ -17,7 +17,4 @@ RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" 
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-# Runtime hint: run this image with host PID namespace.
-LABEL org.opencontainers.image.pid-namespace="host"
-
 ENTRYPOINT []

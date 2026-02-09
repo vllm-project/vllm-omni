@@ -87,7 +87,6 @@ vLLM-Omni offers an official docker image for deployment. These images are built
 Here's an example deployment command that has been verified on 2 x H100's:
 ```bash
 docker run --runtime nvidia --gpus 2 \
-    --pid=host \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
