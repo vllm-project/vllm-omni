@@ -51,8 +51,7 @@ if __name__ == "__main__":
 
     For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
     list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
-    batched inputs, you can [modify this configuration](../../../configuration/stage_configs.md
-    ) to let the model accept a longer batch of prompts.
+    batched inputs, you can [modify this configuration](https://github.com/vllm-project/vllm-omni/tree/main/configuration/stage_configs.md) to let the model accept a longer batch of prompts.
 
 Apart from string prompt, vLLM-Omni also supports dictionary prompts in the same style as vLLM.
 This is useful for models that support negative prompts.
