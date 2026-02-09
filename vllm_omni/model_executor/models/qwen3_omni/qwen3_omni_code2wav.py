@@ -175,7 +175,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             left_context_size: Number of overlapping frames for context
 
         Returns:
-            waveform: [batch, 1, waveform_len] - Complete waveform
+            list[torch.Tensor]: Complete waveform decoded from the input
+                codes. For ``batch_size == 1``, this is a list containing a
+                single tensor with shape ``[1, waveform_len]``.
         """
         # TODO Support batch_size > 1
         wavs = []
