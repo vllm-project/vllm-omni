@@ -1108,7 +1108,7 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
     if run_level == "advanced_model":
         # Verify image description
         word_types = ["text", "image", "audio", "video"]
-        keywords_dict = request_config.get("keywords", {})
+        keywords_dict = request_config.get("key_words", {})
         for word_type in word_types:
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
