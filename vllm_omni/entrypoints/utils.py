@@ -331,12 +331,12 @@ def has_pid_host() -> bool | None:
             else:
                 return False
 
-    return None
+    return False
 
 
 def detect_pid_host() -> bool:
     ic = in_container()
     if not ic:
-        return False
+        return True
 
     return has_pid_host()
