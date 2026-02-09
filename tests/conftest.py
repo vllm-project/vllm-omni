@@ -614,11 +614,6 @@ def convert_audio_to_text(audio_data):
 
 
 def convert_audio_file_to_text(output_path):
-    text = convert_audio_file_to_text(output_path=output_path)
-    return text
-
-
-def convert_audio_file_to_text(output_path):
     import whisper
 
     model = whisper.load_model("small")

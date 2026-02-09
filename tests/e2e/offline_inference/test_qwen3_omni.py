@@ -40,8 +40,8 @@ def get_question(prompt_type="video"):
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("test_config", test_params)
-def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating audio output."""
     video = generate_synthetic_video(224, 224, 300)["np_array"]
 
