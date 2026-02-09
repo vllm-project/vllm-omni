@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
