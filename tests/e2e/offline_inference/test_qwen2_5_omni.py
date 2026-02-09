@@ -16,7 +16,7 @@ from vllm.multimodal.image import convert_image_mode
 from tests.conftest import OmniRunner
 from vllm_omni.platforms import current_omni_platform
 
-from .utils import create_new_process_for_each_test, hardware_test
+from tests.utils import create_new_process_for_each_test, hardware_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
