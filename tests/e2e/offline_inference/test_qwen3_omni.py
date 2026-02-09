@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from vllm.assets.video import VideoAsset
 
+from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 from .conftest import OmniRunner
@@ -31,6 +32,9 @@ else:
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("test_config", test_params)
 def test_video_to_audio(omni_runner: type[OmniRunner], test_config) -> None:
     """Test processing video, generating audio output."""

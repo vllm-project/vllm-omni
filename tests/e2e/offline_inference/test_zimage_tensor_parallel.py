@@ -12,18 +12,18 @@ import torch
 from PIL import Image
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from tests.utils import GPUMemoryMonitor, hardware_test
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.utils import GPUMemoryMonitor
-from vllm_omni import Omni
-from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.platforms import current_omni_platform
 
 # os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -127,7 +127,10 @@ def _run_zimage_generate(
         cleanup_dist_env_and_memory()
 
 
-@pytest.mark.integration
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parallel
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 def test_zimage_tensor_parallel_tp2(tmp_path: Path):
     if current_omni_platform.is_npu() or current_omni_platform.is_rocm():
         pytest.skip("Z-Image TP e2e test is only supported on CUDA for now.")
