@@ -10,12 +10,11 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 from pathlib import Path
 
 import pytest
-from tests.utils import hardware_test
 
 from tests.conftest import (
     generate_synthetic_video,
 )
-
+from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -29,6 +28,7 @@ else:
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+
 
 def get_question(prompt_type="video"):
     prompts = {

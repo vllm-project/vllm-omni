@@ -82,6 +82,7 @@ def get_max_batch_size(size_type="few"):
     batch_sizes = {"few": 5, "medium": 100, "large": 256}
     return batch_sizes.get(size_type, 5)
 
+
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
