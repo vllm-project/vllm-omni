@@ -10,7 +10,7 @@
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
