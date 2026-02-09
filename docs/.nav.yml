@@ -54,6 +54,12 @@ nav:
     - contributing/model/README.md
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
+    - Advanced Features:
+      - contributing/features/cfg_parallel.md
+      - contributing/features/sequence_parallel.md
+      - contributing/features/tensor_parallel.md
+      - contributing/features/cache_dit.md
+      - contributing/features/teacache.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md

@@ -1,9 +1,12 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class DummyBuffer:

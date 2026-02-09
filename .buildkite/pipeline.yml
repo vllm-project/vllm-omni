@@ -20,19 +20,7 @@ steps:
   - label: "Simple Unit Test"
     depends_on: image-build
     commands:
-    - |
-      pytest -v -s \
-        tests/entrypoints/ \
-        tests/diffusion/cache/ \
-        tests/diffusion/lora/ \
-        tests/model_executor/models/qwen2_5_omni/test_audio_length.py \
-        tests/worker/ \
-        tests/distributed/omni_connectors/test_kv_flow.py \
-        --cov=vllm_omni \
-        --cov-branch \
-        --cov-report=term-missing \
-        --cov-report=html \
-        --cov-report=xml
+      - "pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
     agents:
       queue: "gpu_1_queue"
     plugins:
@@ -118,7 +106,7 @@ steps:
     timeout_in_minutes: 15
     depends_on: image-build
     commands:
-      - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
+      - pytest -s -v -m 'core_model and cache and diffusion and not distributed_cuda and L4'
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:

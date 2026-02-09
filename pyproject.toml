@@ -175,6 +175,10 @@ markers = [
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
 ]
+filterwarnings = [
+    "ignore:.*does not have '__test__' attribute.*:UserWarning",
+    "ignore:.*does not have '__bases__' attribute.*:UserWarning",
+]
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [

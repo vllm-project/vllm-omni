@@ -9,6 +9,8 @@ from vllm import SamplingParams
 
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
     "ignore",
