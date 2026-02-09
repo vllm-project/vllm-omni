@@ -66,7 +66,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             assert req_state is not None
             req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
             req_states.append(req_state)
-            self.input_batch.remove_request(req_id)
+            # Remove the request from the current input batch only if it is still present.
+            if req_id in self.input_batch.req_id_to_index:
+                self.input_batch.remove_request(req_id)
         for req_state in req_states:
             # update the request state in self.input_batch
             self.input_batch.add_request(req_state)
