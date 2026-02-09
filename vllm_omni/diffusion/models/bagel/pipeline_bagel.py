@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 @dataclass
 class BagelGenParams:
     num_timesteps: int = 50
-    timestep_shift: float = 1.0
+    timestep_shift: float = 3.0
     # CFG 参数
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.5
