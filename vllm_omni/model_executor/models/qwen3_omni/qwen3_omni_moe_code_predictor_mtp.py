@@ -458,10 +458,6 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
                 TopPLogitsWarper(top_p=0.8),
             ]
         )
-        max_batch_size = vllm_config.scheduler_config.max_num_seqs
-        self.position_ids_buffer = []
-        for layer_idx in range(self.num_code_groups - 1):
-            self.position_ids_buffer.append(torch.arange(layer_idx + 2, dtype=torch.int64).repeat(max_batch_size))
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -508,13 +504,11 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         batch_size = current_input.shape[0]
 
         # Predict all residual layers (layers 1 to num_code_groups-1) autoregressively
-        begin_pos = 0
         for layer_idx in range(self.num_code_groups - 1):
-            # Input for this layer: [last_talker_hidden, prev_layer_embed]
-
+            seq_len = layer_idx + 2
+            # Compute position_ids dynamically to avoid torch.compile specializing batch_size
+            position_ids = torch.arange(seq_len, device=current_input.device, dtype=torch.int64).repeat(batch_size)
             # Forward through code_predictor model
-            position_ids = self.position_ids_buffer[layer_idx][: (layer_idx + 2) * batch_size]  # [1, seq_len]
-            begin_pos += layer_idx + 2
             outputs = self.model(
                 inputs_embeds=current_input,
                 attention_mask=None,

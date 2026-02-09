@@ -8,6 +8,7 @@ import json
 import os
 import re
 from collections.abc import Iterable
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
@@ -197,9 +199,7 @@ def get_prompt_language(prompt):
     return "en"
 
 
-class LongCatImagePipeline(
-    nn.Module,
-):
+class LongCatImagePipeline(nn.Module, CFGParallelMixin):
     def __init__(
         self,
         *,
@@ -460,6 +460,16 @@ class LongCatImagePipeline(
                 f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
             )
 
+    def cfg_normalize_function(self, noise_pred, comb_pred, cfg_renorm_min=0.0):
+        """
+        Normalize the combined noise prediction.
+        """
+        cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+        noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+        scale = (cond_norm / (noise_norm + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+        noise_pred = comb_pred * scale
+        return noise_pred
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -604,6 +614,9 @@ class LongCatImagePipeline(
         if self.do_classifier_free_guidance:
             negative_prompt_embeds = negative_prompt_embeds.to(device)
 
+        # custom partial function with cfg_renorm_min
+        self.cfg_normalize_function = partial(self.cfg_normalize_function, cfg_renorm_min=cfg_renorm_min)
+
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
             if self._interrupt:
@@ -612,43 +625,37 @@ class LongCatImagePipeline(
             self._current_timestep = t
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-            noise_pred_text = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                return_dict=False,
-            )[0]
-
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_image_ids,
+                "return_dict": False,
+            }
             if self.do_classifier_free_guidance:
-                noise_pred_uncond = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_pred_uncond + self._guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                if enable_cfg_renorm:
-                    cond_norm = torch.norm(noise_pred_text, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    scale = (cond_norm / (noise_norm + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                    noise_pred = noise_pred * scale
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep / 1000,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_image_ids,
+                    "return_dict": False,
+                }
             else:
-                noise_pred = noise_pred_text
+                negative_kwargs = None
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=self.do_classifier_free_guidance,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=enable_cfg_renorm,
+            )
 
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                    latents = latents.to(latents_dtype)
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
 
         self._current_timestep = None
 

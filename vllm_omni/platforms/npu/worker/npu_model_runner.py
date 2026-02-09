@@ -54,12 +54,13 @@ class OmniNPUModelRunner(NPUModelRunner):
                     self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
                 )
             hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
-            self.talker_mtp_input_ids = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+            self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
-                self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False
+                max_batch_size, hidden_size, dtype=self.dtype, numpy=False
             )
-            self.last_talker_hidden = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
-            self.text_step = self._make_buffer(self.max_num_reqs, hidden_size, dtype=self.dtype, numpy=False)
+            self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+            self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         image_grid_thw = []
@@ -590,12 +591,16 @@ class OmniNPUModelRunner(NPUModelRunner):
                 model_instance=self.model,
             ):
                 if getattr(self.model, "talker", None) is not None and hasattr(self.model, "talker_mtp"):
+                    num_tokens_padded_talker_mtp = num_tokens_padded
+                    if num_tokens_padded_talker_mtp == self.max_num_tokens:
+                        num_tokens_padded_talker_mtp = self.talker_mtp_input_ids.gpu.shape[0]
                     hidden_states = self.talker_mtp(
-                        self.talker_mtp_input_ids.gpu[:num_tokens_padded],
-                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded],
-                        self.last_talker_hidden.gpu[:num_tokens_padded],
-                        self.text_step.gpu[:num_tokens_padded],
+                        self.talker_mtp_input_ids.gpu[:num_tokens_padded_talker_mtp],
+                        self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded_talker_mtp],
+                        self.last_talker_hidden.gpu[:num_tokens_padded_talker_mtp],
+                        self.text_step.gpu[:num_tokens_padded_talker_mtp],
                     )
+                    self.compilation_config.cache_dir = None
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded, intermediate_tensors, inputs_embeds
                 )
@@ -728,13 +733,10 @@ class OmniNPUModelRunner(NPUModelRunner):
             # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
-                    if self.model_config.async_chunk:
-                        req_infos = self._get_additional_information(scheduler_output, req_id)
-                    else:
-                        req_state = self.requests.get(req_id)
-                        req_infos = (
-                            getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-                        )
+                    req_state = self.requests.get(req_id)
+                    req_infos = (
+                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+                    )
                     start_offset = int(self.query_start_loc.cpu[req_index])
                     sched_tokens = int(num_scheduled_tokens_np[req_index])
                     s, e = start_offset, start_offset + sched_tokens
@@ -775,39 +777,16 @@ class OmniNPUModelRunner(NPUModelRunner):
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
 
-    def _get_additional_information(self, scheduler_output: "SchedulerOutput", req_id: str) -> dict:
-        req_infos = None
-        req_state = self.requests.get(req_id)
-        additional_information_cpu = getattr(req_state, "additional_information_cpu", None)
+    def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
-            if new_req.req_id == req_id:
-                payload_info = getattr(new_req, "additional_information", None)
-                if payload_info is not None:
-                    return payload_info
+            payload_info = getattr(new_req, "additional_information", None)
+            self._merge_additional_information_update(new_req.req_id, payload_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
-            if isinstance(cached_infos, dict) and req_id in cached_infos:
-                req_infos = cached_infos[req_id]
-                if not isinstance(req_infos, dict):
-                    req_infos = None
-
-        if req_infos is None or req_infos.get("last_talker_hidden", None) is None:
-            if req_infos is None:
-                additional_information_cpu.pop("thinker_embeddings", None)
-                req_infos = additional_information_cpu
-            else:
-                req_infos["last_talker_hidden"] = additional_information_cpu.get("last_talker_hidden", None)
-                req_infos["num_processed_thinker_tokens"] = additional_information_cpu.get(
-                    "num_processed_thinker_tokens", 0
-                )
-            if not isinstance(req_infos, dict):
-                req_infos = None
-
-        if req_infos is None:
-            logger.warning(f"No additional_information found for req_id: {req_id}")
-
-        return req_infos
+            if isinstance(cached_infos, dict):
+                for req_id, req_infos in cached_infos.items():
+                    self._merge_additional_information_update(req_id, req_infos)
 
     def _preprocess(
         self,
@@ -923,15 +902,12 @@ class OmniNPUModelRunner(NPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+            if self.vllm_config.model_config.async_chunk:
+                self._update_additional_information(scheduler_output)
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 # Try to get additional_information from multiple sources
-                if self.vllm_config.model_config.async_chunk:
-                    req_infos = self._get_additional_information(scheduler_output, req_id)
-                else:
-                    req_state = self.requests.get(req_id)
-                    req_infos = (
-                        getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
-                    )
+                req_state = self.requests.get(req_id)
+                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
                 s, e = start_offset, start_offset + sched_tokens
@@ -941,6 +917,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
                     input_ids=input_ids[s:e], input_embeds=inputs_embeds[s:e], **req_infos
                 )
+
                 if hasattr(self.model, "talker_mtp") and span_len == 1:
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)

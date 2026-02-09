@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import torch
 
@@ -85,6 +86,12 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
 
     runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
 
     # Initialize per-request embeds (batch-major inside talker_mtp_inputs_embeds)
     runner.talker_mtp_inputs_embeds.gpu[0] = torch.tensor([1.0, 2.0, 3.0, 4.0])

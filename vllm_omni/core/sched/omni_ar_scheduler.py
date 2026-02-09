@@ -6,20 +6,20 @@ from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
 
-import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.adapter import get_chunk, put_chunk
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
@@ -185,13 +185,19 @@ class OmniARScheduler(VLLMScheduler):
                 get_chunk(self.omni_connector, scheduler_output)
 
             # Add information about requests needing KV cache transfer
-            scheduler_output.finished_requests_needing_kv_transfer = self.get_finished_requests_needing_kv_transfer()
+            finished_reqs = self.get_finished_requests_needing_kv_transfer()
         except Exception:
             # If anything goes wrong, leave the original output unchanged
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
-            scheduler_output.finished_requests_needing_kv_transfer = {}
+            finished_reqs = {}
 
-        return scheduler_output
+        # Wrap in omni scheduler output to carry transfer metadata.
+        base_fields = SchedulerOutput.__dataclass_fields__.keys()
+        base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+        return OmniSchedulerOutput(
+            **base_data,
+            finished_requests_needing_kv_transfer=finished_reqs,
+        )
 
     def update_from_output(
         self,
@@ -278,47 +284,32 @@ class OmniARScheduler(VLLMScheduler):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status
+            finish_reason = None
+            routed_experts = None
 
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+            elif request.pooling_params and pooler_output is not None:
+                # Pooling stops as soon as there is output.
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
 
-            # If criteria returns True, it means we must STOP the request (e.g. legacy behavior, not used now)
-            # If criteria returns False, it might have triggered a background transfer
-            # (e.g. prefill finished / special token) but continues decoding
+            # If criteria returns True, it means we must STOP the request.
+            # If criteria returns False, it might have triggered a background
+            # transfer (e.g. prefill finished / special token) but continues decoding.
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
 
-            # Stop checking for pooler models.
-            pooler_output = None
-            if pooler_outputs:
-                pooler_output = pooler_outputs[req_index]
-                if request.output_token_ids:
-                    stopped = check_stop(request, self.max_model_len)
-            routed_experts = None
             if stopped:
-                # [Omni] Handle routed experts if enabled
-                if self.vllm_config.model_config.enable_return_routed_experts:
-                    kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-                    block_ids = kv_blocks.get_block_ids()[0]
-                    num_tokens = request.num_tokens - 1
+                routed_experts = self._get_routed_experts(request)
 
-                    # compute slot mapping
-                    block_ids_array = np.array(block_ids, dtype=np.int32)
-                    num_blocks = len(block_ids)
-                    block_size = self.block_size
-
-                    # generate block offsets
-                    block_offsets = np.arange(0, block_size)
-
-                    # compute slot mapping: slot = block_id * block_size + offset
-                    slot_mapping = (
-                        block_offsets.reshape((1, block_size)) + block_ids_array.reshape((num_blocks, 1)) * block_size
-                    ).flatten()[:num_tokens]
-
-                    routed_experts = self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
-
-                kv_transfer_params = self._free_request(request)
+                # Capture finish_reason BEFORE _handle_stopped_request, which may
+                # reset the status to WAITING for streaming requests that continue.
+                finish_reason = request.get_finished_reason()
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 else:
@@ -345,13 +336,13 @@ class OmniARScheduler(VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
-                        finish_reason=request.get_finished_reason(),
+                        finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,

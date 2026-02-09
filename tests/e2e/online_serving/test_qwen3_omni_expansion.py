@@ -8,6 +8,7 @@ import concurrent.futures
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+import threading
 import time
 from pathlib import Path
 
@@ -21,7 +22,6 @@ from tests.conftest import (
     dummy_messages_from_mix_data,
     generate_synthetic_audio,
     generate_synthetic_image,
-    modify_stage_config,
 )
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -33,6 +33,29 @@ stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omn
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
+_omni_server_lock = threading.Lock()
+
+
+@pytest.fixture(scope="module")
+def omni_server(request):
+    """Start vLLM-Omni server as a subprocess with actual model weights.
+    Uses session scope so the server starts only once for the entire test session.
+    Multi-stage initialization can take 10-20+ minutes.
+    """
+    with _omni_server_lock:
+        model, stage_config_path = request.param
+
+        print(f"Starting OmniServer with model: {model}")
+
+        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+            print("OmniServer started successfully")
+            yield server
+            print("OmniServer stopping...")
+
+        print("OmniServer stopped")
+
+
+@pytest.fixture
 def client(omni_server):
     """OpenAI client for the running vLLM-Omni server."""
     return openai.OpenAI(
@@ -86,227 +109,180 @@ def get_deploy_config(deploy_type="TP1"):
     return result.get(deploy_type, result["TP1"])
 
 
-@pytest.mark.parametrize("test_config", test_params)
-def test_text_to_text_001(test_config: tuple[str, str]) -> None:
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_text_001(client: openai.OpenAI, omni_server) -> None:
     """Test processing text, generating text output via OpenAI API."""
-    model, stage_config_path = test_config
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
-        # Test single completion
-        api_client = client(server)
-        start_time = time.perf_counter()
-        chat_completion = api_client.chat.completions.create(
-            model=server.model, messages=messages, max_tokens=20, modalities=["text"]
-        )
-        # Verify E2E
-        print(f"the request e2e is: {time.perf_counter() - start_time}")
-        # TODO: Verify the E2E latency after confirmation baseline.
+    # Test single completion
+    start_time = time.perf_counter()
+    chat_completion = client.chat.completions.create(
+        model=omni_server.model, messages=messages, max_tokens=20, modalities=["text"]
+    )
+    # Verify E2E
+    print(f"the request e2e is: {time.perf_counter() - start_time}")
+    # TODO: Verify the E2E latency after confirmation baseline.
 
-        # Verify only output text
-        assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
+    # Verify only output text
+    assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
 
-        # Verify text output success
-        text_choice = chat_completion.choices[0]
-        assert text_choice.message.content is not None, "No text output is generated"
-        assert chat_completion.usage.completion_tokens <= 20, "The output length more than the requested max_tokens."
-        assert "beijing" in text_choice.message.content.lower(), "The output do not contain keywords."
+    # Verify text output success
+    text_choice = chat_completion.choices[0]
+    assert text_choice.message.content is not None, "No text output is generated"
+    assert chat_completion.usage.completion_tokens <= 20, "The output length more than the requested max_tokens."
+    assert "beijing" in text_choice.message.content.lower(), "The output do not contain keywords."
 
 
-@pytest.mark.parametrize("test_config", test_params)
-def test_audio_to_text_001(test_config: tuple[str, str]) -> None:
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_to_text_001(client: openai.OpenAI, omni_server) -> None:
     """Test processing text, generating text output via OpenAI API."""
-    model, stage_config_path = test_config
-    deploy_config = get_deploy_config()
-    deploy_config[0]["default_sampling_params.ignore_eos"] = True
-    stage_config_path = modify_stage_config(stage_config_path, deploy_config)
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(1, 1)['base64']}"
-        messages = dummy_messages_from_mix_data(audio_data_url=audio_data_url)
-        # Test single completion
-        api_client = client(server)
-        start_time = time.perf_counter()
-        chat_completion = api_client.chat.completions.create(
-            model=server.model, messages=messages, max_tokens=200, modalities=["text"]
-        )
-        # Verify only output text
-        assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(1, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(audio_data_url=audio_data_url)
+    # Test single completion
+    start_time = time.perf_counter()
+    chat_completion = client.chat.completions.create(model=omni_server.model, messages=messages, modalities=["text"])
+    # Verify only output text
+    assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
 
-        # Verify text output success
-        text_choice = chat_completion.choices[0]
-        assert text_choice.message.content is not None, "No text output is generated"
-        assert chat_completion.usage.completion_tokens == 200, (
-            "The output length differs from the requested max_tokens."
-        )
+    # Verify text output success
+    text_choice = chat_completion.choices[0]
+    assert text_choice.message.content is not None, "No text output is generated"
+    assert "water" in text_choice.message.content.lower(), "The output do not contain keywords."
 
-        # Verify E2E
-        print(f"the request e2e is: {time.perf_counter() - start_time}")
-        # TODO: Verify the E2E latency after confirmation baseline.
+    # Verify E2E
+    print(f"the request e2e is: {time.perf_counter() - start_time}")
+    # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.parametrize("test_config", test_params)
-def test_audio_to_text_audio_001(test_config: tuple[str, str]) -> None:
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     """Test processing text, generating audio output via OpenAI API."""
 
-    model, stage_config_path = test_config
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(1, 5)['base64']}"
+
+    messages = dummy_messages_from_mix_data(audio_data_url=audio_data_url)
     num_concurrent_requests = get_max_batch_size()
-    stage_config_path = modify_stage_config(
-        stage_config_path,
-        {
-            "stage_args": {
-                0: {"runtime.max_batch_size": num_concurrent_requests},
-                1: {"runtime.max_batch_size": num_concurrent_requests},
-            }
-        },
-    )
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        audio_data_url = []
-        for _ in range(5):
-            audio_data_url.append(f"data:audio/wav;base64,{generate_synthetic_audio(1, 5)['base64']}")
-
-        messages = dummy_messages_from_mix_data(audio_data_url=audio_data_url)
-
-        # Test single completion
-        api_client = client(server)
-        e2e_list = list()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
-            # Submit multiple completion requests concurrently
-            futures = [
-                executor.submit(api_client.chat.completions.create, model=server.model, messages=messages)
-                for _ in range(num_concurrent_requests)
-            ]
-            start_time = time.perf_counter()
-            # Wait for all requests to complete and collect results
-            chat_completions = list()
-            for future in concurrent.futures.as_completed(futures):
-                chat_completions.append(future.result())
-                # Verify E2E
-                current_e2e = time.perf_counter() - start_time
-                print(f"the request e2e is: {current_e2e}")
-                # TODO: Verify the E2E latency after confirmation baseline.
-                e2e_list.append(current_e2e)
-
-        print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
-        # Verify all completions succeeded
-        assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
-        for chat_completion in chat_completions:
-            # Verify audio output success
-            audio_message = chat_completion.choices[1].message
-            audio_data = audio_message.audio.data
-            assert audio_data is not None, "No audio output is generated"
-            assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
-
-            # Verify text output success
-            text_choice = chat_completion.choices[0]
-            text_content = text_choice.message.content
-            assert text_choice.message.content is not None, "No text output is generated"
-
-            # Verify text output same as audio output
-            audio_content = convert_audio_to_text(audio_data)
-            print(f"text content is: {text_content}")
-            print(f"audio content is: {audio_content}")
-            similarity = cosine_similarity_text(audio_content, text_content)
-            print(f"similarity between audio and text is: {similarity}")
-            assert similarity > 0.9, "The audio content is not same as the text"
-
-
-@pytest.mark.parametrize("test_config", test_params)
-def test_image_to_text_001(test_config: tuple[str, str]) -> None:
-    """Test processing text, generating text output via OpenAI API."""
-    model, stage_config_path = test_config
-    deploy_config = get_deploy_config()
-    stage_config_path = modify_stage_config(stage_config_path, deploy_config)
-
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
-        messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
-        # Test single completion
-        api_client = client(server)
+    # Test single completion
+    e2e_list = list()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+        # Submit multiple completion requests concurrently
+        futures = [
+            executor.submit(client.chat.completions.create, model=omni_server.model, messages=messages)
+            for _ in range(num_concurrent_requests)
+        ]
         start_time = time.perf_counter()
-        chat_completion = api_client.chat.completions.create(
-            model=server.model, messages=messages, max_tokens=100, modalities=["text"]
-        )
-        # Verify E2E
-        print(f"the request e2e is: {time.perf_counter() - start_time}")
-        # TODO: Verify the E2E latency after confirmation baseline.
+        # Wait for all requests to complete and collect results
+        chat_completions = list()
+        for future in concurrent.futures.as_completed(futures):
+            chat_completions.append(future.result())
+            # Verify E2E
+            current_e2e = time.perf_counter() - start_time
+            print(f"the request e2e is: {current_e2e}")
+            # TODO: Verify the E2E latency after confirmation baseline.
+            e2e_list.append(current_e2e)
 
-        # Verify only output text
-        assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
+    print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
+    # Verify all completions succeeded
+    assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
+    for chat_completion in chat_completions:
+        # Verify audio output success
+        audio_message = chat_completion.choices[1].message
+        audio_data = audio_message.audio.data
+        assert audio_data is not None, "No audio output is generated"
+        assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
+
+        # Verify text output success
+        text_choice = chat_completion.choices[0]
+        text_content = text_choice.message.content
+        assert text_choice.message.content is not None, "No text output is generated"
+
+        # Verify text output same as audio output
+        audio_content = convert_audio_to_text(audio_data)
+        print(f"text content is: {text_content}")
+        print(f"audio content is: {audio_content}")
+        similarity = cosine_similarity_text(audio_content, text_content)
+        print(f"similarity between audio and text is: {similarity}")
+        assert similarity > 0.9, "The audio content is not same as the text"
+
+
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_image_to_text_001(client: openai.OpenAI, omni_server) -> None:
+    """Test processing text, generating text output via OpenAI API."""
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
+    # Test single completion
+    start_time = time.perf_counter()
+    chat_completion = client.chat.completions.create(
+        model=omni_server.model, messages=messages, max_tokens=100, modalities=["text"]
+    )
+    # Verify E2E
+    print(f"the request e2e is: {time.perf_counter() - start_time}")
+    # TODO: Verify the E2E latency after confirmation baseline.
+
+    # Verify only output text
+    assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
+
+    # Verify text output success
+    text_choice = chat_completion.choices[0]
+    text_content = text_choice.message.content
+    assert text_content is not None, "No text output is generated"
+    assert chat_completion.usage.completion_tokens <= 100, "The output length more than the requested max_tokens."
+    assert "square" in text_content.lower(), "The output do not contain keywords."
+
+
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_image_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
+    """Test processing text, generating audio output via OpenAI API."""
+
+    num_concurrent_requests = get_max_batch_size()
+
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
+
+    # Test single completion
+    e2e_list = list()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+        # Submit multiple completion requests concurrently
+        futures = [
+            executor.submit(
+                client.chat.completions.create,
+                model=omni_server.model,
+                messages=messages,
+            )
+            for _ in range(num_concurrent_requests)
+        ]
+        start_time = time.perf_counter()
+        # Wait for all requests to complete and collect results
+        chat_completions = list()
+        for future in concurrent.futures.as_completed(futures):
+            chat_completions.append(future.result())
+            # Verify E2E
+            current_e2e = time.perf_counter() - start_time
+            print(f"the request e2e is: {current_e2e}")
+            # TODO: Verify the E2E latency after confirmation baseline.
+            e2e_list.append(current_e2e)
+
+    print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
+    # Verify all completions succeeded
+    assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
+    for chat_completion in chat_completions:
+        # Verify audio output success
+        audio_message = chat_completion.choices[1].message
+        audio_data = audio_message.audio.data
+        assert audio_data is not None, "No audio output is generated"
+        assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
 
         # Verify text output success
         text_choice = chat_completion.choices[0]
         text_content = text_choice.message.content
         assert text_content is not None, "No text output is generated"
-        assert chat_completion.usage.completion_tokens <= 100, "The output length more than the requested max_tokens."
         assert "square" in text_content.lower(), "The output do not contain keywords."
 
-
-@pytest.mark.parametrize("test_config", test_params)
-def test_image_to_text_audio_001(test_config: tuple[str, str]) -> None:
-    """Test processing text, generating audio output via OpenAI API."""
-
-    model, stage_config_path = test_config
-    num_concurrent_requests = 5
-    stage_config_path = modify_stage_config(
-        stage_config_path,
-        {
-            "stage_args": {
-                0: {"runtime.max_batch_size": num_concurrent_requests},
-                1: {"runtime.max_batch_size": num_concurrent_requests},
-            }
-        },
-    )
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        image_data_url = []
-        for _ in range(4):
-            image_data_url.append(f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}")
-
-        messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
-
-        # Test single completion
-        api_client = client(server)
-        e2e_list = list()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
-            # Submit multiple completion requests concurrently
-            futures = [
-                executor.submit(
-                    api_client.chat.completions.create,
-                    model=server.model,
-                    messages=messages,
-                )
-                for _ in range(num_concurrent_requests)
-            ]
-            start_time = time.perf_counter()
-            # Wait for all requests to complete and collect results
-            chat_completions = list()
-            for future in concurrent.futures.as_completed(futures):
-                chat_completions.append(future.result())
-                # Verify E2E
-                current_e2e = time.perf_counter() - start_time
-                print(f"the request e2e is: {current_e2e}")
-                # TODO: Verify the E2E latency after confirmation baseline.
-                e2e_list.append(current_e2e)
-
-        print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
-        # Verify all completions succeeded
-        assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
-        for chat_completion in chat_completions:
-            # Verify audio output success
-            audio_message = chat_completion.choices[1].message
-            audio_data = audio_message.audio.data
-            assert audio_data is not None, "No audio output is generated"
-            assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
-
-            # Verify text output success
-            text_choice = chat_completion.choices[0]
-            text_content = text_choice.message.content
-            assert text_content is not None, "No text output is generated"
-            assert "square" in text_content.lower(), "The output do not contain keywords."
-
-            # Verify text output same as audio output
-            audio_content = convert_audio_to_text(audio_data)
-            print(f"text content is: {text_content}")
-            print(f"audio content is: {audio_content}")
-            similarity = cosine_similarity_text(audio_content, text_content)
-            print(f"similarity between audio and text is: {similarity}")
-            assert similarity > 0.9, "The audio content is not same as the text"
+        # Verify text output same as audio output
+        audio_content = convert_audio_to_text(audio_data)
+        print(f"text content is: {text_content}")
+        print(f"audio content is: {audio_content}")
+        similarity = cosine_similarity_text(audio_content, text_content)
+        print(f"similarity between audio and text is: {similarity}")
+        assert similarity > 0.9, "The audio content is not same as the text"

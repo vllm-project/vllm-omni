@@ -1,6 +1,4 @@
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionStreamResponse,
-)
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionStreamResponse
 
 
 class OmniChatCompletionStreamResponse(ChatCompletionStreamResponse):

@@ -1,10 +1,10 @@
-from vllm.inputs.data import SingletonPrompt
 from vllm.inputs.parse import (
     ParsedEmbedsPrompt,
     ParsedSingletonPrompt,
     ParsedStrPrompt,
     ParsedTextPrompt,
     ParsedTokensPrompt,
+    SingletonPrompt,
 )
 
 
