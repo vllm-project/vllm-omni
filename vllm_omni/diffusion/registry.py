@@ -13,8 +13,6 @@ from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
 logger = init_logger(__name__)
 
-logger = init_logger(__name__)
-
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
     "QwenImagePipeline": (
