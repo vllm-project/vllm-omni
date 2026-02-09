@@ -12,11 +12,10 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset
 from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.multimodal.image import convert_image_mode
-
-from tests.utils import create_new_process_for_each_test, hardware_test
 from vllm_omni.platforms import current_omni_platform
 
-from .conftest import OmniRunner
+from tests.conftest import OmniRunner
+from .utils import create_new_process_for_each_test, hardware_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
