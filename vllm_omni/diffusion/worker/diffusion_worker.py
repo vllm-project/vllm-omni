@@ -13,10 +13,11 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 import zmq
-from vllm.config import VllmConfig
+from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import GiB_bytes
+from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
@@ -84,13 +85,16 @@ class DiffusionWorker:
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration
-        vllm_config = VllmConfig()
+        vllm_config = VllmConfig(compilation_config=CompilationConfig())
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
-        with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
+        with (
+            set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
+            set_current_vllm_config(self.vllm_config),
+        ):
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
@@ -104,16 +108,17 @@ class DiffusionWorker:
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
+            init_workspace_manager(self.device)
 
-        # Create model runner and load model
-        self.model_runner = DiffusionModelRunner(
-            vllm_config=self.vllm_config,
-            od_config=self.od_config,
-            device=self.device,
-        )
-        self.model_runner.load_model(
-            memory_pool_context_fn=self._maybe_get_memory_pool_context,
-        )
+            # Create model runner and load model
+            self.model_runner = DiffusionModelRunner(
+                vllm_config=self.vllm_config,
+                od_config=self.od_config,
+                device=self.device,
+            )
+            self.model_runner.load_model(
+                memory_pool_context_fn=self._maybe_get_memory_pool_context,
+            )
         assert self.model_runner.pipeline is not None
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.model_runner.pipeline,

@@ -123,7 +123,7 @@ steps:
     timeout_in_minutes: 20
     depends_on: image-build
     commands:
-      - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+      - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:

@@ -85,6 +85,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image_3",
+        "pipeline_hunyuan_image_3",
+        "HunyuanImage3Pipeline",
+    ),
     "Flux2KleinPipeline": (
         "flux2_klein",
         "pipeline_flux2_klein",
