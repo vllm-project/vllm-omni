@@ -6,6 +6,8 @@ import pytest
 
 from vllm_omni.entrypoints.stage_utils import set_stage_devices
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _make_dummy_torch(call_log):
     class _Props:

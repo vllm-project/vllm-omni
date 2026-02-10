@@ -3,6 +3,8 @@
 
 import pytest
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_resolve_max_mel_frames_default():
     from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import resolve_max_mel_frames

@@ -8,6 +8,7 @@ nav:
     - OpenAI-Compatible API:
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
+      - Text to Speech: serving/speech_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:
@@ -44,6 +45,7 @@ nav:
       - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
       - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
+    - ComfyUI: features/comfyui.md
 - Developer Guide:
   - General:
     - contributing/README.md
@@ -53,6 +55,12 @@ nav:
     - contributing/model/README.md
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
+    - Advanced Features:
+      - contributing/features/cfg_parallel.md
+      - contributing/features/sequence_parallel.md
+      - contributing/features/tensor_parallel.md
+      - contributing/features/cache_dit.md
+      - contributing/features/teacache.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md

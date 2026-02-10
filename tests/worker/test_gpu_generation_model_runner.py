@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:

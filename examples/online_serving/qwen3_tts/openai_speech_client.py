@@ -5,10 +5,10 @@ to generate audio from text using Qwen3-TTS models.
 
 Examples:
     # CustomVoice task (predefined speaker)
-    python openai_speech_client.py --text "Hello, how are you?" --voice Vivian
+    python openai_speech_client.py --text "Hello, how are you?" --voice vivian
 
     # CustomVoice with emotion instruction
-    python openai_speech_client.py --text "I'm so happy!" --voice Vivian \
+    python openai_speech_client.py --text "I'm so happy!" --voice vivian \
         --instructions "Speak with excitement"
 
     # VoiceDesign task (voice from description)
@@ -30,7 +30,7 @@ import os
 import httpx
 
 # Default server configuration
-DEFAULT_API_BASE = "http://localhost:8000"
+DEFAULT_API_BASE = "http://localhost:8091"
 DEFAULT_API_KEY = "EMPTY"
 
 
@@ -111,9 +111,14 @@ def run_tts_generation(args) -> None:
         print(response.text)
         return
 
-    if response.content.decode("utf-8").startswith('{"error"'):
-        print(f"Error: {response.content.decode('utf-8')}")
-        return
+    # Check for JSON error response (only if content is valid UTF-8 text)
+    try:
+        text = response.content.decode("utf-8")
+        if text.startswith('{"error"'):
+            print(f"Error: {text}")
+            return
+    except UnicodeDecodeError:
+        pass  # Binary audio data, not an error
 
     # Save audio response
     output_path = args.output or "tts_output.wav"
@@ -173,8 +178,8 @@ def parse_args():
     parser.add_argument(
         "--voice",
         type=str,
-        default="Vivian",
-        help="Speaker/voice name (default: Vivian). Options: Vivian, Ryan, etc.",
+        default="vivian",
+        help="Speaker/voice name (default: vivian). Options: vivian, ryan, aiden, etc.",
     )
     parser.add_argument(
         "--language",

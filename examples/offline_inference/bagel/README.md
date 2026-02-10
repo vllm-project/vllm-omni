@@ -151,6 +151,24 @@ The default yaml configuration deploys Thinker and DiT on the same GPU. You can 
 
 ------
 
+#### Tensor Parallelism (TP)
+
+For larger models or multi-GPU environments, you can enable Tensor Parallelism (TP) by modifying the stage configuration (e.g., [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)).
+
+1. **Set `tensor_parallel_size`**: Increase this value (e.g., to `2` or `4`).
+2. **Set `devices`**: Specify the comma-separated GPU IDs to be used for the stage (e.g., `"0,1"`).
+
+Example configuration for TP=2 on GPUs 0 and 1:
+```yaml
+    engine_args:
+      tensor_parallel_size: 2
+      ...
+    runtime:
+      devices: "0,1"
+```
+
+------
+
 #### 🔗 Runtime Configuration
 
 | Parameter             | Value   | Description                      |

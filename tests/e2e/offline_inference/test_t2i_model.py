@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -32,6 +33,9 @@ elif current_omni_platform.is_rocm():
     models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 2})
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str):
     m = None

@@ -166,6 +166,7 @@ class OmniDiffusionSamplingParams:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     generator: torch.Generator | list[torch.Generator] | None = None
+    generator_device: str | None = None
 
     # layered info
     layers: int = 4

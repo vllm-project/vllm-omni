@@ -12,3 +12,4 @@ torchsde>=0.2.6
 openai-whisper>=20250625
 imageio[ffmpeg]>=2.37.2
 sox>=1.5.0
+prettytable>=3.8.0

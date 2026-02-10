@@ -22,10 +22,27 @@ cd /workspace/vllm-omni/examples/online_serving/bagel
 bash run_server.sh
 ```
 
-If you have a custom stage configs file, launch the server with the command below:
-
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+```
+
+#### 🚀 Tensor Parallelism (TP)
+
+For larger models or multi-GPU environments, you can enable Tensor Parallelism (TP) for the server.
+
+1. **Modify Stage Config**: Create or modify a stage configuration yaml (e.g., [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)). Set `tensor_parallel_size` to `2` (or more) and update `devices` to include multiple GPU IDs (e.g., `"0,1"`).
+
+```yaml
+    engine_args:
+      tensor_parallel_size: 2
+      ...
+    runtime:
+      devices: "0,1"
+```
+
+2. **Launch Server**:
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/your/custom_bagel.yaml
 ```
 
 ### Send Multi-modal Request

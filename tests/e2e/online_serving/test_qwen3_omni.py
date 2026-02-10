@@ -28,6 +28,7 @@ from tests.conftest import (
     merge_base64_and_convert_to_text,
     modify_stage_config,
 )
+from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -145,6 +146,9 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> None:
     """
@@ -215,6 +219,9 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     assert similarity > 0.9, "The audio content is not same as the text"
 
 
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
     """

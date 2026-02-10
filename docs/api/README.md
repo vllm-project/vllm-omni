@@ -15,9 +15,6 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
 - [vllm_omni.entrypoints.client_request_state.ClientRequestState][]
-- [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
-- [vllm_omni.entrypoints.log_utils.StageRequestMetrics][]
-- [vllm_omni.entrypoints.log_utils.StageStats][]
 - [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni.OmniBase][]
 - [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
@@ -114,3 +111,8 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
 - [vllm_omni.worker.mixins.OmniWorkerMixin][]
+
+
+## Metrics
+
+- [vllm_omni.metrics.OrchestratorAggregator][]
