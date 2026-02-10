@@ -86,9 +86,13 @@ def mock_request():
     # OpenAI standard sampling fields
     request.temperature = None
     request.top_p = None
+    request.top_k = None
     request.max_tokens = None
+    request.min_tokens = None
     request.seed = None
+    request.ignore_eos = None
     request.stop = None
+    request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
     return request
@@ -106,9 +110,13 @@ def test_openai_sampling_fields_contains_expected_fields():
     expected_fields = {
         "temperature",
         "top_p",
+        "top_k",
         "max_tokens",
+        "min_tokens",
         "seed",
+        "ignore_eos",
         "stop",
+        "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
     }
@@ -234,20 +242,6 @@ def test_multiple_params_override_together(serving_chat, mock_request):
     # Preserved from YAML (not in _OPENAI_SAMPLING_FIELDS)
     assert comprehension_params.top_k == 1
     assert comprehension_params.repetition_penalty == 1.05
-
-
-def test_yaml_custom_params_not_overridden_by_request(serving_chat, mock_request):
-    """Test that YAML custom params (top_k, repetition_penalty) are not affected."""
-    # Even if request has these attributes, they should not override YAML
-    # because they're not in _OPENAI_SAMPLING_FIELDS
-    mock_request.top_k = 100  # Not in allowlist
-    mock_request.repetition_penalty = 2.0  # Not in allowlist
-
-    result = serving_chat._build_sampling_params_list_from_request(mock_request)
-
-    comprehension_params = result[0]
-    assert comprehension_params.top_k == 1  # YAML default preserved
-    assert comprehension_params.repetition_penalty == 1.05  # YAML default preserved
 
 
 # =============================================================================

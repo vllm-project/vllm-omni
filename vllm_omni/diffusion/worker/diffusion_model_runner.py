@@ -87,18 +87,17 @@ class DiffusionModelRunner:
             return nullcontext()
 
         # Load model within forward context
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            load_config = LoadConfig()
-            model_loader = DiffusersPipelineLoader(load_config)
-            time_before_load = time.perf_counter()
+        load_config = LoadConfig()
+        model_loader = DiffusersPipelineLoader(load_config)
+        time_before_load = time.perf_counter()
 
-            with get_memory_context():
-                with DeviceMemoryProfiler() as m:
-                    self.pipeline = model_loader.load_model(
-                        od_config=self.od_config,
-                        load_device=load_device,
-                    )
-            time_after_load = time.perf_counter()
+        with get_memory_context():
+            with DeviceMemoryProfiler() as m:
+                self.pipeline = model_loader.load_model(
+                    od_config=self.od_config,
+                    load_device=load_device,
+                )
+        time_after_load = time.perf_counter()
 
         logger.info(
             "Model loading took %.4f GiB and %.6f seconds",
@@ -159,7 +158,13 @@ class DiffusionModelRunner:
         self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
 
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            if req.sampling_params.generator_device is not None:
+                gen_device = req.sampling_params.generator_device
+            elif self.device.type == "cpu":
+                gen_device = "cpu"
+            else:
+                gen_device = self.device
+            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
         # Refresh cache context if needed
         if (

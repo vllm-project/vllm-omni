@@ -971,6 +971,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         _update_if_not_none(
             gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
         )
+        _update_if_not_none(gen_params, "generator_device", request.generator_device)
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
@@ -1047,6 +1048,7 @@ async def edit_images(
     guidance_scale: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
+    generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
 ) -> ImageGenerationResponse:
@@ -1129,6 +1131,7 @@ async def edit_images(
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
         _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
+        _update_if_not_none(gen_params, "generator_device", generator_device)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit_{int(time.time())}"

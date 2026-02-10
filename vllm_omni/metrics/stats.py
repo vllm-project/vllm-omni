@@ -221,24 +221,33 @@ class OrchestratorAggregator:
         stage_id: int,
         request_id: str,
     ) -> None:
-        if (
-            output_to_yield.final_output_type == "audio"
-            and finished
-            and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
-        ):
-            nframes = int(multimodal_output[-1].shape[0])
-            stage_events_for_req = self.stage_events.get(request_id, [])
-            if stage_events_for_req:
-                for stage_event in stage_events_for_req:
-                    if stage_event.stage_id == stage_id:
-                        stage_event.audio_generated_frames += nframes
-                        break
-            else:
-                logger.warning(
-                    "Failed to record audio generated frames for request %s at stage %s: no stage event found",
-                    request_id,
-                    stage_id,
-                )
+        try:
+            if (
+                output_to_yield.final_output_type == "audio"
+                and finished
+                and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
+                and len(multimodal_output) > 0
+            ):
+                last = multimodal_output[-1]
+                nframes = int(last.shape[0]) if last.ndim > 0 else 1
+                stage_events_for_req = self.stage_events.get(request_id, [])
+                if stage_events_for_req:
+                    for stage_event in stage_events_for_req:
+                        if stage_event.stage_id == stage_id:
+                            stage_event.audio_generated_frames += nframes
+                            break
+                else:
+                    logger.warning(
+                        "Failed to record audio generated frames for request %s at stage %s: no stage event found",
+                        request_id,
+                        stage_id,
+                    )
+        except Exception:
+            logger.debug(
+                "Failed to record audio frames for request %s",
+                request_id,
+                exc_info=True,
+            )
 
     def _as_stage_request_stats(
         self,

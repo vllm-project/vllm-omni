@@ -45,6 +45,9 @@ class DiffusionParallelConfig:
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
+    vae_patch_parallel_size: int = 1
+    """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -56,6 +59,7 @@ class DiffusionParallelConfig:
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
         assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
+        assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -65,6 +69,7 @@ class DiffusionParallelConfig:
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+
         self.world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
@@ -359,7 +364,6 @@ class OmniDiffusionConfig:
     # support multi images input
     supports_multimodal_inputs: bool = False
 
-    # Logging
     log_level: str = "info"
 
     # Omni configuration (injected from stage config)

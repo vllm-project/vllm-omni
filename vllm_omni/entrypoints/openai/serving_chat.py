@@ -489,9 +489,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _OPENAI_SAMPLING_FIELDS: set[str] = {
         "temperature",
         "top_p",
+        "top_k",
         "max_tokens",
+        "min_tokens",
         "seed",
+        "ignore_eos",
         "stop",
+        "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
     }
