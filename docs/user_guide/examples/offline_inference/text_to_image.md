@@ -51,7 +51,8 @@ if __name__ == "__main__":
 
     For diffusion pipelines, the stage config field `stage_args.[].runtime.max_batch_size` is 1 by default, and the input
     list is sliced into single-item requests before feeding into the diffusion pipeline. For models that do internally support
-    batched inputs, you can [modify this configuration](../../../configuration/stage_configs.md) to let the model accept a longer batch of prompts.
+    batched inputs, you can [modify this configuration](../../../configuration/stage_configs.md
+    ) to let the model accept a longer batch of prompts.
 
 Apart from string prompt, vLLM-Omni also supports dictionary prompts in the same style as vLLM.
 This is useful for models that support negative prompts.
@@ -95,11 +96,16 @@ Key arguments:
 - `--prompt`: text description (string).
 - `--seed`: integer seed for deterministic sampling.
 - `--cfg_scale`: true CFG scale (model-specific guidance strength).
-- `--cfg_parallel_size`: the number of devices to run CFG Parallel. CFG Parallel is valid only if classifier-free guidance is enabled and `cfg_parallel_size` is set to 2.
 - `--num_images_per_prompt`: number of images to generate per prompt (saves as `output`, `output_1`, ...).
 - `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--height/--width`: output resolution (defaults 1024x1024).
 - `--output`: path to save the generated PNG.
+- `--vae_use_slicing`: enable VAE slicing for memory optimization.
+- `--vae_use_tiling`: enable VAE tiling for memory optimization.
+- `--cfg_parallel_size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+
+> ℹ️ If you encounter OOM errors, try using `--vae_use_slicing` and `--vae_use_tiling` to reduce memory usage.
 
 > ℹ️ Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
 

@@ -102,15 +102,19 @@ class DiffusionEngine:
         if not isinstance(outputs, list):
             outputs = [outputs] if outputs is not None else []
 
+        metrics = {
+            "image_num": int(request.sampling_params.num_outputs_per_prompt),
+            "resolution": int(request.sampling_params.resolution),
+            "postprocess_time_ms": postprocess_time * 1000,
+        }
+        if self.pre_process_func is not None:
+            metrics["preprocessing_time_ms"] = preprocess_time * 1000
+
         # Handle single request or multiple requests
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
             request_id = request.request_ids[0] if request.request_ids else ""
-
-            metrics = {}
-            if output.trajectory_timesteps is not None:
-                metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
             if supports_audio_output(self.od_config.model_class_name):
                 audio_payload = outputs[0] if len(outputs) == 1 else outputs
@@ -148,10 +152,6 @@ class DiffusionEngine:
                 num_outputs = request.sampling_params.num_outputs_per_prompt
                 request_outputs = outputs[output_idx : output_idx + num_outputs] if output_idx < len(outputs) else []
                 output_idx += num_outputs
-
-                metrics = {}
-                if output.trajectory_timesteps is not None:
-                    metrics["trajectory_timesteps"] = output.trajectory_timesteps
 
                 if supports_audio_output(self.od_config.model_class_name):
                     audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
@@ -253,7 +253,7 @@ class DiffusionEngine:
 
         try:
             # Give worker enough time — export + compression + table can be slow
-            results = self.collective_rpc(method="stop_profile", timeout=60000)
+            results = self.collective_rpc(method="stop_profile", timeout=600)
         except Exception:
             logger.error("Failed to stop profiling on workers", exc_info=True)
             return {"traces": [], "tables": []}

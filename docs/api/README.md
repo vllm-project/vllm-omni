@@ -10,11 +10,11 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
 - [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
 - [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
+- [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
+- [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
+- [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
 - [vllm_omni.entrypoints.cli.serve.OmniServeCommand][]
 - [vllm_omni.entrypoints.client_request_state.ClientRequestState][]
-- [vllm_omni.entrypoints.log_utils.OrchestratorMetrics][]
-- [vllm_omni.entrypoints.log_utils.StageRequestMetrics][]
-- [vllm_omni.entrypoints.log_utils.StageStats][]
 - [vllm_omni.entrypoints.omni.Omni][]
 - [vllm_omni.entrypoints.omni.OmniBase][]
 - [vllm_omni.entrypoints.omni_diffusion.OmniDiffusion][]
@@ -26,7 +26,9 @@ Main entry points for vLLM-Omni inference and serving.
 
 Input data structures for multi-modal inputs.
 
+- [vllm_omni.inputs.data.OmniDiffusionSamplingParams][]
 - [vllm_omni.inputs.data.OmniEmbedsPrompt][]
+- [vllm_omni.inputs.data.OmniTextPrompt][]
 - [vllm_omni.inputs.data.OmniTokenInputs][]
 - [vllm_omni.inputs.data.OmniTokensPrompt][]
 - [vllm_omni.inputs.parse.parse_singleton_prompt_omni][]
@@ -58,6 +60,7 @@ Core scheduling and caching components.
 - [vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler][]
 - [vllm_omni.core.sched.output.OmniCachedRequestData][]
 - [vllm_omni.core.sched.output.OmniNewRequestData][]
+- [vllm_omni.core.sched.output.OmniSchedulerOutput][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedGroupResidualVectorQuantization][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.DistributedResidualVectorQuantization][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.vq.core_vq.EuclideanCodebook][]
@@ -88,20 +91,28 @@ Configuration classes.
 
 Worker classes and model runners for distributed inference.
 
-- [vllm_omni.diffusion.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]
-- [vllm_omni.diffusion.worker.gpu_diffusion_worker.GPUDiffusionWorker][]
-- [vllm_omni.diffusion.worker.gpu_diffusion_worker.WorkerProc][]
-- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorker][]
-- [vllm_omni.diffusion.worker.npu.npu_worker.NPUWorkerProc][]
+- [vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner][]
+- [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
+- [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
+- [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
+- [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]
+- [vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker][]
+- [vllm_omni.platforms.npu.worker.npu_generation_model_runner.NPUGenerationModelRunner][]
+- [vllm_omni.platforms.npu.worker.npu_generation_worker.NPUGenerationWorker][]
+- [vllm_omni.platforms.npu.worker.npu_model_runner.OmniNPUModelRunner][]
+- [vllm_omni.platforms.xpu.worker.xpu_ar_model_runner.XPUARModelRunner][]
+- [vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker][]
+- [vllm_omni.platforms.xpu.worker.xpu_generation_model_runner.XPUGenerationModelRunner][]
+- [vllm_omni.platforms.xpu.worker.xpu_generation_worker.XPUGenerationWorker][]
 - [vllm_omni.worker.gpu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
-- [vllm_omni.worker.npu.npu_ar_model_runner.ExecuteModelState][]
-- [vllm_omni.worker.npu.npu_ar_model_runner.NPUARModelRunner][]
-- [vllm_omni.worker.npu.npu_ar_worker.NPUARWorker][]
-- [vllm_omni.worker.npu.npu_generation_model_runner.NPUGenerationModelRunner][]
-- [vllm_omni.worker.npu.npu_generation_worker.NPUGenerationWorker][]
-- [vllm_omni.worker.npu.npu_model_runner.OmniNPUModelRunner][]
+- [vllm_omni.worker.mixins.OmniWorkerMixin][]
+
+
+## Metrics
+
+- [vllm_omni.metrics.OrchestratorAggregator][]

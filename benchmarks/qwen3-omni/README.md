@@ -53,7 +53,7 @@ bash benchmarks/qwen3-omni/vllm_omni/eval_qwen3_moe_omni.sh
 ```
 
 What it does:
-- Runs `examples/offline_inference/qwen3_omni/end2end.py` with `--enable-stats`.
+- Runs `examples/offline_inference/qwen3_omni/end2end.py` with `--log-stats`.
 - Uses `benchmarks/build_dataset/top100.txt` and writes to:
   - Logs: `benchmarks/qwen3-omni/vllm_omni/logs/`
     - `omni_llm_pipeline_text.orchestrator.stats.jsonl` — per-stage latency stats.

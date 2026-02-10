@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .connectors.base import OmniConnectorBase
 
 from vllm_omni.entrypoints.stage_utils import OmniStageTaskType
+from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
 
@@ -30,7 +31,7 @@ def try_send_via_connector(
     sampling_params: Any,
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
-    metrics: Any,
+    metrics: OrchestratorAggregator,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -179,6 +180,27 @@ def try_recv_via_connector(
             return None, None
 
 
+def update_request_payload(connector: "OmniConnectorBase", req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
+    """Update the payload data for a request in the connector.
+
+    Args:
+        connector: OmniConnectorBase instance
+        req_id: Request ID to update
+        payload_data: New payload data to store
+    """
+    origin_payload = connector.request_payload[req_id]
+    for key, value in payload_data.items():
+        if key == "finished":
+            continue
+        elif isinstance(value, torch.Tensor) and key in origin_payload:
+            payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
+        elif isinstance(value, list) and key in origin_payload:
+            payload_data[key] = origin_payload[key] + value
+
+    connector.request_payload[req_id] = payload_data
+    return payload_data
+
+
 def get_chunk(
     connector: "OmniConnectorBase",
     scheduler_output: SchedulerOutput,
@@ -206,6 +228,7 @@ def get_chunk(
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
             new_req_data.additional_information = payload_data
+            connector.request_payload[req_id] = payload_data
             if payload_data.get("finished"):
                 connector.finished_requests.add(req_id)
 
@@ -222,15 +245,13 @@ def get_chunk(
         connector_get_key = f"{req_id}_{target_stage_id}_{chunk_id}"
         payload_data = get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key)
         if payload_data:
+            payload_data = update_request_payload(connector, req_id, payload_data)
             cached_reqs.additional_information[cached_req_id] = payload_data
             if payload_data.get("finished"):
                 connector.finished_requests.add(req_id)
 
 
 def get_through_connector(connector, target_stage_id, stage_id, req_id, connector_get_key):
-    # Wait for data from previous stage
-    import time
-
     # TODO: add correct check mechanism for the payload_data
     max_wait = 300
     for _ in range(max_wait):
@@ -280,12 +301,8 @@ def get_chunk_for_generation(
     if payload_data.get("finished"):
         connector.finished_requests.add(request_id)
         request.status = RequestStatus.FINISHED_STOPPED
-
-    # TODO: remove special handling for prompt token ids ?
-    if chunk_id == 0:
-        request.prompt_token_ids = payload_data.get("code_predictor_codes", [])
-    else:
-        request.prompt_token_ids += payload_data.get("code_predictor_codes", [])
+    request.prompt_token_ids = payload_data.get("code_predictor_codes", [])
+    request.num_computed_tokens = 0
 
 
 def put_chunk(
@@ -308,8 +325,6 @@ def put_chunk(
     stage_id = connector.stage_id
     next_stage_id = stage_id + 1
     request_id = request.external_req_id
-    prompt_token_ids = request.prompt_token_ids
-    connector.request_prompt_token_ids[request_id] = prompt_token_ids
     chunk_id = connector.put_requests[request_id]
     connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
     payload_data = None
@@ -318,6 +333,7 @@ def put_chunk(
     if custom_process_input_func:
         try:
             payload_data = custom_process_input_func(
+                connector=connector,
                 pooling_output=pooling_output,
                 request=request,
             )
@@ -325,41 +341,7 @@ def put_chunk(
             logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
-            logger.warning("[Stage-%d] No payload data to send for request %s", stage_id, request_id)
             return
-
-        if stage_id == 0 and chunk_id == 0:
-            if connector.request_payload.get(request_id) is None:
-                if not payload_data.get("finished"):
-                    connector.request_payload[request_id] = payload_data
-                    return
-            else:
-                save_payload = connector.request_payload.pop(request_id)
-                payload_data["thinker_embeddings"] = torch.cat(
-                    (save_payload.get("thinker_embeddings"), payload_data.get("thinker_embeddings")), dim=0
-                )
-                payload_data["thinker_hidden_states"] = torch.cat(
-                    (save_payload.get("thinker_hidden_states"), payload_data.get("thinker_hidden_states")), dim=0
-                )
-                logger.debug("[Stage-%d] Merged embeddings and hidden states for request %s", stage_id, request_id)
-
-        if stage_id == 1:
-            # TODO: Make parameters configurable and optimize algorithms
-            chunk_size = left_context_size = 25
-            connector.code_prompt_token_ids[request_id].append(payload_data.get("code_predictor_codes", []))
-            length = len(connector.code_prompt_token_ids[request_id])
-            chunk_length = length % chunk_size
-            if chunk_length != 0 and not payload_data.get("finished"):
-                return
-
-            context_length = chunk_length if chunk_length != 0 else chunk_size
-            end_index = min(length, left_context_size + context_length)
-            payload_data["code_predictor_codes"] = (
-                torch.tensor(connector.code_prompt_token_ids[request_id][-end_index:])
-                .transpose(0, 1)
-                .reshape(-1)
-                .tolist()
-            )
 
         success, size, metadata = connector.put(
             from_stage=str(stage_id), to_stage=str(next_stage_id), put_key=connector_put_key, data=payload_data

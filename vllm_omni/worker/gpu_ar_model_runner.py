@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -28,9 +29,6 @@ from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
     IntermediateTensors,
-    get_pp_group,
-    get_tp_group,
-    has_kv_transfer_group,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
@@ -221,6 +219,24 @@ class GPUARModelRunner(OmniGPUModelRunner):
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            # True if any attention backend handles KV cache update separately
+            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
+            # slot_mappings must use padded dimensions to match the key/value tensors.
+            from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+
+            has_separate_kv_update = not all(
+                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
+                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
+
             attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -232,6 +248,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings_by_group,
             )
 
             (
@@ -262,6 +279,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,

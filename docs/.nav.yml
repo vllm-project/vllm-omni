@@ -11,17 +11,23 @@ nav:
   - Examples:
     - examples/README.md
     - Offline Inference:
+      - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
+      - LoRA Inference Examples: user_guide/examples/offline_inference/lora_inference.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Qwen3-TTS Offline Inference: user_guide/examples/offline_inference/qwen3_tts.md
+      - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
     - Online Serving:
+      - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
+      - Online LoRA Inference (Diffusion): user_guide/examples/online_serving/lora_inference.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
+      - Qwen3-TTS Online Serving: user_guide/examples/online_serving/qwen3_tts.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
   - General:
     - usage/*
@@ -38,6 +44,7 @@ nav:
       - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
       - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
+    - ComfyUI: features/comfyui.md
 - Developer Guide:
   - General:
     - contributing/README.md
@@ -47,6 +54,12 @@ nav:
     - contributing/model/README.md
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_diffusion_model.md
+    - Advanced Features:
+      - contributing/features/cfg_parallel.md
+      - contributing/features/sequence_parallel.md
+      - contributing/features/tensor_parallel.md
+      - contributing/features/cache_dit.md
+      - contributing/features/teacache.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
@@ -54,6 +67,7 @@ nav:
     - Feature Design:
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
+      - design/feature/omni_connectors/
     - Module Design:
       - design/module/ar_module.md
       - design/module/dit_module.md

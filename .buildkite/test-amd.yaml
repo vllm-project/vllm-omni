@@ -44,7 +44,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
+    - pytest -s -v -m 'core_model and cache and diffusion and not distributed_rocm and MI325'
 
 - label: "Diffusion Sequence Parallelism Test"
   timeout_in_minutes: 20
@@ -56,7 +56,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
 
 - label: "Diffusion Tensor Parallelism Test"
   timeout_in_minutes: 20

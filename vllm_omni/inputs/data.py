@@ -104,6 +104,9 @@ class OmniEmbedsPrompt(EmbedsPrompt):
 # Must ensure that all additional prompt types are inherited from vLLM prompt types
 # Because TypedDict doesn't support isinstance and are dict. Cannot distinguish them in runtime.
 # Inheritance ensure that there are only additional fields but not removing fields--safe to route to LLM.generate()
+OmniSingletonPrompt: TypeAlias = str | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
+"""Omni singleton prompt type extending vLLM's SingletonPrompt with additional fields."""
+
 OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
 
 

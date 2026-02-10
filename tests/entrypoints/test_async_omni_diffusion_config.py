@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm_omni.entrypoints import omni as omni_module
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_default_stage_config_includes_cache_backend(monkeypatch):

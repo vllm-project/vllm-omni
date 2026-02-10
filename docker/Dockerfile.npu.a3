@@ -1,5 +1,5 @@
-ARG VLLM_ASCEND_IMAGE=quay.nju.edu.cn/ascend/vllm-ascend
-ARG VLLM_ASCEND_TAG=v0.11.0rc2
+ARG VLLM_ASCEND_IMAGE=quay.io/ascend/vllm-ascend
+ARG VLLM_ASCEND_TAG=v0.14.0rc1-a3
 FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
 
 ARG APP_DIR=/vllm-workspace/vllm-omni
@@ -8,7 +8,7 @@ WORKDIR ${APP_DIR}
 COPY . .
 
 # Install vllm-omni with dev dependencies
-RUN pip install --no-cache-dir -e ".[dev]"
+RUN pip install --no-cache-dir -e . --no-build-isolation
 
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 

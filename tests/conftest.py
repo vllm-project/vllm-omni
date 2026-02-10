@@ -60,6 +60,12 @@ def clean_gpu_memory_between_tests():
     _run_post_test_cleanup()
 
 
+@pytest.fixture(autouse=True)
+def log_test_name_before_test(request):
+    print(f"--- Running test: {request.node.name}")
+    yield
+
+
 def _run_pre_test_cleanup(enable_force=False):
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
@@ -582,14 +588,19 @@ def convert_audio_to_text(audio_data):
     """
     Convert base64 encoded audio data to text using speech recognition.
     """
-    import whisper
-
     audio_data = base64.b64decode(audio_data)
     output_path = f"./test_{int(time.time())}"
     with open(output_path, "wb") as audio_file:
         audio_file.write(audio_data)
 
     print(f"audio data is saved: {output_path}")
+
+    text = convert_audio_file_to_text(output_path=output_path)
+    return text
+
+
+def convert_audio_file_to_text(output_path):
+    import whisper
 
     model = whisper.load_model("base")
     text = model.transcribe(
@@ -598,6 +609,10 @@ def convert_audio_to_text(audio_data):
         word_timestamps=True,
         condition_on_previous_text=False,
     )["text"]
+    del model
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
     if text:
         return text
     else:
@@ -608,7 +623,6 @@ def merge_base64_and_convert_to_text(base64_list):
     """
     Merge a list of base64 encoded audio data and convert to text.
     """
-    import whisper
     from pydub import AudioSegment
 
     merged_audio = None
@@ -621,17 +635,8 @@ def merge_base64_and_convert_to_text(base64_list):
             merged_audio += seg
     output_path = f"./test_{int(time.time())}"
     merged_audio.export(output_path, format="wav")
-    model = whisper.load_model("base")
-    text = model.transcribe(
-        output_path,
-        temperature=0.0,
-        word_timestamps=True,
-        condition_on_previous_text=False,
-    )["text"]
-    if text:
-        return text
-    else:
-        return ""
+    text = convert_audio_file_to_text(output_path)
+    return text
 
 
 def modify_stage_config(
@@ -880,6 +885,7 @@ class OmniServer:
         model: str,
         serve_args: list[str],
         *,
+        port: int | None = None,
         env_dict: dict[str, str] | None = None,
     ) -> None:
         _run_pre_test_cleanup(enable_force=True)
@@ -890,7 +896,10 @@ class OmniServer:
         self.env_dict = env_dict
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
-        self.port = get_open_port()
+        if port is None:
+            self.port = get_open_port()
+        else:
+            self.port = port
 
     def _start_server(self) -> None:
         """Start the vLLM-Omni server subprocess."""

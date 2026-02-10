@@ -14,13 +14,17 @@ class MultiModalsBenchmarkMetrics(BenchmarkMetrics):
     median_audio_ttfp_ms: float = 0.0
     std_audio_ttfp_ms: float = 0.0
     percentiles_audio_ttfp_ms: list[tuple[float, float]] = None
-    total_audio_duration_ms: float = 0.0
+    total_audio_duration_s: float = 0.0
     total_audio_frames: int = 0
     audio_throughput: float = 0.0
     mean_audio_rtf: float = 0.0
     median_audio_rtf: float = 0.0
     std_audio_rtf: float = 0.0
     percentiles_audio_rtf: list[tuple[float, float]] = None
+    mean_audio_duration_s: float = 0.0
+    median_audio_duration_s: float = 0.0
+    std_audio_duration_s: float = 0.0
+    percentiles_audio_duration_s: list[tuple[float, float]] = None
 
 
 def print_metrics(
@@ -73,7 +77,7 @@ def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiMod
 
 def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchmarkMetrics):
     print("{s:{c}^{n}}".format(s=" Audio Result ", n=50, c="="))
-    print("{:<40} {:<10.2f}".format("Total audio duration generated(s):", metrics.total_audio_duration_ms))
+    print("{:<40} {:<10.2f}".format("Total audio duration generated(s):", metrics.total_audio_duration_s))
     print("{:<40} {:<10}".format("Total audio frames generated:", metrics.total_audio_frames))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", metrics.audio_throughput))
     for metric in selected_percentile_metrics:
@@ -92,16 +96,23 @@ def process_one_metric(
         "e2el": "End-to-end Latency",
         "audio_ttfp": "Time to First Packet",
         "audio_rtf": "Real Time Factor",
+        "audio_duration": "Audio Duration",
     }
 
     header = metric_header_map.get(metric_attribute_name, metric_attribute_name)
     print("{s:{c}^{n}}".format(s=header, n=50, c="-"))
 
     is_audio_rtf = metric_attribute_name == "audio_rtf"
+    is_audio_duration = metric_attribute_name == "audio_duration"
 
-    suffix = "" if is_audio_rtf else "_ms"
-    unit_suffix = "" if is_audio_rtf else " (ms)"
-
+    suffix = "_ms"
+    unit_suffix = " (ms)"
+    if is_audio_duration:
+        suffix = "_s"
+        unit_suffix = " (s)"
+    elif is_audio_rtf:
+        suffix = ""
+        unit_suffix = ""
     mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
     mean_value = getattr(metrics, mean_attr_name, 0.0)
     print(f"{f'Mean {metric_attribute_name.upper()}{unit_suffix}:':<40} {mean_value:<10.2f}")
@@ -212,6 +223,9 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
+        warnings.formatwarning = (
+            lambda msg, category, filename, lineno, line=None: f"{filename}:{lineno}: {category.__name__}: {msg}\n"
+        )
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration on the benchmark arguments.",
             stacklevel=2,
@@ -296,7 +310,11 @@ def calculate_metrics(
         std_audio_ttfp_ms=np.std(audio_ttfps or 0) * 1000,
         median_audio_ttfp_ms=np.median(audio_ttfps or 0) * 1000,
         percentiles_audio_ttfp_ms=[(p, np.percentile(audio_ttfps or 0, p) * 1000) for p in selected_percentiles],
-        total_audio_duration_ms=sum(audio_duration),
+        mean_audio_duration_s=np.mean(audio_duration or 0),
+        std_audio_duration_s=np.std(audio_duration or 0),
+        median_audio_duration_s=np.median(audio_duration or 0),
+        percentiles_audio_duration_s=[(p, np.percentile(audio_duration or 0, p)) for p in selected_percentiles],
+        total_audio_duration_s=sum(audio_duration),
         total_audio_frames=sum(audio_frames),
         audio_throughput=sum(audio_duration) / dur_s,
         mean_audio_rtf=np.mean(audio_rtfs or 0),

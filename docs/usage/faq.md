@@ -22,7 +22,7 @@ A: At first, you can check current [issues](https://github.com/vllm-project/vllm
 
 > Q: Does vLLM-Omni support AWQ or any other quantization?
 
-A: vLLM-Omni partitions model into several stages. For AR stages, it will reuse main logic of LLMEngine in vLLM. So current quantization supported in vLLM should be also supported in vLLM-Omni for them. But systematic verification is ongoing. For quantization for DiffusionEngine, we are working on it. Please stay tuned and welcome contribution!
+A: We plan to introduce GGUF FP8 prequantized models and online FP8 quantization in version 0.16.0. Support for other quantization types will follow in future releases. For details, please see our [Q1 quantization roadmap](https://github.com/vllm-project/vllm-omni/issues/1057).
 
 > Q: Does vLLM-Omni support multimodal streaming input and output?
 

@@ -9,6 +9,8 @@ import pytest
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
     "ignore",
