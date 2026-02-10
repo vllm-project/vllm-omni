@@ -371,6 +371,40 @@ class BagelPipeline(nn.Module):
                         # SigLIP processor returns dict with pixel_values; we want the tensor
                         return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
 
+                    # 关键：按照 Bagel 官方逻辑 resize 图像
+                    # 确保尺寸被 latent_downsample 整除（stride=16）
+                    stride = self.bagel.latent_downsample  # 通常 = 16
+                    max_img_size = int(self.bagel.max_latent_size * stride)  # 通常 = 512
+
+                    def _resize_to_stride(img):
+                        """Resize image so both dimensions are divisible by stride, 
+                        and within [min_size, max_size]."""
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        w, h = img.size
+                        # Scale down if longest edge exceeds max
+                        scale = min(max_img_size / max(w, h), 1.0)
+                        # Scale up if shortest edge is too small (min 256)
+                        min_img_size = min(256, max_img_size)
+                        scale = max(scale, min_img_size / min(w, h))
+                        new_w = max(stride, int(round(w * scale / stride) * stride))
+                        new_h = max(stride, int(round(h * scale / stride) * stride))
+                        # Clamp to max
+                        new_w = min(new_w, max_img_size)
+                        new_h = min(new_h, max_img_size)
+                        if new_w != w or new_h != h:
+                            img = img.resize((new_w, new_h), Image.BICUBIC)
+                        return img
+
+                    # Resize all input images
+                    image_input = [_resize_to_stride(img) for img in image_input]
+
+                    # 关键：从 resize 后的图像推导 image_shape
+                    # 官方代码: image_shapes = input_term.size[::-1]  # (H, W) from PIL (W, H)
+                    resized_w, resized_h = image_input[0].size
+                    image_shape = (resized_h, resized_w)
+                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}, image_shape={image_shape}")
+
                     def vae_transforms(img):
                         if img.mode != "RGB":
                             img = img.convert("RGB")
