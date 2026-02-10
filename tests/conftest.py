@@ -896,64 +896,6 @@ def modify_stage_config(
     return output_path
 
 
-def kill_process_tree(pid):
-    """kill process and its children with verification"""
-    try:
-        parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
-
-        # Get all PIDs first
-        all_pids = [pid] + [child.pid for child in children]
-
-        # Terminate children
-        for child in children:
-            try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
-
-        # Wait for children
-        gone, still_alive = psutil.wait_procs(children, timeout=10)
-
-        # Kill remaining children
-        for child in still_alive:
-            try:
-                child.kill()
-            except psutil.NoSuchProcess:
-                pass
-
-        # Terminate parent
-        try:
-            parent.terminate()
-            parent.wait(timeout=10)
-        except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-            try:
-                parent.kill()
-            except psutil.NoSuchProcess:
-                pass
-
-        # VERIFICATION: Check if all processes are gone
-        time.sleep(1)  # Give system time
-        alive_processes = []
-        for check_pid in all_pids:
-            if psutil.pid_exists(check_pid):
-                alive_processes.append(check_pid)
-
-        if alive_processes:
-            print(f"Warning: Processes still alive: {alive_processes}")
-            # Optional: Try system kill
-            import subprocess
-
-            for alive_pid in alive_processes:
-                try:
-                    subprocess.run(["kill", "-9", str(alive_pid)], timeout=2)
-                except Exception as e:
-                    print(f"Cleanup failed: {e}")
-
-    except psutil.NoSuchProcess:
-        pass
-
-
 class OmniServer:
     """Omniserver for vLLM-Omni tests."""
 
@@ -1022,13 +964,70 @@ class OmniServer:
 
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
 
+    def _kill_process_tree(self, pid):
+        """kill process and its children with verification"""
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+
+            # Get all PIDs first
+            all_pids = [pid] + [child.pid for child in children]
+
+            # Terminate children
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+
+            # Wait for children
+            gone, still_alive = psutil.wait_procs(children, timeout=10)
+
+            # Kill remaining children
+            for child in still_alive:
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+            # Terminate parent
+            try:
+                parent.terminate()
+                parent.wait(timeout=10)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                try:
+                    parent.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+            # VERIFICATION: Check if all processes are gone
+            time.sleep(1)  # Give system time
+            alive_processes = []
+            for check_pid in all_pids:
+                if psutil.pid_exists(check_pid):
+                    alive_processes.append(check_pid)
+
+            if alive_processes:
+                print(f"Warning: Processes still alive: {alive_processes}")
+                # Optional: Try system kill
+                import subprocess
+
+                for alive_pid in alive_processes:
+                    try:
+                        subprocess.run(["kill", "-9", str(alive_pid)], timeout=2)
+                    except Exception as e:
+                        print(f"Cleanup failed: {e}")
+
+        except psutil.NoSuchProcess:
+            pass
+
     def __enter__(self):
         self._start_server()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
-            kill_process_tree(self.proc.pid)
+            self._kill_process_tree(self.proc.pid)
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
         cleanup_dist_env_and_memory()
@@ -1386,7 +1385,6 @@ class OmniRunner:
             stage_configs_path=stage_configs_path,
             **kwargs,
         )
-        self._pid = os.getpid()
 
     def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
         """
@@ -1659,8 +1657,6 @@ class OmniRunner:
         """Context manager exit - cleanup resources."""
         self.close()
         del self.omni
-        if self._pid:
-            kill_process_tree(self._pid)
         cleanup_dist_env_and_memory()
         _run_post_test_cleanup(enable_force=True)
 
