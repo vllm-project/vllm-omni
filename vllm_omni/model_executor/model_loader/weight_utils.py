@@ -20,6 +20,7 @@ def download_weights_from_hf_specific(
     allow_patterns: list[str],
     revision: str | None = None,
     ignore_patterns: str | list[str] | None = None,
+    require_all: bool = False,
 ) -> str:
     """Download model weights from Hugging Face Hub. Users can specify the
     allow_patterns to download only the necessary weights.
@@ -35,6 +36,9 @@ def download_weights_from_hf_specific(
         ignore_patterns (Optional[Union[str, list[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        require_all (bool): If True, will iterate through and download files
+            matching all patterns in allow_patterns. If False, will stop after
+            the first pattern that matches any files.
 
     Returns:
         str: The path to the downloaded model weights.
@@ -48,20 +52,31 @@ def download_weights_from_hf_specific(
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         start_time = time.perf_counter()
-        for allow_pattern in allow_patterns:
+        if require_all:
             hf_folder = snapshot_download(
                 model_name_or_path,
-                allow_patterns=allow_pattern,
+                allow_patterns=allow_patterns,
                 ignore_patterns=ignore_patterns,
                 cache_dir=cache_dir,
                 revision=revision,
                 local_files_only=local_only,
                 **download_kwargs,
             )
-            # If we have downloaded weights for this allow_pattern,
-            # we don't need to check the rest.
-            if any(Path(hf_folder).glob(allow_pattern)):
-                break
+        else:
+            for allow_pattern in allow_patterns:
+                hf_folder = snapshot_download(
+                    model_name_or_path,
+                    allow_patterns=allow_pattern,
+                    ignore_patterns=ignore_patterns,
+                    cache_dir=cache_dir,
+                    revision=revision,
+                    local_files_only=local_only,
+                    **download_kwargs,
+                )
+                # If we have downloaded weights for this allow_pattern,
+                # we don't need to check the rest, unless require_all is set.
+                if any(Path(hf_folder).glob(allow_pattern)):
+                    break
         time_taken = time.perf_counter() - start_time
         if time_taken > 0.5:
             logger.info(
