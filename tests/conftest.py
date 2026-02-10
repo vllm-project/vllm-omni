@@ -305,6 +305,11 @@ def generate_synthetic_audio(
     if max_amp > 0:
         audio_data = audio_data / max_amp * 0.8
 
+    audio_array = audio_data.copy()
+    result = {
+        "np_array": audio_array,
+    }
+
     # Handle file saving
     audio_bytes = None
 
@@ -331,9 +336,7 @@ def generate_synthetic_audio(
 
     # Return result
     base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-    result = {
-        "base64": base64_audio,
-    }
+    result["base64"] = base64_audio
     if save_to_file and output_path:
         result["file_path"] = output_path
 
@@ -503,6 +506,9 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
         # Draw square
         draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
 
+    image_array = np.array(image)
+    result = {"np_array": image_array.copy()}
+
     # Handle file saving
     image_bytes = None
     saved_file_path = None
@@ -536,9 +542,7 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     # Return result
-    result = {
-        "base64": base64_image,
-    }
+    result["base64"] = base64_image
     if save_to_file and saved_file_path:
         result["file_path"] = saved_file_path
 
