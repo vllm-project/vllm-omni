@@ -378,7 +378,7 @@ class BagelPipeline(nn.Module):
                         arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
                         return arr.permute(2, 0, 1)
 
-                    # 1. Update VAE
+                    # === 对 gen_context 更新图像 (VAE + ViT) ===
                     gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
                         curr_kvlens=gen_context["kv_lens"],
                         curr_rope=gen_context["ropes"],
@@ -386,12 +386,9 @@ class BagelPipeline(nn.Module):
                         transforms=vae_transforms,
                         new_token_ids=self.new_token_ids,
                     )
-
                     for k, v in gen_input_vae.items():
                         if torch.is_tensor(v):
                             gen_input_vae[k] = v.to(self.device)
-
-                    # VAE needs bfloat16 to match model strings usually, specifically encode
                     with torch.autocast(
                         device_type=self.device.type,
                         enabled=self.device.type != "cpu",
@@ -403,7 +400,6 @@ class BagelPipeline(nn.Module):
                     gen_context["kv_lens"] = newlens_vae
                     gen_context["ropes"] = new_rope_vae
 
-                    # 2. Update ViT
                     gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
                         curr_kvlens=gen_context["kv_lens"],
                         curr_rope=gen_context["ropes"],
@@ -411,11 +407,9 @@ class BagelPipeline(nn.Module):
                         transforms=vit_transforms,
                         new_token_ids=self.new_token_ids,
                     )
-
                     for k, v in gen_input_img.items():
                         if torch.is_tensor(v):
                             gen_input_img[k] = v.to(self.device)
-
                     with torch.autocast(
                         device_type=self.device.type,
                         enabled=self.device.type != "cpu",
@@ -426,50 +420,16 @@ class BagelPipeline(nn.Module):
                         )
                     gen_context["kv_lens"] = newlens_img
                     gen_context["ropes"] = new_rope_img
-                    
-                    # CFG: cfg_text_context 也需要图像（有图像，无文本）
-                    # 需要重新准备 VAE 和 ViT 输入，因为 cfg_text_context 的 kv_lens 可能不同
-                    gen_input_vae_cfg, newlens_vae_cfg, new_rope_vae_cfg = self.bagel.prepare_vae_images(
-                        curr_kvlens=cfg_text_context["kv_lens"],
-                        curr_rope=cfg_text_context["ropes"],
-                        images=image_input,
-                        transforms=vae_transforms,
-                        new_token_ids=self.new_token_ids,
-                    )
-                    for k, v in gen_input_vae_cfg.items():
-                        if torch.is_tensor(v):
-                            gen_input_vae_cfg[k] = v.to(self.device)
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        enabled=self.device.type != "cpu",
-                        dtype=self.od_config.dtype,
-                    ):
-                        cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_vae(
-                            self.vae, cfg_text_context["past_key_values"], **gen_input_vae_cfg
-                        )
-                    cfg_text_context["kv_lens"] = newlens_vae_cfg
-                    cfg_text_context["ropes"] = new_rope_vae_cfg
-                    
-                    gen_input_img_cfg, newlens_img_cfg, new_rope_img_cfg = self.bagel.prepare_vit_images(
-                        curr_kvlens=cfg_text_context["kv_lens"],
-                        curr_rope=cfg_text_context["ropes"],
-                        images=image_input,
-                        transforms=vit_transforms,
-                        new_token_ids=self.new_token_ids,
-                    )
-                    for k, v in gen_input_img_cfg.items():
-                        if torch.is_tensor(v):
-                            gen_input_img_cfg[k] = v.to(self.device)
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        enabled=self.device.type != "cpu",
-                        dtype=self.od_config.dtype,
-                    ):
-                        cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_vit(
-                            cfg_text_context["past_key_values"], **gen_input_img_cfg
-                        )
-                    cfg_text_context["kv_lens"] = newlens_img_cfg
-                    cfg_text_context["ropes"] = new_rope_img_cfg
+
+                    # === CFG: 图像处理完后，deepcopy gen_context → cfg_text_context ===
+                    # 官方逻辑：cfg_text_context = deepcopy(gen_context) 在图像处理之后
+                    # 这样 cfg_text_context 包含图像但不会包含后续的文本
+                    cfg_text_context = deepcopy(gen_context)
+
+            # === 处理文本 ===
+            # 官方逻辑：在文本处理前，cfg_text_context = deepcopy(gen_context)
+            # 但我们已经在图像处理后做了 deepcopy，所以这里不需要再次 deepcopy
+            # （如果没有图像输入，cfg_text_context 初始值已经是空的 deepcopy）
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -490,10 +450,8 @@ class BagelPipeline(nn.Module):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(self.device)
-            
-            # CFG: 在处理文本前，保存 cfg_text_context（无文本条件）
-            cfg_text_context = deepcopy(gen_context)
-            
+
+            # 更新 gen_context 的文本
             with torch.autocast(
                 device_type=self.device.type,
                 enabled=self.device.type != "cpu",
@@ -504,18 +462,29 @@ class BagelPipeline(nn.Module):
                 )
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
-            
-            # CFG: cfg_img_context 也需要更新文本（有文本，无图像）
+
+            # === CFG: cfg_img_context 也需要更新文本（有文本，无图像）===
+            # 关键：必须用 cfg_img_context 自己的 kv_lens/ropes 来 prepare_prompts
+            cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
+                curr_kvlens=cfg_img_context["kv_lens"],
+                curr_rope=cfg_img_context["ropes"],
+                prompts=[prompt],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            for k, v in cfg_img_generation_input.items():
+                if torch.is_tensor(v):
+                    cfg_img_generation_input[k] = v.to(self.device)
             with torch.autocast(
                 device_type=self.device.type,
                 enabled=self.device.type != "cpu",
                 dtype=self.od_config.dtype,
             ):
                 cfg_img_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    cfg_img_context["past_key_values"], **generation_input
+                    cfg_img_context["past_key_values"], **cfg_img_generation_input
                 )
-            cfg_img_context["kv_lens"] = newlens
-            cfg_img_context["ropes"] = new_rope
+            cfg_img_context["kv_lens"] = cfg_img_newlens
+            cfg_img_context["ropes"] = cfg_img_new_rope
 
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
