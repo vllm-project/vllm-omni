@@ -57,7 +57,6 @@ _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _DIT: GroupCoordinator | None = None
-_VAE: GroupCoordinator | None = None
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -344,7 +343,7 @@ def is_dp_last_group():
 
 
 def get_dit_world_size():
-    """Return world size for the DiT model (excluding VAE)."""
+    """Return world size for the DiT model."""
     return (
         get_data_parallel_world_size()
         * get_classifier_free_guidance_world_size()
@@ -352,22 +351,6 @@ def get_dit_world_size():
         * get_pipeline_parallel_world_size()
         * get_tensor_model_parallel_world_size()
     )
-
-
-# Add VAE getter functions
-def get_vae_parallel_group() -> GroupCoordinator:
-    assert _VAE is not None, "VAE parallel group is not initialized"
-    return _VAE
-
-
-def get_vae_parallel_world_size():
-    """Return world size for the VAE parallel group."""
-    return get_vae_parallel_group().world_size
-
-
-def get_vae_parallel_rank():
-    """Return my rank for the VAE parallel group."""
-    return get_vae_parallel_group().rank_in_group
 
 
 # * SET
@@ -488,18 +471,6 @@ def init_dit_group(
 def get_dit_group():
     assert _DIT is not None, "DIT group is not initialized"
     return _DIT
-
-
-def init_vae_group(
-    dit_parallel_size: int,
-    vae_parallel_size: int,
-    backend: str,
-):
-    # Initialize VAE group first
-    global _VAE
-    assert _VAE is None, "VAE parallel group is already initialized"
-    vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
 
 
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
@@ -658,7 +629,6 @@ def initialize_model_parallel(
     ring_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
-    vae_parallel_size: int = 0,
     backend: str | None = None,
 ) -> None:
     if backend is None:
@@ -802,8 +772,6 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
-    if vae_parallel_size > 0:
-        init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
 
 
@@ -832,11 +800,6 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
-
-    global _VAE
-    if _VAE:
-        _VAE.destroy()
-    _VAE = None
 
 
 def destroy_distributed_environment():
