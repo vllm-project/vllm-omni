@@ -50,8 +50,8 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     Input Setting: stream=False
     Datasets: single request
     """
-    video = generate_synthetic_video(224, 224, 300)["np_array"]
-    image = generate_synthetic_image(224, 224)["np_array"]
+    video = generate_synthetic_video(16, 16, 30)["np_array"]
+    image = generate_synthetic_image(16, 16)["np_array"]
     audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
     if len(audio.shape) == 2:
         audio = audio.squeeze()
