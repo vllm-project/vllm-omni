@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # ruff: noqa: E402
@@ -32,6 +33,10 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 models = ["riverclouds/qwen_image_random"]
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cache
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("model_name", models)
 def test_cache_dit(model_name: str):
     """Test cache-dit backend with diffusion model."""

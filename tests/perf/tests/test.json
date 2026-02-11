@@ -1,0 +1,44 @@
+[
+    {
+        "test_name": "test_qwen3_omni",
+        "server_params":
+        {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "stage_config_name": "qwen3_omni_default.yaml"
+        },
+        "benchmark_params": [{
+            "dataset_name": "random",
+            "num_prompts": 5,
+            "qps": [0.5, 1],
+            "random_input_len": 10,
+            "random_output_len": 10,
+            "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+        },{"dataset_name": "random-mm",
+            "num_prompts": 5,
+            "qps": [0.5, 1],
+            "random_input_len": 10,
+            "random_output_len": 10,
+            "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"}]
+    },
+    {
+        "test_name": "test_qwen3_omni_chunk",
+        "server_params":
+        {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "stage_config_name": "qwen3_omni_async_chunk.yaml"
+        },
+        "benchmark_params": [{
+            "dataset_name": "random",
+            "num_prompts": 5,
+            "qps": [0.5, 1],
+            "random_input_len": 10,
+            "random_output_len": 10,
+            "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+        },{"dataset_name": "random-mm",
+            "num_prompts": 5,
+            "qps": [0.5, 1],
+            "random_input_len": 10,
+            "random_output_len": 10,
+            "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"}]
+    }
+]

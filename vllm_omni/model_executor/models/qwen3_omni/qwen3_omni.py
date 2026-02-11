@@ -589,6 +589,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             input_embeds = self.talker.embed_input_ids(input_ids)
 
         span_len = input_ids.shape[0]
+        update_dict = {}
         if span_len > 1:
             # prefill
             input_ids, input_embeds, update_dict = self.talker_preprocess_prefill(input_ids, input_embeds, **info_dict)
@@ -600,11 +601,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             update_dict["code_predictor_codes"] = code_predictor_codes
         else:
             # decode
-            if info_dict.get("num_processed_tokens", 0) < len(info_dict.get("thinker_input_ids", [])):
+            if not info_dict.get("decode_flag", False):
                 info_dict["num_processed_tokens"] = len(info_dict.get("thinker_input_ids", [])) + 1
+                update_dict["decode_flag"] = True
 
             last_talker_hidden, text_step, update_dict = self.talker_preprocess_decode(
-                input_ids, input_embeds, **info_dict
+                input_ids, input_embeds, update_dict, **info_dict
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
@@ -874,8 +876,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_embed = thinker_embed[start_index : start_index + 1].to(device)
         return self.talker.text_projection(thinker_embed).to(device)
 
-    def talker_preprocess_decode(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
-        update_dict: dict[str, dict] = {}
+    def talker_preprocess_decode(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor, update_dict: dict, **info_dict: dict
+    ):
         last_talker_hidden = None
         text_step = None
         try:

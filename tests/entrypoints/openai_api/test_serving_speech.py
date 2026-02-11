@@ -16,6 +16,8 @@ from vllm_omni.entrypoints.openai.serving_speech import (
 )
 from vllm_omni.outputs import OmniRequestOutput
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 logger = logging.getLogger(__name__)
 
 

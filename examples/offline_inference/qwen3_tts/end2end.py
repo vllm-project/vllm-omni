@@ -219,7 +219,7 @@ def main(args):
     omni = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
-        log_stats=args.enable_stats,
+        log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
 
@@ -275,7 +275,7 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--enable-stats",
+        "--log-stats",
         action="store_true",
         default=False,
         help="Enable writing detailed statistics (default: disabled)",

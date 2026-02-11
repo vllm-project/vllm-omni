@@ -11,7 +11,17 @@ from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
-from vllm.multimodal.processing.context import set_request_id
+
+try:
+    from vllm.multimodal.processing import set_request_id
+except ImportError:  # vllm without set_request_id (older releases)
+    from contextlib import contextmanager
+
+    @contextmanager
+    def set_request_id(_request_id: str):
+        yield
+
+
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
