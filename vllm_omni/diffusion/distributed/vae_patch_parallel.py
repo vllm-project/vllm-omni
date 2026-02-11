@@ -345,11 +345,200 @@ def _distributed_patch_decode(
     return out
 
 
+def _distributed_tiled_decode_wan(
+    *,
+    vae: Any,
+    orig_decode: Callable[..., Any],
+    z: torch.Tensor,
+    group: dist.ProcessGroup,
+    vae_patch_parallel_size: int,
+) -> torch.Tensor:
+    """Distributed version of AutoencoderKLWan.tiled_decode (decode only).
+
+    Each rank decodes a subset of spatial tiles (all temporal frames for those
+    tiles); rank0 gathers all tiles and performs the same blend + stitch logic
+    as diffusers. Non-rank0 ranks return an empty tensor until the final
+    broadcast.
+    """
+    world_size, rank, pp_size = _get_world_rank_pp_size(group, vae_patch_parallel_size)
+    if pp_size <= 1:
+        return orig_decode(z, return_dict=False)[0]
+
+    _, _, num_frames, height, width = z.shape
+
+    spatial_compression_ratio = int(getattr(vae, "spatial_compression_ratio", 8))
+    tile_sample_min_height = int(getattr(vae, "tile_sample_min_height", 256))
+    tile_sample_min_width = int(getattr(vae, "tile_sample_min_width", 256))
+    tile_sample_stride_height = int(getattr(vae, "tile_sample_stride_height", 192))
+    tile_sample_stride_width = int(getattr(vae, "tile_sample_stride_width", 192))
+
+    tile_latent_min_height = tile_sample_min_height // spatial_compression_ratio
+    tile_latent_min_width = tile_sample_min_width // spatial_compression_ratio
+    tile_latent_stride_height = tile_sample_stride_height // spatial_compression_ratio
+    tile_latent_stride_width = tile_sample_stride_width // spatial_compression_ratio
+
+    patch_size = getattr(getattr(vae, "config", None), "patch_size", None)
+    sample_height = height * spatial_compression_ratio
+    sample_width = width * spatial_compression_ratio
+
+    if patch_size is not None:
+        sample_height = sample_height // patch_size
+        sample_width = sample_width // patch_size
+        t_stride_h = tile_sample_stride_height // patch_size
+        t_stride_w = tile_sample_stride_width // patch_size
+        blend_height = tile_sample_min_height // patch_size - t_stride_h
+        blend_width = tile_sample_min_width // patch_size - t_stride_w
+    else:
+        t_stride_h = tile_sample_stride_height
+        t_stride_w = tile_sample_stride_width
+        blend_height = tile_sample_min_height - t_stride_h
+        blend_width = tile_sample_min_width - t_stride_w
+
+    # Enumerate spatial tile grid.
+    h_starts = list(range(0, height, tile_latent_stride_height))
+    w_starts = list(range(0, width, tile_latent_stride_width))
+    num_rows = len(h_starts)
+    num_cols = len(w_starts)
+    num_tiles = num_rows * num_cols
+
+    if num_tiles < 2:
+        return orig_decode(z, return_dict=False)[0]
+
+    active = rank < pp_size
+
+    local_tiles: list[torch.Tensor] = []
+    local_meta: list[tuple[int, int, int, int]] = []  # (tile_id, T, H, W)
+
+    tile_id = 0
+    for i in h_starts:
+        for j in w_starts:
+            tile_rank = (tile_id + 1) % pp_size
+            if active and (tile_rank == rank):
+                # Decode all temporal frames for this spatial tile.
+                vae.clear_cache()
+                time_slices: list[torch.Tensor] = []
+                for k in range(num_frames):
+                    vae._conv_idx = [0]
+                    tile = z[:, :, k : k + 1, i : i + tile_latent_min_height, j : j + tile_latent_min_width]
+                    tile = vae.post_quant_conv(tile)
+                    decoded = vae.decoder(tile, feat_cache=vae._feat_map, feat_idx=vae._conv_idx, first_chunk=(k == 0))
+                    time_slices.append(decoded)
+                decoded_tile = torch.cat(time_slices, dim=2)  # (B, C, T, H', W')
+                local_tiles.append(decoded_tile)
+                local_meta.append(
+                    (tile_id, int(decoded_tile.shape[2]), int(decoded_tile.shape[3]), int(decoded_tile.shape[4]))
+                )
+            tile_id += 1
+    vae.clear_cache()
+
+    # Gather per-rank tile counts.
+    count_tensor = torch.tensor([len(local_tiles)], device=z.device, dtype=torch.int64)
+    if rank == 0:
+        count_gather = [torch.empty_like(count_tensor) for _ in range(world_size)]
+    else:
+        count_gather = None
+    dist.gather(count_tensor, gather_list=count_gather, dst=0, group=group)
+    max_count = 0
+    if rank == 0:
+        counts = [int(t.item()) for t in count_gather]  # type: ignore[arg-type]
+        max_count = max(counts) if counts else 0
+    max_count_tensor = torch.tensor([max_count], device=z.device, dtype=torch.int64)
+    dist.broadcast(max_count_tensor, src=0, group=group)
+    max_count = int(max_count_tensor.item())
+
+    if max_count == 0:
+        return orig_decode(z, return_dict=False)[0]
+
+    out_channels = _get_vae_out_channels(vae)
+
+    # Compute max tile spatial dims across all ranks for padded gather.
+    local_max_t = max((m[1] for m in local_meta), default=0)
+    local_max_h = max((m[2] for m in local_meta), default=0)
+    local_max_w = max((m[3] for m in local_meta), default=0)
+    local_max_tensor = torch.tensor([local_max_t, local_max_h, local_max_w], device=z.device, dtype=torch.int64)
+    dist.all_reduce(local_max_tensor, op=dist.ReduceOp.MAX, group=group)
+    max_t = int(local_max_tensor[0].item())
+    max_h = int(local_max_tensor[1].item())
+    max_w = int(local_max_tensor[2].item())
+
+    # Prepare padded metadata + tiles for gather.
+    meta_tensor = torch.full((max_count, 4), -1, device=z.device, dtype=torch.int64)
+    tile_tensor = torch.zeros(
+        (max_count, z.shape[0], out_channels, max_t, max_h, max_w),
+        device=z.device,
+        dtype=z.dtype,
+    )
+    for idx, (tid, t_dim, h_dim, w_dim) in enumerate(local_meta):
+        meta_tensor[idx, 0] = tid
+        meta_tensor[idx, 1] = t_dim
+        meta_tensor[idx, 2] = h_dim
+        meta_tensor[idx, 3] = w_dim
+        tile_tensor[idx, :, :, :t_dim, :h_dim, :w_dim] = local_tiles[idx]
+
+    if rank == 0:
+        meta_gather = [torch.empty_like(meta_tensor) for _ in range(world_size)]
+        tile_gather = [torch.empty_like(tile_tensor) for _ in range(world_size)]
+    else:
+        meta_gather = None
+        tile_gather = None
+
+    dist.gather(meta_tensor, gather_list=meta_gather, dst=0, group=group)
+    dist.gather(tile_tensor, gather_list=tile_gather, dst=0, group=group)
+
+    if rank != 0:
+        return torch.empty(0, device=z.device, dtype=z.dtype)
+
+    # Reconstruct tile grid on rank0.
+    tile_map: dict[int, torch.Tensor] = {}
+    for src_rank in range(world_size):
+        meta_src = meta_gather[src_rank]  # type: ignore[index]
+        tiles_src = tile_gather[src_rank]  # type: ignore[index]
+        for idx in range(max_count):
+            tid = int(meta_src[idx, 0].item())
+            if tid < 0:
+                continue
+            t_dim = int(meta_src[idx, 1].item())
+            h_dim = int(meta_src[idx, 2].item())
+            w_dim = int(meta_src[idx, 3].item())
+            tile_map[tid] = tiles_src[idx, :, :, :t_dim, :h_dim, :w_dim]
+
+    rows: list[list[torch.Tensor]] = []
+    for r in range(num_rows):
+        row: list[torch.Tensor] = []
+        for c in range(num_cols):
+            tid = r * num_cols + c
+            row.append(tile_map[tid])
+        rows.append(row)
+
+    # Blend and stitch (same logic as diffusers AutoencoderKLWan.tiled_decode).
+    result_rows: list[torch.Tensor] = []
+    for i, row in enumerate(rows):
+        result_row: list[torch.Tensor] = []
+        for j, tile in enumerate(row):
+            if i > 0:
+                tile = vae.blend_v(rows[i - 1][j], tile, blend_height)
+            if j > 0:
+                tile = vae.blend_h(row[j - 1], tile, blend_width)
+            result_row.append(tile[:, :, :, :t_stride_h, :t_stride_w])
+        result_rows.append(torch.cat(result_row, dim=-1))
+
+    dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
+
+    if patch_size is not None:
+        from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+
+        dec = unpatchify(dec, patch_size=patch_size)
+
+    return torch.clamp(dec, min=-1.0, max=1.0)
+
+
 class VaePatchParallelism:
     """Patch/tile-parallel VAE decode wrapper.
 
     This is meant to wrap `vae.decode` as an instance-level override
-    so pipelines don't need model-specific code paths.
+    so pipelines don't need model-specific code paths.  The concrete
+    distributed decode strategy is selected at init time based on the
+    VAE type (4-D image vs 5-D video).
     """
 
     def __init__(
@@ -358,17 +547,23 @@ class VaePatchParallelism:
         *,
         vae_patch_parallel_size: int,
         group_getter: Callable[[], dist.ProcessGroup],
+        expected_ndim: int = 4,
+        distributed_tiled_decode_fn: Callable[..., torch.Tensor] = _distributed_tiled_decode,
+        distributed_patch_decode_fn: Callable[..., torch.Tensor] | None = None,
     ) -> None:
         self._vae = vae
         self._vae_patch_parallel_size = int(vae_patch_parallel_size)
         self._group_getter = group_getter
+        self._expected_ndim = expected_ndim
+        self._distributed_tiled_decode_fn = distributed_tiled_decode_fn
+        self._distributed_patch_decode_fn = distributed_patch_decode_fn
 
         self._vae_scale_factor = _get_vae_spatial_scale_factor(vae)
         self._orig_decode = vae.decode
 
     def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
         # Keep the original path for unsupported VAE types / shapes.
-        if z.ndim != 4:
+        if z.ndim != self._expected_ndim:
             return self._orig_decode(z, return_dict=return_dict, *args, **kwargs)
 
         if self._vae_patch_parallel_size <= 1 or not dist.is_initialized():
@@ -390,8 +585,8 @@ class VaePatchParallelism:
 
         # Match diffusers' condition for when VAE tiling would be used.
         tile_latent_min_size = getattr(self._vae, "tile_latent_min_size", None)
-        if tile_latent_min_size is None:
-            decoded = _distributed_tiled_decode(
+        if tile_latent_min_size is None or self._distributed_patch_decode_fn is None:
+            decoded = self._distributed_tiled_decode_fn(
                 vae=self._vae,
                 orig_decode=self._orig_decode,
                 z=z,
@@ -401,7 +596,7 @@ class VaePatchParallelism:
         else:
             should_tile = (z.shape[-1] > tile_latent_min_size) or (z.shape[-2] > tile_latent_min_size)
             if should_tile:
-                decoded = _distributed_tiled_decode(
+                decoded = self._distributed_tiled_decode_fn(
                     vae=self._vae,
                     orig_decode=self._orig_decode,
                     z=z,
@@ -409,7 +604,7 @@ class VaePatchParallelism:
                     vae_patch_parallel_size=pp_size,
                 )
             else:
-                decoded = _distributed_patch_decode(
+                decoded = self._distributed_patch_decode_fn(
                     vae=self._vae,
                     orig_decode=self._orig_decode,
                     z=z,
@@ -426,7 +621,7 @@ class VaePatchParallelism:
         if rank == 0 and not decoded.is_contiguous():
             decoded = decoded.contiguous()
 
-        shape_tensor = torch.empty((4,), device=z.device, dtype=torch.int64)
+        shape_tensor = torch.empty((self._expected_ndim,), device=z.device, dtype=torch.int64)
         if rank == 0:
             shape_tensor.copy_(torch.tensor(tuple(decoded.shape), device=z.device, dtype=torch.int64))
         dist.broadcast(shape_tensor, src=0, group=group)
@@ -456,20 +651,32 @@ def maybe_wrap_vae_decode_with_patch_parallelism(
     vae = getattr(pipeline, "vae", None)
     if vae is None or not hasattr(vae, "decode"):
         return
-    try:
-        from diffusers.models.autoencoders import AutoencoderKL
-    except Exception:
-        return
-    if not isinstance(vae, AutoencoderKL):
-        return
 
     if getattr(vae, "_vllm_vae_patch_parallel_installed", False):
+        return
+
+    try:
+        from diffusers.models.autoencoders import AutoencoderKL, AutoencoderKLWan
+    except ImportError:
+        return
+
+    if isinstance(vae, AutoencoderKLWan):
+        kwargs = dict(
+            expected_ndim=5,
+            distributed_tiled_decode_fn=_distributed_tiled_decode_wan,
+        )
+    elif isinstance(vae, AutoencoderKL):
+        kwargs = dict(
+            distributed_patch_decode_fn=_distributed_patch_decode,
+        )
+    else:
         return
 
     wrapper = VaePatchParallelism(
         vae,
         vae_patch_parallel_size=vae_patch_parallel_size,
         group_getter=group_getter,
+        **kwargs,
     )
 
     vae._vllm_vae_patch_parallel_installed = True  # type: ignore[attr-defined]

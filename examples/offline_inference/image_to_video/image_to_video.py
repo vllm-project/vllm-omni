@@ -94,6 +94,18 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
+    )
+    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
@@ -135,6 +147,8 @@ def main():
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
     parallel_config = DiffusionParallelConfig(
         cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
     omni = Omni(
         model=args.model,
@@ -159,7 +173,10 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
-    print(f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size}")
+    print(
+        f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size},"
+        f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}"
+    )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
