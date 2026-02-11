@@ -21,7 +21,7 @@ if current_omni_platform.is_npu():
     stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
 elif current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_config = str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
 else:
     stage_config = str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
 
