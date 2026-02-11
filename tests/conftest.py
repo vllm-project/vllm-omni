@@ -1570,103 +1570,18 @@ class OmniRunner:
         )
         return self.generate(omni_inputs, sampling_params_list)
 
-    def generate_audio(
-        self,
-        prompts: list[str] | str,
-        sampling_params_list: list[OmniSamplingParams] | None = None,
-        system_prompt: str | None = None,
-        audios: PromptAudioInput = None,
-        mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> list[OmniRequestOutput]:
-        """
-        Convenience method to generate with multimodal inputs.
-        Args:
-            prompts: Text prompt(s)
-            sampling_params_list: List of sampling parameters for each stage
-            system_prompt: Optional system prompt
-            audios: Audio input(s)
-            mm_processor_kwargs: Optional processor kwargs
-        Returns:
-            List of OmniRequestOutput objects from stages with final_output=True
-        """
-        omni_inputs = self.get_omni_inputs(
-            prompts=prompts,
-            system_prompt=system_prompt,
-            audios=audios,
-            mm_processor_kwargs=mm_processor_kwargs,
-        )
-        return self.generate(omni_inputs, sampling_params_list)
-
-    def generate_video(
-        self,
-        prompts: list[str] | str,
-        sampling_params_list: list[OmniSamplingParams] | None = None,
-        system_prompt: str | None = None,
-        videos: PromptVideoInput = None,
-        mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> list[OmniRequestOutput]:
-        """
-        Convenience method to generate with multimodal inputs.
-        Args:
-            prompts: Text prompt(s)
-            sampling_params_list: List of sampling parameters for each stage
-            system_prompt: Optional system prompt
-            videos: Video input(s)
-            mm_processor_kwargs: Optional processor kwargs
-        Returns:
-            List of OmniRequestOutput objects from stages with final_output=True
-        """
-        omni_inputs = self.get_omni_inputs(
-            prompts=prompts,
-            system_prompt=system_prompt,
-            videos=videos,
-            mm_processor_kwargs=mm_processor_kwargs,
-        )
-        return self.generate(omni_inputs, sampling_params_list)
-
-    def generate_image(
-        self,
-        prompts: list[str] | str,
-        sampling_params_list: list[OmniSamplingParams] | None = None,
-        system_prompt: str | None = None,
-        images: PromptImageInput = None,
-        mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> list[OmniRequestOutput]:
-        """
-        Convenience method to generate with multimodal inputs.
-        Args:
-            prompts: Text prompt(s)
-            sampling_params_list: List of sampling parameters for each stage
-            system_prompt: Optional system prompt
-            images: Image input(s)
-            mm_processor_kwargs: Optional processor kwargs
-        Returns:
-            List of OmniRequestOutput objects from stages with final_output=True
-        """
-        omni_inputs = self.get_omni_inputs(
-            prompts=prompts,
-            system_prompt=system_prompt,
-            images=images,
-            mm_processor_kwargs=mm_processor_kwargs,
-        )
-        return self.generate(omni_inputs, sampling_params_list)
-
     def __enter__(self):
         """Context manager entry."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup resources."""
-        self.close()
-        del self.omni
+        if hasattr(self.omni, "close"):
+            self.omni.close()
+        time.sleep(5)
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
         cleanup_dist_env_and_memory()
-
-    def close(self):
-        """Close and cleanup the Omni instance."""
-        if hasattr(self.omni, "close"):
-            self.omni.close()
 
 
 @pytest.fixture(scope="module")

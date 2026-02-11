@@ -774,11 +774,6 @@ def _stage_worker(
         task_type = task.get("type", OmniStageTaskType.GENERATE)
         if task_type == OmniStageTaskType.SHUTDOWN:
             logger.info("Received shutdown signal")
-            logger.debug(f"[Stage-{stage_id}] Current engine state: {stage_engine}")
-            logger.debug(f"[Stage-{stage_id}] Connectors state: {connectors}")
-            stage_engine.shutdown()
-            logger.debug(f"[Stage-{stage_id}] Current engine state: {stage_engine}")
-            logger.debug(f"[Stage-{stage_id}] Connectors state: {connectors}")
             break
 
         # Handle profiler control commands
@@ -1000,8 +995,6 @@ def _stage_worker(
                         "error_tb": _tb,
                     }
                 )
-
-    logger.info(f"[Stage-{stage_id}] Worker process exiting, PID: {os.getpid()}")
 
 
 def _stage_worker_async_entry(
