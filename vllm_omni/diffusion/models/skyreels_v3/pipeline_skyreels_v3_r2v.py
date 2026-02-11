@@ -307,12 +307,12 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput):
 
     def encode_image(
         self,
-        image: PIL.Image.Image | torch.Tensor,
+        image: PIL.Image.Image | list[PIL.Image.Image] | torch.Tensor,
         device: torch.device,
         num_videos_per_prompt: int = 1,
     ) -> torch.Tensor:
         """Encode reference image using CLIP."""
-        if isinstance(image, PIL.Image.Image):
+        if isinstance(image, (PIL.Image.Image, list)):
             image = self.image_processor(images=image, return_tensors="pt").pixel_values
         image = image.to(device=device, dtype=self.image_encoder.dtype)
 
@@ -351,8 +351,10 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput):
         width = request.sampling_params.width or 832
         num_frames = request.sampling_params.num_frames or 81
         num_inference_steps = request.sampling_params.num_inference_steps or 50
-        guidance_scale = request.sampling_params.guidance_scale or 7.5
-        num_videos_per_prompt = request.sampling_params.num_videos_per_prompt or 1
+        guidance_scale = (
+            request.sampling_params.guidance_scale if request.sampling_params.guidance_scale is not None else 7.5
+        )
+        num_videos_per_prompt = getattr(request.sampling_params, "num_outputs_per_prompt", None) or 1
 
         do_classifier_free_guidance = guidance_scale > 1.0
 
@@ -365,28 +367,40 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput):
             request.sampling_params.negative_prompt,
         )
 
-        # Encode reference image
-        images = []
+        # Encode reference image using CLIP
+        # Use the resized PIL image from multi_modal_data, not the VAE-preprocessed one
+        pil_images = []
         for p in request.prompts:
-            if isinstance(p, dict) and "additional_information" in p:
-                img = p["additional_information"].get("preprocessed_image")
-                if img is not None:
-                    images.append(img)
+            multi_modal_data = p.get("multi_modal_data") or {} if isinstance(p, dict) else {}
+            img = multi_modal_data.get("image")
+            if img is not None:
+                pil_images.append(img)
 
-        if not images:
-            raise ValueError("No preprocessed images found in request")
+        if not pil_images:
+            raise ValueError("No reference images found in request (expected in prompt['multi_modal_data']['image'])")
 
-        image_tensor = torch.cat(images, dim=0).to(device=device, dtype=dtype)
-        image_embeds = self.encode_image(image_tensor, device, num_videos_per_prompt)
+        # Use CLIPImageProcessor to obtain CLIP-ready image tensor
+        image_embeds = self.encode_image(pil_images, device, num_videos_per_prompt)
 
         # Prepare latents
+        # Use separate temporal and spatial VAE scale factors, as required by AutoencoderKLWan.
+        vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 1)
+        vae_scale_factor_spatial = getattr(
+            self.vae.config,
+            "scale_factor_spatial",
+            getattr(self, "vae_scale_factor", 1),
+        )
+
+        # Latent temporal length is typically shorter than the decoded frame count.
+        num_latent_frames = (num_frames - 1) // vae_scale_factor_temporal + 1
+
         num_channels_latents = self.transformer.in_channels
         latents_shape = (
             batch_size * num_videos_per_prompt,
             num_channels_latents,
-            num_frames,
-            height // self.vae_scale_factor,
-            width // self.vae_scale_factor,
+            num_latent_frames,
+            height // vae_scale_factor_spatial,
+            width // vae_scale_factor_spatial,
         )
 
         generator = torch.Generator(device=device)
@@ -413,7 +427,7 @@ class SkyReelsV3R2VPipeline(nn.Module, SupportImageInput):
                 hidden_states=latent_model_input,
                 timestep=timestep,
                 encoder_hidden_states=prompt_embeds,
-                image_hidden_states=image_embeds if do_classifier_free_guidance else image_embeds.repeat(2, 1),
+                image_hidden_states=image_embeds.repeat(2, 1) if do_classifier_free_guidance else image_embeds,
             ).sample
 
             # Perform CFG

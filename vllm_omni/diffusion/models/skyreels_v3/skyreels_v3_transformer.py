@@ -25,10 +25,6 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinea
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,
-    SequenceParallelOutput,
-)
 
 logger = init_logger(__name__)
 
@@ -50,8 +46,9 @@ def apply_rotary_emb_skyreels(
         Tensor with rotary embeddings applied
     """
     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-    cos = freqs_cos[..., 0::2]
-    sin = freqs_sin[..., 1::2]
+    # freqs_cos and freqs_sin are 2D [seq_len, dim], so use : indexing not ...
+    cos = freqs_cos[:, 0::2]
+    sin = freqs_sin[:, 1::2]
     out = torch.empty_like(hidden_states)
     out[..., 0::2] = x1 * cos - x2 * sin
     out[..., 1::2] = x1 * sin + x2 * cos
@@ -206,6 +203,13 @@ class SkyReelsSelfAttention(nn.Module):
         # Apply rotary embeddings
         if rotary_emb is not None:
             freqs_cos, freqs_sin = rotary_emb
+            # freqs_* are 2D [S, head_dim]; make them broadcastable with
+            # query/key of shape [B, S, num_heads, head_dim] by reshaping to
+            # [1, S, 1, head_dim].
+            if freqs_cos.dim() == 2:
+                freqs_cos = freqs_cos.unsqueeze(0).unsqueeze(2)
+            if freqs_sin.dim() == 2:
+                freqs_sin = freqs_sin.unsqueeze(0).unsqueeze(2)
             query = apply_rotary_emb_skyreels(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_skyreels(key, freqs_cos, freqs_sin)
 
@@ -504,12 +508,6 @@ class SkyReelsTransformer3DModel(nn.Module):
             bias=True,
         )
 
-        # Sequence parallel plan (for distributed training)
-        self._sp_plan = {
-            "input": SequenceParallelInput(split_dim=1, expected_dims=3),
-            "output": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-        }
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -559,7 +557,8 @@ class SkyReelsTransformer3DModel(nn.Module):
 
         # Optional image conditioning
         if image_hidden_states is not None and self.image_dim is not None:
-            image_emb = self.image_proj(image_hidden_states).unsqueeze(1)  # [B, 1, inner_dim]
+            image_emb, _ = self.image_proj(image_hidden_states)
+            image_emb = image_emb.unsqueeze(1)  # [B, 1, inner_dim]
             encoder_hidden_states = torch.cat([encoder_hidden_states, image_emb], dim=1)
 
         # Get rotary position embeddings
@@ -578,7 +577,7 @@ class SkyReelsTransformer3DModel(nn.Module):
 
         # Output projection
         hidden_states = self.norm_out(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states, _ = self.proj_out(hidden_states)
 
         # Reshape back to video format
         hidden_states = hidden_states.transpose(1, 2).reshape(

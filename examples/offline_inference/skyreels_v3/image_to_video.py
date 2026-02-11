@@ -154,10 +154,9 @@ def main():
         # Extract video frames from OmniRequestOutput
         video_frames = None
         if isinstance(output, OmniRequestOutput):
+            # In diffusion mode, output.images is the full list of frames
             if hasattr(output, "images") and output.images:
-                video_frames = output.images[0]
-            elif hasattr(output, "multimodal_output") and output.multimodal_output:
-                video_frames = output.multimodal_output[0]
+                video_frames = output.images
             else:
                 raise ValueError("No video data found in diffusion output.")
         else:
