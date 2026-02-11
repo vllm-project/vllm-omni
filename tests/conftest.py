@@ -1570,6 +1570,34 @@ class OmniRunner:
         )
         return self.generate(omni_inputs, sampling_params_list)
 
+    def _cleanup_process(self):
+        try:
+            keywords = ["vllm", "core"]
+
+            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
+                try:
+                    cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
+                    name = proc.name().lower()
+
+                    is_process = any(keyword in cmdline for keyword in keywords) or any(
+                        keyword in name for keyword in keywords
+                    )
+
+                    if is_process:
+                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
+
+                        try:
+                            proc.terminate()
+                            time.sleep(2)
+                        except Exception:
+                            proc.kill()
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+        except Exception as e:
+            print(f"Error in psutil vllm cleanup: {e}")
+
     def __enter__(self):
         """Context manager entry."""
         return self
@@ -1578,7 +1606,7 @@ class OmniRunner:
         """Context manager exit - cleanup resources."""
         if hasattr(self.omni, "close"):
             self.omni.close()
-        time.sleep(5)
+        self._cleanup_process()
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
         cleanup_dist_env_and_memory()
