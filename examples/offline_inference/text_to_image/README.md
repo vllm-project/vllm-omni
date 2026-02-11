@@ -1,8 +1,9 @@
 # Text-To-Image
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
+This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512`, `Tongyi-MAI/Z-Image` (Base), and `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
+- `z_image_examples.py`: comparison examples showing Z-Image Base vs Turbo usage.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
 
 Note that when you pass in multiple independent prompts, they will be processed sequentially. Batching requests is currently not supported.
@@ -74,17 +75,33 @@ if __name__ == "__main__":
 
 ## Local CLI Usage
 
+### Z-Image Turbo (Fast Inference)
 ```bash
 python text_to_image.py \
   --model Tongyi-MAI/Z-Image-Turbo \
   --prompt "a cup of coffee on the table" \
   --seed 42 \
-  --cfg_scale 4.0 \
   --num_images_per_prompt 1 \
-  --num_inference_steps 50 \
+  --num_inference_steps 8 \
+  --guidance_scale 0.0 \
   --height 1024 \
   --width 1024 \
-  --output outputs/coffee.png
+  --output outputs/coffee_turbo.png
+```
+
+### Z-Image Base (High Quality with CFG)
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image \
+  --prompt "a cup of coffee on the table" \
+  --negative_prompt "blurry, low quality, distorted" \
+  --seed 42 \
+  --num_images_per_prompt 1 \
+  --num_inference_steps 50 \
+  --guidance_scale 4.0 \
+  --height 1280 \
+  --width 720 \
+  --output outputs/coffee_base.png
 ```
 
 Key arguments:
@@ -102,6 +119,26 @@ Key arguments:
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 
 > ℹ️ If you encounter OOM errors, try using `--vae_use_slicing` and `--vae_use_tiling` to reduce memory usage.
+
+## Z-Image Base vs Turbo Comparison
+
+For detailed comparison and usage examples of both Z-Image variants, see:
+
+```bash
+python z_image_examples.py --example all
+```
+
+Key differences:
+
+| Feature | Z-Image Base | Z-Image Turbo |
+|---------|--------------|---------------|
+| Model | `Tongyi-MAI/Z-Image` | `Tongyi-MAI/Z-Image-Turbo` |
+| Inference Steps | 28-50 (default: 50) | 8 |
+| CFG Support | ✅ Yes (guidance_scale 3.0-5.0) | ❌ Must use 0.0 |
+| Negative Prompts | ✅ Supported | ❌ Not supported |
+| Fine-tunable | ✅ Yes | ❌ No (distilled) |
+| Scheduler Shift | 6.0 | 3.0 |
+| Best For | High quality, fine-tuning | Fast iteration, speed |
 
 > ℹ️ Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
 

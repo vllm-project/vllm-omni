@@ -27,7 +27,7 @@ th {
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 | `GlmImagePipeline` | GLM-Image | `zai-org/GLM-Image` |
-|`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
+|`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image` (Base), `Tongyi-MAI/Z-Image-Turbo` |
 | `WanPipeline` | Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` |
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |
@@ -61,7 +61,7 @@ th {
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` |
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2511 | `Qwen/Qwen-Image-Edit-2511` |
-|`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
+|`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image` (Base), `Tongyi-MAI/Z-Image-Turbo` |
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 |`Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` |
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` |

@@ -39,6 +39,8 @@ Text-to-image generation quickstart with vLLM-Omni:
 from vllm_omni.entrypoints.omni import Omni
 
 if __name__ == "__main__":
+    # Use Z-Image-Turbo for fast inference (8 steps)
+    # or Z-Image (Base) for higher quality (28-50 steps with CFG support)
     omni = Omni(model="Tongyi-MAI/Z-Image-Turbo")
     prompt = "a cup of coffee on the table"
     outputs = omni.generate(prompt)
@@ -59,8 +61,9 @@ You can pass a list of prompts and wait for them to process altogether, shown be
 from vllm_omni.entrypoints.omni import Omni
 
 if __name__ == "__main__":
+    # For batch inference with Z-Image models
     omni = Omni(
-        model="Tongyi-MAI/Z-Image-Turbo",
+        model="Tongyi-MAI/Z-Image-Turbo",  # or "Tongyi-MAI/Z-Image" for Base
         # stage_configs_path="./stage-config.yaml",  # See below
     )
     prompts = [
@@ -93,7 +96,11 @@ For more usages, please refer to [offline inference](../user_guide/examples/offl
 Text-to-image generation quickstart with vLLM-Omni:
 
 ```bash
+# Fast inference with Turbo (8 steps, no CFG)
 vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091
+
+# Or use Base model for higher quality (50 steps, CFG support)
+# vllm serve Tongyi-MAI/Z-Image --omni --port 8091
 ```
 
 ```bash
