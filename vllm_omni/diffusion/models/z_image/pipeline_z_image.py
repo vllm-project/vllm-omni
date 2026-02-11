@@ -156,10 +156,22 @@ class ZImagePipeline(nn.Module):
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=od_config.revision,
+                prefix="text_encoder.",
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="vae",
+                revision=od_config.revision,
+                prefix="vae.",
+            ),
         ]
         self._execution_device = get_local_device()
         model = od_config.model
