@@ -182,7 +182,9 @@ class ZImagePipeline(nn.Module):
         with init_on_device_without_buffers("meta"):
             self.text_encoder = AutoModelForCausalLM.from_config(text_encoder_config)
         recursive_replace_linear(self.text_encoder, od_config)
-        init_parameters(self.text_encoder, dtype=od_config.dtype)
+        init_parameters(self.text_encoder, dtype=od_config.dtype, device=self._execution_device)
+        if text_encoder_config.tie_word_embeddings:
+            self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
@@ -658,5 +660,5 @@ class ZImagePipeline(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_weights = loader.load_weights(weights)
-        loaded_weights |= {name for name, _ in self.vae.named_parameters()}
+        loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
         return loaded_weights
