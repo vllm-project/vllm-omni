@@ -158,7 +158,13 @@ class DiffusionModelRunner:
         self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
 
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            req.sampling_params.generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            if req.sampling_params.generator_device is not None:
+                gen_device = req.sampling_params.generator_device
+            elif self.device.type == "cpu":
+                gen_device = "cpu"
+            else:
+                gen_device = self.device
+            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
         # Refresh cache context if needed
         if (
