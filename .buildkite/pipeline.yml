@@ -214,7 +214,6 @@ steps:
     timeout_in_minutes: 15
     depends_on: image-build
     commands:
-    - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
     agents:
