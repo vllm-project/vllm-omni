@@ -2,16 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Workarounds for cuBLAS compatibility issues across GPU drivers.
 
-``Tensor.expand()`` produces stride-0 dimensions that share memory.
-Some cuBLAS versions / GPU drivers reject stride-0 in
-``cublasSgemmStridedBatched`` or ``cublasGemmEx``, raising
-``CUBLAS_STATUS_INVALID_VALUE``.
+Some cuBLAS versions reject the batched GEMM dispatched by the ``@``
+operator inside ``RotaryEmbedding.forward``, raising
+``CUBLAS_STATUS_INVALID_VALUE`` from ``cublasSgemmStridedBatched``.
 
-The functions in this module monkey-patch the ``forward`` of rotary-embedding
-modules to call ``.contiguous()`` after ``expand()``, eliminating the
-stride-0 tensors.  The patches are safe for all GPUs – ``.contiguous()``
-is a no-op when the tensor is already contiguous, and the extra memory
-for the small ``inv_freq`` buffer is negligible.
+Because the inner dimension (k) of the multiplication is always **1**,
+the matmul is mathematically equivalent to element-wise broadcast
+multiplication (``A * B``).  The patches in this module replace ``@``
+with ``*``, which runs through CUDA element-wise kernels instead of
+cuBLAS and is therefore immune to the driver bug.
 """
 
 from __future__ import annotations
@@ -45,19 +44,17 @@ def patch_qwen25vl_rope_for_cublas_compat(model: nn.Module) -> None:
         def _make_safe_forward(rope_mod: Qwen2_5_VLRotaryEmbedding):
             @torch.no_grad()
             def _safe_forward(x: torch.Tensor, position_ids: torch.Tensor):
-                inv_freq_expanded = (
-                    rope_mod.inv_freq[None, None, :, None]
-                    .float()
-                    .expand(3, position_ids.shape[1], -1, 1)
-                    .contiguous()  # avoid stride-0 in cuBLAS
-                )
-                position_ids_expanded = (
-                    position_ids[:, :, None, :].float().contiguous()
-                )  # position_ids also comes from expand() with stride-0
+                # inv_freq: (dim//2,)
+                # After unsqueeze: (1, 1, dim//2, 1)
+                inv_freq_expanded = rope_mod.inv_freq[None, None, :, None].float()
+                # position_ids: (3, bs, seq_len)  →  (3, bs, 1, seq_len)
+                position_ids_expanded = position_ids[:, :, None, :].float()
 
                 device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False):
-                    freqs = (inv_freq_expanded @ position_ids_expanded).transpose(2, 3)
+                    # k == 1, so matmul ≡ broadcast multiply:
+                    #   (1,1,dim//2,1) * (3,bs,1,seq_len) → (3,bs,dim//2,seq_len)
+                    freqs = (inv_freq_expanded * position_ids_expanded).transpose(2, 3)
                     emb = torch.cat((freqs, freqs), dim=-1)
                     cos = emb.cos() * rope_mod.attention_scaling
                     sin = emb.sin() * rope_mod.attention_scaling
@@ -68,7 +65,7 @@ def patch_qwen25vl_rope_for_cublas_compat(model: nn.Module) -> None:
 
         module.forward = _make_safe_forward(module)
         logger.info(
-            "Patched %s for cuBLAS stride-0 compatibility",
+            "Patched %s – replaced matmul with broadcast multiply",
             type(module).__name__,
         )
 
@@ -81,14 +78,12 @@ def patch_qwen25vl_rope_for_cublas_compat(model: nn.Module) -> None:
 def patch_qwen3_rope_for_cublas_compat(model: nn.Module) -> None:
     """Patch every ``Qwen3RotaryEmbedding`` in *model*.
 
-    ``Qwen3RotaryEmbedding.forward`` does::
+    Same cuBLAS issue as Qwen2.5-VL but with standard 3-D shapes::
 
-        inv_freq_expanded = self.inv_freq[None, :, None]
-            .float().expand(position_ids.shape[0], -1, 1)
-        # shape: (bs, dim//2, 1)  strides: (0, 1, 1)  ← stride-0!
+        inv_freq_expanded  : (bs, dim//2, 1)
+        position_ids_expanded : (bs, 1, seq_len)
 
-    For bs > 1 this passes a stride-0 A matrix to
-    ``cublasSgemmStridedBatched``, which some drivers reject.
+    k == 1, so ``@`` is replaced with broadcast ``*``.
     """
     try:
         from transformers.models.qwen3.modeling_qwen3 import (
@@ -104,18 +99,16 @@ def patch_qwen3_rope_for_cublas_compat(model: nn.Module) -> None:
         def _make_safe_forward(rope_mod: Qwen3RotaryEmbedding):
             @torch.no_grad()
             def _safe_forward(x: torch.Tensor, position_ids: torch.Tensor):
-                inv_freq_expanded = (
-                    rope_mod.inv_freq[None, :, None]
-                    .float()
-                    .expand(position_ids.shape[0], -1, 1)
-                    .contiguous()  # avoid stride-0 in cuBLAS
-                    .to(x.device)
-                )
-                position_ids_expanded = position_ids[:, None, :].float().contiguous()
+                # inv_freq: (dim//2,)  →  (1, dim//2, 1)
+                inv_freq_expanded = rope_mod.inv_freq[None, :, None].float().to(x.device)
+                # position_ids: (bs, seq_len)  →  (bs, 1, seq_len)
+                position_ids_expanded = position_ids[:, None, :].float()
 
                 device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False):
-                    freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+                    # k == 1, so matmul ≡ broadcast multiply:
+                    #   (1,dim//2,1) * (bs,1,seq_len) → (bs,dim//2,seq_len)
+                    freqs = (inv_freq_expanded * position_ids_expanded).transpose(1, 2)
                     emb = torch.cat((freqs, freqs), dim=-1)
                     cos = emb.cos() * rope_mod.attention_scaling
                     sin = emb.sin() * rope_mod.attention_scaling
@@ -126,6 +119,6 @@ def patch_qwen3_rope_for_cublas_compat(model: nn.Module) -> None:
 
         module.forward = _make_safe_forward(module)
         logger.info(
-            "Patched %s for cuBLAS stride-0 compatibility",
+            "Patched %s – replaced matmul with broadcast multiply",
             type(module).__name__,
         )
