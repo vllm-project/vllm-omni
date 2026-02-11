@@ -17,14 +17,6 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # - label: "Test on NPU"
-  #   depends_on: ~
-  #   key: npu-test
-  #   commands:
-  #     - ".buildkite/scripts/hardware_ci/run_npu_test.sh"
-  #   agents:
-  #     queue: "ascend"
-
   - label: "Simple Unit Test"
     depends_on: image-build
     commands:
