@@ -104,15 +104,12 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker][]
 - [vllm_omni.platforms.xpu.worker.xpu_generation_model_runner.XPUGenerationModelRunner][]
 - [vllm_omni.platforms.xpu.worker.xpu_generation_worker.XPUGenerationWorker][]
+- [vllm_omni.worker.base.OmniGPUWorkerBase][]
 - [vllm_omni.worker.gpu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_ar_worker.GPUARWorker][]
 - [vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner][]
 - [vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker][]
+- [vllm_omni.worker.gpu_memory_utils.parse_cuda_visible_devices][]
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
 - [vllm_omni.worker.mixins.OmniWorkerMixin][]
-
-
-## Metrics
-
-- [vllm_omni.metrics.OrchestratorAggregator][]
