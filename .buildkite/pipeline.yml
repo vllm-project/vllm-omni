@@ -9,6 +9,14 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
+  - label: "Upload Nightly Pipeline"
+    depends_on: image-build
+    if: build.env("NIGHTLY") == "1"
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-nightly.yaml
+    agents:
+      queue: "cpu_queue_premerge"
+
   # - label: "Test on NPU"
   #   depends_on: ~
   #   key: npu-test
@@ -213,20 +221,20 @@ steps:
     timeout_in_minutes: 15
     depends_on: image-build
     commands:
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+      - export VLLM_LOGGING_LEVEL=DEBUG
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
-    - docker#v5.2.0:
-        image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-        always-pull: true
-        propagate-environment: true
-        environment:
-        - "HF_HOME=/fsx/hf_cache"
-        volumes:
-        - "/fsx/hf_cache:/fsx/hf_cache"
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Qwen3-TTS E2E Test"
     timeout_in_minutes: 10
