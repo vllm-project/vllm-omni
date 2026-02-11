@@ -188,11 +188,11 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Your-org/your-model \
     --prompt "a cup of coffee on the table" \
-    --negative_prompt "ugly, unclear" \
-    --cfg_scale 4.0 \
-    --num_inference_steps 50 \
+    --negative-prompt "ugly, unclear" \
+    --cfg-scale 4.0 \
+    --num-inference-steps 50 \
     --output "cfg_enabled.png" \
-    --cfg_parallel_size 2
+    --cfg-parallel-size 2
 ```
 
 **Verify:**
@@ -246,4 +246,4 @@ Adding CFG-Parallel support:
 
 1. ✅ **Create mixin** - Inherit from `CFGParallelMixin` and implement `diffuse()` method
 2. ✅ **(Optional) Customize** - Override `predict_noise()` or `cfg_normalize_function()` for custom behavior
-3. ✅ **Test** - Verify with `--cfg_parallel_size 2` and compare performance
+3. ✅ **Test** - Verify with `--cfg-parallel-size 2` and compare performance

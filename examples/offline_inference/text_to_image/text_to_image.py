@@ -25,19 +25,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
-        "--negative_prompt",
+        "--negative-prompt",
         default=None,
         help="negative prompt for classifier-free conditional guidance.",
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
-        "--cfg_scale",
+        "--cfg-scale",
         type=float,
         default=4.0,
         help="True classifier-free guidance scale specific to Qwen-Image.",
     )
     parser.add_argument(
-        "--guidance_scale",
+        "--guidance-scale",
         type=float,
         default=1.0,
         help="Classifier-free guidance scale.",
@@ -51,19 +51,19 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the generated image (PNG).",
     )
     parser.add_argument(
-        "--num_images_per_prompt",
+        "--num-images-per-prompt",
         type=int,
         default=1,
         help="Number of images to generate for the given prompt.",
     )
     parser.add_argument(
-        "--num_inference_steps",
+        "--num-inference-steps",
         type=int,
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
     )
     parser.add_argument(
-        "--cache_backend",
+        "--cache-backend",
         type=str,
         default=None,
         choices=["cache_dit", "tea_cache"],
@@ -79,26 +79,26 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument(
-        "--ulysses_degree",
+        "--ulysses-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
-        "--ring_degree",
+        "--ring-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
     parser.add_argument(
-        "--cfg_parallel_size",
+        "--cfg-parallel-size",
         type=int,
         default=1,
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
-        "--enforce_eager",
+        "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
     )
@@ -119,23 +119,23 @@ def parse_args() -> argparse.Namespace:
         help="Number of ready layers (blocks) to keep on GPU during generation.",
     )
     parser.add_argument(
-        "--vae_use_slicing",
+        "--vae-use-slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
     )
     parser.add_argument(
-        "--vae_use_tiling",
+        "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
     )
     parser.add_argument(
-        "--tensor_parallel_size",
+        "--tensor-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
-        "--vae_patch_parallel_size",
+        "--vae-patch-parallel-size",
         type=int,
         default=1,
         help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
