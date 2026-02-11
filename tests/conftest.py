@@ -1101,7 +1101,9 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
         AssertionError: When the response does not meet validation criteria
     """
     assert response.success, "The request failed."
-    print(f"the avg e2e is: {response.e2e_latency}")
+    e2e_latency = response.e2e_latency
+    if e2e_latency is not None:
+        print(f"the avg e2e is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
