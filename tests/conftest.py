@@ -1572,7 +1572,7 @@ class OmniRunner:
 
     def _cleanup_process(self):
         try:
-            keywords = ["core"]
+            keywords = ["enginecore"]
 
             for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
                 try:
