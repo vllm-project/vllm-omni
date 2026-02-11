@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable
+from copy import deepcopy
 from dataclasses import dataclass
 from math import isqrt
 
@@ -19,7 +20,7 @@ from PIL import Image
 from torch import nn
 from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -38,13 +39,11 @@ logger = init_logger(__name__)
 class BagelGenParams:
     num_timesteps: int = 50
     timestep_shift: float = 3.0
-    # CFG 参数
     cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.5
     cfg_interval: tuple = (0.4, 1.0)
     cfg_renorm_min: float = 0.0
     cfg_renorm_type: str = "global"
-
 
 
 def add_special_tokens(tokenizer):
@@ -257,6 +256,97 @@ class BagelPipeline(nn.Module):
 
         self.to(self.device)
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            (".qkv_proj_moe_gen", ".q_proj_moe_gen", "q"),
+            (".qkv_proj_moe_gen", ".k_proj_moe_gen", "k"),
+            (".qkv_proj_moe_gen", ".v_proj_moe_gen", "v"),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+        # Common prefixes that need to be mapped to `bagel.` namespace
+        bagel_prefixes = (
+            "language_model.",
+            "time_embedder.",
+            "latent_pos_embed.",
+            "vae2llm.",
+            "llm2vae.",
+            "vit_model.",
+            "vision_model.",
+            "connector.",
+            "vit_pos_embed.",
+        )
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # Generate Candidate Names
+            candidates = []
+
+            # Direct match
+            candidates.append(name)
+
+            # Bagel Prefix match
+            if name.startswith(bagel_prefixes):
+                candidates.append("bagel." + name)
+
+            # VAE match (from ae.safetensors or unet checkpoints)
+            if name.startswith(("encoder.", "decoder.")):
+                candidates.append("vae." + name)
+
+            # Try loading candidates
+            loaded = False
+            for cand in candidates:
+                # 1. Try QKV Mapping first (most specific)
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name in cand:
+                        mapped_cand = cand.replace(weight_name, param_name)
+                        param = params_dict.get(mapped_cand)
+                        if param is not None:
+                            getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight, shard_id)
+                            loaded = True
+                            break
+                if loaded:
+                    break
+
+                # 2. Try direct parameter match
+                param = params_dict.get(cand)
+                if param is not None:
+                    # Special handling for resize/reshape
+
+                    # Case A: Latent Pos Embed Resize
+                    if cand.endswith("bagel.latent_pos_embed.pos_embed") and loaded_weight.ndim == 2:
+                        npos, hdim = loaded_weight.shape
+                        if param.shape != loaded_weight.shape:
+                            param.data = param.data.new_empty((npos, hdim))
+                            # Update config
+                            side = isqrt(npos)
+                            self.bagel.max_latent_size = side
+                            if hasattr(self.bagel, "config"):
+                                setattr(self.bagel.config, "max_latent_size", side)
+                            if hasattr(self.bagel.latent_pos_embed, "max_num_patch_per_side"):
+                                self.bagel.latent_pos_embed.max_num_patch_per_side = side
+
+                    # Case B: SigLIP Patch Embedding Reshape
+                    if cand.endswith("embeddings.patch_embedding.weight") and loaded_weight.ndim == 2:
+                        # Checkpoint has (Hidden, C*P*P), model expects (Hidden, C, P, P)
+                        if param.ndim == 4 and loaded_weight.numel() == param.numel():
+                            loaded_weight = loaded_weight.view(param.shape)
+
+                    if param.shape != loaded_weight.shape:
+                        pass
+
+                    getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
+                    loaded = True
+                    break
+
+            if loaded:
+                loaded_params.add(name)
+
+        return loaded_params
+
     @staticmethod
     def _decode_image_from_latent(
         bagel: Bagel, vae: AutoEncoder, latent: torch.Tensor, image_shape: tuple[int, int]
@@ -303,55 +393,40 @@ class BagelPipeline(nn.Module):
             )
         image_shape = (height, width)
 
-        # 从 request 中读取 CFG 参数（优先从 extra_args 中读取）
-        extra_args = getattr(req.sampling_params, 'extra_args', {}) or {}
-        cfg_text_scale = extra_args.get('cfg_text_scale', None)
-        cfg_img_scale = extra_args.get('cfg_img_scale', 1.5)
-        
-        # 如果 extra_args 中没有 cfg_text_scale，则使用 guidance_scale
-        if cfg_text_scale is None:
-            cfg_text_scale = getattr(req.sampling_params, 'guidance_scale', 4.0) or 4.0
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
+        cfg_img_scale = extra_args.get("cfg_img_scale", 1.5)
 
-        # Map request params to Bagel gen params (defaults follow Bagel inferencer)
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
         )
-        # 初始化gen_context
+
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-        # 初始化 CFG contexts（用于无条件分支）
-        from copy import deepcopy
-        cfg_text_context = deepcopy(gen_context)  # 无文本条件
-        cfg_img_context = deepcopy(gen_context)   # 无图像条件
+        cfg_text_context = deepcopy(gen_context)
+        cfg_img_context = deepcopy(gen_context)
 
-        # Add text prompt (prefill) on gen context.
-        # [Omni] Check for injected KV Cache from remote transfer
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
             gen_context["past_key_values"] = injected_kv
-
-            # User requested: kv_lens and ropes set to [gen_context["past_key_values"].key_cache[0].shape[0]]
-            # Assuming injected_kv is compatible and has key_cache[0]
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
             gen_context["ropes"] = [seq_len]
-            
-            # 注意: 当使用注入的 KV Cache 时，CFG 分支无法正确工作
-            # 因为我们只有一个 KV Cache，而 CFG 需要三个不同的 KV Cache
-            # 这里禁用 CFG（设置 scale=1.0）
-            logger.warning("CFG is disabled when using injected KV Cache (single KV cache cannot support 3-branch CFG)")
+
+            # Disable CFG: single KV cache cannot support 3-branch CFG
+            logger.warning("CFG is disabled when using injected KV Cache")
             gen_params = BagelGenParams(
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
-                cfg_text_scale=1.0,  # 禁用 CFG
-                cfg_img_scale=1.0,   # 禁用 CFG
+                cfg_text_scale=1.0,
+                cfg_img_scale=1.0,
             )
 
         else:
@@ -368,17 +443,12 @@ class BagelPipeline(nn.Module):
                 if self.image_processor and self.vae:
 
                     def vit_transforms(img):
-                        # SigLIP processor returns dict with pixel_values; we want the tensor
                         return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
 
-                    # 关键：按照 Bagel 官方逻辑 resize 图像
-                    # 确保尺寸被 latent_downsample 整除（stride=16）
-                    stride = self.bagel.latent_downsample  # 通常 = 16
-                    max_img_size = int(self.bagel.max_latent_size * stride)  # 通常 = 512
+                    stride = self.bagel.latent_downsample
+                    max_img_size = int(self.bagel.max_latent_size * stride)
 
                     def _resize_to_stride(img):
-                        """Resize image so both dimensions are divisible by stride, 
-                        and within [min_size, max_size]."""
                         if img.mode != "RGB":
                             img = img.convert("RGB")
                         w, h = img.size
@@ -396,14 +466,11 @@ class BagelPipeline(nn.Module):
                             img = img.resize((new_w, new_h), Image.BICUBIC)
                         return img
 
-                    # Resize all input images
                     image_input = [_resize_to_stride(img) for img in image_input]
 
-                    # 关键：从 resize 后的图像推导 image_shape
-                    # 官方代码: image_shapes = input_term.size[::-1]  # (H, W) from PIL (W, H)
                     resized_w, resized_h = image_input[0].size
                     image_shape = (resized_h, resized_w)
-                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}, image_shape={image_shape}")
+                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
 
                     def vae_transforms(img):
                         if img.mode != "RGB":
@@ -412,7 +479,7 @@ class BagelPipeline(nn.Module):
                         arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
                         return arr.permute(2, 0, 1)
 
-                    # === 对 gen_context 更新图像 (VAE + ViT) ===
+                    # Update gen_context with image (VAE + ViT)
                     gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
                         curr_kvlens=gen_context["kv_lens"],
                         curr_rope=gen_context["ropes"],
@@ -455,15 +522,9 @@ class BagelPipeline(nn.Module):
                     gen_context["kv_lens"] = newlens_img
                     gen_context["ropes"] = new_rope_img
 
-                    # === CFG: 图像处理完后，deepcopy gen_context → cfg_text_context ===
-                    # 官方逻辑：cfg_text_context = deepcopy(gen_context) 在图像处理之后
-                    # 这样 cfg_text_context 包含图像但不会包含后续的文本
                     cfg_text_context = deepcopy(gen_context)
 
-            # === 处理文本 ===
-            # 官方逻辑：在文本处理前，cfg_text_context = deepcopy(gen_context)
-            # 但我们已经在图像处理后做了 deepcopy，所以这里不需要再次 deepcopy
-            # （如果没有图像输入，cfg_text_context 初始值已经是空的 deepcopy）
+            # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -485,7 +546,6 @@ class BagelPipeline(nn.Module):
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(self.device)
 
-            # 更新 gen_context 的文本
             with torch.autocast(
                 device_type=self.device.type,
                 enabled=self.device.type != "cpu",
@@ -497,8 +557,30 @@ class BagelPipeline(nn.Module):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
-            # === CFG: cfg_img_context 也需要更新文本（有文本，无图像）===
-            # 关键：必须用 cfg_img_context 自己的 kv_lens/ropes 来 prepare_prompts
+            # cfg_text_context: update with negative prompt (no text condition)
+            neg_prompt = extra_args.get("negative_prompt", "")
+            neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
+                curr_kvlens=cfg_text_context["kv_lens"],
+                curr_rope=cfg_text_context["ropes"],
+                prompts=[neg_prompt],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            for k, v in neg_input.items():
+                if torch.is_tensor(v):
+                    neg_input[k] = v.to(self.device)
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    cfg_text_context["past_key_values"], **neg_input
+                )
+            cfg_text_context["kv_lens"] = neg_newlens
+            cfg_text_context["ropes"] = neg_rope
+
+            # cfg_img_context: update with text prompt (no image condition)
             cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_img_context["kv_lens"],
                 curr_rope=cfg_img_context["ropes"],
@@ -525,7 +607,6 @@ class BagelPipeline(nn.Module):
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(req.sampling_params.seed)
 
-        # Prepare latent query and run flow
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
@@ -558,12 +639,13 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
-        # CFG: 为两个无条件分支准备 latent 输入
+        # text cfg
         generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text_context["kv_lens"],
             curr_rope=cfg_text_context["ropes"],
             image_sizes=[image_shape],
         )
+        # img cfg
         generation_input_cfg_img = self.bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_img_context["kv_lens"],
             curr_rope=cfg_img_context["ropes"],
@@ -583,160 +665,25 @@ class BagelPipeline(nn.Module):
         ):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
-                # CFG: 无文本条件的 KV Cache
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
-                # CFG: 无图像条件的 KV Cache
                 cfg_img_past_key_values=cfg_img_context["past_key_values"],
-                # 基础参数
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
-                # CFG 参数
                 cfg_text_scale=gen_params.cfg_text_scale,
                 cfg_img_scale=gen_params.cfg_img_scale,
                 cfg_interval=gen_params.cfg_interval,
                 cfg_renorm_min=gen_params.cfg_renorm_min,
                 cfg_renorm_type=gen_params.cfg_renorm_type,
-                # 主分支 latent 输入
                 **generation_input,
-                # CFG text 分支的位置索引
-                cfg_text_packed_position_ids=generation_input_cfg_text['cfg_packed_position_ids'],
-                cfg_text_packed_query_indexes=generation_input_cfg_text['cfg_packed_query_indexes'],
-                cfg_text_key_values_lens=generation_input_cfg_text['cfg_key_values_lens'],
-                cfg_text_packed_key_value_indexes=generation_input_cfg_text['cfg_packed_key_value_indexes'],
-                # CFG img 分支的位置索引
-                cfg_img_packed_position_ids=generation_input_cfg_img['cfg_packed_position_ids'],
-                cfg_img_packed_query_indexes=generation_input_cfg_img['cfg_packed_query_indexes'],
-                cfg_img_key_values_lens=generation_input_cfg_img['cfg_key_values_lens'],
-                cfg_img_packed_key_value_indexes=generation_input_cfg_img['cfg_packed_key_value_indexes'],
+                cfg_text_packed_position_ids=generation_input_cfg_text["cfg_packed_position_ids"],
+                cfg_text_packed_query_indexes=generation_input_cfg_text["cfg_packed_query_indexes"],
+                cfg_text_key_values_lens=generation_input_cfg_text["cfg_key_values_lens"],
+                cfg_text_packed_key_value_indexes=generation_input_cfg_text["cfg_packed_key_value_indexes"],
+                cfg_img_packed_position_ids=generation_input_cfg_img["cfg_packed_position_ids"],
+                cfg_img_packed_query_indexes=generation_input_cfg_img["cfg_packed_query_indexes"],
+                cfg_img_key_values_lens=generation_input_cfg_img["cfg_key_values_lens"],
+                cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
             )
 
-        # Decode first sample
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
         return DiffusionOutput(output=img)
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        state = self.state_dict()
-        allowed = set(state.keys())
-        shapes = {k: tuple(v.shape) for k, v in state.items()}
-
-        tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
-
-        # Expand allowed/tp_aware_params with stacked param source names.
-        # QKVParallelLinear merges q_proj+k_proj+v_proj into qkv_proj; the
-        # checkpoint stores the original separate names.  We must recognise
-        # those names so _filtered_weights does not drop them.
-        _stacked_expansions = [
-            (".qkv_proj", ".q_proj"),
-            (".qkv_proj", ".k_proj"),
-            (".qkv_proj", ".v_proj"),
-            (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
-            (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
-            (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
-        ]
-        stacked_source_names: set[str] = set()
-        for name in list(allowed):
-            for target_suffix, source_suffix in _stacked_expansions:
-                if target_suffix in name:
-                    stacked_source_names.add(name.replace(target_suffix, source_suffix))
-        allowed.update(stacked_source_names)
-        tp_aware_params.update(stacked_source_names)
-
-        def _normalize_name(name: str) -> str:
-            # Common wrappers/prefixes in checkpoints.
-            for pfx in ("module.", "model."):
-                if name.startswith(pfx):
-                    name = name[len(pfx) :]
-            # Common component renames across repos.
-            if name.startswith("vae_model."):
-                name = "vae." + name[len("vae_model.") :]
-            # Bagel `ae.safetensors` commonly stores AE weights without a top-level prefix.
-            # Map them into this pipeline's `vae.*` namespace.
-            if name.startswith("encoder.") or name.startswith("decoder."):
-                name = "vae." + name
-            return name
-
-        def _iter_candidate_names(name: str) -> Iterable[str]:
-            """Yield candidate parameter names in this pipeline for a checkpoint key.
-
-            The upstream Bagel repo typically stores Bagel-core layers (time_embedder,
-            latent_pos_embed, vae2llm, llm2vae, etc.) at the top-level of the model,
-            while this vllm-omni integration nests them under `self.bagel`.
-            """
-            n = _normalize_name(name)
-            yield n
-
-            # Map Bagel core layers from top-level -> `bagel.*` namespace.
-            for pfx in ("time_embedder.", "latent_pos_embed.", "vae2llm.", "llm2vae."):
-                if n.startswith(pfx):
-                    yield "bagel." + n
-                    break
-
-            # Map connector and vit_pos_embed to `bagel.*`
-            for pfx in ("connector.", "vit_pos_embed."):
-                if n.startswith(pfx):
-                    yield "bagel." + n
-                    break
-
-            if n.startswith("vit_model."):
-                yield "bagel." + n  # matches self.bagel.vit_model
-            elif n.startswith("vision_model."):
-                yield "bagel.vit_model." + n
-            elif n.startswith("model.vision_model."):
-                yield "bagel.vit_model." + n[len("model.") :]
-
-        def _filtered_weights():
-            total = 0
-            kept = 0
-            shape_mismatch = 0
-            for name, tensor in weights:
-                total += 1
-                picked = None
-                for cand in _iter_candidate_names(name):
-                    if cand in allowed:
-                        # Only accept if tensor shape matches target param/buffer shape.
-                        if tuple(tensor.shape) == shapes.get(cand) or cand in tp_aware_params:
-                            picked = cand
-                            break
-                        else:
-                            if cand.endswith("bagel.latent_pos_embed.pos_embed") and tensor.ndim == 2:
-                                npos, hdim = tensor.shape
-                                side = isqrt(int(npos))
-                                if side * side == int(npos) and hdim == int(self.bagel.hidden_size):
-                                    param = self.bagel.latent_pos_embed.pos_embed
-                                    # Resize in-place to keep the same Parameter object.
-                                    param.data = param.data.new_empty((npos, hdim))
-                                    # Update model bookkeeping so position-id generation matches.
-                                    self.bagel.max_latent_size = int(side)
-                                    if hasattr(self.bagel, "config"):
-                                        setattr(self.bagel.config, "max_latent_size", int(side))
-                                    if hasattr(self.bagel.latent_pos_embed, "max_num_patch_per_side"):
-                                        self.bagel.latent_pos_embed.max_num_patch_per_side = int(side)
-                                    shapes[cand] = (npos, hdim)
-                                    picked = cand
-                                    break
-                            # Handle flattened patch embedding for SigLIP
-                            if cand.endswith("embeddings.patch_embedding.weight") and tensor.ndim == 2:
-                                # Checkpoint has (Hidden, C*P*P), model expects (Hidden, C, P, P)
-                                if shapes.get(cand) is not None:
-                                    target_shape = shapes[cand]
-                                    if tensor.numel() == torch.prod(torch.tensor(target_shape)):
-                                        # Reshape tensor to match target
-                                        tensor = tensor.view(target_shape)
-                                        picked = cand
-                                        break
-
-                            shape_mismatch += 1
-                            # Keep this quiet; shape mismatches are expected for ignored modules.
-                if picked is not None:
-                    kept += 1
-                    yield picked, tensor
-                # else: ignore extra weights (e.g. connector/vision/und)
-            logger.info_once(
-                "BagelPipeline weight filter kept %d/%d tensors (shape mismatches seen: %d)",
-                kept,
-                total,
-                shape_mismatch,
-            )
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(_filtered_weights())

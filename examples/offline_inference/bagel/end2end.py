@@ -45,16 +45,13 @@ def parse_args():
     parser.add_argument("--ray-address", type=str, default=None)
     parser.add_argument("--stage-configs-path", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
-    
+
     # CFG 参数
-    parser.add_argument("--guidance-scale", type=float, default=4.0, 
-                        help="Text CFG scale (alias for --cfg-text-scale)")
-    parser.add_argument("--cfg-text-scale", type=float, default=None,
-                        help="Text CFG scale (overrides --guidance-scale if set)")
-    parser.add_argument("--cfg-img-scale", type=float, default=1.5,
-                        help="Image CFG scale")
-    parser.add_argument("--negative-prompt", type=str, default=None,
-                        help="Negative prompt (not yet supported, reserved for future)")
+    parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
+    parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
+    parser.add_argument(
+        "--negative-prompt", type=str, default=None, help="Negative prompt (not yet supported, reserved for future)"
+    )
 
     args = parser.parse_args()
     return args
@@ -106,18 +103,14 @@ def main():
             else:
                 print(f"[Warning] Image path {args.image_path} does not exist.")
 
-        # 计算 CFG scale
-        cfg_text_scale = args.cfg_text_scale if args.cfg_text_scale is not None else args.guidance_scale
-        
         result = client.generate(
             prompts,
             OmniDiffusionSamplingParams(
                 seed=52,
                 need_kv_receive=False,
                 num_inference_steps=args.steps,
-                guidance_scale=cfg_text_scale,
                 extra_args={
-                    "cfg_text_scale": cfg_text_scale,
+                    "cfg_text_scale": args.cfg_text_scale,
                     "cfg_img_scale": args.cfg_img_scale,
                 },
             ),
@@ -176,7 +169,12 @@ def main():
         if args.modality == "text2img":
             params_list[0].max_tokens = 1  # type: ignore # The first stage is a SamplingParam (vllm)
             if len(params_list) > 1:
-                params_list[1].num_inference_steps = args.steps  # type: ignore # The second stage is an OmniDiffusionSamplingParam
+                diffusion_params = params_list[1]
+                diffusion_params.num_inference_steps = args.steps  # type: ignore
+                diffusion_params.extra_args = {  # type: ignore
+                    "cfg_text_scale": args.cfg_text_scale,
+                    "cfg_img_scale": args.cfg_img_scale,
+                }
 
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

@@ -10,13 +10,12 @@
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from tqdm import tqdm
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
+from tqdm import tqdm
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2PreTrainedModel,
@@ -1209,18 +1208,14 @@ class Bagel(nn.Module):
             query_curr += 1
 
             vae_position_ids = self.get_flattened_position_ids(
-                H, W, 
-                self.latent_downsample, 
-                max_num_patches_per_side=self.max_latent_size
+                H, W, self.latent_downsample, max_num_patches_per_side=self.max_latent_size
             )
             packed_vae_position_ids.append(vae_position_ids)
 
             h, w = H // self.latent_downsample, W // self.latent_downsample
             num_image_tokens = h * w
 
-            packed_init_noises.append(
-                torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size**2)
-            )
+            packed_init_noises.append(torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size**2))
             packed_vae_token_indexes.extend(range(query_curr, query_curr + num_image_tokens))
             packed_seqlens.append(num_image_tokens + 2)
 
@@ -1255,6 +1250,7 @@ class Bagel(nn.Module):
 
     def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
         return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids)
+
     def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
         packed_position_ids, packed_indexes, packed_key_value_indexes = list(), list(), list()
 
@@ -1305,47 +1301,37 @@ class Bagel(nn.Module):
         timestep_shift: float = 1.0,
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
-        cfg_interval: Optional[Tuple[float, float]] = [0, 1],
+        cfg_interval: tuple[float, float] | None = [0, 1],
         # cfg_text
         cfg_text_scale: float = 1.0,
-        cfg_text_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_text_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_text_past_key_values: Optional[NaiveCache] = None,
-        cfg_text_key_values_lens: Optional[torch.IntTensor] = None,
-        cfg_text_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_text_packed_position_ids: torch.LongTensor | None = None,
+        cfg_text_past_key_values: NaiveCache | None = None,
+        cfg_text_key_values_lens: torch.IntTensor | None = None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
         # cfg_img
         cfg_img_scale: float = 1.0,
-        cfg_img_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_img_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_img_past_key_values: Optional[NaiveCache] = None,
-        cfg_img_key_values_lens: Optional[torch.IntTensor] = None,
-        cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_img_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_img_packed_position_ids: torch.LongTensor | None = None,
+        cfg_img_past_key_values: NaiveCache | None = None,
+        cfg_img_key_values_lens: torch.IntTensor | None = None,
+        cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
         cfg_type: str = "parallel",
-        # cache_args
-        enable_taylorseer=False,
     ):
-        if enable_taylorseer:
-            self.language_model.model.enable_taylorseer = True
-            model_pred_cache_dic, model_pred_current = cache_init(self, num_timesteps)
-            model_pred_text_cache_dic, model_pred_text_current = cache_init(self, num_timesteps)
-            model_pred_img_cache_dic, model_pred_img_current = cache_init(self, num_timesteps)
-        else:
-            self.language_model.model.enable_taylorseer = False
-            model_pred_cache_dic, model_pred_current = None, None
-            model_pred_text_cache_dic, model_pred_text_current = None, None
-            model_pred_img_cache_dic, model_pred_img_current = None, None
-    
         x_t = packed_init_noises
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
-        dts =  timesteps[:-1] - timesteps[1:] # 错位相减，全是0.02
-        timesteps = timesteps[:-1] # 算49次就行了
+        dts = timesteps[:-1] - timesteps[1:]  # 错位相减，全是0.02
+        timesteps = timesteps[:-1]  # 算49次就行了
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
-
-            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device) # 调整大小与x_t.shape[0]一致(latent token)时间步嵌入
-            if t > cfg_interval[0] and t <= cfg_interval[1]:    # 只有在t在[cfg_interval[0], cfg_interval[1]]之间的时候才进行cfg
+            timestep = torch.tensor(
+                [t] * x_t.shape[0], device=x_t.device
+            )  # 调整大小与x_t.shape[0]一致(latent token)时间步嵌入
+            if (
+                t > cfg_interval[0] and t <= cfg_interval[1]
+            ):  # 只有在t在[cfg_interval[0], cfg_interval[1]]之间的时候才进行cfg
                 cfg_text_scale_ = cfg_text_scale
                 cfg_img_scale_ = cfg_img_scale
             else:
@@ -1353,7 +1339,7 @@ class Bagel(nn.Module):
                 cfg_img_scale_ = 1.0
             v_t = self._forward_flow(
                 x_t=x_t,
-                timestep=timestep, 
+                timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_vae_position_ids=packed_vae_position_ids,
                 packed_text_ids=packed_text_ids,
@@ -1381,21 +1367,10 @@ class Bagel(nn.Module):
                 cfg_img_past_key_values=cfg_img_past_key_values,
                 cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
                 cfg_type=cfg_type,
-                # cache
-                model_pred_cache_dic=model_pred_cache_dic,
-                model_pred_current=model_pred_current,
-                model_pred_text_cache_dic=model_pred_text_cache_dic,
-                model_pred_text_current=model_pred_text_current,
-                model_pred_img_cache_dic=model_pred_img_cache_dic,
-                model_pred_img_current=model_pred_img_current,
             )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i] # velocity pointing from data to noise
+            x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
             # dts 不是常数，因为 timestep_shift 让 timestep 分布 不均匀
-        if enable_taylorseer:
-            del model_pred_cache_dic, model_pred_current
-            del model_pred_text_cache_dic, model_pred_text_current
-            del model_pred_img_cache_dic, model_pred_img_current
         # 每个样本的序列长度，包含 <vision_start> + latent tokens + <vision_end>
         # -2 相当于只算 latent tokens 的长度
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
@@ -1419,26 +1394,19 @@ class Bagel(nn.Module):
         cfg_renorm_type: str = "global",
         # cfg_text
         cfg_text_scale: float = 1.0,
-        cfg_text_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_text_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_text_key_values_lens: Optional[torch.Tensor] = None,
-        cfg_text_past_key_values: Optional[NaiveCache] = None,
-        cfg_text_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_text_packed_position_ids: torch.LongTensor | None = None,
+        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_text_key_values_lens: torch.Tensor | None = None,
+        cfg_text_past_key_values: NaiveCache | None = None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
         # cfg_img
         cfg_img_scale: float = 1.0,
-        cfg_img_packed_position_ids: Optional[torch.LongTensor] = None,
-        cfg_img_packed_query_indexes: Optional[torch.LongTensor] = None,
-        cfg_img_key_values_lens: Optional[torch.Tensor] = None,
-        cfg_img_past_key_values: Optional[NaiveCache] = None,
-        cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_img_packed_position_ids: torch.LongTensor | None = None,
+        cfg_img_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_img_key_values_lens: torch.Tensor | None = None,
+        cfg_img_past_key_values: NaiveCache | None = None,
+        cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
         cfg_type: str = "parallel",
-        # cache
-        model_pred_cache_dic: Optional[Dict[str, Any]] = None,
-        model_pred_current: Optional[int] = None,
-        model_pred_text_cache_dic: Optional[Dict[str, Any]] = None,
-        model_pred_text_current: Optional[int] = None,
-        model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
-        model_pred_img_current: Optional[int] = None,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
@@ -1457,12 +1425,8 @@ class Bagel(nn.Module):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes
+                "packed_text_indexes": packed_text_indexes,
             }
-        
-        if self.language_model.model.enable_taylorseer:
-            self.language_model.model.cache_dic = model_pred_cache_dic
-            self.language_model.model.current = model_pred_current
 
         output = self.language_model.forward(
             packed_query_sequence=packed_sequence,
@@ -1480,10 +1444,6 @@ class Bagel(nn.Module):
         v_t = v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:
-        # language_model.forward_inference
-            if self.language_model.model.enable_taylorseer:
-                self.language_model.model.cache_dic = model_pred_text_cache_dic
-                self.language_model.model.current = model_pred_text_current
             cfg_text_output = self.language_model.forward(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
@@ -1498,14 +1458,11 @@ class Bagel(nn.Module):
             )
             # LLM 输出的是 Hidden States (比如 4096维)。
             # 需要通过一个线性层 (llm2vae)把它投射回 VAE Latent 的维度
-            #（比如 4通道 x 4 Patch = 64维）。
+            # （比如 4通道 x 4 Patch = 64维）。
             cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
         if cfg_img_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
-                self.language_model.model.cache_dic = model_pred_img_cache_dic
-                self.language_model.model.current = model_pred_img_current
             cfg_img_output = self.language_model.forward(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
@@ -1534,7 +1491,7 @@ class Bagel(nn.Module):
                     v_t = v_t_text
             else:
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                
+
                 if cfg_img_scale > 1.0:
                     v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
                 else:
@@ -1548,7 +1505,7 @@ class Bagel(nn.Module):
                     norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
                     norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
                 else:
-                    raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
+                    raise NotImplementedError(f"{cfg_renorm_type} is not supported")
                 scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 v_t = v_t_ * scale
         else:
