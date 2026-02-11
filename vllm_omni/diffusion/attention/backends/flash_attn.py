@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import einops
 import torch
 from vllm.logger import init_logger
 
@@ -143,3 +144,74 @@ class FlashAttentionImpl(AttentionImpl):
             layout="BNSD",
         )
         return output
+
+    def forward_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        """XPU flash attention implementation."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            HAS_FLASH_ATTN,
+            _pad_input,
+            _unpad_input,
+            _upad_input,
+            flash_attn_func,
+            flash_attn_varlen_func,
+        )
+
+        if not HAS_FLASH_ATTN:
+            raise ImportError(
+                "FlashAttentionBackend requires Flash Attention. "
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+
+        query_length = query.size(1)
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        #  Contains at least one padding token in the sequence
+        if attention_mask is not None and torch.any(~attention_mask):
+            assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
+
+            out_unpad = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seq_lens_q,
+                cu_seqlens_k=cu_seq_lens_k,
+                max_seqlen_q=max_length_q,
+                max_seqlen_k=max_length_k,
+                **{
+                    "causal": self.causal,
+                    "softmax_scale": self.softmax_scale,
+                },
+            )
+            if isinstance(out_unpad, tuple):
+                out_unpad = out_unpad[0]
+
+            out = _pad_input(out_unpad, indices_q, query.size(0), query_length)
+
+        else:
+            batch_size, q_len = query.size()[:2]
+            cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+            max_seqlen = q_len
+
+            query, key, value = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [query, key, value])
+
+            out = flash_attn_func(
+                query,
+                key,
+                value,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=self.causal,
+                softmax_scale=self.softmax_scale,
+            )
+            out = einops.rearrange(out, "(b s) h d -> b s h d", b=batch_size)
+        return out
