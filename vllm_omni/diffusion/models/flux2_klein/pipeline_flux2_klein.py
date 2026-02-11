@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.cublas_compat import patch_qwen3_rope_for_cublas_compat
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -218,6 +219,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             subfolder="text_encoder",
             local_files_only=local_files_only,
         )
+        patch_qwen3_rope_for_cublas_compat(self.text_encoder)
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
             model,
             subfolder="tokenizer",
