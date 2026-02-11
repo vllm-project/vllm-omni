@@ -5,10 +5,10 @@ to generate audio from text using Qwen3-TTS models.
 
 Examples:
     # CustomVoice task (predefined speaker)
-    python openai_speech_client.py --text "Hello, how are you?" --voice Vivian
+    python openai_speech_client.py --text "Hello, how are you?" --voice vivian
 
     # CustomVoice with emotion instruction
-    python openai_speech_client.py --text "I'm so happy!" --voice Vivian \
+    python openai_speech_client.py --text "I'm so happy!" --voice vivian \
         --instructions "Speak with excitement"
 
     # VoiceDesign task (voice from description)
@@ -30,7 +30,7 @@ import os
 import httpx
 
 # Default server configuration
-DEFAULT_API_BASE = "http://localhost:8000"
+DEFAULT_API_BASE = "http://localhost:8091"
 DEFAULT_API_KEY = "EMPTY"
 
 
@@ -178,8 +178,8 @@ def parse_args():
     parser.add_argument(
         "--voice",
         type=str,
-        default="Vivian",
-        help="Speaker/voice name (default: Vivian). Options: Vivian, Ryan, etc.",
+        default="vivian",
+        help="Speaker/voice name (default: vivian). Options: vivian, ryan, aiden, etc.",
     )
     parser.add_argument(
         "--language",

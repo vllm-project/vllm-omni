@@ -119,12 +119,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of ready layers (blocks) to keep on GPU during generation.",
     )
     parser.add_argument(
-        "--tensor_parallel_size",
-        type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
-    )
-    parser.add_argument(
         "--vae_use_slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
@@ -133,6 +127,18 @@ def parse_args() -> argparse.Namespace:
         "--vae_use_tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--vae_patch_parallel_size",
+        type=int,
+        default=1,
+        help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
     )
     return parser.parse_args()
 
@@ -176,6 +182,7 @@ def main():
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
 
     # Check if profiling is requested via environment variable
@@ -207,8 +214,10 @@ def main():
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
-        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}"
     )
+    print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 

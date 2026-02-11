@@ -402,7 +402,7 @@ class BagelPipeline(nn.Module):
             )
             # Fail fast with a clear error instead of CUDA gather OOB.
             max_tid = int(generation_input["packed_text_ids"].max().item())
-            emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
+            emb_n = int(self.language_model.vocab_size)
             if max_tid >= emb_n:
                 raise ValueError(
                     "Tokenizer/model vocab mismatch: max token id "
@@ -438,7 +438,7 @@ class BagelPipeline(nn.Module):
         )
         # Fail fast for special tokens used by the image path as well.
         max_tid_img = int(generation_input["packed_text_ids"].max().item())
-        emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
+        emb_n = int(self.language_model.vocab_size)
         if max_tid_img >= emb_n:
             raise ValueError(
                 "Tokenizer/model vocab mismatch (image path): max token id "
@@ -482,6 +482,28 @@ class BagelPipeline(nn.Module):
         state = self.state_dict()
         allowed = set(state.keys())
         shapes = {k: tuple(v.shape) for k, v in state.items()}
+
+        tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
+
+        # Expand allowed/tp_aware_params with stacked param source names.
+        # QKVParallelLinear merges q_proj+k_proj+v_proj into qkv_proj; the
+        # checkpoint stores the original separate names.  We must recognise
+        # those names so _filtered_weights does not drop them.
+        _stacked_expansions = [
+            (".qkv_proj", ".q_proj"),
+            (".qkv_proj", ".k_proj"),
+            (".qkv_proj", ".v_proj"),
+            (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
+            (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
+            (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+        ]
+        stacked_source_names: set[str] = set()
+        for name in list(allowed):
+            for target_suffix, source_suffix in _stacked_expansions:
+                if target_suffix in name:
+                    stacked_source_names.add(name.replace(target_suffix, source_suffix))
+        allowed.update(stacked_source_names)
+        tp_aware_params.update(stacked_source_names)
 
         def _normalize_name(name: str) -> str:
             # Common wrappers/prefixes in checkpoints.
@@ -536,7 +558,7 @@ class BagelPipeline(nn.Module):
                 for cand in _iter_candidate_names(name):
                     if cand in allowed:
                         # Only accept if tensor shape matches target param/buffer shape.
-                        if tuple(tensor.shape) == shapes.get(cand):
+                        if tuple(tensor.shape) == shapes.get(cand) or cand in tp_aware_params:
                             picked = cand
                             break
                         else:
