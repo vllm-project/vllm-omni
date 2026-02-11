@@ -5,33 +5,33 @@ By adding markers before test functions, tests can later be executed uniformly b
 ## Current Markers
 Defined in `pyproject.toml`:
 
-| Marker             | Description                                             |
-| ------------------ | ------------------------------------------------------- |
-| `core_model`       | Core model tests (run in each PR)                       |
-| `diffusion`        | Diffusion model tests                                   |
-| `omni`             | Omni model tests                                        |
-| `cache`            | Cache backend tests                                     |
-| `parallel`         | Parallelism/distributed tests                           |
-| `cpu`              | Tests that run on CPU                                   |
-| `gpu`              | Tests that run on GPU (auto-added)                      |
-| `cuda`             | Tests that run on CUDA (auto-added)                     |
-| `rocm`             | Tests that run on AMD/ROCm (auto-added)                 |
-| `npu`              | Tests that run on NPU/Ascend (auto-added)               |
-| `H100`             | Tests that require H100 GPU                             |
-| `L4`               | Tests that require L4 GPU                               |
-| `MI325`            | Tests that require MI325 GPU (AMD/ROCm)                 |
-| `A2`               | Tests that require A2 NPU                               |
-| `A3`               | Tests that require A3 NPU                               |
-| `distributed_cuda` | Tests that require multi cards on CUDA platform         |
-| `distributed_rocm` | Tests that require multi cards on ROCm platform         |
-| `distributed_npu`  | Tests that require multi cards on NPU platform          |
-| `skipif_cuda`      | Skip if the num of CUDA cards is less than the required |
-| `skipif_rocm`      | Skip if the num of ROCm cards is less than the required |
-| `skipif_npu`       | Skip if the num of NPU cards is less than the required  |
-| `slow`             | Slow tests (may skip in quick CI)                       |
-| `benchmark`        | Benchmark tests                                         |
+| Marker             | Description                                               |
+| ------------------ | --------------------------------------------------------- |
+| `core_model`       | Core model tests (run in each PR)                         |
+| `diffusion`        | Diffusion model tests                                     |
+| `omni`             | Omni model tests                                          |
+| `cache`            | Cache backend tests                                       |
+| `parallel`         | Parallelism/distributed tests                             |
+| `cpu`              | Tests that run on CPU                                     |
+| `gpu`              | Tests that run on GPU *                                   |
+| `cuda`             | Tests that run on CUDA *                                  |
+| `rocm`             | Tests that run on AMD/ROCm *                              |
+| `npu`              | Tests that run on NPU/Ascend *                            |
+| `H100`             | Tests that require H100 GPU  *                            |
+| `L4`               | Tests that require L4 GPU *                               |
+| `MI325`            | Tests that require MI325 GPU (AMD/ROCm) *                 |
+| `A2`               | Tests that require A2 NPU *                               |
+| `A3`               | Tests that require A3 NPU *                               |
+| `distributed_cuda` | Tests that require multi cards on CUDA platform *         |
+| `distributed_rocm` | Tests that require multi cards on ROCm platform  *        |
+| `distributed_npu`  | Tests that require multi cards on NPU platform  *         |
+| `skipif_cuda`      | Skip if the num of CUDA cards is less than the required * |
+| `skipif_rocm`      | Skip if the num of ROCm cards is less than the required * |
+| `skipif_npu`       | Skip if the num of NPU cards is less than the required *  |
+| `slow`             | Slow tests (may skip in quick CI)                         |
+| `benchmark`        | Benchmark tests                                           |
 
-For those markers shown as auto-added, they will be added by the `@hardware_test` decorator.
+\* Means those markers are auto-added, and they will be added by the `@hardware_test` decorator.
 
 ### Example usage for markers
 
@@ -71,10 +71,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
    Support for `skipif_rocm` and `skipif_npu` will be implemented later.
 
 
-5. **Runs each test in a new process**  
-   Automatically wraps the distributed test with a decorator (`@create_new_process_for_each_test`) to ensure isolation and compatibility with multi-process hardware backends.
-
-6. **Works with pytest filtering**  
+5. **Works with pytest filtering**  
    Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "distributed_cuda and L4"`).
 
 #### Example usage for decorator
@@ -94,7 +91,6 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
     ```
 - `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), NPU (A2/A3)
 - `num_cards` can be int (all platforms) or dict (per platform); defaults to 1 when missing
-- `hardware_test` automatically applies `@create_new_process_for_each_test` for distributed tests.
 - Distributed markers (`distributed_cuda`, `distributed_rocm`, `distributed_npu`) are auto-added for multi-card cases
 - Filtering examples:
     - CUDA only: `pytest -m "distributed_cuda and L4"`

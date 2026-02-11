@@ -8,7 +8,8 @@ import pytest
 from vllm import SamplingParams
 from vllm.inputs import PromptType
 
-from vllm_omni.entrypoints.async_omni import AsyncOmni, ClientRequestState
+from tests.utils import hardware_test
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -57,6 +58,9 @@ async def generate(
     return count, request_id
 
 
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:
@@ -111,51 +115,3 @@ async def test_abort():
         num_generated_tokens, request_id = await task
         assert num_generated_tokens == NUM_EXPECTED_TOKENS
     await asyncio.sleep(5)
-
-
-@pytest.mark.asyncio
-async def test_build_and_log_summary(monkeypatch):
-    from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
-
-    RealCRS = ClientRequestState
-    capture_metrics = {}
-
-    class MockCRS(RealCRS):
-        def __init__(self, request_id: str):
-            super().__init__(request_id)
-            capture_metrics[request_id] = self
-
-    monkeypatch.setattr("vllm_omni.entrypoints.async_omni.ClientRequestState", MockCRS)
-    monkeypatch.setattr("vllm_omni.entrypoints.client_request_state.ClientRequestState", MockCRS)
-
-    with ExitStack() as after:
-        # Avoid SHM IPC in tests to prevent /dev/shm exhaustion and SIGBUS.
-        engine = AsyncOmni(
-            model=model,
-            stage_configs_path=stage_config,
-            shm_threshold_bytes=sys.maxsize,
-        )
-        after.callback(engine.shutdown)
-        prompt = "Hello my name is Robert and "
-        NUM_EXPECTED_TOKENS = 64
-        NUM_REQUESTS = 3
-        request_ids = [f"request-{i}" for i in range(NUM_REQUESTS)]
-
-        # Create concurrent requests.
-        tasks: list[asyncio.Task] = []
-        for idx, request_id in enumerate(request_ids):
-            tasks.append(asyncio.create_task(generate(engine, request_id, prompt, NUM_EXPECTED_TOKENS)))
-
-        # Confirm the requests are okay.
-        for idx, task in enumerate(tasks):
-            await task
-            output_modalities = ["text"]
-            final_stage_id_for_e2e = get_final_stage_id_for_e2e(
-                output_modalities, engine.output_modalities, engine.stage_list
-            )
-            summary = capture_metrics[request_ids[idx]].metrics.build_and_log_summary(final_stage_id_for_e2e)
-
-            # Check that total tokens matches sum of stage tokens.
-            assert summary["e2e_total_tokens"] == sum(stage["tokens"] for stage in summary["stages"])
-            # Check that total time matches sum of stage times.
-            assert summary["e2e_total_time_ms"] >= sum(stage["total_time_ms"] for stage in summary["stages"])

@@ -1,4 +1,8 @@
+import pytest
+
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_preprocessor(monkeypatch):

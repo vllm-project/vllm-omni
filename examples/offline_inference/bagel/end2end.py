@@ -36,7 +36,7 @@ def parse_args():
     )
 
     # OmniLLM init args
-    parser.add_argument("--enable-stats", action="store_true", default=False)
+    parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--init-timeout", type=int, default=300)
@@ -120,7 +120,7 @@ def main():
 
         omni_kwargs.update(
             {
-                "log_stats": args.enable_stats,
+                "log_stats": args.log_stats,
                 "init_sleep_seconds": args.init_sleep_seconds,
                 "batch_timeout": args.batch_timeout,
                 "init_timeout": args.init_timeout,

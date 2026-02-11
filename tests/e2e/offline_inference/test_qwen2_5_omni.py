@@ -13,10 +13,10 @@ from vllm.assets.video import VideoAsset
 from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.multimodal.image import convert_image_mode
 
+from tests.utils import create_new_process_for_each_test, hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 from .conftest import OmniRunner
-from .utils import create_new_process_for_each_test
 
 models = ["Qwen/Qwen2.5-Omni-3B"]
 
@@ -34,8 +34,10 @@ test_params = [(model, stage_config) for model in models]
 
 
 @pytest.mark.core_model
-@pytest.mark.parametrize("test_config", test_params)
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("test_config", test_params)
 def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     model, stage_config_path = test_config
@@ -94,8 +96,10 @@ def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: t
 
 
 @pytest.mark.core_model
-@pytest.mark.parametrize("test_config", test_params)
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @create_new_process_for_each_test("spawn")
+@pytest.mark.parametrize("test_config", test_params)
 def test_mixed_modalities_to_text_only(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
     """Test processing audio, image, and video together, generating audio output."""
     model, stage_config_path = test_config
