@@ -1657,8 +1657,9 @@ class OmniRunner:
         """Context manager exit - cleanup resources."""
         self.close()
         del self.omni
-        cleanup_dist_env_and_memory()
+        _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
 
     def close(self):
         """Close and cleanup the Omni instance."""
