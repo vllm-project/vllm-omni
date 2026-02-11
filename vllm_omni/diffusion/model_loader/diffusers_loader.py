@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
+TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 
 
 class DiffusersPipelineLoader:

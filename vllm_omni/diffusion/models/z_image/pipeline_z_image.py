@@ -28,7 +28,8 @@ from diffusers.models.autoencoders import AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -42,6 +43,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.diffusion.models.utils import recursive_replace_linear, init_parameters
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -166,12 +168,6 @@ class ZImagePipeline(nn.Module):
                 revision=od_config.revision,
                 prefix="text_encoder.",
             ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="vae",
-                revision=od_config.revision,
-                prefix="vae.",
-            ),
         ]
         self._execution_device = get_local_device()
         model = od_config.model
@@ -180,9 +176,14 @@ class ZImagePipeline(nn.Module):
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        self.text_encoder = AutoModel.from_pretrained(
+        text_encoder_config = AutoConfig.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
+        with init_on_device_without_buffers("meta"):
+            self.text_encoder = AutoModelForCausalLM.from_config(text_encoder_config)
+        recursive_replace_linear(self.text_encoder, od_config)
+        init_parameters(self.text_encoder, dtype=od_config.dtype)
+
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
         )
@@ -656,4 +657,6 @@ class ZImagePipeline(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        loaded_weights |= {name for name, _ in self.vae.named_parameters()}
+        return loaded_weights
