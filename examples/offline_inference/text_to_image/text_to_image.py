@@ -5,6 +5,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -119,6 +120,24 @@ def parse_args() -> argparse.Namespace:
         help="Number of ready layers (blocks) to keep on GPU during generation.",
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8"],
+        help="Quantization method for the transformer. "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs). "
+        "Default: None (no quantization, uses BF16).",
+    )
+    parser.add_argument(
+        "--ignored-layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer name patterns to skip quantization. "
+        "Only used when --quantization is set. "
+        "Available layers: to_qkv, to_out, add_kv_proj, to_add_out, img_mlp, txt_mlp, proj_out. "
+        "Example: --ignored-layers 'add_kv_proj,to_add_out'",
+    )
+    parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
@@ -188,6 +207,18 @@ def main():
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
+    # Build quantization kwargs: use quantization_config dict when
+    # ignored_layers is specified so the list flows through OmniDiffusionConfig
+    quant_kwargs: dict[str, Any] = {}
+    ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
+    if args.quantization and ignored_layers:
+        quant_kwargs["quantization_config"] = {
+            "method": args.quantization,
+            "ignored_layers": ignored_layers,
+        }
+    elif args.quantization:
+        quant_kwargs["quantization"] = args.quantization
+
     omni = Omni(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
@@ -200,6 +231,7 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        **quant_kwargs,
     )
 
     if profiler_enabled:
@@ -212,6 +244,9 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
+    if ignored_layers:
+        print(f"  Ignored layers: {ignored_layers}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
         f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
