@@ -56,7 +56,7 @@ python extract_tts_prompts.py -i meta.lst -o top100.txt -n 100
 **Options:**
 - `-i, --input`: Input metadata file (default: `meta.lst`)
 - `-o, --output`: Output prompts file (default: `prompts.txt`)
-- `-n, --num_lines`: Number of prompts to extract (required)
+- `-n, --num-lines`: Number of prompts to extract (required)
 
 ### 7. Clean Up (Optional)
 

@@ -94,6 +94,7 @@ plugins:
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
         - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building
+        - "vllm_omni.diffusion.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.async_diffusion"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building

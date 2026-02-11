@@ -181,11 +181,11 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Your-org/your-model \
     --prompt "a cup of coffee on the table" \
-    --negative_prompt "ugly, unclear" \
-    --cfg_scale 4.0 \
-    --num_inference_steps 50 \
+    --negative-prompt "ugly, unclear" \
+    --cfg-scale 4.0 \
+    --num-inference-steps 50 \
     --output "tp_enabled.png" \
-    --tensor_parallel_size 2
+    --tensor-parallel-size 2
 ```
 
 **Verify:**

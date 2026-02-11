@@ -317,10 +317,10 @@ python image_edit.py \
   --model "Qwen/Qwen-Image-Edit" \
   --image "qwen_image_output.png" \
   --prompt "turn this cat to a dog" \
-  --negative_prompt "low quality, blurry" \
-  --cfg_scale 4.0 \
+  --negative-prompt "low quality, blurry" \
+  --cfg-scale 4.0 \
   --output "edited_image.png" \
-  --cfg_parallel_size 2
+  --cfg-parallel-size 2
 ```
 
 #### Online Serving

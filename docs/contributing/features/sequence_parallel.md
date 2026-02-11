@@ -277,9 +277,9 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Your-org/your-model \
     --prompt "a cup of coffee on the table" \
-    --num_inference_steps 50 \
-    --ulysses_degree 2 \
-    --ring_degree 2 \
+    --num-inference-steps 50 \
+    --ulysses-degree 2 \
+    --ring-degree 2 \
     --output sp_test_image_ulysses=2_ring=2.png
 ```
 
@@ -298,9 +298,9 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Your-org/your-model \
     --prompt "a cup of coffee on the table" \
-    --num_inference_steps 50 \
-    --ulysses_degree 2 \
-    --tensor_parallel_size 2 \
+    --num-inference-steps 50 \
+    --ulysses-degree 2 \
+    --tensor-parallel-size 2 \
     --output sp_test_image_ulysses=2_tp=2.png
 ```
 

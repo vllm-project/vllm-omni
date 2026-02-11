@@ -19,7 +19,7 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
-    parser.add_argument("--prompt_type", default="text", choices=["text"])
+    parser.add_argument("--prompt-type", default="text", choices=["text"])
 
     parser.add_argument(
         "--modality",
