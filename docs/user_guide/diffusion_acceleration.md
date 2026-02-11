@@ -1,6 +1,6 @@
 # Diffusion Acceleration Overview
 
-vLLM-Omni supports various cache acceleration methods to speed up diffusion model inference with minimal quality degradation. These methods include **cache methods** that intelligently cache intermediate computations to avoid redundant work across diffusion timesteps, and **parallelism methods** that distribute the computation across multiple devices.
+vLLM-Omni supports various acceleration methods to speed up diffusion model inference with minimal quality degradation. These include **cache methods** that intelligently cache intermediate computations to avoid redundant work across diffusion timesteps, **parallelism methods** that distribute the computation across multiple devices, and **quantization methods** that reduce memory footprint while preserving accuracy.
 
 ## Supported Acceleration Methods
 
@@ -13,6 +13,10 @@ vLLM-Omni currently supports two main cache acceleration backends:
     - **SCM** (Step Computation Masking): Selectively computes steps based on adaptive masking
 
 Both methods can provide significant speedups (typically **1.5x-2.0x**) while maintaining high output quality.
+
+vLLM-Omni also supports quantization methods:
+
+3. **[FP8 Quantization](diffusion/quantization/overview.md)** - Reduces DiT linear layers from BF16 to FP8, providing ~1.28x speedup with minimal quality loss. Supports per-layer skip for sensitive layers.
 
 vLLM-Omni also supports parallelism methods for diffusion models, including:
 
@@ -34,6 +38,12 @@ vLLM-Omni also supports parallelism methods for diffusion models, including:
 |--------|--------------|-------------|----------|
 | **TeaCache** | `cache_backend="tea_cache"` | Simple, adaptive caching with minimal configuration | Quick setup, balanced speed/quality |
 | **Cache-DiT** | `cache_backend="cache_dit"` | Advanced caching with multiple techniques (DBCache, TaylorSeer, SCM) | Maximum acceleration, fine-grained control |
+
+### Quantization Methods
+
+| Method | Configuration | Description | Best For |
+|--------|--------------|-------------|----------|
+| **FP8** | `quantization="fp8"` | FP8 W8A8 on Ada/Hopper, weight-only on older GPUs | Memory reduction, inference speedup |
 
 ## Supported Models
 
@@ -58,9 +68,17 @@ The following table shows which models are currently supported by each accelerat
 
 ### VideoGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |CFG-Parallel |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
 |-------|------------------|:--------:|:---------:|:----------:|:--------------:|:----------------:|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ |
+
+### Quantization
+
+| Model | Model Identifier | FP8 |
+|-------|------------------|:---:|
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ |
+| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ |
 
 
 ## Performance Benchmarks
@@ -272,12 +290,30 @@ outputs = omni.generate(
 )
 ```
 
+### Using FP8 Quantization
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model="<your-model>",
+    quantization="fp8",
+)
+
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50),
+)
+```
+
 ## Documentation
 
 For detailed information on each acceleration method:
 
 - **[TeaCache Guide](diffusion/teacache.md)** - Complete TeaCache documentation, configuration options, and best practices
 - **[Cache-DiT Acceleration Guide](diffusion/cache_dit_acceleration.md)** - Comprehensive Cache-DiT guide covering DBCache, TaylorSeer, SCM, and configuration parameters
+- **[FP8 Quantization Guide](diffusion/quantization/overview.md)** - FP8 quantization for DiT models with per-layer control
 - **[Tensor Parallelism](diffusion/parallelism_acceleration.md#tensor-parallelism)** - Guidance on how to enable TP for diffusion models.
 - **[Sequence Parallelism](diffusion/parallelism_acceleration.md#sequence-parallelism)** - Guidance on how to set sequence parallelism with configuration.
 - **[CFG-Parallel](diffusion/parallelism_acceleration.md#cfg-parallel)** - Guidance on how to set CFG-Parallel to run positive/negative branches across ranks.
