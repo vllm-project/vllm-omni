@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import (
 )
 from vllm_omni.diffusion.models.longcat_image.pipeline_longcat_image import calculate_shift
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.cublas_compat import patch_qwen25vl_rope_for_cublas_compat
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -249,6 +250,7 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
+        patch_qwen25vl_rope_for_cublas_compat(self.text_encoder)
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
         )
