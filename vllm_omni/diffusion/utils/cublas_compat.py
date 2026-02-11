@@ -47,7 +47,9 @@ def patch_qwen25vl_rope_for_cublas_compat(model: nn.Module) -> None:
                     .expand(3, position_ids.shape[1], -1, 1)
                     .contiguous()  # avoid stride-0 in cuBLAS
                 )
-                position_ids_expanded = position_ids[:, :, None, :].float()
+                position_ids_expanded = (
+                    position_ids[:, :, None, :].float().contiguous()
+                )  # position_ids also comes from expand() with stride-0
 
                 device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
                 with torch.autocast(device_type=device_type, enabled=False):
