@@ -21,22 +21,22 @@ If you use a gated model (e.g., `stabilityai/stable-audio-open-1.0`), ensure you
 python text_to_audio.py \
   --model stabilityai/stable-audio-open-1.0 \
   --prompt "The sound of a hammer hitting a wooden surface" \
-  --negative_prompt "Low quality" \
+  --negative-prompt "Low quality" \
   --seed 42 \
-  --guidance_scale 7.0 \
-  --audio_length 10.0 \
-  --num_inference_steps 100 \
+  --guidance-scale 7.0 \
+  --audio-length 10.0 \
+  --num-inference-steps 100 \
   --output stable_audio_output.wav
 ```
 
 Key arguments:
 
 - `--prompt`: text description (string).
-- `--negative_prompt`: negative prompt for classifier-free guidance.
+- `--negative-prompt`: negative prompt for classifier-free guidance.
 - `--seed`: integer seed for deterministic generation.
-- `--guidance_scale`: classifier-free guidance scale.
-- `--audio_length`: audio duration in seconds.
-- `--num_inference_steps`: diffusion sampling steps.(more steps = higher quality, slower).
+- `--guidance-scale`: classifier-free guidance scale.
+- `--audio-length`: audio duration in seconds.
+- `--num-inference-steps`: diffusion sampling steps.(more steps = higher quality, slower).
 - `--output`: path to save the generated WAV file.
 
 ## Example materials

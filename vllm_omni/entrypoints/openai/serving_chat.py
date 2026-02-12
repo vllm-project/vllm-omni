@@ -16,6 +16,7 @@ from pydantic import TypeAdapter
 from vllm.renderers import RendererLike
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
@@ -38,7 +39,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
     ChatMessage,
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
@@ -679,6 +679,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
+        last_metrics: dict[str, Any] | None = None
         try:
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
@@ -686,6 +687,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
+
+                if omni_res.metrics:
+                    last_metrics = omni_res.metrics
 
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
@@ -1224,6 +1228,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices=[choice_data],
                             model=model_name,
                             modality=final_output_type,
+                            metrics=omni_res.metrics,
                         )
 
                         # handle usage stats if requested & if continuous
@@ -1273,13 +1278,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details and num_cached_tokens:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
 
-                final_usage_chunk = ChatCompletionStreamResponse(
+                final_usage_chunk = OmniChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
                     created=created_time,
                     choices=[],
                     model=model_name,
                     usage=final_usage,
+                    metrics=last_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
@@ -1326,7 +1332,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         conversation: list[ConversationMessage],
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
-    ) -> ErrorResponse | ChatCompletionResponse:
+    ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
 
@@ -1348,6 +1354,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_logprobs = None
         prompt_token_ids = None
         kv_transfer_params = None
+        response_metrics: dict[str, Any] | None = None
 
         # Build requested modalities set for filtering
         requested_modalities = (
@@ -1379,9 +1386,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
+            if omni_outputs.metrics:
+                response_metrics = omni_outputs.metrics
             choices.extend(choices_data)
 
-        response = ChatCompletionResponse(
+        response = OmniChatCompletionResponse(
             id=request_id,
             created=created_time,
             model=model_name,
@@ -1390,6 +1399,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_logprobs=prompt_logprobs,
             prompt_token_ids=prompt_token_ids,
             kv_transfer_params=kv_transfer_params,
+            metrics=response_metrics,
         )
 
         # Log complete response if output logging is enabled

@@ -82,8 +82,11 @@ def omni_snapshot_download(model_id) -> str:
     # For other cases (Hugging Face), perform a real download to ensure all
     # necessary files (including *.pt for audio/diffusion) are available locally
     # before stage workers are spawned. This prevents initialization timeouts.
+    # Return the original model_id so that model_config.model preserves
+    # HuggingFace semantics (e.g. "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    # instead of the resolved cache path.
     try:
-        return download_weights_from_hf_specific(
+        download_weights_from_hf_specific(
             model_name_or_path=model_id,
             cache_dir=None,
             allow_patterns=["*"],
@@ -91,7 +94,7 @@ def omni_snapshot_download(model_id) -> str:
         )
     except huggingface_hub.errors.RepositoryNotFoundError:
         logger.warning(f"Repository not found for '{model_id}'.")
-        return model_id
+    return model_id
 
 
 class OmniBase:
@@ -818,7 +821,7 @@ class Omni(OmniBase):
                         request_output=engine_outputs,
                     )
 
-                    # Record audio generated frames with unified signature
+                    # Record audio generated frames (only when finished)
                     try:
                         finished = (
                             engine_outputs.finished
@@ -831,7 +834,8 @@ class Omni(OmniBase):
                                 else False
                             )
                         )
-                        metrics.record_audio_generated_frames(output_to_yield, finished, stage_id, req_id)
+                        if finished:
+                            metrics.record_audio_generated_frames(output_to_yield, stage_id, req_id)
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Failed to record audio metrics for req {req_id} at stage {stage_id}: {e}",

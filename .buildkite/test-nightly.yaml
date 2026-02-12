@@ -1,14 +1,4 @@
 steps:
-  - label: ":docker: Build image"
-    key: image-build
-    commands:
-      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
-      - "docker build --file docker/Dockerfile.ci -t vllm-omni-ci ."
-      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
-      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
-    agents:
-      queue: "cpu_queue_premerge"
-
   - label: "Omni Model Test with H100"
     timeout_in_minutes: 60
     depends_on: image-build
@@ -46,23 +36,22 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-
-
   - label: "Omni Model Test"
     timeout_in_minutes: 60
     depends_on: image-build
+    if: build.env("NIGHTLY") == "1"
     commands:
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py
+      - export VLLM_LOGGING_LEVEL=DEBUG
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
-    - docker#v5.2.0:
-        image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-        always-pull: true
-        propagate-environment: true
-        environment:
-        - "HF_HOME=/fsx/hf_cache"
-        volumes:
-        - "/fsx/hf_cache:/fsx/hf_cache"
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"

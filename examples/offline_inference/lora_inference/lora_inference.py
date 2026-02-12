@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
     parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
     parser.add_argument(
-        "--num_inference_steps",
+        "--num-inference-steps",
         type=int,
         default=50,
         help="Number of denoising steps for the diffusion sampler.",

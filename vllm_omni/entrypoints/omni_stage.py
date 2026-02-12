@@ -49,6 +49,7 @@ from vllm_omni.entrypoints.stage_utils import (
     maybe_dump_to_shm,
     set_stage_devices,
 )
+from vllm_omni.entrypoints.utils import detect_pid_host
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
 from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
@@ -66,12 +67,17 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
     """
     from vllm_omni.worker.gpu_memory_utils import is_process_scoped_memory_available
 
-    if is_process_scoped_memory_available():
-        logger.debug("NVML process-scoped memory available — concurrent init is safe, skipping locks")
+    if is_process_scoped_memory_available() and detect_pid_host():
+        logger.debug(
+            "NVML process-scoped memory available and PID host is available — concurrent init is safe, skipping locks"
+        )
         yield
         return
-
-    logger.debug("NVML unavailable — using sequential init locks")
+    else:
+        logger.debug(
+            "NVML unavailable or PID host is not available (usually inside a container, "
+            "--pid=host is not set in docker run command) — using sequential init locks"
+        )
 
     from vllm_omni.platforms import current_omni_platform
 

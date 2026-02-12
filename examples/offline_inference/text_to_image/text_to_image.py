@@ -5,6 +5,7 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -25,19 +26,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
-        "--negative_prompt",
+        "--negative-prompt",
         default=None,
         help="negative prompt for classifier-free conditional guidance.",
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
-        "--cfg_scale",
+        "--cfg-scale",
         type=float,
         default=4.0,
         help="True classifier-free guidance scale specific to Qwen-Image.",
     )
     parser.add_argument(
-        "--guidance_scale",
+        "--guidance-scale",
         type=float,
         default=1.0,
         help="Classifier-free guidance scale.",
@@ -51,19 +52,19 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the generated image (PNG).",
     )
     parser.add_argument(
-        "--num_images_per_prompt",
+        "--num-images-per-prompt",
         type=int,
         default=1,
         help="Number of images to generate for the given prompt.",
     )
     parser.add_argument(
-        "--num_inference_steps",
+        "--num-inference-steps",
         type=int,
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
     )
     parser.add_argument(
-        "--cache_backend",
+        "--cache-backend",
         type=str,
         default=None,
         choices=["cache_dit", "tea_cache"],
@@ -79,26 +80,26 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument(
-        "--ulysses_degree",
+        "--ulysses-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
-        "--ring_degree",
+        "--ring-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
     parser.add_argument(
-        "--cfg_parallel_size",
+        "--cfg-parallel-size",
         type=int,
         default=1,
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
-        "--enforce_eager",
+        "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
     )
@@ -119,23 +120,41 @@ def parse_args() -> argparse.Namespace:
         help="Number of ready layers (blocks) to keep on GPU during generation.",
     )
     parser.add_argument(
-        "--vae_use_slicing",
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8"],
+        help="Quantization method for the transformer. "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs). "
+        "Default: None (no quantization, uses BF16).",
+    )
+    parser.add_argument(
+        "--ignored-layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer name patterns to skip quantization. "
+        "Only used when --quantization is set. "
+        "Available layers: to_qkv, to_out, add_kv_proj, to_add_out, img_mlp, txt_mlp, proj_out. "
+        "Example: --ignored-layers 'add_kv_proj,to_add_out'",
+    )
+    parser.add_argument(
+        "--vae-use-slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
     )
     parser.add_argument(
-        "--vae_use_tiling",
+        "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
     )
     parser.add_argument(
-        "--tensor_parallel_size",
+        "--tensor-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
-        "--vae_patch_parallel_size",
+        "--vae-patch-parallel-size",
         type=int,
         default=1,
         help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
@@ -188,6 +207,18 @@ def main():
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
+    # Build quantization kwargs: use quantization_config dict when
+    # ignored_layers is specified so the list flows through OmniDiffusionConfig
+    quant_kwargs: dict[str, Any] = {}
+    ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
+    if args.quantization and ignored_layers:
+        quant_kwargs["quantization_config"] = {
+            "method": args.quantization,
+            "ignored_layers": ignored_layers,
+        }
+    elif args.quantization:
+        quant_kwargs["quantization"] = args.quantization
+
     omni = Omni(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
@@ -200,6 +231,7 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        **quant_kwargs,
     )
 
     if profiler_enabled:
@@ -212,6 +244,9 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
+    if ignored_layers:
+        print(f"  Ignored layers: {ignored_layers}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
         f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "

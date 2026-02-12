@@ -217,14 +217,12 @@ class OrchestratorAggregator:
     def record_audio_generated_frames(
         self,
         output_to_yield: Any,
-        finished: bool,
         stage_id: int,
         request_id: str,
     ) -> None:
         try:
             if (
                 output_to_yield.final_output_type == "audio"
-                and finished
                 and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
                 and len(multimodal_output) > 0
             ):
@@ -247,6 +245,73 @@ class OrchestratorAggregator:
                 "Failed to record audio frames for request %s",
                 request_id,
                 exc_info=True,
+            )
+
+    def process_stage_metrics(
+        self,
+        *,
+        result: dict[str, Any],
+        stage_type: str,
+        stage_id: int,
+        req_id: str,
+        engine_outputs: Any,
+        finished: bool,
+        final_output_type: str | None,
+        output_to_yield: Any | None,
+    ) -> None:
+        """Process and record stage metrics.
+
+        Args:
+            result: Result dict containing metrics from stage
+            stage_type: Type of the stage (e.g., 'llm', 'diffusion')
+            stage_id: Stage identifier
+            req_id: Request identifier
+            engine_outputs: Engine output object
+            finished: Whether stage processing is finished
+            final_output_type: Type of final output (e.g., 'text', 'audio')
+            output_to_yield: Output object to attach metrics to
+        """
+        try:
+            _m: StageRequestStats | None = result.get("metrics")
+
+            # 1. Accumulate metrics from stage stats
+            if _m is not None:
+                self.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
+                self.accumulate_diffusion_metrics(stage_type, req_id, engine_outputs)
+                if finished:
+                    self.on_stage_metrics(stage_id, req_id, _m, final_output_type)
+
+            # 2. No output to yield, nothing more to do
+            if output_to_yield is None:
+                return
+
+            # 3. Not finished yet — empty metrics, skip audio recording
+            if not finished:
+                output_to_yield.metrics = {}
+                return
+
+            # 4. Finished with output: assign text metrics if available
+            output_to_yield.metrics = {}
+            stage_event = next(
+                (evt for evt in reversed(self.stage_events.get(req_id, [])) if evt.stage_id == stage_id),
+                None,
+            )
+            if stage_event is not None and stage_event.final_output_type == "text":
+                output_to_yield.metrics = {
+                    "num_tokens_in": stage_event.num_tokens_in,
+                    "num_tokens_out": stage_event.num_tokens_out,
+                    "stage_id": stage_event.stage_id,
+                    "final_output_type": stage_event.final_output_type,
+                }
+
+            # 5. Finished: record audio generated frames
+            self.record_audio_generated_frames(output_to_yield, stage_id, req_id)
+
+        except Exception:
+            logger.exception(
+                "Failed to process metrics for stage %s, req %s",
+                stage_id,
+                req_id,
             )
 
     def _as_stage_request_stats(
