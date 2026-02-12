@@ -1,138 +1,88 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E tests for Qwen2.5-Omni model with mixed modality inputs and audio output.
+E2E tests for Qwen2.5-Omni model with mixed modality inputs, audio and text output.
 """
 
 from pathlib import Path
 
 import pytest
-from vllm.assets.audio import AudioAsset
-from vllm.assets.image import ImageAsset
-from vllm.assets.video import VideoAsset
-from vllm.envs import VLLM_USE_MODELSCOPE
-from vllm.multimodal.image import convert_image_mode
 
-from tests.utils import create_new_process_for_each_test, hardware_test
+from tests.conftest import (
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+)
+from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
-from .conftest import OmniRunner
-
-models = ["Qwen/Qwen2.5-Omni-3B"]
+models = ["Qwen/Qwen2.5-Omni-7B"]
 
 # CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
 if current_omni_platform.is_npu():
     stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
 elif current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_config = str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
 else:
-    stage_config = str(Path(__file__).parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models]
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@create_new_process_for_each_test("spawn")
-@pytest.mark.parametrize("test_config", test_params)
-def test_mixed_modalities_to_audio(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
-    """Test processing audio, image, and video together, generating audio output."""
-    model, stage_config_path = test_config
-    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
-        # Prepare multimodal inputs
-        question = "What is recited in the audio? What is in this image? Describe the video briefly."
-        audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
-        audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
-        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
-        if not VLLM_USE_MODELSCOPE:
-            video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
-        else:
-            # modelscope can't access raushan-testing-hf/videos-test, skip video input temporarily
-            video = None
-
-        outputs = runner.generate_multimodal(
-            prompts=question,
-            audios=audio,
-            images=image,
-            videos=video,
-        )
-
-        # Find and verify text output (thinker stage)
-        text_output = None
-        output_count = 0
-        for stage_output in outputs:
-            if stage_output.final_output_type == "text":
-                text_output = stage_output
-                output_count += 1
-                break
-        assert output_count > 0
-
-        assert text_output is not None
-        assert len(text_output.request_output) > 0
-        text_content = text_output.request_output[0].outputs[0].text
-        assert text_content is not None
-        assert len(text_content.strip()) > 0
-
-        # Find and verify audio output (code2wav stage)
-        audio_output = None
-        output_count = 0
-        for stage_output in outputs:
-            if stage_output.final_output_type == "audio":
-                audio_output = stage_output
-                output_count += 1
-                break
-        assert output_count > 0
-
-        assert audio_output is not None
-        assert len(audio_output.request_output) > 0
-
-        # Verify audio tensor exists and has content
-        audio_tensor = audio_output.request_output[0].outputs[0].multimodal_output["audio"]
-        assert audio_tensor is not None
-        assert audio_tensor.numel() > 0
+def get_question(prompt_type="mix"):
+    prompts = {
+        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+        "text_only": "What is the capital of China?",
+    }
+    return prompts.get(prompt_type, prompts["mix"])
 
 
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@create_new_process_for_each_test("spawn")
-@pytest.mark.parametrize("test_config", test_params)
-def test_mixed_modalities_to_text_only(omni_runner: type[OmniRunner], test_config: tuple[str, str]) -> None:
-    """Test processing audio, image, and video together, generating audio output."""
-    model, stage_config_path = test_config
-    with omni_runner(model, seed=42, stage_configs_path=stage_config_path) as runner:
-        # Prepare multimodal inputs
-        question = "What is recited in the audio? What is in this image? Describe the video briefly."
-        audio = AudioAsset("mary_had_lamb").audio_and_sample_rate
-        audio = (audio[0][: 16000 * 5], audio[1])  # Trim to first 5 seconds
-        image = convert_image_mode(ImageAsset("cherry_blossom").pil_image.resize((128, 128)), "RGB")
-        video = VideoAsset(name="baby_reading", num_frames=4).np_ndarrays
-        modalities = ["text"]
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
+    """
+    Test multi-modal input processing and text/audio output generation via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text + audio + video + image
+    Output Modal: audio
+    Input Setting: stream=False
+    Datasets: single request
+    """
+    video = generate_synthetic_video(16, 16, 30)["np_array"]
+    image = generate_synthetic_image(16, 16)["np_array"]
+    audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
 
-        outputs = runner.generate_multimodal(
-            prompts=question,
-            audios=audio,
-            images=image,
-            videos=video,
-            modalities=modalities,
-        )
+    request_config = {
+        "prompts": get_question(),
+        "videos": video,
+        "images": image,
+        "audios": (audio, 16000),
+        "modalities": ["audio"],
+    }
 
-        # Find and verify text output (thinker stage)
-        text_output = None
-        output_count = 0
-        for stage_output in outputs:
-            assert stage_output.final_output_type != "audio"
-            if stage_output.final_output_type == "text":
-                text_output = stage_output
-                output_count += 1
-                break
-        assert output_count > 0
+    # Test single completion
+    omni_runner_handler.send_request(request_config)
 
-        assert text_output is not None
-        assert len(text_output.request_output) > 0
-        text_content = text_output.request_output[0].outputs[0].text
-        assert text_content is not None
-        assert len(text_content.strip()) > 0
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_text_to_text(omni_runner, omni_runner_handler) -> None:
+    """
+    Test text input processing and text output generation via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text
+    Output Modal: text
+    Input Setting: stream=False
+    Datasets: single request
+    """
+
+    request_config = {"prompts": get_question("text_only"), "modalities": ["text"]}
+
+    # Test single completion
+    omni_runner_handler.send_request(request_config)
