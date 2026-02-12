@@ -10,11 +10,14 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 if "VLLM_TARGET_DEVICE" not in os.environ:
     os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
+import concurrent.futures
 import gc
 import socket
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +26,21 @@ import psutil
 import pytest
 import torch
 import yaml
+from openai import OpenAI
+from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
+
 logger = init_logger(__name__)
+
+PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
+PromptImageInput = list[Any] | Any | None
+PromptVideoInput = list[Any] | Any | None
 
 
 @pytest.fixture(autouse=True)
@@ -292,6 +305,11 @@ def generate_synthetic_audio(
     if max_amp > 0:
         audio_data = audio_data / max_amp * 0.8
 
+    audio_array = audio_data.copy()
+    result = {
+        "np_array": audio_array,
+    }
+
     # Handle file saving
     audio_bytes = None
 
@@ -318,16 +336,14 @@ def generate_synthetic_audio(
 
     # Return result
     base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-    result = {
-        "base64": base64_audio,
-    }
+    result["base64"] = base64_audio
     if save_to_file and output_path:
         result["file_path"] = output_path
 
     return result
 
 
-def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> str:
+def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
     """Generate synthetic video with bouncing balls and return base64 string."""
 
     import cv2
@@ -397,6 +413,10 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         video_frames.append(frame_rgb)
 
+    video_array = np.array(video_frames)
+    result = {
+        "np_array": video_array,
+    }
     video_bytes = None
     saved_file_path = None
 
@@ -451,16 +471,14 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
 
     base64_video = base64.b64encode(video_bytes).decode("utf-8")
 
-    result = {
-        "base64": base64_video,
-    }
+    result["base64"] = base64_video
     if save_to_file and saved_file_path:
         result["file_path"] = saved_file_path
 
     return result
 
 
-def generate_synthetic_image(width: int, height: int, save_to_file: bool = False) -> Any:
+def generate_synthetic_image(width: int, height: int, save_to_file: bool = False) -> dict[str, Any]:
     """Generate synthetic image with randomly colored squares and return base64 string."""
     from PIL import Image, ImageDraw
 
@@ -487,6 +505,9 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
 
         # Draw square
         draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
+
+    image_array = np.array(image)
+    result = {"np_array": image_array.copy()}
 
     # Handle file saving
     image_bytes = None
@@ -521,9 +542,7 @@ def generate_synthetic_image(width: int, height: int, save_to_file: bool = False
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     # Return result
-    result = {
-        "base64": base64_image,
-    }
+    result["base64"] = base64_image
     if save_to_file and saved_file_path:
         result["file_path"] = saved_file_path
 
@@ -594,7 +613,6 @@ def convert_audio_to_text(audio_data):
         audio_file.write(audio_data)
 
     print(f"audio data is saved: {output_path}")
-
     text = convert_audio_file_to_text(output_path=output_path)
     return text
 
@@ -602,7 +620,7 @@ def convert_audio_to_text(audio_data):
 def convert_audio_file_to_text(output_path):
     import whisper
 
-    model = whisper.load_model("base")
+    model = whisper.load_model("small")
     text = model.transcribe(
         output_path,
         temperature=0.0,
@@ -641,7 +659,7 @@ def merge_base64_and_convert_to_text(base64_list):
 
 def modify_stage_config(
     yaml_path: str,
-    updates: dict[str, Any],
+    updates: dict[str, Any] = None,
     deletes: dict[str, Any] = None,
 ) -> str:
     """
@@ -792,7 +810,7 @@ def modify_stage_config(
         elif isinstance(current, dict) and last_key in current:
             del current[last_key]
         else:
-            raise KeyError(f"Path {path} does not exist")
+            print(f"Path {path} does not exist")
 
     # Apply deletions first
     if deletes:
@@ -829,42 +847,43 @@ def modify_stage_config(
                 # Delete entire key
                 del config[key]
 
-    # Apply updates
-    for key, value in updates.items():
-        if key == "stage_args":
-            if value and isinstance(value, dict):
-                stage_args = config.get("stage_args", [])
-                if not stage_args:
-                    raise ValueError("stage_args does not exist in config")
+    if updates:
+        # Apply updates
+        for key, value in updates.items():
+            if key == "stage_args":
+                if value and isinstance(value, dict):
+                    stage_args = config.get("stage_args", [])
+                    if not stage_args:
+                        raise ValueError("stage_args does not exist in config")
 
-                for stage_id, stage_updates in value.items():
-                    # Find stage by ID
-                    target_stage = None
-                    for stage in stage_args:
-                        if stage.get("stage_id") == stage_id:
-                            target_stage = stage
-                            break
+                    for stage_id, stage_updates in value.items():
+                        # Find stage by ID
+                        target_stage = None
+                        for stage in stage_args:
+                            if stage.get("stage_id") == stage_id:
+                                target_stage = stage
+                                break
 
-                    if target_stage is None:
-                        available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-                        raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+                        if target_stage is None:
+                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
 
-                    # Apply updates to this stage
-                    for path, val in stage_updates.items():
-                        # Check if this is a simple key (not dot-separated)
-                        # Example: 'engine_input_source' vs 'engine_args.max_model_len'
-                        if "." not in path:
-                            # Direct key assignment (e.g., updating a list value)
-                            target_stage[path] = val
-                        else:
-                            # Dot-separated path (e.g., nested dict access)
-                            apply_update(target_stage, path, val)
-        elif "." in key:
-            # Apply using dot-separated path
-            apply_update(config, key, value)
-        else:
-            # Direct top-level key
-            config[key] = value
+                        # Apply updates to this stage
+                        for path, val in stage_updates.items():
+                            # Check if this is a simple key (not dot-separated)
+                            # Example: 'engine_input_source' vs 'engine_args.max_model_len'
+                            if "." not in path:
+                                # Direct key assignment (e.g., updating a list value)
+                                target_stage[path] = val
+                            else:
+                                # Dot-separated path (e.g., nested dict access)
+                                apply_update(target_stage, path, val)
+            elif "." in key:
+                # Apply using dot-separated path
+                apply_update(config, key, value)
+            else:
+                # Direct top-level key
+                config[key] = value
 
     # Save to new file with timestamp
     timestamp = int(time.time())
@@ -1012,3 +1031,641 @@ class OmniServer:
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
         cleanup_dist_env_and_memory()
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-level",
+        action="store",
+        default="core_model",
+        choices=["core_model", "advanced_model"],
+        help="Test level to run: L2, L3",
+    )
+
+
+@pytest.fixture(scope="session")
+def run_level(request):
+    return request.config.getoption("--run-level")
+
+
+_omni_server_lock = threading.Lock()
+
+
+@pytest.fixture(scope="module")
+def omni_server(request, run_level):
+    """Start vLLM-Omni server as a subprocess with actual model weights.
+    Uses session scope so the server starts only once for the entire test session.
+    Multi-stage initialization can take 10-20+ minutes.
+    """
+    with _omni_server_lock:
+        model, stage_config_path = request.param
+        if run_level == "advanced_model":
+            stage_config_path = modify_stage_config(
+                stage_config_path,
+                deletes={
+                    "stage_args": {
+                        0: ["engine_args.load_format"],
+                        1: ["engine_args.load_format"],
+                        2: ["engine_args.load_format"],
+                    }
+                },
+            )
+
+        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+            print("OmniServer started successfully")
+            yield server
+            print("OmniServer stopping...")
+
+        print("OmniServer stopped")
+
+
+@dataclass
+class OmniResponse:
+    text_content: str | None = None
+    audio_data: list[str] | None = None
+    audio_content: str | None = None
+    similarity: float | None = None
+    e2e_latency: float | None = None
+    success: bool = False
+    error_message: str | None = None
+
+
+def assert_omni_response(response: OmniResponse, request_config: dict[str, Any], run_level):
+    """
+    Validate response results.
+
+    Args:
+        response: OmniResponse object
+
+    Raises:
+        AssertionError: When the response does not meet validation criteria
+    """
+    assert response.success, "The request failed."
+    e2e_latency = response.e2e_latency
+    if e2e_latency is not None:
+        print(f"the avg e2e is: {e2e_latency}")
+
+    modalities = request_config.get("modalities", ["text", "audio"])
+
+    if "audio" in modalities:
+        assert response.audio_content is not None, "No audio output is generated"
+        print(f"audio content is: {response.audio_content}")
+
+    if "text" in modalities:
+        assert response.text_content is not None, "No text output is generated"
+        print(f"text content is: {response.text_content}")
+
+    if run_level == "advanced_model":
+        # Verify image description
+        word_types = ["text", "image", "audio", "video"]
+        keywords_dict = request_config.get("key_words", {})
+        for word_type in word_types:
+            keywords = keywords_dict.get(word_type)
+            if "text" in modalities:
+                if keywords:
+                    assert any(keyword in response.text_content.lower() for keyword in keywords), (
+                        "The output does not contain any of the keywords."
+                    )
+            else:
+                if keywords:
+                    assert any(keyword in response.audio_content.lower() for keyword in keywords), (
+                        "The output does not contain any of the keywords."
+                    )
+
+        # Verify similarity
+        if "text" in modalities and "audio" in modalities:
+            assert response.similarity > 0.9, "The audio content is not same as the text"
+            print(f"similarity is: {response.similarity}")
+
+
+class OpenAIClientHandler:
+    """
+    OpenAI client handler class, encapsulating both streaming and non-streaming response processing logic.
+
+    This class integrates OpenAI API request sending, response handling, and validation functionality,
+    supporting both single request and concurrent request modes.
+    """
+
+    def __init__(
+        self, host: str = "127.0.0.1", port: int = get_open_port(), api_key: str = "EMPTY", run_level: str = None
+    ):
+        """
+        Initialize the OpenAI client.
+
+        Args:
+            host: vLLM-Omni server host address
+            port: vLLM-Omni server port
+            api_key: API key (defaults to "EMPTY")
+        """
+        self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
+        self.run_level = run_level
+
+    def _process_stream_response(self, chat_completion) -> OmniResponse:
+        """
+        Process streaming responses.
+
+        Args:
+            chat_completion: OpenAI streaming response object
+            request_config: Request configuration dictionary
+
+        Returns:
+            OmniResponse: Processed response object
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            text_content = ""
+            audio_data = []
+
+            for chunk in chat_completion:
+                for choice in chunk.choices:
+                    # Get content data
+                    if hasattr(choice, "delta"):
+                        content = getattr(choice.delta, "content", None)
+                    else:
+                        content = None
+
+                    # Get modality type
+                    modality = getattr(chunk, "modality", None)
+
+                    # Process content based on modality type
+                    if modality == "audio" and content:
+                        audio_data.append(content)
+                    elif modality == "text" and content:
+                        text_content += content if content else ""
+
+            # Calculate end-to-end latency
+            result.e2e_latency = time.perf_counter() - start_time
+
+            # Process audio and text content
+            audio_content = None
+            similarity = None
+
+            if audio_data or text_content:
+                if audio_data:
+                    audio_content = merge_base64_and_convert_to_text(audio_data)
+                if audio_content and text_content:
+                    similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+
+            # Populate result object
+            result.text_content = text_content
+            result.audio_data = audio_data
+            result.audio_content = audio_content
+            result.similarity = similarity
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def _process_non_stream_response(self, chat_completion) -> OmniResponse:
+        """
+        Process non-streaming responses.
+
+        Args:
+            chat_completion: OpenAI non-streaming response object
+            request_config: Request configuration dictionary
+
+        Returns:
+            OmniResponse: Processed response object
+        """
+        result = OmniResponse()
+        start_time = time.perf_counter()
+
+        try:
+            audio_data = None
+            text_content = None
+
+            # Iterate through all choices
+            for choice in chat_completion.choices:
+                # Process audio data
+                if hasattr(choice.message, "audio") and choice.message.audio is not None:
+                    audio_message = choice.message
+                    audio_data = audio_message.audio.data
+
+                # Process text content
+                if hasattr(choice.message, "content") and choice.message.content is not None:
+                    text_content = choice.message.content
+
+            # Calculate end-to-end latency
+            result.e2e_latency = time.perf_counter() - start_time
+
+            # Process audio and text content
+            audio_content = None
+            similarity = None
+
+            if audio_data or text_content:
+                if audio_data:
+                    audio_content = convert_audio_to_text(audio_data)
+                if audio_content and text_content:
+                    similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
+
+            # Populate result object
+            result.text_content = text_content
+            result.audio_content = audio_content
+            result.similarity = similarity
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Non-stream processing error: {str(e)}"
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def send_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Send OpenAI requests.
+
+        Args:
+            request_config: Request configuration dictionary containing parameters like model, messages, stream
+            request_num: Number of requests, defaults to 1 (single request)
+
+        Returns:
+            List[OmniResponse]: List of response objects
+        """
+
+        responses = []
+        stream = request_config.get("stream", False)
+
+        if request_num == 1:
+            # Send single request
+            chat_completion = self.client.chat.completions.create(
+                model=request_config.get("model"), messages=request_config.get("messages"), stream=stream
+            )
+
+            if stream:
+                response = self._process_stream_response(chat_completion)
+            else:
+                response = self._process_non_stream_response(chat_completion)
+
+            assert_omni_response(response, request_config, run_level=self.run_level)
+            responses.append(response)
+
+        else:
+            # Send concurrent requests
+            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+                futures = []
+
+                # Submit all request tasks
+                for _ in range(request_num):
+                    future = executor.submit(
+                        self.client.chat.completions.create,
+                        model=request_config.get("model"),
+                        messages=request_config.get("messages"),
+                        stream=stream,
+                    )
+                    futures.append(future)
+
+                # Process completed tasks
+                for future in concurrent.futures.as_completed(futures):
+                    chat_completion = future.result()
+
+                    if stream:
+                        response = self._process_stream_response(chat_completion)
+                    else:
+                        response = self._process_non_stream_response(chat_completion)
+
+                    assert_omni_response(response, request_config, run_level=self.run_level)
+                    responses.append(response)
+
+        return responses
+
+
+@pytest.fixture
+def openai_client(omni_server, run_level):
+    """Create OpenAIClientHandler fixture"""
+    return OpenAIClientHandler(host=omni_server.host, port=omni_server.port, api_key="EMPTY", run_level=run_level)
+
+
+class OmniRunner:
+    """
+    Test runner for Omni models.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        seed: int = 42,
+        stage_init_timeout: int = 300,
+        batch_timeout: int = 10,
+        init_timeout: int = 300,
+        shm_threshold_bytes: int = 65536,
+        log_stats: bool = False,
+        stage_configs_path: str | None = None,
+        **kwargs,
+    ) -> None:
+        """
+        Initialize an OmniRunner for testing.
+
+        Args:
+            model_name: The model name or path
+            seed: Random seed for reproducibility
+            stage_init_timeout: Timeout for initializing a single stage in seconds
+            batch_timeout: Timeout for batching in seconds
+            init_timeout: Timeout for initializing stages in seconds
+            shm_threshold_bytes: Threshold for using shared memory
+            log_stats: Enable detailed statistics logging
+            stage_configs_path: Optional path to YAML stage config file
+            **kwargs: Additional arguments passed to Omni
+        """
+        cleanup_dist_env_and_memory()
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        self.model_name = model_name
+        self.seed = seed
+
+        self.omni = Omni(
+            model=model_name,
+            log_stats=log_stats,
+            stage_init_timeout=stage_init_timeout,
+            batch_timeout=batch_timeout,
+            init_timeout=init_timeout,
+            shm_threshold_bytes=shm_threshold_bytes,
+            stage_configs_path=stage_configs_path,
+            **kwargs,
+        )
+
+    def get_default_sampling_params_list(self) -> list[OmniSamplingParams]:
+        """
+        Get a list of default sampling parameters for all stages.
+
+        Returns:
+            List of SamplingParams with default decoding for each stage
+        """
+        return [st.default_sampling_params for st in self.omni.stage_list]
+
+    def get_omni_inputs(
+        self,
+        prompts: list[str] | str,
+        system_prompt: str | None = None,
+        audios: PromptAudioInput = None,
+        images: PromptImageInput = None,
+        videos: PromptVideoInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+        modalities: list[str] | None = None,
+    ) -> list[TextPrompt]:
+        """
+        Construct Omni input format from prompts and multimodal data.
+
+        Args:
+            prompts: Text prompt(s) - either a single string or list of strings
+            system_prompt: Optional system prompt (defaults to Qwen system prompt)
+            audios: Audio input(s) - tuple of (audio_array, sample_rate) or list of tuples
+            images: Image input(s) - PIL Image or list of PIL Images
+            videos: Video input(s) - numpy array or list of numpy arrays
+            mm_processor_kwargs: Optional processor kwargs (e.g., use_audio_in_video)
+
+        Returns:
+            List of prompt dictionaries suitable for Omni.generate()
+        """
+        if system_prompt is None:
+            system_prompt = (
+                "You are Qwen, a virtual human developed by the Qwen Team, Alibaba "
+                "Group, capable of perceiving auditory and visual inputs, as well as "
+                "generating text and speech."
+            )
+
+        video_padding_token = "<|VIDEO|>"
+        image_padding_token = "<|IMAGE|>"
+        audio_padding_token = "<|AUDIO|>"
+
+        if "Qwen3-Omni-30B-A3B-Instruct" in self.model_name:
+            video_padding_token = "<|video_pad|>"
+            image_padding_token = "<|image_pad|>"
+            audio_padding_token = "<|audio_pad|>"
+
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        def _normalize_mm_input(mm_input, num_prompts):
+            if mm_input is None:
+                return [None] * num_prompts
+            if isinstance(mm_input, list):
+                if len(mm_input) != num_prompts:
+                    raise ValueError(
+                        f"Multimodal input list length ({len(mm_input)}) must match prompts length ({num_prompts})"
+                    )
+                return mm_input
+            return [mm_input] * num_prompts
+
+        num_prompts = len(prompts)
+        audios_list = _normalize_mm_input(audios, num_prompts)
+        images_list = _normalize_mm_input(images, num_prompts)
+        videos_list = _normalize_mm_input(videos, num_prompts)
+
+        omni_inputs = []
+        for i, prompt_text in enumerate(prompts):
+            user_content = ""
+            multi_modal_data = {}
+
+            audio = audios_list[i]
+            if audio is not None:
+                if isinstance(audio, list):
+                    for _ in audio:
+                        user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    multi_modal_data["audio"] = audio
+                else:
+                    user_content += f"<|audio_bos|>{audio_padding_token}<|audio_eos|>"
+                    multi_modal_data["audio"] = audio
+
+            image = images_list[i]
+            if image is not None:
+                if isinstance(image, list):
+                    for _ in image:
+                        user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    multi_modal_data["image"] = image
+                else:
+                    user_content += f"<|vision_bos|>{image_padding_token}<|vision_eos|>"
+                    multi_modal_data["image"] = image
+
+            video = videos_list[i]
+            if video is not None:
+                if isinstance(video, list):
+                    for _ in video:
+                        user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    multi_modal_data["video"] = video
+                else:
+                    user_content += f"<|vision_bos|>{video_padding_token}<|vision_eos|>"
+                    multi_modal_data["video"] = video
+
+            user_content += prompt_text
+
+            full_prompt = (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{user_content}<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+
+            input_dict: TextPrompt = {"prompt": full_prompt}
+            if multi_modal_data:
+                input_dict["multi_modal_data"] = multi_modal_data
+            if modalities:
+                input_dict["modalities"] = modalities
+            if mm_processor_kwargs:
+                input_dict["mm_processor_kwargs"] = mm_processor_kwargs
+
+            omni_inputs.append(input_dict)
+
+        return omni_inputs
+
+    def generate(
+        self,
+        prompts: list[TextPrompt],
+        sampling_params_list: list[OmniSamplingParams] | None = None,
+    ) -> list[OmniRequestOutput]:
+        """
+        Generate outputs for the given prompts.
+
+        Args:
+            prompts: List of prompt dictionaries with 'prompt' and optionally
+                    'multi_modal_data' keys
+            sampling_params_list: List of sampling parameters for each stage.
+                                 If None, uses default parameters.
+
+        Returns:
+            List of OmniRequestOutput objects from stages with final_output=True
+        """
+        if sampling_params_list is None:
+            sampling_params_list = self.get_default_sampling_params_list()
+
+        return self.omni.generate(prompts, sampling_params_list)
+
+    def generate_multimodal(
+        self,
+        prompts: list[str] | str,
+        sampling_params_list: list[OmniSamplingParams] | None = None,
+        system_prompt: str | None = None,
+        audios: PromptAudioInput = None,
+        images: PromptImageInput = None,
+        videos: PromptVideoInput = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+        modalities: list[str] | None = None,
+    ) -> list[OmniRequestOutput]:
+        """
+        Convenience method to generate with multimodal inputs.
+
+        Args:
+            prompts: Text prompt(s)
+            sampling_params_list: List of sampling parameters for each stage
+            system_prompt: Optional system prompt
+            audios: Audio input(s)
+            images: Image input(s)
+            videos: Video input(s)
+            mm_processor_kwargs: Optional processor kwargs
+
+        Returns:
+            List of OmniRequestOutput objects from stages with final_output=True
+        """
+        omni_inputs = self.get_omni_inputs(
+            prompts=prompts,
+            system_prompt=system_prompt,
+            audios=audios,
+            images=images,
+            videos=videos,
+            mm_processor_kwargs=mm_processor_kwargs,
+            modalities=modalities,
+        )
+        return self.generate(omni_inputs, sampling_params_list)
+
+    def _cleanup_process(self):
+        try:
+            keywords = ["enginecore"]
+
+            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
+                try:
+                    cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
+                    name = proc.name().lower()
+
+                    is_process = any(keyword in cmdline for keyword in keywords) or any(
+                        keyword in name for keyword in keywords
+                    )
+
+                    if is_process:
+                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
+
+                        try:
+                            proc.terminate()
+                            time.sleep(2)
+                        except Exception:
+                            proc.kill()
+
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+        except Exception as e:
+            print(f"Error in psutil vllm cleanup: {e}")
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup resources."""
+        if hasattr(self.omni, "close"):
+            self.omni.close()
+        self._cleanup_process()
+        _run_pre_test_cleanup(enable_force=True)
+        _run_post_test_cleanup(enable_force=True)
+        cleanup_dist_env_and_memory()
+
+
+@pytest.fixture(scope="module")
+def omni_runner(request):
+    with _omni_server_lock:
+        model, stage_config_path = request.param
+        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
+            print("OmniRunner started successfully")
+            yield runner
+            print("OmniRunner stopping...")
+
+        print("OmniRunner stopped")
+
+
+class OmniRunnerHandler:
+    def __init__(self, omni_runner):
+        self.runner = omni_runner
+
+    def _process_output(self, outputs: list[Any]) -> OmniResponse:
+        result = OmniResponse()
+        try:
+            text_content = None
+            audio_content = None
+            for stage_output in outputs:
+                if getattr(stage_output, "final_output_type", None) == "text":
+                    text_content = stage_output.request_output[0].outputs[0].text
+                if getattr(stage_output, "final_output_type", None) == "audio":
+                    audio_content = stage_output.request_output[0].outputs[0].multimodal_output["audio"]
+
+            result.audio_content = audio_content
+            result.text_content = text_content
+            result.success = True
+
+        except Exception as e:
+            result.error_message = f"Output processing error: {str(e)}"
+            result.success = False
+            print(f"Error: {result.error_message}")
+
+        return result
+
+    def send_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
+        if request_config is None:
+            request_config = {}
+        prompts = request_config.get("prompts")
+        videos = request_config.get("videos")
+        images = request_config.get("images")
+        audios = request_config.get("audios")
+        modalities = request_config.get("modalities", ["text", "audio"])
+        outputs = self.runner.generate_multimodal(
+            prompts=prompts, videos=videos, images=images, audios=audios, modalities=modalities
+        )
+        response = self._process_output(outputs)
+        assert_omni_response(response, request_config, run_level="L2")
+        return response
+
+
+@pytest.fixture
+def omni_runner_handler(omni_runner):
+    return OmniRunnerHandler(omni_runner)
