@@ -12,9 +12,7 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-)
+from tests.conftest import OmniServer, modify_stage_config
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
@@ -33,6 +31,20 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
         raise RuntimeError(f"Failed to load configuration file: {str(e)}")
 
 
+def modify_stage(default_path, updates, deletes):
+    kwargs = {}
+    if updates is not None:
+        kwargs["updates"] = updates
+    if deletes is not None:
+        kwargs["deletes"] = deletes
+    if kwargs:
+        path = modify_stage_config(default_path, **kwargs)
+    else:
+        path = default_path
+
+    return path
+
+
 def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
     unique_params = set()
     for config in configs:
@@ -40,31 +52,28 @@ def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str
         model = config["server_params"]["model"]
         stage_config_name = config["server_params"]["stage_config_name"]
         stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
+        delete = config["server_params"].get("delete", None)
+        update = config["server_params"].get("update", None)
+        stage_config_path = modify_stage(stage_config_path, update, delete)
         unique_params.add((test_name, model, stage_config_path))
 
     return list(unique_params)
 
 
-def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[tuple[str, str, str], dict]:
+def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, dict]:
     mapping = {}
     for config in configs:
         test_name = config["test_name"]
-        model = config["server_params"]["model"]
-        stage_config_name = config["server_params"]["stage_config_name"]
-        stage_config_path = str(Path(__file__).parent.parent / "stage_configs" / stage_config_name)
-        server_key = (test_name, model, stage_config_path)
-
-        mapping[server_key] = {
-            "test_name": test_name,
-            "model": model,
-            "stage_config_path": stage_config_path,
-            "benchmark_params": config["benchmark_params"],
-        }
-
+        if test_name not in mapping:
+            mapping[test_name] = {
+                "test_name": test_name,
+                "benchmark_params": [],
+            }
+        mapping[test_name]["benchmark_params"].extend(config["benchmark_params"])
     return mapping
 
 
-CONFIG_FILE_PATH = str(Path(__file__).parent.parents / "tests" / "test.json")
+CONFIG_FILE_PATH = str(Path(__file__).parent.parent / "tests" / "test.json")
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 
 
@@ -81,9 +90,9 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        _, model, stage_config_path = request.param
+        test_name, model, stage_config_path = request.param
 
-        print(f"Starting OmniServer with model: {model}")
+        print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
         with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
             print("OmniServer started successfully")
@@ -93,29 +102,10 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
-@pytest.fixture
-def benchmark_params(request, omni_server):
-    test_name, model, stage_config_path = request.node.callspec.params["omni_server"]
-    server_key = (test_name, model, stage_config_path)
-
-    if server_key not in server_to_benchmark_mapping:
-        raise ValueError(f"No benchmark parameters found for server key: {server_key}")
-
-    config_data = server_to_benchmark_mapping[server_key]
-    all_params = config_data["benchmark_params"]
-
-    param_index = request.param if hasattr(request, "param") else 0
-
-    if param_index < len(all_params):
-        return {"test_name": config_data["test_name"], "model": config_data["model"], "params": all_params[param_index]}
-    else:
-        raise ValueError(f"No benchmark parameters found for index {param_index}")
-
-
-def run_benchmark(args: list, test_name: str, qps: float) -> Any:
+def run_benchmark(args: list, test_name: str, flow, dataset_name: str) -> Any:
     """Generate synthetic image with random values."""
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"result_{test_name}_{qps}_{current_dt}.json"
+    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{current_dt}.json"
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -152,49 +142,104 @@ def run_benchmark(args: list, test_name: str, qps: float) -> Any:
     return result
 
 
+def get_benchmark_params_for_server(test_name: str) -> list:
+    if test_name not in server_to_benchmark_mapping:
+        return []
+    return server_to_benchmark_mapping[test_name]["benchmark_params"]
+
+
 def create_benchmark_indices():
     indices = []
-    for server_key, config_data in server_to_benchmark_mapping.items():
+    for test_name, config_data in server_to_benchmark_mapping.items():
         params_list = config_data["benchmark_params"]
-        indices.extend(range(len(params_list)))
+        for idx in range(len(params_list)):
+            indices.append((test_name, idx))
     return indices
 
 
 benchmark_indices = create_benchmark_indices()
 
 
+@pytest.fixture(params=benchmark_indices)
+def benchmark_params(request, omni_server):
+    """Benchmark parameters fixture with proper parametrization"""
+    test_name, param_index = request.param
+    all_params = get_benchmark_params_for_server(test_name)
+
+    if not all_params:
+        raise ValueError(f"No benchmark parameters found for test: {test_name}")
+
+    if param_index >= len(all_params):
+        raise ValueError(f"No benchmark parameters found for index {param_index} in test: {test_name}")
+
+    return {"test_name": test_name, "params": all_params[param_index]}
+
+
+def assert_result(result, params):
+    assert result["completed"] == params.get("num_prompts"), "Request failures exist"
+    baseline_data = params.get("baseline", {})
+    for metric_name, baseline_value in baseline_data.items():
+        current_value = result[metric_name]
+        if "throughput" in metric_name:
+            assert current_value >= baseline_value, f"{metric_name}: {current_value} < {baseline_value}"
+        else:
+            assert current_value <= baseline_value, f"{metric_name}: {current_value} > {baseline_value}"
+
+
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
-    model = benchmark_params["model"]
     params = benchmark_params["params"]
+    dataset_name = params.get("dataset_name", "")
 
     host = omni_server.host
     port = omni_server.port
+    model = omni_server.model
 
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
 
-    for qps in params.get("qps", []):
-        args = [
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--dataset-name",
-            params.get("dataset_name", "random"),
-            "--num-prompts",
-            str(params.get("num_prompts", 100)),
-            "--random-input-len",
-            str(params.get("random_input_len", 10)),
-            "--random-output-len",
-            str(params.get("random_output_len", 10)),
-            "--percentile-metrics",
-            params.get("percentile-metrics", "ttft,tpot,itl,e2el"),
-            "--request-rate",
-            str(qps),
-        ]
+    def to_list(value, default=None):
+        if value is None:
+            return [] if default is None else [default]
+        return [value] if not isinstance(value, (list, tuple)) else list(value)
 
-        result = run_benchmark(args=args, test_name=test_name, qps=qps)
-        assert result["completed"] == params.get("num_prompts"), "Request failures exist"
+    qps_list = to_list(params.get("qps"))
+    num_prompt_list = to_list(params.get("num_prompts"))
+    max_concurrency_list = to_list(params.get("max_concurrency"))
+
+    max_len = max(len(qps_list), len(max_concurrency_list))
+    if len(num_prompt_list) == 1 and max_len > 1:
+        num_prompt_list = num_prompt_list * max_len
+    elif len(num_prompt_list) != max_len and max_len > 0:
+        raise ValueError("The number of prompts does not match the QPS or max_concurrency")
+
+    args = ["--host", host, "--port", str(port)]
+    exclude_keys = {"qps", "baseline", "num_prompts", "max_concurrency"}
+
+    for key, value in params.items():
+        if key in exclude_keys or value is None:
+            continue
+
+        arg_name = f"--{key.replace('_', '-')}"
+
+        if isinstance(value, bool) and value:
+            args.append(arg_name)
+        elif isinstance(value, dict):
+            json_str = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            args.extend([arg_name, json_str])
+        elif not isinstance(value, bool):
+            args.extend([arg_name, str(value)])
+
+    # QPS test
+    for qps, num_prompt in zip(qps_list, num_prompt_list):
+        args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
+        result = run_benchmark(args=args, test_name=test_name, flow=qps, dataset_name=dataset_name)
+        assert_result(result, params)
+
+    # concurrency test
+    for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
+        args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
+        result = run_benchmark(args=args, test_name=test_name, flow=concurrency, dataset_name=dataset_name)
+        assert_result(result, params)

@@ -810,7 +810,7 @@ def modify_stage_config(
                         # Find stage by ID
                         target_stage = None
                         for stage in stage_args:
-                            if stage.get("stage_id") == stage_id:
+                            if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
 
@@ -841,7 +841,7 @@ def modify_stage_config(
                     # Find stage by ID
                     target_stage = None
                     for stage in stage_args:
-                        if stage.get("stage_id") == stage_id:
+                        if stage.get("stage_id") == int(stage_id):
                             target_stage = stage
                             break
 
