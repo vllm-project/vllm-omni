@@ -821,7 +821,7 @@ class Omni(OmniBase):
                         request_output=engine_outputs,
                     )
 
-                    # Record audio generated frames with unified signature
+                    # Record audio generated frames (only when finished)
                     try:
                         finished = (
                             engine_outputs.finished
@@ -834,7 +834,8 @@ class Omni(OmniBase):
                                 else False
                             )
                         )
-                        metrics.record_audio_generated_frames(output_to_yield, finished, stage_id, req_id)
+                        if finished:
+                            metrics.record_audio_generated_frames(output_to_yield, stage_id, req_id)
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Failed to record audio metrics for req {req_id} at stage {stage_id}: {e}",
