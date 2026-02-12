@@ -1,18 +1,17 @@
-from typing import Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
-
-from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
-
-from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
 from vllm.model_executor.models.utils import maybe_prefix
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel
@@ -73,6 +72,7 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
     """
     # Prefix the patterns because we always start from `self.model`
     quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+
     def _recursive_replace(module: nn.Module, prefix: str):
         for child_name, child_module in module.named_children():
             new_module = child_module
@@ -80,17 +80,20 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
             # Replace modules as needed
             if isinstance(child_module, nn.Linear):
                 style = "replicate"
-                new_module = replace_linear_class(
-                    child_module, style, quant_config, prefix=qual_name
-                )
+                new_module = replace_linear_class(child_module, style, quant_config, prefix=qual_name)
             else:
                 _recursive_replace(child_module, prefix=qual_name)
             if new_module is not child_module:
                 setattr(module, child_name, new_module)
+
     _recursive_replace(model, prefix="")
 
 
-def init_parameters(module: nn.Module, dtype: torch.dtype | None, device: torch.device | None = None,):
+def init_parameters(
+    module: nn.Module,
+    dtype: torch.dtype | None,
+    device: torch.device | None = None,
+):
     for name, param in module.named_parameters(recurse=False):
         if param.device == torch.device("meta"):
             new_param = nn.Parameter(
@@ -111,7 +114,7 @@ def create_transformers_model(
     hf_config: "PretrainedConfig",
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
-) -> PreTrainedModel:
+) -> "PreTrainedModel":
     """Create a HuggingFace model using the given auto class and model name."""
     dtype = dtype or od_config.dtype
     with init_on_device_without_buffers("meta"):

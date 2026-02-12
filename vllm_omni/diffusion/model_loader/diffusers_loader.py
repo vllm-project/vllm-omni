@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_download_from_modelscope,
     safetensors_weights_iterator,
 )
+from vllm.transformers_utils.repo_utils import file_exists
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -33,6 +34,12 @@ logger = init_logger(__name__)
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
+INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
+
+
+def get_subfolder_file_path(subfolder: str | None, file: str) -> str:
+    """Get the subfolder path."""
+    return f"{subfolder}/" if subfolder is not None else file
 
 
 class DiffusersPipelineLoader:
@@ -95,8 +102,21 @@ class DiffusersPipelineLoader:
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = DIFFUSION_MODEL_WEIGHTS_INDEX
-        index_file_with_subfolder = f"{subfolder}/{index_file}" if subfolder else index_file
+        possible_index_files = [
+            f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
+        ]
+        available_index_file = list(
+            filter(lambda f: file_exists(model_name_or_path, f, revision), possible_index_files)
+        )
+        assert len(available_index_file) <= 1, (
+            f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
+        )
+        index_file_with_subfolder = available_index_file[0] if len(available_index_file) == 1 else None
+        index_file = (
+            index_file_with_subfolder.split("/")[-1]
+            if index_file_with_subfolder and subfolder is not None
+            else index_file_with_subfolder
+        )
 
         # only hf is supported currently
         if load_format == "auto":
@@ -265,7 +285,4 @@ class DiffusersPipelineLoader:
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
-                raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
-                )
+                raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
