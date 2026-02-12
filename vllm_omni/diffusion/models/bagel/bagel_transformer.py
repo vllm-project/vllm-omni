@@ -1322,16 +1322,16 @@ class Bagel(nn.Module):
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
-        dts = timesteps[:-1] - timesteps[1:]  # 错位相减，全是0.02
-        timesteps = timesteps[:-1]  # 算49次就行了
+        dts = timesteps[:-1] - timesteps[1:]
+        timesteps = timesteps[:-1]
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
             timestep = torch.tensor(
                 [t] * x_t.shape[0], device=x_t.device
-            )  # 调整大小与x_t.shape[0]一致(latent token)时间步嵌入
+            )
             if (
                 t > cfg_interval[0] and t <= cfg_interval[1]
-            ):  # 只有在t在[cfg_interval[0], cfg_interval[1]]之间的时候才进行cfg
+            ):
                 cfg_text_scale_ = cfg_text_scale
                 cfg_img_scale_ = cfg_img_scale
             else:
@@ -1370,9 +1370,6 @@ class Bagel(nn.Module):
             )
 
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
-            # dts 不是常数，因为 timestep_shift 让 timestep 分布 不均匀
-        # 每个样本的序列长度，包含 <vision_start> + latent tokens + <vision_end>
-        # -2 相当于只算 latent tokens 的长度
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
 
@@ -1456,9 +1453,6 @@ class Bagel(nn.Module):
                 is_causal=False,
                 **extra_inputs,
             )
-            # LLM 输出的是 Hidden States (比如 4096维)。
-            # 需要通过一个线性层 (llm2vae)把它投射回 VAE Latent 的维度
-            # （比如 4通道 x 4 Patch = 64维）。
             cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
