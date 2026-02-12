@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import einops
 import torch
 from vllm.logger import init_logger
 
@@ -158,7 +157,6 @@ class FlashAttentionImpl(AttentionImpl):
             _pad_input,
             _unpad_input,
             _upad_input,
-            flash_attn_func,
             flash_attn_varlen_func,
         )
 
@@ -196,13 +194,15 @@ class FlashAttentionImpl(AttentionImpl):
             out = _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
         else:
+            from einops import rearrange
+
             batch_size, q_len = query.size()[:2]
             cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
             max_seqlen = q_len
 
-            query, key, value = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [query, key, value])
+            query, key, value = (rearrange(x, "b s ... -> (b s) ...") for x in [query, key, value])
 
-            out = flash_attn_func(
+            out = flash_attn_varlen_func(
                 query,
                 key,
                 value,
@@ -213,5 +213,5 @@ class FlashAttentionImpl(AttentionImpl):
                 causal=self.causal,
                 softmax_scale=self.softmax_scale,
             )
-            out = einops.rearrange(out, "(b s) h d -> b s h d", b=batch_size)
+            out = rearrange(out, "(b s) h d -> b s h d", b=batch_size)
         return out
