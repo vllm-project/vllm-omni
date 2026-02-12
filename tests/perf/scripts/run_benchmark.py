@@ -175,8 +175,8 @@ def benchmark_params(request, omni_server):
     return {"test_name": test_name, "params": all_params[param_index]}
 
 
-def assert_result(result, params):
-    assert result["completed"] == params.get("num_prompts"), "Request failures exist"
+def assert_result(result, params, num_prompt):
+    assert result["completed"] == num_prompt, "Request failures exist"
     baseline_data = params.get("baseline", {})
     for metric_name, baseline_value in baseline_data.items():
         current_value = result[metric_name]
@@ -205,18 +205,24 @@ def test_performance_benchmark(omni_server, benchmark_params):
             return [] if default is None else [default]
         return [value] if not isinstance(value, (list, tuple)) else list(value)
 
-    qps_list = to_list(params.get("qps"))
+    qps_list = to_list(params.get("request_rate"))
     num_prompt_list = to_list(params.get("num_prompts"))
     max_concurrency_list = to_list(params.get("max_concurrency"))
 
     max_len = max(len(qps_list), len(max_concurrency_list))
     if len(num_prompt_list) == 1 and max_len > 1:
         num_prompt_list = num_prompt_list * max_len
+    elif max_len == 1 and len(num_prompt_list) > 1:
+        if len(qps_list) == 1:
+            qps_list = qps_list * len(num_prompt_list)
+        if len(max_concurrency_list) == 1:
+            max_concurrency_list = max_concurrency_list * len(num_prompt_list)
+        max_len = max(len(qps_list), len(max_concurrency_list))
     elif len(num_prompt_list) != max_len and max_len > 0:
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
-    exclude_keys = {"qps", "baseline", "num_prompts", "max_concurrency"}
+    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency"}
 
     for key, value in params.items():
         if key in exclude_keys or value is None:
@@ -236,10 +242,10 @@ def test_performance_benchmark(omni_server, benchmark_params):
     for qps, num_prompt in zip(qps_list, num_prompt_list):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(args=args, test_name=test_name, flow=qps, dataset_name=dataset_name)
-        assert_result(result, params)
+        assert_result(result, params, num_prompt=num_prompt)
 
     # concurrency test
     for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(args=args, test_name=test_name, flow=concurrency, dataset_name=dataset_name)
-        assert_result(result, params)
+        assert_result(result, params, num_prompt=num_prompt)
