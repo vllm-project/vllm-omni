@@ -106,7 +106,7 @@ class DiffusersPipelineLoader:
             f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
         ]
         available_index_file = list(
-            filter(lambda f: file_exists(model_name_or_path, f, revision), possible_index_files)
+            filter(lambda f: file_exists(model_name_or_path, f, revision=revision), possible_index_files)
         )
         assert len(available_index_file) <= 1, (
             f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
