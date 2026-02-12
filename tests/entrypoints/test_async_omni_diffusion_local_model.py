@@ -23,6 +23,7 @@ def _install_stub(monkeypatch, name: str, module: types.ModuleType) -> None:
 
 def _load_async_module():
     """Load vllm_omni.entrypoints.async_omni_diffusion without package imports."""
+    sys.modules.pop("vllm_omni.diffusion.model_config_loader", None)
     spec = importlib.util.spec_from_file_location(
         "async_omni_diffusion_under_test",
         Path(__file__).resolve().parents[2] / "vllm_omni" / "entrypoints" / "async_omni_diffusion.py",
@@ -62,10 +63,13 @@ def test_local_model_path_bypasses_hf_validation(monkeypatch, tmp_path):
     _install_stub(monkeypatch, "vllm.transformers_utils.config", vllm_tf_config_mod)
 
     # Stub vllm_omni package and required submodules to avoid importing heavy deps
+    repo_root = Path(__file__).resolve().parents[2]
     vo_root = types.ModuleType("vllm_omni")
-    vo_root.__path__ = []
+    vo_root.__path__ = [str(repo_root / "vllm_omni")]
     vo_entrypoints = types.ModuleType("vllm_omni.entrypoints")
+    vo_entrypoints.__path__ = [str(repo_root / "vllm_omni" / "entrypoints")]
     vo_diffusion_pkg = types.ModuleType("vllm_omni.diffusion")
+    vo_diffusion_pkg.__path__ = [str(repo_root / "vllm_omni" / "diffusion")]
     vo_inputs_pkg = types.ModuleType("vllm_omni.inputs")
     vo_lora_pkg = types.ModuleType("vllm_omni.lora")
     _install_stub(monkeypatch, "vllm_omni", vo_root)
@@ -203,10 +207,16 @@ def test_local_bagel_without_transformer_config(monkeypatch, tmp_path):
     _install_stub(monkeypatch, "vllm.transformers_utils", vllm_tf_utils_mod)
     _install_stub(monkeypatch, "vllm.transformers_utils.config", vllm_tf_config_mod)
 
+    repo_root = Path(__file__).resolve().parents[2]
     vo_root = types.ModuleType("vllm_omni")
-    vo_root.__path__ = []
+    vo_root.__path__ = [str(repo_root / "vllm_omni")]
     _install_stub(monkeypatch, "vllm_omni", vo_root)
-    _install_stub(monkeypatch, "vllm_omni.entrypoints", types.ModuleType("vllm_omni.entrypoints"))
+    vo_entrypoints = types.ModuleType("vllm_omni.entrypoints")
+    vo_entrypoints.__path__ = [str(repo_root / "vllm_omni" / "entrypoints")]
+    _install_stub(monkeypatch, "vllm_omni.entrypoints", vo_entrypoints)
+    vo_diffusion_pkg = types.ModuleType("vllm_omni.diffusion")
+    vo_diffusion_pkg.__path__ = [str(repo_root / "vllm_omni" / "diffusion")]
+    _install_stub(monkeypatch, "vllm_omni.diffusion", vo_diffusion_pkg)
 
     diff_data_mod = types.ModuleType("vllm_omni.diffusion.data")
 
@@ -266,7 +276,9 @@ def test_local_bagel_without_transformer_config(monkeypatch, tmp_path):
     _install_stub(monkeypatch, "vllm_omni.lora", types.ModuleType("vllm_omni.lora"))
 
     vo_outputs_mod = types.ModuleType("vllm_omni.outputs")
-    vo_outputs_mod.OmniRequestOutput = type("OmniRequestOutput", (), {"from_diffusion": classmethod(lambda cls, **_: cls())})
+    vo_outputs_mod.OmniRequestOutput = type(
+        "OmniRequestOutput", (), {"from_diffusion": classmethod(lambda cls, **_: cls())}
+    )
     _install_stub(monkeypatch, "vllm_omni.outputs", vo_outputs_mod)
 
     # Load and instantiate
