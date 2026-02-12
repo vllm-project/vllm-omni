@@ -27,6 +27,7 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
+  # L4 Test
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     if: build.env("NIGHTLY") == "1"
