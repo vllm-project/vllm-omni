@@ -14,7 +14,7 @@ steps:
     depends_on: image-build
     if: build.branch != "main"
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-ready.yaml
+      - buildkite-agent pipeline upload .buildkite/test-ready.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -23,7 +23,7 @@ steps:
     depends_on: image-build
     if: build.branch == "main"
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-merge.yaml
+      - buildkite-agent pipeline upload .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
@@ -31,6 +31,6 @@ steps:
     depends_on: image-build
     if: build.env("NIGHTLY") == "1"
     commands:
-      - buildkite-agent pipeline upload .buildkite/test-nightly.yaml
+      - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:
       queue: "cpu_queue_premerge"
