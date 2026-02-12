@@ -3,6 +3,8 @@ from typing import Literal, TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
+
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm.model_executor.layers.linear import (
@@ -13,6 +15,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.models.utils import maybe_prefix
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers.models.auto.auto_factory import _BaseAutoModelClass
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
     )
@@ -99,3 +103,19 @@ def init_parameters(module: nn.Module, dtype: torch.dtype | None, device: torch.
             setattr(module, name, new_param)
     for child in module.children():
         init_parameters(child, dtype, device)
+
+
+def create_transformers_model(
+    auto_cls: "_BaseAutoModelClass",
+    od_config: OmniDiffusionConfig,
+    hf_config: "PretrainedConfig",
+    dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
+) -> PreTrainedModel:
+    """Create a HuggingFace model using the given auto class and model name."""
+    dtype = dtype or od_config.dtype
+    with init_on_device_without_buffers("meta"):
+        model = auto_cls.from_config(hf_config)
+    recursive_replace_linear(model, od_config)
+    init_parameters(model, dtype=dtype, device=device)
+    return model

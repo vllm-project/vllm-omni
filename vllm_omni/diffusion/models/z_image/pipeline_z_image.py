@@ -29,7 +29,6 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from vllm.model_executor.models.transformers.utils import init_on_device_without_buffers
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -43,7 +42,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
-from vllm_omni.diffusion.models.utils import recursive_replace_linear, init_parameters
+from vllm_omni.diffusion.models.utils import create_transformers_model
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -179,10 +178,12 @@ class ZImagePipeline(nn.Module):
         text_encoder_config = AutoConfig.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
-        with init_on_device_without_buffers("meta"):
-            self.text_encoder = AutoModelForCausalLM.from_config(text_encoder_config)
-        recursive_replace_linear(self.text_encoder, od_config)
-        init_parameters(self.text_encoder, dtype=od_config.dtype, device=self._execution_device)
+        self.text_encoder = create_transformers_model(
+            AutoModelForCausalLM,
+            od_config,
+            hf_config=text_encoder_config,
+            device=self._execution_device,
+        )
         if text_encoder_config.tie_word_embeddings:
             self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
