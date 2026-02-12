@@ -1,14 +1,16 @@
 # Stage config for running Qwen3-Omni-MoE with 3-stage architecture
 # Stage 0: Thinker (multimodal understanding + text generation)
-# Stage 1: Talker (text embeddings → 16-layer RVQ codec codes)
+# Stage 1: Talker (text embeddings → 8-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
 
 # The following config has been verified on 2x H100-80G GPUs.
+async_chunk: false
 stage_args:
   - stage_id: 0
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "0"
-      max_batch_size: 1
+      max_batch_size: 64
     engine_args:
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -20,9 +22,9 @@ stage_args:
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
+      max_num_batched_tokens: 32768
       hf_config_name: thinker_config
       tensor_parallel_size: 1
-      load_format: dummy
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -30,29 +32,29 @@ stage_args:
       temperature: 0.4
       top_p: 0.9
       top_k: 1
-      max_tokens: 100
+      max_tokens: 2048
       seed: 42
       detokenize: True
       repetition_penalty: 1.05
 
   - stage_id: 1
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
-       devices: "1"
-       max_batch_size: 1
+      devices: "1"
+      max_batch_size: 64
     engine_args:
-       model_stage: talker
-       model_arch: Qwen3OmniMoeForConditionalGeneration
-       worker_type: ar
-       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-       gpu_memory_utilization: 0.6
-       enforce_eager: true
-       trust_remote_code: true
-       engine_output_type: latent  # Output codec codes for code2wav
-      #  tensor_parallel_size: 2
-       enable_prefix_caching: false
-       distributed_executor_backend: "mp"
-       hf_config_name: talker_config
-       load_format: dummy
+      model_stage: talker
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+      trust_remote_code: true
+      engine_output_type: latent  # Output codec codes for code2wav
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      distributed_executor_backend: "mp"
+      hf_config_name: talker_config
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
@@ -60,16 +62,17 @@ stage_args:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      max_tokens: 100
+      max_tokens: 4096
       seed: 42
       detokenize: False
       repetition_penalty: 1.05
       stop_token_ids: [2150]
 
   - stage_id: 2
+    stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "1"
-      max_batch_size: 1
+      max_batch_size: 64
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -77,14 +80,13 @@ stage_args:
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
+      async_scheduling: false
       enable_prefix_caching: false
       engine_output_type: audio  # Final output: audio waveform
       gpu_memory_utilization: 0.1
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 1000000
       hf_config_name: thinker_config
-      load_format: dummy
-      async_scheduling: false
     engine_input_source: [1]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
     final_output: true
@@ -93,7 +95,7 @@ stage_args:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 200
+      max_tokens: 65536
       seed: 42
       detokenize: True
       repetition_penalty: 1.1

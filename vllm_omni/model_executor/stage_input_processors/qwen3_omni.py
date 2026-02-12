@@ -84,7 +84,7 @@ def _validate_stage_inputs(stage_list, engine_input_source):
 
 
 def thinker2talker_async_chunk(
-    connector: Any,
+    transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
 ) -> list[dict[str, Any]]:
@@ -96,7 +96,7 @@ def thinker2talker_async_chunk(
     """
 
     request_id = request.external_req_id
-    chunk_id = connector.put_requests[request_id]
+    chunk_id = transfer_manager.put_req_chunk[request_id]
     if chunk_id == 0:
         all_token_ids = request.all_token_ids  # prefill + decode
         prompt_token_ids = request.prompt_token_ids
@@ -114,12 +114,12 @@ def thinker2talker_async_chunk(
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
             "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
         }
-        if connector.request_payload.get(request_id) is None:
+        if transfer_manager.request_payload.get(request_id) is None:
             if not request.is_finished():
-                connector.request_payload[request_id] = talker_additional_info
+                transfer_manager.request_payload[request_id] = talker_additional_info
                 return None
         else:
-            save_payload = connector.request_payload.pop(request_id)
+            save_payload = transfer_manager.request_payload.pop(request_id)
             talker_additional_info["thinker_embeddings"] = torch.cat(
                 (save_payload.get("thinker_embeddings"), talker_additional_info.get("thinker_embeddings")), dim=0
             )
@@ -206,7 +206,7 @@ def thinker2talker(
 
 
 def talker2code2wav_async_chunk(
-    connector: Any,
+    transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
 ):
@@ -241,8 +241,8 @@ def talker2code2wav_async_chunk(
 
     request_id = request.external_req_id
     chunk_size = left_context_size = 25
-    connector.code_prompt_token_ids[request_id].append(codec_codes)
-    length = len(connector.code_prompt_token_ids[request_id])
+    transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+    length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size
     if chunk_length != 0 and not request.is_finished():
         return None
@@ -252,7 +252,10 @@ def talker2code2wav_async_chunk(
 
     info = {
         "code_predictor_codes": (
-            torch.tensor(connector.code_prompt_token_ids[request_id][-end_index:]).transpose(0, 1).reshape(-1).tolist()
+            torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:])
+            .transpose(0, 1)
+            .reshape(-1)
+            .tolist()
         ),
         "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
     }

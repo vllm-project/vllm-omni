@@ -45,6 +45,7 @@ class OmniModelConfig(ModelConfig):
             (default: "thinker")
         model_arch: Model architecture name
             (default: "Qwen2_5OmniForConditionalGeneration")
+        worker_type: Model Type, e.g., "ar" or "generation"
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
             "audio", "latents"). If None, output type is inferred.
@@ -63,6 +64,7 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
+    worker_type: str | None = None
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None

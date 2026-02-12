@@ -27,7 +27,7 @@ cd examples/online_serving/qwen2_5_omni
 #### Send request via python
 
 ```bash
-python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities
+python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities --port 8091 --host "localhost"
 ```
 
 The Python client supports the following command-line arguments:

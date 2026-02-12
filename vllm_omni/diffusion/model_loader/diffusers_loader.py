@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import file_exists
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -229,13 +230,22 @@ class DiffusersPipelineLoader:
             allow_patterns_overrides=None,
         )
 
-    def load_model(self, od_config: OmniDiffusionConfig, load_device: str) -> nn.Module:
+    def load_model(
+        self,
+        od_config: OmniDiffusionConfig,
+        load_device: str,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> nn.Module:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             with target_device:
-                model = initialize_model(od_config)
-
+                if load_format == "default":
+                    model = initialize_model(od_config)
+                elif load_format == "custom_pipeline":
+                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                    model = model_cls(od_config=od_config)
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model)

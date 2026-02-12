@@ -4,7 +4,6 @@
 import fcntl
 import os
 import time
-from collections import defaultdict
 from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
@@ -25,14 +24,6 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
         self.device = config.get("device", "cuda:0")
-        self.put_requests: dict[str, int] = defaultdict(int)
-        self.get_requests: dict[str, int] = defaultdict(int)
-        self.finished_requests: set[str] = set()
-        self.request_payload = {}
-        self.request_prompt_token_ids: dict[str, list[int]] = defaultdict(list)
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
-        self.request_ids_mapping: dict[str, str] = {}
-        # Default threshold matches legacy behavior (64KB)
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
         self._metrics = {
             "puts": 0,

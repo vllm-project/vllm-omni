@@ -17,7 +17,7 @@ stage_args:
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.9
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"
@@ -48,7 +48,7 @@ stage_args:
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.6
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       engine_output_type: latent  # Output codec codes for code2wav
       enable_prefix_caching: false
@@ -72,7 +72,7 @@ stage_args:
     stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "1"
-      max_batch_size: 1
+      max_batch_size: 64
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
