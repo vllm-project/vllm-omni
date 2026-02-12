@@ -436,7 +436,7 @@ def apply_offload_hooks(
         )
     # For now, model-wise and layer-wise (block-wise) offloading
     # are functioning as expected when cuda device is available
-    ihas_accel = (
+    has_accel = (
         current_omni_platform.is_cuda()
         or current_omni_platform.is_npu()
     )
