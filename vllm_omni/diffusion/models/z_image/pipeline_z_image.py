@@ -182,6 +182,7 @@ class ZImagePipeline(nn.Module):
             AutoModelForCausalLM,
             od_config,
             hf_config=text_encoder_config,
+            device=torch.get_default_device(),
         )
         if text_encoder_config.tie_word_embeddings:
             self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
