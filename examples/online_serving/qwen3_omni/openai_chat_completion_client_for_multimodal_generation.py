@@ -8,16 +8,6 @@ from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-# Modify OpenAI's API key and API base to use vLLM's API server.
-openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8091/v1"
-
-client = OpenAI(
-    # defaults to os.environ.get("OPENAI_API_KEY")
-    api_key=openai_api_key,
-    base_url=openai_api_base,
-)
-
 SEED = 42
 
 
@@ -342,7 +332,7 @@ query_map = {
 }
 
 
-def run_multimodal_generation(args) -> None:
+def run_multimodal_generation(args, client: OpenAI) -> None:
     model_name = args.model
     thinker_sampling_params = {
         "temperature": 0.4,  # Deterministic
@@ -544,10 +534,28 @@ def parse_args():
         default=1,
         help="Number of concurrent requests to send. Default is 1.",
     )
-
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8091,
+        help="Port of the vLLM Omni API server.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host/IP of the vLLM Omni API server.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_multimodal_generation(args)
+    host = args.host
+    port = args.port
+    openai_api_base = f"http://{host}:{port}/v1"
+    client = OpenAI(
+        api_key="EMPTY",
+        base_url=openai_api_base,
+    )
+    run_multimodal_generation(args, client)
