@@ -1326,12 +1326,8 @@ class Bagel(nn.Module):
         timesteps = timesteps[:-1]
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
-            timestep = torch.tensor(
-                [t] * x_t.shape[0], device=x_t.device
-            )
-            if (
-                t > cfg_interval[0] and t <= cfg_interval[1]
-            ):
+            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
                 cfg_img_scale_ = cfg_img_scale
             else:
