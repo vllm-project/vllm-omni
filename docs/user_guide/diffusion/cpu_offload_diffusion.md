@@ -1,101 +1,143 @@
-# CPU Offloading for Diffusion Model
+# CPU Offloading for Diffusion Models
 
 ## Overview
 
-vLLM-Omni provides two offloading strategies to reduce GPU memory usage for diffusion models, allowing you to run larger models on GPUs with limited VRAM:
+vLLM-Omni provides two offloading strategies to reduce GPU memory usage for diffusion models:
 
-1. **Model-level (Component) Offloading**: Swaps entire model components (DiT transformer, VAE, encoders) between GPU and CPU.
-2. **Layerwise (Blockwise) Offloading**: Keeps only a single or a few transformer blocks on GPU at a time, with compute - memory copy overlap.
+1. **Model-level (Sequential) Offloading**: Mutual exclusion between DiT model and encoder - only one is on GPU at a time.
+2. **Layerwise (Blockwise) Offloading**: Keeps only one transformer block on GPU at a time with compute-memory overlap.
 
-Both approaches use pinned memory for faster CPU-GPU transfers. For now, the two offloading strategies could not be used at the same time.
+Both strategies use pinned memory for faster CPU-GPU transfers. The strategies are **mutually exclusive** for now - if both are enabled, layerwise takes priority.
 
 
-## Model-level CPU Offloading
+## Model-level (Sequential) Offloading
 
-### Implementation
+### How It Works
 
-CPU offload lets the diffusion worker move large model components between GPU and CPU memory on demand. It keeps the DiT transformer resident on GPU only while it is actively running, and swaps it out when encoders modules need the device. This reduces peak VRAM usage so bigger checkpoints run on smaller GPUs, or multiple requests can share the same GPU.
+Model-level offloading implements mutual exclusion between DiT transformer and encoder modules using pre forward hooks:
 
-**Execution Flow**:
-1. Text encoders run on GPU while the DiT transformer is offloaded to CPU.
-2. Before denoising, weights are prefetched back to GPU, honoring pinned-memory copies for speed.
-3. After the diffusion step, the transformer returns to CPU and the process repeats as needed.
+- **When encoders run**: DiT transformer is offloaded to CPU
+- **When DiT runs**: Encoders are offloaded to CPU
+- **VAE**: Stays resident on GPU
 
-Transfers use pinned host buffers, and the worker coordinates swaps via mutex-style hooks so components never compete for memory.
+Before each module's forward pass, the hook automatically moves it to GPU while offloading the other module group to CPU. Transfers use pinned memory for speed.
 
-### Configuration
-You can enable CPU offload in two ways:
+### Usage
 
-1. **Python API**: set `enable_cpu_offload=True`.
-
+**Python API:**
 ```python
 from vllm_omni import Omni
 
-if __name__ == "__main__":
-
-    m = Omni(model="Qwen/Qwen-Image",enable_cpu_offload=True)
+m = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers", enable_cpu_offload=True)
 ```
 
-2. **CLI**: pass `--enable-cpu-offload` to the diffusion service entrypoint.
+**CLI:**
+```bash
+vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-cpu-offload
+```
 
 ### Limitations
-- Cold start latency increases for over one minute for some models(e.g., Qwen-Image)
+- Cold start latency increases
+- Adds overhead from CPU-GPU transfers between encoder and denoising phases
+- Support single GPU only for now
 
 
 ## Layerwise (Blockwise) Offloading
 
-### Implementation
-Layerwise offload operates at transformer block granularity, keeping a single transformer block, or a specified number of blocks, on GPU while others stay in CPU memory.
+### How It Works
 
-Unlike full model-wise CPU offload which swaps entire components like DiT and encoders, layerwise offloading applies a sliding window way of loading and offloading weights between gpu and cpu: while block `i` computes, block `i+1` get prefetched asynchronously via pinned memory. In this way, only partial blocks(s) reside on GPU at any moment during inference, so that greatly decrease the memory occupancy.
+Layerwise offloading keeps only one transformer block on GPU at a time.
 
-**Execution Flow**:
+As each block completes, the next block is prefetched to GPU while the current block is freed. The pre and forward hooks utilized by layerwise offloading apply a separate CUDA stream (`copy_stream`) to overlap weight transfer with computation, and retain flattened tensors in pinned CPU memory for block parameters re-materialization. Encoders, VAE, and non-block DiT modules (embeddings, norms) always stay on GPU.
 
-1. During model initialization, all components are loaded to CPU first. Then components other than DiT model(s) in the pipeline, such as VAE and encoders, are moved to GPU. The weights of target transformer blocks are collected as contiguous tensors per layer on CPU with pinned memory; and non-block modules (embeddings, norms, etc) in the DiT model are moved to and stay on GPU.
-2. The first block(s) are transferred to GPU during initialization of `LayerwiseOffloader`, before the first denoising step of the very first request.
-3. As each block executes, the next block prefetches on a separate CUDA stream for compute - memory copy overlap. After execution, the current block is immediately freed from GPU memory.
-4. When the last block completes, the first block prefetches for the next denoising step.
+**Execution Flow:**
 
+| Block | Pre-forward Hook | Forward | Post-forward Hook |
+|-------|------------------|---------|-------------------|
+| block-0 | Prefetch block-1 (async) | Compute block-0 | Free block-0 |
+| block-1 | Prefetch block-2 (async) | Compute block-1 | Free block-1 |
+| ... | ... | ... | ... |
+| block-(n-1) | **Prefetch block-0** (async) | Compute block-(n-1) | Free block-(n-1) |
 
-Example of hook executions of a DiT model with n layers, by default keep a single layer on GPU:
-| Layer (block) idx | forward pre-hook               | forward          | forward post-hook         |
-|-------------------|--------------------------------|------------------|---------------------------|
-| layer-0           | prefetch layer 1 (copy stream) | compute layer 0  | free layer-0 gpu weights  |
-| layer-1           | prefetch layer 2 (copy stream) | compute layer 1  | free layer-1 gpu weights  |
-| layer-2           | prefetch layer 3 (copy stream) | compute layer 2  | free layer-2 gpu weights  |
-| ...               | ...                            | ...              | ...                       |
-| layer-(n-1)       | **prefetch layer 0 (copy stream)** | compute layer (n-1) | free layer (n-1) gpu weights  |
+Each transformer block has a `LayerwiseOffloadHook` that prefetches the next block before forward and frees the current block after forward.
 
+Layerwise offloading is primarily recommended for large **video generation models** where the compute cost per block is high enough to effectively overlap with memory prefetch operations. For example, Wan2.2 T2V and I2V pipelines.
 
-### Configuration
+### Usage
 
-1. **Python API**: set `enable_layerwise_offload=True` and optionally `layerwise_num_gpu_layers`.
-
+**Python API:**
 ```python
 from vllm_omni import Omni
 
-if __name__ == "__main__":
-    m = Omni(
-        model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        enable_layerwise_offload=True,
-        ...
-    )
+# Text-to-video
+m = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers", enable_layerwise_offload=True)
+
+# Or image-to-video
+m = Omni(model="Wan-AI/Wan2.2-I2V-A14B-Diffusers", enable_layerwise_offload=True)
 ```
 
-2. **CLI**: pass `--enable-layerwise-offload` and `--layerwise-num-gpu-layers` to the diffusion service entrypoint.
+**CLI:**
+```bash
+# Text-to-video
+vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-layerwise-offload
 
-### Supported Models
+# Or image-to-video
+vllm-omni serve diffusion Wan-AI/Wan2.2-I2V-A14B-Diffusers --enable-layerwise-offload
+```
 
-| Architecture | Models | Example HF Models | DiT Model Cls | Blocks Attr Name |
-|--------------|--------|-------------------|----------|----------|
-| `QwenImagePipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | "transformer_blocks" |
-| `Wan22Pipeline` | Wan2.2 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | "blocks" |
+### To Support a Model
 
-NOTE: Models must define `_layerwise_offload_blocks_attr` class attribute so that the layerwise offloader finds the target transformer blocks.
+Models must define the blocks attribute name for layerwise offloading:
+
+```python
+class WanTransformer3DModel(nn.Module):
+    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+
+    def __init__(self):
+        self.blocks = nn.ModuleList([...])  # Transformer blocks
+```
 
 ### Limitations
 - Cold start latency increases because of
-    1) components are loaded to CPU first at the very first during initialization,  
+    1) components are loaded to CPU first at the very first during initialization,
     2) weight consolidation and pinning
-- Performance depends on CPU <-> GPU interconnection (e.g., PCIe bandwidth).
+- Performance depends on compute cost and H2D bandwidth as well
 - Support single GPU only for now
+
+
+### Implementation Notes
+
+**Module Discovery**
+
+The offloader automatically discovers pipeline components:
+
+- **DiT modules**: `transformer`, `transformer_2`, `dit`
+- **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
+- **VAE**: `vae`
+
+**Hook System**
+
+Both strategies use vLLM-Omni's hook registry system (`HookRegistry` and `ModelHook`) to register pre/post forward callbacks on modules, enabling automatic swapping without modifying model code.
+
+**Backend Architecture**
+
+```
+OffloadBackend (base class)
+├── ModelLevelOffloadBackend → uses SequentialOffloadHook
+└── LayerWiseOffloadBackend → uses LayerwiseOffloadHook
+```
+
+Factory function `get_offload_backend()` selects the appropriate backend based on configuration.
+
+
+## Supported Models
+
+| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attr (Layerwise specific) |
+|--------------|----------------|-----------|---------------------|-------------------|-------------|
+| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | `"transformer_blocks"` |
+
+**Notes:**
+- Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
+- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attr` pointing to transformer blocks
