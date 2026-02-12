@@ -81,7 +81,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
             torch_dtype=torch.bfloat16,
             **attn_kwargs,
         )
-        self.task_type = model_path.split("-")[-1].strip("/")
+        self.task_type = model_path.split("-")[-1].split("/")[0]
         # Mark that this model produces multimodal outputs
         self.have_multimodal_outputs = True
 

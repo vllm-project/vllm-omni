@@ -188,8 +188,8 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Qwen/Qwen-Image \
     --prompt "a cup of coffee on the table" \
-    --cache_backend cache_dit \
-    --num_inference_steps 50
+    --cache-backend cache_dit \
+    --num-inference-steps 50
 ```
 
 

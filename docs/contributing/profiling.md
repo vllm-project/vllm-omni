@@ -106,7 +106,7 @@ python image_to_video.py \
     #    Reducing frames to the absolute minimum (2) keeps the
     #    tensor size small, ensuring the trace file doesn't become
     #    multi-gigabytes in size.
-    --num_frames 2 \
+    --num-frames 2 \
     \
     # Minimize Iteration Loop (Steps):
     #    This is the most critical setting for profiling.
@@ -114,12 +114,12 @@ python image_to_video.py \
     #    Profiling 2 steps gives you the exact same performance
     #    data as 50 steps, but saves minutes of runtime and
     #    prevents the trace viewer from freezing.
-    --num_inference_steps 2 \
+    --num-inference-steps 2 \
     \
-    --guidance_scale 5.0 \
-    --guidance_scale_high 6.0 \
-    --boundary_ratio 0.875 \
-    --flow_shift 12.0 \
+    --guidance-scale 5.0 \
+    --guidance-scale-high 6.0 \
+    --boundary-ratio 0.875 \
+    --flow-shift 12.0 \
     --fps 16 \
     --output i2v_output.mp4
 

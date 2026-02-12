@@ -679,7 +679,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
-        final_metrics: dict[str, Any] | None = None
+        last_metrics: dict[str, Any] | None = None
         try:
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
@@ -689,7 +689,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     continue
 
                 if omni_res.metrics:
-                    final_metrics = omni_res.metrics
+                    last_metrics = omni_res.metrics
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1227,7 +1228,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices=[choice_data],
                             model=model_name,
                             modality=final_output_type,
-                            metrics=final_metrics,
+                            metrics=omni_res.metrics,
                         )
 
                         # handle usage stats if requested & if continuous
@@ -1284,7 +1285,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     choices=[],
                     model=model_name,
                     usage=final_usage,
-                    metrics=final_metrics,
+                    metrics=last_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_unset=True, exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
