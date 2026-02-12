@@ -763,6 +763,37 @@ omni = Omni(model="your-model",
 )
 ```
 
+### CPU Offload
+
+See detailed guide: [CPU Offloading for Diffusion Models](../../user_guide/diffusion/cpu_offload_diffusion.md)
+
+vLLM-Omni provides two offloading strategies to reduce GPU memory usage:
+
+1. **Model-level offload**: Mutual exclusion between DiT and encoders (only one on GPU at a time)
+2. **Layerwise (Blockwise) offload**: Keeps only a single transformer block on GPU at a time with compute-memory overlap
+
+**Usage:** Enable offload when initializing:
+```python
+# Model-level offload
+omni = Omni(model="your-model", enable_cpu_offload=True)
+
+# Layerwise offload
+omni = Omni(model="your-model", enable_layerwise_offload=True)
+```
+
+**To support layerwise offloading:** Define the blocks attribute name in your transformer:
+
+```python
+class WanTransformer3DModel(nn.Module):
+    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+
+    def __init__(self):
+        self.blocks = nn.ModuleList([...])  # Transformer blocks
+```
+
+**Note:** Layerwise offloading is primarily recommended for large **video generation models** where the compute cost per block is high enough to effectively overlap with memory prefetch operations.
+
+
 ---
 
 ## Troubleshooting

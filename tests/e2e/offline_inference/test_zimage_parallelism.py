@@ -154,7 +154,7 @@ def _run_zimage_generate(
         cleanup_dist_env_and_memory()
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})

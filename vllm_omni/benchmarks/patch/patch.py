@@ -71,6 +71,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    text_latency: float = 0.0
 
 
 async def async_request_openai_chat_omni_completions(
@@ -148,6 +149,7 @@ async def async_request_openai_chat_omni_completions(
                                         output.itl.append(timestamp - most_recent_timestamp)
                                     generated_text += content or ""
                                     most_recent_timestamp = timestamp
+                                    output.text_latency = timestamp - st
                                 elif modality == "audio":
                                     if output.audio_ttfp == 0.0:
                                         output.audio_ttfp = timestamp - st
@@ -161,8 +163,8 @@ async def async_request_openai_chat_omni_completions(
                                             else:
                                                 generated_audio = generated_audio + seg
 
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
+                            if metrics := data.get("metrics"):
+                                output.output_tokens = metrics.get("num_tokens_out", 0)
 
                 output.latency = timestamp - st
                 output.generated_text = generated_text
