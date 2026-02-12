@@ -33,7 +33,7 @@ cd examples/online_serving/qwen3_omni
 ####  Send request via python
 
 ```bash
-python openai_chat_completion_client_for_multimodal_generation.py --query-type use_image
+python openai_chat_completion_client_for_multimodal_generation.py --query-type use_image --port 8091 --host "localhost"
 ```
 
 The Python client supports the following command-line arguments:
