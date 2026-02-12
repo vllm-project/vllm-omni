@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
 class SequentialOffloader:
     """Sequential offloader: DiT and encoders take turns on GPU.
 
@@ -65,7 +66,7 @@ class SequentialOffloader:
         previous_device = param.device
         module.to("cpu", non_blocking=True)
 
-        # Release allocator blocks when tensors leave the GPU.
+        # Release allocator blocks when tensors leave the accelerator device.
         if previous_device.type != "cpu":
             if previous_device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -145,7 +146,7 @@ class LayerwiseOffloader:
         blocks: list[nn.Module],
         device: torch.device,
         pin_memory: bool = True,
-        num_device_layers: int = 1,
+        num_gpu_layers: int = 1,
     ):
         assert all(isinstance(m, nn.Module) for m in blocks), "All transformer blocks must be torch.nn.Module"
         assert current_omni_platform.is_cuda() or current_omni_platform.is_npu(), (
@@ -350,7 +351,7 @@ class LayerwiseOffloader:
             return
 
         evt = self._prefetch_done[layer_idx]
-        if evt is not None:
+        if self._use_cuda_streams and evt is not None:
             torch.cuda.current_stream().wait_event(evt)
 
         # free GPU residency
@@ -435,11 +436,9 @@ def apply_offload_hooks(
             "Automatically disabled model-wise offloading."
         )
     # For now, model-wise and layer-wise (block-wise) offloading
-    # are functioning as expected when cuda device is available
-    has_accel = (
-        current_omni_platform.is_cuda()
-        or current_omni_platform.is_npu()
-    )
+    # are functioning as expected when accelerator devices are available
+    has_accel = current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+
     if not has_accel or current_omni_platform.get_device_count() < 1:
         logger.info("CPU Offloading requires accelerator devices available. Skipping for now...")
         return
