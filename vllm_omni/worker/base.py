@@ -9,8 +9,10 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
+from vllm_omni.entrypoints.utils import detect_pid_host
 from vllm_omni.worker.gpu_memory_utils import (
     get_process_gpu_memory,
+    is_process_scoped_memory_available,
 )
 
 logger = init_logger(__name__)
@@ -59,7 +61,11 @@ class OmniGPUWorkerBase(GPUWorker):
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
 
-        process_memory = get_process_gpu_memory(self.local_rank)
+        process_memory = (
+            get_process_gpu_memory(self.local_rank)
+            if is_process_scoped_memory_available() and detect_pid_host()
+            else None
+        )
 
         if process_memory is not None:
             # NVML available: use per-process memory
