@@ -30,8 +30,8 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
-from vllm.vllm_flash_attn import flash_attn_varlen_func
 
+from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 
