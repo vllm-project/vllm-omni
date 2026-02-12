@@ -77,6 +77,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         mp.set_start_method("spawn", force=True)
         processes = []
 
+        # Extract worker_extension_cls and custom_pipeline_args from od_config
+        worker_extension_cls = od_config.worker_extension_cls
+        custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
+
         # Launch all worker processes
         scheduler_pipe_readers = []
         scheduler_pipe_writers = []
@@ -91,6 +95,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     od_config,
                     writer,
                     broadcast_handle,
+                    worker_extension_cls,
+                    custom_pipeline_args,
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,

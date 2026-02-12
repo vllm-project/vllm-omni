@@ -163,6 +163,8 @@ class AsyncOmni(OmniBase):
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
+                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """
 Diffusion Worker for vLLM-Omni.
 
@@ -7,15 +8,19 @@ Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
 
+import gc
 import multiprocessing as mp
 import os
+from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 import torch
 import zmq
 from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -67,6 +72,15 @@ class DiffusionWorker:
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
+        # Create model runner
+        self.model_runner = DiffusionModelRunner(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
+        )
+        self.load_model(load_format=self.od_config.diffusion_load_format)
+        self.init_lora_manager()
+        logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
@@ -110,16 +124,22 @@ class DiffusionWorker:
             )
             init_workspace_manager(self.device)
 
-            # Create model runner and load model
-            self.model_runner = DiffusionModelRunner(
-                vllm_config=self.vllm_config,
-                od_config=self.od_config,
-                device=self.device,
-            )
+    def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
+        """Load the diffusion model using DiffusionModelRunner."""
+        with (
+            set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
+            set_current_vllm_config(self.vllm_config),
+        ):
             self.model_runner.load_model(
                 memory_pool_context_fn=self._maybe_get_memory_pool_context,
+                load_format=load_format,
+                custom_pipeline_name=custom_pipeline_name,
             )
-        assert self.model_runner.pipeline is not None
+
+    def init_lora_manager(self) -> None:
+        """Initialize the LoRA manager for this worker."""
+        if self.model_runner.pipeline is None:
+            return
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.model_runner.pipeline,
             device=self.device,
@@ -128,7 +148,6 @@ class DiffusionWorker:
             lora_path=self.od_config.lora_path,
             lora_scale=self.od_config.lora_scale,
         )
-        logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def generate(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Generate output for the given requests."""
@@ -247,6 +266,32 @@ class DiffusionWorker:
         destroy_distributed_env()
 
 
+class CustomPipelineWorkerExtension:
+    def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]) -> None:
+        """
+        Re-initialize the pipeline with custom arguments.
+
+        Args:
+            custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
+        """
+
+        # Clean up old pipeline
+        if self.model_runner.pipeline is not None:
+            del self.model_runner.pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Get custom pipeline class name
+        custom_pipeline_name = custom_pipeline_args["pipeline_class"]
+
+        # Use the DiffusionWorker's load_model method which handles the forward context
+        self.load_model(
+            load_format="custom_pipeline",
+            custom_pipeline_name=custom_pipeline_name,
+        )
+        self.init_lora_manager()
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -255,8 +300,11 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
+        worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
+        self.gpu_id = gpu_id
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
@@ -274,17 +322,26 @@ class WorkerProc:
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
-        self.worker = self._create_worker(gpu_id, od_config)
-        self.gpu_id = gpu_id
+
+        # Create worker using WorkerWrapperBase for extension support
+        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> DiffusionWorker:
+    def _create_worker(
+        self,
+        gpu_id: int,
+        od_config: OmniDiffusionConfig,
+        worker_extension_cls: str | None,
+        custom_pipeline_args: dict[str, Any] | None = None,
+    ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
-        return DiffusionWorker(
-            local_rank=gpu_id,
-            rank=gpu_id,
+        wrapper = WorkerWrapperBase(
+            gpu_id=gpu_id,
             od_config=od_config,
+            worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
         )
+        return wrapper
 
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
@@ -310,11 +367,8 @@ class WorkerProc:
             return None, False
 
         try:
-            if isinstance(method, str):
-                func = getattr(self.worker, method)
-                result = func(*args, **kwargs)
-            else:
-                result = method(self.worker, *args, **kwargs)
+            # Use execute_method from WorkerWrapperBase for consistent method resolution
+            result = self.worker.execute_method(method, *args, **kwargs)
             return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
@@ -385,6 +439,8 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
@@ -394,6 +450,8 @@ class WorkerProc:
             od_config,
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
+            worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
@@ -404,3 +462,201 @@ class WorkerProc:
         )
         worker_proc.worker_busy_loop()
         logger.info(f"Worker {rank}: Shutdown complete.")
+
+
+class WorkerWrapperBase:
+    """
+    Wrapper base class that creates DiffusionWorker with optional worker_extension_cls support.
+    This enables dynamic inheritance for DiffusionWorker to extend with custom functionality.
+    """
+
+    def __init__(
+        self,
+        gpu_id: int,
+        od_config: OmniDiffusionConfig,
+        base_worker_class: type = DiffusionWorker,
+        worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
+    ):
+        """
+        Initialize WorkerWrapperBase with support for worker extensions.
+
+        Args:
+            gpu_id: GPU device ID
+            od_config: OmniDiffusionConfig configuration
+            worker_extension_cls: Optional qualified name of worker extension class
+            custom_pipeline_args: Optional arguments for custom pipeline initialization
+        """
+        self.gpu_id = gpu_id
+        self.od_config = od_config
+        self.base_worker_class = base_worker_class
+        self.worker_extension_cls = worker_extension_cls
+        self.custom_pipeline_args = custom_pipeline_args
+
+        # Prepare worker class with extension support
+        worker_class = self._prepare_worker_class()
+
+        # Create the actual worker instance
+        self.worker = worker_class(
+            local_rank=gpu_id,
+            rank=gpu_id,
+            od_config=od_config,
+        )
+
+        # Re-initialize pipeline with custom pipeline if provided
+        if self.custom_pipeline_args is not None:
+            self.worker.re_init_pipeline(self.custom_pipeline_args)
+
+    def _prepare_worker_class(self) -> type:
+        """
+        Prepare the worker class with optional extension.
+        Dynamically extends GPUWorker with worker_extension_cls if provided.
+
+        Returns:
+            The worker class (potentially extended)
+        """
+        worker_class = self.base_worker_class
+
+        # If custom_pipeline_args is provided, use CustomPipelineWorkerExtension
+        if self.custom_pipeline_args is not None:
+            # Set worker_extension_cls to CustomPipelineWorkerExtension if not already set
+            if self.worker_extension_cls is None:
+                self.worker_extension_cls = CustomPipelineWorkerExtension
+
+        if self.worker_extension_cls:
+            if isinstance(self.worker_extension_cls, str):
+                worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
+            else:
+                worker_extension_cls = self.worker_extension_cls
+            extended_calls = []
+
+            if worker_extension_cls not in worker_class.__bases__:
+                # Check for conflicts between worker and extension
+                for attr in dir(worker_extension_cls):
+                    if attr.startswith("__"):
+                        continue
+                    if hasattr(worker_class, attr):
+                        logger.warning(
+                            f"Worker class {worker_class} already has attribute "
+                            f"{attr}, which may conflict with worker extension "
+                            f"class {worker_extension_cls}."
+                        )
+                    if callable(getattr(worker_extension_cls, attr)):
+                        extended_calls.append(attr)
+
+                # Dynamically inherit the worker extension class
+                class_name = f"{worker_class.__name__}With{worker_extension_cls.__name__}"
+                worker_class = type(class_name, (worker_extension_cls, worker_class), {})
+                logger.info(
+                    "Created extended worker class %s from %s for extended calls %s",
+                    class_name,
+                    worker_extension_cls,
+                    extended_calls,
+                )
+
+        return worker_class
+
+    def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+        """
+        Generate output for the given requests.
+
+        Args:
+            requests: List of diffusion requests
+
+        Returns:
+            DiffusionOutput with generated results
+        """
+        return self.worker.generate(requests)
+
+    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+        """
+        Execute a forward pass.
+
+        Args:
+            reqs: List of diffusion requests
+            od_config: OmniDiffusionConfig configuration
+
+        Returns:
+            DiffusionOutput with generated results
+        """
+        return self.worker.execute_model(reqs, od_config)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """
+        Load model weights.
+
+        Args:
+            weights: Iterable of (name, tensor) tuples
+
+        Returns:
+            Set of loaded weight names
+        """
+        return self.worker.load_weights(weights)
+
+    def sleep(self, level: int = 1) -> bool:
+        """
+        Put the worker to sleep. The worker should not process any requests.
+        The caller should guarantee that no requests are being processed
+        during the sleep period, before `wake_up` is called.
+
+        Args:
+            level: The sleep level. Level 1 sleep will offload the model
+                weights and discard the kv cache.
+                Currently only support level 1.
+
+        Returns:
+            True on success
+        """
+        return self.worker.sleep(level)
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        """
+        Wake up the worker from sleep mode. See the sleep function
+        method for more details.
+
+        Args:
+            tags: An optional list of tags to reallocate the worker memory
+                for specific memory allocations. Values must be in
+                `("weights")`. If None, all memory is reallocated.
+                wake_up should be called with all tags (or None) before the
+                worker is used again.
+
+        Returns:
+            True on success
+        """
+        return self.worker.wake_up(tags)
+
+    def shutdown(self) -> None:
+        """Shutdown the worker and cleanup resources."""
+        return self.worker.shutdown()
+
+    def execute_method(self, method: str | bytes, *args, **kwargs) -> Any:
+        """
+        Execute a method on the worker.
+
+        Args:
+            method: Method name (str) or serialized callable (bytes)
+
+        Returns:
+            Result of the method execution (type depends on the method)
+
+        Raises:
+            Exception: If method execution fails
+        """
+        try:
+            # Method resolution order:
+            # 1. If method is defined in this class, it will be called directly
+            # 2. Otherwise, since we define `__getattr__` and redirect attribute
+            #    query to `self.worker`, the method will be called on the worker
+            assert isinstance(method, str), "Method must be str"
+            func = getattr(self.worker, method)
+            return func(*args, **kwargs)
+
+        except Exception as e:
+            msg = f"Error executing method {method!r}. This might cause issues in distributed execution."
+            logger.exception(msg)
+            raise e
+
+    def __getattr__(self, attr: str):
+        """Delegate attribute access to the wrapped worker."""
+        return getattr(self.worker, attr)
