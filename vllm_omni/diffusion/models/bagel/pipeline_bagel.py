@@ -20,7 +20,7 @@ from PIL import Image
 from torch import nn
 from transformers import AutoTokenizer, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionModel
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -256,97 +256,6 @@ class BagelPipeline(nn.Module):
 
         self.to(self.device)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".qkv_proj_moe_gen", ".q_proj_moe_gen", "q"),
-            (".qkv_proj_moe_gen", ".k_proj_moe_gen", "k"),
-            (".qkv_proj_moe_gen", ".v_proj_moe_gen", "v"),
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-        ]
-        # Common prefixes that need to be mapped to `bagel.` namespace
-        bagel_prefixes = (
-            "language_model.",
-            "time_embedder.",
-            "latent_pos_embed.",
-            "vae2llm.",
-            "llm2vae.",
-            "vit_model.",
-            "vision_model.",
-            "connector.",
-            "vit_pos_embed.",
-        )
-
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            # Generate Candidate Names
-            candidates = []
-
-            # Direct match
-            candidates.append(name)
-
-            # Bagel Prefix match
-            if name.startswith(bagel_prefixes):
-                candidates.append("bagel." + name)
-
-            # VAE match (from ae.safetensors or unet checkpoints)
-            if name.startswith(("encoder.", "decoder.")):
-                candidates.append("vae." + name)
-
-            # Try loading candidates
-            loaded = False
-            for cand in candidates:
-                # 1. Try QKV Mapping first (most specific)
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if weight_name in cand:
-                        mapped_cand = cand.replace(weight_name, param_name)
-                        param = params_dict.get(mapped_cand)
-                        if param is not None:
-                            getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight, shard_id)
-                            loaded = True
-                            break
-                if loaded:
-                    break
-
-                # 2. Try direct parameter match
-                param = params_dict.get(cand)
-                if param is not None:
-                    # Special handling for resize/reshape
-
-                    # Case A: Latent Pos Embed Resize
-                    if cand.endswith("bagel.latent_pos_embed.pos_embed") and loaded_weight.ndim == 2:
-                        npos, hdim = loaded_weight.shape
-                        if param.shape != loaded_weight.shape:
-                            param.data = param.data.new_empty((npos, hdim))
-                            # Update config
-                            side = isqrt(npos)
-                            self.bagel.max_latent_size = side
-                            if hasattr(self.bagel, "config"):
-                                setattr(self.bagel.config, "max_latent_size", side)
-                            if hasattr(self.bagel.latent_pos_embed, "max_num_patch_per_side"):
-                                self.bagel.latent_pos_embed.max_num_patch_per_side = side
-
-                    # Case B: SigLIP Patch Embedding Reshape
-                    if cand.endswith("embeddings.patch_embedding.weight") and loaded_weight.ndim == 2:
-                        # Checkpoint has (Hidden, C*P*P), model expects (Hidden, C, P, P)
-                        if param.ndim == 4 and loaded_weight.numel() == param.numel():
-                            loaded_weight = loaded_weight.view(param.shape)
-
-                    if param.shape != loaded_weight.shape:
-                        pass
-
-                    getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
-                    loaded = True
-                    break
-
-            if loaded:
-                loaded_params.add(name)
-
-        return loaded_params
-
     @staticmethod
     def _decode_image_from_latent(
         bagel: Bagel, vae: AutoEncoder, latent: torch.Tensor, image_shape: tuple[int, int]
@@ -545,7 +454,6 @@ class BagelPipeline(nn.Module):
             for k, v in generation_input.items():
                 if torch.is_tensor(v):
                     generation_input[k] = v.to(self.device)
-
             with torch.autocast(
                 device_type=self.device.type,
                 enabled=self.device.type != "cpu",
@@ -687,3 +595,130 @@ class BagelPipeline(nn.Module):
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
         return DiffusionOutput(output=img)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        state = self.state_dict()
+        allowed = set(state.keys())
+        shapes = {k: tuple(v.shape) for k, v in state.items()}
+
+        tp_aware_params = {name for name, p in self.named_parameters() if hasattr(p, "weight_loader")}
+
+        # Expand allowed/tp_aware_params with stacked param source names.
+        # QKVParallelLinear merges q_proj+k_proj+v_proj into qkv_proj; the
+        # checkpoint stores the original separate names.  We must recognise
+        # those names so _filtered_weights does not drop them.
+        _stacked_expansions = [
+            (".qkv_proj", ".q_proj"),
+            (".qkv_proj", ".k_proj"),
+            (".qkv_proj", ".v_proj"),
+            (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
+            (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
+            (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+        ]
+        stacked_source_names: set[str] = set()
+        for name in list(allowed):
+            for target_suffix, source_suffix in _stacked_expansions:
+                if target_suffix in name:
+                    stacked_source_names.add(name.replace(target_suffix, source_suffix))
+        allowed.update(stacked_source_names)
+        tp_aware_params.update(stacked_source_names)
+
+        def _normalize_name(name: str) -> str:
+            # Common wrappers/prefixes in checkpoints.
+            for pfx in ("module.", "model."):
+                if name.startswith(pfx):
+                    name = name[len(pfx) :]
+            # Common component renames across repos.
+            if name.startswith("vae_model."):
+                name = "vae." + name[len("vae_model.") :]
+            # Bagel `ae.safetensors` commonly stores AE weights without a top-level prefix.
+            # Map them into this pipeline's `vae.*` namespace.
+            if name.startswith("encoder.") or name.startswith("decoder."):
+                name = "vae." + name
+            return name
+
+        def _iter_candidate_names(name: str) -> Iterable[str]:
+            """Yield candidate parameter names in this pipeline for a checkpoint key.
+
+            The upstream Bagel repo typically stores Bagel-core layers (time_embedder,
+            latent_pos_embed, vae2llm, llm2vae, etc.) at the top-level of the model,
+            while this vllm-omni integration nests them under `self.bagel`.
+            """
+            n = _normalize_name(name)
+            yield n
+
+            # Map Bagel core layers from top-level -> `bagel.*` namespace.
+            for pfx in ("time_embedder.", "latent_pos_embed.", "vae2llm.", "llm2vae."):
+                if n.startswith(pfx):
+                    yield "bagel." + n
+                    break
+
+            # Map connector and vit_pos_embed to `bagel.*`
+            for pfx in ("connector.", "vit_pos_embed."):
+                if n.startswith(pfx):
+                    yield "bagel." + n
+                    break
+
+            if n.startswith("vit_model."):
+                yield "bagel." + n  # matches self.bagel.vit_model
+            elif n.startswith("vision_model."):
+                yield "bagel.vit_model." + n
+            elif n.startswith("model.vision_model."):
+                yield "bagel.vit_model." + n[len("model.") :]
+
+        def _filtered_weights():
+            total = 0
+            kept = 0
+            shape_mismatch = 0
+            for name, tensor in weights:
+                total += 1
+                picked = None
+                for cand in _iter_candidate_names(name):
+                    if cand in allowed:
+                        # Only accept if tensor shape matches target param/buffer shape.
+                        if tuple(tensor.shape) == shapes.get(cand) or cand in tp_aware_params:
+                            picked = cand
+                            break
+                        else:
+                            if cand.endswith("bagel.latent_pos_embed.pos_embed") and tensor.ndim == 2:
+                                npos, hdim = tensor.shape
+                                side = isqrt(int(npos))
+                                if side * side == int(npos) and hdim == int(self.bagel.hidden_size):
+                                    param = self.bagel.latent_pos_embed.pos_embed
+                                    # Resize in-place to keep the same Parameter object.
+                                    param.data = param.data.new_empty((npos, hdim))
+                                    # Update model bookkeeping so position-id generation matches.
+                                    self.bagel.max_latent_size = int(side)
+                                    if hasattr(self.bagel, "config"):
+                                        setattr(self.bagel.config, "max_latent_size", int(side))
+                                    if hasattr(self.bagel.latent_pos_embed, "max_num_patch_per_side"):
+                                        self.bagel.latent_pos_embed.max_num_patch_per_side = int(side)
+                                    shapes[cand] = (npos, hdim)
+                                    picked = cand
+                                    break
+                            # Handle flattened patch embedding for SigLIP
+                            if cand.endswith("embeddings.patch_embedding.weight") and tensor.ndim == 2:
+                                # Checkpoint has (Hidden, C*P*P), model expects (Hidden, C, P, P)
+                                if shapes.get(cand) is not None:
+                                    target_shape = shapes[cand]
+                                    if tensor.numel() == torch.prod(torch.tensor(target_shape)):
+                                        # Reshape tensor to match target
+                                        tensor = tensor.view(target_shape)
+                                        picked = cand
+                                        break
+
+                            shape_mismatch += 1
+                            # Keep this quiet; shape mismatches are expected for ignored modules.
+                if picked is not None:
+                    kept += 1
+                    yield picked, tensor
+                # else: ignore extra weights (e.g. connector/vision/und)
+            logger.info_once(
+                "BagelPipeline weight filter kept %d/%d tensors (shape mismatches seen: %d)",
+                kept,
+                total,
+                shape_mismatch,
+            )
+
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(_filtered_weights())

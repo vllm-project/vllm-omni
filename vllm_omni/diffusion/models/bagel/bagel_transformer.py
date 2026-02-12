@@ -15,7 +15,6 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
-from tqdm import tqdm
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2PreTrainedModel,
@@ -1301,7 +1300,7 @@ class Bagel(nn.Module):
         timestep_shift: float = 1.0,
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
-        cfg_interval: tuple[float, float] | None = [0, 1],
+        cfg_interval: tuple[float, float] = [0, 1],
         # cfg_text
         cfg_text_scale: float = 1.0,
         cfg_text_packed_query_indexes: torch.LongTensor | None = None,
@@ -1325,7 +1324,7 @@ class Bagel(nn.Module):
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
-        for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
+        for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
