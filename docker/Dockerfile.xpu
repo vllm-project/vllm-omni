@@ -95,6 +95,7 @@ ARG COMMON_WORKDIR=/workspace/vllm-omni
 RUN mkdir -p  ${COMMON_WORKDIR}
 COPY . ${COMMON_WORKDIR}
 
+ENV VLLM_OMNI_TARGET_DEVICE=xpu
 RUN cd ${COMMON_WORKDIR} && python -m pip install --no-cache-dir ".[dev]" --no-build-isolation
 
 # FIX triton

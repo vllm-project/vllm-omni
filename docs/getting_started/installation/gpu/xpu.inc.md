@@ -1,11 +1,11 @@
 # --8<-- [start:requirements]
 
-- GPU: Validated on Intel® Arc™ B-Series (It should be supported on the AMD GPUs that are supported by vLLM.)
+- GPU: Validated on Intel® Arc™ B-Series.
 
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni current recommends the steps in under setup through Docker Images.
+vLLM-Omni currently recommends using the Docker image setup steps below.
 
 # --8<-- [start:pre-built-wheels]
 
