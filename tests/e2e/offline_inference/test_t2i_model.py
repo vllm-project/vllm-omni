@@ -34,10 +34,17 @@ elif current_omni_platform.is_rocm():
 
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 2})
 @pytest.mark.parametrize("model_name", models)
-def test_diffusion_model(model_name: str):
+def test_diffusion_model(model_name: str, run_level):
+    if run_level == "core_model" and model_name != "riverclouds/qwen_image_random":
+        pytest.skip()
+
+    if run_level == "advanced_model" and model_name == "riverclouds/qwen_image_random":
+        pytest.skip()
+
     m = None
     try:
         m = Omni(model=model_name)
