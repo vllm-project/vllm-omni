@@ -164,7 +164,7 @@ async def async_request_openai_chat_omni_completions(
                                                 generated_audio = generated_audio + seg
 
                             if metrics := data.get("metrics"):
-                                output.output_tokens = metrics.get("num_tokens_out")
+                                output.output_tokens = metrics.get("num_tokens_out", 0)
 
                 output.latency = timestamp - st
                 output.generated_text = generated_text
