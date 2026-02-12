@@ -117,6 +117,7 @@ def create_transformers_model(
 ) -> "PreTrainedModel":
     """Create a HuggingFace model using the given auto class and model name."""
     dtype = dtype or od_config.dtype
+    device = device or torch.get_default_device()
     with init_on_device_without_buffers("meta"):
         model = auto_cls.from_config(hf_config)
     recursive_replace_linear(model, od_config)
