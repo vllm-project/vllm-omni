@@ -13,8 +13,8 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      max_model_len: 896
-      max_num_batched_tokens: 896
+      max_model_len: 2400
+      max_num_batched_tokens: 2400
       max_num_seqs: 1
       gpu_memory_utilization: 0.8
       skip_mm_profiling: true
@@ -43,8 +43,8 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      max_model_len: 896
-      max_num_batched_tokens: 896
+      max_model_len: 2400
+      max_num_batched_tokens: 2400
       max_num_seqs: 1
       gpu_memory_utilization: 0.8
       skip_mm_profiling: true
