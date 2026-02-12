@@ -2,20 +2,74 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import FeedForward
+import torch.nn.functional as F
 
 # TODO replace this with vLLM implementation
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, RMSNorm, SD35AdaLayerNormZeroX
+from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, SD35AdaLayerNormZeroX
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+
+class GELU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True):
+        super().__init__()
+        self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias)
+        self.approximate = approximate
+
+    def forward(self, hidden_states):
+        hidden_states, _ = self.proj(hidden_states)
+        hidden_states = F.gelu(hidden_states, approximate=self.approximate)
+        return hidden_states
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        final_dropout: bool = False,
+        inner_dim=None,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if inner_dim is None:
+            inner_dim = int(dim * mult)
+        dim_out = dim_out if dim_out is not None else dim
+
+        if activation_fn == "gelu-approximate":
+            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+        else:
+            raise ValueError(f"Unsupported activation function type: {activation_fn}")
+
+        self.net = nn.ModuleList([])
+        self.net.append(act_fn)
+        self.net.append(nn.Dropout(dropout))
+        self.net.append(RowParallelLinear(inner_dim, dim_out, bias=bias))
+        if final_dropout:
+            self.net.append(nn.Dropout(dropout))
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        for layer in self.net:
+            output = layer(hidden_states)
+            hidden_states = output[0] if isinstance(output, tuple) else output
+        return hidden_states
 
 
 class SD3PatchEmbed(nn.Module):
@@ -77,7 +131,6 @@ class SD3CrossAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
-            disable_tp=True,
         )
         self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -88,17 +141,18 @@ class SD3CrossAttention(nn.Module):
                 added_kv_proj_dim,
                 head_size=self.inner_kv_dim // self.num_heads,
                 total_num_heads=self.num_heads,
-                disable_tp=True,
             )
+        else:
+            self.add_kv_proj = None
 
         if not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(self.inner_dim, self.dim, bias=out_bias)
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
-            self.to_out.append(ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias))
+            self.to_out.append(RowParallelLinear(self.inner_dim, self.dim, bias=out_bias))
         else:
             self.to_out = None
 
@@ -106,7 +160,7 @@ class SD3CrossAttention(nn.Module):
         self.norm_added_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.attn = Attention(
-            num_heads=num_heads,
+            num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
@@ -118,13 +172,15 @@ class SD3CrossAttention(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
     ):
         # Compute QKV for image stream (sample projections)
-        qkv, _ = self.to_qkv(hidden_states)
+        qkv = self.to_qkv(hidden_states)
+        qkv = qkv[0]
         img_query, img_key, img_value = qkv.chunk(3, dim=-1)
 
         # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.num_heads, -1))
+        local_num_heads = self.to_qkv.num_heads
+        img_query = img_query.unflatten(-1, (local_num_heads, -1))
+        img_key = img_key.unflatten(-1, (local_num_heads, -1))
+        img_value = img_value.unflatten(-1, (local_num_heads, -1))
 
         # Apply QK normalization
         img_query = self.norm_q(img_query)
@@ -132,12 +188,13 @@ class SD3CrossAttention(nn.Module):
 
         if encoder_hidden_states is not None:
             # Compute QKV for text stream (context projections)
-            qkv, _ = self.add_kv_proj(encoder_hidden_states)
-            txt_query, txt_key, txt_value = qkv.chunk(3, dim=-1)
+            qkv_add = self.add_kv_proj(encoder_hidden_states)
+            qkv_add = qkv_add[0]
+            txt_query, txt_key, txt_value = qkv_add.chunk(3, dim=-1)
 
-            txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
-            txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
-            txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
+            txt_query = txt_query.unflatten(-1, (local_num_heads, -1))
+            txt_key = txt_key.unflatten(-1, (local_num_heads, -1))
+            txt_value = txt_value.unflatten(-1, (local_num_heads, -1))
 
             txt_query = self.norm_added_q(txt_query)
             txt_key = self.norm_added_k(txt_key)
@@ -265,6 +322,8 @@ class SD3TransformerBlock(nn.Module):
         encoder_hidden_states: torch.FloatTensor,
         temb: torch.FloatTensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(encoder_hidden_states, tuple):
+            encoder_hidden_states = encoder_hidden_states[0]
         if self.use_dual_attention:
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2 = self.norm1(
                 hidden_states, emb=temb
@@ -363,7 +422,7 @@ class SD3Transformer2DModel(nn.Module):
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.inner_dim, pooled_projection_dim=self.pooled_projection_dim
         )
-        self.context_embedder = nn.Linear(self.joint_attention_dim, self.caption_projection_dim)
+        self.context_embedder = ReplicatedLinear(self.joint_attention_dim, self.caption_projection_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -380,7 +439,9 @@ class SD3Transformer2DModel(nn.Module):
         )
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, self.patch_size * self.patch_size * self.out_channels, bias=True)
+        self.proj_out = ReplicatedLinear(
+            self.inner_dim, self.patch_size * self.patch_size * self.out_channels, bias=True
+        )
 
     def forward(
         self,
@@ -426,6 +487,9 @@ class SD3Transformer2DModel(nn.Module):
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
+
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = hidden_states[0]
 
         # unpatchify
         patch_size = self.patch_size

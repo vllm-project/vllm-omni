@@ -384,6 +384,13 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
+        # Prefer engine-configured boundary_ratio, but allow per-request fallback.
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+
+        if boundary_ratio is None:
+            boundary_ratio = 0.875
+            logger.warning("boundary_ratio is required for T2V generation. using default value 0.875")
+
         # validate shapes
         self.check_inputs(
             prompt=prompt,
@@ -392,7 +399,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
-            guidance_scale_2=guidance_high if self.boundary_ratio is not None else None,
+            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
+            boundary_ratio=boundary_ratio,
         )
 
         if num_frames % self.vae_scale_factor_temporal != 1:
@@ -440,8 +448,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
-        if self.boundary_ratio is not None:
-            boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
+        if boundary_ratio is not None:
+            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Handle I2V mode when expand_timesteps=True and image is provided
         multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
@@ -780,6 +788,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         prompt_embeds=None,
         negative_prompt_embeds=None,
         guidance_scale_2=None,
+        boundary_ratio=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
@@ -806,5 +815,5 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         ):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
 
-        if self.boundary_ratio is None and guidance_scale_2 is not None:
+        if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
