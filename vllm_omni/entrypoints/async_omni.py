@@ -542,31 +542,6 @@ class AsyncOmni(OmniBase):
 
         return engine_outputs, finished, output_to_yield
 
-    def _assign_output_metrics(
-        self,
-        *,
-        output_to_yield: OmniRequestOutput,
-        metrics: OrchestratorAggregator,
-        request_id: str,
-        stage_id: int,
-        finished: bool,
-    ) -> None:
-        if finished:
-            stage_metrics = None
-            for evt in reversed(metrics.stage_events.get(request_id, [])):
-                if evt.stage_id == stage_id:
-                    stage_metrics = evt
-                    break
-            if stage_metrics is not None and stage_metrics.final_output_type == "text":
-                output_to_yield.metrics = {
-                    "num_tokens_in": stage_metrics.num_tokens_in,
-                    "num_tokens_out": stage_metrics.num_tokens_out,
-                    "stage_id": stage_metrics.stage_id,
-                    "final_output_type": stage_metrics.final_output_type,
-                }
-                return
-        output_to_yield.metrics = {}
-
     def _run_output_handler(self) -> None:
         if self.output_handler is not None:
             return
