@@ -1668,6 +1668,7 @@ def extract_cosmos3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "WanTransformer3DModel": extract_wan2_2_context,
     "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
     "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,
