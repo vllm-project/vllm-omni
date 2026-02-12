@@ -167,7 +167,11 @@ def initialize_model(
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
-        if (
+        from vllm_omni.diffusion.distributed.autoencoders.vae_base import DistributedVaeMixin
+
+        if hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin):
+            model.vae.set_parallel_size(vae_pp_size)
+        elif (
             vae_pp_size > 1
             and hasattr(model, "vae")
             and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
