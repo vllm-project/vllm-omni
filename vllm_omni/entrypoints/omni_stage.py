@@ -201,7 +201,7 @@ def _sequential_init_lock(engine_args: dict[str, Any], stage_init_timeout: int =
 
 
 def _resolve_worker_cls(engine_args: dict[str, Any]) -> None:
-    worker_type = engine_args.pop("worker_type", None)
+    worker_type = engine_args.get("worker_type", None)
     if not worker_type:
         return
     if engine_args.get("worker_cls"):
