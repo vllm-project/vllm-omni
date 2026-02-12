@@ -10,7 +10,7 @@ from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.entrypoints.stage_utils import _to_dict
-from vllm_omni.utils import detect_device_type, is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -164,16 +164,12 @@ def resolve_model_config_path(model: str) -> str:
                 f"Model is not in standard transformers format and does not have model_index.json. "
                 f"Please ensure the model has proper configuration files with 'model_type' field"
             )
-    device_type = detect_device_type()
 
-    # Try device-specific config first
-    if device_type != "cuda" or is_rocm():
-        device_config_file = f"vllm_omni/model_executor/stage_configs/{device_type}/{model_type}.yaml"
-        if is_rocm():
-            device_config_file = f"vllm_omni/model_executor/stage_configs/rocm/{model_type}.yaml"
-        device_config_path = PROJECT_ROOT / device_config_file
-        if os.path.exists(device_config_path):
-            return str(device_config_path)
+    default_config_path = current_omni_platform.get_default_stage_config_path()
+    model_type_str = f"{model_type}.yaml"
+    complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
+    if os.path.exists(complete_config_path):
+        return str(complete_config_path)
 
     # Fall back to default config
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
@@ -221,6 +217,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         base_engine_args = {}
     config_data = OmegaConf.load(config_path)
     stage_args = config_data.stage_args
+    global_async_chunk = config_data.get("async_chunk", False)
     # Convert any nested dataclass objects to dicts before creating OmegaConf
     base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
     base_engine_args = OmegaConf.create(base_engine_args)
@@ -234,6 +231,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
             runtime_cfg = stage_arg.runtime
             max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
             base_engine_args_tmp["max_num_seqs"] = max_batch_size
+            base_engine_args_tmp.async_chunk = global_async_chunk
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
 
@@ -282,3 +280,63 @@ def get_final_stage_id_for_e2e(
         final_stage_id_for_e2e = last_stage_id
 
     return final_stage_id_for_e2e
+
+
+# The following code detects if the process is running in a container and if
+# PID host is available. If so, we can use process-scoped memory tracking;
+# otherwise we need sequential init locks.
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def in_container() -> bool:
+    # Common Docker signal
+    if os.path.exists("/.dockerenv"):
+        return True
+
+    # cgroup markers (works for Docker/containerd/K8s/Podman in many setups)
+    cg = _read_text("/proc/1/cgroup") or ""
+    markers = ("docker", "containerd", "kubepods", "libpod", "podman")
+    return any(m in cg for m in markers)
+
+
+def has_pid_host() -> bool | None:
+    """
+    Returns:
+      True  -> very likely running with --pid=host (host PID namespace)
+      False -> very likely isolated PID namespace (default)
+      None  -> cannot determine
+    """
+    # Strong signal: in host pid namespace, PID 2 is usually kthreadd
+    comm2 = _read_text("/proc/2/comm")
+    if comm2 is not None:
+        comm2 = comm2.strip()
+        if comm2 == "kthreadd":
+            return True
+        # If PID 2 exists and is NOT kthreadd, we're almost certainly not in host pid ns
+        return False
+
+    # Fallback: check for other low-numbered kernel threads (best-effort)
+    for pid, name in [(3, "rcu_gp"), (4, "rcu_par_gp"), (10, "ksoftirqd/0")]:
+        comm = _read_text(f"/proc/{pid}/comm")
+        if comm is not None:
+            if comm.strip() == name:
+                return True
+            else:
+                return False
+
+    return False
+
+
+def detect_pid_host() -> bool:
+    ic = in_container()
+    if not ic:
+        return True
+
+    return has_pid_host()

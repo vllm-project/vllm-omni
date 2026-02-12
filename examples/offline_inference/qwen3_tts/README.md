@@ -1,4 +1,4 @@
-# Qwen3-TTS Offline Inference
+# Qwen3-TTS
 
 This directory contains an offline demo for running Qwen3 TTS models with vLLM Omni. It builds task-specific inputs and generates WAV files locally.
 
@@ -12,6 +12,15 @@ Qwen3 TTS provides multiple task variants for speech generation:
 
 ## Setup
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+
+### ROCm Dependencies
+
+You will need to install these two dependencies `onnxruntime-rocm` and `sox`.
+
+```
+pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
+pip install onnxruntime-rocm sox
+```
 
 ## Quick Start
 

@@ -11,7 +11,7 @@ stage_args:
     engine_args:
       model_stage: thinker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true  # Now we only support eager mode
@@ -41,7 +41,7 @@ stage_args:
     engine_args:
       model_stage: talker
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.8
       enforce_eager: true
@@ -73,7 +73,7 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: Qwen2_5OmniForConditionalGeneration
-      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.3
       enforce_eager: true
@@ -117,8 +117,15 @@ runtime:
         localbuf: 64000000     # 64MB
         proto: "tcp"
 
+    # Yuanrong connector for cross-node/intra-node communication
+    yuanrong_connector:
+      name: YuanrongConnector
+      extra:
+        host: "127.0.0.1"
+        port: "35000"
+
     # SharedMemory connector for intra-node communication
-    #Alternative SHM connector with different threshold
+    # Alternative SHM connector with different threshold
     shared_memory_connector:
       name: SharedMemoryConnector
       extra:

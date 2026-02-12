@@ -1,52 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Diffusion attention backend selector.
+
+This module provides the interface for selecting diffusion attention backends.
+The actual backend selection logic is delegated to the platform layer
+(vllm_omni.platforms), similar to how vLLM handles attention backend selection.
+
+Usage:
+    from vllm_omni.diffusion.attention.selector import get_attn_backend
+
+    # Get the appropriate backend for current platform
+    backend_cls = get_attn_backend(head_size=64)
+
+    # Or override via environment variable
+    # export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+"""
 
 import importlib
 import os
 from functools import cache
 
-import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
 )
-from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
-from vllm_omni.utils.platform_utils import detect_device_type, is_rocm
 
 logger = init_logger(__name__)
 
-# environment variable value -> backend module and class
-_BACKEND_CONFIG = {
-    "FLASH_ATTN": {
-        "module": "vllm_omni.diffusion.attention.backends.flash_attn",
-        "class": "FlashAttentionBackend",
-    },
-    "TORCH_SDPA": {
-        "module": "vllm_omni.diffusion.attention.backends.sdpa",
-        "class": "SDPABackend",
-    },
-    "SAGE_ATTN": {
-        "module": "vllm_omni.diffusion.attention.backends.sage_attn",
-        "class": "SageAttentionBackend",
-    },
-    "ASCEND": {"module": "vllm_omni.diffusion.attention.backends.ascend_attn", "class": "AscendAttentionBackend"},
-}
 
-_BACKENDS_SUPPORT_ATTENTION_MASK = ["SDPA", "ASCEND", "FLASH_ATTN"]
+def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
+    """Load a backend class from its fully qualified path.
 
+    Args:
+        cls_path: Fully qualified class path (e.g.,
+            "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend")
 
-def load_backend(backend_name: str) -> type[AttentionBackend]:
-    config = _BACKEND_CONFIG[backend_name]
-
+    Returns:
+        The loaded backend class
+    """
+    module_path, class_name = cls_path.rsplit(".", 1)
     try:
-        module = importlib.import_module(config["module"])
-        backend_class = getattr(module, config["class"])
+        module = importlib.import_module(module_path)
+        backend_class = getattr(module, class_name)
         return backend_class
     except ImportError as e:
-        raise ImportError(f"Failed to import module {config['module']}: {e}")
+        raise ImportError(f"Failed to import module {module_path}: {e}")
     except AttributeError as e:
-        raise AttributeError(f"Class {config['class']} not found in module: {e}")
+        raise AttributeError(f"Class {class_name} not found in module: {e}")
 
 
 @cache
@@ -54,43 +56,30 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
     """
     Get attention backend for diffusion models.
 
-    The backend is selected based on the following priority:
-    1. DIFFUSION_ATTENTION_BACKEND environment variable (if set, e.g. export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN)
-    2. Default backend (SDPA)
+    The backend selection is delegated to the current platform
+    (vllm_omni.platforms.current_omni_platform), which selects the
+    appropriate backend based on:
+    1. User override via DIFFUSION_ATTENTION_BACKEND environment variable
+    2. Platform-specific defaults and capabilities
+
+    This is similar to how vLLM's get_attn_backend_cls works, where the
+    platform layer decides which backend to use based on hardware capabilities.
 
     Args:
-        head_size: Head size (currently not used for selection, but kept for API compatibility)
+        head_size: Head size for attention computation (may affect backend selection)
 
     Returns:
         The selected attention backend class
     """
-    # Check environment variable
+    from vllm_omni.platforms import current_omni_platform
 
-    backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND", None)
+    # Check environment variable for user override
+    selected_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
 
-    if detect_device_type() == "cuda" and not is_rocm():
-        compute_capability = torch.cuda.get_device_capability()
-        major, minor = compute_capability
-        if 80 <= major * 10 + minor < 100:
-            if backend_name is None:
-                backend_name = "FLASH_ATTN"
-        else:
-            if backend_name == "FLASH_ATTN":
-                logger.warning(
-                    """Flash Attention requires GPU with compute capability >= 8.0 or < 10.0. "
-                               "Falling back to TORCH_SDPA backend."""
-                )
-                backend_name = "TORCH_SDPA"
+    # Delegate to platform for backend selection
+    backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
+        selected_backend=selected_backend,
+        head_size=head_size,
+    )
 
-    if backend_name is not None:
-        backend_name_upper = backend_name.upper()
-        if backend_name_upper not in _BACKEND_CONFIG:
-            valid_backends = list(_BACKEND_CONFIG.keys())
-            raise ValueError(
-                f"Invalid attention backend for diffusion: '{backend_name}'. Valid backends are: {valid_backends}"
-            )
-        logger.info(f"Using attention backend '{backend_name_upper}' for diffusion")
-        return load_backend(backend_name_upper)
-
-    # Default to SDPA
-    return SDPABackend
+    return _load_backend_cls(backend_cls_path)

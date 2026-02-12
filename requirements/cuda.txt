@@ -1,0 +1,3 @@
+-r common.txt
+onnxruntime>=1.23.2
+fa3-fwd==0.0.1

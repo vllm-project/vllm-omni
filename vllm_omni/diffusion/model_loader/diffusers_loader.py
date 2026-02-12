@@ -13,6 +13,7 @@ from torch import nn
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -94,6 +95,7 @@ class DiffusersPipelineLoader:
         load_format = self.load_config.load_format
         use_safetensors = False
         index_file = DIFFUSION_MODEL_WEIGHTS_INDEX
+        index_file_with_subfolder = f"{subfolder}/{index_file}" if subfolder else index_file
 
         # only hf is supported currently
         if load_format == "auto":
@@ -129,8 +131,8 @@ class DiffusersPipelineLoader:
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
-                if pattern == "*.safetensors":
-                    use_safetensors = True
+                # Decide by actual files rather than pattern name (patterns may include subfolders).
+                use_safetensors = any(f.endswith(".safetensors") for f in hf_weights_files)
                 break
 
         if use_safetensors:
@@ -142,11 +144,22 @@ class DiffusersPipelineLoader:
             if not is_local:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
-                    index_file,
+                    index_file_with_subfolder,
                     self.load_config.download_dir,
                     revision,
                 )
-            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
+            # Some diffusers pipelines keep component weights under a
+            # subfolder (e.g. "transformer/") and the corresponding index file
+            # uses filenames relative to that subfolder. vLLM's
+            # `filter_duplicate_safetensors_files` expects weight_map entries
+            # to be relative to the `hf_folder` we pass in, so we point it to
+            # the component subfolder to avoid filtering out all shards.
+            filter_folder = os.path.join(hf_folder, subfolder) if subfolder is not None else hf_folder
+            hf_weights_files = filter_duplicate_safetensors_files(
+                hf_weights_files,
+                filter_folder,
+                index_file,
+            )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -188,8 +201,9 @@ class DiffusersPipelineLoader:
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
-            model_config.model,
-            model_config.revision,
+            model_name_or_path=model_config.model,
+            subfolder=None,
+            revision=model_config.revision,
             fall_back_to_pt=True,
             allow_patterns_overrides=None,
         )
@@ -204,7 +218,35 @@ class DiffusersPipelineLoader:
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model)
+
+            # Process weights after loading for quantization (e.g., FP8 online quantization)
+            # This is needed for vLLM's quantization methods that need to transform weights
+            self._process_weights_after_loading(model, target_device)
+
         return model.eval()
+
+    def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
+        """Process weights after loading for quantization methods.
+
+        This handles vLLM's quantization methods that need to process weights
+        after loading (e.g., FP8 online quantization from BF16/FP16 weights).
+        """
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, QuantizeMethodBase):
+                # Move module to target device for processing if needed
+                module_device = next(module.parameters(), None)
+                if module_device is not None:
+                    module_device = module_device.device
+                needs_device_move = module_device != target_device
+
+                if needs_device_move:
+                    module.to(target_device)
+
+                quant_method.process_weights_after_loading(module)
+
+                if needs_device_move:
+                    module.to(module_device)
 
     def load_weights(self, model: nn.Module) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}

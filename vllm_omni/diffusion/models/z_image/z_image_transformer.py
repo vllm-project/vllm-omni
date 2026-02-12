@@ -18,6 +18,7 @@
 
 import math
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -31,6 +32,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
@@ -250,6 +256,7 @@ class ZImageAttention(nn.Module):
         num_kv_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-6,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -264,6 +271,7 @@ class ZImageAttention(nn.Module):
             total_num_heads=num_heads,
             total_num_kv_heads=num_kv_heads,
             bias=False,
+            quant_config=quant_config,
         )
 
         assert qk_norm is True
@@ -281,6 +289,7 @@ class ZImageAttention(nn.Module):
                     bias=False,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 )
             ]
         )
@@ -343,13 +352,19 @@ class ZImageAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        quant_config: "QuantizationConfig | None" = None,
+    ):
         super().__init__()
         self.w13 = MergedColumnParallelLinear(
             dim,
             [hidden_dim] * 2,
             bias=False,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.act = SiluAndMul()
         self.w2 = RowParallelLinear(
@@ -358,6 +373,7 @@ class FeedForward(nn.Module):
             bias=False,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
         )
 
     def forward(self, x):
@@ -374,6 +390,7 @@ class ZImageTransformerBlock(nn.Module):
         norm_eps: float,
         qk_norm: bool,
         modulation=True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.dim = dim
@@ -384,9 +401,14 @@ class ZImageTransformerBlock(nn.Module):
             num_kv_heads=n_kv_heads,
             qk_norm=qk_norm,
             eps=1e-5,
+            quant_config=quant_config,
         )
 
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
+        self.feed_forward = FeedForward(
+            dim=dim,
+            hidden_dim=int(dim / 3 * 8),
+            quant_config=quant_config,
+        )
         self.layer_id = layer_id
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -544,6 +566,10 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "w13": ["w1", "w3"],
+    }
 
     # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
@@ -585,6 +611,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         t_scale=1000.0,
         axes_dims=[32, 48, 48],
         axes_lens=[1024, 512, 512],
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
         self.dtype = torch.bfloat16
@@ -644,6 +671,7 @@ class ZImageTransformer2DModel(CachedTransformer):
                     norm_eps,
                     qk_norm,
                     modulation=True,
+                    quant_config=quant_config,
                 )
                 for layer_id in range(n_refiner_layers)
             ]
@@ -658,6 +686,7 @@ class ZImageTransformer2DModel(CachedTransformer):
                     norm_eps,
                     qk_norm,
                     modulation=False,
+                    quant_config=quant_config,
                 )
                 for layer_id in range(n_refiner_layers)
             ]
@@ -673,7 +702,15 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         self.layers = nn.ModuleList(
             [
-                ZImageTransformerBlock(layer_id, dim, n_heads, n_kv_heads, norm_eps, qk_norm)
+                ZImageTransformerBlock(
+                    layer_id,
+                    dim,
+                    n_heads,
+                    n_kv_heads,
+                    norm_eps,
+                    qk_norm,
+                    quant_config=quant_config,
+                )
                 for layer_id in range(n_layers)
             ]
         )
@@ -848,7 +885,13 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         # Match t_embedder output dtype to x for layerwise casting compatibility
         adaln_input = t.type_as(x)
-        x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
+        # Use torch.where instead of x[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
+        x_pad_mask = torch.cat(x_inner_pad_mask)
+        x = torch.where(
+            x_pad_mask.unsqueeze(1).expand_as(x),
+            self.x_pad_token.expand(x.shape[0], -1),
+            x,
+        )
         x = list(x.split(x_item_seqlens, dim=0))
         x_cos, x_sin = self.rope_embedder(torch.cat(x_pos_ids, dim=0))
         x_cos = list(x_cos.split(x_item_seqlens, dim=0))
@@ -871,7 +914,13 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         cap_feats = torch.cat(cap_feats, dim=0)
         cap_feats = self.cap_embedder(cap_feats)
-        cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
+        # Use torch.where instead of cap_feats[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
+        cap_pad_mask = torch.cat(cap_inner_pad_mask)
+        cap_feats = torch.where(
+            cap_pad_mask.unsqueeze(1).expand_as(cap_feats),
+            self.cap_pad_token.expand(cap_feats.shape[0], -1),
+            cap_feats,
+        )
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
         cap_cos, cap_sin = self.rope_embedder(torch.cat(cap_pos_ids, dim=0))
         cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))

@@ -328,7 +328,7 @@ def main(args):
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
-        log_stats=args.enable_stats,
+        log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
     )
 
@@ -418,7 +418,7 @@ def main(args):
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
                 request_id = output.request_id
-                audio_tensor = output.multimodal_output["audio"]
+                audio_tensor = output.outputs[0].multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
                 # Convert to numpy array and ensure correct format
@@ -455,7 +455,7 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--enable-stats",
+        "--log-stats",
         action="store_true",
         default=False,
         help="Enable writing detailed statistics (default: disabled)",

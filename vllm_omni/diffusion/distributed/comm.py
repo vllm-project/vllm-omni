@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from vllm_omni.platforms import current_omni_platform
+
 __all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
 
 
@@ -48,7 +50,7 @@ def all_to_all_4D(
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
             if use_sync:
-                torch.cuda.synchronize()
+                current_omni_platform.synchronize()
         else:
             output = input_t
         # if scattering the seq-dim, transpose the heads back to the original dimension
@@ -83,7 +85,7 @@ def all_to_all_4D(
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
             if use_sync:
-                torch.cuda.synchronize()
+                current_omni_platform.synchronize()
         else:
             output = input_t
 
@@ -155,7 +157,7 @@ def all_to_all_5D(
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
             if use_sync:
-                torch.cuda.synchronize()
+                current_omni_platform.synchronize()
         else:
             output = input_t
 
@@ -190,7 +192,7 @@ def all_to_all_5D(
         if seq_world_size > 1:
             dist.all_to_all_single(output, input_t, group=group)
             if use_sync:
-                torch.cuda.synchronize()
+                current_omni_platform.synchronize()
         else:
             output = input_t
 

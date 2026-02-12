@@ -122,7 +122,7 @@ class TeaCacheHook(ModelHook):
         #   - cfg_rank 0: positive branch
         #   - cfg_rank > 0: negative branch
         # Without CFG-parallel, branches alternate within a single rank
-        if module.do_true_cfg:
+        if getattr(module, "do_true_cfg", False):
             cfg_parallel_size = get_classifier_free_guidance_world_size()
             if cfg_parallel_size > 1:
                 cfg_rank = get_classifier_free_guidance_rank()

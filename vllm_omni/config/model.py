@@ -1,4 +1,5 @@
 import warnings
+from dataclasses import field
 from typing import Any
 
 import torch
@@ -20,10 +21,7 @@ from vllm.transformers_utils.config import (
     get_hf_text_config,
     get_pooling_config,
 )
-from vllm.transformers_utils.gguf_utils import (
-    is_gguf,
-    maybe_patch_hf_config_from_gguf,
-)
+from vllm.transformers_utils.gguf_utils import is_gguf, maybe_patch_hf_config_from_gguf
 from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -42,6 +40,7 @@ class OmniModelConfig(ModelConfig):
 
     Attributes:
         stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        async_chunk: If set to True, perform async chunk
         model_stage: Stage type identifier, e.g., "thinker" or "talker"
             (default: "thinker")
         model_arch: Model architecture name
@@ -49,6 +48,8 @@ class OmniModelConfig(ModelConfig):
         engine_output_type: Optional output type specification for the engine.
             Used to route outputs to appropriate processors (e.g., "image",
             "audio", "latents"). If None, output type is inferred.
+        stage_connector_config: Stage connector configuration dictionary.
+            Contains "name" (connector name), "extra" (extra connector config).
 
     Example:
         >>> config = OmniModelConfig(
@@ -59,10 +60,18 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
+    async_chunk: bool = False
     model_stage: str = "thinker"
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: str | None = None
     hf_config_name: str | None = None
+    custom_process_next_stage_input_func: str | None = None
+    stage_connector_config: dict[str, Any] = field(
+        default_factory=lambda: {
+            "name": "SharedMemoryConnector",
+            "extra": {},
+        }
+    )
     omni_kv_config: dict | None = None
 
     @property
@@ -101,6 +110,7 @@ class OmniModelConfig(ModelConfig):
         mm_processor_cache_gb: float | None,
         mm_processor_cache_type: MMCacheType | None,
         mm_shm_cache_max_object_size_mb: int | None,
+        mm_encoder_only: bool | None,
         mm_encoder_tp_mode: MMEncoderTPMode | None,
         mm_encoder_attn_backend: AttentionBackendEnum | str | None,
         interleave_mm_strings: bool | None,
@@ -171,6 +181,15 @@ class OmniModelConfig(ModelConfig):
             self.model, hf_token=self.hf_token, revision=self.revision
         )
         self.model_arch_config = self.get_model_arch_config()
+
+        if self.convert == "mm_encoder_only":
+            logger.warning_once(
+                "`--convert mm_encoder_only` is deprecated and "
+                "will be removed in v0.15. "
+                "Please use --mm-encoder-only` instead."
+            )
+            mm_encoder_only = True
+            self.convert = "none"
 
         architectures = self.architectures
         registry = self.registry
@@ -253,6 +272,7 @@ class OmniModelConfig(ModelConfig):
                 mm_processor_cache_gb=mm_processor_cache_gb,
                 mm_processor_cache_type=mm_processor_cache_type,
                 mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
+                mm_encoder_only=mm_encoder_only,
                 mm_encoder_tp_mode=mm_encoder_tp_mode,
                 mm_encoder_attn_backend=mm_encoder_attn_backend,
                 interleave_mm_strings=interleave_mm_strings,

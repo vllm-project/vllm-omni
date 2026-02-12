@@ -82,6 +82,19 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return SharedMemoryConnector(config)
 
 
+def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.yuanrong_connector import YuanrongConnector
+    except ImportError:
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.yuanrong_connector import YuanrongConnector
+    return YuanrongConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
