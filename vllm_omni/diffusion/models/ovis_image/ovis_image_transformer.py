@@ -16,23 +16,30 @@
 # limitations under the License.
 
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.attention import FeedForward
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps, get_1d_rotary_pos_embed, CombinedTimestepLabelEmbeddings
+from diffusers.models.embeddings import (
+    CombinedTimestepLabelEmbeddings,
+    TimestepEmbedding,
+    Timesteps,
+    get_1d_rotary_pos_embed,
+)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZeroSingle
 from diffusers.utils import is_torch_npu_available
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear, ColumnParallelLinear, MergedColumnParallelLinear
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -49,7 +56,7 @@ class AdaLayerNormZero(nn.Module):
         num_embeddings (`int`): The size of the embeddings dictionary.
     """
 
-    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True):
+    def __init__(self, embedding_dim: int, num_embeddings: int | None = None, norm_type="layer_norm", bias=True):
         super().__init__()
         if num_embeddings is not None:
             self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
@@ -57,11 +64,7 @@ class AdaLayerNormZero(nn.Module):
             self.emb = None
 
         self.silu = nn.SiLU()
-        self.linear = ReplicatedLinear(
-            embedding_dim, 
-            6 * embedding_dim, 
-            bias=bias
-        )
+        self.linear = ReplicatedLinear(embedding_dim, 6 * embedding_dim, bias=bias)
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
         else:
@@ -70,21 +73,21 @@ class AdaLayerNormZero(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        timestep: Optional[torch.Tensor] = None,
-        class_labels: Optional[torch.LongTensor] = None,
-        hidden_dtype: Optional[torch.dtype] = None,
-        emb: Optional[torch.Tensor] = None,
+        timestep: torch.Tensor | None = None,
+        class_labels: torch.LongTensor | None = None,
+        hidden_dtype: torch.dtype | None = None,
+        emb: torch.Tensor | None = None,
     ):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        
+
         emb, _ = self.linear(self.silu(emb))
-        
+
         chunks = emb.chunk(6, dim=1)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunks
 
         x = self.norm(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        
+
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -127,7 +130,7 @@ class FeedForward(nn.Module):
         self.net.append(act_fn)
         self.net.append(nn.Dropout(dropout))
         self.net.append(RowParallelLinear(inner_dim, dim_out, bias=bias))
-        
+
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
@@ -198,10 +201,7 @@ class OvisImageAttention(nn.Module):
             )
 
             self.to_add_out = RowParallelLinear(
-                input_size=self.inner_dim,
-                output_size=query_dim, 
-                bias=out_bias,
-                input_is_parallel=True 
+                input_size=self.inner_dim, output_size=query_dim, bias=out_bias, input_is_parallel=True
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -220,13 +220,11 @@ class OvisImageAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.to_qkv(hidden_states)
-        
+
         local_num_heads = self.to_qkv.num_heads
         head_dim = self.head_dim
-        
-        # vLLM QKV format is contiguous [Q, K, V]
         query, key, value = qkv.chunk(3, dim=-1)
-        
+
         query = query.unflatten(-1, (local_num_heads, head_dim))
         key = key.unflatten(-1, (local_num_heads, head_dim))
         value = value.unflatten(-1, (local_num_heads, head_dim))
@@ -236,13 +234,12 @@ class OvisImageAttention(nn.Module):
 
         if self.added_kv_proj_dim is not None:
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
-            
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
-            
+
             encoder_query = encoder_query.unflatten(-1, (local_num_heads, head_dim))
             encoder_key = encoder_key.unflatten(-1, (local_num_heads, head_dim))
             encoder_value = encoder_value.unflatten(-1, (local_num_heads, head_dim))
-            
+
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
@@ -251,14 +248,18 @@ class OvisImageAttention(nn.Module):
             value = torch.cat([encoder_value, value], dim=1)
 
         if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
+            cos, sin = image_rotary_emb  # [S, D/2]
             cos = cos.to(query.dtype)
             sin = sin.to(query.dtype)
             query = self.rope(query, cos, sin)
             key = self.rope(key, cos, sin)
 
-        hidden_states = self.attn(query, key, value)
-        hidden_states = hidden_states.flatten(2, 3) 
+        hidden_states = self.attn(
+            query,
+            key,
+            value,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
 
         if encoder_hidden_states is not None:
             enc_len = encoder_hidden_states.shape[1]
@@ -266,10 +267,8 @@ class OvisImageAttention(nn.Module):
                 hidden_states[:, :enc_len],
                 hidden_states[:, enc_len:],
             )
-            
             hidden_states, _ = self.to_out[0](hidden_states)
             hidden_states = self.to_out[1](hidden_states)
-            
             encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
             return hidden_states, encoder_hidden_states
@@ -305,9 +304,8 @@ class OvisImageSingleTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        
         text_seq_len = encoder_hidden_states.shape[1]
-        
+
         combined_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
         residual = combined_states
 
@@ -330,14 +328,11 @@ class OvisImageSingleTransformerBlock(nn.Module):
         proj_output = gate.unsqueeze(1) * proj_output
 
         hidden_states = residual + proj_output
-        
+
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
-        encoder_hidden_states, hidden_states = (
-            hidden_states[:, :text_seq_len],
-            hidden_states[:, text_seq_len:],
-        )
+        encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
         return encoder_hidden_states, hidden_states
 
 
@@ -380,13 +375,13 @@ class OvisImageTransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
             encoder_hidden_states, emb=temb
         )
         joint_attention_kwargs = joint_attention_kwargs or {}
 
+        # Attention.
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
@@ -399,6 +394,7 @@ class OvisImageTransformerBlock(nn.Module):
         elif len(attention_outputs) == 3:
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
+        # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
@@ -412,6 +408,7 @@ class OvisImageTransformerBlock(nn.Module):
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
 
+        # Process attention outputs for the `encoder_hidden_states`.
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
@@ -504,7 +501,6 @@ class OvisImageTransformer2DModel(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
-        
         self.pos_embed = OvisImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
@@ -536,7 +532,9 @@ class OvisImageTransformer2DModel(nn.Module):
             ]
         )
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = RowParallelLinear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True, input_is_parallel=False)
+        self.proj_out = RowParallelLinear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True, input_is_parallel=False
+        )
 
     def forward(
         self,
@@ -569,6 +567,7 @@ class OvisImageTransformer2DModel(nn.Module):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
+
         hidden_states, _ = self.x_embedder(hidden_states)
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
 
@@ -577,7 +576,6 @@ class OvisImageTransformer2DModel(nn.Module):
 
         encoder_hidden_states = self.context_embedder_norm(encoder_hidden_states)
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
-        
         if txt_ids.ndim == 3:
             logger.warning(
                 "Passing `txt_ids` 3d torch.Tensor is deprecated."
@@ -643,7 +641,6 @@ class OvisImageTransformer2DModel(nn.Module):
         tp_rank = get_tensor_model_parallel_rank()
 
         for name, loaded_weight in weights:
-            
             # 1. Single Block proj_out (RowParallelLinear) weight restructuring
             if "single_transformer_blocks" in name and "proj_out.weight" in name:
                 if tp_size > 1:
@@ -651,7 +648,7 @@ class OvisImageTransformer2DModel(nn.Module):
                     w_attn_local = w_attn.chunk(tp_size, dim=1)[tp_rank]
                     w_mlp_local = w_mlp.chunk(tp_size, dim=1)[tp_rank]
                     local_weight = torch.cat([w_attn_local, w_mlp_local], dim=1)
-                    
+
                     if name in params_dict:
                         params_dict[name].data.copy_(local_weight)
                         loaded_params.add(name)
@@ -664,19 +661,19 @@ class OvisImageTransformer2DModel(nn.Module):
                     w_h_local = w_hidden.chunk(tp_size, dim=0)[tp_rank]
                     w_g_local = w_gate.chunk(tp_size, dim=0)[tp_rank]
                     local_weight = torch.cat([w_h_local, w_g_local], dim=0)
-                    
+
                     if name in params_dict:
                         params_dict[name].data.copy_(local_weight)
                         loaded_params.add(name)
                     continue
-                    
+
             if ("net.0.proj.bias" in name) or ("proj_mlp.bias" in name):
                 if tp_size > 1:
                     b_hidden, b_gate = loaded_weight.chunk(2, dim=0)
                     b_h_local = b_hidden.chunk(tp_size, dim=0)[tp_rank]
                     b_g_local = b_gate.chunk(tp_size, dim=0)[tp_rank]
                     local_bias = torch.cat([b_h_local, b_g_local], dim=0)
-                    
+
                     if name in params_dict:
                         params_dict[name].data.copy_(local_bias)
                         loaded_params.add(name)
@@ -699,10 +696,9 @@ class OvisImageTransformer2DModel(nn.Module):
             # 4. Standard parameter loading
             if name not in params_dict:
                 continue
-            
+
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
         return loaded_params
