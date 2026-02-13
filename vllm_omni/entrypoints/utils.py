@@ -306,42 +306,37 @@ def in_container() -> bool:
     return any(m in cg for m in markers)
 
 
-def _nvml_pid_matches() -> bool | None:
-    """Check if os.getpid() matches what NVML would report via NSpid.
-
-    If /proc/self/status has a single NSpid entry, the container PID equals
-    the host PID, so NVML process-scoped memory tracking works correctly.
-
+def has_pid_host() -> bool | None:
+    """
     Returns:
-      True  -> PID namespaces match (single NSpid entry)
-      False -> PID namespaces differ (multiple NSpid entries)
+      True  -> very likely running with --pid=host (host PID namespace)
+      False -> very likely isolated PID namespace (default)
       None  -> cannot determine
     """
-    status = _read_text("/proc/self/status")
-    if status is None:
-        return None
-    for line in status.splitlines():
-        if line.startswith("NSpid:"):
-            pids = line.split()[1:]
-            # Single PID means container PID == host PID
-            return len(pids) == 1
-    return None
+    # Strong signal: in host pid namespace, PID 2 is usually kthreadd
+    comm2 = _read_text("/proc/2/comm")
+    if comm2 is not None:
+        comm2 = comm2.strip()
+        if comm2 == "kthreadd":
+            return True
+        # If PID 2 exists and is NOT kthreadd, we're almost certainly not in host pid ns
+        return False
+
+    # Fallback: check for other low-numbered kernel threads (best-effort)
+    for pid, name in [(3, "rcu_gp"), (4, "rcu_par_gp"), (10, "ksoftirqd/0")]:
+        comm = _read_text(f"/proc/{pid}/comm")
+        if comm is not None:
+            if comm.strip() == name:
+                return True
+            else:
+                return False
+
+    return False
 
 
 def detect_pid_host() -> bool:
-    """Check if os.getpid() matches the PID that NVML will report.
-
-    NVML always reports host-namespace PIDs.  If this process lives in a
-    different PID namespace the match will fail and process-scoped memory
-    tracking won't work.  We detect this via the NSpid field in
-    /proc/self/status: a single entry means host PID == container PID.
-    """
-    if not in_container():
+    ic = in_container()
+    if not ic:
         return True
 
-    result = _nvml_pid_matches()
-    if result is not None:
-        return result
-
-    # Cannot determine — assume mismatch to be safe.
-    return False
+    return has_pid_host()
