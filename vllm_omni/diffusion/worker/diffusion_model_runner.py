@@ -26,7 +26,7 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.offload import apply_offload_hooks
+from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -62,6 +62,7 @@ class DiffusionModelRunner:
         self.device = device
         self.pipeline = None
         self.cache_backend = None
+        self.offload_backend = None
 
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -69,6 +70,8 @@ class DiffusionModelRunner:
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
+        load_format: str | None = None,
+        custom_pipeline_name: str | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.
@@ -76,7 +79,17 @@ class DiffusionModelRunner:
         Args:
             memory_pool_context_fn: Optional function that returns a context manager
                 for memory pool allocation (used for sleep mode).
+            load_format: Format for loading model weights. Supported formats:
+                - "default" (default): Automatically detect and use the default format based on configuration
+                - "custom_pipeline": Init model from a custom pipeline class specified by `custom_pipeline_name`
+                - "dummy": Skip actual weight loading, useful for testing and custom pipelines that
+                    don't require default weights.
+            custom_pipeline_name: Optional custom pipeline class name to use.
         """
+
+        if load_format == "dummy":
+            return
+
         load_device = (
             "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
         )
@@ -96,6 +109,8 @@ class DiffusionModelRunner:
                 self.pipeline = model_loader.load_model(
                     od_config=self.od_config,
                     load_device=load_device,
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
                 )
         time_after_load = time.perf_counter()
 
@@ -107,8 +122,10 @@ class DiffusionModelRunner:
         logger.info("Model runner: Model loaded successfully.")
 
         # Apply CPU offloading
-        if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
-            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
+        self.offload_backend = get_offload_backend(self.od_config, device=self.device)
+        if self.offload_backend is not None:
+            logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
+            self.offload_backend.enable(self.pipeline)
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:

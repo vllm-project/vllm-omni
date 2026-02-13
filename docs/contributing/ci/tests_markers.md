@@ -7,7 +7,8 @@ Defined in `pyproject.toml`:
 
 | Marker             | Description                                               |
 | ------------------ | --------------------------------------------------------- |
-| `core_model`       | Core model tests (run in each PR)                         |
+| `core_model`       | L1&L2 tests (run in each PR)                              |
+| `advanced_model`   | L3&L4 level tests (run in each merge or nightly)          |
 | `diffusion`        | Diffusion model tests                                     |
 | `omni`             | Omni model tests                                          |
 | `cache`            | Cache backend tests                                       |
