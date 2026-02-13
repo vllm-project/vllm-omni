@@ -377,6 +377,9 @@ def _distributed_tiled_decode_wan(
     tile_latent_stride_height = tile_sample_stride_height // spatial_compression_ratio
     tile_latent_stride_width = tile_sample_stride_width // spatial_compression_ratio
 
+    if not (width > tile_latent_min_width or height > tile_latent_min_height):
+        return orig_decode(z, return_dict=False)[0]
+
     patch_size = getattr(getattr(vae, "config", None), "patch_size", None)
     sample_height = height * spatial_compression_ratio
     sample_width = width * spatial_compression_ratio
@@ -384,15 +387,13 @@ def _distributed_tiled_decode_wan(
     if patch_size is not None:
         sample_height = sample_height // patch_size
         sample_width = sample_width // patch_size
-        t_stride_h = tile_sample_stride_height // patch_size
-        t_stride_w = tile_sample_stride_width // patch_size
-        blend_height = tile_sample_min_height // patch_size - t_stride_h
-        blend_width = tile_sample_min_width // patch_size - t_stride_w
+        tile_sample_stride_height = tile_sample_stride_height // patch_size
+        tile_sample_stride_width = tile_sample_stride_width // patch_size
+        blend_height = tile_sample_min_height // patch_size - tile_sample_stride_height
+        blend_width = tile_sample_min_width // patch_size - tile_sample_stride_width
     else:
-        t_stride_h = tile_sample_stride_height
-        t_stride_w = tile_sample_stride_width
-        blend_height = tile_sample_min_height - t_stride_h
-        blend_width = tile_sample_min_width - t_stride_w
+        blend_height = tile_sample_min_height - tile_sample_stride_height
+        blend_width = tile_sample_min_width - tile_sample_stride_width
 
     # Enumerate spatial tile grid.
     h_starts = list(range(0, height, tile_latent_stride_height))
@@ -412,6 +413,7 @@ def _distributed_tiled_decode_wan(
     tile_id = 0
     for i in h_starts:
         for j in w_starts:
+            # Offset assignment by 1 so rank0 avoids decoding the largest (tile_id=0) tile.
             tile_rank = (tile_id + 1) % pp_size
             if active and (tile_rank == rank):
                 # Decode all temporal frames for this spatial tile.
@@ -451,56 +453,49 @@ def _distributed_tiled_decode_wan(
 
     out_channels = _get_vae_out_channels(vae)
 
-    # Compute max tile spatial dims across all ranks for padded gather.
-    local_max_t = max((m[1] for m in local_meta), default=0)
-    local_max_h = max((m[2] for m in local_meta), default=0)
-    local_max_w = max((m[3] for m in local_meta), default=0)
-    local_max_tensor = torch.tensor([local_max_t, local_max_h, local_max_w], device=z.device, dtype=torch.int64)
-    dist.all_reduce(local_max_tensor, op=dist.ReduceOp.MAX, group=group)
-    max_t = int(local_max_tensor[0].item())
-    max_h = int(local_max_tensor[1].item())
-    max_w = int(local_max_tensor[2].item())
-
     # Prepare padded metadata + tiles for gather.
     meta_tensor = torch.full((max_count, 4), -1, device=z.device, dtype=torch.int64)
-    tile_tensor = torch.zeros(
-        (max_count, z.shape[0], out_channels, max_t, max_h, max_w),
-        device=z.device,
-        dtype=z.dtype,
-    )
     for idx, (tid, t_dim, h_dim, w_dim) in enumerate(local_meta):
         meta_tensor[idx, 0] = tid
         meta_tensor[idx, 1] = t_dim
         meta_tensor[idx, 2] = h_dim
         meta_tensor[idx, 3] = w_dim
-        tile_tensor[idx, :, :, :t_dim, :h_dim, :w_dim] = local_tiles[idx]
 
     if rank == 0:
         meta_gather = [torch.empty_like(meta_tensor) for _ in range(world_size)]
-        tile_gather = [torch.empty_like(tile_tensor) for _ in range(world_size)]
     else:
         meta_gather = None
-        tile_gather = None
-
     dist.gather(meta_tensor, gather_list=meta_gather, dst=0, group=group)
-    dist.gather(tile_tensor, gather_list=tile_gather, dst=0, group=group)
 
-    if rank != 0:
+    # Transfer tile data via point-to-point send/recv so that inactive ranks
+    # (rank >= pp_size) never allocate large tile buffers.
+    if rank == 0:
+        tile_map: dict[int, torch.Tensor] = {}
+        # Own tiles (rank 0).
+        for idx, (tid, _, _, _) in enumerate(local_meta):
+            tile_map[tid] = local_tiles[idx]
+        # Receive from other ranks.
+        for src_rank in range(1, world_size):
+            meta_src = meta_gather[src_rank]
+            for idx in range(max_count):
+                tid = int(meta_src[idx, 0].item())
+                if tid < 0:
+                    continue
+                t_dim = int(meta_src[idx, 1].item())
+                h_dim = int(meta_src[idx, 2].item())
+                w_dim = int(meta_src[idx, 3].item())
+                buf = torch.empty(
+                    (z.shape[0], out_channels, t_dim, h_dim, w_dim),
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+                dist.recv(buf, src=src_rank, group=group)
+                tile_map[tid] = buf
+    else:
+        # Active non-zero ranks send their tiles; inactive ranks have nothing.
+        for tile in local_tiles:
+            dist.send(tile.contiguous(), dst=0, group=group)
         return torch.empty(0, device=z.device, dtype=z.dtype)
-
-    # Reconstruct tile grid on rank0.
-    tile_map: dict[int, torch.Tensor] = {}
-    for src_rank in range(world_size):
-        meta_src = meta_gather[src_rank]  # type: ignore[index]
-        tiles_src = tile_gather[src_rank]  # type: ignore[index]
-        for idx in range(max_count):
-            tid = int(meta_src[idx, 0].item())
-            if tid < 0:
-                continue
-            t_dim = int(meta_src[idx, 1].item())
-            h_dim = int(meta_src[idx, 2].item())
-            w_dim = int(meta_src[idx, 3].item())
-            tile_map[tid] = tiles_src[idx, :, :, :t_dim, :h_dim, :w_dim]
 
     rows: list[list[torch.Tensor]] = []
     for r in range(num_rows):
@@ -515,13 +510,14 @@ def _distributed_tiled_decode_wan(
     for i, row in enumerate(rows):
         result_row: list[torch.Tensor] = []
         for j, tile in enumerate(row):
+            # blend the above tile and the left tile
+            # to the current tile and add the current tile to the result row
             if i > 0:
                 tile = vae.blend_v(rows[i - 1][j], tile, blend_height)
             if j > 0:
                 tile = vae.blend_h(row[j - 1], tile, blend_width)
-            result_row.append(tile[:, :, :, :t_stride_h, :t_stride_w])
+            result_row.append(tile[:, :, :, :tile_sample_stride_height, :tile_sample_stride_width])
         result_rows.append(torch.cat(result_row, dim=-1))
-
     dec = torch.cat(result_rows, dim=3)[:, :, :, :sample_height, :sample_width]
 
     if patch_size is not None:
