@@ -13,10 +13,10 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      max_model_len: 2400
-      max_num_batched_tokens: 2400
+      max_model_len: 8000
+      max_num_batched_tokens: 8000
       max_num_seqs: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.85
       skip_mm_profiling: true
       enforce_eager: true  # Now we only support eager mode
       trust_remote_code: true
@@ -43,10 +43,10 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      max_model_len: 2400
-      max_num_batched_tokens: 2400
+      max_model_len: 8000
+      max_num_batched_tokens: 8000
       max_num_seqs: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.85
       skip_mm_profiling: true
       enforce_eager: true
       trust_remote_code: true
@@ -66,7 +66,7 @@ stage_args:
   - stage_id: 2
     runtime:
       process: true
-      devices: "0"            # Example: use a different GPU than the previous stage; use "0" if single GPU
+      devices: "2"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
