@@ -332,6 +332,15 @@ class OmniDiffusionConfig:
     # TODO: do not hard code
     master_port: int | None = None
 
+    # Worker extension class for custom functionality
+    worker_extension_cls: str | None = None
+
+    # Custom pipeline arguments for custom pipelines
+    custom_pipeline_args: dict[str, Any] | None = None
+
+    # Diffusion model loading format
+    diffusion_load_format: str = "default"  # "default", "custom_pipeline", "dummy"
+
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None
