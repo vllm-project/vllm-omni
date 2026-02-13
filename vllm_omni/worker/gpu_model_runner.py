@@ -799,13 +799,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         - runtime_additional_information: per-request additional information stored in request state
         """
         model_kwargs_extra: dict[str, object] = {}
-        try:
-            model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
-        except Exception as e:
-            logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
-            import traceback
+        # try:
+        #     model_kwargs_extra["runtime_additional_information"] = self._gather_runtime_additional_information()
+        # except Exception as e:
+        #     logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
+        #     import traceback
 
-            traceback.print_exc()
+        #     traceback.print_exc()
         return model_kwargs_extra
 
     def _process_additional_information_updates(

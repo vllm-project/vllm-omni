@@ -266,15 +266,16 @@ class GPUARModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
-                sampling_metadata=self.input_batch.sampling_metadata,
-                logits_index=logits_indices,
-                sampler=self.sampler,
+                # sampling_metadata=self.input_batch.sampling_metadata,
+                # logits_index=logits_indices,
+                # sampler=self.sampler,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):

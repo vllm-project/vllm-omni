@@ -1,0 +1,34 @@
+# Stage config for running Apertus with a single Omni LLM stage.
+# Text+image inputs are preprocessed by OmniInputPreprocessor into token IDs,
+# then Apertus runs as a token-to-token causal LM.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 64
+    engine_args:
+      model_stage: generation
+      model_arch: ApertusForCausalLM
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+      trust_remote_code: false
+      engine_output_type: text
+      enable_prefix_caching: true
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0

@@ -23,6 +23,10 @@ from vllm_omni.engine import (
     OmniEngineCoreRequest,
     PromptEmbedsPayload,
 )
+from vllm_omni.inputs.apertus_preprocess import (
+    ApertusOmniInputPreprocessor,
+    is_apertus_model_config,
+)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.lora.request import LoRARequest
 
@@ -79,7 +83,12 @@ class OmniInputProcessor(InputProcessor):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
         super().__init__(vllm_config, tokenizer, mm_registry)
-        self.input_preprocessor = OmniInputPreprocessor(
+        preprocessor_cls = (
+            ApertusOmniInputPreprocessor
+            if is_apertus_model_config(self.model_config)
+            else OmniInputPreprocessor
+        )
+        self.input_preprocessor = preprocessor_cls(
             self.model_config,
             self.tokenizer,
             mm_registry,
