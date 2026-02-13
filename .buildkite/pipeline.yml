@@ -12,6 +12,7 @@ steps:
   # L2 Test
   - label: "Upload Ready Pipeline"
     depends_on: image-build
+    key: upload-ready-pipeline
     if: build.branch != "main"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-ready.yml
@@ -21,6 +22,7 @@ steps:
   # L3 Test
   - label: "Upload Merge Pipeline"
     depends_on: image-build
+    key: upload-merge-pipeline
     if: build.branch == "main"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-merge.yml
@@ -30,6 +32,7 @@ steps:
   # L4 Test
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
+    key: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
