@@ -52,7 +52,7 @@ def extract_content_after_keyword(keywords, text):
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_001(omni_server) -> None:
     command = [
         "python",
@@ -87,7 +87,7 @@ def test_send_multimodal_request_001(omni_server) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_002(omni_server) -> None:
     command = [
         "python",
@@ -122,7 +122,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
     command = ["bash", os.path.join(example_dir, "run_curl_multimodal_generation.sh"), "mixed_modalities"]
 
@@ -145,7 +145,7 @@ def test_send_multimodal_request_003(omni_server) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_001(omni_server) -> None:
     command = [
         "python",
@@ -175,7 +175,7 @@ def test_modality_control_001(omni_server) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_002(omni_server) -> None:
     command = [
         "python",
@@ -203,7 +203,7 @@ def test_modality_control_002(omni_server) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_003(omni_server) -> None:
     command = [
         "python",
@@ -240,7 +240,7 @@ def test_modality_control_003(omni_server) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_stream_001(omni_server) -> None:
     command = [
         "python",
