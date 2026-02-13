@@ -11,6 +11,7 @@ from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
+from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -40,6 +41,33 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
 
+    def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
+        """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
+
+        The upstream FlashAttentionMetadataBuilder pre-allocates
+        scheduler_metadata with (max_num_seqs + 1) entries, but FA3's
+        get_scheduler_metadata() can return up to
+        (max_num_seqs * max_num_splits + 1) entries, causing a RuntimeError
+        during CUDA graph capture.  After calling the parent implementation
+        we resize any too-small buffers.
+        """
+        super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+
+        for kv_cache_group in self.attn_groups:
+            for attn_group in kv_cache_group:
+                for builder in attn_group.metadata_builders:
+                    sm = getattr(builder, "scheduler_metadata", None)
+                    max_num_splits = getattr(builder, "max_num_splits", 0)
+                    if sm is not None and max_num_splits > 1:
+                        required = self.scheduler_config.max_num_seqs * max_num_splits + 1
+                        if sm.shape[0] < required:
+                            builder.scheduler_metadata = torch.zeros(
+                                required,
+                                dtype=sm.dtype,
+                                device=sm.device,
+                            )
+
+    @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         # TODO move this model specific logic to a separate class
@@ -422,8 +450,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_profile: bool = False,
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
-        activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        num_active_loras: int = 0,
+        activate_lora: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -446,8 +475,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
-            activate_lora: If False, dummy_run is performed without LoRAs.
+            num_active_loras: Number of active LoRAs to capture for.
+            activate_lora: Backward-compatible override for LoRA activation.
         """
+        if activate_lora is None:
+            activate_lora = num_active_loras > 0
+
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
@@ -525,6 +558,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
                 force_has_lora=activate_lora,
+                # Capture shape specialization for specific active LoRA counts.
+                force_num_active_loras=num_active_loras,
             )
         )
 

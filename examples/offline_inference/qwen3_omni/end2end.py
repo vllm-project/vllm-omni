@@ -226,37 +226,6 @@ def get_multi_audios_query() -> QueryResult:
     )
 
 
-# def get_use_audio_in_video_query(video_path: str | None = None) -> QueryResult:
-# question = (
-#     "Describe the content of the video in details, then convert what the "
-#     "baby say into text."
-# )
-# prompt = (
-#     f"<|im_start|>system\n{default_system}<|im_end|>\n"
-#     "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>"
-#     f"{question}<|im_end|>\n"
-#     f"<|im_start|>assistant\n"
-# )
-# if video_path:
-#     if not os.path.exists(video_path):
-#         raise FileNotFoundError(f"Video file not found: {video_path}")
-#     video_frames = video_to_ndarrays(video_path, num_frames=16)
-# else:
-#     video_frames = VideoAsset(name="baby_reading", num_frames=16).np_ndarrays
-# audio = extract_video_audio(video_path, sampling_rate=16000)
-# return QueryResult(
-#     inputs={
-#         "prompt": prompt,
-#         "multi_modal_data": {
-#             "video": video_frames,
-#             "audio": audio,
-#         },
-#         "mm_processor_kwargs": {
-#             "use_audio_in_video": True,
-#         },
-#     },
-#     limit_mm_per_prompt={"audio": 1, "video": 1},
-# )
 def get_use_audio_in_video_query() -> QueryResult:
     question = "Describe the content of the video in details, then convert what the baby say into text."
     prompt = (

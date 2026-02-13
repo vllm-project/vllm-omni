@@ -4,6 +4,7 @@ import os
 import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
@@ -25,6 +26,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         worker_cls: "vllm_omni.worker.gpu_generation_model_runner.GPUGenerationModelRunner"
     """
 
+    @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
