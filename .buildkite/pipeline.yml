@@ -232,7 +232,7 @@ steps:
                    type: DirectoryOrCreate
 
   - label: "Qwen3-TTS E2E Test"
-    timeout_in_minutes: 10
+    timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG

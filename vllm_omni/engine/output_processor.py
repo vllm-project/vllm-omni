@@ -1,4 +1,3 @@
-from ast import Dict
 from collections.abc import Callable
 from typing import Any
 
@@ -37,8 +36,9 @@ class OmniRequestState(RequestState):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Omni-specific: multimodal output accumulation
         self.mm_type: str | None = None
-        self.mm_accumulated: Dict[str, Any] | None = None
+        self.mm_accumulated: dict[str, Any] | None = None
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
@@ -57,7 +57,7 @@ class OmniRequestState(RequestState):
                 return x
 
             if isinstance(payload, dict):
-                incoming: Dict[str, Any] = {}
+                incoming: dict[str, Any] = {}
                 target_key = self.mm_type or "hidden"
 
                 # Iterate directly without unnecessary dict copy
@@ -205,17 +205,18 @@ class OmniRequestState(RequestState):
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
                 self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
 
-        request_id = self.request_id
+        external_req_id = self.external_req_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
         else:
-            request_id, outputs, finished = self.parent_req.get_outputs(request_id, output)
+            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
             if not outputs:
                 return None
+            external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(request_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
 
     def _new_completion_output(
         self,
@@ -257,8 +258,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
     def __init__(
         self,
-        tokenizer: TokenizerLike,
+        tokenizer: TokenizerLike | None,
         log_stats: bool,
+        stream_interval: int = 1,
         engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
@@ -266,11 +268,12 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         Args:
             tokenizer: Tokenizer for detokenizing text outputs
             log_stats: Whether to log statistics
+            stream_interval: Stream interval for output generation
             engine_core_output_type: Optional output type specification
                 (e.g., "image", "audio", "latents"). Used to route outputs
                 to appropriate processors. If None, output type is inferred.
         """
-        super().__init__(tokenizer=tokenizer, log_stats=log_stats)
+        super().__init__(tokenizer=tokenizer, log_stats=log_stats, stream_interval=stream_interval)
         self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
         self._reqid_to_mm_type: dict[str, str] = {}
         self.engine_core_output_type = engine_core_output_type

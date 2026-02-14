@@ -50,7 +50,10 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
     cudagraph_stats: Any
+    # OMNI: multimodal_outputs field for omni-specific multimodal handling
     multimodal_outputs: Any
+    # slot_mappings for attention/drafter (aligned with upstream v1 API)
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
 class GPUARModelRunner(OmniGPUModelRunner):
@@ -386,6 +389,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: pass slot_mappings for drafter
         )
         self.kv_connector_output = kv_connector_output
 
@@ -428,6 +432,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: unpack slot_mappings for drafter
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -454,6 +459,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    slot_mappings,  # OMNI: pass slot_mappings to drafter (upstream v1 API)
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 

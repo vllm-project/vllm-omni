@@ -33,7 +33,13 @@ class SharedMemoryConnector(OmniConnectorBase):
             "inline_writes": 0,
         }
 
-    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
+    def put(
+        self,
+        from_stage: str,
+        to_stage: str,
+        put_key: str,
+        data: Any,
+    ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             # Always serialize first to check size (and for SHM writing)
             # Note: For extremely large objects in "inline" mode (e.g. Ray),
@@ -42,9 +48,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            metadata = {}
-            # if size > self.threshold:
-            if True:  # TODO: correct put & get logic
+            if True:
                 # Use Shared Memory
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
                 with open(lock_file, "w") as lockf:
@@ -53,13 +57,13 @@ class SharedMemoryConnector(OmniConnectorBase):
                     fcntl.flock(lockf, fcntl.LOCK_UN)
 
                 # meta contains {'name': ..., 'size': ...}
-                metadata[put_key] = {"shm": meta, "size": size}
+                metadata = {"shm": meta, "size": size}
                 self._metrics["shm_writes"] += 1
             else:
                 # Inline - pass bytes directly to avoid double serialization of the object
                 # We already serialized it to check size, so we pass the bytes.
                 # The Queue will pickle these bytes (fast), avoiding re-serializing the complex object.
-                metadata[put_key] = {"inline_bytes": payload, "size": size}
+                metadata = {"inline_bytes": payload, "size": size}
                 self._metrics["inline_writes"] += 1
 
             self._metrics["puts"] += 1
@@ -71,7 +75,47 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+    def get(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata=None,
+    ) -> tuple[Any, int] | None:
+        if metadata is not None:
+            # Some callers may wrap metadata by request id.
+            if isinstance(metadata, dict) and get_key in metadata:
+                metadata = metadata.get(get_key)
+
+            if not isinstance(metadata, dict):
+                return None
+
+            if "inline_bytes" in metadata:
+                try:
+                    obj = self.deserialize_obj(metadata["inline_bytes"])
+                    return obj, int(metadata.get("size", 0))
+                except Exception as e:
+                    logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
+                    return None
+
+            if "shm" in metadata:
+                try:
+                    shm_handle = metadata["shm"]
+                    lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                    with open(lock_file, "w") as lockf:
+                        fcntl.flock(lockf, fcntl.LOCK_SH)
+                        data_bytes = shm_read_bytes(shm_handle)
+                        fcntl.flock(lockf, fcntl.LOCK_UN)
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
+                    obj = self.deserialize_obj(data_bytes)
+                    return obj, int(metadata.get("size", 0))
+                except Exception as e:
+                    logger.error(f"SharedMemoryConnector shm get failed for req {get_key}: {e}")
+                    return None
+
+            return None
+
         from multiprocessing import shared_memory as shm_pkg
 
         # Wait for shared memory to be available (with retry logic)
@@ -89,10 +133,10 @@ class SharedMemoryConnector(OmniConnectorBase):
                 else:
                     # Max retries reached, return None
                     logger.warning(f"Shared memory '{get_key}' not found after {max_retries} retries")
-                    return None, 0
+                    return None
 
         if shm is None:
-            return None, 0
+            return None
 
         try:
             lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"

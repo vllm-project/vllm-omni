@@ -128,9 +128,10 @@ class OmniRequestOutput:
         For diffusion outputs, this returns the local _multimodal_output field.
         """
         if self.request_output is not None:
-            # Check completion outputs first (where multimodal_output is attached)
-            if self.request_output.outputs:
-                for output in self.request_output.outputs:
+            # Check completion outputs first (where multimodal_output is attached).
+            outputs = getattr(self.request_output, "outputs", None)
+            if isinstance(outputs, list) and outputs:
+                for output in outputs:
                     mm = getattr(output, "multimodal_output", None)
                     if mm:
                         return mm
