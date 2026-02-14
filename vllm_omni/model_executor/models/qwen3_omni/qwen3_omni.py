@@ -155,6 +155,8 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
             self._init_special_tokens_embeddings()
+            # suppress tokens by setting their probability to ~1e-9 (finite very small)
+            self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
 
         elif self.model_stage == "code2wav":
@@ -1067,18 +1069,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # implemented by assigning their logits to log(1e-9).
 
         if getattr(self, "model_stage", None) == "talker" and isinstance(logits, torch.Tensor):
-            # suppress tokens by setting their probability to ~1e-9 (finite very small)
-            suppressed_tokens = self._get_talker_suppressed_tokens()
             try:
                 logits_cpu = logits.cpu()
-                logits_cpu[:, suppressed_tokens] = -1e9
+                logits_cpu[:, self.suppressed_tokens] = -1e9
                 logits = logits_cpu.to(logits.device)
             except Exception as e:
                 print(f"Error in logits suppression: {e}")
                 print(f"logits.shape: {logits.shape}")
-                print(f"suppressed_tokens: {suppressed_tokens}")
+                print(f"self.suppressed_tokens: {self.suppressed_tokens}")
                 raise e
-            logits[:, suppressed_tokens] = -1e9
+            logits[:, self.suppressed_tokens] = -1e9
         return logits
 
     def sample(
