@@ -1057,7 +1057,8 @@ def omni_server(request, run_level):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        model, stage_config_path = request.param
+        *port, model, stage_config_path = request.param
+        port = port[0] if port else None
         if run_level == "advanced_model":
             stage_config_path = modify_stage_config(
                 stage_config_path,
@@ -1070,7 +1071,8 @@ def omni_server(request, run_level):
                 },
             )
 
-        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+        server_args = ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]
+        with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
@@ -1288,11 +1290,15 @@ class OpenAIClientHandler:
 
         responses = []
         stream = request_config.get("stream", False)
+        modalities = request_config.get("modalities", ["text", "audio"])
 
         if request_num == 1:
             # Send single request
             chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"), messages=request_config.get("messages"), stream=stream
+                model=request_config.get("model"),
+                messages=request_config.get("messages"),
+                stream=stream,
+                modalities=modalities,
             )
 
             if stream:
@@ -1314,6 +1320,7 @@ class OpenAIClientHandler:
                         self.client.chat.completions.create,
                         model=request_config.get("model"),
                         messages=request_config.get("messages"),
+                        modalities=modalities,
                         stream=stream,
                     )
                     futures.append(future)
