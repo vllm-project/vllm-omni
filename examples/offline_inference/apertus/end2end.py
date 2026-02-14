@@ -99,8 +99,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--emu-checkpoint",
         type=str,
-        default="BAAI/Emu3-VisionTokenizer",
-        help="EMU vision tokenizer checkpoint (lmms-eval default).",
+        default="BAAI/Emu3.5-VisionTokenizer",
+        help="EMU3.5 IBQ vision tokenizer checkpoint (lmms-eval default).",
     )
     parser.add_argument(
         "--emu-device",

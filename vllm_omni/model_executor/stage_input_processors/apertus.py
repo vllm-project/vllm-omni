@@ -16,20 +16,12 @@ def merge_image_placeholders(
     image_placeholder: str = "<|image|>",
 ) -> str:
     """Replace image placeholders in order with serialized image token strings.
-
-    If no placeholder appears in the prompt, this method prepends one
-    placeholder per image (same behavior used by simple prompt style).
     """
     if not image_prompts:
         return prompt
 
     merged_prompt = prompt
     placeholder_count = merged_prompt.count(image_placeholder)
-
-    if placeholder_count == 0:
-        image_prefix = " ".join([image_placeholder] * len(image_prompts))
-        merged_prompt = f"{image_prefix}\n{merged_prompt}" if merged_prompt else image_prefix
-        placeholder_count = len(image_prompts)
 
     if placeholder_count != len(image_prompts):
         raise ValueError(

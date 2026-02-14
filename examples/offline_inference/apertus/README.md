@@ -24,7 +24,7 @@ python3 examples/offline_inference/apertus/end2end.py \
   --temperature 0.0 \
   --top-p 1.0 \
   --top-k -1 \
-  --emu-checkpoint BAAI/Emu3-VisionTokenizer \
+  --emu-checkpoint BAAI/Emu3.5-VisionTokenizer \
   --emu-device cuda:0 \
   --emu-dtype bfloat16
 ```
@@ -39,7 +39,7 @@ python3 examples/offline_inference/apertus/end2end.py \
   --stage-configs-path vllm_omni/model_executor/stage_configs/apertus.yaml \
   --image-path /path/to/image.jpg \
   --prompt "What is in this image? <|image|>" \
-  --emu-checkpoint BAAI/Emu3-VisionTokenizer \
+  --emu-checkpoint BAAI/Emu3.5-VisionTokenizer \
   --emu-device cuda:0 \
   --emu-dtype bfloat16
 ```

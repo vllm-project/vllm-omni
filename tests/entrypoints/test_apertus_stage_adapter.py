@@ -17,14 +17,14 @@ def test_merge_image_placeholders_replaces_in_order():
     assert merged == "Describe this: <img_a> and then this: <img_b>."
 
 
-def test_merge_image_placeholders_adds_prefix_when_missing():
+def test_merge_image_placeholders_requires_explicit_placeholders():
     prompt = "What is in the image?"
-    merged = merge_image_placeholders(
-        prompt,
-        image_prompts=["<img_a>", "<img_b>"],
-        image_placeholder="<|image|>",
-    )
-    assert merged == "<img_a> <img_b>\nWhat is in the image?"
+    with pytest.raises(ValueError, match="Mismatch"):
+        merge_image_placeholders(
+            prompt,
+            image_prompts=["<img_a>", "<img_b>"],
+            image_placeholder="<|image|>",
+        )
 
 
 def test_merge_image_placeholders_raises_on_count_mismatch():
