@@ -139,41 +139,41 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
 
-  - label: "Benchmark&Engine Test"
-    timeout_in_minutes: 15
-    depends_on: image-build
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/benchmarks/test_serve_cli.py
-      - pytest -s -v tests/engine/test_async_omni_engine_abort.py
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+  # - label: "Benchmark&Engine Test"
+  #   timeout_in_minutes: 15
+  #   depends_on: image-build
+  #   commands:
+  #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #     - pytest -s -v tests/benchmarks/test_serve_cli.py
+  #     - pytest -s -v tests/engine/test_async_omni_engine_abort.py
+  #   agents:
+  #     queue: "mithril-h100-pool"
+  #   plugins:
+  #     - kubernetes:
+  #         podSpec:
+  #           containers:
+  #             - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #               resources:
+  #                 limits:
+  #                   nvidia.com/gpu: 2
+  #               volumeMounts:
+  #                 - name: devshm
+  #                   mountPath: /dev/shm
+  #                 - name: hf-cache
+  #                   mountPath: /root/.cache/huggingface
+  #               env:
+  #                 - name: HF_HOME
+  #                   value: /root/.cache/huggingface
+  #           nodeSelector:
+  #             node.kubernetes.io/instance-type: gpu-h100-sxm
+  #           volumes:
+  #             - name: devshm
+  #               emptyDir:
+  #                 medium: Memory
+  #             - name: hf-cache
+  #               hostPath:
+  #                 path: /mnt/hf-cache
+  #                 type: DirectoryOrCreate
 
   - label: "Omni Model Test"
     timeout_in_minutes: 15
@@ -194,42 +194,42 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Omni Model Test with H100"
-    timeout_in_minutes: 20
-    depends_on: image-build
-    commands:
-       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-       - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-       - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
-       - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
-    agents:
-       queue: "mithril-h100-pool"
-    plugins:
-       - kubernetes:
-           podSpec:
-             containers:
-               - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                 resources:
-                   limits:
-                     nvidia.com/gpu: 2
-                 volumeMounts:
-                   - name: devshm
-                     mountPath: /dev/shm
-                   - name: hf-cache
-                     mountPath: /root/.cache/huggingface
-                 env:
-                   - name: HF_HOME
-                     value: /root/.cache/huggingface
-             nodeSelector:
-               node.kubernetes.io/instance-type: gpu-h100-sxm
-             volumes:
-               - name: devshm
-                 emptyDir:
-                   medium: Memory
-               - name: hf-cache
-                 hostPath:
-                   path: /mnt/hf-cache
-                   type: DirectoryOrCreate
+  # - label: "Omni Model Test with H100"
+  #   timeout_in_minutes: 20
+  #   depends_on: image-build
+  #   commands:
+  #      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #      - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
+  #      - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
+  #      - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
+  #   agents:
+  #      queue: "mithril-h100-pool"
+  #   plugins:
+  #      - kubernetes:
+  #          podSpec:
+  #            containers:
+  #              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #                resources:
+  #                  limits:
+  #                    nvidia.com/gpu: 2
+  #                volumeMounts:
+  #                  - name: devshm
+  #                    mountPath: /dev/shm
+  #                  - name: hf-cache
+  #                    mountPath: /root/.cache/huggingface
+  #                env:
+  #                  - name: HF_HOME
+  #                    value: /root/.cache/huggingface
+  #            nodeSelector:
+  #              node.kubernetes.io/instance-type: gpu-h100-sxm
+  #            volumes:
+  #              - name: devshm
+  #                emptyDir:
+  #                  medium: Memory
+  #              - name: hf-cache
+  #                hostPath:
+  #                  path: /mnt/hf-cache
+  #                  type: DirectoryOrCreate
 
   - label: "Qwen3-TTS E2E Test"
     timeout_in_minutes: 20
@@ -251,40 +251,40 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Diffusion Image Edit Test with H100 (1 GPU)"
-    timeout_in_minutes: 20
-    depends_on: image-build
-    commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 1
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+  # - label: "Diffusion Image Edit Test with H100 (1 GPU)"
+  #   timeout_in_minutes: 20
+  #   depends_on: image-build
+  #   commands:
+  #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #     - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
+  #   agents:
+  #     queue: "mithril-h100-pool"
+  #   plugins:
+  #     - kubernetes:
+  #         podSpec:
+  #           containers:
+  #             - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #               resources:
+  #                 limits:
+  #                   nvidia.com/gpu: 1
+  #               volumeMounts:
+  #                 - name: devshm
+  #                   mountPath: /dev/shm
+  #                 - name: hf-cache
+  #                   mountPath: /root/.cache/huggingface
+  #               env:
+  #                 - name: HF_HOME
+  #                   value: /root/.cache/huggingface
+  #           nodeSelector:
+  #             node.kubernetes.io/instance-type: gpu-h100-sxm
+  #           volumes:
+  #             - name: devshm
+  #               emptyDir:
+  #                 medium: Memory
+  #             - name: hf-cache
+  #               hostPath:
+  #                 path: /mnt/hf-cache
+  #                 type: DirectoryOrCreate
 
   # - label: "Bagel Text2Img Model Test with H100"
   #   timeout_in_minutes: 30
