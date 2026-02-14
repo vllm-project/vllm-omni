@@ -1,8 +1,9 @@
-# LoRA-Inference
+# LoRA Inference(Diffusion)
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/lora_inference>.
 
-This contains examples for using LoRA (Low-Rank Adaptation) adapters with vLLM-omni diffusion models for offline inference.
+
+This directory contains examples for using LoRA (Low-Rank Adaptation) adapters with vLLM-omni diffusion models for offline inference.
 The example uses the  `stabilityai/stable-diffusion-3.5-medium` as the default model, but you can replace it with other models in vLLM-omni.
 
 ## Overview
@@ -25,7 +26,7 @@ python -m examples.offline_inference.lora_inference.lora_inference \
     --prompt "A piece of cheesecake" \
     --lora-path /path/to/lora/ \
     --lora-scale 1.0 \
-    --num_inference_steps 50 \
+    --num-inference-steps 50 \
     --height 1024 \
     --width 1024 \
     --output output_preloaded.png
@@ -42,7 +43,7 @@ python -m examples.offline_inference.lora_inference.lora_inference \
     --prompt "A piece of cheesecake" \
     --lora-request-path /path/to/lora/ \
     --lora-scale 1.0 \
-    --num_inference_steps 50 \
+    --num-inference-steps 50 \
     --height 1024 \
     --width 1024 \
     --output output_per_request.png
@@ -55,7 +56,7 @@ If no LoRA request is provided, we will use the base model without any LoRA adap
 ```bash
 python -m examples.offline_inference.lora_inference.lora_inference \
     --prompt "A piece of cheesecake" \
-    --num_inference_steps 50 \
+    --num-inference-steps 50 \
     --height 1024 \
     --width 1024 \
     --output output_no_lora.png
@@ -76,7 +77,7 @@ python -m examples.offline_inference.lora_inference.lora_inference \
 - `--seed`: Random seed for reproducibility (default: 42)
 - `--height`: Image height in pixels (default: 1024)
 - `--width`: Image width in pixels (default: 1024)
-- `--num_inference_steps`: Number of denoising steps (default: 50)
+- `--num-inference-steps`: Number of denoising steps (default: 50)
 - `--output`: Output file path (default: `lora_output.png`)
 
 ## How LoRA Works

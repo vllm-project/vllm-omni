@@ -5,6 +5,7 @@ import io
 import json
 import os
 import random
+import ssl
 import sys
 import time
 import traceback
@@ -71,6 +72,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    text_latency: float = 0.0
 
 
 async def async_request_openai_chat_omni_completions(
@@ -113,8 +115,8 @@ async def async_request_openai_chat_omni_completions(
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
+    timestamp = st
     audio_generate_time = 0.0
-    audio_first_timestamp = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -133,7 +135,6 @@ async def async_request_openai_chat_omni_completions(
                             continue
 
                         chunk = message.removeprefix("data: ")
-
                         if chunk != "[DONE]":
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
@@ -148,11 +149,12 @@ async def async_request_openai_chat_omni_completions(
                                     else:
                                         output.itl.append(timestamp - most_recent_timestamp)
                                     generated_text += content or ""
+                                    most_recent_timestamp = timestamp
+                                    output.text_latency = timestamp - st
                                 elif modality == "audio":
                                     if output.audio_ttfp == 0.0:
-                                        audio_first_timestamp = timestamp
                                         output.audio_ttfp = timestamp - st
-                                    audio_generate_time = timestamp - audio_first_timestamp
+                                    audio_generate_time = timestamp - st
                                     if content != "":
                                         audio_bytes = base64.b64decode(content)
                                         seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
@@ -162,10 +164,10 @@ async def async_request_openai_chat_omni_completions(
                                             else:
                                                 generated_audio = generated_audio + seg
 
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
-                            most_recent_timestamp = timestamp
+                            if metrics := data.get("metrics"):
+                                output.output_tokens = metrics.get("num_tokens_out", 0)
 
+                output.latency = timestamp - st
                 output.generated_text = generated_text
                 if generated_audio is not None:
                     output.audio_duration = len(generated_audio) / 1000.0
@@ -181,9 +183,7 @@ async def async_request_openai_chat_omni_completions(
                     else:
                         output.audio_rtf = 0
                         logger.warning("Audio duration is zero")
-
                 output.success = True
-                output.latency = most_recent_timestamp - st
             else:
                 output.error = response.reason or ""
                 output.success = False
@@ -241,6 +241,7 @@ async def benchmark(
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
+    ssl_context: ssl.SSLContext | bool | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -248,6 +249,7 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
     # Reuses connections across requests to reduce TLS handshake overhead.
+    ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
     connector = aiohttp.TCPConnector(
         limit=max_concurrency or 0,
         limit_per_host=max_concurrency or 0,
@@ -256,7 +258,7 @@ async def benchmark(
         keepalive_timeout=60,
         enable_cleanup_closed=True,
         force_close=False,
-        ssl=("https://" in api_url),
+        ssl=ssl_setting,
     )
 
     session = aiohttp.ClientSession(
@@ -473,6 +475,9 @@ async def benchmark(
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
+            "total_audio_duration_s": metrics.total_audio_duration_s,
+            "total_audio_frames": metrics.total_audio_frames,
+            "audio_throughput": metrics.audio_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
@@ -505,8 +510,20 @@ async def benchmark(
         if metric_attribute_name not in selected_percentile_metrics:
             return
         is_audio_rtf = metric_attribute_name == "audio_rtf"
+        is_audio_duration = metric_attribute_name == "audio_duration"
 
-        suffix = "" if is_audio_rtf else "_ms"
+        suffix = "_ms"
+        if is_audio_duration:
+            suffix = "_s"
+        elif is_audio_rtf:
+            suffix = ""
+        mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
+        mean_value = getattr(metrics, mean_attr_name, 0.0)
+        result[mean_attr_name] = mean_value
+
+        median_attr_name = f"median_{metric_attribute_name}{suffix}"
+        median_value = getattr(metrics, median_attr_name, 0.0)
+        result[median_attr_name] = median_value
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value

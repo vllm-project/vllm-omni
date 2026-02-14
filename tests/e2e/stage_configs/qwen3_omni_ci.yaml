@@ -24,6 +24,7 @@ stage_args:
     enable_prefix_caching: false
     hf_config_name: thinker_config
     tensor_parallel_size: 1
+    load_format: dummy
   final_output: true
   final_output_type: text
   is_comprehension: true
@@ -55,6 +56,7 @@ stage_args:
     max_model_len: 32768
     distributed_executor_backend: "mp"
     hf_config_name: talker_config
+    load_format: dummy
   engine_input_source: [0]
   custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
   default_sampling_params:

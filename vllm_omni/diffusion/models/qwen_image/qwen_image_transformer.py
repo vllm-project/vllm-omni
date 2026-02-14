@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
+from __future__ import annotations
+
 from collections.abc import Iterable
+from functools import lru_cache
 from math import prod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -22,6 +24,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -249,7 +256,7 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @functools.cache
+    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -268,7 +275,7 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
-    @functools.cache
+    @lru_cache(maxsize=16)
     def _compute_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -311,7 +318,6 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
-        self.rope_cache = {}
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
@@ -349,14 +355,7 @@ class QwenEmbedRope(nn.Module):
         max_vid_index = 0
         for idx, fhw in enumerate(video_fhw):
             frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
-
-            if not torch.compiler.is_compiling():
-                if rope_key not in self.rope_cache:
-                    self.rope_cache[rope_key] = self._compute_video_freqs(frame, height, width, idx)
-                video_freq = self.rope_cache[rope_key]
-            else:
-                video_freq = self._compute_video_freqs(frame, height, width, idx)
+            video_freq = self._compute_video_freqs(frame, height, width, idx)
             video_freq = video_freq.to(device)
             vid_freqs.append(video_freq)
 
@@ -371,7 +370,7 @@ class QwenEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @functools.cache
+    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -398,7 +397,16 @@ class QwenEmbedRope(nn.Module):
 
 
 class ColumnParallelApproxGELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str,
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -406,6 +414,8 @@ class ColumnParallelApproxGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
         )
         self.approximate = approximate
 
@@ -423,6 +433,8 @@ class FeedForward(nn.Module):
         activation_fn: str = "gelu-approximate",
         inner_dim: int | None = None,
         bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -432,13 +444,17 @@ class FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            ColumnParallelApproxGELU(
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=prefix
+            ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
                 inner_dim,
                 dim_out,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
             ),
         ]
 
@@ -464,6 +480,7 @@ class QwenImageCrossAttention(nn.Module):
         pre_only: bool = False,
         context_pre_only: bool = False,
         out_dim: int | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -479,6 +496,8 @@ class QwenImageCrossAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
+            quant_config=quant_config,
+            prefix="to_qkv",
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -493,6 +512,8 @@ class QwenImageCrossAttention(nn.Module):
             hidden_size=added_kv_proj_dim,
             head_size=head_dim,
             total_num_heads=num_heads,
+            quant_config=quant_config,
+            prefix="add_kv_proj",
         )
         self.add_query_num_heads = self.add_kv_proj.num_heads
         self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -504,6 +525,8 @@ class QwenImageCrossAttention(nn.Module):
             bias=out_bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix="to_add_out",
         )
 
         assert not pre_only
@@ -513,6 +536,8 @@ class QwenImageCrossAttention(nn.Module):
             bias=out_bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix="to_out",
         )
 
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
@@ -645,6 +670,7 @@ class QwenImageTransformerBlock(nn.Module):
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
         zero_cond_t: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -664,9 +690,10 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
+            quant_config=quant_config,
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim)
+        self.img_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="img_mlp")
 
         # Text processing modules
         self.txt_mod = nn.Sequential(
@@ -676,7 +703,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim)
+        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="txt_mlp")
 
         self.zero_cond_t = zero_cond_t
 
@@ -870,6 +897,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         zero_cond_t: bool = False,
         use_additional_t_cond: bool = False,
         use_layer3d_rope: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
@@ -899,6 +927,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     zero_cond_t=zero_cond_t,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]

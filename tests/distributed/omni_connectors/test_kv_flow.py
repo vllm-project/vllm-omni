@@ -1,13 +1,14 @@
 import pytest
 import torch
 
-from tests.utils import hardware_test
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cache]
 
 
 class MockConnector:
@@ -58,11 +59,6 @@ def common_constants():
     }
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_manager_extraction(kv_config, mock_connector, common_constants):
     """Test extraction and sending logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -109,11 +105,6 @@ def test_manager_extraction(kv_config, mock_connector, common_constants):
     assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_manager_reception(kv_config, mock_connector, common_constants):
     """Test reception and injection logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -171,11 +162,6 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     assert req.kv_metadata["seq_len"] == seq_len
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_integration_flow(common_constants):
     """Simulate extraction -> connector -> reception."""
     num_layers = common_constants["num_layers"]
@@ -211,7 +197,8 @@ def test_integration_flow(common_constants):
         recv_timeout=1.0,
     )
     receiver_manager = OmniKVTransferManager(receiver_config)
-    receiver_manager._connector = connector  # Share the same mock connector instance
+    # Share the same mock connector instance
+    receiver_manager._connector = connector
 
     req = OmniDiffusionRequest(
         prompts=["test_integ"],
@@ -228,11 +215,6 @@ def test_integration_flow(common_constants):
     assert req.kv_metadata["seq_len"] == 10
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_manager_extraction_no_connector(kv_config, common_constants):
     """Test extraction when connector is unavailable (should still return IDs)."""
     block_size = common_constants["block_size"]

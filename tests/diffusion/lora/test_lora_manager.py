@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.utils import get_supported_lora_modules
@@ -10,6 +11,8 @@ from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.lora.request import LoRARequest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyLoRALayer:

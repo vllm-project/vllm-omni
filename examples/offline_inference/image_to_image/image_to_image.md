@@ -19,8 +19,8 @@ python image_edit.py \
   --image qwen-bear.png \
   --prompt "Let this mascot dance under the moon, surrounded by floating stars and poetic bubbles such as 'Be Kind'" \
   --output output_image_edit.png \
-  --num_inference_steps 50 \
-  --cfg_scale 4.0
+  --num-inference-steps 50 \
+  --cfg-scale 4.0
 ```
 
 ### Multiple Image Editing (Qwen-Image-Edit-2509)
@@ -33,23 +33,23 @@ python image_edit.py \
   --image img1.png img2.png \
   --prompt "Combine these images into a single scene" \
   --output output_image_edit.png \
-  --num_inference_steps 50 \
-  --cfg_scale 4.0 \
-  --guidance_scale 1.0
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --guidance-scale 1.0
 ```
 
 Key arguments:
 
 - `--model`: model name or path. Use `Qwen/Qwen-Image-Edit-2509` or later for multiple image support.
 - `--image`: path(s) to the source image(s) (PNG/JPG, converted to RGB). Can specify multiple images.
-- `--prompt` / `--negative_prompt`: text description (string).
-- `--cfg_scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.
-- `--guidance_scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
-- `--num_inference_steps`: diffusion sampling steps (more steps = higher quality, slower).
+- `--prompt` / `--negative-prompt`: text description (string).
+- `--cfg-scale`: true classifier-free guidance scale (default: 4.0). Classifier-free guidance is enabled by setting cfg_scale > 1 and providing a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, usually at the expense of lower image quality.
+- `--guidance-scale`: guidance scale for guidance-distilled models (default: 1.0, disabled). Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models.
+- `--num-inference-steps`: diffusion sampling steps (more steps = higher quality, slower).
 - `--output`: path to save the generated PNG.
-- `--vae_use_slicing`: enable VAE slicing for memory optimization.
-- `--vae_use_tiling`: enable VAE tiling for memory optimization.
-- `--cfg_parallel_size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--vae-use-slicing`: enable VAE slicing for memory optimization.
+- `--vae-use-tiling`: enable VAE tiling for memory optimization.
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 
-> ℹ️ If you encounter OOM errors, try using `--vae_use_slicing` and `--vae_use_tiling` to reduce memory usage.
+> ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.

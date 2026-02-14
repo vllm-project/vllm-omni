@@ -8,16 +8,6 @@ from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-# Modify OpenAI's API key and API base to use vLLM's API server.
-openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8091/v1"
-
-client = OpenAI(
-    # defaults to os.environ.get("OPENAI_API_KEY")
-    api_key=openai_api_key,
-    base_url=openai_api_base,
-)
-
 SEED = 42
 
 
@@ -308,19 +298,24 @@ def get_multi_audios_query(custom_prompt: str | None = None):
 
 def get_use_audio_in_video_query(
     video_path: str | None = None,
-    audio_path: str | None = None,
     custom_prompt: str | None = None,
 ):
+    """Query for use_audio_in_video mode.
+
+    When use_audio_in_video=True, audio is automatically extracted from the video
+    by the server. Do NOT send a separate audio_url - this would cause a mismatch
+    between the number of audio and video items.
+    """
     question = custom_prompt or (
         "Describe the content of the video in details, then convert what the baby say into text."
     )
     video_url = get_video_url_from_path(video_path)
-    audio_url = get_audio_url_from_path(audio_path)
+    # Note: audio is extracted from video automatically when use_audio_in_video=True
+    # Do not include a separate audio_url here
     return {
         "role": "user",
         "content": [
             {"type": "video_url", "video_url": {"url": video_url}},
-            {"type": "audio_url", "audio_url": {"url": audio_url}},
             {"type": "text", "text": question},
         ],
     }
@@ -337,7 +332,7 @@ query_map = {
 }
 
 
-def run_multimodal_generation(args) -> None:
+def run_multimodal_generation(args, client: OpenAI) -> None:
     model_name = args.model
     thinker_sampling_params = {
         "temperature": 0.4,  # Deterministic
@@ -397,7 +392,6 @@ def run_multimodal_generation(args) -> None:
     elif args.query_type == "use_audio_in_video":
         prompt = query_func(
             video_path=video_path,
-            audio_path=audio_path,
             custom_prompt=custom_prompt,
         )
     else:
@@ -484,7 +478,7 @@ def parse_args():
         "--query-type",
         "-q",
         type=str,
-        default="use_mixed_modalities",
+        default="use_audio_in_video",
         choices=query_map.keys(),
         help="Query type.",
     )
@@ -540,10 +534,28 @@ def parse_args():
         default=1,
         help="Number of concurrent requests to send. Default is 1.",
     )
-
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8091,
+        help="Port of the vLLM Omni API server.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host/IP of the vLLM Omni API server.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run_multimodal_generation(args)
+    host = args.host
+    port = args.port
+    openai_api_base = f"http://{host}:{port}/v1"
+    client = OpenAI(
+        api_key="EMPTY",
+        base_url=openai_api_base,
+    )
+    run_multimodal_generation(args, client)

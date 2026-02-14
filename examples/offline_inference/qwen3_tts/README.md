@@ -1,4 +1,4 @@
-# Qwen3-TTS Offline Inference
+# Qwen3-TTS
 
 This directory contains an offline demo for running Qwen3 TTS models with vLLM Omni. It builds task-specific inputs and generates WAV files locally.
 

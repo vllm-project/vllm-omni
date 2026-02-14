@@ -5,8 +5,6 @@ import copy
 import time
 import weakref
 from collections.abc import AsyncGenerator, Iterable, Sequence
-from dataclasses import asdict
-from pprint import pformat
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -23,9 +21,6 @@ from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.log_utils import (
-    OrchestratorMetrics,
-)
 from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
@@ -37,6 +32,7 @@ from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
 # Internal imports (our code)
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -166,8 +162,9 @@ class AsyncOmni(OmniBase):
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-                    "layerwise_num_gpu_layers": kwargs.get("layerwise_num_gpu_layers", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
+                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",
@@ -196,11 +193,10 @@ class AsyncOmni(OmniBase):
             if stage.vllm_config is not None and stage.tokenizer is not None:
                 try:
                     vllm_config = stage.vllm_config
-                    tokenizer = stage.tokenizer
                     # Initialize input_processor
+                    # OMNI: OmniInputProcessor creates tokenizer internally from vllm_config
                     self.input_processor = OmniInputProcessor(
                         vllm_config=vllm_config,
-                        tokenizer=tokenizer,
                     )
                     # Initialize model_config
                     self.model_config = vllm_config.model_config
@@ -299,10 +295,11 @@ class AsyncOmni(OmniBase):
             )
 
             # Metrics/aggregation helper
-            metrics = OrchestratorMetrics(
-                num_stages,
-                self._enable_stats,
-                _wall_start_ts,
+            metrics = OrchestratorAggregator(
+                num_stages=num_stages,
+                log_stats=self.log_stats,
+                wall_start_ts=_wall_start_ts,
+                final_stage_id_for_e2e=final_stage_id_for_e2e,
             )
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
@@ -329,8 +326,6 @@ class AsyncOmni(OmniBase):
                     req_state,
                     metrics,
                     final_stage_id_for_e2e,
-                    _req_start_ts,
-                    _wall_start_ts,
                 ):
                     yield output
             else:
@@ -339,21 +334,25 @@ class AsyncOmni(OmniBase):
                     req_state,
                     metrics,
                     final_stage_id_for_e2e,
-                    _req_start_ts,
-                    _wall_start_ts,
                     sampling_params_list,
                     prompt,
                 ):
                     yield output
 
-            logger.debug(f"[{self._name}] All requests completed")
-
-            # Summarize and print stats
+            logger.debug(f"[{self._name}] Request {request_id} finalized at stage-{final_stage_id_for_e2e}")
             try:
-                summary = metrics.build_and_log_summary(final_stage_id_for_e2e)
-                logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
+                # Finalize E2E metrics if not already done
+                metrics.on_finalize_request(
+                    final_stage_id_for_e2e,
+                    request_id,
+                    _req_start_ts.get(request_id, _wall_start_ts),
+                )
+
+                logger.debug(f"[{self._name}] All requests completed")
+                # Summarize and print stats
+                metrics.build_and_log_summary()
             except Exception as e:
-                logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
+                logger.exception(f"[{self._name}] Request {request_id} Failed to finalized/build/log summary: {e}")
             finally:
                 self.request_states.pop(request_id, None)
         except (asyncio.CancelledError, GeneratorExit):
@@ -367,10 +366,8 @@ class AsyncOmni(OmniBase):
         prompt: Any,
         sampling_params_list: list[SamplingParams],
         req_state: ClientRequestState,
-        metrics: OrchestratorMetrics,
+        metrics: OrchestratorAggregator,
         final_stage_id_for_e2e: int,
-        req_start_ts: dict[int, float],
-        wall_start_ts: float,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         all_stages_finished = {stage_id: False for stage_id in range(final_stage_id_for_e2e + 1)}
         submit_flag = True
@@ -383,9 +380,11 @@ class AsyncOmni(OmniBase):
                 except asyncio.QueueEmpty:
                     await asyncio.sleep(0.001)
                     continue
-
                 engine_outputs, finished, output_to_yield = self._process_single_result(
-                    result, stage, stage_id, metrics, req_start_ts, wall_start_ts, final_stage_id_for_e2e
+                    result,
+                    stage,
+                    stage_id,
+                    metrics,
                 )
                 if submit_flag and stage_id == 0:
                     submit_flag = False
@@ -410,10 +409,8 @@ class AsyncOmni(OmniBase):
         self,
         request_id: str,
         req_state: ClientRequestState,
-        metrics: OrchestratorMetrics,
+        metrics: OrchestratorAggregator,
         final_stage_id_for_e2e: int,
-        req_start_ts: dict[int, float],
-        wall_start_ts: float,
         sampling_params_list: list[SamplingParams],
         prompt: Any,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
@@ -422,9 +419,11 @@ class AsyncOmni(OmniBase):
             while not finished:
                 result = await req_state.queue.get()
                 assert stage_id == req_state.stage_id
-                req_id = result.get("request_id")
                 engine_outputs, finished, output_to_yield = self._process_single_result(
-                    result, stage, stage_id, metrics, req_start_ts, wall_start_ts, final_stage_id_for_e2e
+                    result,
+                    stage,
+                    stage_id,
+                    metrics,
                 )
                 if output_to_yield:
                     yield output_to_yield
@@ -433,9 +432,11 @@ class AsyncOmni(OmniBase):
             stage.set_engine_outputs(engine_outputs)
             # Forward to next stage if there is one
             next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e and finished:
+            if next_stage_id <= final_stage_id_for_e2e:
                 next_stage: OmniStage = self.stage_list[next_stage_id]
-                next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
+                # Derive inputs for the next stage, record postprocess time
+                with metrics.stage_postprocess_timer(stage_id, request_id):
+                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]
 
                 # Check if we have a connector for this edge
@@ -448,7 +449,7 @@ class AsyncOmni(OmniBase):
                         connector=connector,
                         stage_id=stage_id,
                         next_stage_id=next_stage_id,
-                        req_id=req_id,
+                        req_id=request_id,
                         next_inputs=next_inputs,
                         sampling_params=sp_next,
                         original_prompt=prompt,
@@ -462,24 +463,21 @@ class AsyncOmni(OmniBase):
                     # because continuing would cause the request to be silently dropped
                     # and the orchestrator to hang waiting for completion.
                     error_msg = (
-                        f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                        f"[{self._name}] Failed to send request {request_id} to stage-{next_stage_id} via connector. "
                         "Configure a connector for this edge or inspect connector logs for details."
                     )
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
-                logger.debug(f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}")
+                logger.debug(f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}")
             else:
-                logger.debug(f"[{self._name}] Request {req_id} fully completed")
+                logger.debug(f"[{self._name}] Request {request_id} fully completed")
 
     def _process_single_result(
         self,
         result: dict[str, Any],
         stage: OmniStage,
         stage_id: int,
-        metrics: OrchestratorMetrics,
-        req_start_ts: dict[int, float],
-        wall_start_ts: float,
-        final_stage_id_for_e2e: int,
+        metrics: OrchestratorAggregator,
     ) -> tuple[Any, bool, OmniRequestOutput | None]:
         """
         Process a single result dictionary from a stage.
@@ -501,40 +499,9 @@ class AsyncOmni(OmniBase):
 
         finished = engine_outputs.finished
 
-        # Mark last output time
-        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
-
-        try:
-            _m = asdict(result.get("metrics"))
-            if _m is not None and finished:
-                metrics.on_stage_metrics(stage_id, req_id, _m)
-        except Exception as e:
-            logger.exception(
-                f"[{self._name}] Failed to process metrics for stage {stage_id}, req {req_id}: {e}",
-            )
-
-        logger.debug(
-            f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
-        )
-
         output_to_yield = None
+
         if getattr(stage, "final_output", False):
-            logger.debug(f"[{self._name}] Request {req_id} finalized at stage-{stage_id}")
-
-            # Finalize request metrics if this is the E2E final stage and it's finished
-            try:
-                rid_key = str(req_id)
-                if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
-                    metrics.on_finalize_request(
-                        stage_id,
-                        req_id,
-                        req_start_ts.get(req_id, wall_start_ts),
-                    )
-            except Exception as e:
-                logger.exception(
-                    f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
-                )
-
             # Construct output to yield
             images = []
             if stage.final_output_type == "image":
@@ -556,6 +523,23 @@ class AsyncOmni(OmniBase):
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
                 )
+        # Mark last output time
+        metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
+
+        metrics.process_stage_metrics(
+            result=result,
+            stage_type=stage.stage_type,
+            stage_id=stage_id,
+            req_id=req_id,
+            engine_outputs=engine_outputs,
+            finished=finished,
+            final_output_type=stage.final_output_type,
+            output_to_yield=output_to_yield,
+        )
+
+        logger.debug(
+            f"[{self._name}] Stage-{stage_id} completed request {req_id}; forwarding or finalizing",
+        )
 
         return engine_outputs, finished, output_to_yield
 
@@ -674,6 +658,15 @@ class AsyncOmni(OmniBase):
             if stage.is_comprehension:
                 return stage.is_tracing_enabled
         return False
+
+    @property
+    def renderer(self):
+        """Return the renderer from input_processor if available.
+
+        OMNI: Required by upstream OpenAIServingModels.__init__ which
+        accesses engine_client.renderer.
+        """
+        return self.input_processor.renderer
 
     async def do_log_stats(self) -> None:
         pass

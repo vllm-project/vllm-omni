@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyInputBatch:
@@ -24,6 +27,7 @@ def _make_runner(multimodal_outputs):
         None,
         None,
         multimodal_outputs,
+        None,
     )
     runner.kv_connector_output = None
     runner.input_batch = _DummyInputBatch()

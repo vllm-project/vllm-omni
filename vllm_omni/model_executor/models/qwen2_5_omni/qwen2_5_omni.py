@@ -22,6 +22,9 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.model_executor.models.vision import (
+    get_llm_pos_ids_for_vision,
+)
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -35,7 +38,6 @@ from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
-from vllm_omni.model_executor.models.vision import get_llm_pos_ids_for_vision
 from vllm_omni.platforms import current_omni_platform
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
