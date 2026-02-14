@@ -71,14 +71,7 @@ For additional features and advanced configurations, refer to the:
 ### Testing
 
 vLLM-Omni uses `pytest` to test the codebase.
-
-```bash
-# Run all tests
-pytest tests/
-
-# Run tests for a single test file with detailed output
-pytest -s -v tests/test_omni_llm.py
-```
+Please refer to the [test instructions](./ci/test_guide.md) for detailed testing information.
 
 !!! warning
     Currently, not all unit tests pass when run on CPU platforms. If you don't have access to a GPU platform to run unit tests locally, rely on the continuous integration system to run the tests for now.
@@ -122,6 +115,9 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 
 !!! note
     If the PR spans more than one category, please include all relevant prefixes.
+
+### Local Test
+We hope that you can first run the L1 & L2 level test cases in your local environment, attach the corresponding results to the PR, and then contact us to add the "ready" label. Please refer to the [test instructions](./ci/test_guide.md) for running the test cases.
 
 ### Code Quality
 
