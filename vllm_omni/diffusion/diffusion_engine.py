@@ -316,8 +316,11 @@ class DiffusionEngine:
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         num_inference_steps = 1
-        height = 1024
-        width = 1024
+        # NOTE: Use a moderate resolution to avoid OOM on smaller GPUs or
+        # when using parallel strategies that increase peak memory (e.g.,
+        # sequence parallelism).
+        height = 512
+        width = 512
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
