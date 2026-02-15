@@ -2,7 +2,6 @@ from dataclasses import field
 from typing import Any
 
 from pydantic import ConfigDict
-from pydantic.dataclasses import dataclass
 from vllm.config import ModelConfig
 from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
 from vllm.config.utils import config
@@ -15,8 +14,7 @@ import vllm_omni.model_executor.models as me_models
 logger = init_logger(__name__)
 
 
-@config
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+@config(config=ConfigDict(arbitrary_types_allowed=True))
 class OmniModelConfig(ModelConfig):
     """Configuration for Omni models, extending the base ModelConfig.
 
