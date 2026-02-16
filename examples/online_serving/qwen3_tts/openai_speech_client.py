@@ -83,6 +83,8 @@ def run_tts_generation(args) -> None:
     if args.ref_audio:
         if args.ref_audio.startswith(("http://", "https://")):
             payload["ref_audio"] = args.ref_audio
+        elif args.ref_audio.startswith("data:"):
+            payload["ref_audio"] = args.ref_audio
         else:
             payload["ref_audio"] = encode_audio_to_base64(args.ref_audio)
     if args.ref_text:
@@ -199,7 +201,7 @@ def parse_args():
         "--ref-audio",
         type=str,
         default=None,
-        help="Reference audio file path or URL for voice cloning (Base task)",
+        help="Reference audio file path, URL, or base64 for voice cloning (Base task)",
     )
     parser.add_argument(
         "--ref-text",
