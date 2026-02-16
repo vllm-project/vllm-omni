@@ -129,9 +129,6 @@ def resolve_model_config_path(model_type: str) -> str | None:
 
     Returns:
         String path to the stage configuration file if found, None otherwise
-
-    Raises:
-        FileNotFoundError: If no stage config file exists for the model type
     """
     default_config_path = current_omni_platform.get_default_stage_config_path()
     config_file_name = f"{model_type}.yaml"
