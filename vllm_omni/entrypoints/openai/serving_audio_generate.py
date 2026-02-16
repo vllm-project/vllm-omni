@@ -45,18 +45,8 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
         """
         Generate audio using diffusion-based models (e.g. Stable Audio).
 
-        This endpoint is designed for audio generation models that use
-        diffusion pipelines, as opposed to TTS models that use
-        autoregressive generation.
-
-        Parameters:
-        - input: Text prompt describing the audio to generate
-        - negative_prompt: Negative prompt for classifier-free guidance
-        - audio_length: Duration of the generated audio in seconds
-        - audio_start: Start time offset in seconds
-        - guidance_scale: Classifier-free guidance scale
-        - num_inference_steps: Number of diffusion steps
-        - seed: Random seed for reproducibility
+        This endpoint is designed for audio generation models as
+        opposed to TTS models that specifically generate speech.
         """
 
         error_check_ret = await self._check_model(request)
