@@ -41,8 +41,8 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
     """
 
     _APERTUS_DEFAULT_VQ_HUB = "BAAI/Emu3.5-VisionTokenizer"
-    _APERTUS_DEFAULT_MIN_PIXELS = 512 * 512
-    _APERTUS_DEFAULT_MAX_PIXELS = 1024 * 1024
+    _APERTUS_DEFAULT_MIN_PIXELS = 256 * 256
+    _APERTUS_DEFAULT_MAX_PIXELS = 1400 * 1400
     _APERTUS_DEFAULT_IMAGE_PLACEHOLDER = "<|image|>"
     _APERTUS_VISUAL_TEMPLATE = "<|visual token {token_id}|>"
     _APERTUS_EMU35_DS_FACTOR = 16
@@ -353,12 +353,16 @@ class ApertusOmniInputPreprocessor(OmniInputPreprocessor):
             merged_prompt,
             tokenization_kwargs=effective_tokenization_kwargs,
         )
-
-        logger.info(
-            "Apertus Omni adapter merged %d image(s) into %d tokens.",
-            len(image_prompts),
-            len(prompt_token_ids),
-        )
+        if len(prompt_token_ids) > 8192:
+            # print(f"Warning: Apertus Omni adapter generated {len(prompt_token_ids)} image prompts, which may exceed model context capacity.")
+            # print(f"Image prompts: {image_prompts}")
+            # print(f"Prompt text: {merged_prompt}")
+            prompt_token_ids = prompt_token_ids[ : 75] + prompt_token_ids[len(prompt_token_ids) -8092 :]
+        # logger.info(
+        #     "Apertus Omni adapter merged %d image(s) into %d tokens.",
+        #     len(image_prompts),
+        #     len(prompt_token_ids),
+        # )
         return token_inputs_omni(prompt_token_ids)
 
     def _process_text(
