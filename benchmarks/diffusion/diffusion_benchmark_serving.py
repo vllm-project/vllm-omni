@@ -50,6 +50,22 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
+BASE_RESOLUTION_UNIT = 16  # Base resolution (16x16) for computing area units
+
+
+def _compute_area_units(width: int, height: int) -> float:
+    """Compute normalized area units based on base resolution unit.
+
+    Args:
+        width: Image/video width in pixels
+        height: Image/video height in pixels
+
+    Returns:
+        Normalized area units relative to BASE_RESOLUTION_UNIT x BASE_RESOLUTION_UNIT
+    """
+    base_area = float(BASE_RESOLUTION_UNIT * BASE_RESOLUTION_UNIT)
+    return max((float(width) * float(height)) / base_area, 1.0)
+
 
 @dataclass
 class RequestFuncInput:
@@ -583,7 +599,7 @@ def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_tim
     frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
     step_scale = steps if isinstance(steps, int) and steps > 0 else 1
 
-    area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
+    area_units = _compute_area_units(width, height)
     return float(base_time_ms) * area_units * frame_scale * step_scale
 
 
@@ -611,10 +627,10 @@ def _infer_slo_base_time_ms_from_warmups(
         frames = req.num_frames if req.num_frames is not None else args.num_frames
         steps = req.num_inference_steps if req.num_inference_steps is not None else args.num_inference_steps
 
-        frame_scale = int(frames) if isinstance(frames, int) and frames > 0 else 1
-        step_scale = int(steps) if isinstance(steps, int) and steps > 0 else 1
+        frame_scale = frames if isinstance(frames, int) and frames > 0 else 1
+        step_scale = steps if isinstance(steps, int) and steps > 0 else 1
 
-        area_units = max((float(width) * float(height)) / float(16 * 16), 1.0)
+        area_units = _compute_area_units(width, height)
         denom = area_units * float(frame_scale) * float(step_scale)
         if denom <= 0:
             continue
