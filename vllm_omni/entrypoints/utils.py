@@ -117,8 +117,8 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     return obj
 
 
-def resolve_model_config_path(model_type: str) -> str:
-    """Resolve the stage config file path from the model name.
+def resolve_model_config_path(model_type: str) -> str | None:
+    """Resolve the stage config file path from the model type.
 
     Resolves stage configuration path based on the model type and device type.
     First tries to find a device-specific YAML file from stage_configs/{device_type}/
@@ -128,7 +128,7 @@ def resolve_model_config_path(model_type: str) -> str:
         model_type: Model type string
 
     Returns:
-        String path to the stage configuration file
+        String path to the stage configuration file if found, None otherwise
 
     Raises:
         FileNotFoundError: If no stage config file exists for the model type
