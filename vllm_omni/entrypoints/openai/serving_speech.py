@@ -49,10 +49,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
     @classmethod
-    def for_diffusion(cls, *args, **kwargs) -> bool:
-        """Check if the current instance is in diffusion mode."""
-        cls.diffusion_mode = True
-        return cls(*args, **kwargs)
+    def for_diffusion(cls, *args, **kwargs) -> "OmniOpenAIServingSpeech":
+        """Create an instance configured to run in diffusion mode."""
+        instance = cls(*args, **kwargs)
+        instance.diffusion_mode = True
+        return instance
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
