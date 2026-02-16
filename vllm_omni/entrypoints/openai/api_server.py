@@ -445,6 +445,7 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
+        # audio related
         state.openai_serving_speech = None
         state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
             engine_client,
@@ -453,8 +454,10 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
+        # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
+            diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
