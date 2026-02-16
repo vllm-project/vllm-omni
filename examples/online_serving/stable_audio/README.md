@@ -4,7 +4,7 @@ Generate audio from text prompts using Stable Audio models via an OpenAI-compati
 
 ## Features
 
-- **OpenAI-compatible API**: Use `/v1/audio/speech` endpoint
+- **OpenAI-compatible API**: Use `/v1/audio/generate` endpoint
 - **Flexible control**: Adjust audio length, guidance scale, inference steps
 - **Quality control**: Use negative prompts to avoid unwanted characteristics
 - **Reproducible**: Set random seed for deterministic generation
@@ -28,7 +28,7 @@ vllm-omni serve stabilityai/stable-audio-open-1.0 \
 #### Using curl
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of a cat purring",
@@ -56,7 +56,7 @@ bash curl_examples.sh
 ### Endpoint
 
 ```
-POST /v1/audio/speech
+POST /v1/audio/generate
 ```
 
 ### Request Body
@@ -96,7 +96,7 @@ Returns audio data in the requested format (default: WAV).
 ### Basic Generation
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of ocean waves"
@@ -106,7 +106,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ### Custom Duration
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A dog barking",
@@ -117,7 +117,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ### High Quality with Negative Prompt
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A piano playing a gentle melody",
@@ -131,7 +131,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ### Reproducible Generation
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Thunder and rain sounds",
@@ -145,7 +145,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 For faster generation with slightly lower quality:
 
 ```bash
-curl -X POST http://localhost:8000/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Birds chirping in a forest",

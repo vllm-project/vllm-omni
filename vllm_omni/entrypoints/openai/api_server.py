@@ -79,12 +79,16 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    OpenAICreateAudioGenerateRequest,
+    OpenAICreateSpeechRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
 )
+from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
@@ -428,7 +432,9 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
-        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
+        state.openai_serving_speech = None
+
+        state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
             engine_client,
             state.openai_serving_models,
             request_logger=request_logger,
@@ -713,6 +719,10 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
+    state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
 
@@ -723,6 +733,10 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
+
+
+def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
+    return getattr(request.app.state, "openai_serving_audio_generate", None)
 
 
 @router.post(
@@ -825,6 +839,34 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         return base_server.create_error_response(message="The model does not support Speech API")
     try:
         return await handler.create_speech(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+@router.post(
+    "/v1/audio/generate",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
+    handler = OmniAudioGenerate(raw_request)
+    if handler is None:
+        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Audio Generate API",
+            )
+        return base_server.create_error_response(message="The model does not support Audio Generate API")
+    try:
+        return await handler.create_audio_generate(request, raw_request)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 

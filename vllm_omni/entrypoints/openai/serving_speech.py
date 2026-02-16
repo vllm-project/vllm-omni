@@ -1,7 +1,6 @@
 import asyncio
 from typing import Any
 
-import torch
 from fastapi import Request
 from fastapi.responses import Response
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
@@ -14,7 +13,6 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateSpeechRequest,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -43,17 +41,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
         super().__init__(*args, **kwargs)
-        self.diffusion_mode = False
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
-
-    @classmethod
-    def for_diffusion(cls, *args, **kwargs) -> "OmniOpenAIServingSpeech":
-        """Create an instance configured to run in diffusion mode."""
-        instance = cls(*args, **kwargs)
-        instance.diffusion_mode = True
-        return instance
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -82,9 +72,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if model_stage in _TTS_MODEL_STAGES:
                     return True
         return False
-
-    def _is_stable_audio_model(self) -> bool:
-        return self.engine_client.model_type == "StableAudioPipeline"
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
@@ -244,45 +231,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "prompt": prompt_text,
                     "additional_information": tts_params,
                 }
-            elif self._is_stable_audio_model():
-                # Handle Stable Audio models
-                # Stable Audio uses diffusion, needs different parameters
-                default_sr = 44100  # Default sample rate for Stable Audio
-
-                # Build prompt for Stable Audio
-                prompt = {
-                    "prompt": request.input,
-                }
-                if request.negative_prompt:
-                    prompt["negative_prompt"] = request.negative_prompt
-
-                # Build sampling params for diffusion
-                sampling_params_list = [OmniDiffusionSamplingParams(num_outputs_per_prompt=1)]
-
-                # Create generator if seed provided
-                if request.seed is not None:
-                    from vllm_omni.platforms import current_omni_platform
-
-                    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(request.seed)
-                    sampling_params_list[0].generator = generator
-
-                if request.guidance_scale is not None:
-                    sampling_params_list[0].guidance_scale = request.guidance_scale
-
-                if request.num_inference_steps is not None:
-                    sampling_params_list[0].num_inference_steps = request.num_inference_steps
-
-                # Set up audio duration parameters
-                if request.audio_length is not None:
-                    audio_length = request.audio_length
-                    audio_start = request.audio_start if request.audio_start is not None else 0.0
-                    audio_end_in_s = audio_start + audio_length
-                    sampling_params_list[0].extra_args = {
-                        "audio_start_in_s": audio_start,
-                        "audio_end_in_s": audio_end_in_s,
-                    }
-
-                tts_params = {}
             else:
                 # Fallback for unsupported models
                 tts_params = {}

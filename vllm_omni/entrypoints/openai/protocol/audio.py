@@ -49,30 +49,51 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Maximum tokens to generate",
     )
 
-    # Stable Audio specific parameters
+    @field_validator("stream_format")
+    @classmethod
+    def validate_stream_format(cls, v: str) -> str:
+        if v == "sse":
+            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
+        return v
+
+
+class OpenAICreateAudioGenerateRequest(BaseModel):
+    """Request model for audio generation via diffusion models (e.g. Stable Audio)."""
+
+    input: str = Field(
+        description="Text prompt describing the audio to generate",
+    )
+    model: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+    )
+    stream_format: Literal["sse", "audio"] | None = "audio"
     audio_length: float | None = Field(
         default=None,
-        description="Audio length in seconds (for Stable Audio models)",
+        description="Audio length in seconds",
     )
     audio_start: float | None = Field(
         default=0.0,
-        description="Audio start time in seconds (for Stable Audio models)",
+        description="Audio start time in seconds",
     )
     negative_prompt: str | None = Field(
         default=None,
-        description="Negative prompt for classifier-free guidance (for Stable Audio models)",
+        description="Negative prompt for classifier-free guidance",
     )
     guidance_scale: float | None = Field(
         default=None,
-        description="Guidance scale for diffusion models (for Stable Audio models)",
+        description="Guidance scale for diffusion models",
     )
     num_inference_steps: int | None = Field(
         default=None,
-        description="Number of inference steps (for Stable Audio models)",
+        description="Number of inference steps",
     )
     seed: int | None = Field(
         default=None,
-        description="Random seed for reproducibility (for Stable Audio models)",
+        description="Random seed for reproducibility",
     )
 
     @field_validator("stream_format")

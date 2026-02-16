@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenAI-compatible client for Stable Audio via /v1/audio/speech endpoint.
+OpenAI-compatible client for Stable Audio via /v1/audio/generate endpoint.
 
 This script demonstrates how to use the OpenAI-compatible speech API
 to generate audio from text using Stable Audio models.
@@ -32,7 +32,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate audio with Stable Audio via OpenAI-compatible API")
     parser.add_argument(
         "--api_url",
-        default="http://localhost:8000/v1/audio/speech",
+        default="http://localhost:8000/v1/audio/generate",
         help="API endpoint URL",
     )
     parser.add_argument(
