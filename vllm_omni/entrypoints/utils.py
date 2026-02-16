@@ -125,13 +125,12 @@ def resolve_model_config_path(model_type: str) -> str:
     directory. If not found, falls back to the default config file.
 
     Args:
-        model: Model name or path (used to determine model_type)
+        model_type: Model type string
 
     Returns:
         String path to the stage configuration file
 
     Raises:
-        ValueError: If model_type cannot be determined
         FileNotFoundError: If no stage config file exists for the model type
     """
     default_config_path = current_omni_platform.get_default_stage_config_path()
