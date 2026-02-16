@@ -3,6 +3,8 @@
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
+import logging
+
 # test if flash_attn (FA2) is available
 try:
     import flash_attn  # noqa: F401
@@ -45,12 +47,17 @@ HAS_FLASH_ATTN_HOPPER = HAS_FA3
 flash_attn_forward_hopper = fa3_fwd_func
 flash3_attn_func = fa3_attn_func
 
+logger = logging.getLogger(__name__)
+
 try:
     from flashinfer.prefill import single_prefill_with_kv_cache  # noqa: F401
 
     HAS_FLASHINFER = True
-except (ImportError, ModuleNotFoundError):
+except Exception as e:
+    # flashinfer may raise RuntimeError at import-time for version/binary mismatches.
+    # Treat it as unavailable so the runtime can gracefully fall back to other backends.
     HAS_FLASHINFER = False
+    logger.warning("FlashInfer is unavailable; falling back to other attention backends. Reason: %s", e)
 
 try:
     import aiter  # noqa: F401

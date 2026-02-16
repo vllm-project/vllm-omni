@@ -73,7 +73,7 @@ stage_args:
     stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
       devices: "1"
-      max_batch_size: 1
+      max_batch_size: 64
     engine_args:
       model_stage: code2wav
       model_arch: Qwen3OmniMoeForConditionalGeneration
@@ -86,7 +86,7 @@ stage_args:
       engine_output_type: audio  # Final output: audio waveform
       gpu_memory_utilization: 0.1
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 10000
+      max_num_batched_tokens: 51200 # [TODO] if max_num_batch_tokens < max_batch_size * 800, there will be precision problem.
       hf_config_name: thinker_config
     engine_input_source: [1]
     final_output: true

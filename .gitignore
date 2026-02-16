@@ -153,6 +153,14 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Claude
+CLAUDE.md
+.claude/
+
+# Codex
+AGENTS.md
+.codex/
+
 # cursor
 .cursor/
 
@@ -214,6 +222,7 @@ data/
 datasets/
 *.csv
 *.json
+!apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 *.jsonl
 *.parquet
 
@@ -233,3 +242,6 @@ configs/development.yaml
 Dockerfile.dev
 discussion
 tmp_test
+
+# output files
+*.wav

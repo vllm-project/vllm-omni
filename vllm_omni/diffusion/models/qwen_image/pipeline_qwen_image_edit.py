@@ -110,9 +110,9 @@ def get_qwen_image_edit_pre_process_func(
             if image is not None and not (
                 isinstance(image, torch.Tensor) and len(image.shape) > 1 and image.shape[1] == latent_channels
             ):
-                image = image_processor.resize(image, height, width)
+                image = image_processor.resize(image, calculated_height, calculated_width)
                 prompt_image = image
-                image = image_processor.preprocess(image, height, width)
+                image = image_processor.preprocess(image, calculated_height, calculated_width)
                 image = image.unsqueeze(2)
 
                 # Store preprocessed image and prompt image in request

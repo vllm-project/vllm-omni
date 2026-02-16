@@ -1,0 +1,266 @@
+[
+    {
+        "test_name": "test_qwen3_omni",
+        "server_params": {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "stage_config_name": "qwen3_omni.yaml"
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "random",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "request_rate": [
+                    0.1,
+                    0.5,
+                    1
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            },
+            {
+                "dataset_name": "random",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "max_concurrency": [
+                    1,
+                    4,
+                    10
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "max_concurrency": [
+                    1,
+                    4,
+                    10
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 3,
+                "random_mm_num_mm_items_range_ratio": 0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(32, 32, 1)": 0.5,
+                    "(0, 1, 1)": 0.1,
+                    "(32, 32, 2)": 0.4
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "request_rate": [
+                    0.1,
+                    0.5,
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 3,
+                "random_mm_num_mm_items_range_ratio": 0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(32, 32, 1)": 0.5,
+                    "(0, 1, 1)": 0.1,
+                    "(32, 32, 2)": 0.4
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_qwen3_omni_chunk",
+        "server_params": {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "stage_config_name": "qwen3_omni.yaml",
+            "update": {
+                "async_chunk": true,
+                "stage_args": {
+                    "0": {
+                        "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                    },
+                    "1": {
+                        "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
+                    }
+                }
+            },
+            "delete": {
+                "stage_args": {
+                    "2": [
+                        "custom_process_input_func"
+                    ]
+                }
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "random",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "request_rate": [
+                    0.1,
+                    0.5,
+                    1
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            },
+            {
+                "dataset_name": "random",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "max_concurrency": [
+                    1,
+                    4,
+                    10
+                ],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "max_concurrency": [
+                    1,
+                    4,
+                    10
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 3,
+                "random_mm_num_mm_items_range_ratio": 0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(32, 32, 1)": 0.5,
+                    "(0, 1, 1)": 0.1,
+                    "(32, 32, 2)": 0.4
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "num_prompts": [
+                    10,
+                    40,
+                    100
+                ],
+                "request_rate": [
+                    0.1,
+                    0.5,
+                    1
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "ignore_eos": true,
+                "random_mm_base_items_per_request": 3,
+                "random_mm_num_mm_items_range_ratio": 0,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(32, 32, 1)": 0.5,
+                    "(0, 1, 1)": 0.1,
+                    "(32, 32, 2)": 0.4
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": 100000,
+                    "mean_audio_ttfp_ms": 100000,
+                    "mean_audio_rtf": 100000
+                }
+            }
+        ]
+    }
+]

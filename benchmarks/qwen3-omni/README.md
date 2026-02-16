@@ -36,7 +36,7 @@ bash benchmarks/qwen3-omni/transformers/eval_qwen3_moe_omni_transformers.sh
 ```
 
 What it does:
-- Runs `qwen3_omni_moe_transformers.py` over `top100.txt` with `--num_prompts 100`.
+- Runs `qwen3_omni_moe_transformers.py` over `top100.txt` with `--num-prompts 100`.
 - Outputs to `benchmarks/qwen3-omni/transformers/benchmark_results/`:
   - `perf_stats.json` — aggregated & per-prompt TPS/latency (thinker/talker/code2wav/overall).
   - `results.json` — per-prompt outputs and audio paths.
@@ -53,7 +53,7 @@ bash benchmarks/qwen3-omni/vllm_omni/eval_qwen3_moe_omni.sh
 ```
 
 What it does:
-- Runs `examples/offline_inference/qwen3_omni/end2end.py` with `--enable-stats`.
+- Runs `examples/offline_inference/qwen3_omni/end2end.py` with `--log-stats`.
 - Uses `benchmarks/build_dataset/top100.txt` and writes to:
   - Logs: `benchmarks/qwen3-omni/vllm_omni/logs/`
     - `omni_llm_pipeline_text.orchestrator.stats.jsonl` — per-stage latency stats.

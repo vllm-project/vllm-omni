@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import OmniServer
+from tests.utils import hardware_test
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen3_omni_ci.yaml")]
@@ -29,6 +30,9 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
+@pytest.mark.core_model
+@pytest.mark.benchmark
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bench_serve_chat(omni_server):
     command = [

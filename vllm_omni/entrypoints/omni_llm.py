@@ -82,8 +82,8 @@ class OmniLLM(LLM):
         self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
-        self._enable_stats: bool = bool(log_stats)
         self.model_type = resolve_model_type(model)
+        self.log_stats: bool = bool(log_stats)
 
         # Load stage configurations
         if stage_configs_path is None:
