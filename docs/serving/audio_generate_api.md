@@ -336,10 +336,3 @@ vllm-omni serve stabilityai/stable-audio-open-1.0 \
     --omni \
     --uvicorn-log-level debug
 ```
-
-## See Also
-
-- [Speech API (TTS)](speech_api.md) -- text-to-speech via `/v1/audio/speech`
-- [Stable Audio Online Serving Examples](../../examples/online_serving/stable_audio/README.md)
-- [Offline Inference Example](../../examples/offline_inference/text_to_audio/README.md)
-- [Stable Audio Model Card](https://huggingface.co/stabilityai/stable-audio-open-1.0)
