@@ -395,10 +395,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
 
-        # REMOVE
-        print(f"num_inference_steps: {num_inference_steps}")
-        print(f"guidance_scale: {guidance_scale}")
-
         if generator is None:
             generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
