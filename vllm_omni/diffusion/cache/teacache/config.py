@@ -33,7 +33,13 @@ _MODEL_COEFFICIENTS = {
     # without requiring the user to change rel_l1_thresh.
     #
     # rescaled_distance = 4 * rel_distance
-    "SD3Transformer2DModel": [0.0, 0.0, 0.0, 4.0, 0.0],
+    "SD3Transformer2DModel": [
+        -4.277698959844608e03,
+        5.002450261031280e02,
+        5.621228389518113e01,
+        -1.353017614952596e00,
+        3.800369667338725e-02,
+    ],
 }
 
 
