@@ -35,8 +35,8 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
-from vllm_omni.platforms import current_omni_platform
 from vllm_omni.model_executor.omni_process_mixin import OmniProcessingMixin
+from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
