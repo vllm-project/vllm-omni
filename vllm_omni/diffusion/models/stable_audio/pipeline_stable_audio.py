@@ -354,7 +354,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         negative_prompt: str | list[str] | None = None,
         audio_end_in_s: float | None = None,
         audio_start_in_s: float = 0.0,
-        num_inference_steps: int = 100,
         guidance_scale: float = 7.0,
         num_waveforms_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -372,7 +371,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             negative_prompt: Negative prompt for CFG
             audio_end_in_s: Audio end time in seconds (max ~47s for stable-audio-open-1.0)
             audio_start_in_s: Audio start time in seconds
-            num_inference_steps: Number of denoising steps
             guidance_scale: CFG scale
             num_waveforms_per_prompt: Number of audio outputs per prompt
             generator: Random generator for reproducibility
@@ -393,9 +391,13 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
 
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
+
+        # REMOVE
+        print(f"num_inference_steps: {num_inference_steps}")
+        print(f"guidance_scale: {guidance_scale}")
 
         if generator is None:
             generator = req.sampling_params.generator

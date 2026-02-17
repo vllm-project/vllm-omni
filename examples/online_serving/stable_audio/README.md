@@ -79,11 +79,11 @@ POST /v1/audio/generate
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text prompt describing the audio to generate |
-| `audio_length` | float | 10.0 | Audio duration in seconds (max ~47s for stable-audio-open-1.0) |
+| `audio_length` | float | ~47s | Audio duration in seconds (max ~47s for stable-audio-open-1.0) |
 | `audio_start` | float | 0.0 | Audio start time in seconds |
 | `negative_prompt` | string | null | Text describing what to avoid in generation |
 | `guidance_scale` | float | 7.0 | Classifier-free guidance scale (higher = more adherence to prompt) |
-| `num_inference_steps` | int | 100 | Number of denoising steps (higher = better quality, slower) |
+| `num_inference_steps` | int | 50 | Number of denoising steps (higher = better quality, slower) |
 | `seed` | int | null | Random seed for reproducibility |
 | `response_format` | string | "wav" | Output format: wav, mp3, flac, pcm |
 
