@@ -664,7 +664,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         if prompt is None and prompt_embeds is None:
             raise ValueError("Provide either `prompt` or `prompt_embeds`.")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loader.load_weights(weights)

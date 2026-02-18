@@ -783,7 +783,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loader.load_weights(weights)

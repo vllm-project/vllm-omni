@@ -142,7 +142,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 if module:
                     module.to(f"cuda:{tp_rank}")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         self.pre_load()
         skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
         # List of unexpected keywords in weight names
@@ -163,7 +163,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             self,
             skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(weights)
+        loader.load_weights(weights)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed

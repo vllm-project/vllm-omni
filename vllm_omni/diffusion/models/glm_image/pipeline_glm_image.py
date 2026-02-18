@@ -1006,10 +1006,10 @@ class GlmImagePipeline(nn.Module):
 
         return DiffusionOutput(output=image)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load transformer weights."""
         # Filter weights for transformer only
         transformer_weights = (
             (name.replace("transformer.", ""), weight) for name, weight in weights if name.startswith("transformer.")
         )
-        return self.transformer.load_weights(transformer_weights)
+        self.transformer.load_weights(transformer_weights)

@@ -596,7 +596,7 @@ class BagelPipeline(nn.Module):
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
         return DiffusionOutput(output=img)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         state = self.state_dict()
         allowed = set(state.keys())
         shapes = {k: tuple(v.shape) for k, v in state.items()}
@@ -721,4 +721,4 @@ class BagelPipeline(nn.Module):
             )
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(_filtered_weights())
+        loader.load_weights(_filtered_weights())

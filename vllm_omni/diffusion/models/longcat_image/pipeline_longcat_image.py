@@ -672,7 +672,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
 
         return DiffusionOutput(output=image)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loader.load_weights(weights)
