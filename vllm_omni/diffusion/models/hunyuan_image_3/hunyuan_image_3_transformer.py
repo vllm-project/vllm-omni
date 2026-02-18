@@ -1588,20 +1588,6 @@ class HunyuanFusedMoE(SharedFusedMoE):
         self._init_hook_handle.remove()
 
     def forward(self, hidden_states, router_logits):
-        from vllm.model_executor.layers.fused_moe.layer import get_forward_context
-
-        ctx = get_forward_context()
-        if not ctx.remaining_moe_layers:
-            import re
-
-            moe_names = [name for name in ctx.no_compile_layers.keys() if ".mlp.experts" in name]
-
-            def get_layer_num(name):
-                match = re.search(r"layers\.(\d+)\.mlp", name)
-                return int(match.group(1)) if match else -1
-
-            moe_names.sort(key=get_layer_num, reverse=True)
-            ctx.remaining_moe_layers.extend(moe_names)
         return super().forward(hidden_states, router_logits)
 
 
