@@ -1,3 +1,6 @@
+# Argument to configure vllm base image if pre-built
+ARG VLLM_BASE=vllm-base
+
 FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04 AS vllm-base
 
 WORKDIR /workspace/
@@ -60,7 +63,8 @@ ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE="copy"
 
-RUN git clone -b v0.16.0 https://github.com/vllm-project/vllm
+ARG VLLM_VERSION=v0.16.0
+RUN git clone -b ${VLLM_VERSION} https://github.com/vllm-project/vllm
 WORKDIR /workspace/vllm
 
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -109,7 +113,7 @@ CMD ["/bin/bash"]
 
 ENTRYPOINT []
 
-From vllm-base as vllm-omni
+From ${VLLM_BASE} as vllm-omni
 
 ARG COMMON_WORKDIR=/workspace/vllm-omni
 RUN mkdir -p  ${COMMON_WORKDIR}
