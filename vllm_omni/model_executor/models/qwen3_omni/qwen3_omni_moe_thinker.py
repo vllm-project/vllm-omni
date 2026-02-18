@@ -83,11 +83,13 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 from vllm.multimodal.processing import (
-    MultiModalPromptUpdates,
-    PlaceholderFeaturesInfo,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
+)
+from vllm.multimodal.processing.processor import (
+    MultiModalPromptUpdates,
+    PlaceholderFeaturesInfo,
 )
 from vllm.sequence import IntermediateTensors
 

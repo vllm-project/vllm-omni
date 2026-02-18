@@ -15,7 +15,7 @@ from vllm.entrypoints.chat_utils import (
     MultiModalDataDict,
     MultiModalUUIDDict,
     _AssistantParser,
-    _ChatTemplateContentFormat,
+    ChatTemplateContentFormat,
     _ContentPart,
     _get_full_multimodal_text_prompt,
     _parse_chat_message_content_part,
@@ -128,7 +128,7 @@ class OmniAsyncMultiModalContentParser(AsyncMultiModalContentParser):
 def parse_chat_messages_futures(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
-    content_format: _ChatTemplateContentFormat,
+    content_format: ChatTemplateContentFormat,
     mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
@@ -161,7 +161,7 @@ def parse_chat_messages_futures(
 def _parse_chat_message_content(
     message: ChatCompletionMessageParam,
     mm_tracker: BaseMultiModalItemTracker,
-    content_format: _ChatTemplateContentFormat,
+    content_format: ChatTemplateContentFormat,
     interleave_strings: bool,
     mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> list[ConversationMessage]:

@@ -24,17 +24,15 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
-    apply_hf_chat_template,
-    apply_mistral_chat_template,
     get_history_tool_calls_cnt,
     make_tool_call_id,
-    resolve_chat_template_content_format,
 )
+from vllm.renderers.hf import resolve_chat_template_content_format
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
     parse_chat_output,
 )
-from vllm.entrypoints.openai.protocol import (
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -42,21 +40,23 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
-    DeltaFunctionCall,
     DeltaMessage,
+    FunctionCall,
+    FunctionDefinition,
+    ToolCall,
+)
+from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
     DeltaToolCall,
     ErrorInfo,
     ErrorResponse,
-    FunctionCall,
-    FunctionDefinition,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
-    ResponsesRequest,
-    ToolCall,
     UsageInfo,
 )
-from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
-from vllm.entrypoints.openai.serving_engine import (
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.engine.serving import (
     ChatLikeRequest,
     clamp_prompt_logprobs,
 )
@@ -376,16 +376,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if tokenizer is None:
             request_prompt = "placeholder"
         elif isinstance(tokenizer, MistralTokenizer):
-            request_prompt = apply_mistral_chat_template(
+            from vllm.renderers.mistral import safe_apply_chat_template as mistral_apply
+            request_prompt = mistral_apply(
                 tokenizer,
                 messages=messages,
                 **_chat_template_kwargs,
             )
         else:
-            request_prompt = apply_hf_chat_template(
-                tokenizer=tokenizer,
+            from vllm.renderers.hf import safe_apply_chat_template as hf_apply
+            request_prompt = hf_apply(
+                model_config,
+                tokenizer,
                 conversation=conversation,
-                model_config=model_config,
                 **_chat_template_kwargs,
             )
 

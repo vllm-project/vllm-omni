@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
 from starlette.routing import Route
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.anthropic.serving_messages import AnthropicServingMessages
+from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.api_server import (
@@ -29,15 +29,16 @@ from vllm.entrypoints.openai.api_server import (
     setup_server,
 )
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.protocol import (
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
-    ErrorResponse,
 )
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
-from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-from vllm.entrypoints.openai.serving_responses import OpenAIServingResponses
-from vllm.entrypoints.openai.serving_transcription import (
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+from vllm.entrypoints.openai.models.protocol import BaseModelPath
+from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+from vllm.entrypoints.openai.translations.serving import (
     OpenAIServingTranscription,
     OpenAIServingTranslation,
 )
@@ -48,10 +49,10 @@ from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
 from vllm.entrypoints.pooling.score.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
-from vllm.entrypoints.tool_server import DemoToolServer, MCPToolServer, ToolServer
+from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
+from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.utils import (
     load_aware_call,
-    process_chat_template,
     process_lora_modules,
     with_cancellation,
 )
@@ -357,11 +358,7 @@ async def omni_init_app_state(
         supported_tasks = set(await engine_client.get_supported_tasks())
     logger.info("Supported tasks: %s", supported_tasks)
 
-    resolved_chat_template = await process_chat_template(
-        args.chat_template,
-        engine_client,
-        vllm_config.model_config if vllm_config is not None else None,
-    )
+    resolved_chat_template = load_chat_template(args.chat_template)
 
     if args.tool_server == "demo":
         tool_server: ToolServer | None = DemoToolServer()

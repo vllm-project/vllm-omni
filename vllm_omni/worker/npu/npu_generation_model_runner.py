@@ -14,7 +14,7 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
-from vllm.multimodal.inputs import MultiModalKwargs
+from vllm.multimodal.inputs import MultiModalKwargsItem as MultiModalKwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
