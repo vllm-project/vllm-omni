@@ -113,14 +113,13 @@ CMD ["/bin/bash"]
 
 ENTRYPOINT []
 
-From ${VLLM_BASE} as vllm-omni
+FROM ${VLLM_BASE} AS vllm-omni
 
-ARG COMMON_WORKDIR=/workspace/vllm-omni
-RUN mkdir -p  ${COMMON_WORKDIR}
-COPY . ${COMMON_WORKDIR}
+WORKDIR /workspace/vllm-omni
+COPY . .
 
 ENV VLLM_OMNI_TARGET_DEVICE=xpu
-RUN cd ${COMMON_WORKDIR} && python -m pip install --no-cache-dir ".[dev]" --no-build-isolation
+RUN uv pip install --no-cache-dir ".[dev]" --no-build-isolation
 
 # FIX triton
 RUN --mount=type=cache,target=/root/.cache/uv \
