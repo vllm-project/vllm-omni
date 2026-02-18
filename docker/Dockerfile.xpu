@@ -130,7 +130,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip uninstall oneccl oneccl-devel
 
-FROM vllm-omni AS vllm-openai
+FROM vllm-omni AS vllm-omni-openai
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
