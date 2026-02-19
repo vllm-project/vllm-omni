@@ -804,17 +804,14 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             )
             kwargs["num_image_tokens"] = num_image_tokens
             # 50 and 5.0 hard code
-            from vllm.forward_context import set_forward_context
-
-            with set_forward_context(None, self.vllm_config):
-                results = self.pipeline(
-                    batch_size=len(batch_gen_image_info),
-                    image_size=[batch_gen_image_info[0].image_height, batch_gen_image_info[0].image_width],
-                    num_inference_steps=kwargs.get("num_inference_steps", 50),
-                    guidance_scale=kwargs.get("guidance_scale", 5.0),
-                    generator=generator,
-                    model_kwargs=kwargs,
-                )
+            results = self.pipeline(
+                batch_size=len(batch_gen_image_info),
+                image_size=[batch_gen_image_info[0].image_height, batch_gen_image_info[0].image_width],
+                num_inference_steps=kwargs.get("num_inference_steps", 50),
+                guidance_scale=kwargs.get("guidance_scale", 5.0),
+                generator=generator,
+                model_kwargs=kwargs,
+            )
             samples = results[0]
             return samples
 
@@ -929,24 +926,27 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            custom_pos_emb=custom_pos_emb,
-            mode=mode,
-            first_step=first_step,
-            query_lens=query_lens,
-            seq_lens=seq_lens,
-            num_image_tokens=num_image_tokens,
-            gen_timestep_scatter_index=gen_timestep_scatter_index,
-        )
+        from vllm.forward_context import set_forward_context
+
+        with set_forward_context(None, self.vllm_config):
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                custom_pos_emb=custom_pos_emb,
+                mode=mode,
+                first_step=first_step,
+                query_lens=query_lens,
+                seq_lens=seq_lens,
+                num_image_tokens=num_image_tokens,
+                gen_timestep_scatter_index=gen_timestep_scatter_index,
+            )
         hidden_states = outputs[0]
 
         if mode == "gen_text":
