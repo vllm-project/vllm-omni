@@ -5,8 +5,10 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.utils import hardware_test
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import is_npu, is_rocm
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,47 +22,66 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 models = ["Tongyi-MAI/Z-Image-Turbo", "riverclouds/qwen_image_random"]
 
-# NPU still can't run Tongyi-MAI/Z-Image-Turbo properly
 # Modelscope can't find riverclouds/qwen_image_random
 # TODO: When NPU support is ready, remove this branch.
-if is_npu():
-    models = ["Qwen/Qwen-Image"]
-elif is_rocm():
+if current_omni_platform.is_npu():
+    models = ["Tongyi-MAI/Z-Image-Turbo", "Qwen/Qwen-Image"]
+elif current_omni_platform.is_rocm():
     # TODO: When ROCm support is ready, remove this branch.
     # vLLM V0.11.0 has issues running riverclouds/qwen_image_random
     # on ROCm
     models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 1, "rocm": 2})
 @pytest.mark.parametrize("model_name", models)
-def test_diffusion_model(model_name: str):
-    m = Omni(model=model_name)
-    # high resolution may cause OOM on L4
-    height = 256
-    width = 256
-    outputs = m.generate(
-        "a photo of a cat sitting on a laptop keyboard",
-        height=height,
-        width=width,
-        num_inference_steps=2,
-        guidance_scale=0.0,
-        generator=torch.Generator("cuda").manual_seed(42),
-        num_outputs_per_prompt=2,
-    )
-    # Extract images from request_output[0]['images']
-    first_output = outputs[0]
-    assert first_output.final_output_type == "image"
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
+def test_diffusion_model(model_name: str, run_level):
+    if run_level == "core_model" and model_name != "riverclouds/qwen_image_random":
+        pytest.skip()
 
-    req_out = first_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
+    if run_level == "advanced_model" and model_name == "riverclouds/qwen_image_random":
+        pytest.skip()
 
-    images = req_out.images
+    m = None
+    try:
+        m = Omni(model=model_name)
+        # high resolution may cause OOM on L4
+        height = 256
+        width = 256
+        outputs = m.generate(
+            "a photo of a cat sitting on a laptop keyboard",
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=2,
+                guidance_scale=0.0,
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+                num_outputs_per_prompt=2,
+            ),
+        )
+        # Extract images from request_output[0]['images']
+        first_output = outputs[0]
+        assert first_output.final_output_type == "image"
+        if not hasattr(first_output, "request_output") or not first_output.request_output:
+            raise ValueError("No request_output found in OmniRequestOutput")
 
-    assert len(images) == 2
-    # check image size
-    assert images[0].width == width
-    assert images[0].height == height
-    images[0].save("image_output.png")
+        req_out = first_output.request_output[0]
+        if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
+            raise ValueError("Invalid request_output structure or missing 'images' key")
+
+        images = req_out.images
+
+        assert len(images) == 2
+        # check image size
+        assert images[0].width == width
+        assert images[0].height == height
+        images[0].save("image_output.png")
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        raise
+    finally:
+        if m is not None and hasattr(m, "close"):
+            m.close()

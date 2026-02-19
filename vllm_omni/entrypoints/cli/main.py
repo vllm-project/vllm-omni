@@ -18,10 +18,12 @@ def main():
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+        import vllm_omni.entrypoints.cli.benchmark.main
         import vllm_omni.entrypoints.cli.serve
 
         CMD_MODULES = [
             vllm_omni.entrypoints.cli.serve,
+            vllm_omni.entrypoints.cli.benchmark.main,
         ]
 
         cli_env_setup()

@@ -14,21 +14,34 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 4. [Tensor Parallelism](#tensor-parallelism): Tensor parallelism shards model weights across devices. This can reduce per-GPU memory usage. Note that for diffusion models we currently shard the majority of layers within the DiT.
 
+5. [VAE Patch Parallelism](#vae-patch-parallelism): VAE patch parallelism shards VAE decode spatially across ranks. This can reduce the peak memory of VAE decode and (depending on resolution and communication overhead) speed up VAE decode.
+
 The following table shows which models are currently supported by parallelism method:
 
 ### ImageGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel |
-|-------|------------------|------------|---------|--------------|--------------------------|
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ✅ | ✅ | ❌ | ❌ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ✅ | ✅ | ❌ | ❌ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ❌ | ❌ | ❌ |
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ❌ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ❌ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ❌ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ✅ | ✅ | ✅ | ❌ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ❌ | ❌ | ❌ | ✅ (TP=2 only) |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ❌ | ❌ | ❌ |
+| Model                    | Model Identifier                     | Ulysses-SP | Ring-SP | CFG-Parallel | Tensor-Parallel | VAE-Patch-Parallel |
+|--------------------------|--------------------------------------|:----------:|:-------:|:------------:|:---------------:|:------------------:|
+| **LongCat-Image**        | `meituan-longcat/LongCat-Image`      |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |
+| **LongCat-Image-Edit**   | `meituan-longcat/LongCat-Image-Edit` |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |
+| **Ovis-Image**           | `OvisAI/Ovis-Image`                  |     ❌      |    ❌    |      ❌       |        ❌        |         ❌          |
+| **Qwen-Image**           | `Qwen/Qwen-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
+| **Qwen-Image-Edit**      | `Qwen/Qwen-Image-Edit`               |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509`          |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
+| **Qwen-Image-Layered**   | `Qwen/Qwen-Image-Layered`            |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
+| **Z-Image**              | `Tongyi-MAI/Z-Image-Turbo`           |     ✅      |    ✅    |      ❌       |  ✅ (TP=2 only)  |         ✅          |
+| **Stable-Diffusion3.5**  | `stabilityai/stable-diffusion-3.5`   |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |
+| **FLUX.2-klein**         | `black-forest-labs/FLUX.2-klein-4B`  |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |
+| **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ✅       |        ✅        |         ❌          |
+
+!!! note "TP Limitations for Diffusion Models"
+    We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
+
+    - Good news: The text_encoder typically has minimal impact on overall inference performance.
+    - Bad news: When TP is enabled, every TP process retains a full copy of the text_encoder weights, leading to significant GPU memory waste.
+
+    We are actively refactoring this design to address this. For details and progress, please refer to [Issue #771](https://github.com/vllm-project/vllm-omni/issues/771).
+
 
 !!! note "Why Z-Image is TP=2 only"
     Z-Image Turbo is currently limited to `tensor_parallel_size` of **1 or 2** due to model shape divisibility constraints.
@@ -36,9 +49,9 @@ The following table shows which models are currently supported by parallelism me
 
 ### VideoGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-SP | Tensor-Parallel |
+| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel |
 |-------|------------------|------------|---------|--------------------------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ❌ | ❌ |
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ |
 
 ### Tensor Parallelism
 
@@ -56,12 +69,53 @@ omni = Omni(
 )
 
 outputs = omni.generate(
-    prompt="a cat reading a book",
-    num_inference_steps=9,
-    width=512,
-    height=512,
+    "a cat reading a book",
+    OmniDiffusionSamplingParams(
+        num_inference_steps=9,
+        width=512,
+        height=512,
+    ),
 )
 ```
+
+### VAE Patch Parallelism
+
+VAE patch parallelism distributes the VAE decode workload across multiple ranks by splitting the latent spatially. It is configured via `DiffusionParallelConfig.vae_patch_parallel_size` and can be combined with other parallelism methods (e.g., TP).
+
+!!! note "Enablement and feature gate"
+    - VAE patch parallelism is currently **enabled only for validated pipelines** (currently: `Tongyi-MAI/Z-Image-Turbo`).
+    - If `vae_patch_parallel_size > 1` is set for a validated pipeline, vLLM-Omni will automatically enable `vae_use_tiling` as a safety gate. (We use `vae_use_tiling` because it indicates the VAE supports diffusers tiling parameters like `tile_latent_min_size` and `tile_overlap_factor`.)
+
+#### Offline Inference
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=2,
+    ),
+    vae_use_tiling=True,
+)
+
+outputs = omni.generate(
+    prompt="a cat reading a book",
+    num_inference_steps=9,
+    width=1024,
+    height=1024,
+)
+```
+
+#### How it works (method selection)
+
+VAE patch parallelism automatically selects between two internal decode methods based on whether diffusers tiling would kick in:
+
+- `_distributed_tiled_decode`: Used when the latent spatial size exceeds `vae.tile_latent_min_size` (i.e., diffusers tiled decode). Each rank decodes a subset of tiles; rank0 gathers and runs the same overlap+blend+stitch logic as diffusers. This matches the single-rank diffusers tiled output.
+
+- `_distributed_patch_decode`: Used when diffusers tiling would not kick in. Each rank decodes a grid patch expanded with a latent-space halo; then rank0 gathers the cropped core patches and stitches them into the full image. This path has no blending and can introduce small numerical differences compared to the non-parallel decode.
 
 ### Sequence Parallelism
 
@@ -72,6 +126,7 @@ outputs = omni.generate(
 An example of offline inference script using [Ulysses-SP](https://arxiv.org/pdf/2309.14509) is shown below:
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 ulysses_degree = 2
 
@@ -80,7 +135,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
@@ -122,6 +180,7 @@ Ring-Attention ([arxiv paper](https://arxiv.org/abs/2310.01889)) splits the inpu
 An example of offline inference script using Ring-Attention is shown below:
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 ring_degree = 2
 
@@ -130,7 +189,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ring_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 See `examples/offline_inference/text_to_image/text_to_image.py` for a complete working example.
@@ -172,6 +234,7 @@ You can combine both Ulysses-SP and Ring-Attention for larger scale parallelism.
 
 ```python
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 # Hybrid: 2 Ulysses × 2 Ring = 4 GPUs total
@@ -180,7 +243,10 @@ omni = Omni(
     parallel_config=DiffusionParallelConfig(ulysses_degree=2, ring_degree=2)
 )
 
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50, width=2048, height=2048)
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50, width=2048, height=2048),
+)
 ```
 
 ##### Online Serving
@@ -208,109 +274,11 @@ To measure the parallelism methods, we run benchmarks with **Qwen/Qwen-Image** m
 | Hybrid Ulysses + Ring  |  2  |  2  |  24.3s | 1.87x |
 
 
-##### How to parallelize a new model
-
-If a diffusion model has been deployed in vLLM-Omni and supports single-card inference, you can refer to the following instructions to parallelize it with [Ulysses-SP](https://arxiv.org/pdf/2309.14509).
-
-
-This section uses **Qwen-Image** (`QwenImageTransformer2DModel`) as the reference implementation. Qwen-Image is a **dual-stream** transformer (text + image) that performs **joint attention** across the concatenated sequences. Because of that, when enabling sequence parallel you typically:
-
-- Chunk **image tokens** (`hidden_states`) across SP ranks along the **sequence dimension**.
-- Keep **text embeddings** (`encoder_hidden_states`) **replicated** on all SP ranks for correctness (unless you implement full joint-SP semantics and explicitly split text too).
-- Chunk **image RoPE freqs** to match the chunked image tokens.
-- `all_gather` the final output back along the sequence dimension.
-
-First, add the sequence-parallel helpers and (for Qwen-Image) the forward-context flag. Then, in the transformer's `forward()`:
-
-- Chunk `hidden_states` by SP world size.
-- Set `get_forward_context().split_text_embed_in_sp = False` because Qwen-Image uses joint attention and we would use a full text embedding in each rank.
-- After `pos_embed`, chunk `img_freqs` on `dim=0` (token axis) to match the chunked image tokens; only chunk `txt_freqs` if you explicitly split text embeddings in SP.
-
-Taking `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` as an example:
-
-```diff
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
-    get_sp_group,
-)
-from vllm_omni.diffusion.forward_context import get_forward_context
-
-class QwenImageTransformer2DModel(...):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
-        encoder_hidden_states_mask: torch.Tensor = None,
-        timestep: torch.LongTensor = None,
-        img_shapes: list[tuple[int, int, int]] | None = None,
-        txt_seq_lens: list[int] | None = None,
-        ...
-    ):
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           # Chunk image tokens along sequence dimension.
-+           hidden_states = torch.chunk(
-+               hidden_states,
-+               get_sequence_parallel_world_size(),
-+               dim=-2,
-+           )[get_sequence_parallel_rank()]
-+
-+           # Qwen-Image uses *dual-stream* (text + image) and runs *joint attention*.
-+           # Text embeddings should be replicated across SP ranks for correctness.
-+           get_forward_context().split_text_embed_in_sp = False
-
-        hidden_states = self.img_in(hidden_states)
-
-        ...
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
-
-+       def get_rotary_emb_chunk(freqs):
-+           return torch.chunk(freqs, get_sequence_parallel_world_size(), dim=0)[
-+               get_sequence_parallel_rank()
-+           ]
-+
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           img_freqs, txt_freqs = image_rotary_emb
-+           img_freqs = get_rotary_emb_chunk(img_freqs)
-+           if get_forward_context().split_text_embed_in_sp:
-+               txt_freqs = get_rotary_emb_chunk(txt_freqs)
-+           image_rotary_emb = (img_freqs, txt_freqs)
-```
-
-Next, at the end of the `forward()` function, call `get_sp_group().all_gather` to gather the chunked outputs across devices and concatenate them along the sequence dimension (matching the earlier `dim=-2` chunking):
-
-```diff
-class QwenImageTransformer2DModel(...):
-    def forward(...):
-        ...
-        hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
-
-+       if self.parallel_config.sequence_parallel_size > 1:
-+           output = get_sp_group().all_gather(output, dim=-2)
-        return Transformer2DModelOutput(sample=output)
-```
-
-Finally, you can set the parallel configuration and pass it to `Omni` and start parallel inference with:
-```diff
-from vllm_omni import Omni
-+from vllm_omni.diffusion.data import DiffusionParallelConfig
-ulysses_degree = 2
-
-omni = Omni(
-    model="Qwen/Qwen-Image",
-+    parallel_config=DiffusionParallelConfig(ulysses_degree=2)
-)
-
-outputs = omni.generate(prompt="A cat sitting on a windowsill", num_inference_steps=50)
-```
-
-
 ### CFG-Parallel
 
-##### Offline Inference
+#### Offline Inference
 
-CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=...)`. The recommended configuration is `cfg_parallel_size=2` (one rank for the positive branch and one rank for the negative branch).
+CFG-Parallel is enabled through `DiffusionParallelConfig(cfg_parallel_size=2)`, which runs one rank for the positive branch and one rank for the negative branch.
 
 An example of offline inference using CFG-Parallel (image-to-image) is shown below:
 
@@ -318,87 +286,47 @@ An example of offline inference using CFG-Parallel (image-to-image) is shown bel
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
+image_path = "path_to_image.png"
 omni = Omni(
     model="Qwen/Qwen-Image-Edit",
     parallel_config=DiffusionParallelConfig(cfg_parallel_size=2),
 )
+input_image = Image.open(image_path).convert("RGB")
 
 outputs = omni.generate(
-    prompt="turn this cat to a dog",
-    negative_prompt="low quality, blurry",
-    true_cfg_scale=4.0,
-    pil_image=input_image,
-    num_inference_steps=50,
+    {
+        "prompt": "turn this cat to a dog",
+        "negative_prompt": "low quality, blurry",
+        "multi_modal_data": {"image": input_image},
+    },
+    OmniDiffusionSamplingParams(
+        true_cfg_scale=4.0,
+        num_inference_steps=50,
+    ),
 )
 ```
 
 Notes:
 
-- CFG-Parallel is only effective when **true CFG** is enabled (i.e., `true_cfg_scale > 1` and a `negative_prompt` is provided).
+- CFG-Parallel is only effective when a `negative_prompt` is provided AND a guidance scale (or `cfg_scale`) is greater than 1.
 
-#### How to parallelize a pipeline
+See `examples/offline_inference/image_to_image/image_edit.py` for a complete working example.
+```bash
+cd examples/offline_inference/image_to_image/
+python image_edit.py \
+  --model "Qwen/Qwen-Image-Edit" \
+  --image "qwen_image_output.png" \
+  --prompt "turn this cat to a dog" \
+  --negative-prompt "low quality, blurry" \
+  --cfg-scale 4.0 \
+  --output "edited_image.png" \
+  --cfg-parallel-size 2
+```
 
-This section describes how to add CFG-Parallel to a diffusion **pipeline**. We use the Qwen-Image pipeline (`vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py`) as the reference implementation.
+#### Online Serving
 
-In `QwenImagePipeline`, each diffusion step runs two denoiser forward passes sequentially:
+You can enable CFG-Parallel in online serving for diffusion models via `--cfg-parallel-size`:
 
-- positive (prompt-conditioned)
-- negative (negative-prompt-conditioned)
-
-CFG-Parallel assigns these two branches to different ranks in the **CFG group** and synchronizes the results.
-
-Below is an example of CFG-Parallel implementation:
-
-```python
-def diffuse(
-        self,
-        ...
-        ):
-    # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
-    cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
-
-    self.transformer.do_true_cfg = do_true_cfg
-
-    if cfg_parallel_ready:
-        cfg_group = get_cfg_group()
-        cfg_rank = get_classifier_free_guidance_rank()
-
-        if cfg_rank == 0:
-            local_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-        else:
-            local_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                encoder_hidden_states=negative_prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=negative_txt_seq_lens,
-                attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-
-        gathered = cfg_group.all_gather(local_pred, separate_tensors=True)
-        if cfg_rank == 0:
-            noise_pred = gathered[0]
-            neg_noise_pred = gathered[1]
-            comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-        cfg_group.broadcast(latents, src=0)
-    else:
-        # fallback: run positive then negative sequentially on one rank
-        ...
+```bash
+vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
 ```

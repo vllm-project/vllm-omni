@@ -18,6 +18,7 @@ Enable cache-dit acceleration by simply setting `cache_backend="cache_dit"`. Cac
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Simplest way: just enable cache-dit with default parameters
 omni = Omni(
@@ -27,7 +28,7 @@ omni = Omni(
 
 images = omni.generate(
     "a beautiful landscape",
-    num_inference_steps=50,
+    OmniDiffusionSamplingParams(num_inference_steps=50),
 )
 ```
 
@@ -69,7 +70,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 ## Acceleration Methods
 
-For comprehensive illustration, please view cache-dit [User_Guide](https://github.com/vipshop/cache-dit/blob/main/docs/User_Guide.md)
+For comprehensive illustration, please view cache-dit [User_Guide](https://cache-dit.readthedocs.io/en/latest/user_guide/OVERVIEWS/)
 
 ### 1. DBCache (Dual Block Cache)
 
@@ -187,8 +188,8 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Qwen/Qwen-Image \
     --prompt "a cup of coffee on the table" \
-    --cache_backend cache_dit \
-    --num_inference_steps 50
+    --cache-backend cache_dit \
+    --num-inference-steps 50
 ```
 
 
@@ -222,6 +223,6 @@ To test another model, you can modify `--model` with the target model identifier
 
 ## Additional Resources
 
-- [Cache-DiT User Guide](https://github.com/vipshop/cache-dit/blob/main/docs/User_Guide.md)
-- [Cache-DiT Benchmark](https://github.com/vipshop/cache-dit/tree/main/bench)
-- [DBCache Technical Details](https://github.com/vipshop/cache-dit/blob/main/docs/DBCache.md)
+- [Cache-DiT User Guide](https://cache-dit.readthedocs.io/en/latest/user_guide/OVERVIEWS/)
+- [Cache-DiT Benchmark](https://cache-dit.readthedocs.io/en/latest/benchmark/HYBRID_CACHE/)
+- [DBCache Technical Details](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)

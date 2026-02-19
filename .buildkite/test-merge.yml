@@ -1,0 +1,329 @@
+steps:
+  - label: ":docker: Build image"
+    key: image-build
+    commands:
+      - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+      - "docker build --file docker/Dockerfile.ci -t vllm-omni-ci ."
+      - "docker tag vllm-omni-ci public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+      - "docker push public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT"
+    agents:
+      queue: "cpu_queue_premerge"
+
+  - label: "Simple Unit Test"
+    depends_on: image-build
+    commands:
+      - "pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Model Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "advanced_model and diffusion" --run-level "advanced_model"
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Images API LoRA E2E"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/online_serving/test_images_generations_lora.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Model CPU offloading Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
+      - pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Audio Generation Model Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_stable_audio_model.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Cache Backend Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Sequence Parallelism Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion Tensor Parallelism Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/e2e/offline_inference/test_zimage_tensor_parallel.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Diffusion GPU Worker Test"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - pytest -s -v tests/diffusion/test_diffusion_worker.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+
+  - label: "Benchmark&Engine Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/benchmarks/test_serve_cli.py
+      - pytest -s -v tests/engine/test_async_omni_engine_abort.py
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 2
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  - label: "Omni Model Test"
+    timeout_in_minutes: 15
+    depends_on: image-build
+    commands:
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+    agents:
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+    - docker#v5.2.0:
+        image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+        always-pull: true
+        propagate-environment: true
+        environment:
+        - "HF_HOME=/fsx/hf_cache"
+        volumes:
+        - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "Omni Model Test with H100"
+    timeout_in_minutes: 30
+    depends_on: image-build
+    commands:
+       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+       - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
+       - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
+       - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
+    agents:
+       queue: "mithril-h100-pool"
+    plugins:
+       - kubernetes:
+           podSpec:
+             containers:
+               - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                 resources:
+                   limits:
+                     nvidia.com/gpu: 2
+                 volumeMounts:
+                   - name: devshm
+                     mountPath: /dev/shm
+                   - name: hf-cache
+                     mountPath: /root/.cache/huggingface
+                 env:
+                   - name: HF_HOME
+                     value: /root/.cache/huggingface
+             nodeSelector:
+               node.kubernetes.io/instance-type: gpu-h100-sxm
+             volumes:
+               - name: devshm
+                 emptyDir:
+                   medium: Memory
+               - name: hf-cache
+                 hostPath:
+                   path: /mnt/hf-cache
+                   type: DirectoryOrCreate
+
+  - label: "Diffusion Image Edit Test with H100 (1 GPU)"
+    timeout_in_minutes: 20
+    depends_on: image-build
+    commands:
+      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
+  # - label: "Bagel Text2Img Model Test with H100"
+  #   timeout_in_minutes: 30
+  #   depends_on: image-build
+  #   commands:
+  #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  #     - pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py
+  #   agents:
+  #     queue: "mithril-h100-pool"
+  #   plugins:
+  #     - kubernetes:
+  #         podSpec:
+  #           containers:
+  #             - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #               resources:
+  #                 limits:
+  #                   nvidia.com/gpu: 1
+  #               volumeMounts:
+  #                 - name: devshm
+  #                   mountPath: /dev/shm
+  #                 - name: hf-cache
+  #                   mountPath: /root/.cache/huggingface
+  #               env:
+  #                 - name: HF_HOME
+  #                   value: /root/.cache/huggingface
+  #           nodeSelector:
+  #             node.kubernetes.io/instance-type: gpu-h100-sxm
+  #           volumes:
+  #             - name: devshm
+  #               emptyDir:
+  #                 medium: Memory
+  #             - name: hf-cache
+  #               hostPath:
+  #                 path: /mnt/hf-cache
+  #                 type: DirectoryOrCreate

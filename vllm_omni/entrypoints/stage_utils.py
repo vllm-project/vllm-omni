@@ -57,12 +57,12 @@ def set_stage_devices(
         - CUDA: Sets CUDA_VISIBLE_DEVICES and calls torch.cuda.set_device()
         - NPU: Sets ASCEND_RT_VISIBLE_DEVICES and calls torch.npu.set_device()
     """
-    from vllm_omni.utils import detect_device_type, get_device_control_env_var
+    from vllm_omni.platforms import current_omni_platform
 
     if device_type is None:
-        device_type = detect_device_type()
+        device_type = current_omni_platform.device_type
 
-    env_var = get_device_control_env_var()
+    env_var = current_omni_platform.device_control_env_var
 
     try:
         selected_physical: int | None = None
@@ -141,12 +141,25 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
-def shm_write_bytes(payload: bytes) -> dict[str, Any]:
+def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
     """
-    shm = _shm.SharedMemory(create=True, size=len(payload))
+    try:
+        shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+    except FileExistsError:
+        if name:
+            # If name is specified and exists, unlink it and try again
+            try:
+                existing = _shm.SharedMemory(name=name)
+                existing.unlink()
+            except Exception:
+                pass
+            shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+        else:
+            raise
+
     mv = memoryview(shm.buf)
     mv[: len(payload)] = payload
     del mv
@@ -209,7 +222,8 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     """
     payload = serialize_obj(obj)
     if len(payload) > threshold:
-        return True, shm_write_bytes(payload)
+        logger.debug(f"Dumping object to SHM with size: {len(payload)}")
+        return True, shm_write_bytes(payload, name=None)
     return False, obj
 
 

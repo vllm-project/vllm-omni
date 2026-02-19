@@ -14,15 +14,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm_omni.utils.platform_utils import detect_device_type
-
-device_type = detect_device_type()
-if device_type == "cuda":
-    torch_device = torch.cuda
-elif device_type == "npu":
-    torch_device = torch.npu
-else:
-    raise ValueError(f"Unsupported device type: {device_type} for this test script! Expected GPU or NPU.")
+from vllm_omni.platforms import current_omni_platform
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -48,6 +40,11 @@ def test_4d_identity(
     use_sync: bool,
 ):
     """Test that two consecutive all-to-all operations return the original input."""
+    # Skip if not enough GPUs available
+    available_gpus = current_omni_platform.get_device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
     # Ensure num_heads is divisible by world_size
     if num_heads % world_size != 0:
         pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
@@ -80,8 +77,8 @@ def _test_4d_identity_worker(
 ):
     """Worker function for test_4d_identity."""
     # Set device
-    device = torch.device(f"{device_type}:{local_rank}")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
 
     # Set environment variables for distributed training
     update_environment_variables(
@@ -177,6 +174,11 @@ def test_5d_identity(
     use_sync: bool,
 ):
     """Test that two consecutive all-to-all operations return the original input."""
+    # Skip if not enough GPUs available
+    available_gpus = current_omni_platform.get_device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
     # Ensure num_heads is divisible by world_size
     if num_heads % world_size != 0:
         pytest.skip(f"num_heads ({num_heads}) not divisible by world_size ({world_size})")
@@ -209,8 +211,8 @@ def _test_5d_identity_worker(
 ):
     """Worker function for test_5d_identity."""
     # Set device
-    device = torch.device(f"{device_type}:{local_rank}")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
 
     # Set environment variables for distributed training
     update_environment_variables(
@@ -305,6 +307,11 @@ def test_ring_p2p(
     head_size: int,
 ):
     """Test Ring P2P communication (send_recv)."""
+    # Skip if not enough GPUs available
+    available_gpus = current_omni_platform.get_device_count()
+    if available_gpus < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs but only {available_gpus} available")
+
     torch.multiprocessing.spawn(
         _test_ring_p2p_worker,
         args=(world_size, dtype, batch_size, num_heads, head_size),
@@ -324,8 +331,8 @@ def _test_ring_p2p_worker(
     import sys
 
     # Set device
-    device = torch.device(f"{device_type}:{local_rank}")
-    torch_device.set_device(device)
+    device = torch.device(f"{current_omni_platform.device_type}:{local_rank}")
+    current_omni_platform.set_device(device)
 
     # Set env vars
     # Use a different port to avoid conflict with other tests if run in parallel

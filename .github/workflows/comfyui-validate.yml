@@ -1,0 +1,40 @@
+name: ComfyUI Integration -- Validate backwards compatibility
+
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+    paths:
+      - "apps/ComfyUI-vLLM-Omni/**"
+
+defaults:
+  run:
+    working-directory: apps/ComfyUI-vLLM-Omni
+
+jobs:
+  check-base-path:
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+      - id: check
+        run: |
+          if [ -d "apps/ComfyUI-vLLM-Omni" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+  validate:
+    needs: check-base-path
+    if: needs.check-base-path.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: comfy-org/node-diff@main

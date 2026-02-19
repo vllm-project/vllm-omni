@@ -1,162 +1,57 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
-import base64
-import concurrent.futures
-import ctypes
 import os
-import signal
-import socket
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-import openai
-import pytest
-from vllm.assets.video import VideoAsset
-from vllm.utils import get_open_port
-
-from vllm_omni.utils import is_rocm
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
+from pathlib import Path
+
+import pytest
+
+from tests.conftest import (
+    dummy_messages_from_mix_data,
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+    modify_stage_config,
+)
+from tests.utils import hardware_test
+from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
+
+def get_chunk_config():
+    path = modify_stage_config(
+        str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml"),
+        updates={
+            "async_chunk": True,
+            "stage_args": {
+                0: {
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                },
+                1: {
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
+                },
+            },
+        },
+        deletes={"stage_args": {2: ["custom_process_input_func"]}},
+    )
+    return path
+
+
 # CI stage config for 2xH100-80G GPUs or AMD GPU MI325
-if is_rocm():
+if current_omni_platform.is_rocm():
     # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
 else:
-    stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+    stage_configs = [get_chunk_config()]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
-
-
-class OmniServer:
-    """Omniserver for vLLM-Omni tests."""
-
-    def __init__(
-        self,
-        model: str,
-        serve_args: list[str],
-        *,
-        env_dict: dict[str, str] | None = None,
-    ) -> None:
-        self.model = model
-        self.serve_args = serve_args
-        self.env_dict = env_dict
-        self.proc: subprocess.Popen | None = None
-        self.host = "127.0.0.1"
-        self.port = get_open_port()
-
-    def _start_server(self) -> None:
-        """Start the vLLM-Omni server subprocess."""
-        env = os.environ.copy()
-        env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        if self.env_dict is not None:
-            env.update(self.env_dict)
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "vllm_omni.entrypoints.cli.main",
-            "serve",
-            self.model,
-            "--omni",
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
-        ] + self.serve_args
-
-        # Helper to ensure child process dies when parent dies
-        libc = ctypes.CDLL("libc.so.6")
-
-        def preexec_fn():
-            # Ensure the child process receives SIGTERM when the parent (this test runner) dies.
-            # This prevents orphaned processes if the test is killed unexpectedly.
-            PR_SET_PDEATHSIG = 1
-            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
-
-        print(f"Launching OmniServer with: {' '.join(cmd)}")
-        self.proc = subprocess.Popen(
-            cmd,
-            env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # Set working directory to vllm-omni root
-            start_new_session=True,
-            preexec_fn=preexec_fn,
-        )
-
-        # Wait for server to be ready
-        max_wait = 600  # 10 minutes
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex((self.host, self.port))
-                    if result == 0:
-                        print(f"Server ready on {self.host}:{self.port}")
-                        return
-            except Exception:
-                pass
-            time.sleep(2)
-
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
-
-    def __enter__(self):
-        self._start_server()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.proc:
-            try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.proc.wait()
-
-
-@pytest.fixture
-def omni_server(request):
-    """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses module scope so the server starts only once for all tests.
-    Multi-stage initialization can take 10-20+ minutes.
-    """
-    model, stage_config_path = request.param
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
-        yield server
-
-
-@pytest.fixture
-def client(omni_server):
-    """OpenAI client for the running vLLM-Omni server."""
-    return openai.OpenAI(
-        base_url=f"http://{omni_server.host}:{omni_server.port}/v1",
-        api_key="EMPTY",
-    )
-
-
-@pytest.fixture(scope="session")
-def base64_encoded_video() -> str:
-    """Base64 encoded video for testing."""
-    video = VideoAsset(name="baby_reading", num_frames=4)
-    with open(video.video_path, "rb") as f:
-        content = f.read()
-        return base64.b64encode(content).decode("utf-8")
 
 
 def get_system_prompt():
@@ -175,110 +70,79 @@ def get_system_prompt():
     }
 
 
-def dummy_messages_from_video_data(
-    video_data_url: str,
-    content_text: str = "Describe the video briefly.",
-):
-    """Create messages with video data URL for OpenAI API."""
-    return [
-        get_system_prompt(),
-        {
-            "role": "user",
-            "content": [
-                {"type": "video_url", "video_url": {"url": video_data_url}},
-                {"type": "text", "text": content_text},
-            ],
-        },
-    ]
+def get_prompt(prompt_type="text_only"):
+    prompts = {
+        "text_only": "What is the capital of China? Answer in 20 words.",
+        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+    }
+    return prompts.get(prompt_type, prompts["text_only"])
 
 
+def get_max_batch_size(size_type="few"):
+    batch_sizes = {"few": 5, "medium": 100, "large": 256}
+    return batch_sizes.get(size_type, 5)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_video_to_audio_concurrent(
-    client: openai.OpenAI,
-    omni_server,
-    base64_encoded_video: str,
-) -> None:
-    """Test processing video with multiple concurrent completions, generating audio output via OpenAI API."""
-    # Create data URL for the base64 encoded video
-    video_data_url = f"data:video/mp4;base64,{base64_encoded_video}"
+def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+    """
+    Test multi-modal input processing and text/audio output generation via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text + audio + video + image
+    Output Modal: text + audio
+    Input Setting: stream=True
+    Datasets: single request
+    """
 
-    messages = dummy_messages_from_video_data(video_data_url)
-
-    # Test multiple concurrent completions
-    num_concurrent_requests = 5
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
-        # Submit multiple completion requests concurrently
-        futures = [
-            executor.submit(
-                client.chat.completions.create,
-                model=omni_server.model,
-                messages=messages,
-            )
-            for _ in range(num_concurrent_requests)
-        ]
-
-        # Wait for all requests to complete and collect results
-        chat_completions = [future.result() for future in concurrent.futures.as_completed(futures)]
-
-    # Verify all completions succeeded
-    assert len(chat_completions) == num_concurrent_requests
-
-    for chat_completion in chat_completions:
-        assert len(chat_completion.choices) == 2  # 1 for text output, 1 for audio output
-
-        # Verify text output
-        text_choice = chat_completion.choices[0]
-        assert text_choice.finish_reason == "length"
-
-        # Verify we got a response
-        text_message = text_choice.message
-        assert text_message.content is not None and len(text_message.content) >= 10
-        assert text_message.role == "assistant"
-
-        # Verify audio output
-        audio_choice = chat_completion.choices[1]
-        assert audio_choice.finish_reason == "stop"
-        audio_message = audio_choice.message
-
-        # Check if audio was generated
-        if hasattr(audio_message, "audio") and audio_message.audio:
-            assert audio_message.audio.data is not None
-            assert len(audio_message.audio.data) > 0
-
-    # Test streaming completion
-    chat_completion = client.chat.completions.create(
-        model=omni_server.model,
-        messages=messages,
-        stream=True,
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("mix"),
     )
 
-    # Collect text and audio data from stream
-    text_content = ""
-    audio_data = None
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {
+            "audio": ["water", "chirping"],
+            "image": ["square", "quadrate"],
+        },
+    }
 
-    for chunk in chat_completion:
-        for choice in chunk.choices:
-            if hasattr(choice, "delta"):
-                content = getattr(choice.delta, "content", None)
-            else:
-                content = None
+    # Test single completion
+    openai_client.send_request(request_config)
 
-            modality = getattr(chunk, "modality", None)
 
-            if modality == "audio" and content:
-                # Audio chunk - decode base64 content
-                if audio_data is None:
-                    audio_data = base64.b64decode(content)
-                else:
-                    audio_data += base64.b64decode(content)
-            elif modality == "text" and content:
-                # Text chunk - accumulate text content
-                text_content += content if content else ""
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_text_001(omni_server, openai_client) -> None:
+    """
+    Test text input processing and text/audio output generation via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text
+    Output Modal: text + audio
+    Datasets: few requests
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
-    # Verify text output
-    assert text_content is not None and len(text_content) >= 2
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
 
-    # Verify audio output
-    assert audio_data is not None
-    assert len(audio_data) > 0
+    openai_client.send_request(request_config, request_num=get_max_batch_size())

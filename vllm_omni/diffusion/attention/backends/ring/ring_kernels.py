@@ -6,7 +6,13 @@ import math
 
 import torch
 
-from .ring_globals import HAS_AITER, HAS_FLASH_ATTN, HAS_FLASH_ATTN_HOPPER, HAS_FLASHINFER, HAS_NPU
+from .ring_globals import (
+    HAS_AITER,
+    HAS_FA3,
+    HAS_FLASH_ATTN,
+    HAS_FLASHINFER,
+    fa3_fwd_func,
+)
 
 _scaled_dot_product_flash_attention = torch.ops.aten._scaled_dot_product_flash_attention
 _scaled_dot_product_efficient_attention = torch.ops.aten._scaled_dot_product_efficient_attention
@@ -26,22 +32,10 @@ if HAS_FLASH_ATTN:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
 
-if HAS_FLASH_ATTN_HOPPER:
-    from flash_attn_interface import _flash_attn_backward as flash_attn_func_hopper_backward
-    from flash_attn_interface import _flash_attn_forward as flash_attn_forward_hopper
-    from flash_attn_interface import flash_attn_func as flash3_attn_func
-else:
-    flash_attn_forward_hopper = None
-    flash_attn_func_hopper_backward = None
-    flash3_attn_func = None
-
 if HAS_FLASHINFER:
     from flashinfer.prefill import single_prefill_with_kv_cache
 
     _LOG2_E = math.log2(math.e)
-
-if HAS_NPU:
-    import torch_npu
 
 
 def pytorch_attn_forward(
@@ -146,50 +140,33 @@ def flash_attn_forward(
     return block_out, block_lse
 
 
-def flash_attn3_func_forward(
-    q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax
-):
-    assert HAS_FLASH_ATTN_HOPPER
-    # current signature of flash_attn_forward_hopper:
-    # (q, k, v, softmax_scale, causal, window_size, descale_q=None, descale_k=None, descale_v=None, gqa_parallel=False)
+def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
+    """FA3 forward pass for inference.
 
-    out, softmax_lse, *unused = flash_attn_forward_hopper(
-        q=q,
-        k=k,
-        v=v,
-        k_new=None,
-        v_new=None,
-        qv=None,
-        out=None,
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        cu_seqlens_k_new=None,
-        seqused_q=None,
-        seqused_k=None,
-        max_seqlen_q=None,
-        max_seqlen_k=None,
-        page_table=None,
-        kv_batch_idx=None,
-        leftpad_k=None,
-        rotary_cos=None,
-        rotary_sin=None,
-        seqlens_rotary=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
+    FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.
+    Uses low-level API (_flash_attn_forward) which always returns softmax_lse,
+    required for Ring Attention's correct accumulation.
+    """
+    assert HAS_FA3, "FA3 is not available"
+    assert fa3_fwd_func is not None, "FA3 low-level API (fa3_fwd_func) not available"
+
+    # Low-level API always returns (out, softmax_lse, S_dmask, rng_state)
+    out, softmax_lse, *_ = fa3_fwd_func(
+        q,
+        k,
+        v,
         softmax_scale=softmax_scale,
-        causal=False,
-        window_size=(-1, -1),
-        attention_chunk=0,
-        softcap=0.0,
-        rotary_interleaved=True,
-        scheduler_metadata=None,
-        num_splits=0,
-        pack_gqa=None,
-        sm_margin=0,
+        causal=causal,
+        window_size_left=window_size[0] if window_size else -1,
+        window_size_right=window_size[1] if window_size else -1,
+        softcap=softcap if softcap else 0.0,
     )
 
     return out, softmax_lse
+
+
+# Legacy alias for backward compatibility
+flash_attn3_func_forward = fa3_forward
 
 
 def flash_attn_forward_aiter(
@@ -264,20 +241,3 @@ def flashinfer_attn_forward(
         raise ValueError(f"Invalid input shape: {q.shape}")
     lse = lse / _LOG2_E
     return out, lse
-
-
-def npu_attn_forward(q, k, v, softmax_scale=None, layout="BSND"):
-    assert HAS_NPU, "torch_npu is not available"
-    softmax_scale = q.shape[-1] ** (-0.5)
-    block_out, block_lse = torch_npu.npu_fused_infer_attention_score(
-        q,
-        k,
-        v,
-        num_heads=q.shape[-2],
-        input_layout=layout,
-        scale=softmax_scale,
-        softmax_lse_flag=True,
-        pre_tokens=65535,
-        next_tokens=65535,
-    )
-    return block_out, block_lse.squeeze(dim=-1)

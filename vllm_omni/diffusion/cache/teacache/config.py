@@ -25,14 +25,19 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
-    # SD3 / SD3.5 default coefficients.
-    #
-    # Empirically we want SD3's default caching behavior (rel_l1_thresh=0.2) to be
-    # conservative enough to preserve quality. We therefore scale the raw rel-L1
-    # distance up (linear polynomial), effectively reducing the aggressiveness
-    # without requiring the user to change rel_l1_thresh.
-    #
-    # rescaled_distance = 4 * rel_distance
+    # Bagel transformer coefficients
+    # Using Qwen's coefficients as reasonable default given shared architecture
+    "Bagel": [1.33313129e06, -1.68644226e05, 7.95050740e03, -1.63747873e02, 1.26352397e00],
+    # Z-Image transformer coefficients
+    # Copied from Qwen-Image, need to be tuned specifically for Z-Image in future
+    "ZImageTransformer2DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
+    # SD3 / SD3.5 coefficients (estimated for SD3.5).
     "SD3Transformer2DModel": [
         -4.277698959844608e03,
         5.002450261031280e02,

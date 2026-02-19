@@ -1,26 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import multiprocessing as mp
+import os
 import time
-import weakref
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable
 from typing import Any
 
 import PIL.Image
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.scheduler import Scheduler, scheduler
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
 logger = init_logger(__name__)
 
@@ -32,37 +30,16 @@ def supports_image_input(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_image_input", False))
 
 
-@dataclass
-class BackgroundResources:
-    """
-    Used as a finalizer for clean shutdown.
-    Create a BackgroundResources instance to encapsulate all background resources
-    (e.g., the scheduler and worker processes) that need explicit cleanup.
-    This object holds references to external system resources that are not managed
-    by Python's garbage collector (like OS processes, message queues, etc.),
-    so they must be cleaned up manually to avoid resource leaks or zombie processes.
-    """
+def image_color_format(model_class_name: str) -> str:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    return getattr(model_cls, "color_format", "RGB")
 
-    scheduler: Scheduler | None = None
-    processes: list[mp.Process] | None = None
 
-    def __call__(self):
-        """Clean up background resources."""
-        if scheduler is not None:
-            try:
-                for _ in range(scheduler.num_workers):
-                    scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
-                scheduler.close()
-            except Exception as exc:
-                logger.warning("Failed to send shutdown signal: %s", exc)
-        for proc in self.processes:
-            if not proc.is_alive():
-                continue
-            proc.join(30)
-            if proc.is_alive():
-                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
-                proc.terminate()
-                proc.join(30)
+def supports_audio_output(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_audio_output", False))
 
 
 class DiffusionEngine:
@@ -79,9 +56,9 @@ class DiffusionEngine:
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
 
-        self._processes: list[mp.Process] = []
-        self._closed = False
-        self._make_client()
+        executor_class = DiffusionExecutor.get_class(od_config)
+        self.executor = executor_class(od_config)
+
         try:
             self._dummy_run()
         except Exception as e:
@@ -89,103 +66,118 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    def step(self, requests: list[OmniDiffusionRequest]):
-        try:
-            # Apply pre-processing if available
-            if self.pre_process_func is not None:
-                preprocess_start_time = time.time()
-                requests = self.pre_process_func(requests)
-                preprocess_time = time.time() - preprocess_start_time
-                logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+    def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        # Apply pre-processing if available
+        if self.pre_process_func is not None:
+            preprocess_start_time = time.time()
+            request = self.pre_process_func(request)
+            preprocess_time = time.time() - preprocess_start_time
+            logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
-            output = self.add_req_and_wait_for_response(requests)
-            if output.error:
-                raise Exception(f"{output.error}")
-            logger.info("Generation completed successfully.")
+        output = self.add_req_and_wait_for_response(request)
+        if output.error:
+            raise Exception(f"{output.error}")
+        logger.info("Generation completed successfully.")
 
-            if output.output is None:
-                logger.warning("Output is None, returning empty OmniRequestOutput")
-                # Return empty output for the first request
-                if len(requests) > 0:
-                    request = requests[0]
-                    request_id = request.request_id or ""
-                    prompt = request.prompt
-                    if isinstance(prompt, list):
-                        prompt = prompt[0] if prompt else None
-                    return OmniRequestOutput.from_diffusion(
+        if output.output is None:
+            logger.warning("Output is None, returning empty OmniRequestOutput")
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id=request.request_ids[i] if i < len(request.request_ids) else "",
+                    images=[],
+                    prompt=prompt,
+                    metrics={},
+                    latents=None,
+                )
+                for i, prompt in enumerate(request.prompts)
+            ]
+
+        postprocess_start_time = time.time()
+        outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
+        postprocess_time = time.time() - postprocess_start_time
+        logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+        # Convert to OmniRequestOutput format
+        # Ensure outputs is a list
+        if not isinstance(outputs, list):
+            outputs = [outputs] if outputs is not None else []
+
+        metrics = {
+            "image_num": int(request.sampling_params.num_outputs_per_prompt),
+            "resolution": int(request.sampling_params.resolution),
+            "postprocess_time_ms": postprocess_time * 1000,
+        }
+        if self.pre_process_func is not None:
+            metrics["preprocessing_time_ms"] = preprocess_time * 1000
+
+        # Handle single request or multiple requests
+        if len(request.prompts) == 1:
+            # Single request: return single OmniRequestOutput
+            prompt = request.prompts[0]
+            request_id = request.request_ids[0] if request.request_ids else ""
+
+            if supports_audio_output(self.od_config.model_class_name):
+                audio_payload = outputs[0] if len(outputs) == 1 else outputs
+                return [
+                    OmniRequestOutput.from_diffusion(
                         request_id=request_id,
                         images=[],
                         prompt=prompt,
-                        metrics={},
-                        latents=None,
-                    )
-                return None
-
-            postprocess_start_time = time.time()
-            images = self.post_process_func(output.output) if self.post_process_func is not None else output.output
-            postprocess_time = time.time() - postprocess_start_time
-            logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
-
-            # Convert to OmniRequestOutput format
-            # Ensure images is a list
-            if not isinstance(images, list):
-                images = [images] if images is not None else []
-
-            # Handle single request or multiple requests
-            if len(requests) == 1:
-                # Single request: return single OmniRequestOutput
-                request = requests[0]
-                request_id = request.request_id or ""
-                prompt = request.prompt
-                if isinstance(prompt, list):
-                    prompt = prompt[0] if prompt else None
-
-                metrics = {}
-                if output.trajectory_timesteps is not None:
-                    metrics["trajectory_timesteps"] = output.trajectory_timesteps
-
-                return OmniRequestOutput.from_diffusion(
-                    request_id=request_id,
-                    images=images,
-                    prompt=prompt,
-                    metrics=metrics,
-                    latents=output.trajectory_latents,
-                )
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                        multimodal_output={"audio": audio_payload},
+                        final_output_type="audio",
+                    ),
+                ]
             else:
-                # Multiple requests: return list of OmniRequestOutput
-                # Split images based on num_outputs_per_prompt for each request
-                results = []
-                image_idx = 0
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=outputs,
+                        prompt=prompt,
+                        metrics=metrics,
+                        latents=output.trajectory_latents,
+                    ),
+                ]
+        else:
+            # Multiple requests: return list of OmniRequestOutput
+            # Split images based on num_outputs_per_prompt for each request
+            results = []
+            output_idx = 0
 
-                for request in requests:
-                    request_id = request.request_id or ""
-                    prompt = request.prompt
-                    if isinstance(prompt, list):
-                        prompt = prompt[0] if prompt else None
+            for i, prompt in enumerate(request.prompts):
+                request_id = request.request_ids[i] if i < len(request.request_ids) else ""
 
-                    # Get images for this request
-                    num_outputs = request.num_outputs_per_prompt
-                    request_images = images[image_idx : image_idx + num_outputs] if image_idx < len(images) else []
-                    image_idx += num_outputs
+                # Get images for this request
+                num_outputs = request.sampling_params.num_outputs_per_prompt
+                request_outputs = outputs[output_idx : output_idx + num_outputs] if output_idx < len(outputs) else []
+                output_idx += num_outputs
 
-                    metrics = {}
-                    if output.trajectory_timesteps is not None:
-                        metrics["trajectory_timesteps"] = output.trajectory_timesteps
-
+                if supports_audio_output(self.od_config.model_class_name):
+                    audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
-                            images=request_images,
+                            images=[],
+                            prompt=prompt,
+                            metrics=metrics,
+                            latents=output.trajectory_latents,
+                            multimodal_output={"audio": audio_payload},
+                            final_output_type="audio",
+                        )
+                    )
+                else:
+                    results.append(
+                        OmniRequestOutput.from_diffusion(
+                            request_id=request_id,
+                            images=request_outputs,
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
                         )
                     )
 
-                return results
-        except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            return None
+            return results
 
     @staticmethod
     def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
@@ -199,125 +191,160 @@ class DiffusionEngine:
         """
         return DiffusionEngine(config)
 
-    def _make_client(self):
-        # TODO rename it
-        scheduler.initialize(self.od_config)
+    def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
+        return self.executor.add_req(request)
 
-        # Get the broadcast handle from the initialized scheduler
-        broadcast_handle = scheduler.get_broadcast_handle()
+    def start_profile(self, trace_filename: str | None = None) -> None:
+        """
+        Start torch profiling on all diffusion workers.
 
-        processes, result_handle = self._launch_workers(
-            broadcast_handle=broadcast_handle,
-        )
+        Creates a directory (if needed) and sets up a base filename template
+        for per-rank profiler traces (typically saved as <template>_rank<N>.json).
 
-        if result_handle is not None:
-            scheduler.initialize_result_queue(result_handle)
-        else:
-            logger.error("Failed to get result queue handle from workers")
+        Args:
+            trace_filename: Optional base filename (without extension or rank suffix).
+                            If None, generates one using current timestamp.
+        """
+        if trace_filename is None:
+            trace_filename = f"stage_0_diffusion_{int(time.time())}_rank"
 
-        self._processes = processes
+        trace_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
 
-        self.resources = BackgroundResources(scheduler=scheduler, processes=self._processes)
-        # Use weakref.finalize instead of __del__ or relying on self.close() at shutdown.
-        # During interpreter shutdown, global state (e.g., modules, built-ins) may already
-        # be cleared (set to None), so calling normal cleanup methods can fail with
-        # AttributeError: 'NoneType' object has no attribute '...'.
-        # weakref.finalize schedules cleanup *before* such destruction begins,
-        # ensuring resources are released while the runtime environment is still intact.
-        self._finalizer = weakref.finalize(self, self.resources)
+        # Expand ~ and ~user, then make absolute (robust against cwd changes)
+        trace_dir = os.path.expanduser(trace_dir)
+        trace_dir = os.path.abspath(trace_dir)
 
-    def _launch_workers(self, broadcast_handle):
-        od_config = self.od_config
-        logger.info("Starting server...")
+        try:
+            os.makedirs(trace_dir, exist_ok=True)
+        except OSError as exc:
+            logger.error(f"Failed to create profiler directory {trace_dir}: {exc}")
+            raise
 
-        num_gpus = od_config.num_gpus
-        mp.set_start_method("spawn", force=True)
-        processes = []
+        # Build final template path (without rank or extension — torch.profiler appends those)
+        full_template = os.path.join(trace_dir, trace_filename)
 
-        # Get the appropriate worker class for current device
-        worker_proc = get_diffusion_worker_class()
+        expected_pattern = f"{full_template}*.json"
+        logger.info(f"Starting diffusion profiling → {expected_pattern}")
 
-        # Launch all worker processes
-        scheduler_pipe_readers = []
-        scheduler_pipe_writers = []
+        # Also log the absolute directory once (useful in multi-node or containers)
+        logger.debug(f"Profiler output directory: {trace_dir}")
 
-        for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
-            scheduler_pipe_writers.append(writer)
-            process = mp.Process(
-                target=worker_proc.worker_main,
-                args=(
-                    i,  # rank
-                    od_config,
-                    writer,
-                    broadcast_handle,
-                ),
-                name=f"DiffusionWorker-{i}",
-                daemon=True,
+        # Propagate to all workers
+        try:
+            self.collective_rpc(method="start_profile", args=(full_template,))
+        except Exception as e:
+            logger.error("Failed to start profiling on workers", exc_info=True)
+            raise RuntimeError(f"Could not start profiler: {e}") from e
+
+    def stop_profile(self) -> dict:
+        """
+        Stop profiling on all workers and collect the final trace/table paths.
+
+        The worker (torch_profiler.py) now handles trace export, compression to .gz,
+        and deletion of the original .json file. This method only collects and
+        reports the paths returned by the workers.
+
+        Returns:
+            dict with keys:
+            - "traces": list of final trace file paths (usually .json.gz)
+            - "tables": list of table strings (one per rank)
+        """
+        logger.info("Stopping diffusion profiling and collecting results...")
+
+        try:
+            # Give worker enough time — export + compression + table can be slow
+            results = self.collective_rpc(method="stop_profile", timeout=600)
+        except Exception:
+            logger.error("Failed to stop profiling on workers", exc_info=True)
+            return {"traces": [], "tables": []}
+
+        output_files = {"traces": [], "tables": []}
+        successful_traces = 0
+
+        if not results:
+            logger.warning("No profiling results returned from any rank")
+            return output_files
+
+        for rank, res in enumerate(results):
+            if not isinstance(res, dict):
+                logger.warning(f"Rank {rank}: invalid result format (got {type(res)})")
+                continue
+
+            # 1. Trace file — should be .json.gz if compression succeeded
+            trace_path = res.get("trace")
+            if trace_path:
+                # We trust the worker — it created/compressed the file
+                logger.info(f"[Rank {rank}] Final trace: {trace_path}")
+                output_files["traces"].append(trace_path)
+                successful_traces += 1
+
+                # Optional: warn if path looks suspicious (e.g. still .json)
+                if not trace_path.endswith((".json.gz", ".json")):
+                    logger.warning(f"Rank {rank}: unusual trace path extension: {trace_path}")
+
+            # 2. Table file — plain text
+            table = res.get("table")
+            if table:
+                output_files["tables"].append(table)
+
+        # Final summary logging
+        num_ranks = len(results)
+        if successful_traces > 0:
+            final_paths_str = ", ".join(output_files["traces"][:3])
+            if len(output_files["traces"]) > 3:
+                final_paths_str += f" ... (+{len(output_files['traces']) - 3} more)"
+
+            logger.info(
+                f"Profiling stopped. Collected {successful_traces} trace file(s) "
+                f"from {num_ranks} rank(s). "
+                f"Final trace paths: {final_paths_str}"
             )
-            scheduler_pipe_readers.append(reader)
-            process.start()
-            processes.append(process)
+        elif output_files["traces"]:
+            logger.info(
+                f"Profiling stopped but no traces were successfully collected. "
+                f"Reported paths: {', '.join(output_files['traces'][:3])}"
+                f"{' ...' if len(output_files['traces']) > 3 else ''}"
+            )
+        else:
+            logger.info("Profiling stopped — no trace files were collected from any rank.")
 
-        # Wait for all workers to be ready
-        scheduler_infos = []
-        result_handle = None
-        for writer in scheduler_pipe_writers:
-            writer.close()
+        if output_files["tables"]:
+            logger.debug(f"Collected {len(output_files['tables'])} profiling table(s)")
 
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
-                processes[i].join()
-                logger.error(f"Exit code: {processes[i].exitcode}")
-                raise
-
-            if data["status"] != "ready":
-                raise RuntimeError("Initialization failed. Please see the error messages above.")
-
-            if i == 0:
-                result_handle = data.get("result_handle")
-
-            scheduler_infos.append(data)
-            reader.close()
-
-        logger.debug("All workers are ready")
-
-        return processes, result_handle
-
-    def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
-        return scheduler.add_req(requests)
+        return output_files
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        prompt = "dummy run"
-        # note that num_inference_steps=1 will cause timestep and temb None in the pipeline
         num_inference_steps = 1
         height = 1024
         width = 1024
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
-
-            dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
+            color_format = image_color_format(self.od_config.model_class_name)
+            dummy_image = PIL.Image.new(color_format, (width, height))
         else:
             dummy_image = None
+        prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
         req = OmniDiffusionRequest(
-            prompt=prompt,
-            height=height,
-            width=width,
-            pil_image=dummy_image,
-            num_inference_steps=num_inference_steps,
-            num_outputs_per_prompt=1,
+            prompts=[prompt],
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                # Keep warmup path minimal and robust across text encoders.
+                # Some models may fail when warmup implicitly triggers
+                # classifier-free guidance with an empty negative prompt.
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+            ),
         )
         logger.info("dummy run to warm up the model")
-        requests = self.pre_process_func([req]) if self.pre_process_func is not None else [req]
-        self.add_req_and_wait_for_response(requests)
+        request = self.pre_process_func(req) if self.pre_process_func is not None else req
+        self.add_req_and_wait_for_response(request)
 
     def collective_rpc(
         self,
-        method: str | Callable,
+        method: str,
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict | None = None,
@@ -326,7 +353,7 @@ class DiffusionEngine:
         """Call a method on worker processes and get results immediately.
 
         Args:
-            method: The method name (str) or callable to execute on workers
+            method: The method name (str) to execute on workers
             timeout: Optional timeout in seconds
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
@@ -335,59 +362,18 @@ class DiffusionEngine:
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
         """
-        if self._closed:
-            raise RuntimeError("DiffusionEngine is closed.")
-
-        deadline = None if timeout is None else time.monotonic() + timeout
-        kwargs = kwargs or {}
-
-        assert isinstance(method, str)
-        send_method = method
-
-        # Prepare RPC request message
-        rpc_request = {
-            "type": "rpc",
-            "method": send_method,
-            "args": args,
-            "kwargs": kwargs,
-            "output_rank": unique_reply_rank,
-        }
-
-        try:
-            # Broadcast RPC request to all workers via unified message queue
-            scheduler.mq.enqueue(rpc_request)
-
-            # Determine which workers we expect responses from
-            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
-
-            responses = []
-            for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
-                try:
-                    if scheduler.result_mq is None:
-                        raise RuntimeError("Result queue not initialized")
-
-                    response = scheduler.result_mq.dequeue(timeout=dequeue_timeout)
-
-                    # Check if response indicates an error
-                    if isinstance(response, dict) and response.get("status") == "error":
-                        raise RuntimeError(
-                            f"Worker failed with error '{response.get('error')}', "
-                            "please check the stack trace above for the root cause"
-                        )
-
-                    responses.append(response)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-
-            return responses[0] if unique_reply_rank is not None else responses
-
-        except Exception as e:
-            logger.error(f"RPC call failed: {e}")
-            raise
+        assert isinstance(method, str), "Only string method names are supported for now"
+        return self.executor.collective_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            unique_reply_rank=unique_reply_rank,
+        )
 
     def close(self) -> None:
-        self._finalizer()
+        if hasattr(self, "executor"):
+            self.executor.shutdown()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
         # TODO implement it

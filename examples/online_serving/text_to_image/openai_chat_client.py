@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qwen-Image OpenAI-compatible chat client for image generation.
+Qwen-Image OpenAI-compatible image generation client.
 
 Usage:
     python openai_chat_client.py --prompt "A beautiful landscape" --output output.png
@@ -25,14 +25,14 @@ def generate_image(
     negative_prompt: str | None = None,
     num_outputs_per_prompt: int = 1,
 ) -> bytes | None:
-    """Generate an image using the chat completions API.
+    """Generate an image using the images generation API.
 
     Args:
         prompt: Text description of the image
         server_url: Server URL
         height: Image height in pixels
         width: Image width in pixels
-        steps: Number of inference steps
+        steps: Number of diffusion steps
         true_cfg_scale: Qwen-Image CFG scale
         seed: Random seed
         negative_prompt: Negative prompt
@@ -41,33 +41,31 @@ def generate_image(
     Returns:
         Image bytes or None if failed
     """
-    messages = [{"role": "user", "content": prompt}]
+    payload: dict[str, object] = {
+        "prompt": prompt,
+        "response_format": "b64_json",
+        "n": num_outputs_per_prompt,
+    }
 
-    # Build extra_body with generation parameters
-    extra_body = {}
-    if height is not None:
-        extra_body["height"] = height
-    if width is not None:
-        extra_body["width"] = width
+    if width is not None and height is not None:
+        payload["size"] = f"{width}x{height}"
+    elif width is not None:
+        payload["size"] = f"{width}x{width}"
+    elif height is not None:
+        payload["size"] = f"{height}x{height}"
+
     if steps is not None:
-        extra_body["num_inference_steps"] = steps
+        payload["num_inference_steps"] = steps
     if true_cfg_scale is not None:
-        extra_body["true_cfg_scale"] = true_cfg_scale
-    if seed is not None:
-        extra_body["seed"] = seed
+        payload["true_cfg_scale"] = true_cfg_scale
     if negative_prompt:
-        extra_body["negative_prompt"] = negative_prompt
-    extra_body["num_outputs_per_prompt"] = num_outputs_per_prompt
+        payload["negative_prompt"] = negative_prompt
+    if seed is not None:
+        payload["seed"] = seed
 
-    # Build request payload
-    payload = {"messages": messages}
-    if extra_body:
-        payload["extra_body"] = extra_body
-
-    # Send request
     try:
         response = requests.post(
-            f"{server_url}/v1/chat/completions",
+            f"{server_url}/v1/images/generations",
             headers={"Content-Type": "application/json"},
             json=payload,
             timeout=300,
@@ -75,15 +73,13 @@ def generate_image(
         response.raise_for_status()
         data = response.json()
 
-        # Extract image from response
-        content = data["choices"][0]["message"]["content"]
-        if isinstance(content, list) and len(content) > 0:
-            image_url = content[0].get("image_url", {}).get("url", "")
-            if image_url.startswith("data:image"):
-                _, b64_data = image_url.split(",", 1)
-                return base64.b64decode(b64_data)
+        items = data.get("data")
+        if isinstance(items, list) and items:
+            first = items[0].get("b64_json") if isinstance(items[0], dict) else None
+            if isinstance(first, str):
+                return base64.b64decode(first)
 
-        print(f"Unexpected response format: {content}")
+        print(f"Unexpected response format: {data}")
         return None
 
     except Exception as e:

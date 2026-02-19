@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import fcntl
+import os
+import time
 from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
@@ -19,7 +22,8 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        # Default threshold matches legacy behavior (64KB)
+        self.stage_id = config.get("stage_id", -1)
+        self.device = config.get("device", "cuda:0")
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
         self._metrics = {
             "puts": 0,
@@ -30,7 +34,11 @@ class SharedMemoryConnector(OmniConnectorBase):
         }
 
     def put(
-        self, from_stage: str, to_stage: str, request_id: str, data: Any
+        self,
+        from_stage: str,
+        to_stage: str,
+        put_key: str,
+        data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             # Always serialize first to check size (and for SHM writing)
@@ -40,9 +48,14 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            if size > self.threshold:
+            if True:
                 # Use Shared Memory
-                meta = shm_write_bytes(payload)
+                lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+                with open(lock_file, "w") as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    meta = shm_write_bytes(payload, name=put_key)
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
                 self._metrics["shm_writes"] += 1
@@ -59,52 +72,87 @@ class SharedMemoryConnector(OmniConnectorBase):
             return True, size, metadata
 
         except Exception as e:
-            logger.error(f"SharedMemoryConnector put failed for req {request_id}: {e}")
+            logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
     def get(
-        self, from_stage: str, to_stage: str, request_id: str, metadata: dict[str, Any] | None = None
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata=None,
     ) -> tuple[Any, int] | None:
-        if not metadata:
-            logger.error(f"SharedMemoryConnector get called without metadata for req {request_id}")
+        if metadata is not None:
+            # Some callers may wrap metadata by request id.
+            if isinstance(metadata, dict) and get_key in metadata:
+                metadata = metadata.get(get_key)
+
+            if not isinstance(metadata, dict):
+                return None
+
+            if "inline_bytes" in metadata:
+                try:
+                    obj = self.deserialize_obj(metadata["inline_bytes"])
+                    return obj, int(metadata.get("size", 0))
+                except Exception as e:
+                    logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
+                    return None
+
+            if "shm" in metadata:
+                try:
+                    shm_handle = metadata["shm"]
+                    lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                    with open(lock_file, "w") as lockf:
+                        fcntl.flock(lockf, fcntl.LOCK_SH)
+                        data_bytes = shm_read_bytes(shm_handle)
+                        fcntl.flock(lockf, fcntl.LOCK_UN)
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
+                    obj = self.deserialize_obj(data_bytes)
+                    return obj, int(metadata.get("size", 0))
+                except Exception as e:
+                    logger.error(f"SharedMemoryConnector shm get failed for req {get_key}: {e}")
+                    return None
+
+            return None
+
+        from multiprocessing import shared_memory as shm_pkg
+
+        # Wait for shared memory to be available (with retry logic)
+        max_retries = 30
+        retry_delay = 0.1  # 100ms between retries
+        shm = None
+
+        for attempt in range(max_retries):
+            try:
+                shm = shm_pkg.SharedMemory(name=get_key)
+                break  # Successfully opened, exit retry loop
+            except FileNotFoundError:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    # Max retries reached, return None
+                    logger.warning(f"Shared memory '{get_key}' not found after {max_retries} retries")
+                    return None
+
+        if shm is None:
             return None
 
         try:
-            obj = None
-            size = 0
+            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+            with open(lock_file) as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_SH)
+                data_bytes = shm_read_bytes({"name": get_key, "size": shm.size})
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            # Clean up the temporary file if it still exists.
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+            obj = self.deserialize_obj(data_bytes)
+            return obj, shm.size
+        finally:
+            shm.close()
 
-            if "shm" in metadata:
-                meta = metadata["shm"]
-                # shm_read_bytes handles reading and unlinking
-                data_bytes = shm_read_bytes(meta)
-                obj = self.deserialize_obj(data_bytes)
-                size = metadata.get("size", len(data_bytes))
-            elif "inline_bytes" in metadata:
-                # Deserialize bytes back to object
-                payload = metadata["inline_bytes"]
-                obj = self.deserialize_obj(payload)
-                size = metadata.get("size", len(payload))
-            elif "inline" in metadata:
-                obj = metadata["inline"]
-                size = metadata.get("size", 0)
-                if size == 0:
-                    # Fallback if size wasn't recorded
-                    try:
-                        size = len(self.serialize_obj(obj))
-                    except Exception:
-                        pass
-            else:
-                logger.error(
-                    f"Unknown metadata format in SharedMemoryConnector for req {request_id}: {list(metadata.keys())}"
-                )
-                return None
-
-            self._metrics["gets"] += 1
-            return obj, size
-
-        except Exception as e:
-            logger.error(f"SharedMemoryConnector get failed for req {request_id}: {e}")
-            return None
+        # TODO: update another read method
 
     def cleanup(self, request_id: str) -> None:
         # SHM segments are automatically unlinked during 'get' (shm_read_bytes).
