@@ -62,9 +62,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.v1.attention.backend import AttentionType
 
-from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = logging.getLogger(__name__)
