@@ -199,10 +199,7 @@ async def async_request_openai_chat_omni_completions(
 
 
 async def async_request_openai_audio_speech(
-    request_func_input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: tqdm | None = None,
-    mm_position: Literal["first", "last"] = "last",
+    request_func_input: RequestFuncInput, session: aiohttp.ClientSession, pbar: tqdm | None = None
 ) -> MixRequestFuncOutput:
     """Non-streaming request to /v1/audio/speech endpoint.
 
@@ -235,6 +232,8 @@ async def async_request_openai_audio_speech(
                 audio_bytes = await response.read()
                 end_time = time.perf_counter()
                 output.latency = end_time - st
+                # ttft = latency since this is a non-streaming request
+                # hence there is no distinction between first and last token/audio
                 output.ttft = output.latency
                 output.audio_ttfp = output.latency
 
@@ -248,14 +247,18 @@ async def async_request_openai_audio_speech(
                         output.audio_frames = 0
                         logger.warning("Audio frame width is zero")
                     if output.audio_duration > 0:
+                        # rtf = audio_generate_time / audio_duration and
+                        # audio_generate_time = latency since this is a non-streaming request
+                        # so the time to receive last portion of audio is the latency
                         output.audio_rtf = output.latency / output.audio_duration
                     else:
                         output.audio_rtf = 0
                         logger.warning("Audio duration is zero")
+                    output.success = True
                 except Exception as e:
-                    logger.warning(f"Failed to parse audio response: {e}")
-
-                output.success = True
+                    output.success = False
+                    output.error = f"Failed to parse audio response: {e}"
+                    logger.error(f"ERROR: Failed to parse audio response: {e}")
             else:
                 output.error = response.reason or ""
                 output.success = False
