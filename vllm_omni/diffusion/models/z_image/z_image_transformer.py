@@ -614,7 +614,6 @@ class ZImageTransformer2DModel(CachedTransformer):
         quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
-        self.dtype = torch.bfloat16
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.all_patch_size = all_patch_size
