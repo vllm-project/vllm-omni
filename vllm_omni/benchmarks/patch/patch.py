@@ -236,6 +236,7 @@ async def async_request_openai_audio_speech(
                 end_time = time.perf_counter()
                 output.latency = end_time - st
                 output.ttft = output.latency
+                output.audio_ttfp = output.latency
 
                 try:
                     audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
