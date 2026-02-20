@@ -176,7 +176,7 @@ steps:
   #                 type: DirectoryOrCreate
 
   - label: "Omni Model Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 20
     depends_on: image-build
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG

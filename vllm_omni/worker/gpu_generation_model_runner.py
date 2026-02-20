@@ -380,9 +380,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
+        # [Omni] Copy req_id mappings to avoid async scheduling mutation.
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         output = OmniModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},

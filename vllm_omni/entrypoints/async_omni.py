@@ -390,7 +390,8 @@ class AsyncOmni(OmniBase):
                     submit_flag = False
                     prompt_token_ids = engine_outputs.prompt_token_ids
                     engine_input = copy.deepcopy(prompt)
-                    engine_input["prompt_token_ids"] = [0] * compute_talker_prompt_ids_length(prompt_token_ids)
+                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
                     for i in range(1, len(self.stage_list)):
                         task = {
