@@ -140,7 +140,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             if hasattr(self, prefix.split(".")[0]):
                 module = dict(self.named_modules()).get(prefix)
                 if module:
-                    module.to(f"cuda:{tp_rank}")
+                    module.to(f"{self.model.device.type}:{tp_rank}")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self.pre_load()
@@ -369,7 +369,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
     def vae_encode(self, image, cfg_factor=1):
         config = self.vae.config
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+        with torch.autocast(device_type=self.model.device.type, dtype=torch.float16, enabled=True):
             vae_encode_result = self.vae.encode(image)
             if isinstance(vae_encode_result, torch.Tensor):
                 latents = vae_encode_result
