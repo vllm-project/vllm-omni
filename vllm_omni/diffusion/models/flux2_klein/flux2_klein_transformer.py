@@ -728,9 +728,9 @@ class Flux2Transformer2DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
+            (".to_qkv.", ".to_q.", "q"),
+            (".to_qkv.", ".to_k.", "k"),
+            (".to_qkv.", ".to_v.", "v"),
             (".add_kv_proj", ".add_q_proj", "q"),
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
@@ -744,14 +744,6 @@ class Flux2Transformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if "to_qkvkv_mlp_proj" in name:
-                name = name.replace("to_qkvkv_mlp_proj", "to_qkv_mlp_proj")
-            if "to_qkv_mlp_proj" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
