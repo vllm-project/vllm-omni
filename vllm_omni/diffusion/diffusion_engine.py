@@ -331,6 +331,10 @@ class DiffusionEngine:
                 height=height,
                 width=width,
                 num_inference_steps=num_inference_steps,
+                # Keep warmup path minimal and robust across text encoders.
+                # Some models may fail when warmup implicitly triggers
+                # classifier-free guidance with an empty negative prompt.
+                guidance_scale=0.0,
                 num_outputs_per_prompt=1,
             ),
         )

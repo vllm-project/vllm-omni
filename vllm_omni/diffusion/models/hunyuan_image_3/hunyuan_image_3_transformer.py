@@ -64,6 +64,7 @@ from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = logging.getLogger(__name__)
@@ -1588,20 +1589,6 @@ class HunyuanFusedMoE(SharedFusedMoE):
         self._init_hook_handle.remove()
 
     def forward(self, hidden_states, router_logits):
-        from vllm.model_executor.layers.fused_moe.layer import get_forward_context
-
-        ctx = get_forward_context()
-        if not ctx.remaining_moe_layers:
-            import re
-
-            moe_names = [name for name in ctx.no_compile_layers.keys() if ".mlp.experts" in name]
-
-            def get_layer_num(name):
-                match = re.search(r"layers\.(\d+)\.mlp", name)
-                return int(match.group(1)) if match else -1
-
-            moe_names.sort(key=get_layer_num, reverse=True)
-            ctx.remaining_moe_layers.extend(moe_names)
         return super().forward(hidden_states, router_logits)
 
 
@@ -1751,6 +1738,7 @@ class HunyuanImage3Model(nn.Module):
         lora_config = None
         self.num_redundant_experts = 0
         self.config = config
+        self.device = get_local_device()
         self.quant_config = quant_config
         self.padding_idx = config.pad_token_id
         lora_vocab = (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1)) if lora_config else 0
@@ -2444,7 +2432,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     **model_kwargs,
                 )
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                     model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                     pred = model_output["diffusion_prediction"]
                 pred = pred.to(dtype=torch.float32)
@@ -2491,7 +2479,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if hasattr(self.vae, "ffactor_temporal"):
             latents = latents.unsqueeze(2)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
             image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
         if hasattr(self.vae, "ffactor_temporal"):

@@ -1,22 +1,92 @@
+async_chunk: true
 stage_args:
   - stage_id: 0
-    stage_type: llm  # Use llm stage type to launch OmniLLM
+    stage_type: llm
     runtime:
       devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: qwen3_tts
-      model_arch: Qwen3TTSForConditionalGeneration
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      hf_overrides:
+        architectures: [Qwen3TTSTalkerForConditionalGeneration]
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.3
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 512
+      max_model_len: 4096
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      model_arch: Qwen3TTSCode2Wav
+      hf_overrides:
+        architectures: [Qwen3TTSCode2Wav]
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       enforce_eager: true
       trust_remote_code: true
       async_scheduling: false
       enable_prefix_caching: false
-      engine_output_type: audio  # Final output: audio waveform
-      gpu_memory_utilization: 0.1
+      engine_output_type: audio
+      gpu_memory_utilization: 0.2
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 1000000
-
+      max_num_batched_tokens: 8192
+      max_model_len: 32768
+    engine_input_source: [0]
     final_output: true
     final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

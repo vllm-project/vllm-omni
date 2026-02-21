@@ -310,10 +310,12 @@ class TestTTSMethods:
         speech_server.engine_client.stage_list = [mock_stage]
         assert speech_server._is_tts_model() is True
 
-    def test_build_tts_prompt(self, speech_server):
-        """Test TTS prompt format."""
-        prompt = speech_server._build_tts_prompt("Hello")
-        assert prompt == "<|im_start|>assistant\nHello<|im_end|>\n<|im_start|>assistant\n"
+    def test_estimate_prompt_len_fallback(self, speech_server):
+        """Test prompt length estimation falls back to 2048 when model is unavailable."""
+        tts_params = {"text": ["Hello"], "task_type": ["CustomVoice"]}
+        result = speech_server._estimate_prompt_len(tts_params)
+        # Without a real model, it should fall back to 2048.
+        assert result == 2048
 
     def test_validate_tts_request_basic(self, speech_server):
         """Test basic validation cases."""

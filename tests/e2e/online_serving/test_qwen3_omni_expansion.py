@@ -4,64 +4,53 @@
 E2E Online tests for Qwen3-Omni model.
 """
 
-import concurrent.futures
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-import threading
-import time
 from pathlib import Path
 
-import openai
 import pytest
 
 from tests.conftest import (
-    OmniServer,
-    convert_audio_to_text,
-    cosine_similarity_text,
     dummy_messages_from_mix_data,
     generate_synthetic_audio,
     generate_synthetic_image,
+    generate_synthetic_video,
+    modify_stage_config,
 )
+from tests.utils import hardware_test
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
-# CI stage config for 2*H100-80G GPUs
-stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+AUDIO_KEY = ["water", "chirping", "crackling"]
+IMAGE_KEY = ["square", "quadrate"]
+VIDEO_KEY = ["sphere", "globe", "circle", "round", "ball"]
 
+
+def get_chunk_config(default_path):
+    path = modify_stage_config(
+        default_path,
+        updates={
+            "async_chunk": True,
+            "stage_args": {
+                0: {
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                },
+                1: {
+                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
+                },
+            },
+        },
+        deletes={"stage_args": {2: ["custom_process_input_func"]}},
+    )
+    return path
+
+
+# CI stage config for 2*H100-80G GPUs
+default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+stage_configs = [default_path, get_chunk_config(default_path)]
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
-
-
-_omni_server_lock = threading.Lock()
-
-
-@pytest.fixture(scope="module")
-def omni_server(request):
-    """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses session scope so the server starts only once for the entire test session.
-    Multi-stage initialization can take 10-20+ minutes.
-    """
-    with _omni_server_lock:
-        model, stage_config_path = request.param
-
-        print(f"Starting OmniServer with model: {model}")
-
-        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
-            print("OmniServer started successfully")
-            yield server
-            print("OmniServer stopping...")
-
-        print("OmniServer stopped")
-
-
-@pytest.fixture
-def client(omni_server):
-    """OpenAI client for the running vLLM-Omni server."""
-    return openai.OpenAI(
-        base_url=f"http://{omni_server.host}:{omni_server.port}/v1",
-        api_key="EMPTY",
-    )
 
 
 def get_system_prompt():
@@ -83,7 +72,10 @@ def get_system_prompt():
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China?",
-        "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
+        "mix": "What is recited in the audio? What is in this image? What is in this video?",
+        "text_video": "What is in this video? ",
+        "text_image": "What is in this image? ",
+        "text_audio": "What is in this audio? ",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -93,196 +85,228 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-def get_deploy_config(deploy_type="TP1"):
-    result = {
-        "TP1": {
-            "stage_args": {
-                0: {
-                    "engine_args.gpu_memory_utilization": 0.95,
-                    "engine_args.tensor_parallel_size": 1,
-                    "runtime.devices": "0",
-                },
-                2: {"runtime.devices": "1"},
-            }
-        }
-    }
-    return result.get(deploy_type, result["TP1"])
-
-
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(client: openai.OpenAI, omni_server) -> None:
-    """Test processing text, generating text output via OpenAI API."""
+def test_text_to_audio_001(omni_server, openai_client) -> None:
     messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
-    # Test single completion
-    start_time = time.perf_counter()
-    chat_completion = client.chat.completions.create(
-        model=omni_server.model, messages=messages, max_tokens=20, modalities=["text"]
-    )
-    # Verify E2E
-    print(f"the request e2e is: {time.perf_counter() - start_time}")
-    # TODO: Verify the E2E latency after confirmation baseline.
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+        "key_words": {"text": ["beijing"]},
+    }
 
-    # Verify only output text
-    assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
-
-    # Verify text output success
-    text_choice = chat_completion.choices[0]
-    assert text_choice.message.content is not None, "No text output is generated"
-    assert chat_completion.usage.completion_tokens <= 20, "The output length more than the requested max_tokens."
-    assert "beijing" in text_choice.message.content.lower(), "The output do not contain keywords."
+    openai_client.send_request(request_config)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_to_text_001(client: openai.OpenAI, omni_server) -> None:
-    """Test processing text, generating text output via OpenAI API."""
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(1, 1)['base64']}"
-    messages = dummy_messages_from_mix_data(audio_data_url=audio_data_url)
-    # Test single completion
-    start_time = time.perf_counter()
-    chat_completion = client.chat.completions.create(model=omni_server.model, messages=messages, modalities=["text"])
-    # Verify only output text
-    assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
+def test_text_to_text_audio_001(omni_server, openai_client) -> None:
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
-    # Verify text output success
-    text_choice = chat_completion.choices[0]
-    assert text_choice.message.content is not None, "No text output is generated"
-    assert "water" in text_choice.message.content.lower(), "The output do not contain keywords."
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "key_words": {"text": ["beijing"]},
+    }
 
-    # Verify E2E
-    print(f"the request e2e is: {time.perf_counter() - start_time}")
-    # TODO: Verify the E2E latency after confirmation baseline.
+    openai_client.send_request(request_config)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
-    """Test processing text, generating audio output via OpenAI API."""
-
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(1, 5)['base64']}"
-
-    messages = dummy_messages_from_mix_data(audio_data_url=audio_data_url)
-    num_concurrent_requests = get_max_batch_size()
-    # Test single completion
-    e2e_list = list()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
-        # Submit multiple completion requests concurrently
-        futures = [
-            executor.submit(client.chat.completions.create, model=omni_server.model, messages=messages)
-            for _ in range(num_concurrent_requests)
-        ]
-        start_time = time.perf_counter()
-        # Wait for all requests to complete and collect results
-        chat_completions = list()
-        for future in concurrent.futures.as_completed(futures):
-            chat_completions.append(future.result())
-            # Verify E2E
-            current_e2e = time.perf_counter() - start_time
-            print(f"the request e2e is: {current_e2e}")
-            # TODO: Verify the E2E latency after confirmation baseline.
-            e2e_list.append(current_e2e)
-
-    print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
-    # Verify all completions succeeded
-    assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
-    for chat_completion in chat_completions:
-        # Verify audio output success
-        audio_message = chat_completion.choices[1].message
-        audio_data = audio_message.audio.data
-        assert audio_data is not None, "No audio output is generated"
-        assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
-
-        # Verify text output success
-        text_choice = chat_completion.choices[0]
-        text_content = text_choice.message.content
-        assert text_choice.message.content is not None, "No text output is generated"
-
-        # Verify text output same as audio output
-        audio_content = convert_audio_to_text(audio_data)
-        print(f"text content is: {text_content}")
-        print(f"audio content is: {audio_content}")
-        similarity = cosine_similarity_text(audio_content, text_content)
-        print(f"similarity between audio and text is: {similarity}")
-        assert similarity > 0.9, "The audio content is not same as the text"
-
-
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_image_to_text_001(client: openai.OpenAI, omni_server) -> None:
-    """Test processing text, generating text output via OpenAI API."""
+def test_image_to_text_001(omni_server, openai_client) -> None:
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
-    # Test single completion
-    start_time = time.perf_counter()
-    chat_completion = client.chat.completions.create(
-        model=omni_server.model, messages=messages, max_tokens=100, modalities=["text"]
-    )
-    # Verify E2E
-    print(f"the request e2e is: {time.perf_counter() - start_time}")
-    # TODO: Verify the E2E latency after confirmation baseline.
 
-    # Verify only output text
-    assert len(chat_completion.choices) == 1, "The generated content includes more than just text."
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["text"],
+        "key_words": {"image": IMAGE_KEY},
+    }
 
-    # Verify text output success
-    text_choice = chat_completion.choices[0]
-    text_content = text_choice.message.content
-    assert text_content is not None, "No text output is generated"
-    assert chat_completion.usage.completion_tokens <= 100, "The output length more than the requested max_tokens."
-    assert "square" in text_content.lower(), "The output do not contain keywords."
+    openai_client.send_request(request_config)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_image_to_text_audio_001(client: openai.OpenAI, omni_server) -> None:
-    """Test processing text, generating audio output via OpenAI API."""
+def test_image_to_audio_001(omni_server, openai_client) -> None:
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
 
-    num_concurrent_requests = get_max_batch_size()
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+        "key_words": {"image": IMAGE_KEY},
+    }
 
+    openai_client.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
 
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url)
 
-    # Test single completion
-    e2e_list = list()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
-        # Submit multiple completion requests concurrently
-        futures = [
-            executor.submit(
-                client.chat.completions.create,
-                model=omni_server.model,
-                messages=messages,
-            )
-            for _ in range(num_concurrent_requests)
-        ]
-        start_time = time.perf_counter()
-        # Wait for all requests to complete and collect results
-        chat_completions = list()
-        for future in concurrent.futures.as_completed(futures):
-            chat_completions.append(future.result())
-            # Verify E2E
-            current_e2e = time.perf_counter() - start_time
-            print(f"the request e2e is: {current_e2e}")
-            # TODO: Verify the E2E latency after confirmation baseline.
-            e2e_list.append(current_e2e)
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "key_words": {"image": IMAGE_KEY},
+    }
 
-    print(f"the avg e2e is: {sum(e2e_list) / len(e2e_list)}")
-    # Verify all completions succeeded
-    assert len(chat_completions) == num_concurrent_requests, "Not all requests succeeded."
-    for chat_completion in chat_completions:
-        # Verify audio output success
-        audio_message = chat_completion.choices[1].message
-        audio_data = audio_message.audio.data
-        assert audio_data is not None, "No audio output is generated"
-        assert audio_message.audio.expires_at > time.time(), "The generated audio has expired."
+    openai_client.send_request(request_config, request_num=get_max_batch_size())
 
-        # Verify text output success
-        text_choice = chat_completion.choices[0]
-        text_content = text_choice.message.content
-        assert text_content is not None, "No text output is generated"
-        assert "square" in text_content.lower(), "The output do not contain keywords."
 
-        # Verify text output same as audio output
-        audio_content = convert_audio_to_text(audio_data)
-        print(f"text content is: {text_content}")
-        print(f"audio content is: {audio_content}")
-        similarity = cosine_similarity_text(audio_content, text_content)
-        print(f"similarity between audio and text is: {similarity}")
-        assert similarity > 0.9, "The audio content is not same as the text"
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_video_to_text_001(omni_server, openai_client) -> None:
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    messages = dummy_messages_from_mix_data(video_data_url=video_data_url)
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["text"],
+        "key_words": {"video": VIDEO_KEY},
+    }
+
+    openai_client.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_video_to_audio_001(omni_server, openai_client) -> None:
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    messages = dummy_messages_from_mix_data(video_data_url=video_data_url)
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+        "key_words": {"video": VIDEO_KEY},
+    }
+
+    openai_client.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_video_to_text_audio_001(omni_server, openai_client) -> None:
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+
+    messages = dummy_messages_from_mix_data(video_data_url=video_data_url)
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "key_words": {"video": VIDEO_KEY},
+    }
+
+    openai_client.send_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        audio_data_url=audio_data_url, system_prompt=get_system_prompt(), content_text=get_prompt("text_audio")
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["text"],
+        "key_words": {"audio": AUDIO_KEY},
+    }
+
+    openai_client.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+
+    messages = dummy_messages_from_mix_data(
+        image_data_url=image_data_url, system_prompt=get_system_prompt(), content_text=get_prompt("text_image")
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+        "key_words": {"image": IMAGE_KEY},
+    }
+
+    openai_client.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 30)['base64']}"
+
+    messages = dummy_messages_from_mix_data(
+        video_data_url=video_data_url, system_prompt=get_system_prompt(), content_text=get_prompt("text_video")
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "key_words": {"video": VIDEO_KEY},
+    }
+
+    openai_client.send_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("mix"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {"audio": AUDIO_KEY, "image": IMAGE_KEY, "video": VIDEO_KEY},
+    }
+    openai_client.send_request(request_config, request_num=get_max_batch_size())

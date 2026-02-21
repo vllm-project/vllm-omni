@@ -7,9 +7,7 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
-- [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalContentParser][]
-- [vllm_omni.entrypoints.chat_utils.OmniAsyncMultiModalItemTracker][]
-- [vllm_omni.entrypoints.chat_utils.parse_chat_messages_futures][]
+- [vllm_omni.entrypoints.chat_utils.extract_audio_from_video_async][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
@@ -31,7 +29,6 @@ Input data structures for multi-modal inputs.
 - [vllm_omni.inputs.data.OmniTextPrompt][]
 - [vllm_omni.inputs.data.OmniTokenInputs][]
 - [vllm_omni.inputs.data.OmniTokensPrompt][]
-- [vllm_omni.inputs.parse.parse_singleton_prompt_omni][]
 - [vllm_omni.inputs.preprocess.OmniInputPreprocessor][]
 
 ## Engine

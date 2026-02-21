@@ -1126,6 +1126,9 @@ async def _stage_worker_async(
                 vllm_config=vllm_config,
                 usage_context=usage_context,
                 engine_args=omni_engine_args,
+                disable_log_stats=bool(
+                    engine_args.get("disable_log_stats", True) or getattr(omni_engine_args, "disable_log_stats", True)
+                ),
             )
     omni_stage.set_async_engine(stage_engine)
     if hasattr(omni_stage.async_engine, "log_stats") and omni_stage.async_engine.log_stats:

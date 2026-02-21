@@ -27,6 +27,7 @@ def _make_runner(multimodal_outputs):
         None,
         None,
         multimodal_outputs,
+        None,
     )
     runner.kv_connector_output = None
     runner.input_batch = _DummyInputBatch()

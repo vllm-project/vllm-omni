@@ -12,9 +12,34 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install vllm-omni into the same uv-managed Python environment used by the base image.
-RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]"
+# Install vLLM wheel for the specific commit
+# URL format: https://wheels.vllm.ai/<commit_hash>/
+# Current vLLM wheel commit: 2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
+# Note: --prerelease=allow is required because nightly/commit wheels use
+# pre-release version numbers (e.g. 2.10.0.dev...) which uv ignores by default,
+# causing it to fall back to the older stable release from PyPI.
+RUN uv pip install --system --upgrade --force-reinstall --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
 
+
+RUN uv pip uninstall --system nvidia-cublas-cu12
+# Install vllm-omni into the same uv-managed Python environment used by the base image.
+# Use bash -c so that $(python3 -c ...) is expanded inside the container.
+RUN uv pip install --system --no-cache-dir ".[dev]"
+
+# pplx_kernels is optional; the base image may already ship a version.
+# Reinstall attempt may fail if no compatible wheel exists for the current
+# PyTorch/CUDA combination – allow the build to continue regardless.
+RUN pip install --upgrade --force-reinstall "pplx_kernels" || true
+
+RUN /bin/bash -c 'FLASHINFER_CUDA_TAG="$(python3 -c "import torch; print((torch.version.cuda or \"12.4\").replace(\".\", \"\"))")" && \
+    uv pip install --system --upgrade --force-reinstall \
+      "flashinfer-python==0.6.3" \
+      "flashinfer-cubin==0.6.3" \
+      "flashinfer-jit-cache==0.6.3" \
+      --extra-index-url "https://flashinfer.ai/whl/cu${FLASHINFER_CUDA_TAG}"'
+# Pin nvidia-cublas-cu12 after vllm-omni install so dependency resolution does not overwrite it
+RUN uv pip install --system --upgrade --force-reinstall "nvidia-cublas-cu12==12.9.1.4"
+RUN uv pip install --system --upgrade --force-reinstall "numpy==2.2.6"
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []

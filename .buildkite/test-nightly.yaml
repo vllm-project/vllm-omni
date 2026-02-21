@@ -5,8 +5,8 @@ steps:
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py
-      - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py
+      - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "advanced_model" --run-level "advanced_model"
+      - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -43,7 +43,7 @@ steps:
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py
+      - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
