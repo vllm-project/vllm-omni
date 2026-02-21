@@ -156,6 +156,12 @@ class ZImagePipeline(nn.Module):
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=od_config.revision,
+                prefix="text_encoder.",
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
                 subfolder="transformer",
                 revision=od_config.revision,
                 prefix="transformer.",
@@ -163,9 +169,9 @@ class ZImagePipeline(nn.Module):
             ),
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
-                subfolder="text_encoder",
+                subfolder="vae",
                 revision=od_config.revision,
-                prefix="text_encoder.",
+                prefix="vae.",
             ),
         ]
         self._execution_device = get_local_device()
@@ -186,9 +192,8 @@ class ZImagePipeline(nn.Module):
         if text_encoder_config.tie_word_embeddings:
             self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self._execution_device
-        )
+        vae_config = AutoencoderKL.load_config(model, subfolder="vae", local_files_only=local_files_only)
+        self.vae = AutoencoderKL.from_config(vae_config).to(self._execution_device)
         # Get vLLM quantization config for linear layers
         quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
         self.transformer = ZImageTransformer2DModel(quant_config=quant_config)
@@ -660,5 +665,4 @@ class ZImagePipeline(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_weights = loader.load_weights(weights)
-        loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
         return loaded_weights

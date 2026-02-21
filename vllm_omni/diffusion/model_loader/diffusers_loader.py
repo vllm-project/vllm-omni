@@ -180,7 +180,7 @@ class DiffusersPipelineLoader:
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files,
                 filter_folder,
-                index_file,
+                index_file or "",
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
