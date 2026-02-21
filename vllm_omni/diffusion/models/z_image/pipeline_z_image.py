@@ -664,5 +664,4 @@ class ZImagePipeline(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        loaded_weights = loader.load_weights(weights)
-        return loaded_weights
+        return loader.load_weights(weights)
