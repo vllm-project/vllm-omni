@@ -858,12 +858,12 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)  # 384 * 0.125 = 48
         row_limit = self.tile_sample_min_size - blend_extent  # 384 - 48 = 336
 
-        # 分布式/多卡：输入不做 padding -> 每 rank 对解码输出做右/下 padding -> GPU all_gather -> rank0重组/融合/裁剪
+        # Distributed/multi-GPU: no padding on input -> each rank pads decoded output to right/bottom -> GPU all_gather -> rank0 reconstructs/blends/crops
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
 
-            # 统计tile
+            # Count tiles
             num_rows = math.ceil(H / overlap_size)
             num_cols = math.ceil(W / overlap_size)
             total_tiles = num_rows * num_cols
@@ -871,7 +871,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
             print(f"==={torch.distributed.get_rank()},  {total_tiles=}, {tiles_per_rank=}, {world_size=}")
 
-            # 本 rank 的 tile 索引（循环分配）：rank, rank+world_size,
+            # This rank's tile indices (round-robin allocation): rank, rank+world_size,
             my_linear_indices = list(range(rank, total_tiles, world_size))
             if my_linear_indices == []:
                 my_linear_indices = [0]
@@ -893,7 +893,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
                     j : j + self.tile_latent_min_size,
                 ]
                 dec = self.decoder(tile)
-                # 对边界 tile 的输出做右/下方向 padding 到标准尺寸
+                # Pad boundary tile outputs to standard size in right/bottom direction
                 pad_h = max(0, H_out_std - dec.shape[-2])
                 pad_w = max(0, W_out_std - dec.shape[-1])
                 if pad_h > 0 or pad_w > 0:
@@ -901,7 +901,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
                 decoded_tiles.append(dec)
                 decoded_metas.append(torch.tensor([ri, rj, pad_w, pad_h], device=z.device, dtype=torch.int64))
 
-            # 各rank数量不一定相同，进行padding到相同长度
+            # Each rank may have different counts, pad to same length
             T_out = decoded_tiles[0].shape[2] if len(decoded_tiles) > 0 else (T - 1) * self.ffactor_temporal + 1
             while len(decoded_tiles) < tiles_per_rank:
                 decoded_tiles.append(
@@ -919,7 +919,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
                     )
                 )
 
-            # 进行gpu的all_gather
+            # Perform GPU all_gather
             decoded_tiles = torch.stack(decoded_tiles, dim=0)
             decoded_metas = torch.stack(decoded_metas, dim=0)
 
@@ -930,15 +930,15 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             dist.all_gather(metas_gather_list, decoded_metas)
 
             if rank != 0:
-                # 非0号rank返回空占位，结果只在rank0上有效
+                # Non-rank0 returns empty placeholder, results only valid on rank0
                 return torch.empty(0, device=z.device)
 
-            # rank0：根据 (ri, rj) 元信息重建 tile 网格；跳过占位项 (ri, rj) == (-1, -1)
+            # rank0: reconstruct tile grid based on (ri, rj) metadata; skip placeholders where (ri, rj) == (-1, -1)
             rows = [[None for _ in range(num_cols)] for _ in range(num_rows)]
             for r in range(world_size):
                 # [tiles_per_rank, B, C, T, H, W]
                 gathered_tiles_r = tiles_gather_list[r]
-                # [tiles_per_rank, 4]，元素: (ri, rj, pad_w, pad_h)
+                # [tiles_per_rank, 4], elements: (ri, rj, pad_w, pad_h)
                 gathered_metas_r = metas_gather_list[r]
                 for k in range(gathered_tiles_r.shape[0]):
                     ri = int(gathered_metas_r[k][0])
@@ -946,7 +946,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
                     if ri < 0 or rj < 0:
                         continue
                     if ri < num_rows and rj < num_cols:
-                        # 去除padding
+                        # Remove padding
                         pad_w = int(gathered_metas_r[k][2])
                         pad_h = int(gathered_metas_r[k][3])
                         h_end = None if pad_h == 0 else -pad_h
@@ -969,7 +969,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             dec = torch.cat(result_rows, dim=-2)
             return dec
 
-        # 单卡：原有串行逻辑
+        # Single GPU: original sequential logic
         rows = []
         for i in range(0, H, overlap_size):
             row = []
@@ -1156,7 +1156,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             self.disable_temporal_tiling()
             return
 
-        # tiling在input_shape和sample_size上限制很多，任意的input_shape和sample_size很可能不满足条件，因此这里使用固定值
+        # Tiling has many restrictions on input_shape and sample_size, arbitrary input_shape and sample_size may not meet conditions, so fixed values are used here
         min_sample_size = int(1 / self.tile_overlap_factor) * self.ffactor_spatial
         min_sample_tsize = int(1 / self.tile_overlap_factor) * self.ffactor_temporal
         sample_size = random.choice([None, 1 * min_sample_size, 2 * min_sample_size, 3 * min_sample_size])
@@ -1178,37 +1178,37 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
 def load_sharded_safetensors(model_dir):
     """
-    手动加载分片的 safetensors 文件
+    Manually load sharded safetensors files
     Args:
-        model_dir: 包含分片文件的目录路径
+        model_dir: directory path containing shard files
     Returns:
-        合并后的完整权重字典
+        merged complete weight dictionary
     """
-    # 获取所有分片文件并按编号排序
+    # Get all shard files and sort by number
     shard_files = []
     for file in os.listdir(model_dir):
         if file.endswith(".safetensors"):
             shard_files.append(file)
 
-    # 按分片编号排序
+    # Sort by shard number
     shard_files.sort(key=lambda x: int(x.split("-")[1]))
 
-    print(f"找到 {len(shard_files)} 个分片文件")
+    print(f"Found {len(shard_files)} shard files")
 
-    # 合并所有权重
+    # Merge all weights
     merged_state_dict = dict()
 
     for shard_file in shard_files:
         shard_path = os.path.join(model_dir, shard_file)
-        print(f"加载分片: {shard_file}")
+        print(f"Loading shard: {shard_file}")
 
-        # 使用 safetensors 加载当前分片
+        # Load current shard using safetensors
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
                 merged_state_dict[key] = tensor
 
-    print(f"合并完成，总键数量: {len(merged_state_dict)}")
+    print(f"Merging complete, total key count: {len(merged_state_dict)}")
     return merged_state_dict
 
 
