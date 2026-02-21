@@ -4,7 +4,7 @@ stage_args:
     stage_type: llm
     runtime:
       devices: "0"
-      max_batch_size: 1
+      max_batch_size: 10
     engine_args:
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration

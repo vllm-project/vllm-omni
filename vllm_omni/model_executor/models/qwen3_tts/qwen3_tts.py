@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
-import copy
 import io
 import urllib.request
 from collections.abc import Iterable
@@ -130,6 +129,13 @@ class Qwen3TTSModelForGeneration(nn.Module):
         except Exception:
             logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
 
+    @staticmethod
+    def extract_val(d, key, default):
+        val = d.get(key, default)
+        if isinstance(val, list):
+            return val[0] if len(val) > 0 else default
+        return val
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -139,7 +145,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         """
-        Forward pass for TTS generation model.
+        Forward pass for TTS generation model (Patched for batched inference).
 
         Args:
             input_ids: Input token IDs (required for TTS generation)
@@ -151,46 +157,62 @@ class Qwen3TTSModelForGeneration(nn.Module):
         Returns:
             OmniOutput: Contains multimodal outputs with audio tensors
         """
+        runtime_info_list = kwargs.get("runtime_additional_information", [{}])
+        if not isinstance(runtime_info_list, list):
+            runtime_info_list = [runtime_info_list]
 
-        # Extract additional parameters from kwargs that the generation methods expect
+        # Initialize lists to accumulate batched inputs
+        texts = []
+        task_types = []
+        speakers = []
+        languages = []
+        instructs = []
+        merged_kwargs = {}
 
-        runtime_additional_information = kwargs.get("model_intermediate_buffer")
-        if runtime_additional_information is None:
-            runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
-        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
-            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-        if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
-            runtime_additional_information = runtime_additional_information[0]
-        runtime_additional_information = copy.deepcopy(runtime_additional_information)
-        text = runtime_additional_information.pop("text", [""])[0]
-        # Extract task_type from kwargs, default to self.task_type
-        task_type = _normalize_task_type(runtime_additional_information.pop("task_type", [self.task_type])[0])
-        speaker = runtime_additional_information.pop("speaker", ["uncle_fu"])[0]
-        language = runtime_additional_information.pop("language", ["Auto"])[0]
-        instruct = runtime_additional_information.pop("instruct", [""])[0]
-        for key, value in runtime_additional_information.items():
-            if isinstance(value, list) and len(value) > 0:
-                runtime_additional_information[key] = value[0]
+        # Keys that the underlying model natively supports as lists for batched inference
+        batched_keys = {"ref_audio", "ref_text", "x_vector_only_mode", "voice_clone_prompt"}
 
-        # During profile/warmup runs, text is empty and no real inputs exist.
-        # Cap generation steps so the full pipeline executes (preserving
-        # KV-cache profiling behaviour) but exits quickly even if the model
-        # cannot converge from degenerate dummy inputs.
-        if not text:
+        for req_info in runtime_info_list:
+            texts.append(self.extract_val(req_info, "text", ""))
+            task_types.append(self.extract_val(req_info, "task_type", self.task_type))
+            speakers.append(self.extract_val(req_info, "speaker", "uncle_fu"))
+            languages.append(self.extract_val(req_info, "language", "Auto"))
+            instructs.append(self.extract_val(req_info, "instruct", ""))
+
+            for k, v in req_info.items():
+                if k not in ["text", "task_type", "speaker", "language", "instruct"]:
+                    # Extract single value from list if wrapped
+                    val = v[0] if isinstance(v, list) and len(v) > 0 else v
+
+                    if k in batched_keys:
+                        # Accumulate as list for batched generation
+                        if k not in merged_kwargs:
+                            merged_kwargs[k] = []
+                        merged_kwargs[k].append(val)
+                    else:
+                        # For scalar params (e.g. max_new_tokens), take from the first request
+                        if k not in merged_kwargs:
+                            merged_kwargs[k] = val
+
+        # During profile/warmup runs, texts are empty.
+        if all(not t for t in texts):
             logger.info("Profile run detected (empty text). Capping max_new_tokens to 2.")
-            runtime_additional_information["max_new_tokens"] = 2
+            merged_kwargs["max_new_tokens"] = 2
 
-        # Call the appropriate generation method based on task_type
+        # Assume uniform task type across the batch
+        if len(set(task_types)) > 1:
+            raise ValueError(f"Mixed task types not supported: {set(task_types)}")
+        task_type = task_types[0]
+
+        # Call the appropriate generation method based on task_type, passing lists
         if task_type == "CustomVoice":
             result = self.model.generate_custom_voice(
-                text, speaker=speaker, language=language, instruct=instruct, **runtime_additional_information
+                texts, speaker=speakers, language=languages, instruct=instructs, **merged_kwargs
             )
         elif task_type == "VoiceDesign":
-            result = self.model.generate_voice_design(
-                text, instruct=instruct, language=language, **runtime_additional_information
-            )
+            result = self.model.generate_voice_design(texts, instruct=instructs, language=languages, **merged_kwargs)
         elif task_type == "Base":
-            result = self.model.generate_voice_clone(text, language=language, **runtime_additional_information)
+            result = self.model.generate_voice_clone(texts, language=languages, **merged_kwargs)
         else:
             raise ValueError(f"Invalid task type: {task_type}")
 
@@ -209,17 +231,20 @@ class Qwen3TTSModelForGeneration(nn.Module):
         # Handle tuple format: (audio_tensors, sample_rate)
         if isinstance(model_outputs, tuple) and len(model_outputs) == 2:
             audio_tensors, sr = model_outputs
-            # audio_tensors is a list of numpy arrays, convert first one to tensor if needed
+            # audio_tensors is a list of numpy arrays, convert ALL to tensors
             if isinstance(audio_tensors, list) and len(audio_tensors) > 0:
-                # Convert numpy array to tensor if needed
-                audio_tensor = audio_tensors[0]
-                if isinstance(audio_tensor, np.ndarray):
-                    audio_tensor = torch.from_numpy(audio_tensor).float()
-                elif not isinstance(audio_tensor, torch.Tensor):
-                    audio_tensor = torch.tensor(audio_tensor, dtype=torch.float32)
+                audio_tensor_list = []
+                for audio_tensor in audio_tensors:
+                    if isinstance(audio_tensor, np.ndarray):
+                        audio_tensor_list.append(torch.from_numpy(audio_tensor).float())
+                    elif not isinstance(audio_tensor, torch.Tensor):
+                        audio_tensor_list.append(torch.tensor(audio_tensor, dtype=torch.float32))
+                    else:
+                        audio_tensor_list.append(audio_tensor)
+
                 return OmniOutput(
                     text_hidden_states=None,
-                    multimodal_outputs={"model_outputs": audio_tensor, "sr": torch.tensor(sr, dtype=torch.int)},
+                    multimodal_outputs={"model_outputs": audio_tensor_list, "sr": torch.tensor(sr, dtype=torch.int)},
                 )
 
         # If it's already a tensor, wrap it
