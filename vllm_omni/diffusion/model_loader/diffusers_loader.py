@@ -109,9 +109,10 @@ class DiffusersPipelineLoader:
         available_index_file = list(
             filter(lambda f: file_exists(model_name_or_path, f, revision=revision), possible_index_files)
         )
-        assert len(available_index_file) <= 1, (
-            f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
-        )
+        if len(available_index_file) > 1:
+            raise ValueError(
+                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
+            )
         index_file_with_subfolder = available_index_file[0] if len(available_index_file) == 1 else None
         index_file = (
             index_file_with_subfolder.split("/")[-1]
