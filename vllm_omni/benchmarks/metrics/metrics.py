@@ -223,8 +223,8 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
-        warnings.formatwarning = (
-            lambda msg, category, filename, lineno, line=None: f"{filename}:{lineno}: {category.__name__}: {msg}\n"
+        warnings.formatwarning = lambda msg, category, filename, lineno, line=None: (
+            f"{filename}:{lineno}: {category.__name__}: {msg}\n"
         )
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration on the benchmark arguments.",

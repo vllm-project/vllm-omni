@@ -1,6 +1,8 @@
 name: VLLM-Omni PR Reviewer
 
 on:
+  pull_request:
+    types: [opened, ready_for_review]
   issue_comment:
     types: [created]
 
@@ -14,14 +16,17 @@ jobs:
     name: Review Pull Request
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Only run when the comment is from a collaborator/owner/member
+    # Trigger on:
+    # 1. PR opened or marked ready for review (auto-run, only from same repo)
+    # 2. Manual @vllm-omni-reviewer comment by members/collaborators
     if: |
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request != null &&
-      contains(github.event.comment.body, '@vllm-omni-reviewer') &&
-      (github.event.comment.author_association == 'MEMBER' ||
-       github.event.comment.author_association == 'COLLABORATOR' ||
-       github.event.comment.author_association == 'OWNER')
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '@vllm-omni-reviewer') &&
+       (github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        github.event.comment.author_association == 'OWNER'))
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
