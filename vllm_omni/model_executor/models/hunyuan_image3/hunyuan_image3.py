@@ -1217,8 +1217,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 latents = latents.squeeze(2)
             else:
                 # If T > 1, take the first frame (shouldn't happen for conditional images)
-                latents = latents[:, :, 0, :, :]
                 logger.warning(f"T({latents.shape[2]}) > 1, should not happen for conditional images")
+                latents = latents[:, :, 0, :, :]
 
         # Always use t=0 to declare it is a clean conditional image
         t = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
@@ -1235,13 +1235,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         pixel_values: torch.Tensor,
         vit_attention_mask: torch.Tensor,
         vit_spatial_shapes: torch.Tensor,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor | None:
         """
         Encode pixel_values through ViT encoder (vision_model and vision_aligner).
         """
         # Handle empty batch
         if pixel_values.shape[0] == 0:
-            return tuple()
+            return None
 
         vision_output = self.vision_model(
             pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
@@ -1303,7 +1303,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
 
-        assert vit_embeddings.shape[0] == len(vae_token_embeddings), (
+        assert vit_embeddings is not None and vit_embeddings.shape[0] == len(vae_token_embeddings), (
             f"Number of ViT embeddings ({vit_embeddings.shape[0]}) does not match "
             f"number of VAE token embeddings ({len(vae_token_embeddings)}). "
             "Each image should have both VAE and ViT embeddings."

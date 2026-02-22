@@ -3,6 +3,7 @@ Reference code
 [FLUX] https://github.com/black-forest-labs/flux/blob/main/src/flux/modules/autoencoder.py
 [DCAE] https://github.com/mit-han-lab/efficientvit/blob/master/efficientvit/models/efficientvit/dc_ae.py
 """
+
 import math
 import os
 import random
