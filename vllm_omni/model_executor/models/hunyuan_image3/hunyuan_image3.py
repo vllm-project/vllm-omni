@@ -827,8 +827,8 @@ class HunyuanImage3Processor:
 
     def __call__(
         self,
-        text: TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput] = None,
-        images: ImageInput = None,
+        text: TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput],
+        images: ImageInput,
         **kwargs,
     ):
         """
@@ -875,6 +875,7 @@ class HunyuanImage3Processor:
             current_info["vit_pixel_attention_mask"] = vit_pixel_values["pixel_attention_mask"].squeeze(0)
             # shape: (2, )
             current_info["vit_spatial_shapes"] = vit_pixel_values["spatial_shapes"].squeeze(0)
+            logger.info(f"vit input image: {image.width} x {image.height}, token grid: {vit_pixel_values['spatial_shapes']}")
 
             # VAE processing
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
@@ -884,6 +885,14 @@ class HunyuanImage3Processor:
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
             current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(dtype=torch_dtype)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
+            logger.info(f"vae input image: {image.width} x {image.height}, target size: {image_width} x {image_height}, " 
+                         + f"token grid: {token_width} x {token_height}.")
+
+            # size
+            base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
+            current_info["base_size"] = torch.tensor(base_size)
+            current_info["ratio_index"] = torch.tensor(ratio_index)
+            logger.info(f"base size: {base_size} and ratio index: {ratio_index}")
 
             batch_data.append(current_info)
 
@@ -1008,6 +1017,10 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["vae_pixel_values"] = MultiModalFieldConfig.batched("image")
         if "vae_token_grid_hw" in hf_inputs:
             config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image")
+        if "base_size" in hf_inputs:
+            config["base_size"] = MultiModalFieldConfig.batched("image")
+        if "ratio_index" in hf_inputs:
+            config["ratio_index"] = MultiModalFieldConfig.batched("image")
         return config
 
     def _get_prompt_updates(
@@ -1032,20 +1045,33 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         if eoi_token_id is None:
             raise ValueError("End of image token '<eoi>' not found in tokenizer vocabulary")
 
-        # Get image token information from out_mm_kwargs
         out_mm_data = out_mm_kwargs.get_data()
         vit_spatial_shapes = out_mm_data.get("vit_spatial_shapes")
         vae_token_grid_hw = out_mm_data.get("vae_token_grid_hw")
+        base_size = out_mm_data.get("base_size")
+        ratio_index = out_mm_data.get("ratio_index")
 
         def get_replacement_image(item_idx: int) -> PromptUpdateDetails:
             _vit_token_grid_hw = vit_spatial_shapes.tolist()[item_idx]
             _vae_token_grid_hw = vae_token_grid_hw.tolist()[item_idx]
+            _base_size = base_size.tolist()[item_idx]
+            _ratio_index = ratio_index.tolist()[item_idx]
+
             timestep_token_num = 1
             vae_token_num = _vae_token_grid_hw[0] * _vae_token_grid_hw[1]
             vit_token_num = _vit_token_grid_hw[0] * _vit_token_grid_hw[1]
 
+            base_size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{_base_size}>")
+            if base_size_token_id is None:
+                raise ValueError(f"Base size token '<img_size_{_base_size}>' not found in tokenizer vocabulary")
+            ratio_token_id = tokenizer.convert_tokens_to_ids(f"<img_ratio_{_ratio_index}>")
+            if ratio_token_id is None:
+                raise ValueError(f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary")
+
             replacement = (
                 [boi_token_id]
+                + [base_size_token_id]
+                + [ratio_token_id]
                 + [img_token_id] * timestep_token_num
                 + [img_token_id] * vae_token_num
                 + [joint_img_sep_token_id]
