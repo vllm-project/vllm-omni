@@ -104,7 +104,7 @@ class HunyuanModel(HunYuanModel):
         v = v.reshape(-1, hidden_size)
         return torch.concat((q, k, v))
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+    def get_expert_mapping(self) -> tuple[list[tuple[str, str, int, str]], dict[str, tuple[str, int, int]]]:
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
@@ -875,7 +875,9 @@ class HunyuanImage3Processor:
             current_info["vit_pixel_attention_mask"] = vit_pixel_values["pixel_attention_mask"].squeeze(0)
             # shape: (2, )
             current_info["vit_spatial_shapes"] = vit_pixel_values["spatial_shapes"].squeeze(0)
-            logger.info(f"vit input image: {image.width} x {image.height}, token grid: {vit_pixel_values['spatial_shapes']}")
+            logger.info(
+                f"vit input image: {image.width} x {image.height}, token grid: {vit_pixel_values['spatial_shapes']}"
+            )
 
             # VAE processing
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
@@ -885,8 +887,10 @@ class HunyuanImage3Processor:
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
             current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(dtype=torch_dtype)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
-            logger.info(f"vae input image: {image.width} x {image.height}, target size: {image_width} x {image_height}, " 
-                         + f"token grid: {token_width} x {token_height}.")
+            logger.info(
+                f"vae input image: {image.width} x {image.height}, target size: {image_width} x {image_height}, "
+                + f"token grid: {token_width} x {token_height}."
+            )
 
             # size
             base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
