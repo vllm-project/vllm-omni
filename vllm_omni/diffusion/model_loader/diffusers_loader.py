@@ -38,11 +38,6 @@ TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
 
 
-def get_subfolder_file_path(subfolder: str | None, file: str) -> str:
-    """Get the subfolder path."""
-    return f"{subfolder}/" if subfolder is not None else file
-
-
 class DiffusersPipelineLoader:
     """Model loader that can load diffusers pipeline components from disk."""
 
