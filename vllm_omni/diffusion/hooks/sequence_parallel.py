@@ -315,19 +315,6 @@ class SequenceParallelSplitHook(ModelHook):
             logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
             return x
 
-        def _get_ulysses_mode() -> str:
-            try:
-                from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
-
-                if not is_forward_context_available():
-                    return "strict"
-                cfg = get_forward_context().omni_diffusion_config
-                if cfg is None:
-                    return "strict"
-                return str(getattr(cfg.parallel_config, "ulysses_mode", "strict"))
-            except Exception:
-                return "strict"
-
         def _raise_strict_divisibility_error(*, dim: int, seq_len: int, sp_size: int) -> None:
             # Keep message actionable: strict mode must be evenly shardable at the split hook level.
             msg = (
@@ -345,7 +332,9 @@ class SequenceParallelSplitHook(ModelHook):
             raise ValueError(msg)
 
         def _maybe_validate_strict_divisibility(*, dim: int, seq_len: int) -> None:
-            if _get_ulysses_mode() != "strict":
+            from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+            if get_ulysses_mode(default="strict") != "strict":
                 return
             sp_size = int(self.config.sequence_parallel_size)
             if sp_size <= 1:

@@ -13,6 +13,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 
 def _ceil_div(n: int, d: int) -> int:
@@ -73,11 +74,7 @@ def _ulysses_all_to_all_any_qkv(
     head_cnt_local = padded_head_cnt // world_size
 
     # (B, S_local, H, D) -> (world_size, S_local, B, H_local, D)
-    x_t = (
-        x.reshape(bsz, s_local, world_size, head_cnt_local, head_dim)
-        .permute(2, 1, 0, 3, 4)
-        .contiguous()
-    )
+    x_t = x.reshape(bsz, s_local, world_size, head_cnt_local, head_dim).permute(2, 1, 0, 3, 4).contiguous()
     # (world_size, S_local, B, H_local, D) -> (world_size * S_local, B, H_local, D)
     x_t = x_t.flatten(0, 1)
 
@@ -148,19 +145,6 @@ def _ulysses_all_to_all_any_o(
     return out
 
 
-def _get_ulysses_mode() -> str:
-    try:
-        from vllm_omni.diffusion.forward_context import get_forward_context
-
-        cfg = get_forward_context().omni_diffusion_config
-        if cfg is None:
-            return "strict"
-        p = cfg.parallel_config
-        return str(getattr(p, "ulysses_mode", "strict"))
-    except Exception:
-        return "strict"
-
-
 @dataclass(frozen=True, slots=True)
 class _UlyssesCtx(ParallelAttentionContext):
     """Per-forward context for Ulysses sequence-parallel attention."""
@@ -218,7 +202,7 @@ class UlyssesParallelAttention:
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ):
-        mode = _get_ulysses_mode()
+        mode = get_ulysses_mode(default="strict")
         joint_tensor_query = joint_tensor_key = joint_tensor_value = None
         joint_strategy = "front"
         joint_len = 0
@@ -330,9 +314,7 @@ class UlyssesParallelAttention:
                 self._ulysses_pg, query, seq_lens=seq_lens, use_sync=self._use_sync
             )
             key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=seq_lens, use_sync=self._use_sync)
-            value, _ = _ulysses_all_to_all_any_qkv(
-                self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync
-            )
+            value, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync)
         else:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):

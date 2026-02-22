@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import os
-import pickle
 import socket
 import tempfile
 
+import numpy as np
 import pytest
 import torch
 
@@ -18,8 +18,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -88,11 +87,10 @@ def _run_attention_case(
             softmax_scale=1.0 / (head_size**0.5),
         ).to(device=device, dtype=torch.float32)
 
-        with open(input_file, "rb") as f:
-            payload = pickle.load(f)
-        q_full = torch.from_numpy(payload["q"]).to(device=device)
-        k_full = torch.from_numpy(payload["k"]).to(device=device)
-        v_full = torch.from_numpy(payload["v"]).to(device=device)
+        with np.load(input_file, allow_pickle=False) as payload:
+            q_full = torch.from_numpy(payload["q"]).to(device=device)
+            k_full = torch.from_numpy(payload["k"]).to(device=device)
+            v_full = torch.from_numpy(payload["v"]).to(device=device)
 
         if world_size == 1:
             q, k, v = q_full, k_full, v_full
@@ -106,9 +104,7 @@ def _run_attention_case(
                 v = torch.tensor_split(v_full, world_size, dim=1)[local_rank].contiguous()
             else:
                 if len(split_sizes) != world_size:
-                    raise ValueError(
-                        f"split_sizes length ({len(split_sizes)}) must equal world_size ({world_size})."
-                    )
+                    raise ValueError(f"split_sizes length ({len(split_sizes)}) must equal world_size ({world_size}).")
                 if sum(int(x) for x in split_sizes) != q_full.shape[1]:
                     raise ValueError(
                         "split_sizes must sum to full seq_len "
@@ -153,8 +149,7 @@ def _run_attention_case(
                 out_full = None
 
         if local_rank == 0:
-            with open(output_file, "wb") as f:
-                pickle.dump(out_full.detach().cpu().numpy(), f)
+            np.save(output_file, out_full.detach().cpu().numpy())
 
     destroy_distributed_env()
 
@@ -180,11 +175,11 @@ def test_ulysses_uaa_matches_baseline(sp_world_size: int, seq_len: int, num_head
     while sp_port == base_port:
         sp_port = _find_free_port()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f_in:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f_base:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_base:
         baseline_file = f_base.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f_sp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_sp:
         sp_file = f_sp.name
 
     try:
@@ -192,8 +187,7 @@ def test_ulysses_uaa_matches_baseline(sp_world_size: int, seq_len: int, num_head
         q = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
         k = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
         v = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
-        with open(input_file, "wb") as f:
-            pickle.dump({"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}, f)
+        np.savez(input_file, q=q.numpy(), k=k.numpy(), v=v.numpy())
 
         # Baseline (no SP)
         torch.multiprocessing.spawn(
@@ -218,10 +212,8 @@ def test_ulysses_uaa_matches_baseline(sp_world_size: int, seq_len: int, num_head
             nprocs=sp_world_size,
         )
 
-        with open(baseline_file, "rb") as f:
-            baseline = pickle.load(f)
-        with open(sp_file, "rb") as f:
-            sp = pickle.load(f)
+        baseline = np.load(baseline_file, allow_pickle=False)
+        sp = np.load(sp_file, allow_pickle=False)
 
         baseline_t = torch.from_numpy(baseline)
         sp_t = torch.from_numpy(sp)
@@ -257,11 +249,11 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
     while sp_port == base_port:
         sp_port = _find_free_port()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f_in:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npz") as f_in:
         input_file = f_in.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f_base:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_base:
         baseline_file = f_base.name
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as f_sp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".npy") as f_sp:
         sp_file = f_sp.name
 
     try:
@@ -269,8 +261,7 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
         q = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
         k = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
         v = torch.randn(batch_size, seq_len, num_heads, head_size, dtype=torch.float32)
-        with open(input_file, "wb") as f:
-            pickle.dump({"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}, f)
+        np.savez(input_file, q=q.numpy(), k=k.numpy(), v=v.numpy())
 
         # Baseline (no SP)
         torch.multiprocessing.spawn(
@@ -298,14 +289,16 @@ def test_ulysses_uaa_hybrid_ring_matches_baseline() -> None:
             nprocs=sp_world_size,
         )
 
-        with open(baseline_file, "rb") as f:
-            baseline = pickle.load(f)
-        with open(sp_file, "rb") as f:
-            sp = pickle.load(f)
+        baseline = np.load(baseline_file, allow_pickle=False)
+        sp = np.load(sp_file, allow_pickle=False)
 
         baseline_t = torch.from_numpy(baseline)
         sp_t = torch.from_numpy(sp)
         assert baseline_t.shape == sp_t.shape
+        # Hybrid (Ulysses+Ring) typically has slightly larger numerical differences
+        # than pure Ulysses due to different communication/reduction order and
+        # the SDPA kernel path used by Ring attention. Use a looser tolerance to
+        # keep the test stable across GPUs/kernels while still catching regressions.
         torch.testing.assert_close(sp_t, baseline_t, atol=5e-4, rtol=5e-4)
     finally:
         for path in (input_file, baseline_file, sp_file):

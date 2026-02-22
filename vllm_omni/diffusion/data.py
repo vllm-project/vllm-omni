@@ -83,8 +83,7 @@ class DiffusionParallelConfig:
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
         )
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
-            "ulysses_mode must be one of {'strict','advanced_uaa'}, "
-            f"but got {self.ulysses_mode!r}."
+            f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
         return self
 
