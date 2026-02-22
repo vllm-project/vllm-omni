@@ -45,13 +45,14 @@ def replace_linear_class(
     if not isinstance(style, str):
         raise ValueError(f"Unsupported parallel style type {type(style)}, expected str")
 
-    vllm_linear_cls, vllm_linear_kwargs = {
+    vllm_linear_maps = {
         "colwise": (ColumnParallelLinear, {}),
         "colwise_rep": (ColumnParallelLinear, {"gather_output": True}),
         "rowwise": (RowParallelLinear, {}),
         "rowwise_rep": (RowParallelLinear, {"input_is_parallel": False}),
         "replicate": (ReplicatedLinear, {}),
-    }.get(style, (ReplicatedLinear, {}))
+    }
+    vllm_linear_cls, vllm_linear_kwargs = vllm_linear_maps[style]
 
     return vllm_linear_cls(
         input_size=linear.in_features,
@@ -68,7 +69,6 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
     """Recursively replace modules in the model as needed.
     Currently, this replaces:
     - `nn.Linear` with vLLM's tensor parallel linear classes
-    - `*RMSNorm` with vLLM's `RMSNorm`
     """
     # Prefix the patterns because we always start from `self.model`
     quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
@@ -101,7 +101,8 @@ def init_parameters(
                     param.data,
                     dtype=dtype,
                     device=device,
-                )
+                ),
+                requires_grad=param.requires_grad,
             )
             setattr(module, name, new_param)
     for child in module.children():
