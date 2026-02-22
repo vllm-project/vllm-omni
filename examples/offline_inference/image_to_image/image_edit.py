@@ -142,6 +142,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="output_image_edit.png",
@@ -403,6 +406,7 @@ def main():
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_outputs_per_prompt,
             layers=args.layers,
