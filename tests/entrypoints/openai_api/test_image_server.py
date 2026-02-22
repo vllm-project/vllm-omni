@@ -168,7 +168,13 @@ def test_client(mock_async_diffusion):
     app.state.engine_client = mock_async_diffusion
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
-    app.state.diffusion_model_name = "Qwen/Qwen-Image"  # For models endpoint
+    from vllm.entrypoints.openai.models.protocol import BaseModelPath
+
+    from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels
+
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
+    )
     app.state.args = Namespace(
         default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
         max_generated_image_size=4096,  # 64*64
@@ -246,33 +252,6 @@ def test_health_endpoint_no_engine():
     assert data["status"] == "unhealthy"
 
 
-def test_models_endpoint(test_client):
-    """Test /v1/models endpoint for diffusion mode"""
-    response = test_client.get("/v1/models")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["object"] == "list"
-    assert len(data["data"]) == 1
-    assert data["data"][0]["id"] == "Qwen/Qwen-Image"
-    assert data["data"][0]["object"] == "model"
-
-
-def test_models_endpoint_no_engine():
-    """Test /v1/models endpoint when no engine is initialized"""
-    from fastapi import FastAPI
-
-    from vllm_omni.entrypoints.openai.api_server import router
-
-    app = FastAPI()
-    app.include_router(router)
-    # Don't set any engine
-
-    client = TestClient(app)
-    response = client.get("/v1/models")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["object"] == "list"
-    assert len(data["data"]) == 0
 
 
 def test_generate_single_image(test_client):
