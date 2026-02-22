@@ -717,7 +717,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin):
 
         return DiffusionOutput(output=image)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_weights = loader.load_weights(weights)
         # Record other components not tracked by AutoWeightsLoader
