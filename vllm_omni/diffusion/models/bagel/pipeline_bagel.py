@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -321,6 +322,9 @@ class BagelPipeline(nn.Module):
         cfg_text_context = deepcopy(gen_context)
         cfg_img_context = deepcopy(gen_context)
 
+        torch.cuda.synchronize()
+        pipeline_t0 = time.time()
+
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
@@ -566,6 +570,9 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input_cfg_img[k] = v.to(self.device)
 
+        torch.cuda.synchronize()
+        prefill_done = time.time()
+
         with torch.autocast(
             device_type=self.device.type,
             enabled=self.device.type != "cpu",
@@ -593,7 +600,26 @@ class BagelPipeline(nn.Module):
                 cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
             )
 
+        torch.cuda.synchronize()
+        denoise_done = time.time()
+
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+
+        torch.cuda.synchronize()
+        decode_done = time.time()
+
+        prefill_t = prefill_done - pipeline_t0
+        denoise_t = denoise_done - prefill_done
+        vae_decode_t = decode_done - denoise_done
+        total_t = decode_done - pipeline_t0
+        logger.info(
+            "Pipeline total: %.3fs  (prefill=%.3fs, denoise=%.3fs, vae_decode=%.3fs)",
+            total_t,
+            prefill_t,
+            denoise_t,
+            vae_decode_t,
+        )
+
         return DiffusionOutput(output=img)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
