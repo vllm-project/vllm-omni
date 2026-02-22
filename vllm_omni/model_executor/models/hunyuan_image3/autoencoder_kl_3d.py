@@ -624,7 +624,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)  # 384 * 0.125 = 48
         row_limit = self.tile_sample_min_size - blend_extent  # 384 - 48 = 336
 
-        # Distributed/multi-GPU: no padding on input -> each rank pads decoded output to right/bottom 
+        # Distributed/multi-GPU: no padding on input -> each rank pads decoded output to right/bottom
         # -> GPU all_gather -> rank0 reassembles/fuses/crops
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             rank = dist.get_rank()
@@ -882,7 +882,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             self.disable_temporal_tiling()
             return
 
-        # Tiling has many restrictions on input_shape and sample_size, arbitrary input_shape 
+        # Tiling has many restrictions on input_shape and sample_size, arbitrary input_shape
         # and sample_size may not meet conditions, so use fixed values here
         min_sample_size = int(1 / self.tile_overlap_factor) * self.ffactor_spatial
         min_sample_tsize = int(1 / self.tile_overlap_factor) * self.ffactor_temporal
