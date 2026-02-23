@@ -578,7 +578,7 @@ def retrieve_timesteps(
     num_inference_steps: int | None = None,
     device: str | torch.device | None = None,
     timesteps: list[int] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ):
     """
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
