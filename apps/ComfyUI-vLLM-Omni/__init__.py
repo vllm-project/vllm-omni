@@ -7,7 +7,7 @@ __all__ = [
 ]
 
 __author__ = """vLLM-Omni Team"""
-__email__ = "collaboration@vllm.ai"
+__email__ = "vllm-omni@vllm.ai"
 __version__ = "0.0.1"
 
 from .comfyui_vllm_omni.nodes import (
