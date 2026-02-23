@@ -8,7 +8,6 @@
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
 import math
-import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -1395,20 +1394,7 @@ class Bagel(nn.Module):
                 "merged_cache": self._merge_naive_caches(branches_cache),
             }
 
-        num_steps = len(timesteps)
-        logger.info(
-            "Denoising: %d steps, cfg_text=%.1f, cfg_img=%.1f, batched_cfg=%s",
-            num_steps,
-            cfg_text_scale,
-            cfg_img_scale,
-            cfg_batched is not None,
-        )
-        torch.cuda.synchronize()
-        denoise_t0 = time.time()
-
         for i, t in enumerate(timesteps):
-            torch.cuda.synchronize()
-            step_t0 = time.time()
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
@@ -1437,21 +1423,6 @@ class Bagel(nn.Module):
             )
 
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
-            torch.cuda.synchronize()
-            step_dt = time.time() - step_t0
-            logger.info("  Step %d/%d  t=%.4f  %.3fs", i + 1, num_steps, t.item(), step_dt)
-
-        torch.cuda.synchronize()
-        denoise_total = time.time() - denoise_t0
-        if num_steps > 0:
-            logger.info(
-                "Denoising done: %d steps in %.3fs (avg %.3fs/step)",
-                num_steps,
-                denoise_total,
-                denoise_total / num_steps,
-            )
-        else:
-            logger.info("Denoising done: 0 steps (skipped)")
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
