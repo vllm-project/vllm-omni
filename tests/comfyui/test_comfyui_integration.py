@@ -10,9 +10,9 @@ import requests
 import torch
 from comfy_api.input import AudioInput, VideoInput
 from comfyui_vllm_omni.nodes import (
-    VLLMOmniComprehension,
     VLLMOmniGenerateImage,
     VLLMOmniTTS,
+    VLLMOmniUnderstanding,
     VLLMOmniVoiceClone,
 )
 from PIL import Image
@@ -304,15 +304,15 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
                     {"stage_type": "llm"},
                     {"stage_type": "llm"},
                 ],
-                outputs=[_build_audio_chat_output(), _build_text_output("Comprehension response")],
+                outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],
             ),
-            id="multimodal-comprehension",
+            id="multimodal-understanding",
         )
     ],
     indirect=["server_case"],
 )
-async def test_comprehension_node(api_server: str):
-    node = VLLMOmniComprehension()
+async def test_understanding_node(api_server: str):
+    node = VLLMOmniUnderstanding()
 
     image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
     video = VideoInput(b"mock_video_for_test")  # type: ignore[reportAbstractUsage]
@@ -330,7 +330,7 @@ async def test_comprehension_node(api_server: str):
         use_audio_in_video=True,
     )
 
-    assert text_response == "Comprehension response"
+    assert text_response == "Understanding response"
     assert isinstance(audio_response, dict)
     assert audio_response["sample_rate"] == 24000
     assert isinstance(audio_response["waveform"], torch.Tensor)
