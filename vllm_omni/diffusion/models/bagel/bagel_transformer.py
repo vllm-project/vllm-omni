@@ -21,7 +21,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.utils import ModelOutput
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -34,8 +33,6 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-
-logger = init_logger(__name__)
 
 
 def patchify(imgs, p):
