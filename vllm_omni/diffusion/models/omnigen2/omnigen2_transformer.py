@@ -181,10 +181,7 @@ class TimestepEmbedding(nn.Module):
         if condition is not None:
             sample = sample + self.cond_proj(condition)
         sample = self.linear_1(sample)
-
-        if self.act is not None:
-            sample = self.act(sample)
-
+        sample = self.act(sample)
         sample = self.linear_2(sample)
 
         if self.post_act is not None:
