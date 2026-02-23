@@ -1527,7 +1527,6 @@ class Bagel(nn.Module):
             v_t = self.llm2vae(output.packed_query_sequence)
             v_t = v_t[packed_vae_token_indexes]
 
-
         # ── CFG combination ──
         if use_cfg:
             if cfg_renorm_type == "text_channel":
