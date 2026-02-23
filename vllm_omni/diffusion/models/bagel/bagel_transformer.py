@@ -1283,6 +1283,15 @@ class Bagel(nn.Module):
 
         return generation_input
 
+    @staticmethod
+    def _merge_naive_caches(caches: list) -> NaiveCache:
+        """Merge multiple NaiveCache objects by concatenating KV tensors per layer."""
+        merged = NaiveCache(caches[0].num_layers)
+        for layer_idx in range(merged.num_layers):
+            merged.key_cache[layer_idx] = torch.cat([c.key_cache[layer_idx] for c in caches], dim=0)
+            merged.value_cache[layer_idx] = torch.cat([c.value_cache[layer_idx] for c in caches], dim=0)
+        return merged
+
     def generate_image(
         self,
         packed_text_ids: torch.LongTensor,
@@ -1324,6 +1333,64 @@ class Bagel(nn.Module):
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
+        # ── Pre-compute batched CFG state (merged caches + indices) ──
+        use_cfg_text = cfg_text_scale > 1.0
+        use_cfg_img = cfg_img_scale > 1.0
+        cfg_batched = None
+
+        if use_cfg_text:
+            seq_len = int(packed_seqlens.sum())
+
+            # Branch 0: main (gen_context), always present
+            branches_qi = [packed_indexes]
+            branches_kvi = [packed_key_value_indexes]
+            branches_kvl = [key_values_lens]
+            branches_pid = [packed_position_ids]
+            branches_cache = [past_key_values]
+
+            # Branch 1: cfg_text (unconditional text), always present when use_cfg_text
+            branches_qi.append(cfg_text_packed_query_indexes)
+            branches_kvi.append(cfg_text_packed_key_value_indexes)
+            branches_kvl.append(cfg_text_key_values_lens)
+            branches_pid.append(cfg_text_packed_position_ids)
+            branches_cache.append(cfg_text_past_key_values)
+
+            # Branch 2: cfg_img (text-only, no image), optional
+            if use_cfg_img:
+                branches_qi.append(cfg_img_packed_query_indexes)
+                branches_kvi.append(cfg_img_packed_key_value_indexes)
+                branches_kvl.append(cfg_img_key_values_lens)
+                branches_pid.append(cfg_img_packed_position_ids)
+                branches_cache.append(cfg_img_past_key_values)
+
+            num_branches = len(branches_cache)
+
+            # Compute per-branch offsets in the merged KV+Q attention tensor
+            merged_offsets = [0]
+            for b_idx in range(num_branches):
+                merged_offsets.append(merged_offsets[-1] + int(branches_kvl[b_idx].sum()) + seq_len)
+
+            cfg_batched = {
+                "num_branches": num_branches,
+                "seq_len": seq_len,
+                "batched_query_lens": packed_seqlens.repeat(num_branches),
+                "batched_position_ids": torch.cat(branches_pid),
+                "batched_kv_lens": torch.cat(branches_kvl),
+                "batched_query_indexes": torch.cat(
+                    [qi + merged_offsets[b_idx] for b_idx, qi in enumerate(branches_qi)]
+                ),
+                "batched_kv_indexes": torch.cat(
+                    [kvi + merged_offsets[b_idx] for b_idx, kvi in enumerate(branches_kvi)]
+                ),
+                "batched_text_indexes": torch.cat(
+                    [packed_text_indexes + b_idx * seq_len for b_idx in range(num_branches)]
+                ),
+                "batched_vae_indexes": torch.cat(
+                    [packed_vae_token_indexes + b_idx * seq_len for b_idx in range(num_branches)]
+                ),
+                "merged_cache": self._merge_naive_caches(branches_cache),
+            }
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
@@ -1347,24 +1414,13 @@ class Bagel(nn.Module):
                 packed_key_value_indexes=packed_key_value_indexes,
                 cfg_renorm_min=cfg_renorm_min,
                 cfg_renorm_type=cfg_renorm_type,
-                # cfg_text
                 cfg_text_scale=cfg_text_scale_,
-                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
-                cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
-                cfg_text_key_values_lens=cfg_text_key_values_lens,
-                cfg_text_past_key_values=cfg_text_past_key_values,
-                cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
-                # cfg_img
                 cfg_img_scale=cfg_img_scale_,
-                cfg_img_packed_position_ids=cfg_img_packed_position_ids,
-                cfg_img_packed_query_indexes=cfg_img_packed_query_indexes,
-                cfg_img_key_values_lens=cfg_img_key_values_lens,
-                cfg_img_past_key_values=cfg_img_past_key_values,
-                cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
-                cfg_type=cfg_type,
+                cfg_batched=cfg_batched,
             )
 
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
 
@@ -1384,22 +1440,11 @@ class Bagel(nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         cfg_renorm_min: float = 0.0,
         cfg_renorm_type: str = "global",
-        # cfg_text
         cfg_text_scale: float = 1.0,
-        cfg_text_packed_position_ids: torch.LongTensor | None = None,
-        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
-        cfg_text_key_values_lens: torch.Tensor | None = None,
-        cfg_text_past_key_values: NaiveCache | None = None,
-        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
-        # cfg_img
         cfg_img_scale: float = 1.0,
-        cfg_img_packed_position_ids: torch.LongTensor | None = None,
-        cfg_img_packed_query_indexes: torch.LongTensor | None = None,
-        cfg_img_key_values_lens: torch.Tensor | None = None,
-        cfg_img_past_key_values: NaiveCache | None = None,
-        cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
-        cfg_type: str = "parallel",
+        cfg_batched: dict | None = None,
     ):
+        # Build query sequence (identical for all CFG branches)
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -1414,60 +1459,76 @@ class Bagel(nn.Module):
 
         extra_inputs = {}
         if self.use_moe:
-            extra_inputs = {
-                "mode": "gen",
-                "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes,
-            }
+            extra_inputs["mode"] = "gen"
 
-        output = self.language_model.forward(
-            packed_query_sequence=packed_sequence,
-            query_lens=packed_seqlens,
-            packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            update_past_key_values=False,
-            is_causal=False,
-            **extra_inputs,
-        )
-        v_t = self.llm2vae(output.packed_query_sequence)
-        v_t = v_t[packed_vae_token_indexes]
+        use_cfg = cfg_text_scale > 1.0
+        cfg_text_v_t = None
+        cfg_img_v_t = None
 
-        if cfg_text_scale > 1.0:
-            cfg_text_output = self.language_model.forward(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_text_packed_position_ids,
-                packed_query_indexes=cfg_text_packed_query_indexes,
-                past_key_values=cfg_text_past_key_values,
-                key_values_lens=cfg_text_key_values_lens,
-                packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+        if use_cfg and cfg_batched is not None:
+            # ── Batched CFG: single LLM forward for all branches ──
+            seq_len = cfg_batched["seq_len"]
+            num_branches = cfg_batched["num_branches"]
+
+            batched_sequence = packed_sequence.repeat(num_branches, 1)
+
+            if self.use_moe:
+                extra_inputs["packed_text_indexes"] = cfg_batched["batched_text_indexes"]
+                extra_inputs["packed_vae_token_indexes"] = cfg_batched["batched_vae_indexes"]
+
+            output = self.language_model.forward(
+                packed_query_sequence=batched_sequence,
+                query_lens=cfg_batched["batched_query_lens"],
+                packed_query_position_ids=cfg_batched["batched_position_ids"],
+                packed_query_indexes=cfg_batched["batched_query_indexes"],
+                past_key_values=cfg_batched["merged_cache"],
+                key_values_lens=cfg_batched["batched_kv_lens"],
+                packed_key_value_indexes=cfg_batched["batched_kv_indexes"],
                 update_past_key_values=False,
                 is_causal=False,
                 **extra_inputs,
             )
-            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
-            cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
-        if cfg_img_scale > 1.0:
-            cfg_img_output = self.language_model.forward(
+            # Extract per-branch velocities from batched output
+            all_hidden = output.packed_query_sequence
+            assert all_hidden.shape[0] == seq_len * num_branches, (
+                f"Expected packed sequence length {seq_len * num_branches}, but got {all_hidden.shape[0]}"
+            )
+
+            v_t = self.llm2vae(all_hidden[:seq_len])[packed_vae_token_indexes]
+
+            branch_idx = 1
+            cfg_text_v_t = self.llm2vae(all_hidden[branch_idx * seq_len : (branch_idx + 1) * seq_len])[
+                packed_vae_token_indexes
+            ]
+            branch_idx += 1
+            if cfg_img_scale > 1.0:
+                cfg_img_v_t = self.llm2vae(all_hidden[branch_idx * seq_len : (branch_idx + 1) * seq_len])[
+                    packed_vae_token_indexes
+                ]
+        else:
+            # ── Single forward (no CFG or outside cfg_interval) ──
+            if self.use_moe:
+                extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
+                extra_inputs["packed_text_indexes"] = packed_text_indexes
+
+            output = self.language_model.forward(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_img_packed_position_ids,
-                packed_query_indexes=cfg_img_packed_query_indexes,
-                past_key_values=cfg_img_past_key_values,
-                key_values_lens=cfg_img_key_values_lens,
-                packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+                packed_query_position_ids=packed_position_ids,
+                packed_query_indexes=packed_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
                 update_past_key_values=False,
                 is_causal=False,
                 **extra_inputs,
             )
-            cfg_img_v_t = self.llm2vae(cfg_img_output.packed_query_sequence)
-            cfg_img_v_t = cfg_img_v_t[packed_vae_token_indexes]
+            v_t = self.llm2vae(output.packed_query_sequence)
+            v_t = v_t[packed_vae_token_indexes]
 
-        if cfg_text_scale > 1.0:
+        # ── CFG combination ──
+        if use_cfg:
             if cfg_renorm_type == "text_channel":
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
                 norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
@@ -1497,8 +1558,5 @@ class Bagel(nn.Module):
                     raise NotImplementedError(f"{cfg_renorm_type} is not supported")
                 scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 v_t = v_t_ * scale
-        else:
-            # No CFG
-            pass
 
         return v_t
