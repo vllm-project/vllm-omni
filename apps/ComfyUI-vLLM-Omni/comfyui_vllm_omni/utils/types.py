@@ -15,7 +15,7 @@ class ModelMode(Enum):
     IMAGE_GENERATION = auto()
     VIDEO_GENERATION = auto()
     AUDIO_GENERATION = auto()
-    COMPREHENSION = auto()
+    UNDERSTANDING = auto()
 
 
 class Modality(Enum):

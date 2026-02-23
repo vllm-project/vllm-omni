@@ -47,7 +47,7 @@ If no, check your shell running the ComfyUI process. There may be some error mes
 This extension offers the following nodes based on the output modalities (at **ComfyUI sidebar -> Node Library**):
 
 - **Generate Image** for text-to-image and image-to-image tasks
-- **Multimodality Comprehension** for multimodality-to-text and multimodality-to-audio tasks
+- **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
 
 This extension also offers example workflows (at **ComfyUI sidebar -> Templates -> vLLM-Omni**)
@@ -68,7 +68,7 @@ To build a simple workflow yourself,
 **The following features are tested**:
 
 - Single-node workflows for
-    - Multimodal Comprehension (e.g., Qwen Omni, BAGEL)
+    - Multimodal Understanding (e.g., Qwen Omni, BAGEL)
     - Text-to-Image Generation (e.g., Qwen-Image)
     - Image-to-Image Generation (e.g., Qwen-Image-Edit)
     - TTS (e.g., Qwen TTS, including VoiceDesign, VoiceClone, CustomVoice)
@@ -79,14 +79,14 @@ To build a simple workflow yourself,
 
 ## Screenshots and Examples
 
-### Multimodal comprehension (e.g., Qwen Omni series, BAGEL)
+### Multimodal understanding (e.g., Qwen Omni series, BAGEL)
 
-(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Annotated Example**)
+(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Multimodal Understanding**)
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-comprehension.jpg">
-    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-comprehension.jpg" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-understanding.jpg">
+    <img alt="vLLM-Omni Main Architecture" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-understanding.jpg" width=55%>
   </picture>
 </p>
 

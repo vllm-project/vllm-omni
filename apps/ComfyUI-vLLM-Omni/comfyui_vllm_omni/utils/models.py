@@ -37,7 +37,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
         ],
         "modes": [
             {
-                "mode": ModelMode.COMPREHENSION,
+                "mode": ModelMode.UNDERSTANDING,
                 "input_modalities": [Modality.TEXT, Modality.IMAGE],
             }
         ],
@@ -48,7 +48,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
         "payload_preprocessor": _qwen25_payload_preprocessor,
         "modes": [
             {
-                "mode": ModelMode.COMPREHENSION,
+                "mode": ModelMode.UNDERSTANDING,
                 "input_modalities": [
                     Modality.TEXT,
                     Modality.IMAGE,
@@ -62,7 +62,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
         "stages": ["autoregression", "autoregression", "autoregression"],
         "modes": [
             {
-                "mode": ModelMode.COMPREHENSION,
+                "mode": ModelMode.UNDERSTANDING,
                 "input_modalities": [
                     Modality.TEXT,
                     Modality.IMAGE,

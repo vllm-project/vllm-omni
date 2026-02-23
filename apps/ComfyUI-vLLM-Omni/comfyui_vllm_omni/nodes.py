@@ -133,7 +133,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         return (output,)
 
 
-class VLLMOmniComprehension(_VLLMOmniGenerateBase):
+class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -197,7 +197,7 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
             (
                 text_response,
                 _,
-            ) = await client.generate_comprehension_chat_completion(
+            ) = await client.generate_understanding_chat_completion(
                 model=model,
                 prompt=prompt,
                 image=image,
@@ -221,7 +221,7 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
             (
                 text_response,
                 audio,
-            ) = await client.generate_comprehension_chat_completion(
+            ) = await client.generate_understanding_chat_completion(
                 model=model,
                 prompt=prompt,
                 image=image,

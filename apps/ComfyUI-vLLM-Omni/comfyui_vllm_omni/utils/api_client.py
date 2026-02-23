@@ -217,7 +217,7 @@ class VLLMOmniClient:
 
         return torch.stack(image_tensors, dim=0)
 
-    async def generate_comprehension_chat_completion(
+    async def generate_understanding_chat_completion(
         self,
         *,
         model: str,

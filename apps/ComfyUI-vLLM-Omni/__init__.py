@@ -12,12 +12,12 @@ __version__ = "0.0.1"
 
 from .comfyui_vllm_omni.nodes import (
     VLLMOmniARSampling,
-    VLLMOmniComprehension,
     VLLMOmniDiffusionSampling,
     VLLMOmniGenerateImage,
     VLLMOmniQwenTTSParams,
     VLLMOmniSamplingParamsList,
     VLLMOmniTTS,
+    VLLMOmniUnderstanding,
     VLLMOmniVoiceClone,
 )
 
@@ -25,7 +25,7 @@ from .comfyui_vllm_omni.nodes import (
 NODE_CLASS_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
-    "VLLMOmniComprehension": VLLMOmniComprehension,
+    "VLLMOmniUnderstanding": VLLMOmniUnderstanding,
     "VLLMOmniTTS": VLLMOmniTTS,
     "VLLMOmniVoiceClone": VLLMOmniVoiceClone,
     # === Params ===
@@ -39,7 +39,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
-    "VLLMOmniComprehension": "Multimodality Comprehension",
+    "VLLMOmniUnderstanding": "Multimodality Understanding",
     "VLLMOmniTTS": "TTS (Text to Speech)",
     "VLLMOmniVoiceClone": "TTS Voice Cloning",
     # === Params ===
