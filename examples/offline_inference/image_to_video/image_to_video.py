@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -180,6 +181,7 @@ def main():
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
+    generation_start = time.perf_counter()
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(
         {
@@ -197,6 +199,11 @@ def main():
             num_frames=args.num_frames,
         ),
     )
+    generation_end = time.perf_counter()
+    generation_time = generation_end - generation_start
+
+    # Print profiling results
+    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     # Extract video frames from OmniRequestOutput
     if isinstance(frames, list) and len(frames) > 0:
