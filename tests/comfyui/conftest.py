@@ -29,7 +29,7 @@ def _setup_comfyui_test_environment():
     )
     if not os.path.isdir(_COMFYUI_PLUGIN_PATH):
         raise FileNotFoundError(
-            f"ComfyUI plugin not found at {_COMFYUI_PLUGIN_PATH}."
+            f"ComfyUI plugin not found at {_COMFYUI_PLUGIN_PATH}. "
             "If it is moved elsewhere, please update the path in this conftest.py."
         )
     if _COMFYUI_PLUGIN_PATH not in sys.path:

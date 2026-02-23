@@ -1,3 +1,9 @@
+"""
+Integration tests for ComfyUI nodes that use the Omni API client, with a mocked AsyncOmni and a real API server running in a background process.
+These tests cover the integration between ComfyUI node and the API server, without actual model inference logic.
+It ensures that future changes to the API request and response formats do not break the ComfyUI nodes that use it.
+"""
+
 import multiprocessing
 import time
 import traceback
