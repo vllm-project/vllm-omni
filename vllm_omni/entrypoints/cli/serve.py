@@ -6,6 +6,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
 import argparse
+import os
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -14,6 +15,7 @@ from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
 logger = init_logger(__name__)
@@ -45,6 +47,10 @@ class OmniServeCommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        if not os.environ.get("VLLM_DISABLE_LOG_LOGO"):
+            os.environ["VLLM_DISABLE_LOG_LOGO"] = "1"
+            log_logo()
+
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
