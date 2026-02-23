@@ -479,6 +479,13 @@ class VLLMOmniDiffusionSampling:
                         "tooltip": "Enable VAE slicing for reduced memory usage (slight quality trade-off)",
                     },
                 ),
+                "vae_use_tiling": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable VAE tiling for reduced memory usage (slight quality trade-off)",
+                    },
+                ),
                 # === Put seed at last. ===
                 # Whenever a field named "seed" is present, ComfyUI adds another field called "control after generate"
                 "seed": (
