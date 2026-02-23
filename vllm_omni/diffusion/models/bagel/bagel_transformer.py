@@ -1286,8 +1286,9 @@ class Bagel(nn.Module):
     @staticmethod
     def _merge_naive_caches(caches: list) -> NaiveCache:
         """Merge multiple NaiveCache objects by concatenating KV tensors per layer."""
-        merged = NaiveCache(caches[0].num_layers)
-        for layer_idx in range(merged.num_layers):
+        num_layers = len(caches[0].key_cache)
+        merged = NaiveCache(num_layers)
+        for layer_idx in range(num_layers):
             merged.key_cache[layer_idx] = torch.cat([c.key_cache[layer_idx] for c in caches], dim=0)
             merged.value_cache[layer_idx] = torch.cat([c.value_cache[layer_idx] for c in caches], dim=0)
         return merged
