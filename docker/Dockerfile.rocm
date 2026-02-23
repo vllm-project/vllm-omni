@@ -1,8 +1,20 @@
 ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.15.0
-FROM ${BASE_IMAGE} AS final
+FROM ${BASE_IMAGE} AS base
+
+# Declare a variable to know if we want to use the nightly build or the stable build.
+# NOTE: REMINDER to vLLM-Omni rebase maintainer
+# Remember to set `USE_NIGHTLY_BUILD` to 0, when switching back to stable vLLM docker image
+# 1. If vLLM-omni maintainer is forced to use custom commits
+#    during rebasing, they can change the two variables
+# 2. Whenever vLLM upstream has released a stable version,
+#    we should swap over to use stable release ASAP.
+#    We should avoid relying on custom commits.
+ARG USE_NIGHTLY_BUILD=1
+ARG VLLM_VERSION_OR_COMMIT_HASH=2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
+ARG ARG_PYTORCH_ROCM_ARCH
+ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
 ARG COMMON_WORKDIR=/app
-
 WORKDIR ${COMMON_WORKDIR}
 
 # Step 1: Setup - Install system dependencies
@@ -11,18 +23,31 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
+# Step 2: Conditionally reinstall vllm from source for nightly builds
+RUN if [ "${USE_NIGHTLY_BUILD}" = "1" ]; then \
+        python3 -m pip uninstall -y vllm && rm -rf vllm && \
+        git clone https://github.com/vllm-project/vllm.git && \
+        cd vllm && \
+        git checkout ${VLLM_VERSION_OR_COMMIT_HASH} && \
+        python3 -m pip install -r requirements/rocm.txt && \
+        python3 setup.py clean --all && \
+        PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} python3 setup.py develop && \
+        cd ../ && \
+        rm -rf vllm/.git; \
+    fi
 
-# Step 2: Copy vllm-omni code and install without uv
+# Step 3: Copy vllm-omni code and install without uv
+RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]" --no-build-isolation
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-CMD ["/bin/bash"]
+FROM base AS test
 
+CMD ["/bin/bash"]
 ENTRYPOINT []
 
-#Set entrypoint for vllm-openai official images
-FROM final AS vllm-openai
+# Set entrypoint for vllm-openai official images
+FROM base AS vllm-openai
 ENTRYPOINT ["vllm", "serve", "--omni"]
