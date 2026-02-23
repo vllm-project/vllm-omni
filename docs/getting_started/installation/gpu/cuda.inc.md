@@ -20,7 +20,20 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.16.0 --torch-backend=auto
+# vllm 0.16.0 is still under prerelease
+uv pip install --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
+
+# vllm 0.16.0 may have some bugs for cuda 12.9, here is how we solve them:
+export FLASHINFER_CUDA_TAG="$(python3 -c 'import torch; print((torch.version.cuda or "12.4").replace(".", ""))')"
+
+uv pip install --upgrade --force-reinstall \
+  "flashinfer-python==0.6.3" \
+  "flashinfer-cubin==0.6.3" \
+  "flashinfer-jit-cache==0.6.3" \
+  --extra-index-url "https://flashinfer.ai/whl/cu${FLASHINFER_CUDA_TAG}"
+
+uv pip install --upgrade --force-reinstall "nvidia-cublas-cu12==12.9.1.4"
+uv pip install --upgrade --force-reinstall "numpy==2.2.6"
 ```
 
 #### Installation of vLLM-Omni
