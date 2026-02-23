@@ -47,6 +47,10 @@ class VLLMOmniClient:
         """Run text-to-image generation via DALLE API"""
         await self._check_model_exist(model)
 
+        # Exclude internal key in sampling_params
+        if sampling_params is not None:
+            sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
+
         size = f"{width}x{height}"
         payload = {
             "model": model,
@@ -57,16 +61,7 @@ class VLLMOmniClient:
         if negative_prompt:
             payload["negative_prompt"] = negative_prompt
         if sampling_params is not None:
-            # Only select specific sampling params
-            for k in (
-                "n",
-                "num_inference_steps",
-                "guidance_scale",
-                "true_cfg_scale",
-                "vae_use_slicing",
-            ):
-                if k in sampling_params and sampling_params[k] is not None:
-                    payload[k] = sampling_params[k]
+            payload.update(sampling_params)
         logger.debug("img gen payload: %s", payload)
 
         url = self.base_url + "/images/generations"
@@ -123,6 +118,10 @@ class VLLMOmniClient:
         """Run image editing via DALLE API"""
         await self._check_model_exist(model)
 
+        # Exclude internal key in sampling_params
+        if sampling_params is not None:
+            sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
+
         size = f"{width}x{height}"
         image_filename = "image.png"  # Required for multipart form
         form = aiohttp.FormData()
@@ -138,10 +137,8 @@ class VLLMOmniClient:
         if negative_prompt:
             form.add_field("negative_prompt", negative_prompt)
         if sampling_params is not None:
-            # Only select specific sampling params
-            for k in ("n", "num_inference_steps", "guidance_scale", "true_cfg_scale"):
-                if k in sampling_params and sampling_params[k] is not None:
-                    form.add_field(k, str(sampling_params[k]))
+            for k, v in sampling_params.items():
+                form.add_field(k, str(v))
         if mask is not None:
             mask_filename = "mask.png"
             form.add_field(
@@ -432,7 +429,7 @@ class VLLMOmniClient:
             spec, _ = lookup_model_spec(model)
             is_single_sampling_param = isinstance(sampling_params, dict) or len(sampling_params) == 1
 
-            # Exclude internal key
+            # Exclude internal key in sampling_params
             if isinstance(sampling_params, dict):
                 sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
             else:

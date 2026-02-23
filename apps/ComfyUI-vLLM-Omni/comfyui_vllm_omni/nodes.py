@@ -1,4 +1,4 @@
-from typing import Literal, cast
+from typing import Literal
 
 import torch
 from comfy_api.input import AudioInput, VideoInput
@@ -86,7 +86,10 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
 
         # Prefer DALL-E compatible API for simple (one-stage) diffusion models
         if (spec is None or spec["stages"] == ["diffusion"]) and not is_bagel:
-            sampling_params = cast(dict | None, sampling_params)
+            # The number of sampling parameter groups should have been validated.
+            # Now, simply convert single-item list to dict.
+            if isinstance(sampling_params, list):
+                sampling_params = sampling_params[0]
             if audio is None and image is None and video is None:
                 # No multimodal input --- use DALL-E image generation
                 logger.info("Using DALL-E image generation endpoint")
