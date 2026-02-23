@@ -405,14 +405,13 @@ def retrieve_timesteps(
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
         timesteps (`List[int]`, *optional*):
             Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
-            `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
-            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
-            `num_inference_steps` and `timesteps` must be `None`.
+            `num_inference_steps` must be `None`.
+        **kwargs:
+            Additional keyword arguments passed to `scheduler.set_timesteps`.
 
     Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
-        second element is the number of inference steps.
+        timesteps (`torch.Tensor`): The timestep schedule from the scheduler.
+        num_inference_steps (`int`): The number of inference steps.
     """
     if timesteps is not None:
         accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
@@ -441,11 +440,7 @@ class OmniGen2Pipeline(nn.Module):
     - FlowMatchEulerDiscreteScheduler for noise scheduling
 
     Args:
-        transformer (OmniGen2Transformer2DModel): The transformer model for image generation.
-        vae (AutoencoderKL): The VAE model for image encoding/decoding.
-        scheduler (FlowMatchEulerDiscreteScheduler): The scheduler for noise scheduling.
-        text_encoder (Qwen2_5_VLModel): The text encoder model.
-        tokenizer (Union[Qwen2Tokenizer, Qwen2TokenizerFast]): The tokenizer for text processing.
+        od_config (OmniDiffusionConfig): The OmniDiffusion configuration.
     """
 
     def __init__(

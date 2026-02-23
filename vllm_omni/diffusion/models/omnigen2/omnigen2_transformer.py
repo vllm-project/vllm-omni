@@ -332,10 +332,9 @@ class LuminaFeedForward(nn.Module):
     A feed-forward layer.
 
     Parameters:
-        hidden_size (`int`):
-            The dimensionality of the hidden layers in the model. This parameter determines the width of the
-            model's hidden representations.
-        intermediate_size (`int`): The intermediate dimension of the feedforward layer.
+        dim (`int`):
+            The dimensionality of the input and output tensors.
+        inner_dim (`int`): The intermediate dimension of the feedforward layer.
         multiple_of (`int`, *optional*): Value to ensure hidden dimension is a multiple
             of this value.
         ffn_dim_multiplier (float, *optional*): Custom multiplier for hidden
@@ -610,8 +609,6 @@ class OmniGen2TransformerBlock(nn.Module):
         ffn_dim_multiplier: Multiplier for the feed-forward network dimension
         norm_eps: Epsilon value for normalization layers
         modulation: Whether to use modulation for conditional generation
-        use_fused_rms_norm: Whether to use fused RMS normalization
-        use_fused_swiglu: Whether to use fused SwiGLU activation
     """
 
     def __init__(
@@ -747,8 +744,6 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         axes_lens: Lengths for rotary position embeddings
         text_feat_dim: Dimension of text features
         timestep_scale: Scale factor for timestep embeddings
-        use_fused_rms_norm: Whether to use fused RMS normalization
-        use_fused_swiglu: Whether to use fused SwiGLU activation
     """
 
     _supports_gradient_checkpointing = True

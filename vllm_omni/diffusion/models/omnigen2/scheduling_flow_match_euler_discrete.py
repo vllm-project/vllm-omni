@@ -47,11 +47,8 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
     Args:
         num_train_timesteps (`int`, defaults to 1000):
             The number of diffusion steps to train the model.
-        timestep_spacing (`str`, defaults to `"linspace"`):
-            The way the timesteps should be scaled. Refer to Table 2 of the [Common Diffusion Noise Schedules and
-            Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.
-        shift (`float`, defaults to 1.0):
-            The shift value for the timestep schedule.
+        dynamic_time_shift (`bool`, defaults to `True`):
+            Whether to use dynamic time shifting for the timestep schedule.
     """
 
     _compatibles = []
@@ -169,11 +166,6 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 The current discrete timestep in the diffusion chain.
             sample (`torch.FloatTensor`):
                 A current instance of a sample created by the diffusion process.
-            s_churn (`float`):
-            s_tmin  (`float`):
-            s_tmax  (`float`):
-            s_noise (`float`, defaults to 1.0):
-                Scaling factor for noise added to the sample.
             generator (`torch.Generator`, *optional*):
                 A random number generator.
             return_dict (`bool`):
