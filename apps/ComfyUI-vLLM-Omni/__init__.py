@@ -6,8 +6,8 @@ __all__ = [
     "WEB_DIRECTORY",
 ]
 
-__author__ = """Zeyu Huang"""
-__email__ = "11222265+fhfuih@users.noreply.github.com"
+__author__ = """vLLM-Omni Team"""
+__email__ = "collaboration@vllm.ai"
 __version__ = "0.0.1"
 
 from .comfyui_vllm_omni.nodes import (
