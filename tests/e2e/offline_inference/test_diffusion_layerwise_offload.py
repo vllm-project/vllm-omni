@@ -17,13 +17,15 @@ if str(REPO_ROOT) not in sys.path:
 from vllm_omni import Omni
 
 # Models to test and expected saved memory in MB, correspondingly
-MODELS_SAVED_MEMORY_MB = {"riverclouds/qwen_image_random": 4500}
+MODELS_SAVED_MEMORY_MB = {
+    "riverclouds/qwen_image_random": 4500,
+    # "Wan-AI/Wan2.2-T2V-A14B-Diffusers": 45000,
+}
 
 
 def run_inference(
     model_name: str,
     layerwise_offload: bool = False,
-    num_gpu_layers: int = 1,
     num_inference_steps: int = 3,
 ) -> float:
     # For now, only support on GPU, so apply torch.cuda operations here
@@ -36,7 +38,6 @@ def run_inference(
     m = Omni(
         model=model_name,
         enable_layerwise_offload=layerwise_offload,
-        layerwise_num_gpu_layers=num_gpu_layers,
         boundary_ratio=0.875,
         flow_shift=5.0,
     )
@@ -83,16 +84,12 @@ def test_layerwise_offload_diffusion_model(model_name: str):
         cleanup_dist_env_and_memory()
 
         # Run with layerwise offloading (1 layer on device)
-        layerwise_offload_peak_memory = run_inference(model_name, layerwise_offload=True, num_gpu_layers=1)
+        layerwise_offload_peak_memory = run_inference(model_name, layerwise_offload=True)
         cleanup_dist_env_and_memory()
-
-        # Run with 2 layers on device
-        layerwise_offload_two_layers_peak = run_inference(model_name, layerwise_offload=True, num_gpu_layers=2)
     except Exception:
         pytest.fail("Inference failed")
 
     print(f"Layerwise offload peak memory (1 GPU layer): {layerwise_offload_peak_memory} MB")
-    print(f"Layerwise offload peak memory (2 GPU layers): {layerwise_offload_two_layers_peak} MB")
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
     # Verify that layerwise offloading significantly reduces memory usage
@@ -100,11 +97,4 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     assert layerwise_offload_peak_memory + MODELS_SAVED_MEMORY_MB[model_name] < no_offload_peak_memory, (
         f"Layerwise offload peak memory {layerwise_offload_peak_memory} MB "
         f"should be significantly less than no offload peak memory {no_offload_peak_memory} MB"
-    )
-
-    # Verify that 2 GPU layers uses more memory than 1 GPU layer
-    # But not excessively more (should be a reasonable increase)
-    assert layerwise_offload_peak_memory < layerwise_offload_two_layers_peak, (
-        f"1 GPU layer peak {layerwise_offload_peak_memory} MB should be < "
-        f"2 GPU layers peak {layerwise_offload_two_layers_peak} MB"
     )

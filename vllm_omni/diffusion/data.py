@@ -298,11 +298,8 @@ class OmniDiffusionConfig:
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
     enable_cpu_offload: bool = False
-
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
-    # Number of transformer blocks ready for computation to keep on GPU
-    layerwise_num_gpu_layers: int = 1
 
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
@@ -334,6 +331,15 @@ class OmniDiffusionConfig:
     # Master port for distributed inference
     # TODO: do not hard code
     master_port: int | None = None
+
+    # Worker extension class for custom functionality
+    worker_extension_cls: str | None = None
+
+    # Custom pipeline arguments for custom pipelines
+    custom_pipeline_args: dict[str, Any] | None = None
+
+    # Diffusion model loading format
+    diffusion_load_format: str = "default"  # "default", "custom_pipeline", "dummy"
 
     # http server endpoint config, would be ignored in local mode
     host: str | None = None

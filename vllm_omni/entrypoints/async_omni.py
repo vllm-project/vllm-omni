@@ -162,8 +162,9 @@ class AsyncOmni(OmniBase):
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-                    "layerwise_num_gpu_layers": kwargs.get("layerwise_num_gpu_layers", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
+                    "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
+                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",
@@ -389,7 +390,8 @@ class AsyncOmni(OmniBase):
                     submit_flag = False
                     prompt_token_ids = engine_outputs.prompt_token_ids
                     engine_input = copy.deepcopy(prompt)
-                    engine_input["prompt_token_ids"] = [0] * compute_talker_prompt_ids_length(prompt_token_ids)
+                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
                     for i in range(1, len(self.stage_list)):
                         task = {

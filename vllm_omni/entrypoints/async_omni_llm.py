@@ -6,7 +6,6 @@ import socket
 from typing import TYPE_CHECKING
 
 import torch
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
@@ -164,21 +163,23 @@ class AsyncOmniLLM(AsyncLLM):
         except RuntimeError:
             pass
 
-        if envs.VLLM_TORCH_PROFILER_DIR and not envs.VLLM_TORCH_PROFILER_DISABLE_ASYNC_LLM:
+        # Use profiler_config from vllm_config (new way, aligned with vllm v1)
+        if vllm_config.profiler_config.profiler == "torch" and not vllm_config.profiler_config.ignore_frontend:
+            profiler_dir = vllm_config.profiler_config.torch_profiler_dir
             logger.info(
                 "Torch profiler enabled. AsyncOmniLLM CPU traces will be collected under %s",
-                envs.VLLM_TORCH_PROFILER_DIR,
+                profiler_dir,
             )
             worker_name = f"{socket.gethostname()}_{os.getpid()}.async_omni_llm"
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                 ],
-                with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
+                with_stack=vllm_config.profiler_config.torch_profiler_with_stack,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    envs.VLLM_TORCH_PROFILER_DIR,
+                    profiler_dir,
                     worker_name=worker_name,
-                    use_gzip=envs.VLLM_TORCH_PROFILER_USE_GZIP,
+                    use_gzip=vllm_config.profiler_config.torch_profiler_use_gzip,
                 ),
             )
         else:

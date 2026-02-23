@@ -46,6 +46,7 @@ def omni_server():
             "120",
             "--trust-remote-code",
             "--enforce-eager",
+            "--disable-log-stats",
         ],
     ) as server:
         print("OmniServer started successfully")

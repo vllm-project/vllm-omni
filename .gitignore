@@ -242,3 +242,6 @@ configs/development.yaml
 Dockerfile.dev
 discussion
 tmp_test
+
+# output files
+*.wav

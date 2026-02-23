@@ -10,7 +10,7 @@ stage_args:
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.6
-      enforce_eager: true
+      enforce_eager: false
       trust_remote_code: true
       engine_output_type: latent  # Output hidden states for talker
       distributed_executor_backend: "mp"

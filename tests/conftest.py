@@ -828,7 +828,7 @@ def modify_stage_config(
                         # Find stage by ID
                         target_stage = None
                         for stage in stage_args:
-                            if stage.get("stage_id") == stage_id:
+                            if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
 
@@ -847,43 +847,42 @@ def modify_stage_config(
                 # Delete entire key
                 del config[key]
 
-    if updates:
-        # Apply updates
-        for key, value in updates.items():
-            if key == "stage_args":
-                if value and isinstance(value, dict):
-                    stage_args = config.get("stage_args", [])
-                    if not stage_args:
-                        raise ValueError("stage_args does not exist in config")
+    # Apply updates
+    for key, value in updates.items():
+        if key == "stage_args":
+            if value and isinstance(value, dict):
+                stage_args = config.get("stage_args", [])
+                if not stage_args:
+                    raise ValueError("stage_args does not exist in config")
 
-                    for stage_id, stage_updates in value.items():
-                        # Find stage by ID
-                        target_stage = None
-                        for stage in stage_args:
-                            if stage.get("stage_id") == stage_id:
-                                target_stage = stage
-                                break
+                for stage_id, stage_updates in value.items():
+                    # Find stage by ID
+                    target_stage = None
+                    for stage in stage_args:
+                        if stage.get("stage_id") == int(stage_id):
+                            target_stage = stage
+                            break
 
-                        if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
-                            raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
+                    if target_stage is None:
+                        available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                        raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
 
-                        # Apply updates to this stage
-                        for path, val in stage_updates.items():
-                            # Check if this is a simple key (not dot-separated)
-                            # Example: 'engine_input_source' vs 'engine_args.max_model_len'
-                            if "." not in path:
-                                # Direct key assignment (e.g., updating a list value)
-                                target_stage[path] = val
-                            else:
-                                # Dot-separated path (e.g., nested dict access)
-                                apply_update(target_stage, path, val)
-            elif "." in key:
-                # Apply using dot-separated path
-                apply_update(config, key, value)
-            else:
-                # Direct top-level key
-                config[key] = value
+                    # Apply updates to this stage
+                    for path, val in stage_updates.items():
+                        # Check if this is a simple key (not dot-separated)
+                        # Example: 'engine_input_source' vs 'engine_args.max_model_len'
+                        if "." not in path:
+                            # Direct key assignment (e.g., updating a list value)
+                            target_stage[path] = val
+                        else:
+                            # Dot-separated path (e.g., nested dict access)
+                            apply_update(target_stage, path, val)
+        elif "." in key:
+            # Apply using dot-separated path
+            apply_update(config, key, value)
+        else:
+            # Direct top-level key
+            config[key] = value
 
     # Save to new file with timestamp
     timestamp = int(time.time())
@@ -1058,7 +1057,8 @@ def omni_server(request, run_level):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        model, stage_config_path = request.param
+        *port, model, stage_config_path = request.param
+        port = port[0] if port else None
         if run_level == "advanced_model":
             stage_config_path = modify_stage_config(
                 stage_config_path,
@@ -1071,7 +1071,8 @@ def omni_server(request, run_level):
                 },
             )
 
-        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+        server_args = ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]
+        with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
@@ -1289,11 +1290,15 @@ class OpenAIClientHandler:
 
         responses = []
         stream = request_config.get("stream", False)
+        modalities = request_config.get("modalities", ["text", "audio"])
 
         if request_num == 1:
             # Send single request
             chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"), messages=request_config.get("messages"), stream=stream
+                model=request_config.get("model"),
+                messages=request_config.get("messages"),
+                stream=stream,
+                modalities=modalities,
             )
 
             if stream:
@@ -1315,6 +1320,7 @@ class OpenAIClientHandler:
                         self.client.chat.completions.create,
                         model=request_config.get("model"),
                         messages=request_config.get("messages"),
+                        modalities=modalities,
                         stream=stream,
                     )
                     futures.append(future)
