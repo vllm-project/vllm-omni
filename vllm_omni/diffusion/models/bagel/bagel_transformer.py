@@ -1465,7 +1465,7 @@ class Bagel(nn.Module):
         cfg_text_v_t = None
         cfg_img_v_t = None
 
-        if use_cfg:
+        if use_cfg and cfg_batched is not None:
             # ── Batched CFG: single LLM forward for all branches ──
             seq_len = cfg_batched["seq_len"]
             num_branches = cfg_batched["num_branches"]
@@ -1527,8 +1527,9 @@ class Bagel(nn.Module):
             v_t = self.llm2vae(output.packed_query_sequence)
             v_t = v_t[packed_vae_token_indexes]
 
+
         # ── CFG combination ──
-        if cfg_text_scale > 1.0:
+        if use_cfg:
             if cfg_renorm_type == "text_channel":
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
                 norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
