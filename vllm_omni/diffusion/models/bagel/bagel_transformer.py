@@ -1287,7 +1287,7 @@ class Bagel(nn.Module):
     def _merge_naive_caches(caches: list) -> NaiveCache:
         """Merge multiple NaiveCache objects by concatenating KV tensors per layer."""
         if not caches:
-            # Handle empty list case gracefully if desired, 
+            # Handle empty list case gracefully if desired,
             # though original code also crashed on this.
             return NaiveCache(0)
 
