@@ -1462,8 +1462,10 @@ class Bagel(nn.Module):
             extra_inputs["mode"] = "gen"
 
         use_cfg = cfg_text_scale > 1.0
+        cfg_text_v_t = None
+        cfg_img_v_t = None
 
-        if use_cfg and cfg_batched is not None:
+        if use_cfg:
             # ── Batched CFG: single LLM forward for all branches ──
             seq_len = cfg_batched["seq_len"]
             num_branches = cfg_batched["num_branches"]
@@ -1495,14 +1497,11 @@ class Bagel(nn.Module):
 
             v_t = self.llm2vae(all_hidden[:seq_len])[packed_vae_token_indexes]
 
-            cfg_text_v_t = None
-            cfg_img_v_t = None
             branch_idx = 1
-            if cfg_text_scale > 1.0:
-                cfg_text_v_t = self.llm2vae(all_hidden[branch_idx * seq_len : (branch_idx + 1) * seq_len])[
-                    packed_vae_token_indexes
-                ]
-                branch_idx += 1
+            cfg_text_v_t = self.llm2vae(all_hidden[branch_idx * seq_len : (branch_idx + 1) * seq_len])[
+                packed_vae_token_indexes
+            ]
+            branch_idx += 1
             if cfg_img_scale > 1.0:
                 cfg_img_v_t = self.llm2vae(all_hidden[branch_idx * seq_len : (branch_idx + 1) * seq_len])[
                     packed_vae_token_indexes
@@ -1527,25 +1526,23 @@ class Bagel(nn.Module):
             )
             v_t = self.llm2vae(output.packed_query_sequence)
             v_t = v_t[packed_vae_token_indexes]
-            cfg_text_v_t = None
-            cfg_img_v_t = None
 
         # ── CFG combination ──
-        if cfg_text_scale > 1.0 and cfg_text_v_t is not None:
+        if cfg_text_scale > 1.0:
             if cfg_renorm_type == "text_channel":
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
                 norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
                 norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
                 scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 v_t_text = v_t_text_ * scale
-                if cfg_img_scale > 1.0 and cfg_img_v_t is not None:
+                if cfg_img_scale > 1.0:
                     v_t = cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
                 else:
                     v_t = v_t_text
             else:
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
 
-                if cfg_img_scale > 1.0 and cfg_img_v_t is not None:
+                if cfg_img_scale > 1.0:
                     v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
                 else:
                     v_t_ = v_t_text_
