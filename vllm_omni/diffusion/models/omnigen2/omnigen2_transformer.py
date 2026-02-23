@@ -234,7 +234,6 @@ def apply_rotary_emb(
         return out
     else:
         # used for lumina
-        # x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
         x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2))
         freqs_cis = freqs_cis.unsqueeze(2)
         x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
@@ -696,7 +695,6 @@ class OmniGen2TransformerBlock(nn.Module):
             norm_hidden_states, gate_msa, scale_mlp, gate_mlp = self.norm1(hidden_states, temb)
             attn_output = self.attn(
                 hidden_states=norm_hidden_states,
-                # encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
             )
@@ -707,7 +705,6 @@ class OmniGen2TransformerBlock(nn.Module):
             norm_hidden_states = self.norm1(hidden_states)
             attn_output = self.attn(
                 hidden_states=norm_hidden_states,
-                # encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
             )
