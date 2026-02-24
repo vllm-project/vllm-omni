@@ -162,5 +162,8 @@ class SharedMemoryConnector(OmniConnectorBase):
         # For now, we rely on the consumer to read and unlink.
         pass
 
+    def close(self) -> None:
+        pass
+
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", "threshold": self.threshold, **self._metrics}

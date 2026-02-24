@@ -22,7 +22,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     SnakeBeta,
 )
 from vllm.config import VllmConfig  # type: ignore
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger  # type: ignore
 from vllm.model_executor.models.utils import (  # type: ignore
     AutoWeightsLoader,
@@ -163,6 +162,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         codes: torch.Tensor,
         chunk_size: int = 300,
         left_context_size: int = 25,
+        seq_token_counts: list[int] | None = None,
     ) -> list[torch.Tensor]:
         """
         Decode long sequences in chunks to avoid OOM.
@@ -173,6 +173,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             codes: [batch, num_quantizers, seq_len] - num_quantizers-layer RVQ codes
             chunk_size: Number of codec frames per chunk
             left_context_size: Number of overlapping frames for context
+            seq_token_counts: Token count for each request in batch
 
         Returns:
             list[torch.Tensor]: Complete waveform decoded from the input
@@ -197,12 +198,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
             start_index = end_index
 
-        ubatch_slices = get_forward_context().ubatch_slices
-        if ubatch_slices is not None:
-            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in ubatch_slices]
+        if seq_token_counts is not None:
+            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in seq_token_counts]
         else:
             # Fallback: assume all batch elements share the same sequence length.
-            # Create one entry per batch so that each element is processed.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
         batch_wav = torch.cat(wavs, dim=-1)
         wavs = []
@@ -216,6 +215,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         codes: torch.Tensor,
         chunk_size: int = 25,
         left_context_size: int = 25,
+        seq_token_counts: list[int] | None = None,
     ) -> list[torch.Tensor]:
         """
         Decode long sequences in chunks to avoid OOM.
@@ -226,21 +226,19 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             codes: [batch, num_quantizers, seq_len] - num_quantizers-layer RVQ codes
             chunk_size: Number of codec frames per chunk
             left_context_size: Number of overlapping frames for context
+            seq_token_counts: Token count for each request in batch
 
         Returns:
             list[torch.Tensor]: Complete waveform decoded from the input
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        # Decode chunk
         wavs = []
         batch_wav = self(codes)
-        ubatch_slices = get_forward_context().ubatch_slices
-        if ubatch_slices is not None:
-            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in ubatch_slices]
+        if seq_token_counts is not None:
+            code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
         else:
             # Fallback: assume all batch elements share the same sequence length.
-            # Create one entry per batch so that each element is processed.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
         for idx, code_seq_len in enumerate(code_seq_lens):
             # TODO: need to optimize algorithms, current only support
