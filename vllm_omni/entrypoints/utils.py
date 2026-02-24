@@ -315,7 +315,7 @@ def load_and_resolve_stage_configs(
     """
     if stage_configs_path is None:
         config_path = resolve_model_config_path(model)
-        stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)
+        stage_configs = load_stage_configs_from_model(config_path, base_engine_args=kwargs)
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
