@@ -1150,8 +1150,12 @@ async def _stage_worker_async(
         await stage_engine.reset_mm_cache()
     logger.debug("[Stage-%s] Engine initialized", stage_id)
 
-    async def handle_profiler_task_async(task_type: OmniStageTaskType) -> None:
-        """Handle profiler task asynchronously for both LLM and diffusion stages."""
+    async def handle_profiler_task_async(task_type: OmniStageTaskType) -> dict:
+        """Handle profiler task asynchronously for both LLM and diffusion stages.
+
+        Returns:
+            dict: For PROFILER_STOP, returns the profiler result data. Empty dict otherwise.
+        """
         if task_type == OmniStageTaskType.PROFILER_START:
             if stage_type == "diffusion":
                 try:
@@ -1169,14 +1173,16 @@ async def _stage_worker_async(
                     logger.info("[Stage-%s] vLLM profiler started", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e)
+            return {}
 
         elif task_type == OmniStageTaskType.PROFILER_STOP:
+            result_data = {}
             if stage_type == "diffusion":
                 try:
-                    trace_files = stage_engine.stop_profile()
+                    result_data = stage_engine.stop_profile() or {}
                     logger.info("[Stage-%s] Diffusion Torch profiler stopped", stage_id)
-                    if trace_files:
-                        logger.info("Diffusion trace files: %s", trace_files)
+                    if result_data:
+                        logger.info("Diffusion trace files: %s", result_data)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e)
             else:
@@ -1185,6 +1191,9 @@ async def _stage_worker_async(
                     logger.info("[Stage-%s] vLLM profiler stopped", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to stop vLLM profiler: %s", stage_id, e)
+            return result_data
+
+        return {}
 
     # Signal readiness to orchestrator and send vllm_config back to main process
     try:
@@ -1286,7 +1295,10 @@ async def _stage_worker_async(
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
             elif is_profiler_task(task_type):
-                await handle_profiler_task_async(task_type)
+                profiler_data = await handle_profiler_task_async(task_type)
+                # Send profiler result back to orchestrator for PROFILER_STOP
+                if task_type == OmniStageTaskType.PROFILER_STOP:
+                    out_q.put({"type": "profiler_result", "data": profiler_data})
             else:
                 asyncio.create_task(generation_single_request(task))
 
