@@ -298,3 +298,24 @@ class AsyncOmniDiffusion:
             None,
         )
         return all(results) if isinstance(results, list) else results
+
+    def start_profile(self, trace_filename: str | None = None) -> None:
+        """Start profiling on the diffusion engine.
+
+        Delegates to the underlying DiffusionEngine's start_profile method
+        which sets up torch profiling on all diffusion workers.
+
+        Args:
+            trace_filename: Optional base filename (without extension or rank suffix).
+                If None, generates one using current timestamp.
+        """
+        self.engine.start_profile(trace_filename=trace_filename)
+
+    def stop_profile(self) -> None:
+        """Stop profiling and return trace file paths.
+
+        Delegates to the underlying DiffusionEngine's stop_profile method
+        which stops profiling on all workers and collects trace paths.
+
+        """
+        self.engine.stop_profile()
