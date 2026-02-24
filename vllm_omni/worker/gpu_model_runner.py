@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.omni_process_mixin import has_postprocess, has_preprocess
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -877,8 +878,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Process model-provided per-request additional_information updates and merge into request state."""
         try:
             # execute the custom postprocess function
-            # TODO(Peiqi): do we have a more elegant way to do this?
-            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
+            if has_postprocess(self.model):
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
                     req_state = self.requests.get(req_id)
                     req_infos = (
@@ -1050,7 +1050,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Prefill: overlay prompt_embeds and collect additional_information
             self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
 
-        if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
+        if has_preprocess(self.model):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
@@ -1095,6 +1095,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_ids[s : s + seg_len] = req_input_ids
 
             # run talker mtp decode
+            # TODO (NickLucche): refactor into OmniProcessingMixin
             if hasattr(self.model, "talker_mtp"):
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
@@ -1165,6 +1166,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             **model_kwargs,
             **model_kwargs_extra,
         )
+        # TODO (NickLucche): refactor check into OmniProcessingMixin
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.

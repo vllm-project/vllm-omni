@@ -32,9 +32,9 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.model_executor.omni_process_mixin import OmniProcessingMixin
 from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
@@ -68,7 +68,12 @@ logger = init_logger(__name__)
     dummy_inputs=Qwen3OmniMoeThinkerDummyInputsBuilder,
 )
 class Qwen3OmniMoeForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, Qwen3OmniMoeConditionalGenerationMixin, CustomProcessMixin, SupportsMRoPE
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    Qwen3OmniMoeConditionalGenerationMixin,
+    OmniProcessingMixin,
+    SupportsMRoPE,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
