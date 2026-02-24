@@ -824,6 +824,50 @@ def calculate_metrics(
     return metrics
 
 
+def start_profile(base_url: str) -> bool:
+    """Start profiling on the server.
+
+    Args:
+        base_url: Base URL of the server (e.g., http://localhost:8091)
+
+    Returns:
+        True if profiling started successfully, False otherwise.
+    """
+    try:
+        resp = requests.post(f"{base_url}/start_profile", timeout=30)
+        if resp.status_code == 200:
+            print("Profiling started on server.")
+            return True
+        else:
+            print(f"Failed to start profiling: HTTP {resp.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to start profiling: {e}")
+        return False
+
+
+def stop_profile(base_url: str) -> bool:
+    """Stop profiling on the server.
+
+    Args:
+        base_url: Base URL of the server (e.g., http://localhost:8091)
+
+    Returns:
+        True if profiling stopped successfully, False otherwise.
+    """
+    try:
+        resp = requests.post(f"{base_url}/stop_profile", timeout=60)
+        if resp.status_code == 200:
+            print("Profiling stopped on server. Trace files saved.")
+            return True
+        else:
+            print(f"Failed to stop profiling: HTTP {resp.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to stop profiling: {e}")
+        return False
+
+
 def wait_for_service(base_url: str, timeout: int = 120) -> None:
     print(f"Waiting for service at {base_url}...")
     start_time = time.time()
@@ -906,6 +950,10 @@ async def benchmark(args):
                 args=args,
             )
 
+        # Start profiling if requested (after warmup, before main benchmark)
+        if args.profile:
+            start_profile(args.base_url)
+
         start_time = time.perf_counter()
         tasks = []
         async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
@@ -914,6 +962,10 @@ async def benchmark(args):
 
         outputs = await asyncio.gather(*tasks)
         total_duration = time.perf_counter() - start_time
+
+        # Stop profiling if it was started
+        if args.profile:
+            stop_profile(args.base_url)
 
     pbar.close()
 
@@ -1064,6 +1116,11 @@ if __name__ == "__main__":
         help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
     )
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable profiling. Calls /start_profile before benchmark and /stop_profile after.",
+    )
 
     args = parser.parse_args()
 
