@@ -179,10 +179,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             else:
                 if payload_data.get("finished"):
                     self.finished_requests.add(req_id)
-                    req.status = RequestStatus.FINISHED_STOPPED
 
-                req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
+                # req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
+                # req.num_computed_tokens = 0
+                new_ids = payload_data.get("code_predictor_codes", [])
+                req.prompt_token_ids = new_ids
                 req.num_computed_tokens = 0
+
+                # Empty chunk with more data expected: keep polling.
+                if not new_ids and not payload_data.get("finished"):
+                    return
 
             # Mark as finished for consumption
             with self.lock:
@@ -308,7 +314,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # of schedule, but have not scheduled
                     continue
                 if request.request_id in self.finished_requests:
-                    request.additional_information = {}
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)

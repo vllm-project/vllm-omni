@@ -62,7 +62,6 @@ class OmniGenerationScheduler(VLLMScheduler):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             # OMNI: Skip requests that are not in self.requests
-            # This can happen when connector marks request as finished and it's removed from requests
             if request.request_id not in self.requests or (
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
             ):
@@ -71,7 +70,25 @@ class OmniGenerationScheduler(VLLMScheduler):
                 continue
 
             num_computed_tokens = request.num_computed_tokens
-            required_tokens = max(len(request.prompt_token_ids) - num_computed_tokens, 1)
+            required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            # async_chunk: don't schedule placeholder tokens when no new chunk is available.
+            if required_tokens <= 0:
+                if (
+                    self.chunk_transfer_adapter is not None
+                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                ):
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
+                    if len(request.prompt_token_ids) <= num_computed_tokens:
+                        request.prompt_token_ids.append(0)
+                        try:
+                            request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+                else:
+                    req_index += 1
+                    continue
             num_new_tokens = min(required_tokens, token_budget)
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -109,6 +126,20 @@ class OmniGenerationScheduler(VLLMScheduler):
                 self.waiting.pop_request()
                 continue
 
+            # async_chunk: wait for the first upstream chunk (don't start with placeholders).
+            if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
+                if request.request_id in self.chunk_transfer_adapter.finished_requests:
+                    request.status = RequestStatus.FINISHED_STOPPED
+                    request.prompt_token_ids.append(0)
+                    try:
+                        request._all_token_ids.append(0)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                else:
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
             # Uniformly treat as diffusion. A feature flag can be added later
             # via config or request tag.
 
@@ -145,11 +176,13 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         # If fast path scheduled none, fall back to the original scheduling
         if not num_scheduled_tokens:
-            res = super().schedule()
             if self.chunk_transfer_adapter:
+                # Don't fall back: base scheduler doesn't handle async_chunk
+                # requests with empty prompt_token_ids.
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
-                self.chunk_transfer_adapter.postprocess_scheduler_output(res)
-            return res
+            else:
+                res = super().schedule()
+                return res
 
         # Compute common prefix blocks (aligned with v1)
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
@@ -318,9 +351,8 @@ class OmniGenerationScheduler(VLLMScheduler):
                 continue
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
-                # The request is already finished. This can happen if the
-                # request is aborted while the model is executing it (e.g.,
-                # in pipeline parallelism or async scheduling).
+                # Request may already be finished (e.g., aborted during
+                # execution / pipeline parallelism / async scheduling).
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -360,8 +392,14 @@ class OmniGenerationScheduler(VLLMScheduler):
             routed_experts = None
 
             # Diffusion request: completes in one step; mark finished and free resources
-            if request.status == RequestStatus.FINISHED_STOPPED or (
-                self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens
+            if (
+                request.status == RequestStatus.FINISHED_STOPPED
+                or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
+                or (
+                    self.chunk_transfer_adapter is not None
+                    and request.request_id in self.chunk_transfer_adapter.finished_requests
+                    and request.num_computed_tokens >= len(request.prompt_token_ids)
+                )
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
@@ -375,15 +413,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
-                if status_before_stop == RequestStatus.RUNNING:
-                    stopped_running_reqs.add(request)
-                elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
-                    # In async chunk mode, request may be in either queue.
-                    # Remove from both to avoid stale queue entries.
+                if status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
                     stopped_running_reqs.add(request)
                     stopped_preempted_reqs.add(request)
                 else:
-                    stopped_preempted_reqs.add(request)
+                    stopped_running_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:

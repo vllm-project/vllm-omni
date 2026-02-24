@@ -1,6 +1,14 @@
 import asyncio
+import base64
+import io
+import ipaddress
+import socket
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
+import numpy as np
+import soundfile as sf
 from fastapi import Request
 from fastapi.responses import Response
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
@@ -16,6 +24,19 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_REF_AUDIO_TIMEOUT_S = 15
+_REF_AUDIO_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+_REF_AUDIO_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
 
 # TTS Configuration (currently supports Qwen3-TTS)
 _TTS_MODEL_STAGES: set[str] = {"qwen3_tts"}
@@ -43,6 +64,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+        self._tts_tokenizer = None
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -61,6 +83,36 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning(f"Could not load speakers from model config: {e}")
 
         return set()
+
+    def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
+        """Estimate prompt length so the placeholder matches model-side embeddings."""
+        try:
+            from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+                Qwen3TTSTalkerForConditionalGeneration,
+            )
+
+            if self._tts_tokenizer is None:
+                from transformers import AutoTokenizer
+
+                model_name = self.engine_client.model_config.model
+                self._tts_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    padding_side="left",
+                )
+            hf_config = self.engine_client.model_config.hf_config
+            talker_config = hf_config.talker_config
+            task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+            return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+                additional_information=tts_params,
+                task_type=task_type,
+                tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
+                codec_language_id=getattr(talker_config, "codec_language_id", None),
+                spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
+            )
+        except Exception as e:
+            logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
+            return 2048
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
@@ -125,9 +177,44 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    def _build_tts_prompt(self, text: str) -> str:
-        """Build TTS prompt from input text."""
-        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+    @staticmethod
+    async def _resolve_ref_audio(ref_audio_str: str) -> tuple[list[float], int]:
+        """Resolve ref_audio URL/base64 to (wav_samples, sample_rate)."""
+        parsed = urlparse(ref_audio_str)
+
+        def _check_ssrf(url: str) -> None:
+            host = urlparse(url).hostname
+            if not host:
+                raise ValueError("ref_audio URL must include a hostname")
+            for info in socket.getaddrinfo(host, None):
+                ip_str = str(info[4][0]).split("%", 1)[0]
+                addr = ipaddress.ip_address(ip_str)
+                if any(addr in net for net in _REF_AUDIO_BLOCKED_NETWORKS):
+                    raise ValueError(f"ref_audio URL resolves to blocked address: {addr}")
+
+        def _fetch_sync() -> tuple[np.ndarray, int]:
+            if parsed.scheme in ("http", "https"):
+                _check_ssrf(ref_audio_str)
+                with urlopen(ref_audio_str, timeout=_REF_AUDIO_TIMEOUT_S) as resp:
+                    data = resp.read(_REF_AUDIO_MAX_BYTES + 1)
+                    if len(data) > _REF_AUDIO_MAX_BYTES:
+                        raise ValueError(f"ref_audio URL exceeds {_REF_AUDIO_MAX_BYTES} bytes")
+                buf = io.BytesIO(data)
+            elif ref_audio_str.startswith("data:"):
+                b64 = ref_audio_str
+                if "," in b64:
+                    b64 = b64.split(",", 1)[1]
+                buf = io.BytesIO(base64.b64decode(b64))
+            else:
+                raise ValueError("ref_audio must be an http(s) URL or data: base64 URI")
+            audio, sr = sf.read(buf, dtype="float32", always_2d=False)
+            if isinstance(audio, np.ndarray) and audio.ndim > 1:
+                audio = np.mean(audio, axis=-1)
+            return np.asarray(audio, dtype=np.float32), int(sr)
+
+        loop = asyncio.get_running_loop()
+        wav_np, sr = await loop.run_in_executor(None, _fetch_sync)
+        return wav_np.tolist(), sr
 
     def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build TTS parameters from request.
@@ -164,9 +251,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["instruct"] = [""]
 
-        # Voice clone parameters (used with Base task)
-        if request.ref_audio is not None:
-            params["ref_audio"] = [request.ref_audio]
+        # Voice clone: ref_audio resolved in create_speech(), not here.
         if request.ref_text is not None:
             params["ref_text"] = [request.ref_text]
         if request.x_vector_only_mode is not None:
@@ -221,11 +306,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if validation_error:
                     return self.create_error_response(validation_error)
 
-                # Build TTS parameters and prompt
+                # Must use prompt_token_ids (not text prompt): the AR Talker
+                # operates on codec tokens; text token IDs exceed codec vocab.
+                # model.preprocess replaces all embeddings, so placeholder value
+                # is irrelevant -- but length must match to avoid excess padding.
                 tts_params = self._build_tts_params(request)
-                prompt_text = self._build_tts_prompt(request.input)
+
+                if request.ref_audio is not None:
+                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                    tts_params["ref_audio"] = [[wav_list, sr]]
+
+                ph_len = self._estimate_prompt_len(tts_params)
                 prompt = {
-                    "prompt": prompt_text,
+                    "prompt_token_ids": [1] * ph_len,
                     "additional_information": tts_params,
                 }
             else:
@@ -282,6 +375,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
 
+            # Streaming accumulates chunks as a list; concat first.
+            if isinstance(audio_tensor, list):
+                import torch
+
+                audio_tensor = torch.cat(audio_tensor, dim=-1)
             # Convert tensor to numpy
             if hasattr(audio_tensor, "float"):
                 audio_tensor = audio_tensor.float().detach().cpu().numpy()
