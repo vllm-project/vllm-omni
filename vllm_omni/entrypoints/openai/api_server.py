@@ -20,7 +20,7 @@ from typing import Annotated, Any, cast
 import httpx
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 from starlette.datastructures import State
 from starlette.routing import Route
@@ -927,6 +927,45 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
     return JSONResponse(
         content={"object": "list", "data": []},
     )
+
+
+# Profiling API endpoints
+def _get_engine_client(raw_request: Request) -> AsyncOmni:
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    if engine_client is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Engine not initialized.",
+        )
+    return engine_client
+
+
+@router.post("/start_profile")
+async def start_profile(raw_request: Request):
+    """Start profiling for the running server.
+
+    Enables torch profiling to capture CPU/CUDA activities, memory allocation,
+    and other performance metrics. Use /stop_profile to stop and save the trace.
+    """
+    logger.info("Starting profiler...")
+    engine_client = _get_engine_client(raw_request)
+    await engine_client.start_profile()
+    logger.info("Profiler started.")
+    return Response(status_code=200)
+
+
+@router.post("/stop_profile")
+async def stop_profile(raw_request: Request):
+    """Stop profiling and save the trace.
+
+    Stops the profiler started by /start_profile and saves the trace file.
+    The trace location is determined by the VLLM_TORCH_PROFILER_DIR environment variable.
+    """
+    logger.info("Stopping profiler...")
+    engine_client = _get_engine_client(raw_request)
+    await engine_client.stop_profile()
+    logger.info("Profiler stopped.")
+    return Response(status_code=200)
 
 
 # Image generation API endpoints
