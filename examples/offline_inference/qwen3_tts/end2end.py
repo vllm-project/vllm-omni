@@ -248,6 +248,13 @@ def main(args):
     Args:
         args: Parsed CLI args from parse_args().
     """
+    if args.batch_size < 1 or (args.batch_size & (args.batch_size - 1)) != 0:
+        raise ValueError(
+            f"--batch-size must be a power of two (got {args.batch_size}); "
+            "non-power-of-two values do not align with CUDA graph capture sizes "
+            "of Code2Wav."
+        )
+
     query_func = query_map[args.query_type]
     if args.query_type in {"CustomVoice", "VoiceDesign"}:
         query_result = query_func(use_batch_sample=args.use_batch_sample)
@@ -260,6 +267,33 @@ def main(args):
         query_result = query_func()
 
     model_name = query_result.model_name
+
+    # Load prompts from text file if provided.
+    # Use the default query as a template so task-specific fields
+    # (e.g. ref_audio for Base) are preserved; only override text.
+    if args.txt_prompts:
+        with open(args.txt_prompts) as f:
+            lines = [line.strip() for line in f if line.strip()]
+        if not lines:
+            raise ValueError(f"No valid prompts found in {args.txt_prompts}")
+        template = query_result.inputs
+        if isinstance(template, list):
+            template = template[0]
+        template_info = template["additional_information"]
+        inputs = []
+        for text in lines:
+            additional_information = {**template_info, "text": [text]}
+            inputs.append(
+                {
+                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "additional_information": additional_information,
+                }
+            )
+    else:
+        inputs = query_result.inputs
+        if not isinstance(inputs, list):
+            inputs = [inputs]
+
     omni = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
@@ -267,32 +301,35 @@ def main(args):
         stage_init_timeout=args.stage_init_timeout,
     )
 
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni_generator = omni.generate(query_result.inputs, sampling_params_list=None)
-    for stage_outputs in omni_generator:
-        for output in stage_outputs.request_output:
-            request_id = output.request_id
-            audio_data = output.outputs[0].multimodal_output["audio"]
-            # async_chunk mode returns a list of chunks; concatenate them.
-            if isinstance(audio_data, list):
-                audio_tensor = torch.cat(audio_data, dim=-1)
-            else:
-                audio_tensor = audio_data
-            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-            sr_val = output.outputs[0].multimodal_output["sr"]
-            audio_samplerate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val[-1])
-            # Convert to numpy array and ensure correct format
-            audio_numpy = audio_tensor.float().detach().cpu().numpy()
+    batch_size = args.batch_size
+    for batch_start in range(0, len(inputs), batch_size):
+        batch = inputs[batch_start : batch_start + batch_size]
+        omni_generator = omni.generate(batch, sampling_params_list=None)
+        for stage_outputs in omni_generator:
+            for output in stage_outputs.request_output:
+                request_id = output.request_id
+                audio_data = output.outputs[0].multimodal_output["audio"]
+                # async_chunk mode returns a list of chunks; concatenate them.
+                if isinstance(audio_data, list):
+                    audio_tensor = torch.cat(audio_data, dim=-1)
+                else:
+                    audio_tensor = audio_data
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+                sr_val = output.outputs[0].multimodal_output["sr"]
+                audio_samplerate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val[-1])
+                # Convert to numpy array and ensure correct format
+                audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
-            # Ensure audio is 1D (flatten if needed)
-            if audio_numpy.ndim > 1:
-                audio_numpy = audio_numpy.flatten()
+                # Ensure audio is 1D (flatten if needed)
+                if audio_numpy.ndim > 1:
+                    audio_numpy = audio_numpy.flatten()
 
-            # Save audio file with explicit WAV format
-            sf.write(output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
-            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+                # Save audio file with explicit WAV format
+                sf.write(output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
+                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 
 def parse_args():
@@ -341,9 +378,9 @@ def parse_args():
         help="Threshold for using shared memory in bytes (default: 65536)",
     )
     parser.add_argument(
-        "--output-wav",
+        "--output-dir",
         default="output_audio",
-        help="[Deprecated] Output wav directory (use --output-dir).",
+        help="Output directory for generated wav files (default: output_audio).",
     )
     parser.add_argument(
         "--num-prompts",
@@ -400,6 +437,12 @@ def parse_args():
         default="icl",
         choices=["icl", "xvec_only"],
         help="Mode tag for Base query x_vector_only_mode (default: icl).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts per batch (default: 1, sequential).",
     )
 
     return parser.parse_args()
