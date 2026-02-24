@@ -36,7 +36,7 @@ from vllm_omni.distributed.omni_connectors import build_stage_connectors
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
 from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
-from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
+from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs, OmniEngineArgs
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
@@ -49,7 +49,7 @@ from vllm_omni.entrypoints.stage_utils import (
     maybe_dump_to_shm,
     set_stage_devices,
 )
-from vllm_omni.entrypoints.utils import detect_pid_host
+from vllm_omni.entrypoints.utils import detect_pid_host, filter_dataclass_kwargs
 from vllm_omni.entrypoints.zmq_utils import (
     ZmqQueue,
     create_zmq_queue,
@@ -212,7 +212,8 @@ def _resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     worker_type = engine_args.get("worker_type", None)
     if not worker_type:
         return
-    if engine_args.get("worker_cls"):
+    worker_cls = engine_args.get("worker_cls")
+    if worker_cls is not None and worker_cls != "auto":
         return
     from vllm_omni.platforms import current_omni_platform
 
@@ -268,6 +269,12 @@ class OmniStage:
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
         self.stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+        if (
+            "stage_id" in stage_config.engine_args
+            and stage_config.engine_args.stage_id != self.stage_id
+            and self.stage_id is not None
+        ):
+            stage_config.engine_args.stage_id = self.stage_id
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -746,6 +753,7 @@ def _stage_worker(
             engine_args["stage_connector_spec"] = stage_connector_spec
             engine_args["stage_id"] = stage_id
         if stage_type == "diffusion":
+            engine_args = filter_dataclass_kwargs(OmniDiffusionConfig, engine_args)
             engine_args.pop("model_stage", None)
             engine_args.pop("model", None)
             stage_engine = OmniDiffusion(
@@ -755,6 +763,8 @@ def _stage_worker(
                 **engine_args,
             )
         else:
+            engine_args = filter_dataclass_kwargs(OmniEngineArgs, engine_args)
+            engine_args.pop("model", None)
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
 
@@ -1162,6 +1172,7 @@ async def _stage_worker_async(
             engine_args["stage_id"] = stage_id
         if stage_type == "diffusion":
             # For diffusion, we need to extract diffusion-specific config
+            engine_args = filter_dataclass_kwargs(OmniDiffusionConfig, engine_args)
             od_config = _build_od_config(engine_args, model)
 
             # Inject omni config for worker to access stage info
@@ -1178,6 +1189,8 @@ async def _stage_worker_async(
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:
+            engine_args = filter_dataclass_kwargs(AsyncOmniEngineArgs, engine_args)
+            engine_args.pop("model", None)
             omni_engine_args = AsyncOmniEngineArgs(model=model, **engine_args)
             usage_context = UsageContext.OPENAI_API_SERVER
             vllm_config = omni_engine_args.create_engine_config(usage_context=usage_context)

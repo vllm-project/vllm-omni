@@ -38,7 +38,6 @@ from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
-    build_base_engine_args,
     get_final_stage_id_for_e2e,
     inject_omni_kv_config,
     load_and_resolve_stage_configs,
@@ -255,7 +254,6 @@ class OmniBase:
         # TODO(wuhang):
         # Remove kwargs as parameters in the future.
         # Use dataclass directly for engine args.
-        base_engine_args = build_base_engine_args(kwargs)
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
 
@@ -263,7 +261,7 @@ class OmniBase:
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
-            base_engine_args,
+            kwargs,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
         )
 
