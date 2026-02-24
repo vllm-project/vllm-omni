@@ -8,10 +8,9 @@ import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
-from pprint import pformat
 from typing import Any, Literal, overload
 
+import huggingface_hub
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from vllm import SamplingParams
@@ -30,7 +29,6 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
-from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
@@ -42,6 +40,10 @@ from vllm_omni.entrypoints.utils import (
     resolve_model_config_path,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -68,14 +70,31 @@ def _dummy_snapshot_download(model_id):
 
 
 def omni_snapshot_download(model_id) -> str:
+    # If it's already a local path, just return it
+    if os.path.exists(model_id):
+        return model_id
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
     if os.environ.get("VLLM_USE_MODELSCOPE", False):
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
-    else:
-        return _dummy_snapshot_download(model_id)
+    # For other cases (Hugging Face), perform a real download to ensure all
+    # necessary files (including *.pt for audio/diffusion) are available locally
+    # before stage workers are spawned. This prevents initialization timeouts.
+    # Return the original model_id so that model_config.model preserves
+    # HuggingFace semantics (e.g. "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    # instead of the resolved cache path.
+    try:
+        download_weights_from_hf_specific(
+            model_name_or_path=model_id,
+            cache_dir=None,
+            allow_patterns=["*"],
+            require_all=True,
+        )
+    except huggingface_hub.errors.RepositoryNotFoundError:
+        logger.warning(f"Repository not found for '{model_id}'.")
+    return model_id
 
 
 class OmniBase:
@@ -240,7 +259,7 @@ class OmniBase:
         )
 
         # Initialize stats paths
-        self._enable_stats: bool = bool(log_stats)
+        self.log_stats: bool = bool(log_stats)
 
         self.worker_backend = worker_backend
         self.ray_address = ray_address
@@ -670,10 +689,11 @@ class Omni(OmniBase):
             final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
         # Metrics/aggregation helper
-        metrics = OrchestratorMetrics(
+        metrics = OrchestratorAggregator(
             num_stages,
-            self._enable_stats,
+            self.log_stats,
             _wall_start_ts,
+            final_stage_id_to_prompt,
         )
 
         it = request_id_to_prompt.items()
@@ -740,11 +760,15 @@ class Omni(OmniBase):
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = result.get("metrics")
+                    _m: StageRequestStats = result.get("metrics")
                     if _m is not None:
-                        if not isinstance(_m, dict):
-                            _m = asdict(_m)
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
+                        # Accumulate generation time
+                        metrics.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
+
+                        # For diffusion stages, we also accumulate diffusion time
+                        metrics.accumulate_diffusion_metrics(stage.stage_type, req_id, engine_outputs)
+
+                        metrics.on_stage_metrics(stage_id, req_id, _m, stage.final_output_type)
                         if pbar:
                             elapsed = pbar.format_dict["elapsed"] or 1e-6
                             # Aggregate total tokens/images across all stages
@@ -781,8 +805,7 @@ class Omni(OmniBase):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_key = str(req_id)
-                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
+                        if stage_id == final_stage_id_to_prompt[req_id]:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -792,17 +815,43 @@ class Omni(OmniBase):
                         logger.exception(
                             f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
                         )
-                    yield OmniRequestOutput(
+                    output_to_yield = OmniRequestOutput(
                         stage_id=stage_id,
                         final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
                         request_output=engine_outputs,
                     )
 
+                    # Record audio generated frames (only when finished)
+                    try:
+                        finished = (
+                            engine_outputs.finished
+                            if hasattr(engine_outputs, "finished")
+                            else (
+                                engine_outputs[0].finished
+                                if isinstance(engine_outputs, list)
+                                and engine_outputs
+                                and hasattr(engine_outputs[0], "finished")
+                                else False
+                            )
+                        )
+                        if finished:
+                            metrics.record_audio_generated_frames(output_to_yield, stage_id, req_id)
+                    except Exception as e:
+                        logger.exception(
+                            f"[{self._name}] Failed to record audio metrics for req {req_id} at stage {stage_id}: {e}",
+                        )
+
+                    yield output_to_yield
+
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     try:
-                        next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                        # Derive inputs for the next stage, record preprocess time
+                        with metrics.stage_postprocess_timer(stage_id, req_id):
+                            next_inputs = next_stage.process_engine_inputs(
+                                self.stage_list, [request_id_to_prompt[req_id]]
+                            )
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Process engine inputs error for req {req_id}"
@@ -856,8 +905,7 @@ class Omni(OmniBase):
 
         # Summarize and print stats
         try:
-            summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
+            metrics.build_and_log_summary()
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 

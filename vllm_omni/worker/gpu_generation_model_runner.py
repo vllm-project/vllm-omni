@@ -50,12 +50,26 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     """
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
+        # remove requests
+        for req_id in scheduler_output.finished_req_ids:
+            self.input_batch.remove_request(req_id)
+        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        cached_req_ids = self.input_batch.req_id_to_index.keys()
+        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        for req_id in unscheduled_req_ids:
+            self.input_batch.remove_request(req_id)
         cached_reqs = scheduler_output.scheduled_cached_reqs
-        for _, req_id in enumerate(cached_reqs.req_ids):
+        req_states = []
+        for req_id in cached_reqs.req_ids:
             req_state = self.requests.get(req_id)
             assert req_state is not None
             req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
-            self.input_batch.remove_request(req_id)
+            req_states.append(req_state)
+            # Remove the request from the current input batch only if it is still present.
+            if req_id in self.input_batch.req_id_to_index:
+                self.input_batch.remove_request(req_id)
+        for req_state in req_states:
             # update the request state in self.input_batch
             self.input_batch.add_request(req_state)
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -244,6 +258,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        if ubatch_slices_padded is None:
+            # reuse ubatch_slices_padded for code2wav batching
+            ubatch_slices_padded = tokens
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -281,6 +299,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: pass slot_mappings for upstream v1 API compatibility
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -322,6 +341,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -342,16 +362,30 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
-            mm_payload = {}
-            for key, out in multimodal_outputs.items():
-                if out is not None and isinstance(out, torch.Tensor):
-                    mm_payload[key] = out.detach().to("cpu").contiguous()
-            pooler_output.append(mm_payload)
+            num_reqs = self.input_batch.num_reqs
+            for i in range(num_reqs):
+                mm_payload = {}
+                for key, out in multimodal_outputs.items():
+                    if isinstance(out, list):
+                        if len(out) != num_reqs:
+                            raise ValueError(
+                                f"Multimodal output list for key '{key}' has length {len(out)} "
+                                f"but expected {num_reqs} (one entry per request)."
+                            )
+                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                    elif isinstance(out, torch.Tensor):
+                        mm_payload[key] = out.detach().to("cpu").contiguous()
+                    else:
+                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
+        # [Omni] Copy req_id mappings to avoid async scheduling mutation.
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         output = OmniModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
@@ -430,8 +464,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         is_profile: bool = False,
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
-        activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        num_active_loras: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -454,7 +488,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             create_mixed_batch: If True, create a mixed batch with both decode
                 (1 token) and prefill (multiple tokens) requests.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
-            activate_lora: If False, dummy_run is performed without LoRAs.
+            num_active_loras: Number of active LoRAs to capture for.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -532,7 +566,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 # `force_has_lora` is used for cudagraph capture; because LoRA is
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
-                force_has_lora=activate_lora,
+                force_has_lora=num_active_loras > 0,
+                # Capture shape specialization for specific active LoRA counts.
+                force_num_active_loras=num_active_loras,
             )
         )
 
@@ -601,8 +637,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             self.lora_config,
             num_scheduled_tokens,
             num_sampled_tokens,
-            activate_lora,
             remove_lora,
+            num_active_loras,
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
@@ -689,13 +725,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
                 # short term mitigation for issue mentioned in
                 # https://github.com/vllm-project/vllm/issues/28334
-                if self.compilation_config.cudagraph_specialize_lora and activate_lora:
+                if self.compilation_config.cudagraph_specialize_lora and num_active_loras > 0:
                     use_cudagraphs = False
 
                 self.drafter.dummy_run(
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
                     is_graph_capturing=is_graph_capturing,
+                    slot_mappings=slot_mappings,  # OMNI: pass slot_mappings (upstream v1 API)
                 )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
@@ -732,55 +769,46 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 assert mm_budget is not None
 
                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
-                    # NOTE: Currently model is profiled with a single non-text
-                    # modality with the max possible input tokens even when
-                    # it supports multiple.
-                    dummy_modality = mm_budget.get_modality_with_max_tokens()
-                    max_mm_items_per_batch = mm_budget.max_items_per_batch_by_modality[dummy_modality]
+                    if not mm_budget.mm_max_toks_per_item:
+                        # All modality limits are 0 — embedding-only mode.
+                        # Budget is non-zero for embedding storage, but
+                        # there's no encoder to profile.
+                        logger.info(
+                            "Skipping encoder profiling for embedding-only "
+                            "mode (all modality limits=0 with "
+                            "enable_mm_embeds=True).",
+                        )
+                    else:
+                        # NOTE: Currently model is profiled with a single non-text
+                        # modality with the max possible input tokens even when
+                        # it supports multiple.
+                        dummy_modality = mm_budget.get_modality_with_max_tokens()
+                        max_mm_items_per_batch = mm_budget.mm_max_items_per_batch[dummy_modality]
 
-                    logger.info(
-                        "Encoder cache will be initialized with a budget of "
-                        "%s tokens, and profiled with %s %s items of the "
-                        "maximum feature size.",
-                        encoder_budget,
-                        max_mm_items_per_batch,
-                        dummy_modality,
-                    )
+                        logger.info(
+                            "Encoder cache will be initialized with a budget of "
+                            "%s tokens, and profiled with %s %s items of the "
+                            "maximum feature size.",
+                            encoder_budget,
+                            max_mm_items_per_batch,
+                            dummy_modality,
+                        )
 
-                    # Create dummy batch of multimodal inputs.
-                    batched_dummy_mm_inputs = self._get_mm_dummy_batch(
-                        dummy_modality,
-                        max_mm_items_per_batch,
-                    )
+                        # Create dummy batch of multimodal inputs.
+                        batched_dummy_mm_inputs = self._get_mm_dummy_batch(
+                            dummy_modality,
+                            max_mm_items_per_batch,
+                        )
 
-                    # Run multimodal encoder.
-                    dummy_encoder_outputs = self.model.embed_multimodal(**batched_dummy_mm_inputs)
+                        # Run multimodal encoder.
+                        dummy_encoder_outputs = self.model.embed_multimodal(**batched_dummy_mm_inputs)
 
-                    sanity_check_mm_encoder_outputs(
-                        dummy_encoder_outputs,
-                        expected_num_items=max_mm_items_per_batch,
-                    )
-
-                    # NOTE: This happens when encoder cache needs to store
-                    # the embeddings that encoder outputs are scattered onto.
-                    # In this case we create dummy embeddings of size
-                    # (max_tokens_for_modality, hidden_size) and scatter
-                    # encoder output into it.
-                    encoder_output_shape = dummy_encoder_outputs[0].shape
-                    max_mm_tokens_per_item = mm_budget.max_tokens_by_modality[dummy_modality]
-                    if encoder_output_shape[0] < max_mm_tokens_per_item:
-                        encoder_hidden_size = encoder_output_shape[-1]
-                        expanded_outputs = []
-                        for output in dummy_encoder_outputs:
-                            expanded = output.new_zeros((max_mm_tokens_per_item, encoder_hidden_size))
-                            num_tokens = output.shape[0]
-                            expanded[:num_tokens].copy_(output)
-                            expanded_outputs.append(expanded)
-
-                        dummy_encoder_outputs = expanded_outputs
-
-                    # Cache the dummy encoder outputs.
-                    self.encoder_cache["tmp"] = dict(enumerate(dummy_encoder_outputs))
+                        sanity_check_mm_encoder_outputs(
+                            dummy_encoder_outputs,
+                            expected_num_items=max_mm_items_per_batch,
+                        )
+                        for i, output in enumerate(dummy_encoder_outputs):
+                            self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True)

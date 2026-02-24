@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -19,6 +20,9 @@ from vllm_omni import Omni
 models = ["linyueqian/stable_audio_random"]
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.parametrize("model_name", models)
 def test_stable_audio_model(model_name: str):
     m = Omni(model=model_name)

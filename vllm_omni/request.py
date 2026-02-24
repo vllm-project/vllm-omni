@@ -91,4 +91,5 @@ class OmniRequest(Request):
             block_hasher=block_hasher,
             additional_information=request.additional_information,
             resumable=request.resumable,
+            reasoning_ended=request.reasoning_ended,
         )

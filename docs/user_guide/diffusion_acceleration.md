@@ -1,6 +1,6 @@
 # Diffusion Acceleration Overview
 
-vLLM-Omni supports various cache acceleration methods to speed up diffusion model inference with minimal quality degradation. These methods include **cache methods** that intelligently cache intermediate computations to avoid redundant work across diffusion timesteps, and **parallelism methods** that distribute the computation across multiple devices.
+vLLM-Omni supports various acceleration methods to speed up diffusion model inference with minimal quality degradation. These include **cache methods** that intelligently cache intermediate computations to avoid redundant work across diffusion timesteps, **parallelism methods** that distribute the computation across multiple devices, and **quantization methods** that reduce memory footprint while preserving accuracy.
 
 ## Supported Acceleration Methods
 
@@ -14,6 +14,10 @@ vLLM-Omni currently supports two main cache acceleration backends:
 
 Both methods can provide significant speedups (typically **1.5x-2.0x**) while maintaining high output quality.
 
+vLLM-Omni also supports quantization methods:
+
+3. **[FP8 Quantization](diffusion/quantization/overview.md)** - Reduces DiT linear layers from BF16 to FP8, providing ~1.28x speedup with minimal quality loss. Supports per-layer skip for sensitive layers.
+
 vLLM-Omni also supports parallelism methods for diffusion models, including:
 
 1. [Ulysses-SP](diffusion/parallelism_acceleration.md#ulysses-sp) - splits the input along the sequence dimension and uses all-to-all communication to allow each device to compute only a subset of attention heads.
@@ -21,6 +25,10 @@ vLLM-Omni also supports parallelism methods for diffusion models, including:
 2. [Ring-Attention](diffusion/parallelism_acceleration.md#ring-attention) - splits the input along the sequence dimension and uses ring-based P2P communication to accumulate attention results, keeping the sequence dimension sharded.
 
 3. [CFG-Parallel](diffusion/parallelism_acceleration.md#cfg-parallel) - runs the positive/negative prompts of classifier-free guidance (CFG) on different devices, then merges on a single device to perform the scheduler step.
+
+4. [Tensor Parallelism](diffusion/parallelism_acceleration.md#tensor-parallelism) - shards DiT weights across devices to reduce per-GPU memory usage.
+
+5. [VAE Patch Parallelism](diffusion/parallelism_acceleration.md#vae-patch-parallelism) - shards VAE decode/encode spatially across ranks to reduce VAE peak memory (and can speed up VAE decode).
 
 ## Quick Comparison
 
@@ -31,32 +39,46 @@ vLLM-Omni also supports parallelism methods for diffusion models, including:
 | **TeaCache** | `cache_backend="tea_cache"` | Simple, adaptive caching with minimal configuration | Quick setup, balanced speed/quality |
 | **Cache-DiT** | `cache_backend="cache_dit"` | Advanced caching with multiple techniques (DBCache, TaylorSeer, SCM) | Maximum acceleration, fine-grained control |
 
+### Quantization Methods
+
+| Method | Configuration | Description | Best For |
+|--------|--------------|-------------|----------|
+| **FP8** | `quantization="fp8"` | FP8 W8A8 on Ada/Hopper, weight-only on older GPUs | Memory reduction, inference speedup |
+
 ## Supported Models
 
 The following table shows which models are currently supported by each acceleration method:
 
 ### ImageGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
-|-------|------------------|:----------:|:-----------:|:-----------:|:----------------:|:----------------:|
-| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ | ✅ |
-| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ | ❌ | ✅ |
-| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ | ❌ | ✅ |
-| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ❌ | ❌ | ✅ |
-| **Bagel** | `ByteDance-Seed/BAGEL-7B-MoT` | ✅ | ✅ | ❌ | ❌ | ❌ |
-| **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ✅ | ❌ | ❌ | ❌ |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel | Tensor-Parallel | VAE-Patch-Parallel |
+|-------|------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|:---------------:|:------------------:|
+| **LongCat-Image** | `meituan-longcat/LongCat-Image` | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
+| **LongCat-Image-Edit** | `meituan-longcat/LongCat-Image-Edit` | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
+| **Ovis-Image** | `OvisAI/Ovis-Image` | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-Edit** | `Qwen/Qwen-Image-Edit` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Qwen-Image-Layered** | `Qwen/Qwen-Image-Layered` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ (TP=2 only) | ✅ |
+| **Stable-Diffusion3.5** | `stabilityai/stable-diffusion-3.5` | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| **Bagel** | `ByteDance-Seed/BAGEL-7B-MoT` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **FLUX.1-dev** | `black-forest-labs/FLUX.1-dev` | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
 
 ### VideoGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention |CFG-Parallel |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
 |-------|------------------|:--------:|:---------:|:----------:|:--------------:|:----------------:|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ |
+
+### Quantization
+
+| Model | Model Identifier | FP8 |
+|-------|------------------|:---:|
+| **Qwen-Image** | `Qwen/Qwen-Image` | ✅ |
+| **Qwen-Image-2512** | `Qwen/Qwen-Image-2512` | ✅ |
+| **Z-Image** | `Tongyi-MAI/Z-Image-Turbo` | ✅ |
 
 
 ## Performance Benchmarks
@@ -201,6 +223,47 @@ outputs = omni.generate(
 )
 ```
 
+### Using Tensor Parallelism
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+)
+
+outputs = omni.generate(
+    prompt="a cat reading a book",
+    num_inference_steps=9,
+    width=512,
+    height=512,
+)
+```
+
+### Using VAE Patch Parallelism
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Tongyi-MAI/Z-Image-Turbo",
+    parallel_config=DiffusionParallelConfig(
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=2,
+    ),
+)
+
+outputs = omni.generate(
+    prompt="a cat reading a book",
+    num_inference_steps=9,
+    width=1024,
+    height=1024,
+)
+```
+
 ### Using CFG-Parallel
 
 Run image-to-image:
@@ -227,11 +290,31 @@ outputs = omni.generate(
 )
 ```
 
+### Using FP8 Quantization
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+omni = Omni(
+    model="<your-model>",
+    quantization="fp8",
+)
+
+outputs = omni.generate(
+    "A cat sitting on a windowsill",
+    OmniDiffusionSamplingParams(num_inference_steps=50),
+)
+```
+
 ## Documentation
 
 For detailed information on each acceleration method:
 
 - **[TeaCache Guide](diffusion/teacache.md)** - Complete TeaCache documentation, configuration options, and best practices
 - **[Cache-DiT Acceleration Guide](diffusion/cache_dit_acceleration.md)** - Comprehensive Cache-DiT guide covering DBCache, TaylorSeer, SCM, and configuration parameters
+- **[FP8 Quantization Guide](diffusion/quantization/overview.md)** - FP8 quantization for DiT models with per-layer control
+- **[Tensor Parallelism](diffusion/parallelism_acceleration.md#tensor-parallelism)** - Guidance on how to enable TP for diffusion models.
 - **[Sequence Parallelism](diffusion/parallelism_acceleration.md#sequence-parallelism)** - Guidance on how to set sequence parallelism with configuration.
 - **[CFG-Parallel](diffusion/parallelism_acceleration.md#cfg-parallel)** - Guidance on how to set CFG-Parallel to run positive/negative branches across ranks.
+- **[VAE Patch Parallelism](diffusion/parallelism_acceleration.md#vae-patch-parallelism)** - Guidance on how to reduce VAE memory via patch/tile parallelism.

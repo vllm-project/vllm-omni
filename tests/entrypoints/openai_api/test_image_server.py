@@ -23,6 +23,8 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Unit Tests
 
 

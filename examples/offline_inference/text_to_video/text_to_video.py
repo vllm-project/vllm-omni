@@ -24,25 +24,25 @@ def parse_args() -> argparse.Namespace:
         help="Diffusers Wan2.2 model ID or local path.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative_prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance_scale", type=float, default=4.0, help="CFG scale (applied to low/high).")
-    parser.add_argument("--guidance_scale_high", type=float, default=None, help="Optional separate CFG for high-noise.")
+    parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale (applied to low/high).")
+    parser.add_argument("--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise.")
     parser.add_argument("--height", type=int, default=720, help="Video height.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames (Wan default is 81).")
-    parser.add_argument("--num_inference_steps", type=int, default=40, help="Sampling steps.")
+    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (Wan default is 81).")
+    parser.add_argument("--num-inference-steps", type=int, default=40, help="Sampling steps.")
     parser.add_argument(
-        "--boundary_ratio",
+        "--boundary-ratio",
         type=float,
         default=0.875,
         help="Boundary split ratio for low/high DiT. Default 0.875 uses both transformers for best quality. Set to 1.0 to load only the low-noise transformer (saves noticeable memory with good quality, recommended if memory is limited).",
     )
     parser.add_argument(
-        "--flow_shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+        "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )
     parser.add_argument(
-        "--cache_backend",
+        "--cache-backend",
         type=str,
         default=None,
         choices=["cache_dit"],
@@ -60,17 +60,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default="wan22_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=24, help="Frames per second for the output video.")
     parser.add_argument(
-        "--vae_use_slicing",
+        "--vae-use-slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
     )
     parser.add_argument(
-        "--vae_use_tiling",
+        "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
     )
     parser.add_argument(
-        "--enforce_eager",
+        "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
     )
@@ -85,32 +85,26 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
-        "--layerwise-num-gpu-layers",
-        type=int,
-        default=1,
-        help="Number of ready layers (blocks) to keep on GPU during generation.",
-    )
-    parser.add_argument(
-        "--ulysses_degree",
+        "--ulysses-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
-        "--ring_degree",
+        "--ring-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
     parser.add_argument(
-        "--cfg_parallel_size",
+        "--cfg-parallel-size",
         type=int,
         default=1,
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
-        "--tensor_parallel_size",
+        "--tensor-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
@@ -155,7 +149,6 @@ def main():
     omni = Omni(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
-        layerwise_num_gpu_layers=args.layerwise_num_gpu_layers,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,

@@ -5,6 +5,7 @@ import io
 import json
 import os
 import random
+import ssl
 import sys
 import time
 import traceback
@@ -71,6 +72,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    text_latency: float = 0.0
 
 
 async def async_request_openai_chat_omni_completions(
@@ -148,6 +150,7 @@ async def async_request_openai_chat_omni_completions(
                                         output.itl.append(timestamp - most_recent_timestamp)
                                     generated_text += content or ""
                                     most_recent_timestamp = timestamp
+                                    output.text_latency = timestamp - st
                                 elif modality == "audio":
                                     if output.audio_ttfp == 0.0:
                                         output.audio_ttfp = timestamp - st
@@ -161,8 +164,8 @@ async def async_request_openai_chat_omni_completions(
                                             else:
                                                 generated_audio = generated_audio + seg
 
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
+                            if metrics := data.get("metrics"):
+                                output.output_tokens = metrics.get("num_tokens_out", 0)
 
                 output.latency = timestamp - st
                 output.generated_text = generated_text
@@ -238,6 +241,7 @@ async def benchmark(
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
+    ssl_context: ssl.SSLContext | bool | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -245,6 +249,7 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
     # Reuses connections across requests to reduce TLS handshake overhead.
+    ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
     connector = aiohttp.TCPConnector(
         limit=max_concurrency or 0,
         limit_per_host=max_concurrency or 0,
@@ -253,7 +258,7 @@ async def benchmark(
         keepalive_timeout=60,
         enable_cleanup_closed=True,
         force_close=False,
-        ssl=("https://" in api_url),
+        ssl=ssl_setting,
     )
 
     session = aiohttp.ClientSession(

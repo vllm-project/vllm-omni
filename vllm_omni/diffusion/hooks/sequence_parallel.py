@@ -235,6 +235,8 @@ class SequenceParallelSplitHook(ModelHook):
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         """Shard outputs for split_output=True entries."""
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
         is_tensor = isinstance(output, torch.Tensor)
         is_tensor_list = isinstance(output, (list, tuple)) and all(isinstance(x, torch.Tensor) for x in output)
 
@@ -243,6 +245,7 @@ class SequenceParallelSplitHook(ModelHook):
             return output
 
         output_list = [output] if is_tensor else list(output)
+        actually_sharded = False
 
         for index, spm in self.metadata.items():
             if not isinstance(index, int):
@@ -252,7 +255,14 @@ class SequenceParallelSplitHook(ModelHook):
             if index >= len(output_list):
                 raise ValueError(f"Index {index} out of bounds for output of length {len(output_list)}.")
 
-            output_list[index] = self._prepare_sp_input(output_list[index], spm, self._last_args, self._last_kwargs)
+            original = output_list[index]
+            output_list[index] = self._prepare_sp_input(original, spm, self._last_args, self._last_kwargs)
+            if output_list[index] is not original:
+                actually_sharded = True
+
+        # Mark SP as active only if at least one tensor was actually sharded
+        if actually_sharded and is_forward_context_available():
+            get_forward_context()._sp_shard_depth += 1
 
         return output_list[0] if is_tensor else type(output)(output_list)
 
@@ -445,6 +455,8 @@ class SequenceParallelGatherHook(ModelHook):
             ctx = get_forward_context()
             original_seq_len = ctx.sp_original_seq_len
 
+        actually_gathered = False
+
         for i, spm in enumerate(self.metadata):
             if spm is None:
                 continue
@@ -465,6 +477,12 @@ class SequenceParallelGatherHook(ModelHook):
                 logger.debug(f"Removed padding: gathered shape {gathered.shape} (original_seq_len={original_seq_len})")
 
             output[i] = gathered
+            actually_gathered = True
+
+        # Mark SP as inactive only if at least one tensor was actually gathered
+        if actually_gathered and is_forward_context_available():
+            ctx = get_forward_context()
+            ctx._sp_shard_depth = max(0, ctx._sp_shard_depth - 1)
 
         return output[0] if is_tensor else type(output)(output)
 

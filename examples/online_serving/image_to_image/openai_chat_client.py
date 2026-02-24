@@ -76,6 +76,10 @@ def edit_image(
 
     # Build extra_body with generation parameters
     extra_body = {}
+    if height is not None:
+        extra_body["height"] = height
+    if width is not None:
+        extra_body["width"] = width
     if steps is not None:
         extra_body["num_inference_steps"] = steps
     if guidance_scale is not None:

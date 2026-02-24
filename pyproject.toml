@@ -137,6 +137,7 @@ warn_unreachable = true
 strict_equality = true
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
@@ -147,7 +148,8 @@ addopts = [
 ]
 markers = [
     # ci/cd required
-    "core_model: Core model tests (run in each PR)",
+    "core_model: L1&L2 tests (run in each PR)",
+    "advanced_model: L3&L4 level tests (run in each merge or nightly)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
@@ -175,6 +177,10 @@ markers = [
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
 ]
+filterwarnings = [
+    "ignore:.*does not have '__test__' attribute.*:UserWarning",
+    "ignore:.*does not have '__bases__' attribute.*:UserWarning",
+]
 
 [tool.typos.default]
 extend-ignore-identifiers-re = [
@@ -184,9 +190,10 @@ extend-ignore-identifiers-re = [
     ".*arange",
     ".*MoBA",
     ".*temperal_downsample",
+    ".*_nd",
     ".*nothink.*",
     ".*NOTHINK.*",
     ".*nin.*",
-    "Ono_Anna",
+    ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
 ]

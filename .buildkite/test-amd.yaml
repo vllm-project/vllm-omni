@@ -44,7 +44,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_cache_dit.py tests/e2e/offline_inference/test_teacache.py
+    - pytest -s -v -m 'core_model and cache and diffusion and not distributed_rocm and MI325'
 
 - label: "Diffusion Sequence Parallelism Test"
   timeout_in_minutes: 20
@@ -56,7 +56,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
 
 - label: "Diffusion Tensor Parallelism Test"
   timeout_in_minutes: 20
@@ -66,7 +66,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_zimage_tensor_parallel.py
+    - pytest -s -v tests/e2e/offline_inference/test_zimage_parallelism.py
 
 - label: "Diffusion GPU Worker Test"
   timeout_in_minutes: 20
@@ -101,7 +101,7 @@ steps:
     - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
     - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
     - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py
-    - pytest -s -v tests/e2e/online_serving/test_async_omni.py
+    - pytest -s -v tests/engine/test_async_omni_engine_abort.py
 
 - label: "Diffusion Image Edit Test"
   timeout_in_minutes: 15
