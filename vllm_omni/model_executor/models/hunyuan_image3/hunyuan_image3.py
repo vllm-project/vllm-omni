@@ -691,9 +691,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = self._timestep_embedding(t, self.frequency_embedding_size, self.max_period).type(
             self.mlp[0].weight.dtype
         )
-        # t_emb = self.linear1(t_freq)
-        # t_emb = self.act(t_emb)
-        # t_emb = self.linear2(t_emb)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -1325,6 +1322,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
             # 3. ViT image embeddings
             vit_embed = vit_embeddings[img_idx]
+
+            # Slice vit_embed to valid tokens
+            h, w = vit_spatial_shapes[img_idx]
+            valid_tokens = int(h * w)
+            vit_embed = vit_embed[:valid_tokens]
 
             stacked_embed = torch.cat([timestep_emb, vae_token_embed, vit_embed], dim=0)
             combined_embeddings.append(stacked_embed)
