@@ -269,7 +269,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # Try to run tests
-    if torch.cuda.is_available() or torch.xpu.is_available():
+    if is_gpu:
         try:
             print("\n[Running Case 1: Padding Equivalence for FA]")
             test_padding_equivalence()
