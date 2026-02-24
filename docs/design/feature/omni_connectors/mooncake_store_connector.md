@@ -1,4 +1,4 @@
-# MooncakeConnector
+# MooncakeStoreConnector
 
 ## When to Use
 
@@ -38,7 +38,7 @@ Define the connector in runtime:
 runtime:
   connectors:
     connector_of_mooncake:
-      name: MooncakeConnector
+      name: MooncakeStoreConnector
       extra:
         host: "127.0.0.1"
         metadata_server: "http://<MASTER_IP>:8080/metadata"
