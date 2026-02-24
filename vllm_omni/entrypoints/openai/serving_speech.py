@@ -160,6 +160,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if model_stage in _TTS_MODEL_STAGES:
                     return True
         return False
+
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
         task_type = request.task_type or "CustomVoice"
