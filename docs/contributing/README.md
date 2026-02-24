@@ -117,7 +117,7 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
     If the PR spans more than one category, please include all relevant prefixes.
 
 ### Local Test
-We hope that you can first run the L1 & L2 level test cases in your local environment, attach the corresponding results to the PR, and then contact us to add the "ready" label. Please refer to the [test instructions](./ci/test_guide.md) for running the test cases.
+Please run the L1 and L2 test cases locally first and attach the results before contacting us to add the "ready" label. Please refer to the [test instructions](./ci/test_guide.md) for running the test cases.
 
 ### Code Quality
 
