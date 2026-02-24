@@ -6,7 +6,6 @@ import json
 import os
 import random
 import ssl
-import sys
 import time
 import traceback
 from collections.abc import Iterable
@@ -41,8 +40,8 @@ get_samples_old = datasets.get_samples
 
 def get_samples(args, tokenizer):
     if args.backend not in ["openai-chat-omni", "openai-audio-speech"]:
-        raise ValueError("benchmark is only supported on 'openai-chat-omni' or 'openai-audio-speech' backend.")
-    if args.dataset_name == "random-mm":
+        return get_samples_old(args, tokenizer)
+    elif args.dataset_name == "random-mm":
         dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
         input_requests = dataset.sample(
             tokenizer=tokenizer,
@@ -99,6 +98,13 @@ async def async_request_openai_chat_omni_completions(
         },
     }
     _update_payload_common(payload, request_func_input)
+
+    response_format = payload.get("response_format", "wav")
+    if response_format == "pcm":
+        raise ValueError(
+            "pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead."
+        )
 
     headers = {
         "Content-Type": "application/json",
@@ -189,8 +195,7 @@ async def async_request_openai_chat_omni_completions(
                 output.success = False
     except Exception:
         output.success = False
-        exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
+        output.error = traceback.format_exc()
         logger.error(f"ERROR: send request failed, reason is: {output.error}")
 
     if pbar:
@@ -214,6 +219,13 @@ async def async_request_openai_audio_speech(
         "input": request_func_input.prompt,
     }
     _update_payload_common(payload, request_func_input)
+
+    response_format = payload.get("response_format", "wav")
+    if response_format == "pcm":
+        raise ValueError(
+            "pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead."
+        )
 
     headers = {
         "Content-Type": "application/json",
@@ -264,8 +276,7 @@ async def async_request_openai_audio_speech(
                 output.success = False
     except Exception:
         output.success = False
-        exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
+        output.error = traceback.format_exc()
         logger.error(f"ERROR: send request failed, reason is: {output.error}")
 
     if pbar:
