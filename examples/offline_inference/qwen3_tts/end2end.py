@@ -4,17 +4,20 @@ Provides single and batch sample inputs for CustomVoice, VoiceDesign, and Base
 tasks, then runs Omni generation and saves output wav files.
 """
 
+import logging
 import os
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import soundfile as sf
+import torch
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
+
+logger = logging.getLogger(__name__)
 
 
 class QueryResult(NamedTuple):
@@ -22,6 +25,44 @@ class QueryResult(NamedTuple):
 
     inputs: dict
     model_name: str
+
+
+def _estimate_prompt_len(
+    additional_information: dict[str, Any],
+    model_name: str,
+    _cache: dict[str, Any] = {},
+) -> int:
+    """Estimate prompt_token_ids placeholder length for the Talker stage.
+
+    The AR Talker replaces all input embeddings via ``preprocess``, so the
+    placeholder values are irrelevant but the **length** must match the
+    embeddings that ``preprocess`` will produce.
+    """
+    try:
+        from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import Qwen3TTSConfig
+        from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+            Qwen3TTSTalkerForConditionalGeneration,
+        )
+
+        if model_name not in _cache:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
+            cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
+            _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
+
+        tok, tcfg = _cache[model_name]
+        task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+        return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
+            additional_information=additional_information,
+            task_type=task_type,
+            tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
+            codec_language_id=getattr(tcfg, "codec_language_id", None),
+            spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+        )
+    except Exception as exc:
+        logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
+        return 2048
 
 
 def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
@@ -34,6 +75,7 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
         QueryResult with Omni inputs and the CustomVoice model path.
     """
     task_type = "CustomVoice"
+    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     if use_batch_sample:
         texts = ["其实我真的有发现，我是一个特别善于观察别人情绪的人。", "She said she would be here by noon."]
         instructs = ["", "Very happy."]
@@ -41,18 +83,18 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
         speakers = ["Vivian", "Ryan"]
         inputs = []
         for text, instruct, language, speaker in zip(texts, instructs, languages, speakers):
-            prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+            additional_information = {
+                "task_type": [task_type],
+                "text": [text],
+                "instruct": [instruct],
+                "language": [language],
+                "speaker": [speaker],
+                "max_new_tokens": [2048],
+            }
             inputs.append(
                 {
-                    "prompt": prompt,
-                    "additional_information": {
-                        "task_type": [task_type],
-                        "text": [text],
-                        "instruct": [instruct],
-                        "language": [language],
-                        "speaker": [speaker],
-                        "max_new_tokens": [2048],
-                    },
+                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "additional_information": additional_information,
                 }
             )
     else:
@@ -60,21 +102,21 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
         language = "Chinese"
         speaker = "Vivian"
         instruct = "用特别愤怒的语气说"
-        prompts = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        additional_information = {
+            "task_type": [task_type],
+            "text": [text],
+            "language": [language],
+            "speaker": [speaker],
+            "instruct": [instruct],
+            "max_new_tokens": [2048],
+        }
         inputs = {
-            "prompt": prompts,
-            "additional_information": {
-                "task_type": [task_type],
-                "text": [text],
-                "language": [language],
-                "speaker": [speaker],
-                "instruct": [instruct],
-                "max_new_tokens": [2048],
-            },
+            "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+            "additional_information": additional_information,
         }
     return QueryResult(
         inputs=inputs,
-        model_name="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        model_name=model_name,
     )
 
 
@@ -88,6 +130,7 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
         QueryResult with Omni inputs and the VoiceDesign model path.
     """
     task_type = "VoiceDesign"
+    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     if use_batch_sample:
         texts = [
             "哥哥，你回来啦，人家等了你好久好久了，要抱抱！",
@@ -100,39 +143,39 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
         languages = ["Chinese", "English"]
         inputs = []
         for text, instruct, language in zip(texts, instructs, languages):
-            prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-            inputs.append(
-                {
-                    "prompt": prompt,
-                    "additional_information": {
-                        "task_type": [task_type],
-                        "text": [text],
-                        "language": [language],
-                        "instruct": [instruct],
-                        "max_new_tokens": [2048],
-                        "non_streaming_mode": [True],
-                    },
-                }
-            )
-    else:
-        text = "哥哥，你回来啦，人家等了你好久好久了，要抱抱！"
-        instruct = "体现撒娇稚嫩的萝莉女声，音调偏高且起伏明显，营造出黏人、做作又刻意卖萌的听觉效果。"
-        language = "Chinese"
-        prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        inputs = {
-            "prompt": prompt,
-            "additional_information": {
+            additional_information = {
                 "task_type": [task_type],
                 "text": [text],
                 "language": [language],
                 "instruct": [instruct],
                 "max_new_tokens": [2048],
                 "non_streaming_mode": [True],
-            },
+            }
+            inputs.append(
+                {
+                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "additional_information": additional_information,
+                }
+            )
+    else:
+        text = "哥哥，你回来啦，人家等了你好久好久了，要抱抱！"
+        instruct = "体现撒娇稚嫩的萝莉女声，音调偏高且起伏明显，营造出黏人、做作又刻意卖萌的听觉效果。"
+        language = "Chinese"
+        additional_information = {
+            "task_type": [task_type],
+            "text": [text],
+            "language": [language],
+            "instruct": [instruct],
+            "max_new_tokens": [2048],
+            "non_streaming_mode": [True],
+        }
+        inputs = {
+            "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+            "additional_information": additional_information,
         }
     return QueryResult(
         inputs=inputs,
-        model_name="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        model_name=model_name,
     )
 
 
@@ -147,6 +190,7 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
         QueryResult with Omni inputs and the Base model path.
     """
     task_type = "Base"
+    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
     ref_audio_single = ref_audio_path_1
     ref_text_single = (
@@ -163,38 +207,38 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
         syn_lang_batch = ["Chinese", "English"]
         inputs = []
         for text, language in zip(syn_text_batch, syn_lang_batch):
-            prompt = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-            inputs.append(
-                {
-                    "prompt": prompt,
-                    "additional_information": {
-                        "task_type": [task_type],
-                        "ref_audio": [ref_audio_single],
-                        "ref_text": [ref_text_single],
-                        "text": [text],
-                        "language": [language],
-                        "x_vector_only_mode": [x_vector_only_mode],
-                        "max_new_tokens": [2048],
-                    },
-                }
-            )
-    else:
-        prompt = f"<|im_start|>assistant\n{syn_text_single}<|im_end|>\n<|im_start|>assistant\n"
-        inputs = {
-            "prompt": prompt,
-            "additional_information": {
+            additional_information = {
                 "task_type": [task_type],
                 "ref_audio": [ref_audio_single],
                 "ref_text": [ref_text_single],
-                "text": [syn_text_single],
-                "language": [syn_lang_single],
+                "text": [text],
+                "language": [language],
                 "x_vector_only_mode": [x_vector_only_mode],
                 "max_new_tokens": [2048],
-            },
+            }
+            inputs.append(
+                {
+                    "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                    "additional_information": additional_information,
+                }
+            )
+    else:
+        additional_information = {
+            "task_type": [task_type],
+            "ref_audio": [ref_audio_single],
+            "ref_text": [ref_text_single],
+            "text": [syn_text_single],
+            "language": [syn_lang_single],
+            "x_vector_only_mode": [x_vector_only_mode],
+            "max_new_tokens": [2048],
+        }
+        inputs = {
+            "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+            "additional_information": additional_information,
         }
     return QueryResult(
         inputs=inputs,
-        model_name="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        model_name=model_name,
     )
 
 
@@ -223,30 +267,22 @@ def main(args):
         stage_init_timeout=args.stage_init_timeout,
     )
 
-    sampling_params = SamplingParams(
-        temperature=0.9,
-        top_p=1.0,
-        top_k=50,
-        max_tokens=2048,
-        seed=42,
-        detokenize=False,
-        repetition_penalty=1.05,
-    )
-
-    sampling_params_list = [
-        sampling_params,
-    ]
-
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
 
-    omni_generator = omni.generate(query_result.inputs, sampling_params_list)
+    omni_generator = omni.generate(query_result.inputs, sampling_params_list=None)
     for stage_outputs in omni_generator:
         for output in stage_outputs.request_output:
             request_id = output.request_id
-            audio_tensor = output.outputs[0].multimodal_output["audio"]
+            audio_data = output.outputs[0].multimodal_output["audio"]
+            # async_chunk mode returns a list of chunks; concatenate them.
+            if isinstance(audio_data, list):
+                audio_tensor = torch.cat(audio_data, dim=-1)
+            else:
+                audio_tensor = audio_data
             output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-            audio_samplerate = output.outputs[0].multimodal_output["sr"].item()
+            sr_val = output.outputs[0].multimodal_output["sr"]
+            audio_samplerate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val[-1])
             # Convert to numpy array and ensure correct format
             audio_numpy = audio_tensor.float().detach().cpu().numpy()
 

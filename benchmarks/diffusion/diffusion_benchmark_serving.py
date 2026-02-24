@@ -6,78 +6,58 @@
 Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
+Supports multiple backends:
+    - vllm-omni: Uses /v1/chat/completions endpoint (default)
+    - openai: Uses /v1/images/generations endpoint
+
 Usage:
-    # Video
+    # Video (vllm-omni backend)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --dataset vbench --task t2v --num-prompts 10 \
+        --backend vllm-omni --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --dataset vbench --task i2v --num-prompts 10
+        --backend vllm-omni --dataset vbench --task i2v --num-prompts 10
 
 
-    # Image
+    # Image (vllm-omni backend)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --dataset vbench --task t2i --num-prompts 10 \
+        --backend vllm-omni --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
     i2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --dataset vbench --task i2i --num-prompts 10
+        --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
+
+    # Image (openai backend)
+    t2i:
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --backend openai --dataset vbench --task t2i --num-prompts 10 \
+        --height 1024 --width 1024 --port 3000
 
 """
 
 import argparse
 import ast
 import asyncio
-import base64
 import glob
 import json
-import mimetypes
 import os
 import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import Any
 
 import aiohttp
 import numpy as np
 import requests
+from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
 from tqdm.asyncio import tqdm
-
-
-@dataclass
-class RequestFuncInput:
-    prompt: str
-    api_url: str
-    model: str
-    width: int | None = None
-    height: int | None = None
-    num_frames: int | None = None
-    num_inference_steps: int | None = None
-    seed: int | None = None
-    fps: int | None = None
-    timestamp: float | None = None
-    slo_ms: float | None = None
-    extra_body: dict[str, Any] = field(default_factory=dict)
-    image_paths: list[str] | None = None
-    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
-
-@dataclass
-class RequestFuncOutput:
-    success: bool = False
-    latency: float = 0.0
-    error: str = ""
-    start_time: float = 0.0
-    response_body: dict[str, Any] = field(default_factory=dict)
-    peak_memory_mb: float = 0.0
-    slo_achieved: bool | None = None
 
 
 class BaseDataset(ABC):
@@ -684,92 +664,6 @@ async def iter_requests(
         yield req
 
 
-def _guess_mime_type(path: str) -> str:
-    mime, _ = mimetypes.guess_type(path)
-    return mime or "application/octet-stream"
-
-
-def _encode_image_as_data_url(path: str) -> str:
-    with open(path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-    mime = _guess_mime_type(path)
-    return f"data:{mime};base64,{encoded}"
-
-
-async def async_request_chat_completions(
-    input: RequestFuncInput,
-    session: aiohttp.ClientSession,
-    pbar: tqdm | None = None,
-) -> RequestFuncOutput:
-    output = RequestFuncOutput()
-    output.start_time = time.perf_counter()
-
-    extra_body = dict(input.extra_body)
-    if input.width and input.height:
-        extra_body.setdefault("height", input.height)
-        extra_body.setdefault("width", input.width)
-    if input.num_frames:
-        extra_body.setdefault("num_frames", input.num_frames)
-    if input.num_inference_steps:
-        extra_body.setdefault("num_inference_steps", input.num_inference_steps)
-    if input.seed is not None:
-        extra_body.setdefault("seed", input.seed)
-    if input.fps:
-        extra_body.setdefault("fps", input.fps)
-
-    if input.image_paths and len(input.image_paths) > 0:
-        content = []
-        if input.prompt:
-            content.append({"type": "text", "text": input.prompt})
-        for img_path in input.image_paths:
-            if not os.path.exists(img_path):
-                output.error = f"Image file not found: {img_path}"
-                output.success = False
-                if pbar:
-                    pbar.update(1)
-                return output
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": _encode_image_as_data_url(img_path)},
-                }
-            )
-        messages = [{"role": "user", "content": content}]
-    else:
-        messages = [{"role": "user", "content": input.prompt}]
-
-    payload = {
-        "model": input.model,
-        "messages": messages,
-    }
-    if extra_body:
-        payload["extra_body"] = extra_body
-
-    try:
-        async with session.post(input.api_url, json=payload) as response:
-            if response.status == 200:
-                resp_json = await response.json()
-                output.response_body = resp_json
-                output.success = True
-                if "peak_memory_mb" in resp_json:
-                    output.peak_memory_mb = resp_json["peak_memory_mb"]
-            else:
-                output.error = f"HTTP {response.status}: {await response.text()}"
-                output.success = False
-    except Exception as e:
-        output.error = str(e)
-        output.success = False
-
-    output.latency = time.perf_counter() - output.start_time
-
-    if output.success and input.slo_ms is not None:
-        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
 def calculate_metrics(
     outputs: list[RequestFuncOutput],
     total_duration: float,
@@ -848,9 +742,9 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
-    # Setup dataset (vLLM-Omni supports diffusion via /v1/chat/completions)
-    api_url = f"{args.base_url}/v1/chat/completions"
-    request_func = async_request_chat_completions
+    # Setup API URL and request function based on backend
+    request_func, api_url = backends_function_mapping[args.backend]
+    api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
@@ -920,9 +814,16 @@ async def benchmark(args):
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
 
+    # Add configuration info to metrics for JSON output
+    metrics["backend"] = args.backend
+    metrics["model"] = args.model
+    metrics["dataset"] = args.dataset
+    metrics["task"] = args.task
+
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
 
     # Section 1: Configuration
+    print("{:<40} {:<15}".format("Backend:", args.backend))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
@@ -978,6 +879,13 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost", help="Server host.")
     parser.add_argument("--port", type=int, default=8091, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="vllm-omni",
+        choices=["vllm-omni", "openai"],
+        help="Backend to target the benchmark to.",
+    )
     parser.add_argument(
         "--dataset",
         type=str,

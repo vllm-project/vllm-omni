@@ -3,10 +3,6 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
 from pathlib import Path
 
 import pytest
@@ -20,6 +16,10 @@ from tests.conftest import (
 )
 from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
@@ -114,7 +114,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {
-            "audio": ["water", "chirping"],
+            "audio": ["water", "chirping", "crackling"],
             "image": ["square", "quadrate"],
         },
     }
