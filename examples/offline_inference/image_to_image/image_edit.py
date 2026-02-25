@@ -2,6 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
+Example script for image editing with OmniGen2.
+
+    python image_edit.py \
+        --image input.png \
+        --model "OmniGen2/OmniGen2" \
+        --prompt "Change the background to classroom." \
+        --negative-prompt "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar" \
+        --num-inference-steps 50 \
+        --seed 0 \
+        --guidance-scale 5.0 \
+        --guidance-scale-2 2.0 \
+        --output outputs/image_edit.png \
+        --num-outputs-per-prompt 2
+
+    Note: For OmniGen2, `guidance_scale` works as `text_guidance_scale`,
+    and `guidance_scale_2` works as `image_guidance_scale`.
+
 Example script for image editing with Qwen-Image-Edit.
 
 Usage (single image):

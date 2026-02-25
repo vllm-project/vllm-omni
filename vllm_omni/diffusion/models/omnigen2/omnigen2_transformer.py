@@ -1,19 +1,14 @@
 import itertools
 import logging
 from collections.abc import Iterable
-from typing import Any
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import PeftAdapterMixin
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.activations import get_activation
 from diffusers.models.embeddings import Timesteps, get_1d_rotary_pos_embed
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
 from einops import rearrange, repeat
 from torch.nn import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -712,7 +707,7 @@ class OmniGen2TransformerBlock(nn.Module):
         return hidden_states
 
 
-class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
+class OmniGen2Transformer2DModel(nn.Module):
     """
     OmniGen2 Transformer 2D Model.
 
@@ -740,11 +735,6 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         timestep_scale: Scale factor for timestep embeddings
     """
 
-    _supports_gradient_checkpointing = True
-    _no_split_modules = ["OmniGen2TransformerBlock"]
-    _skip_layerwise_casting_patterns = ["x_embedder", "norm"]
-
-    @register_to_config
     def __init__(
         self,
         patch_size: int = 2,
@@ -773,7 +763,15 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
                 f"must equal sum(axes_dim_rope) ({sum(axes_dim_rope)})"
             )
 
-        self.out_channels = out_channels or in_channels
+        self.config = SimpleNamespace(
+            patch_size=patch_size,
+            in_channels=in_channels,
+            out_channels=out_channels or in_channels,
+            hidden_size=hidden_size,
+            axes_dim_rope=axes_dim_rope,
+            axes_lens=axes_lens,
+        )
+        self.out_channels = self.config.out_channels
 
         # Initialize embeddings
         self.rope_embedder = OmniGen2RotaryPosEmbed(
@@ -874,8 +872,6 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         # Add learnable embeddings to distinguish different images
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
-
-        self.gradient_checkpointing = False
 
         self.initialize_weights()
 
@@ -1082,22 +1078,8 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         freqs_cis: torch.Tensor,
         text_attention_mask: torch.Tensor,
         ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
-        attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor | Transformer2DModelOutput:
-        if attention_kwargs is not None:
-            attention_kwargs = attention_kwargs.copy()
-            lora_scale = attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
-
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
-                logger.warning("Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective.")
-
         # 1. Condition, positional & patch embedding
         batch_size = len(hidden_states)
         is_hidden_states_tensor = isinstance(hidden_states, torch.Tensor)
@@ -1166,13 +1148,8 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         hidden_states = joint_hidden_states
 
-        for layer_idx, layer in enumerate(self.layers):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    layer, hidden_states, attention_mask, rotary_emb, temb
-                )
-            else:
-                hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
 
         # 4. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb)
@@ -1193,10 +1170,6 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             )
         if is_hidden_states_tensor:
             output = torch.stack(output, dim=0)
-
-        if USE_PEFT_BACKEND:
-            # remove `lora_scale` from each PEFT layer
-            unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
             return output

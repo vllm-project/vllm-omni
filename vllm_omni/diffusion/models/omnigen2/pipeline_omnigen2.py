@@ -1037,6 +1037,12 @@ class OmniGen2Pipeline(nn.Module):
         verbose: bool = False,
         step_func=None,
     ) -> DiffusionOutput:
+        if len(req.prompts) > 1:
+            logger.warning(
+                "OmniGen2 only supports a single prompt per request. "
+                "Only the first prompt will be used; %d extra prompt(s) will be ignored.",
+                len(req.prompts) - 1,
+            )
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or prompt)
         negative_prompt = (
