@@ -31,7 +31,7 @@ def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae
     try:
         m = Omni(
             model=model_name,
-            vae_us_tiling=using_tile,
+            vae_use_tiling=using_tile,
             parallel_config=DiffusionParallelConfig(
                 tensor_parallel_size=tp,
                 vae_patch_parallel_size=vae_patch_parallel_size,
@@ -68,16 +68,16 @@ def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae
 
 @pytest.mark.parametrize("model_name", models)
 def test_vae_parallel_model(model_name: str):
-    non_parallel_result, non_parallel_time = model_run(
+    parallel_result, parallel_time = model_run(
         model_name=model_name,
         tp=2,
         out_width=1280,
         out_height=704,
         out_frames=5,
         using_tile=True,
-        vae_patch_parallel_size=1,
+        vae_patch_parallel_size=2,
     )
-    parallel_result, parallel_time = model_run(
+    non_parallel_result, non_parallel_time = model_run(
         model_name=model_name,
         tp=2,
         out_width=1280,

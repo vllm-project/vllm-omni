@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
@@ -13,6 +14,8 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+
+logger = init_logger(__name__)
 
 
 class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
@@ -126,6 +129,7 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
         if not self.is_distributed_enabled():
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 
+        logger.info("Decode run with distributed executor")
         result = self.distributed_decoder.execute(
             z,
             DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),

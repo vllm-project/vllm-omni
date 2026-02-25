@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from diffusers.models.autoencoders import AutoencoderKL
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
@@ -13,6 +14,8 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+
+logger = init_logger(__name__)
 
 
 class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
@@ -176,6 +179,8 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
         split, exec, merge = self._strategy_select(z)
 
         if split is not None:
+            strategy = "tile" if split == self.tile_split else "patch"
+            logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
             result = self.distributed_decoder.execute(
                 z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
             )
