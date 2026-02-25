@@ -28,6 +28,12 @@ from vllm.logger import init_logger
 
 from .base import DiffusionQuantizationConfig
 from .fp8 import DiffusionFp8Config
+from .bitsandbytes import (
+    DiffusionBitsAndBytesConfig,
+    apply_bnb_quantization,
+    get_bnb_module_kwargs,
+    patch_transformers_for_bnb_load,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -40,6 +46,7 @@ logger = init_logger(__name__)
 # To add a new method, create a new config class and register it here
 _QUANT_CONFIG_REGISTRY: dict[str, type[DiffusionQuantizationConfig]] = {
     "fp8": DiffusionFp8Config,
+    "bitsandbytes": DiffusionBitsAndBytesConfig,
 }
 
 SUPPORTED_QUANTIZATION_METHODS = list(_QUANT_CONFIG_REGISTRY.keys())
@@ -76,6 +83,20 @@ def get_diffusion_quant_config(
         return None
 
     quantization = quantization.lower()
+    alias_map = {
+        "bnb_8bit": "bitsandbytes_8bit",
+        "bnb8": "bitsandbytes_8bit",
+        "bitsandbytes8bit": "bitsandbytes_8bit",
+        "bnb_4bit": "bitsandbytes_4bit",
+        "bnb4": "bitsandbytes_4bit",
+        "bitsandbytes4bit": "bitsandbytes_4bit",
+    }
+    quantization = alias_map.get(quantization, quantization)
+    if quantization in ("bitsandbytes_8bit", "bitsandbytes_4bit"):
+        kwargs = dict(kwargs)
+        kwargs.setdefault("load_in_8bit", quantization.endswith("8bit"))
+        kwargs.setdefault("load_in_4bit", quantization.endswith("4bit"))
+        quantization = "bitsandbytes"
     if quantization not in _QUANT_CONFIG_REGISTRY:
         raise ValueError(
             f"Unknown quantization method: {quantization!r}. Supported methods: {SUPPORTED_QUANTIZATION_METHODS}"
@@ -107,7 +128,11 @@ def get_vllm_quant_config_for_layers(
 
 __all__ = [
     "DiffusionQuantizationConfig",
+    "DiffusionBitsAndBytesConfig",
     "DiffusionFp8Config",
+    "apply_bnb_quantization",
+    "get_bnb_module_kwargs",
+    "patch_transformers_for_bnb_load",
     "get_diffusion_quant_config",
     "get_vllm_quant_config_for_layers",
     "SUPPORTED_QUANTIZATION_METHODS",

@@ -181,6 +181,23 @@ class OmniServeCommand(CLISubcommand):
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
 
+        # Quantization parameters (diffusion-only)
+        omni_config_group.add_argument(
+            "--quantization",
+            type=str,
+            default=None,
+            help="Diffusion quantization method (e.g., bitsandbytes).",
+        )
+        omni_config_group.add_argument(
+            "--quantization-config",
+            type=str,
+            default=None,
+            help=(
+                "JSON string for diffusion quantization config. For bitsandbytes, "
+                "use fields like '{\"load_in_4bit\": true, \"bnb_4bit_compute_dtype\": \"float16\"}'."
+            ),
+        )
+
         # VAE memory optimization parameters
         omni_config_group.add_argument(
             "--vae-use-slicing",

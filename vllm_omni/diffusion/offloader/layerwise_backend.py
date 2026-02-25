@@ -241,6 +241,21 @@ class LayerWiseOffloadBackend(OffloadBackend):
             logger.warning("No DiT/transformer modules found, skipping layer-wise offloading")
             return
 
+        skip_components = set(getattr(pipeline, "_bnb_offload_skip_components", None) or set())
+        if skip_components:
+            logger.debug("Skipping offload for quantized components: %s", sorted(skip_components))
+
+        dit_modules = []
+        dit_names = []
+        for name, module in zip(modules.dit_names, modules.dits):
+            if name in skip_components:
+                continue
+            dit_modules.append(module)
+            dit_names.append(name)
+        if not dit_modules:
+            logger.warning("All DiT modules are quantized; skipping layer-wise offloading")
+            return
+
         # Move encoders to GPU (they stay resident)
         for enc in modules.encoders:
             enc.to(self.device)
@@ -252,12 +267,12 @@ class LayerWiseOffloadBackend(OffloadBackend):
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
 
-        logger.info("Applying layer-wise offloading on %s", modules.dit_names)
+        logger.info("Applying layer-wise offloading on %s", dit_names)
 
         # Apply block-wise offloading hook for each of the blocks in DiT model(s)
         # Note that there might exist multiple DiT models in specific pipelines
-        for i, dit_module in enumerate(modules.dits):
-            dit_name = modules.dit_names[i]
+        for i, dit_module in enumerate(dit_modules):
+            dit_name = dit_names[i]
             logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
 
             blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(dit_module)

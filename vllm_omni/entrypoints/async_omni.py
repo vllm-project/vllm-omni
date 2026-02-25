@@ -117,6 +117,7 @@ class AsyncOmni(OmniBase):
         # TODO: here is different from the Omni class. We should merge the two in the future.
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+        quantization_config = self._normalize_quantization_config(kwargs.get("quantization_config", None))
 
         devices = "0"
         if "parallel_config" in kwargs:
@@ -165,6 +166,8 @@ class AsyncOmni(OmniBase):
                     "enforce_eager": kwargs.get("enforce_eager", False),
                     "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "quantization": kwargs.get("quantization", None),
+                    "quantization_config": quantization_config,
                 },
                 "final_output": True,
                 "final_output_type": "image",

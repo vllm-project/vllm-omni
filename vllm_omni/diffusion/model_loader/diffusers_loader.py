@@ -5,6 +5,7 @@ import glob
 import os
 import time
 from collections.abc import Generator, Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -26,6 +27,11 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.quantization.bitsandbytes import (
+    DiffusionBitsAndBytesConfig,
+    apply_bnb_quantization,
+    patch_transformers_for_bnb_load,
+)
 from vllm_omni.diffusion.registry import initialize_model
 
 logger = init_logger(__name__)
@@ -218,13 +224,57 @@ class DiffusersPipelineLoader:
     ) -> nn.Module:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
+        enable_offload = bool(
+            getattr(od_config, "enable_cpu_offload", False)
+            or getattr(od_config, "enable_layerwise_offload", False)
+        )
         with set_default_torch_dtype(od_config.dtype):
             with target_device:
-                if load_format == "default":
-                    model = initialize_model(od_config)
-                elif load_format == "custom_pipeline":
-                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-                    model = model_cls(od_config=od_config)
+                bnb_config = (
+                    od_config.quantization_config
+                    if isinstance(od_config.quantization_config, DiffusionBitsAndBytesConfig)
+                    else None
+                )
+                enable_hf_bnb_load = bool(
+                    bnb_config is not None and not enable_offload and target_device.type == "cuda"
+                )
+                patch_context = (
+                    patch_transformers_for_bnb_load(
+                        bnb_config,
+                        device=target_device,
+                        enable_cpu_offload=getattr(od_config, "enable_cpu_offload", False),
+                        enable_hf_bnb_load=enable_hf_bnb_load,
+                    )
+                    if bnb_config is not None
+                    else nullcontext(set())
+                )
+                with patch_context as bnb_loaded_components:
+                    if load_format == "default":
+                        model = initialize_model(od_config)
+                    elif load_format == "custom_pipeline":
+                        model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                        model = model_cls(od_config=od_config)
+
+            # Pre-replace transformer Linear modules before loading weights to reduce peak memory.
+            if bnb_config is not None:
+                quantized_components = set(bnb_loaded_components)
+                pre_replace_modules = set()
+                sources = getattr(model, "weights_sources", ())
+                for source in sources:
+                    prefix = getattr(source, "prefix", "")
+                    if prefix:
+                        module_name = prefix.split(".", 1)[0]
+                        if module_name:
+                            pre_replace_modules.add(module_name)
+                if pre_replace_modules:
+                    only_modules = [m for m in bnb_config.get_modules() if m in pre_replace_modules]
+                    quantized_components |= apply_bnb_quantization(
+                        model,
+                        bnb_config,
+                        copy_weights=False,
+                        only_modules=only_modules,
+                    )
+                model._bnb_quantized_components = quantized_components
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model)

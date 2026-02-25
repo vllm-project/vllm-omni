@@ -144,6 +144,7 @@ def retrieve_timesteps(
 
 
 class ZImagePipeline(nn.Module):
+
     def __init__(
         self,
         *,
@@ -218,6 +219,12 @@ class ZImagePipeline(nn.Module):
             )
         else:
             negative_prompt_embeds = []
+        # Ensure prompt embeddings match transformer dtype for downstream linear ops.
+        transformer_dtype = getattr(self.transformer, "dtype", None)
+        if transformer_dtype is not None:
+            prompt_embeds = [pe.to(transformer_dtype) for pe in prompt_embeds]
+            if negative_prompt_embeds:
+                negative_prompt_embeds = [npe.to(transformer_dtype) for npe in negative_prompt_embeds]
         return prompt_embeds, negative_prompt_embeds
 
     def _encode_prompt(

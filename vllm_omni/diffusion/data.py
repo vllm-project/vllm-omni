@@ -14,7 +14,10 @@ from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
 
+from vllm.platforms import current_platform
+
 from vllm_omni.diffusion.quantization import (
+    DiffusionBitsAndBytesConfig,
     DiffusionQuantizationConfig,
     get_diffusion_quant_config,
 )
@@ -255,6 +258,11 @@ class OmniDiffusionConfig:
     # Attention
     attention_backend: str | None = None
 
+    # Quantization (optional)
+    # NOTE: This is diffusion-only quantization (not LLM quantization).
+    quantization: str | None = None
+    quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
+
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
 
@@ -379,11 +387,6 @@ class OmniDiffusionConfig:
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
 
-    # Quantization settings
-    # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
-    quantization: str | None = None
-    quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
-
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
@@ -463,12 +466,58 @@ class OmniDiffusionConfig:
                 logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
                 self.dtype = torch.bfloat16
 
+        # Normalize quantization method string (diffusion-only).
+        if isinstance(self.quantization, str):
+            quantization = self.quantization.strip().lower()
+            quantization_aliases = {
+                "": "none",
+                "null": "none",
+                "none": "none",
+                "no": "none",
+                "false": "none",
+                "bnb_8bit": "bitsandbytes_8bit",
+                "bnb8": "bitsandbytes_8bit",
+                "bitsandbytes_8bit": "bitsandbytes_8bit",
+                "bitsandbytes8bit": "bitsandbytes_8bit",
+                "bnb_4bit": "bitsandbytes_4bit",
+                "bnb4": "bitsandbytes_4bit",
+                "bitsandbytes_4bit": "bitsandbytes_4bit",
+                "bitsandbytes4bit": "bitsandbytes_4bit",
+            }
+            quantization = quantization_aliases.get(quantization, quantization)
+            self.quantization = None if quantization in ("none", "") else quantization
+
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):
             self.cache_config = DiffusionCacheConfig.from_dict(self.cache_config)
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
+
+        def _normalize_quant_method(method: str | None, quant_kwargs: dict[str, Any]) -> str | None:
+            if method is None:
+                return None
+            if isinstance(method, str):
+                method = method.strip().lower()
+                method_aliases = {
+                    "": "none",
+                    "null": "none",
+                    "none": "none",
+                    "no": "none",
+                    "false": "none",
+                    "bnb_8bit": "bitsandbytes_8bit",
+                    "bnb8": "bitsandbytes_8bit",
+                    "bitsandbytes8bit": "bitsandbytes_8bit",
+                    "bnb_4bit": "bitsandbytes_4bit",
+                    "bnb4": "bitsandbytes_4bit",
+                    "bitsandbytes4bit": "bitsandbytes_4bit",
+                }
+                method = method_aliases.get(method, method)
+            if method in ("bitsandbytes_8bit", "bitsandbytes_4bit"):
+                quant_kwargs.setdefault("load_in_8bit", method.endswith("8bit"))
+                quant_kwargs.setdefault("load_in_4bit", method.endswith("4bit"))
+                return "bitsandbytes"
+            return method
 
         # Convert quantization config
         if self.quantization is not None or self.quantization_config is not None:
@@ -480,6 +529,7 @@ class OmniDiffusionConfig:
                 quant_method = config_dict.get("method", self.quantization)
                 # Filter out "method" key for kwargs
                 quant_kwargs = {k: v for k, v in config_dict.items() if k != "method"}
+                quant_method = _normalize_quant_method(quant_method, quant_kwargs)
 
                 # Validate conflicting methods
                 if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
@@ -490,12 +540,28 @@ class OmniDiffusionConfig:
 
                 self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
             elif self.quantization_config is None and self.quantization is not None:
-                self.quantization_config = get_diffusion_quant_config(self.quantization)
+                quant_kwargs: dict[str, Any] = {}
+                quant_method = _normalize_quant_method(self.quantization, quant_kwargs)
+                self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
             elif not isinstance(self.quantization_config, DiffusionQuantizationConfig):
                 raise TypeError(
                     f"quantization_config must be a DiffusionQuantizationConfig, dict, or None, "
                     f"got {type(self.quantization_config)!r}"
                 )
+
+        if isinstance(self.quantization_config, DiffusionBitsAndBytesConfig):
+            if current_platform.is_rocm():
+                try:
+                    from vllm.platforms.rocm import on_gfx9
+                except Exception:
+                    on_gfx9 = None
+                if on_gfx9 is not None and on_gfx9():
+                    raise ValueError("bitsandbytes is not supported on ROCm gfx9 GPUs.")
+            if self.quantization_config.load_in_8bit and not self.enforce_eager:
+                logger.warning(
+                    "CUDA graph is not supported on BitsAndBytes 8bit yet, fallback to the eager mode."
+                )
+                self.enforce_eager = True
 
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1

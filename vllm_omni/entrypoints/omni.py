@@ -168,6 +168,15 @@ class OmniBase:
             cache_config = self._get_default_cache_config(cache_backend)
         return cache_config
 
+    def _normalize_quantization_config(self, quantization_config: Any | None) -> Any | None:
+        if isinstance(quantization_config, str):
+            try:
+                quantization_config = json.loads(quantization_config)
+            except json.JSONDecodeError:
+                logger.warning("Invalid quantization_config JSON, disabling quantization.")
+                quantization_config = None
+        return quantization_config
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # We temporally create a default config for diffusion stage.
@@ -177,6 +186,9 @@ class OmniBase:
             kwargs["dtype"] = str(kwargs["dtype"])
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
+        quantization_config = self._normalize_quantization_config(kwargs.get("quantization_config", None))
+        if quantization_config is not None:
+            kwargs["quantization_config"] = quantization_config
         # TODO: hack, calculate devices based on parallel config.
         devices = "0"
         if "parallel_config" in kwargs:

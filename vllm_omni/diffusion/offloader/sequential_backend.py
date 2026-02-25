@@ -89,6 +89,9 @@ def apply_sequential_offload(
     encoder_modules: list[nn.Module],
     device: torch.device,
     pin_memory: bool = True,
+    *,
+    offload_dit_modules: list[nn.Module] | None = None,
+    offload_encoder_modules: list[nn.Module] | None = None,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -101,6 +104,8 @@ def apply_sequential_offload(
         encoder_modules: Encoder modules to register hooks on
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
+        offload_dit_modules: Optional subset of DiT modules to offload
+        offload_encoder_modules: Optional subset of encoder modules to offload
 
     Example:
         >>> apply_sequential_offload(
@@ -110,11 +115,14 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
+    offload_dit_modules = offload_dit_modules if offload_dit_modules is not None else dit_modules
+    offload_encoder_modules = offload_encoder_modules if offload_encoder_modules is not None else encoder_modules
+
     # Register hooks on DiT modules (offload encoders when DiT runs)
     for dit_mod in dit_modules:
         registry = HookRegistry.get_or_create(dit_mod)
         hook = SequentialOffloadHook(
-            offload_targets=encoder_modules,
+            offload_targets=offload_encoder_modules,
             device=device,
             pin_memory=pin_memory,
         )
@@ -125,7 +133,7 @@ def apply_sequential_offload(
     for enc in encoder_modules:
         registry = HookRegistry.get_or_create(enc)
         hook = SequentialOffloadHook(
-            offload_targets=dit_modules,
+            offload_targets=offload_dit_modules,
             device=device,
             pin_memory=pin_memory,
         )
@@ -173,6 +181,23 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.warning("No encoder modules found, skipping model-level offloading")
             return
 
+        skip_components = set(getattr(pipeline, "_bnb_offload_skip_components", None) or set())
+        offload_dits = [
+            module
+            for name, module in zip(modules.dit_names, modules.dits)
+            if name not in skip_components
+        ]
+        offload_encoders = [
+            module
+            for name, module in zip(modules.encoder_names, modules.encoders)
+            if name not in skip_components
+        ]
+        if skip_components:
+            logger.debug("Skipping offload for quantized components: %s", sorted(skip_components))
+        if not offload_dits and not offload_encoders:
+            logger.warning("All offload candidates are quantized; skipping model-level offloading")
+            return
+
         # Move encoders to GPU
         for enc in modules.encoders:
             enc.to(self.device)
@@ -203,6 +228,8 @@ class ModelLevelOffloadBackend(OffloadBackend):
             encoder_modules=modules.encoders,
             device=self.device,
             pin_memory=self.config.pin_cpu_memory,
+            offload_dit_modules=offload_dits,
+            offload_encoder_modules=offload_encoders,
         )
 
         # Track modules for cleanup

@@ -27,6 +27,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.quantization.bitsandbytes import (
+    DiffusionBitsAndBytesConfig,
+    apply_bnb_quantization,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -120,6 +124,34 @@ class DiffusionModelRunner:
             time_after_load - time_before_load,
         )
         logger.info("Model runner: Model loaded successfully.")
+
+        # Optional diffusion quantization (e.g., bitsandbytes).
+        bnb_config = (
+            self.od_config.quantization_config
+            if isinstance(self.od_config.quantization_config, DiffusionBitsAndBytesConfig)
+            else None
+        )
+        if bnb_config is not None:
+            skip_modules = set(getattr(self.pipeline, "_bnb_quantized_components", set()) or set())
+            quantized_now = apply_bnb_quantization(self.pipeline, bnb_config, skip_modules=skip_modules)
+            if quantized_now:
+                if not hasattr(self.pipeline, "_bnb_quantized_components"):
+                    self.pipeline._bnb_quantized_components = set()
+                self.pipeline._bnb_quantized_components.update(quantized_now)
+            offload_requested = bool(
+                getattr(self.od_config, "enable_cpu_offload", False)
+                or getattr(self.od_config, "enable_layerwise_offload", False)
+            )
+            if offload_requested:
+                if bnb_config.load_in_8bit:
+                    skip_components = set(getattr(self.pipeline, "_bnb_quantized_components", set()) or set())
+                    self.pipeline._bnb_offload_skip_components = skip_components
+                    logger.warning(
+                        "bitsandbytes 8bit + offload: disabled for quantized components (stability)."
+                    )
+                else:
+                    self.pipeline._bnb_offload_skip_components = set()
+                    logger.info("bitsandbytes 4bit + offload: enabled.")
 
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(self.od_config, device=self.device)
