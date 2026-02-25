@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN, flash_attn_varlen_func
 
 N_FFT = 400
 HOP_LENGTH = 160
@@ -140,7 +140,7 @@ class Linear(nn.Linear):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_state: int, n_head: int):
+    def __init__(self, n_state: int, n_head: int, use_flash_attention: bool = True):
         super().__init__()
         self.n_head = n_head
         self.query = Linear(n_state, n_state)
@@ -148,7 +148,7 @@ class MultiHeadAttention(nn.Module):
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
 
-        self.use_flash_attention = True
+        self.use_flash_attention = use_flash_attention and HAS_FLASH_ATTN
 
     def forward(
         self,
@@ -159,15 +159,8 @@ class MultiHeadAttention(nn.Module):
         k = self.key(x)
         v = self.value(x)
 
-        if self.use_flash_attention:
-            if flash_attn_varlen_func is None:
-                x = self.qkv_attention_manual(q, k, v, cu_seqlens=cu_seqlens)
-            else:
-                if q.dtype not in [torch.float16, torch.bfloat16]:
-                    x = self.qkv_attention_manual(q, k, v, cu_seqlens=cu_seqlens)
-                    self.use_flash_attention = False
-                else:
-                    x = self.qkv_flash_attention(q, k, v, cu_seqlens=cu_seqlens)
+        if self.use_flash_attention and q.dtype in [torch.float16, torch.bfloat16]:
+            x = self.qkv_flash_attention(q, k, v, cu_seqlens=cu_seqlens)
         else:
             x = self.qkv_attention_manual(q, k, v, cu_seqlens=cu_seqlens)
 
