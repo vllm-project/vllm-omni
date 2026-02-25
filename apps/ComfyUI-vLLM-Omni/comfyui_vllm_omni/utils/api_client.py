@@ -47,10 +47,6 @@ class VLLMOmniClient:
         """Run text-to-image generation via DALLE API"""
         await self._check_model_exist(model)
 
-        # Exclude internal key in sampling_params
-        if sampling_params is not None:
-            sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
-
         size = f"{width}x{height}"
         payload = {
             "model": model,
@@ -117,10 +113,6 @@ class VLLMOmniClient:
     ) -> torch.Tensor:
         """Run image editing via DALLE API"""
         await self._check_model_exist(model)
-
-        # Exclude internal key in sampling_params
-        if sampling_params is not None:
-            sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
 
         size = f"{width}x{height}"
         image_filename = "image.png"  # Required for multipart form
@@ -432,12 +424,6 @@ class VLLMOmniClient:
         if sampling_params is not None:
             spec, _ = lookup_model_spec(model)
             is_single_sampling_param = isinstance(sampling_params, dict) or len(sampling_params) == 1
-
-            # Exclude internal key in sampling_params
-            if isinstance(sampling_params, dict):
-                sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
-            else:
-                sampling_params = [{k: v for k, v in sp.items() if k != "type"} for sp in sampling_params]
 
             if (spec is None and is_single_sampling_param) or (spec is not None and spec["stages"] == ["diffusion"]):
                 # Diffusion format: extra_body directly contains sampling params.

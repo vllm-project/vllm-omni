@@ -24,6 +24,7 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniUnderstanding,
     VLLMOmniVoiceClone,
 )
+from comfyui_vllm_omni.utils.types import AutoregressionSamplingParams, DiffusionSamplingParams
 from PIL import Image
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -60,45 +61,49 @@ class SamplingKind(StrEnum):
 
 
 # Pre-defined arguments to be used in function calls during the tests
-IMAGE_WIDTH = 512
-IMAGE_HEIGHT = 512
-DIFFUSION_SINGLE_SAMPLING_PARAMS = {
-    "type": "diffusion",
-    "n": 2,
-    "num_inference_steps": 30,
-    "guidance_scale": 6.0,
-    "true_cfg_scale": 1.5,
-}
+IMAGE_WIDTH = 64
+IMAGE_HEIGHT = 64
+DIFFUSION_SINGLE_SAMPLING_PARAMS = DiffusionSamplingParams(
+    {
+        "n": 2,
+        "num_inference_steps": 30,
+        "guidance_scale": 6.0,
+        "true_cfg_scale": 1.5,
+    }
+)
 
 AR_LIST_SAMPLING_PARAMS = [
-    {
-        "type": "autoregression",
-        "max_tokens": 64,
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "repetition_penalty": 1.0,
-        "seed": 21,
-    },
-    {
-        "type": "autoregression",
-        "max_tokens": 96,
-        "temperature": 0.75,
-        "top_p": 0.85,
-        "repetition_penalty": 1.05,
-        "seed": 22,
-    },
-    {
-        "type": "autoregression",
-        "max_tokens": 128,
-        "temperature": 0.8,
-        "top_p": 0.8,
-        "repetition_penalty": 1.1,
-        "seed": 23,
-    },
+    AutoregressionSamplingParams(
+        {
+            "max_tokens": 64,
+            "temperature": 0.6,
+            "top_p": 0.9,
+            "repetition_penalty": 1.0,
+            "seed": 21,
+        }
+    ),
+    AutoregressionSamplingParams(
+        {
+            "max_tokens": 96,
+            "temperature": 0.75,
+            "top_p": 0.85,
+            "repetition_penalty": 1.05,
+            "seed": 22,
+        }
+    ),
+    AutoregressionSamplingParams(
+        {
+            "max_tokens": 128,
+            "temperature": 0.8,
+            "top_p": 0.8,
+            "repetition_penalty": 1.1,
+            "seed": 23,
+        }
+    ),
 ]
 
 
-def _build_image_output(size: tuple[int, int] = (64, 64), color: str = "red") -> Image.Image:
+def _build_image_output(size: tuple[int, int] = (IMAGE_WIDTH, IMAGE_HEIGHT), color: str = "red") -> Image.Image:
     return Image.new("RGB", size, color=color)
 
 
@@ -190,8 +195,6 @@ def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
 
 def _assert_sampling_param_values(received: OmniSamplingParams, expected: dict[str, Any]):
     for key, expected_value in expected.items():
-        if key == "type":  # skip internal fields
-            continue
         actual_value = getattr(received, key, None)
         assert actual_value == expected_value, (
             f"Expected sampling param '{key}'={expected_value}, got {actual_value}. The received sampling params: {received}"
@@ -417,16 +420,17 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
         "height": IMAGE_HEIGHT,
     }
     if image_input:
-        kwargs["image"] = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+        kwargs["image"] = torch.zeros((1, IMAGE_WIDTH, IMAGE_HEIGHT, 3), dtype=torch.float32)
     if sampling_case.sampling_params is not None:
         kwargs["sampling_params"] = sampling_case.sampling_params
+    print(f"!!!!!! Calling {model} node.generate with kwargs: {sampling_case.sampling_params}")
 
     result = await node.generate(**kwargs)
 
     assert isinstance(result, tuple)
     assert len(result) == 1
     assert isinstance(result[0], torch.Tensor)
-    assert result[0].shape == (1, 64, 64, 3)
+    assert result[0].shape == (1, IMAGE_WIDTH, IMAGE_HEIGHT, 3)
 
 
 @pytest.mark.asyncio
@@ -467,7 +471,7 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
 async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
     node = VLLMOmniUnderstanding()
 
-    image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+    image = torch.zeros((1, IMAGE_WIDTH, IMAGE_HEIGHT, 3), dtype=torch.float32)
     video = VideoInput(b"mock_video_for_test")  # type: ignore[reportAbstractUsage]
     audio: AudioInput = {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000}
 

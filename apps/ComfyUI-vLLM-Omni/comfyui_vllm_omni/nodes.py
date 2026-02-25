@@ -6,7 +6,12 @@ from comfy_api.input import AudioInput, VideoInput
 from .utils.api_client import VLLMOmniClient
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
-from .utils.types import AudioFormat
+from .utils.types import (
+    AudioFormat,
+    AutoregressionSamplingParams,
+    DiffusionSamplingParams,
+    QwenTTSModelSpecificParams,
+)
 from .utils.validators import (
     add_sampling_parameters_to_stage,
     validate_model_and_sampling_params_types,
@@ -290,8 +295,7 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
         logger.info("Got extra kwargs in TTS: %s", kwargs)
 
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params.pop("type", None)
-        if not is_qwen_tts and extra_params_type == "qwen-tts":
+        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
@@ -354,8 +358,7 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
         **kwargs,
     ):
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params.pop("type", None)
-        if not is_qwen_tts and extra_params_type == "qwen-tts":
+        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
@@ -420,10 +423,7 @@ class VLLMOmniARSampling:
     CATEGORY = "vLLM-Omni/Sampling Params"
 
     def get_params(self, seed, **kwargs):
-        params = {
-            "type": "autoregression",  # for internal use, removed before sending the request
-            **kwargs,
-        }
+        params = AutoregressionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
         return (params,)
@@ -507,10 +507,7 @@ class VLLMOmniDiffusionSampling:
     CATEGORY = "vLLM-Omni/Sampling Params"
 
     def get_params(self, seed, **kwargs):
-        params = {
-            "type": "diffusion",  # for internal use, removed before sending the request
-            **kwargs,
-        }
+        params = DiffusionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
         return (params,)
@@ -574,4 +571,4 @@ class VLLMOmniQwenTTSParams:
     CATEGORY = "vLLM-Omni/TTS Params"
 
     def get_params(self, **kwargs):
-        return ({"type": "qwen-tts", **kwargs},)
+        return (QwenTTSModelSpecificParams(kwargs),)
