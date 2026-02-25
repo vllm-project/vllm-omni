@@ -22,6 +22,7 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.utils import (
+    filter_dataclass_kwargs,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -151,7 +152,7 @@ class OmniLLM(LLM):
             compilation_config=compilation_config_instance,
             structured_outputs_config=structured_outputs_instance,
             omni_kv_config=omni_kv_config,
-            **kwargs,
+            **filter_dataclass_kwargs(OmniEngineArgs, kwargs),
         )
 
         # Create the Engine (autoselects V0 vs V1)

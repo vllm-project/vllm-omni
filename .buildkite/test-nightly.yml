@@ -1,7 +1,7 @@
 steps:
   - label: "Omni Model Test with H100"
     timeout_in_minutes: 60
-    depends_on: image-build
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -38,7 +38,7 @@ steps:
 
   - label: "Omni Model Test"
     timeout_in_minutes: 60
-    depends_on: image-build
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG
@@ -56,10 +56,9 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-
   - label: "Omni Model Perf Test"
     timeout_in_minutes: 120
-    depends_on: image-build
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
