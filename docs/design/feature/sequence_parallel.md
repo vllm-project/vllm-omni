@@ -1,4 +1,4 @@
-# Support Sequence Parallel
+# Sequence Parallel
 
 This section describes how to add Sequence Parallel (SP) to a diffusion transformer model. We use the Qwen-Image transformer and Wan2.2 transformer as reference implementations.
 
