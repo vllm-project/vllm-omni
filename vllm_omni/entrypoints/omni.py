@@ -3,6 +3,7 @@
 import json
 import multiprocessing as mp
 import os
+import threading
 import time
 import uuid
 import weakref
@@ -11,10 +12,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal, overload
 
 import huggingface_hub
+import msgspec.msgpack
+import zmq
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from vllm import SamplingParams
 from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.utils import get_engine_client_zmq_addr
 
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
@@ -35,10 +40,9 @@ from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
     inject_omni_kv_config,
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
-    resolve_model_config_path,
+    load_and_resolve_stage_configs,
 )
+from vllm_omni.entrypoints.zmq_utils import ZmqQueue
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -49,7 +53,16 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
+def _weak_close_cleanup(
+    stage_list,
+    stage_in_queues,
+    stage_out_queues,
+    ray_pg,
+    zmq_ctx=None,
+    handshake_stop: threading.Event | None = None,
+    zmq_handshake_socket: zmq.Socket | None = None,
+    handshake_thread: threading.Thread | None = None,
+):
     """Weak reference cleanup function for OmniBase instances."""
     if stage_list:
         for q in stage_in_queues:
@@ -57,12 +70,33 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+        for q in stage_out_queues:
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
         for stage in stage_list:
             try:
                 stage.stop_stage_worker()
             except Exception as e:
                 logger.warning(f"Failed to stop stage worker: {e}")
     try_close_ray(ray_pg)
+
+    # Gracefully shutdown handshake server thread
+    if handshake_stop is not None:
+        handshake_stop.set()
+    if handshake_thread is not None:
+        handshake_thread.join(timeout=2.0)
+        if handshake_thread.is_alive():
+            logger.warning("Handshake server thread did not terminate gracefully within timeout")
+
+    # Close ZMQ resources after thread has exited
+    if zmq_handshake_socket is not None:
+        zmq_handshake_socket.close(0)
+    if zmq_ctx is not None:
+        zmq_ctx.term()
 
 
 def _dummy_snapshot_download(model_id):
@@ -125,12 +159,21 @@ class OmniBase:
 
         # Stage management attributes
         self.stage_list: list[OmniStage] = []
-        self._stage_in_queues: list[mp.Queue] = []
-        self._stage_out_queues: list[mp.Queue] = []
+        self._stage_in_queues: list[Any] = []
+        self._stage_out_queues: list[Any] = []
         self._stages_ready: set[int] = set()
         self._ray_pg = None
         self._queue_cls = None
         self._ctx = None
+        self._zmq_ctx: zmq.Context | None = None
+        self._zmq_master_address: str | None = None
+        self._zmq_master_port: int | None = None
+        self._zmq_handshake_socket: zmq.Socket | None = None
+        self._handshake_thread: threading.Thread | None = None
+        self._handshake_stop: threading.Event | None = None
+        self._handshake_endpoints: dict[int, tuple[str, str]] = {}
+        self._handshake_seen: set[int] = set()  # Track which stage IDs have completed ZMQ handshake
+        self._single_stage_id: int | None = None  # Optional: deploy only a specific stage ID
 
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
@@ -206,35 +249,24 @@ class OmniBase:
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
-    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Initialize stage list management."""
-        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
-        shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
-        init_timeout = kwargs.get("init_timeout", 300)
-        worker_backend = kwargs.get("worker_backend", "multi_process")
-        ray_address = kwargs.get("ray_address", None)
-        batch_timeout = kwargs.get("batch_timeout", 10)
+    def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+        """Resolve stage configs and inject defaults shared by orchestrator/headless."""
+        # TODO(wuhang):
+        # Remove kwargs as parameters in the future.
+        # Use dataclass directly for engine args.
+
         stage_configs_path = kwargs.get("stage_configs_path", None)
-        log_stats = kwargs.get("log_stats", False)
-
-        ### base engine args
-        tokenizer = kwargs.get("tokenizer", None)
-
-        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
 
         # Load stage configurations from YAML
-        if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
-            if not self.stage_configs:
-                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
-                self.stage_configs = OmegaConf.create(default_stage_cfg)
-        else:
-            self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model,
+            stage_configs_path,
+            kwargs,
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+        )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
-        for cfg in self.stage_configs:
+        for cfg in stage_configs:
             try:
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
@@ -252,6 +284,27 @@ class OmniBase:
                         cfg.engine_args.lora_scale = lora_scale
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
+
+        return config_path, stage_configs
+
+    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
+        """Initialize stage list management."""
+        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
+        shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
+        init_timeout = kwargs.get("init_timeout", 300)
+        worker_backend = kwargs.get("worker_backend", "multi_process")
+        ray_address = kwargs.get("ray_address", None)
+        batch_timeout = kwargs.get("batch_timeout", 10)
+        log_stats = kwargs.get("log_stats", False)
+        self._single_stage_id = kwargs.get("stage_id", None)
+        self._zmq_master_address = kwargs.get("omni_master_address", None)
+        if self._zmq_master_address is None:
+            self._zmq_master_address = "127.0.0.1"
+            logger.info("No omni_master_address provided, defaulting to localhost (127.0.0.1)")
+        self._zmq_master_port = kwargs.get("omni_master_port", None)
+
+        # Resolve stage configs shared by orchestrator/headless paths.
+        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -281,7 +334,7 @@ class OmniBase:
         self.stage_list = [st for _, st in results]
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
-        logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
+        logger.info(f"[{self._name}] Loaded {len(self.stage_list)} stages")
 
         if self.worker_backend == "ray":
             self._queue_cls = get_ray_queue_class()
@@ -307,10 +360,34 @@ class OmniBase:
             self._ray_pg = create_placement_group(
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
+        else:
+            # Initialize ZMQ context
+            if self._zmq_ctx is None:
+                self._zmq_ctx = zmq.Context()
+
+            # Allocate endpoints for each stage
+            total_stages = len(self.stage_configs)
+            self._handshake_endpoints = {}
+            for sid in range(total_stages):
+                in_endpoint = get_engine_client_zmq_addr(local_only=False, host=self._zmq_master_address)
+                out_endpoint = get_engine_client_zmq_addr(local_only=False, host=self._zmq_master_address)
+                self._handshake_endpoints[sid] = (in_endpoint, out_endpoint)
+                logger.debug(
+                    f"[{self._name}] Allocated endpoints for stage-{sid}: in={in_endpoint}, out={out_endpoint}"
+                )
+
+            # Start handshake server
+            self.start_handshake_server()
 
         for stage_id, stage in enumerate[OmniStage](self.stage_list):
-            in_q = self._queue_cls()
-            out_q = self._queue_cls()
+            if self.worker_backend == "ray":
+                in_q = self._queue_cls()
+                out_q = self._queue_cls()
+            else:
+                in_endpoint, out_endpoint = self._handshake_endpoints[stage_id]
+                in_q = ZmqQueue(self._zmq_ctx, zmq.PUSH, bind=in_endpoint)
+                out_q = ZmqQueue(self._zmq_ctx, zmq.PULL, bind=out_endpoint)
+
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
             stage.attach_queues(in_q, out_q)
@@ -332,6 +409,12 @@ class OmniBase:
             except Exception as e:
                 logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
 
+            if self._single_stage_id is not None and stage_id != int(self._single_stage_id):
+                logger.info(
+                    f"[{self._name}] Skipping initialization of stage-{stage_id} worker due to single_stage_id setting"
+                )
+                continue
+
             stage.init_stage_worker(
                 model,
                 is_async=self.is_async,
@@ -341,6 +424,7 @@ class OmniBase:
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
                 ray_placement_group=self._ray_pg,
+                ignore_runtime_config=True if self._single_stage_id is not None else False,
             )
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
@@ -351,6 +435,9 @@ class OmniBase:
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
         """Wait for all stages to report readiness with optimized polling."""
+        if self._single_stage_id is not None and self.worker_backend != "ray":
+            timeout = self._wait_for_handshakes(timeout)
+
         num_stages = len(self.stage_list)
         deadline = time.time() + max(0, int(timeout))
 
@@ -501,6 +588,129 @@ class OmniBase:
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
+    def _process_handshake_message(self, msg: Any) -> dict[str, Any]:
+        """Process incoming handshake message and generate response.
+
+        Args:
+            msg: Decoded message from client
+
+        Returns:
+            Response dictionary with ok status and either endpoints or error
+        """
+        if not isinstance(msg, dict) or msg.get("type") != "handshake":
+            return {"ok": False, "error": "invalid handshake payload"}
+
+        try:
+            stage_id = int(msg.get("stage_id"))
+        except (TypeError, ValueError) as e:
+            return {"ok": False, "error": f"invalid stage_id: {e}"}
+
+        endpoints = self._handshake_endpoints.get(stage_id)
+        if endpoints is None:
+            return {"ok": False, "error": f"unknown stage_id: {stage_id}"}
+
+        # Mark stage as seen and prepare success response
+        self._handshake_seen.add(stage_id)
+        in_endpoint, out_endpoint = endpoints
+
+        logger.info(
+            "[%s] Handshake received from stage-%s",
+            self._name,
+            stage_id,
+        )
+
+        return {
+            "ok": True,
+            "in_endpoint": in_endpoint,
+            "out_endpoint": out_endpoint,
+        }
+
+    def _run_handshake_server_loop(self) -> None:
+        """Main loop for handshake server - polls for messages and responds."""
+        poller = zmq.Poller()
+        poller.register(self._zmq_handshake_socket, zmq.POLLIN)
+
+        try:
+            while not self._handshake_stop.is_set():
+                events = poller.poll(1000)
+                has_message = any(sock == self._zmq_handshake_socket and event == zmq.POLLIN for sock, event in events)
+                if not has_message:
+                    continue
+
+                msg = msgspec.msgpack.decode(self._zmq_handshake_socket.recv())
+                response = msgspec.msgpack.encode(self._process_handshake_message(msg))
+                self._zmq_handshake_socket.send(response)
+        finally:
+            poller.unregister(self._zmq_handshake_socket)
+
+    def start_handshake_server(self) -> None:
+        """Start the ZMQ handshake server.
+
+        The handshake server allows distributed stages to discover their
+        queue endpoints by querying the orchestrator with their stage_id.
+        Skips starting if the server is already running or ZMQ is not initialized.
+        """
+        # Skip if already running or ZMQ not initialized
+        if self._handshake_thread is not None or self._zmq_ctx is None:
+            return
+
+        # Skip if master address/port not configured
+        if not self._zmq_master_address or self._zmq_master_port is None:
+            return
+
+        # Create server endpoint and socket
+        endpoint = get_engine_client_zmq_addr(
+            local_only=False, host=self._zmq_master_address, port=int(self._zmq_master_port)
+        )
+
+        self._handshake_stop = threading.Event()
+        self._zmq_handshake_socket = make_zmq_socket(self._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000)
+
+        # Start server thread
+        self._handshake_thread = threading.Thread(
+            target=self._run_handshake_server_loop, daemon=True, name="zmq-handshake-server"
+        )
+        self._handshake_thread.start()
+
+    def _wait_for_handshakes(self, timeout: int = 120) -> int:
+        """Wait for handshakes from all expected stages.
+
+        Args:
+            timeout: Timeout in seconds for waiting for handshakes. Default is 120s.
+
+        Returns:
+            Remaining timeout in seconds after waiting for handshakes.
+        """
+        total_stages = len(self.stage_configs)
+        expected = set(range(total_stages)) - {int(self._single_stage_id)}
+        if not expected:
+            return timeout
+
+        deadline = time.time() + max(0, int(timeout))
+        logger.info(f"[{self._name}] Waiting for handshakes from stages: {expected} (timeout: {timeout}s)")
+
+        # NOTE: _handshake_seen may be updated from the handshake server thread.
+        # It is intentionally used here without additional locking because:
+        #   - _handshake_seen only ever grows (stages are added but never removed), and
+        #   - we only check membership and set inclusion relative to `expected`.
+        # Under these monotonic semantics and the CPython GIL, concurrent reads/writes
+        # are safe for this usage and cannot violate correctness: we may observe a
+        # slightly stale view, but the loop condition remains valid and eventually
+        # becomes true once all expected stages have handshaked or the timeout elapses.
+        while not expected.issubset(self._handshake_seen) and time.time() < deadline:
+            time.sleep(1.0)
+
+        remaining_timeout = max(0, int(deadline - time.time()))
+
+        if not expected.issubset(self._handshake_seen):
+            missing = sorted(expected - self._handshake_seen)
+            logger.warning(
+                f"[{self._name}] Handshake timeout: {len(self._handshake_seen)}/{len(expected)} "
+                f"stages completed handshake. Missing stages: {missing}"
+            )
+
+        return remaining_timeout
+
     @property
     def _name(self) -> str:
         return "OmniBase"
@@ -546,7 +756,12 @@ class Omni(OmniBase):
             _weak_close_cleanup,
             self.stage_list,
             self._stage_in_queues,
+            self._stage_out_queues,
             self._ray_pg,
+            self._zmq_ctx,
+            self._handshake_stop,
+            self._zmq_handshake_socket,
+            self._handshake_thread,
         )
 
     @overload

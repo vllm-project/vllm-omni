@@ -564,14 +564,14 @@ class ZImagePipeline(nn.Module):
 
             # Run CFG only if configured AND scale is non-zero
             apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
+            latents_typed = latents.to(self.od_config.dtype)
 
             if apply_cfg:
-                latents_typed = latents.to(self.transformer.dtype)
                 latent_model_input = latents_typed.repeat(2, 1, 1, 1)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                 timestep_model_input = timestep.repeat(2)
             else:
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents_typed
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
 

@@ -18,6 +18,37 @@ warnings.filterwarnings(
     category=DeprecationWarning,
 )
 
+MODEL = "riverclouds/qwen_image_random"
+
+
+class _FakeStageRequestStats:
+    """Fake StageRequestStats object with necessary attributes aligned with real StageRequestStats."""
+
+    def __init__(self, **kwargs):
+        # Required fields (with defaults for testing)
+        self.batch_id = kwargs.get("batch_id", 0)
+        self.batch_size = kwargs.get("batch_size", 1)
+        self.num_tokens_in = kwargs.get("num_tokens_in", 0)
+        self.num_tokens_out = kwargs.get("num_tokens_out", 1)
+        self.stage_gen_time_ms = kwargs.get("stage_gen_time_ms", 10.0)
+        self.rx_transfer_bytes = kwargs.get("rx_transfer_bytes", 0)
+        self.rx_decode_time_ms = kwargs.get("rx_decode_time_ms", 0.0)
+        self.rx_in_flight_time_ms = kwargs.get("rx_in_flight_time_ms", 0.0)
+        self.stage_stats = kwargs.get("stage_stats", None)
+
+        # Optional fields
+        self.stage_id = kwargs.get("stage_id", None)
+        self.final_output_type = kwargs.get("final_output_type", None)
+        self.request_id = kwargs.get("request_id", None)
+        self.postprocess_time_ms = kwargs.get("postprocess_time_ms", 0.0)
+        self.diffusion_metrics = kwargs.get("diffusion_metrics", None)
+        self.audio_generated_frames = kwargs.get("audio_generated_frames", 0)
+
+        # Allow additional attributes for flexibility
+        for key, value in kwargs.items():
+            if not hasattr(self, key):
+                setattr(self, key, value)
+
 
 class _FakeEngineArgs(dict):
     """Fake engine args that can be used both as object attributes and as **kwargs."""
@@ -60,14 +91,62 @@ class _FakeQueue:
     def put_nowait(self, item):
         self._queue.put_nowait(item)
 
-    def get(self):
-        return self._queue.get()
+    def get(self, timeout=None):
+        if timeout is None:
+            return self._queue.get()
+        return self._queue.get(timeout=timeout)
 
     def get_nowait(self):
         return self._queue.get_nowait()
 
     def empty(self):
         return self._queue.empty()
+
+
+class _FakeZmqQueue:
+    """Fake ZmqQueue that wraps _FakeQueue and matches ZmqQueue interface."""
+
+    def __init__(
+        self,
+        ctx=None,
+        socket_type=None,
+        *,
+        bind: str | None = None,
+        connect: str | None = None,
+        recv_timeout_ms: int | None = None,
+        send_timeout_ms: int | None = None,
+    ):
+        """Initialize fake ZMQ queue with same signature as real ZmqQueue."""
+        self._queue = _FakeQueue(maxsize=0)
+        # Determine endpoint from bind or connect
+        path = bind if bind is not None else connect
+        self.endpoint = path or f"fake://zmq-endpoint-{id(self)}"
+        self._recv_timeout_ms = recv_timeout_ms
+        self._send_timeout_ms = send_timeout_ms
+
+    def put(self, obj: Any) -> None:
+        """Send an object to the queue."""
+        self._queue.put(obj)
+
+    def put_nowait(self, obj: Any) -> None:
+        """Send an object to the queue without blocking."""
+        self._queue.put_nowait(obj)
+
+    def get(self, timeout: float | None = None) -> Any:
+        """Receive an object from the queue with optional timeout in seconds."""
+        return self._queue.get(timeout=timeout)
+
+    def get_nowait(self) -> Any:
+        """Receive an object from the queue without blocking."""
+        return self._queue.get_nowait()
+
+    def empty(self) -> bool:
+        """Check if the queue is empty without blocking."""
+        return self._queue.empty()
+
+    def close(self) -> None:
+        """Close the queue."""
+        pass
 
 
 class _FakeStage:
@@ -272,6 +351,19 @@ def _setup_multiprocessing_mocks(monkeypatch):
     monkeypatch.setattr(mp, "get_context", _mock_get_context, raising=False)
     monkeypatch.setattr(mp, "Process", fake_process_class, raising=False)
 
+    # Mock ZmqQueue to use _FakeZmqQueue
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.zmq_utils.ZmqQueue",
+        _FakeZmqQueue,
+        raising=False,
+    )
+    # Also mock where ZmqQueue is imported/used
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.omni_stage.ZmqQueue",
+        _FakeZmqQueue,
+        raising=False,
+    )
+
 
 def _setup_ipc_mocks(monkeypatch):
     """Helper function to set up IPC function mocks."""
@@ -322,6 +414,65 @@ def _setup_log_mocks(monkeypatch):
         _FakeOrchestratorMetrics,
         raising=False,
     )
+
+
+def _setup_connector_mocks(monkeypatch, omni_module=None):
+    """Helper function to set up connector mocks for stage-to-stage forwarding.
+
+    If omni_module is provided, mocks directly on the module. Otherwise, uses string path.
+    """
+
+    # Mock initialize_orchestrator_connectors to return fake connectors
+    def _fake_initialize_orchestrator_connectors(config_path, worker_backend=None, shm_threshold_bytes=None):
+        # Create fake connectors for all stage-to-stage edges
+        # Each connector is just a mock object that will be passed to try_send_via_connector
+        fake_connectors = {}
+        # Add connectors for common edges (0->1, 1->2, etc.)
+        for i in range(10):  # Support up to 10 stages
+            fake_connectors[(str(i), str(i + 1))] = MagicMock()
+        return None, fake_connectors
+
+    if omni_module is not None:
+        # Mock directly on the omni module where it's used (after import)
+        monkeypatch.setattr(omni_module, "initialize_orchestrator_connectors", _fake_initialize_orchestrator_connectors)
+    else:
+        # Mock via string path (before import)
+        monkeypatch.setattr(
+            "vllm_omni.entrypoints.omni.initialize_orchestrator_connectors",
+            _fake_initialize_orchestrator_connectors,
+            raising=False,
+        )
+
+
+def _setup_connector_adapter_mock(monkeypatch, omni_module):
+    """Helper function to mock try_send_via_connector on the omni module.
+
+    This must be called AFTER importing omni module, to mock the function where it's actually used.
+    """
+
+    # Mock try_send_via_connector to always succeed
+    def _fake_try_send_via_connector(
+        connector,
+        stage_id,
+        next_stage_id,
+        req_id,
+        next_inputs,
+        sampling_params,
+        original_prompt,
+        next_stage_queue_submit_fn,
+        metrics,
+    ):
+        # Simulate successful send by calling the submit function
+        task = {
+            "request_id": req_id,
+            "engine_inputs": next_inputs,
+            "sampling_params": sampling_params,
+        }
+        next_stage_queue_submit_fn(task)
+        return True
+
+    # Mock directly on the omni module where it's used
+    monkeypatch.setattr(omni_module, "try_send_via_connector", _fake_try_send_via_connector)
 
 
 @pytest.fixture(autouse=True)
@@ -449,10 +600,19 @@ def mock_get_config(monkeypatch):
 def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_config):
     """Test that stage configs are auto-loaded when stage_configs_path is None."""
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [
-            _FakeStageConfig(fake_stage_config),
-            _FakeStageConfig(fake_stage_config),
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        cfg0 = dict(fake_stage_config)
+        cfg0["stage_id"] = 0
+        cfg1 = dict(fake_stage_config)
+        cfg1["stage_id"] = 1
+        return None, [
+            _FakeStageConfig(cfg0),
+            _FakeStageConfig(cfg1),
         ]
 
     # Remove modules from cache BEFORE setting mocks
@@ -471,10 +631,11 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
-    # Mock load_stage_configs_from_model
+    # Mock load_and_resolve_stage_configs
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -489,13 +650,13 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     # Import the module after mocks are set
     import vllm_omni.entrypoints.omni as omni_module
 
-    # Patch the imported function and class in the module
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
+    # Patch the imported class in the module
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
     # Verify: auto-loaded stage_configs and stage_list have consistent count
     assert isinstance(omni.stage_configs, list)
     assert len(omni.stage_configs) == 2
@@ -514,8 +675,13 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
 def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     """Test that generate raises ValueError when sampling_params_list length doesn't match."""
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(fake_stage_config)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(fake_stage_config)]
 
     import sys
 
@@ -531,14 +697,10 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
-        _fake_loader,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -550,12 +712,12 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
     with pytest.raises(ValueError):
         omni.generate(prompts=["hi"], sampling_params_list=[])
 
@@ -563,11 +725,18 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
 def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     """Test multi-stage generation pipeline with queue polling."""
     stage_cfg0 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
     stage_cfg1["processed_input"] = ["processed-for-stage-1"]
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
 
     import sys
 
@@ -575,6 +744,8 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
         "vllm_omni.entrypoints.omni_stage",
+        "vllm_omni.distributed.omni_connectors.adapter",
+        "vllm_omni.distributed.omni_connectors",
     ]:
         if module_name in sys.modules:
             del sys.modules[module_name]
@@ -585,12 +756,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     _setup_log_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
-        _fake_loader,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -602,8 +768,11 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
+    # Apply connector and adapter mocks after importing omni module
+    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -612,7 +781,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
 
     # Generate the expected request ID format: "0_<uuid>"
     expected_request_id = f"0_{test_uuid}"
@@ -625,7 +794,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     # Stage 1 output (will be collected after stage 0 forwards to it)
@@ -637,7 +806,7 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1, "text": "s1"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -662,11 +831,18 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
 def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
     """Test single-stage generation pipeline with multiple inputs in one batch."""
     stage_cfg0 = dict(fake_stage_config)
-    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg0["final_output"] = False
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
 
     import sys
 
@@ -674,6 +850,8 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
         "vllm_omni.entrypoints.omni_stage",
+        "vllm_omni.distributed.omni_connectors.adapter",
+        "vllm_omni.distributed.omni_connectors",
     ]:
         if module_name in sys.modules:
             del sys.modules[module_name]
@@ -684,7 +862,7 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
     _setup_log_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -696,8 +874,11 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
+    # Apply connector and adapter mocks after importing omni module
+    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -706,7 +887,7 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
 
     # Generate the expected request ID format: "0_<uuid>"
     expected_request_id = f"0_{test_uuid}"
@@ -718,28 +899,28 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[0]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "s0"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -768,12 +949,19 @@ def test_generate_pipeline_with_batch_input(monkeypatch, fake_stage_config):
 def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     """Test that generate returns empty list when all stages have final_output=False."""
     stage_cfg0 = dict(fake_stage_config)
-    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg0["final_output"] = False
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
     stage_cfg1["final_output"] = False
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
 
     import sys
 
@@ -781,6 +969,8 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
         "vllm_omni.entrypoints.omni_stage",
+        "vllm_omni.distributed.omni_connectors.adapter",
+        "vllm_omni.distributed.omni_connectors",
     ]:
         if module_name in sys.modules:
             del sys.modules[module_name]
@@ -791,7 +981,7 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     _setup_log_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -803,8 +993,11 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
+    # Apply connector and adapter mocks after importing omni module
+    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -813,7 +1006,7 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
 
     # Generate the expected request ID format: "0_<uuid>"
     expected_request_id = f"0_{test_uuid}"
@@ -847,12 +1040,19 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
 def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_config):
     """Test that generate uses default sampling params when sampling_params_list is None."""
     stage_cfg0 = dict(fake_stage_config)
-    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg0["stage_id"] = 0
     stage_cfg0["final_output"] = False
+    stage_cfg1 = dict(fake_stage_config)
+    stage_cfg1["stage_id"] = 1
     stage_cfg1["final_output"] = False
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(stage_cfg0), _FakeStageConfig(stage_cfg1)]
 
     import sys
 
@@ -860,6 +1060,8 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
         "vllm_omni.entrypoints.utils",
         "vllm_omni.entrypoints.omni",
         "vllm_omni.entrypoints.omni_stage",
+        "vllm_omni.distributed.omni_connectors.adapter",
+        "vllm_omni.distributed.omni_connectors",
     ]:
         if module_name in sys.modules:
             del sys.modules[module_name]
@@ -870,7 +1072,7 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     _setup_log_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -882,8 +1084,11 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
+    # Apply connector and adapter mocks after importing omni module
+    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -892,7 +1097,7 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
 
     # Generate the expected request ID format: "0_<uuid>"
     expected_request_id = f"0_{test_uuid}"
@@ -902,14 +1107,14 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     omni.stage_list[1]._out_q.put_nowait(
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 1}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
     # Use the default sampling params
@@ -919,8 +1124,13 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
 def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     """Test that _wait_for_stages_ready handles timeout correctly."""
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(fake_stage_config)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(fake_stage_config)]
 
     import sys
 
@@ -936,9 +1146,10 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -961,13 +1172,13 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStageNoReady(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
     # Use very short timeout
-    omni = Omni(model="any", init_timeout=0.01)
+    omni = Omni(model=MODEL, init_timeout=0.01)
     # Verify that no stages are ready
     assert len(omni._stages_ready) == 0
 
@@ -975,8 +1186,13 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
 def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     """Test that generate handles error messages from stages correctly."""
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(fake_stage_config)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(fake_stage_config)]
 
     import sys
 
@@ -992,9 +1208,10 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -1006,8 +1223,8 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -1016,7 +1233,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
 
     # Generate the expected request ID format: "0_<uuid>"
     expected_request_id = f"0_{test_uuid}"
@@ -1034,7 +1251,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
         {
             "request_id": expected_request_id,
             "engine_outputs": [{"stage": 0, "text": "result"}],
-            "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
+            "metrics": _FakeStageRequestStats(num_tokens_out=1, stage_gen_time_ms=10.0),
         }
     )
 
@@ -1050,8 +1267,13 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
 def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     """Test that close() sends shutdown signal to all input queues."""
 
-    def _fake_loader(model: str, base_engine_args=None):
-        return [_FakeStageConfig(fake_stage_config)]
+    def _fake_loader(
+        model: str,
+        stage_configs_path: str | None = None,
+        base_engine_args: dict | None = None,
+        default_stage_cfg_factory=None,
+    ):
+        return None, [_FakeStageConfig(fake_stage_config)]
 
     import sys
 
@@ -1067,9 +1289,10 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     _setup_multiprocessing_mocks(monkeypatch)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch)
 
     monkeypatch.setattr(
-        "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
         _fake_loader,
         raising=False,
     )
@@ -1081,12 +1304,12 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
 
     import vllm_omni.entrypoints.omni as omni_module
 
-    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", _fake_loader)
     monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(model="any", init_timeout=1)
+    omni = Omni(model=MODEL, init_timeout=1)
 
     # Call close
     omni.close()

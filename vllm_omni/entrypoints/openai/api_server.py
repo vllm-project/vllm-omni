@@ -31,9 +31,15 @@ from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
-from vllm.entrypoints.openai.api_server import base, load_log_config
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
+
+# vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
+# Keep a fallback for older/newer upstream layouts during rebase windows.
+try:
+    from vllm.entrypoints.serve.instrumentator.basic import base
+except ModuleNotFoundError:
+    from vllm.entrypoints.openai.basic.api_router import base
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -53,7 +59,8 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.translations.serving import (
+from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
+from vllm.entrypoints.openai.speech_to_text.serving import (
     OpenAIServingTranscription,
     OpenAIServingTranslation,
 )
@@ -195,7 +202,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
     # Load logging config for uvicorn if specified
-    log_config = load_log_config(getattr(args, "log_config_file", None))
+    log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
@@ -211,7 +218,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         if not supported_tasks:
             supported_tasks = ("generate",)
 
-        app = build_openai_app(args)
+        # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
+        app = build_openai_app(args, supported_tasks)
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
