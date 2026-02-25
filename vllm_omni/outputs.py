@@ -258,7 +258,6 @@ class OmniRequestOutput:
         ]
         return f"OmniRequestOutput({', '.join(parts)})"
 
- 
     def _repr_multiline(self, indent: str = "") -> str:
         """Helper to produce multi-line, indented repr for nested logging."""
         images_repr = f"[{len(self.images)} PIL Images]" if self.images else "[]"
@@ -274,9 +273,7 @@ class OmniRequestOutput:
         # Format metrics with each key-value pair on a separate line
         if self.metrics:
             metrics_indent = indent + "    "
-            metrics_lines = f",\n{metrics_indent}".join(
-                f"{k!r}: {v!r}" for k, v in self.metrics.items()
-            )
+            metrics_lines = f",\n{metrics_indent}".join(f"{k!r}: {v!r}" for k, v in self.metrics.items())
             metrics_repr = f"{{\n{metrics_indent}{metrics_lines}\n{indent}  }}"
         else:
             metrics_repr = "{}"
