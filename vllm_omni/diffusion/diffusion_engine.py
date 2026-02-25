@@ -118,9 +118,14 @@ class DiffusionEngine:
             "postprocess_time_ms": round(postprocess_time * 1000,2),
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
+            "postprocess_time_ms": postprocess_time * 1000,
             "denoise_time_per_step_ms": 0.0,
             "vae_time_ms": 0.0,
         }
+        if self.pre_process_func is not None:
+            metrics["preprocessing_time_ms"] = preprocess_time * 1000
+
+         # Handle single request or multiple requests
 
 
         dit_time_seconds = metrics["dit_time_ms"] / 1000
