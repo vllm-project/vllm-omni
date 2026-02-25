@@ -1151,12 +1151,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Inject omni-specific kwargs into forward and cache model output"""
         model_kwargs_extra = self._build_model_kwargs_extra()
 
-        runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
-        if runtime_info:
-            for i, info in enumerate(runtime_info):
-                if info:
-                    logger.debug(f"[OMNI] req[{i}] runtime_additional_information keys: {list(info.keys())}")
-
         model_output = super()._model_forward(
             input_ids=input_ids,
             positions=positions,
