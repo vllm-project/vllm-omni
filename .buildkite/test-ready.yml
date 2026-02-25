@@ -32,10 +32,17 @@ steps:
         TEST_END=$(date +%s)
         TEST_DURATION=$((TEST_END - TEST_START))
 
-      - |
-        buildkite-agent annotate --style "success" --context "test-time-${BUILDKITE_JOB_ID}" \
-          "<h3>✅ Diffusion Model Test : ${TEST_DURATION} second</h3>"
-        buildkite-agent meta-data set "test-duration-${BUILDKITE_JOB_ID}" "${TEST_DURATION}"
+        echo "TEST_START=$TEST_START"
+        echo "TEST_END=$TEST_END"
+        echo "TEST_DURATION=$TEST_DURATION"
+
+        if [ -n "$TEST_DURATION" ]; then
+          buildkite-agent annotate --style "success" --context "test-time-${BUILDKITE_JOB_ID}" \
+            "<h3>✅ Diffusion Model Test : ${TEST_DURATION} seconds</h3>"
+          buildkite-agent meta-data set "test-duration-${BUILDKITE_JOB_ID}" "${TEST_DURATION}"
+        else
+          echo "⚠️ TEST_DURATION is empty, skipping annotation and metadata."
+        fi
     agents:
       queue: "gpu_1_queue"
 
