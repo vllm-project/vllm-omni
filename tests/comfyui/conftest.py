@@ -80,7 +80,3 @@ def _setup_comfyui_test_environment():
     sys.modules["comfy_api.input"] = mock_comfy_api_input
     sys.modules["comfy_extras"] = mock_comfy_extras
     sys.modules["comfy_extras.nodes_audio"] = mock_nodes_audio
-
-
-# Run setup immediately when conftest is imported (before pytest_configure for early loading)
-_setup_comfyui_test_environment()

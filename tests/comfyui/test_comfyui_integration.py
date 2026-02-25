@@ -332,6 +332,9 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
         if server_process.is_alive():
             server_process.terminate()
             server_process.join(timeout=5)
+            if server_process.is_alive():
+                server_process.kill()
+                server_process.join(timeout=5)
         pytest.fail(f"API server failed to start within {wait_time} seconds")
 
     yield f"http://127.0.0.1:{port}/v1"

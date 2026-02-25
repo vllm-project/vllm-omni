@@ -290,7 +290,7 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
         logger.info("Got extra kwargs in TTS: %s", kwargs)
 
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params["type"]
+        extra_params_type = None if model_specific_params is None else model_specific_params.pop("type", None)
         if not is_qwen_tts and extra_params_type == "qwen-tts":
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
@@ -298,7 +298,6 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
             )
 
         combined_params = {**kwargs, **(model_specific_params or {})}
-        combined_params.pop("type", None)  # Internal fields in model_specific_params
 
         client = VLLMOmniClient(url)
 
@@ -355,7 +354,7 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
         **kwargs,
     ):
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params["type"]
+        extra_params_type = None if model_specific_params is None else model_specific_params.pop("type", None)
         if not is_qwen_tts and extra_params_type == "qwen-tts":
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
@@ -369,7 +368,6 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
             **kwargs,
             **(model_specific_params or {}),
         }
-        combined_params.pop("type", None)  # Internal fields in model_specific_params
 
         client = VLLMOmniClient(url)
 
