@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from diffusers.models.autoencoders import AutoencoderKL
 
-from vllm_omni.diffusion.distributed.autoencoders.vae_base import (
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
     DistributedVaeMixin,
     GridSpec,
