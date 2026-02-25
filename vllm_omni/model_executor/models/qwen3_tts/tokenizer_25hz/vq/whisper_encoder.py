@@ -23,19 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func
-except ImportError:
-    try:
-        from flash_attn.flash_attn_interface import flash_attn_unpadded_func as flash_attn_varlen_func
-    except ImportError:
-        print(
-            "\n********\nWarning: flash-attn is not installed. "
-            "Will only run the manual PyTorch version. "
-            "Please install flash-attn for faster inference.\n********\n "
-        )
-        flash_attn_varlen_func = None
-
+from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
 
 N_FFT = 400
 HOP_LENGTH = 160
