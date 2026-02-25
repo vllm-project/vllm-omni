@@ -34,7 +34,14 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
         for i in range(0, z.shape[2], overlap_size):
             for j in range(0, z.shape[3], overlap_size):
                 tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size]
-                tiletask_list.append(TileTask(len(tiletask_list), (i // overlap_size, j // overlap_size), tile))
+                tiletask_list.append(
+                    TileTask(
+                        len(tiletask_list),
+                        (i // overlap_size, j // overlap_size),
+                        tile,
+                        workload=tile.shape[2] * tile.shape[3],
+                    )
+                )
 
         tile_spec = {
             "blend_extent": blend_extent,
@@ -119,6 +126,7 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
             split_dims=(2, 3),
             grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
             tile_spec=tile_spec,
+            output_dtype=self.dtype,
         )
         return tiletask_list, grid_spec
 
@@ -168,7 +176,9 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
         split, exec, merge = self._strategy_select(z)
 
         if split is not None:
-            result = self.distributed_decoder.execute(z, DistributedOperator(split=split, exec=exec, merge=merge))
+            result = self.distributed_decoder.execute(
+                z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
+            )
             if not return_dict:
                 return (result,)
 

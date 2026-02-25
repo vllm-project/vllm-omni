@@ -21,6 +21,7 @@ class GridSpec:
     split_dims: tuple[int, ...]  # For example: (3,4) for (B, C, T, H, W), (2,3) for (B, C, H, W)
     grid_shape: tuple[int, ...]  # For example: (nh, nw) for (B, C, T, H, W), (nh, nw) for (B, C, H, W)
     tile_spec: dict = field(default_factory=dict)
+    output_dtype: torch.dtype | None = None
 
 
 @dataclass
@@ -28,6 +29,7 @@ class TileTask:
     tile_id: int
     grid_coord: tuple[int, ...]  # The coordinate of the tile in GridSpec.grid_shape
     tensor: torch.Tensor | list[torch.Tensor]  # The tile tensor
+    workload: int | float = 1
 
 
 @dataclass
@@ -109,7 +111,18 @@ class DistributedVaeExecutor:
 
         return coord_tensor_map
 
-    def execute(self, z: torch.Tensor, operator: DistributedOperator):
+    def _balance_tasks(self, task_list, num_rank):
+        workloads = [0] * num_rank
+        assigned = [[] for _ in range(num_rank)]
+
+        for task in sorted(task_list, key=lambda t: t.workload, reverse=True):
+            r = workloads.index(min(workloads))
+            assigned[r].append(task)
+            workloads[r] += task.workload
+
+        return assigned
+
+    def execute(self, z: torch.Tensor, operator: DistributedOperator, broadcast_result: bool = True):
         pp_size = min(self.parallel_size, self.world_size)
 
         # 1. Split into tiles
@@ -117,15 +130,17 @@ class DistributedVaeExecutor:
         tid_coord_map = {task.tile_id: task.grid_coord for task in tiletask_list}
 
         # 2. local decode
-        local_tasks = [task for task in tiletask_list if (task.tile_id + 1) % pp_size == self.rank]
+        assigned = self._balance_tasks(tiletask_list, pp_size)
+        local_tasks = assigned[self.rank]
         local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank
         global_padding_shape = self._compute_global_padding_shape(local_results, z.ndim, z.device)
 
         # 5. prepare tile tensors
+        output_dtype = grid_spec.output_dtype if grid_spec.output_dtype is not None else z.dtype
         local_tile_tensor, local_meta_tensor = self._pack_local_tiles(
-            local_results, global_padding_shape, grid_spec, z.device, z.dtype
+            local_results, global_padding_shape, grid_spec, z.device, output_dtype
         )
 
         # 6. gather tiles & meta
@@ -133,11 +148,28 @@ class DistributedVaeExecutor:
         tile_gather = self.gather_tensors(local_tile_tensor)
 
         if self.rank != 0:
-            return torch.empty(0, device=z.device)  # Dummy return for non-zero ranks
-        # 7. reconstruct full tensor (rank 0)
-        coord_tensor_map = self._unpack_tiles(meta_gather, tile_gather, grid_spec, tid_coord_map)
-        decoded_full = operator.merge(coord_tensor_map, grid_spec)
-        return decoded_full
+            result = torch.empty(0, device=z.device)  # Dummy return for non-zero ranks
+        else:
+            # 7. reconstruct full tensor (rank 0)
+            coord_tensor_map = self._unpack_tiles(meta_gather, tile_gather, grid_spec, tid_coord_map)
+            result = operator.merge(coord_tensor_map, grid_spec)
+
+        if broadcast_result:
+            result = self._sync_final_result(result, z.ndim, z.device, output_dtype)
+        return result
+
+    def _sync_final_result(self, rank0_result, output_ndim, output_device, output_dtype):
+        shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=torch.int64)
+        if self.rank == 0:
+            shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=torch.int64))
+        dist.broadcast(shape_tensor, src=0, group=self.group)
+
+        if self.rank != 0:
+            sync_result = torch.empty(tuple(shape_tensor.tolist()), device=output_device, dtype=output_dtype)
+        else:
+            sync_result = rank0_result
+        dist.broadcast(sync_result, src=0, group=self.group)
+        return sync_result
 
 
 class DistributedVaeMixin:

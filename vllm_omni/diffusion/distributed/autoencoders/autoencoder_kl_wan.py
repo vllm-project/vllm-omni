@@ -54,7 +54,10 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
                     time_list.append(tile)
                 tiletask_list.append(
                     TileTask(
-                        len(tiletask_list), (i // tile_latent_stride_height, j // tile_latent_stride_width), time_list
+                        len(tiletask_list),
+                        (i // tile_latent_stride_height, j // tile_latent_stride_width),
+                        time_list,
+                        workload=time_list[0].shape[3] * time_list[0].shape[4],
                     )
                 )
         tile_spec = {
@@ -69,6 +72,7 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
             split_dims=(3, 4),
             grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
             tile_spec=tile_spec,
+            output_dtype=self.dtype,
         )
         return tiletask_list, grid_spec
 
@@ -123,7 +127,9 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 
         result = self.distributed_decoder.execute(
-            z, DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge)
+            z,
+            DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
+            broadcast_result=False,
         )
         if not return_dict:
             return (result,)
