@@ -27,7 +27,7 @@ steps:
         TEST_START=$(/bin/date +%s)
         timeout 20m docker run --rm \
           -e HF_HOME=/fsx/hf_cache \
-          --env-file /tmp/buildkite-env
+          --env-file /tmp/buildkite-env \
           -v /fsx/hf_cache:/fsx/hf_cache \
           public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT \
           pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
