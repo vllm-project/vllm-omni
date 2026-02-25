@@ -123,7 +123,7 @@ class DiffusionEngine:
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
-         # Handle single request or multiple requests
+        # Handle single request or multiple requests
 
         dit_time_seconds = metrics["dit_time_ms"] / 1000
         num_steps = request.sampling_params.num_inference_steps
