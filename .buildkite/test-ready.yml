@@ -16,21 +16,29 @@ steps:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Diffusion Model Test"
-    timeout_in_minutes: 20
+    timeout_in_minutes: 40
     depends_on: upload-ready-pipeline
     commands:
-      - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
+      - echo "--- Pulling Docker image"
+      - docker pull public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+
+      - echo "--- Running tests"
+      - |
+        TEST_START=$(date +%s)
+        timeout 20m docker run --rm \
+          -e HF_HOME=/fsx/hf_cache \
+          -v /fsx/hf_cache:/fsx/hf_cache \
+          public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT \
+          pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
+        TEST_END=$(date +%s)
+        TEST_DURATION=$((TEST_END - TEST_START))
+
+      - |
+        buildkite-agent annotate --style "success" --context "test-time-${BUILDKITE_JOB_ID}" \
+          "<h3>✅ Diffusion Model Test : ${TEST_DURATION} second</h3>"
+        buildkite-agent meta-data set "test-duration-${BUILDKITE_JOB_ID}" "${TEST_DURATION}"
     agents:
-      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
+      queue: "gpu_1_queue"
 
   - label: "Diffusion Model CPU offloading Test"
     timeout_in_minutes: 20
