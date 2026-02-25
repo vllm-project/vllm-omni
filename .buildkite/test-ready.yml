@@ -23,25 +23,28 @@ steps:
 
       - echo "--- Running tests"
       - |
-        TEST_START=$(date +%s)
+        set -x
+        TEST_START=$(/bin/date +%s)
         timeout 20m docker run --rm \
           -e HF_HOME=/fsx/hf_cache \
+          --env-file /tmp/buildkite-env
           -v /fsx/hf_cache:/fsx/hf_cache \
           public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT \
           pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
-        TEST_END=$(date +%s)
+        TEST_END=$(/bin/date +%s)
         TEST_DURATION=$((TEST_END - TEST_START))
+        set +x
 
         echo "TEST_START=$TEST_START"
         echo "TEST_END=$TEST_END"
         echo "TEST_DURATION=$TEST_DURATION"
 
-        if [ -n "$TEST_DURATION" ]; then
+        if [ -n "$TEST_DURATION" ] && [ "$TEST_DURATION" -gt 0 ]; then
           buildkite-agent annotate --style "success" --context "test-time-${BUILDKITE_JOB_ID}" \
             "<h3>✅ Diffusion Model Test : ${TEST_DURATION} seconds</h3>"
           buildkite-agent meta-data set "test-duration-${BUILDKITE_JOB_ID}" "${TEST_DURATION}"
         else
-          echo "⚠️ TEST_DURATION is empty, skipping annotation and metadata."
+          echo "⚠️ TEST_DURATION invalid ($TEST_DURATION), skipping annotation."
         fi
     agents:
       queue: "gpu_1_queue"
