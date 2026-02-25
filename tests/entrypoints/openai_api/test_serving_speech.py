@@ -291,6 +291,7 @@ class TestTTSMethods:
         mock_engine_client = MagicMock()
         mock_engine_client.errored = False
         mock_engine_client.stage_list = None
+        mock_engine_client.tts_max_instructions_length = None
         mock_models = MagicMock()
         mock_models.is_base_model.return_value = True
         return OmniOpenAIServingSpeech(
@@ -299,16 +300,35 @@ class TestTTSMethods:
             request_logger=MagicMock(),
         )
 
-    def test_is_tts_model(self, speech_server):
-        """Test TTS model detection."""
-        # No stage_list -> False
-        assert speech_server._is_tts_model() is False
+    def test_is_tts_detection_no_stage(self, speech_server):
+        """Test TTS model detection when no TTS stage exists."""
+        # Fixture creates server with stage_list = None -> _is_tts should be False
+        assert speech_server._is_tts is False
+        assert speech_server._tts_stage is None
 
-        # With qwen3_tts stage -> True
+    def test_is_tts_detection_with_tts_stage(self):
+        """Test TTS model detection when TTS stage exists."""
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+
+        # Create a TTS stage
         mock_stage = MagicMock()
         mock_stage.model_stage = "qwen3_tts"
-        speech_server.engine_client.stage_list = [mock_stage]
-        assert speech_server._is_tts_model() is True
+        mock_stage.tts_args = {}
+        mock_engine_client.stage_list = [mock_stage]
+
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+
+        assert server._is_tts is True
+        assert server._tts_stage is mock_stage
 
     def test_estimate_prompt_len_fallback(self, speech_server):
         """Test prompt length estimation falls back to 2048 when model is unavailable."""
@@ -381,3 +401,108 @@ class TestTTSMethods:
 
         # Verify speakers are normalized to lowercase
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
+
+    def test_max_instructions_length_default(self, speech_server):
+        """Test default max instructions length (500) when no config provided."""
+        # Fixture creates server with no CLI override and no TTS stage
+        assert speech_server._max_instructions_length == 500
+
+    def test_max_instructions_length_cli_override(self):
+        """Test CLI override (stored in engine_client) takes highest priority."""
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_list = None
+        # CLI override is stored in engine_client
+        mock_engine_client.tts_max_instructions_length = 1000
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+        # Value is cached during __init__
+        assert server._max_instructions_length == 1000
+
+    def test_max_instructions_length_stage_config(self):
+        """Test stage config value is used when no CLI override."""
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None  # No CLI override
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        # Mock stage with tts_args
+        mock_stage = MagicMock()
+        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.tts_args = {"max_instructions_length": 750}
+        mock_engine_client.stage_list = [mock_stage]
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+        # Value is cached during __init__
+        assert server._max_instructions_length == 750
+
+    def test_max_instructions_length_cli_overrides_stage_config(self):
+        """Test CLI override (in engine_client) takes precedence over stage config."""
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        # CLI override stored in engine_client
+        mock_engine_client.tts_max_instructions_length = 2000
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        # Mock stage with tts_args
+        mock_stage = MagicMock()
+        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.tts_args = {"max_instructions_length": 750}
+        mock_engine_client.stage_list = [mock_stage]
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+        # CLI value (2000) should override stage config (750)
+        assert server._max_instructions_length == 2000
+
+    def test_validate_instructions_length_uses_cached_value(self):
+        """Test instructions length validation uses cached _max_instructions_length."""
+        mock_engine_client = MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_list = None
+        # CLI override with max length of 10 characters
+        mock_engine_client.tts_max_instructions_length = 10
+        mock_models = MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=MagicMock(),
+        )
+
+        # Verify cached value
+        assert server._max_instructions_length == 10
+
+        # Instructions within limit should pass
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="short",
+        )
+        assert server._validate_tts_request(req) is None
+
+        # Instructions exceeding limit should fail
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="this is too long",
+        )
+        error = server._validate_tts_request(req)
+        assert error is not None
+        assert "max 10 characters" in error
