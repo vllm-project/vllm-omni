@@ -230,7 +230,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, n_state: int, n_head: int, enable_mp: bool = False, sequence_parallel: bool = False):
+    def __init__(self, n_state: int, n_head: int, sequence_parallel: bool = False):
         super().__init__()
         n_mlp = n_state * 4
         self.attn_ln = nn.LayerNorm(n_state)
@@ -255,8 +255,6 @@ class WhisperEncoder(nn.Module):
         n_layer: int,
         n_window: int = 1500,
         output_dim: int = 512,
-        grad_checkpointing: bool = False,
-        enable_mp: bool = False,
         audio_sequence_parallel: bool = False,
     ):
         super().__init__()
@@ -267,10 +265,7 @@ class WhisperEncoder(nn.Module):
         self.n_mels = n_mels
 
         self.blocks = nn.ModuleList(
-            [
-                ResidualAttentionBlock(n_state, n_head, enable_mp=enable_mp, sequence_parallel=audio_sequence_parallel)
-                for _ in range(n_layer)
-            ]
+            [ResidualAttentionBlock(n_state, n_head, sequence_parallel=audio_sequence_parallel) for _ in range(n_layer)]
         )
         self.ln_post = nn.LayerNorm(n_state)
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
@@ -280,8 +275,6 @@ class WhisperEncoder(nn.Module):
         self.audio_bos_eos_token = nn.Embedding(2, output_dim)
 
         self.output_dim = output_dim
-        self.grad_checkpointing = grad_checkpointing
-        self.enable_mp = enable_mp
         self.n_head = n_head
         self.n_state = n_state
         self.n_window = n_window
@@ -289,13 +282,6 @@ class WhisperEncoder(nn.Module):
         self.audio_sequence_parallel = audio_sequence_parallel
 
         self.tp_world_size = 1
-
-        self.set_audio_sync()
-
-    def set_audio_sync(self):
-        for name, param in self.named_parameters():
-            if not name.startswith("blocks"):
-                setattr(param, "audio_sync", True)
 
     def forward(
         self, x_list: list[Tensor], audio_mellens: list[int], audio_aftercnnlens: list[int], audio_seqlens: list[int]
@@ -358,9 +344,3 @@ class WhisperEncoder(nn.Module):
         output[end_ids] = self.audio_bos_eos_token.weight[1].to(x.dtype)
         output[audio_tokens_mask] = x
         return output
-
-    def lock(self, layers: int):
-        self.conv1.requires_grad_(False)
-        self.conv2.requires_grad_(False)
-        for i in range(min(layers, len(self.blocks))):
-            self.blocks[i].requires_grad_(False)
