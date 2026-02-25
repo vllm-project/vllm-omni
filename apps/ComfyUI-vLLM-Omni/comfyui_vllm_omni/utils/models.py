@@ -11,8 +11,7 @@ def _bagel_payload_preprocessor(payload: dict) -> dict:
                     content["text"] = "<|im_start|>" + content["text"] + "<|im_end|>"
     except (KeyError, TypeError):
         raise RuntimeError("Internal Error: malformatted BAGEL payload")
-    extra_body = payload.pop("extra_body", {})
-    return {**payload, **extra_body}
+    return payload
 
 
 def _qwen25_payload_preprocessor(payload: dict) -> dict:

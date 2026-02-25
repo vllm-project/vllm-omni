@@ -1,14 +1,17 @@
 """
 Integration tests for ComfyUI nodes that use the Omni API client, with a mocked AsyncOmni and a real API server running in a background process.
 These tests cover the integration between ComfyUI node and the API server, without actual model inference logic.
-It ensures that future changes to the API request and response formats do not break the ComfyUI nodes that use it.
+It ensures that
+1. Changes made to the API (e.g., request and response formats) do not break the ComfyUI frontend that use it.
+2. The sampling parameters are correctly passed from the node to AsyncOmni through the API layer.
 """
 
 import multiprocessing
 import time
 import traceback
-from collections.abc import Iterable
-from typing import NamedTuple
+from collections.abc import Iterable, Sequence
+from enum import StrEnum, auto
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,17 +30,75 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 
 class ServerCase(NamedTuple):
+    """Parametrizing the model to serve."""
+
     served_model: str
     stage_list: list
     stage_configs: list[dict]
     outputs: list[OmniRequestOutput]
 
 
-def _build_image(size: tuple[int, int] = (64, 64), color: str = "red") -> Image.Image:
+class SamplingCase(NamedTuple):
+    """Parametrizing the input sampling parameters."""
+
+    kind: "SamplingKind"
+    sampling_params: dict | list[dict] | None
+
+
+class SamplingKind(StrEnum):
+    IMAGE_NONE = auto()
+    IMAGE_DIFFUSION_SINGLE = auto()
+    UNDERSTANDING_NONE = auto()
+    UNDERSTANDING_AR_LIST = auto()
+    TTS_NONE = auto()
+    TTS_DIFFUSION_SINGLE = auto()
+
+
+# Pre-defined arguments to be used in function calls during the tests
+IMAGE_WIDTH = 512
+IMAGE_HEIGHT = 512
+DIFFUSION_SINGLE_SAMPLING_PARAMS = {
+    "type": "diffusion",
+    "n": 2,
+    "num_inference_steps": 30,
+    "guidance_scale": 6.0,
+    "true_cfg_scale": 1.5,
+}
+
+AR_LIST_SAMPLING_PARAMS = [
+    {
+        "type": "autoregression",
+        "max_tokens": 64,
+        "temperature": 0.6,
+        "top_p": 0.9,
+        "repetition_penalty": 1.0,
+        "seed": 21,
+    },
+    {
+        "type": "autoregression",
+        "max_tokens": 96,
+        "temperature": 0.75,
+        "top_p": 0.85,
+        "repetition_penalty": 1.05,
+        "seed": 22,
+    },
+    {
+        "type": "autoregression",
+        "max_tokens": 128,
+        "temperature": 0.8,
+        "top_p": 0.8,
+        "repetition_penalty": 1.1,
+        "seed": 23,
+    },
+]
+
+
+def _build_image_output(size: tuple[int, int] = (64, 64), color: str = "red") -> Image.Image:
     return Image.new("RGB", size, color=color)
 
 
@@ -110,14 +171,14 @@ def _build_audio_speech_output(num_samples: int = 24000) -> OmniRequestOutput:
 def _build_diffusion_image_output_for_images_endpoint() -> OmniRequestOutput:
     return OmniRequestOutput.from_diffusion(
         request_id="test_req_img_dalle",
-        images=[_build_image()],
+        images=[_build_image_output()],
         final_output_type="image",
     )
 
 
 def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
     request_output = MagicMock()
-    request_output.images = [_build_image(color="blue")]
+    request_output.images = [_build_image_output(color="blue")]
     request_output.finished = True
     return OmniRequestOutput(
         request_id="test_req_img_chat",
@@ -127,8 +188,62 @@ def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
     )
 
 
-def _build_mock_outputs(outputs: Iterable[OmniRequestOutput]):
+def _assert_sampling_param_values(received: OmniSamplingParams, expected: dict[str, Any]):
+    for key, expected_value in expected.items():
+        if key == "type":  # skip internal fields
+            continue
+        actual_value = getattr(received, key, None)
+        assert actual_value == expected_value, (
+            f"Expected sampling param '{key}'={expected_value}, got {actual_value}. The received sampling params: {received}"
+        )
+
+
+def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: SamplingCase, server_case: ServerCase):
     async def _mock_generate(*args, **kwargs):
+        received_sampling_params_list: Sequence[OmniSamplingParams] | None = (
+            args[2] if len(args) > 2 else kwargs.get("sampling_params_list")
+        )
+
+        assert received_sampling_params_list is not None, (
+            "In the current codebase, the API layer always provides not-None sampling parameter list when calling `AsyncOmni.generate`"
+            "This test also uses this assumption for now."
+            "If this assertion fails, it means the API layer has changed and this test needs to be updated accordingly."
+            "It does not necessarily mean there is a bug, because `AsyncOmni.generate` does allow sampling_params_list to be None."
+        )
+        assert isinstance(received_sampling_params_list, Sequence), "sampling_params_list should be a Sequence"
+
+        if sampling_case.kind is SamplingKind.IMAGE_NONE:
+            assert len(received_sampling_params_list) == 1
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": IMAGE_WIDTH,
+                    "height": IMAGE_HEIGHT,
+                },
+            )
+        elif sampling_case.kind is SamplingKind.IMAGE_DIFFUSION_SINGLE:
+            assert len(received_sampling_params_list) == 1
+            expected = DIFFUSION_SINGLE_SAMPLING_PARAMS.copy()
+            expected["num_outputs_per_prompt"] = expected.pop("n")  # convert from n to num_outputs_per_prompt
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {
+                    "width": IMAGE_WIDTH,
+                    "height": IMAGE_HEIGHT,
+                    **expected,
+                },
+            )
+        elif sampling_case.kind is SamplingKind.UNDERSTANDING_NONE:
+            assert len(received_sampling_params_list) == 3
+        elif sampling_case.kind is SamplingKind.UNDERSTANDING_AR_LIST:
+            assert len(received_sampling_params_list) == 3
+            for i, expected in enumerate(AR_LIST_SAMPLING_PARAMS):
+                _assert_sampling_param_values(received_sampling_params_list[i], expected)
+        elif sampling_case.kind in {SamplingKind.TTS_NONE, SamplingKind.TTS_DIFFUSION_SINGLE}:
+            assert len(received_sampling_params_list) == 1
+        else:
+            raise AssertionError(f"Unknown sampling case: {sampling_case.kind}")
+
         for output in outputs:
             yield output
 
@@ -141,7 +256,12 @@ def server_case(request) -> ServerCase:
 
 
 @pytest.fixture
-def mock_async_omni(server_case: ServerCase):
+def sampling_case(request) -> SamplingCase:
+    return request.param
+
+
+@pytest.fixture
+def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
     async def _mock_preprocess_chat(self, *args, **kwargs):
         return ([{"role": "user", "content": "test"}], [{"prompt": "test prompt"}])
 
@@ -156,7 +276,7 @@ def mock_async_omni(server_case: ServerCase):
         ),
     ):
         mock_instance = AsyncMock()
-        mock_instance.generate = _build_mock_outputs(server_case.outputs)
+        mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
 
         mock_instance.stage_list = server_case.stage_list
         mock_instance.stage_configs = server_case.stage_configs
@@ -272,18 +392,31 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     ],
     indirect=["server_case"],
 )
-async def test_image_generation_node(api_server: str, model: str, image_input: bool):
+@pytest.mark.parametrize(
+    "sampling_case",
+    [
+        pytest.param(SamplingCase(kind=SamplingKind.IMAGE_NONE, sampling_params=None), id="no-sampling-params"),
+        pytest.param(
+            SamplingCase(kind=SamplingKind.IMAGE_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),
+            id="single-diffusion-sampling-params",
+        ),
+    ],
+    indirect=["sampling_case"],
+)
+async def test_image_generation_node(api_server: str, model: str, image_input: bool, sampling_case: SamplingCase):
     node = VLLMOmniGenerateImage()
 
     kwargs = {
         "url": api_server,
         "model": model,
         "prompt": "A beautiful sunset",
-        "width": 512,
-        "height": 512,
+        "width": IMAGE_WIDTH,
+        "height": IMAGE_HEIGHT,
     }
     if image_input:
         kwargs["image"] = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+    if sampling_case.sampling_params is not None:
+        kwargs["sampling_params"] = sampling_case.sampling_params
 
     result = await node.generate(**kwargs)
 
@@ -317,7 +450,18 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
     ],
     indirect=["server_case"],
 )
-async def test_understanding_node(api_server: str):
+@pytest.mark.parametrize(
+    "sampling_case",
+    [
+        pytest.param(SamplingCase(kind=SamplingKind.UNDERSTANDING_NONE, sampling_params=None), id="no-sampling-params"),
+        pytest.param(
+            SamplingCase(kind=SamplingKind.UNDERSTANDING_AR_LIST, sampling_params=AR_LIST_SAMPLING_PARAMS),
+            id="ar-sampling-params-list",
+        ),
+    ],
+    indirect=["sampling_case"],
+)
+async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
     node = VLLMOmniUnderstanding()
 
     image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
@@ -331,6 +475,7 @@ async def test_understanding_node(api_server: str):
         image=image,
         audio=audio,
         video=video,
+        sampling_params=sampling_case.sampling_params,
         output_text=True,
         output_audio=True,
         use_audio_in_video=True,
@@ -389,9 +534,23 @@ async def test_understanding_node(api_server: str):
     ],
     indirect=["server_case"],
 )
-async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict):
+@pytest.mark.parametrize(
+    "sampling_case",
+    [
+        pytest.param(SamplingCase(kind=SamplingKind.TTS_NONE, sampling_params=None), id="no-sampling-params"),
+        pytest.param(
+            SamplingCase(kind=SamplingKind.TTS_DIFFUSION_SINGLE, sampling_params=DIFFUSION_SINGLE_SAMPLING_PARAMS),
+            id="single-diffusion-sampling-params",
+        ),
+    ],
+    indirect=["sampling_case"],
+)
+async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_case: SamplingCase):
     node = node_cls()
-    result = await node.generate(url=api_server, **call_kwargs)
+    actual_kwargs = dict(call_kwargs)
+    if sampling_case.sampling_params is not None:
+        actual_kwargs["model_specific_params"] = sampling_case.sampling_params
+    result = await node.generate(url=api_server, **actual_kwargs)
 
     assert isinstance(result, tuple)
     assert len(result) == 1

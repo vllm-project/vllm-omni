@@ -424,6 +424,10 @@ class VLLMOmniClient:
             message_content.append({"type": "video_url", "video_url": {"url": video_to_base64(video)}})
         messages = [{"role": "user", "content": message_content}]
 
+        payload: dict[str, Any] = {"messages": messages, "model": model}
+        if modalities:
+            payload["modalities"] = modalities
+
         combined_extra_body: dict[str, Any] = {}
         if sampling_params is not None:
             spec, _ = lookup_model_spec(model)
@@ -437,17 +441,17 @@ class VLLMOmniClient:
 
             if (spec is None and is_single_sampling_param) or (spec is not None and spec["stages"] == ["diffusion"]):
                 # Diffusion format: extra_body directly contains sampling params.
-                # Validation should have taken care of matching sampling params' types.
+                # Validation has already taken care of matching sampling params' types and length. Safe to take [0].
                 # * Use this mode if the model is a simple one-stage diffusion model.
                 # * Fallback to this mode if model is not registered and a single sampling param is provided.
                 sampling_params = sampling_params if isinstance(sampling_params, dict) else sampling_params[0]
-                combined_extra_body: dict[str, Any] = {**sampling_params}
+                combined_extra_body: dict[str, Any] = sampling_params.copy()
                 if "n" in combined_extra_body:
-                    combined_extra_body["num_outputs_per_prompt"] = combined_extra_body["n"]
-                    del combined_extra_body["n"]
+                    combined_extra_body["num_outputs_per_prompt"] = combined_extra_body.pop("n")
             else:
-                # Use AR style payload, extra_body has a sampling_params_list field
-                combined_extra_body: dict[str, Any] = {"sampling_params_list": sampling_params}
+                # AR format: the payload has a sampling_params_list field, containing a list.
+                sampling_params_list = sampling_params if isinstance(sampling_params, list) else [sampling_params]
+                payload["sampling_params_list"] = sampling_params_list
 
         if negative_prompt:
             combined_extra_body["negative_prompt"] = negative_prompt
@@ -455,12 +459,11 @@ class VLLMOmniClient:
         if extra_body:
             combined_extra_body.update(extra_body)
 
-        payload: dict[str, Any] = {"messages": messages, "model": model}
+        # Add extra_body only if it has any content.
         if combined_extra_body:
             payload["extra_body"] = combined_extra_body
-        if modalities:
-            payload["modalities"] = modalities
 
+        # Place to inject any model-specific payload adjustment
         spec, _ = lookup_model_spec(model)
         if spec:
             preprocessor = spec.get("payload_preprocessor", None)
