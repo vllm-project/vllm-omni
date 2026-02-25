@@ -1,4 +1,4 @@
-# Support Cache-DiT
+# Cache-DiT
 
 This section describes how to add cache-dit acceleration to a new diffusion pipeline. We use the Qwen-Image pipeline and LongCat-Image pipeline as reference implementations.
 
