@@ -67,14 +67,22 @@ class DiffusionEngine:
             raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        # 记录扩散引擎整体执行开始时间
+        diffusion_engine_start_time = time.time()
+        
         # Apply pre-processing if available
+        preprocess_time = 0.0
         if self.pre_process_func is not None:
             preprocess_start_time = time.time()
             request = self.pre_process_func(request)
             preprocess_time = time.time() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
+        # 执行扩散推理并统计核心耗时
+        exec_start_time = time.time()
         output = self.add_req_and_wait_for_response(request)
+        exec_total_time = time.time() - exec_start_time
+        
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
@@ -102,15 +110,28 @@ class DiffusionEngine:
         if not isinstance(outputs, list):
             outputs = [outputs] if outputs is not None else []
 
+
         metrics = {
+            "preprocess_time_ms": round(preprocess_time * 1000,2),
+            "diffusion_engine_exec_time_ms": round((time.time() - diffusion_engine_start_time) * 1000,2),
+            "dit_time_ms": round(exec_total_time * 1000,2),
+            "postprocess_time_ms": round(postprocess_time * 1000,2),
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
-            "postprocess_time_ms": postprocess_time * 1000,
+            "denoise_time_per_step_ms": 0.0,
+            "vae_time_ms": 0.0,
         }
-        if self.pre_process_func is not None:
-            metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
-        # Handle single request or multiple requests
+
+        dit_time_seconds = metrics["dit_time_ms"] / 1000
+        num_steps = request.sampling_params.num_inference_steps
+
+        if num_steps > 0:
+            total_denoise_time = dit_time_seconds 
+            metrics["denoise_time_per_step_ms"] = round((total_denoise_time / num_steps) * 1000,2)
+
+        metrics["vae_time_ms"] = round(dit_time_seconds  * 1000,2)
+
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
@@ -177,7 +198,7 @@ class DiffusionEngine:
                         )
                     )
 
-            return results
+        return results
 
     @staticmethod
     def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
