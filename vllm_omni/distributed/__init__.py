@@ -4,10 +4,13 @@
 from .omni_connectors import (
     ConnectorSpec,
     MooncakeConnector,
+    MooncakeStoreConnector,
+    MooncakeTransferEngineConnector,
     OmniConnectorBase,
     OmniConnectorFactory,
     OmniTransferConfig,
     SharedMemoryConnector,
+    YuanrongConnector,
     load_omni_transfer_config,
 )
 
@@ -18,8 +21,11 @@ __all__ = [
     # Connectors
     "OmniConnectorBase",
     "OmniConnectorFactory",
-    "MooncakeConnector",
+    "MooncakeConnector",  # compat alias
+    "MooncakeStoreConnector",
+    "MooncakeTransferEngineConnector",
     "SharedMemoryConnector",
+    "YuanrongConnector",
     # Utilities
     "load_omni_transfer_config",
 ]

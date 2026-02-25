@@ -9,34 +9,34 @@ Usage (single image):
         --image input.png \
         --prompt "Let this mascot dance under the moon, surrounded by floating stars and poetic bubbles such as 'Be Kind'" \
         --output output_image_edit.png \
-        --num_inference_steps 50 \
-        --cfg_scale 4.0 \
-        --guidance_scale 1.0
+        --num-inference-steps 50 \
+        --cfg-scale 4.0 \
+        --guidance-scale 1.0
 
 Usage (multiple images):
     python image_edit.py \
         --image input1.png input2.png input3.png \
         --prompt "Combine these images into a single scene" \
         --output output_image_edit.png \
-        --num_inference_steps 50 \
-        --cfg_scale 4.0 \
-        --guidance_scale 1.0
+        --num-inference-steps 50 \
+        --cfg-scale 4.0 \
+        --guidance-scale 1.0
 
 Usage (with cache-dit acceleration):
     python image_edit.py \
         --image input.png \
         --prompt "Edit description" \
-        --cache_backend cache_dit \
-        --cache_dit_max_continuous_cached_steps 3 \
-        --cache_dit_residual_diff_threshold 0.24 \
-        --cache_dit_enable_taylorseer
+        --cache-backend cache_dit \
+        --cache-dit-max-continuous-cached-steps 3 \
+        --cache-dit-residual-diff-threshold 0.24 \
+        --cache-dit-enable-taylorseer
 
 Usage (with tea_cache acceleration):
     python image_edit.py \
         --image input.png \
         --prompt "Edit description" \
-        --cache_backend tea_cache \
-        --tea_cache_rel_l1_thresh 0.25
+        --cache-backend tea_cache \
+        --tea-cache-rel-l1-thresh 0.25
 
 Usage (layered):
     python image_edit.py \
@@ -44,8 +44,8 @@ Usage (layered):
         --image input.png \
         --prompt "" \
         --output "layered" \
-        --num_inference_steps 50 \
-        --cfg_scale 4.0 \
+        --num-inference-steps 50 \
+        --cfg-scale 4.0 \
         --layers 4 \
         --color-format "RGBA"
 
@@ -53,17 +53,17 @@ Usage (with CFG Parallel):
     python image_edit.py \
         --image input.png \
         --prompt "Edit description" \
-        --cfg_parallel_size 2 \
-        --num_inference_steps 50 \
-        --cfg_scale 4.0
+        --cfg-parallel-size 2 \
+        --num-inference-steps 50 \
+        --cfg-scale 4.0
 
 Usage (disable torch.compile):
     python image_edit.py \
         --image input.png \
         --prompt "Edit description" \
-        --enforce_eager \
-        --num_inference_steps 50 \
-        --cfg_scale 4.0
+        --enforce-eager \
+        --num-inference-steps 50 \
+        --cfg-scale 4.0
 
 For more options, run:
     python image_edit.py --help
@@ -77,10 +77,11 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.platform_utils import detect_device_type, is_npu
+from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         help="Text prompt describing the edit to make to the image.",
     )
     parser.add_argument(
-        "--negative_prompt",
+        "--negative-prompt",
         type=str,
         default=None,
         required=False,
@@ -120,7 +121,7 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for deterministic results.",
     )
     parser.add_argument(
-        "--cfg_scale",
+        "--cfg-scale",
         type=float,
         default=4.0,
         help=(
@@ -131,12 +132,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--guidance_scale",
+        "--guidance-scale",
         type=float,
         default=1.0,
         help=(
             "Guidance scale for guidance-distilled models (default: 1.0, disabled). "
-            "Unlike classifier-free guidance (--cfg_scale), guidance-distilled models take the guidance scale "
+            "Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale "
             "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
         ),
     )
@@ -147,19 +148,19 @@ def parse_args() -> argparse.Namespace:
         help=("Path to save the edited image (PNG). Or prefix for Qwen-Image-Layered model save images(PNG)."),
     )
     parser.add_argument(
-        "--num_outputs_per_prompt",
+        "--num-outputs-per-prompt",
         type=int,
         default=1,
         help="Number of images to generate for the given prompt.",
     )
     parser.add_argument(
-        "--num_inference_steps",
+        "--num-inference-steps",
         type=int,
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
     )
     parser.add_argument(
-        "--cache_backend",
+        "--cache-backend",
         type=str,
         default=None,
         choices=["cache_dit", "tea_cache"],
@@ -170,19 +171,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--ulysses_degree",
+        "--ulysses-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
-        "--ring_degree",
+        "--ring-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
     parser.add_argument(
-        "--tensor_parallel_size",
+        "--tensor-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
@@ -204,56 +205,56 @@ def parse_args() -> argparse.Namespace:
 
     # Cache-DiT specific parameters
     parser.add_argument(
-        "--cache_dit_fn_compute_blocks",
+        "--cache-dit-fn-compute-blocks",
         type=int,
         default=1,
         help="[cache-dit] Number of forward compute blocks. Optimized for single-transformer models.",
     )
     parser.add_argument(
-        "--cache_dit_bn_compute_blocks",
+        "--cache-dit-bn-compute-blocks",
         type=int,
         default=0,
         help="[cache-dit] Number of backward compute blocks.",
     )
     parser.add_argument(
-        "--cache_dit_max_warmup_steps",
+        "--cache-dit-max-warmup-steps",
         type=int,
         default=4,
         help="[cache-dit] Maximum warmup steps (works for few-step models).",
     )
     parser.add_argument(
-        "--cache_dit_residual_diff_threshold",
+        "--cache-dit-residual-diff-threshold",
         type=float,
         default=0.24,
         help="[cache-dit] Residual diff threshold. Higher values enable more aggressive caching.",
     )
     parser.add_argument(
-        "--cache_dit_max_continuous_cached_steps",
+        "--cache-dit-max-continuous-cached-steps",
         type=int,
         default=3,
         help="[cache-dit] Maximum continuous cached steps to prevent precision degradation.",
     )
     parser.add_argument(
-        "--cache_dit_enable_taylorseer",
+        "--cache-dit-enable-taylorseer",
         action="store_true",
         default=False,
         help="[cache-dit] Enable TaylorSeer acceleration (not suitable for few-step models).",
     )
     parser.add_argument(
-        "--cache_dit_taylorseer_order",
+        "--cache-dit-taylorseer-order",
         type=int,
         default=1,
         help="[cache-dit] TaylorSeer polynomial order.",
     )
     parser.add_argument(
-        "--cache_dit_scm_steps_mask_policy",
+        "--cache-dit-scm-steps-mask-policy",
         type=str,
         default=None,
         choices=[None, "slow", "medium", "fast", "ultra"],
         help="[cache-dit] SCM mask policy: None (disabled), slow, medium, fast, ultra.",
     )
     parser.add_argument(
-        "--cache_dit_scm_steps_policy",
+        "--cache-dit-scm-steps-policy",
         type=str,
         default="dynamic",
         choices=["dynamic", "static"],
@@ -262,22 +263,42 @@ def parse_args() -> argparse.Namespace:
 
     # TeaCache specific parameters
     parser.add_argument(
-        "--tea_cache_rel_l1_thresh",
+        "--tea-cache-rel-l1-thresh",
         type=float,
         default=0.2,
         help="[tea_cache] Threshold for accumulated relative L1 distance.",
     )
     parser.add_argument(
-        "--cfg_parallel_size",
+        "--cfg-parallel-size",
         type=int,
         default=1,
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
-        "--enforce_eager",
+        "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--vae-use-slicing",
+        action="store_true",
+        help="Enable VAE slicing for memory optimization.",
+    )
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Enable CPU offloading for diffusion models.",
+    )
+    parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     return parser.parse_args()
 
@@ -300,12 +321,8 @@ def main():
     else:
         input_image = input_images
 
-    device = detect_device_type()
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
-    # Enable VAE memory optimizations on NPU
-    vae_use_slicing = is_npu()
-    vae_use_tiling = is_npu()
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -338,12 +355,14 @@ def main():
     # Initialize Omni with appropriate pipeline
     omni = Omni(
         model=args.model,
-        vae_use_slicing=vae_use_slicing,
-        vae_use_tiling=vae_use_tiling,
+        enable_layerwise_offload=args.enable_layerwise_offload,
+        vae_use_slicing=args.vae_use_slicing,
+        vae_use_tiling=args.vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        enable_cpu_offload=args.enable_cpu_offload,
     )
     print("Pipeline loaded")
 
@@ -368,25 +387,28 @@ def main():
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
-    # Generate edited image
-    generate_kwargs = {
-        "prompt": args.prompt,
-        "pil_image": input_image,
-        "negative_prompt": args.negative_prompt,
-        "generator": generator,
-        "true_cfg_scale": args.cfg_scale,
-        "guidance_scale": args.guidance_scale,
-        "num_inference_steps": args.num_inference_steps,
-        "num_outputs_per_prompt": args.num_outputs_per_prompt,
-        "layers": args.layers,
-        "resolution": args.resolution,
-    }
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
         omni.start_profile()
 
-    outputs = omni.generate(**generate_kwargs)
+    # Generate edited image
+    outputs = omni.generate(
+        {
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "multi_modal_data": {"image": input_image},
+        },
+        OmniDiffusionSamplingParams(
+            generator=generator,
+            true_cfg_scale=args.cfg_scale,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
+            num_outputs_per_prompt=args.num_outputs_per_prompt,
+            layers=args.layers,
+            resolution=args.resolution,
+        ),
+    )
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
@@ -412,7 +434,6 @@ def main():
 
     if not outputs:
         raise ValueError("No output generated from omni.generate()")
-    logger.info("Outputs: %s", outputs)
 
     # Extract images from OmniRequestOutput
     # omni.generate() returns list[OmniRequestOutput], extract images from request_output[0].images

@@ -6,11 +6,11 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE
+from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler
-from vllm_omni.utils.platform_utils import get_diffusion_worker_class
+from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
 
@@ -77,8 +77,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         mp.set_start_method("spawn", force=True)
         processes = []
 
-        # Get the appropriate worker class for current device
-        worker_proc = get_diffusion_worker_class()
+        # Extract worker_extension_cls and custom_pipeline_args from od_config
+        worker_extension_cls = od_config.worker_extension_cls
+        custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
 
         # Launch all worker processes
         scheduler_pipe_readers = []
@@ -88,12 +89,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
             process = mp.Process(
-                target=worker_proc.worker_main,
+                target=WorkerProc.worker_main,
                 args=(
                     i,  # rank
                     od_config,
                     writer,
                     broadcast_handle,
+                    worker_extension_cls,
+                    custom_pipeline_args,
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
@@ -130,8 +133,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
-    def add_req(self, requests: list[OmniDiffusionRequest]):
-        return self.scheduler.add_req(requests)
+    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        return self.scheduler.add_req(request)
 
     def collective_rpc(
         self,

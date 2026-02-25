@@ -37,6 +37,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -173,7 +174,9 @@ class ZImagePipeline(nn.Module):
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
         )
-        self.transformer = ZImageTransformer2DModel()
+        # Get vLLM quantization config for linear layers
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        self.transformer = ZImageTransformer2DModel(quant_config=quant_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         # Note: Context parallelism is applied centrally in registry.initialize_model()
@@ -312,20 +315,19 @@ class ZImagePipeline(nn.Module):
     def interrupt(self):
         return self._interrupt
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
+        height: int = 1024,
+        width: int = 1024,
         num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
         guidance_scale: float = 5.0,
         cfg_normalization: bool = False,
         cfg_truncation: float = 1.0,
         negative_prompt: str | list[str] | None = None,
-        num_images_per_prompt: int | None = 1,
+        num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
         latents: torch.FloatTensor | None = None,
         prompt_embeds: list[torch.FloatTensor] | None = None,
@@ -414,16 +416,28 @@ class ZImagePipeline(nn.Module):
             `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
             generated images.
         """
-        prompt = req.prompt
-        negative_prompt = req.negative_prompt
-        height: int = req.height or 1024
-        width: int = req.width or 1024
-        num_inference_steps = req.num_inference_steps or 50
-        generator = req.generator
-        guidance_scale = req.guidance_scale if req.guidance_rescale is not None else guidance_scale
-        req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
-        if req_num_outputs and req_num_outputs > 0:
-            num_images_per_prompt = req_num_outputs
+        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
+        # TODO: May be some data formatting operations on the API side. Hack for now.
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+            negative_prompt = None
+        elif req.prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        generator = req.sampling_params.generator
+        sigmas = req.sampling_params.sigmas or sigmas
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_rescale is not None else guidance_scale
+        )
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:
@@ -516,6 +530,16 @@ class ZImagePipeline(nn.Module):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+        # Precompute normalized timesteps once to avoid per-step GPU->CPU sync (.item() causes cudaStreamSynchronize)
+        if isinstance(timesteps, torch.Tensor):
+            timesteps_tensor = timesteps.to(device=device, dtype=torch.float32)
+        else:
+            timesteps_tensor = torch.as_tensor(timesteps, device=device, dtype=torch.float32)
+        norm_timesteps = (1000 - timesteps_tensor) / 1000
+        t_norm_list = norm_timesteps.cpu().tolist()
+        if not isinstance(t_norm_list, list):
+            t_norm_list = [t_norm_list]
+
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
             if self.interrupt:
@@ -524,8 +548,9 @@ class ZImagePipeline(nn.Module):
             # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
             timestep = t.expand(latents.shape[0])
             timestep = (1000 - timestep) / 1000
-            # Normalized time for time-aware config (0 at start, 1 at end)
-            t_norm = timestep[0].item()
+            # Normalized time for time-aware config (0 at start, 1 at end);
+            # use precomputed to avoid .item() sync per step
+            t_norm = t_norm_list[i]
 
             # Handle cfg truncation
             current_guidance_scale = self.guidance_scale
@@ -539,14 +564,14 @@ class ZImagePipeline(nn.Module):
 
             # Run CFG only if configured AND scale is non-zero
             apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
+            latents_typed = latents.to(self.od_config.dtype)
 
             if apply_cfg:
-                latents_typed = latents.to(self.transformer.dtype)
                 latent_model_input = latents_typed.repeat(2, 1, 1, 1)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                 timestep_model_input = timestep.repeat(2)
             else:
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents_typed
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
 
@@ -571,13 +596,17 @@ class ZImagePipeline(nn.Module):
 
                     pred = pos + current_guidance_scale * (pos - neg)
 
-                    # Renormalization
+                    # Renormalization (torch.where avoids GPU->CPU sync from Python if/scalar comparison)
                     if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
                         ori_pos_norm = torch.linalg.vector_norm(pos)
                         new_pos_norm = torch.linalg.vector_norm(pred)
                         max_new_norm = ori_pos_norm * float(self._cfg_normalization)
-                        if new_pos_norm > max_new_norm:
-                            pred = pred * (max_new_norm / new_pos_norm)
+                        scale = torch.where(
+                            new_pos_norm > max_new_norm,
+                            (max_new_norm / new_pos_norm.clamp(min=1e-12)).to(pred.dtype),
+                            pred.new_tensor(1.0),
+                        )
+                        pred = pred * scale
 
                     noise_pred.append(pred)
 

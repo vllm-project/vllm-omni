@@ -1,5 +1,8 @@
 import argparse
 import os
+from typing import cast
+
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
 def parse_args():
@@ -16,7 +19,7 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
-    parser.add_argument("--prompt_type", default="text", choices=["text"])
+    parser.add_argument("--prompt-type", default="text", choices=["text"])
 
     parser.add_argument(
         "--modality",
@@ -33,7 +36,7 @@ def parse_args():
     )
 
     # OmniLLM init args
-    parser.add_argument("--enable-stats", action="store_true", default=False)
+    parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--init-timeout", type=int, default=300)
@@ -43,6 +46,12 @@ def parse_args():
     parser.add_argument("--stage-configs-path", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
+    parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
+    parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
+    parser.add_argument(
+        "--negative-prompt", type=str, default=None, help="Negative prompt (not yet supported, reserved for future)"
+    )
+
     args = parser.parse_args()
     return args
 
@@ -50,21 +59,24 @@ def parse_args():
 def main():
     args = parse_args()
     model_name = args.model
+    prompts: list[OmniPromptType] = []
     try:
         # Preferred: load from txt file (one prompt per line)
         if getattr(args, "txt_prompts", None) and args.prompt_type == "text":
             with open(args.txt_prompts, encoding="utf-8") as f:
                 lines = [ln.strip() for ln in f.readlines()]
-            args.prompts = [ln for ln in lines if ln != ""]
-            print(f"[Info] Loaded {len(args.prompts)} prompts from {args.txt_prompts}")
+            prompts = [ln for ln in lines if ln != ""]
+            print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
+        else:
+            prompts = args.prompts
     except Exception as e:
         print(f"[Error] Failed to load prompts: {e}")
         raise
 
-    if args.prompts is None:
+    if not prompts:
         # Default prompt for text2img test if none provided
-        args.prompts = ["<|im_start|>A cute cat<|im_end|>"]
-        print(f"[Info] No prompts provided, using default: {args.prompts}")
+        prompts = ["<|im_start|>A cute cat<|im_end|>"]
+        print(f"[Info] No prompts provided, using default: {prompts}")
     omni_outputs = []
 
     from PIL import Image
@@ -77,21 +89,31 @@ def main():
         print("[Info] Running in img2img mode (Stage 1 only)")
         client = OmniDiffusion(model=model_name)
 
-        generate_kwargs = {
-            "prompt": args.prompts,
-            "seed": 52,
-            "need_kv_receive": False,
-            "num_inference_steps": args.steps,
-        }
-
         if args.image_path:
             if os.path.exists(args.image_path):
                 loaded_image = Image.open(args.image_path).convert("RGB")
-                generate_kwargs["pil_image"] = loaded_image
+                prompts = [
+                    {
+                        "prompt": cast(str, p),
+                        "multi_modal_data": {"image": loaded_image},
+                    }
+                    for p in prompts
+                ]
             else:
                 print(f"[Warning] Image path {args.image_path} does not exist.")
 
-        result = client.generate(**generate_kwargs)
+        result = client.generate(
+            prompts,
+            OmniDiffusionSamplingParams(
+                seed=52,
+                need_kv_receive=False,
+                num_inference_steps=args.steps,
+                extra_args={
+                    "cfg_text_scale": args.cfg_text_scale,
+                    "cfg_img_scale": args.cfg_img_scale,
+                },
+            ),
+        )
 
         # Ensure result is a list for iteration
         if not isinstance(result, list):
@@ -100,8 +122,6 @@ def main():
             omni_outputs = result
 
     else:
-        import copy
-
         from vllm_omni.entrypoints.omni import Omni
 
         omni_kwargs = {}
@@ -110,7 +130,7 @@ def main():
 
         omni_kwargs.update(
             {
-                "log_stats": args.enable_stats,
+                "log_stats": args.log_stats,
                 "init_sleep_seconds": args.init_sleep_seconds,
                 "batch_timeout": args.batch_timeout,
                 "init_timeout": args.init_timeout,
@@ -144,11 +164,16 @@ def main():
                 prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
                 formatted_prompts.append(prompt_dict)
 
-        params_list = copy.deepcopy(omni.default_sampling_params_list)
+        params_list = omni.default_sampling_params_list
         if args.modality == "text2img":
-            params_list[0]["max_tokens"] = 1
+            params_list[0].max_tokens = 1  # type: ignore # The first stage is a SamplingParam (vllm)
             if len(params_list) > 1:
-                params_list[1]["num_inference_steps"] = args.steps
+                diffusion_params = params_list[1]
+                diffusion_params.num_inference_steps = args.steps  # type: ignore
+                diffusion_params.extra_args = {  # type: ignore
+                    "cfg_text_scale": args.cfg_text_scale,
+                    "cfg_img_scale": args.cfg_img_scale,
+                }
 
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

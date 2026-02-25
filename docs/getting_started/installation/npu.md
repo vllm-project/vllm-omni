@@ -16,7 +16,13 @@ vLLM-Omni supports NPU through the vLLM Ascend Plugin (vllm-ascend). This is a c
 
 ## Installation
 
-### Recommended
+### Set up using Docker
+
+=== "NPU"
+
+    --8<-- "docs/getting_started/installation/npu/npu.inc.md:pre-built-images"
+
+### Build wheel from source
 
 === "NPU"
 

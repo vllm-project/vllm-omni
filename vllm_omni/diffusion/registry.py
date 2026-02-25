@@ -85,10 +85,20 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image_3",
+        "pipeline_hunyuan_image_3",
+        "HunyuanImage3Pipeline",
+    ),
     "Flux2KleinPipeline": (
         "flux2_klein",
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
+    ),
+    "FluxPipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxPipeline",
     ),
 }
 
@@ -102,6 +112,11 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+_VAE_PATCH_PARALLEL_ALLOWLIST = {
+    # Only enable for models we have validated end-to-end.
+    "ZImagePipeline",
+}
 
 
 def initialize_model(
@@ -127,11 +142,45 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
+
+        vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
+        if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
+            logger.warning(
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is only enabled for %s; ignoring.",
+                vae_pp_size,
+                sorted(_VAE_PATCH_PARALLEL_ALLOWLIST),
+            )
+        if (
+            vae_pp_size > 1
+            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+            and not od_config.vae_use_tiling
+        ):
+            logger.info(
+                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                vae_pp_size,
+            )
+            od_config.vae_use_tiling = True
+
         # Configure VAE memory optimization settings from config
         if hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+
+        if (
+            vae_pp_size > 1
+            and hasattr(model, "vae")
+            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+            and od_config.vae_use_tiling
+        ):
+            from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_wrap_vae_decode_with_patch_parallelism
+
+            maybe_wrap_vae_decode_with_patch_parallelism(
+                model,
+                vae_patch_parallel_size=vae_pp_size,
+                group_getter=get_dit_group,
+            )
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -164,7 +213,10 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             return
 
         # Find transformer model(s) in the pipeline that have _sp_plan
-        transformer_attrs = ["transformer", "dit", "unet"]
+        # Include transformer_2 for two-stage models (e.g., Wan MoE)
+        transformer_attrs = ["transformer", "transformer_2", "dit", "unet"]
+        applied_count = 0
+
         for attr in transformer_attrs:
             if not hasattr(model, attr):
                 continue
@@ -190,11 +242,17 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
                 else ("ulysses" if sp_config.ulysses_degree > 1 else "ring")
             )
             logger.info(
-                f"Applying sequence parallelism to {transformer.__class__.__name__} "
+                f"Applying sequence parallelism to {transformer.__class__.__name__} ({attr}) "
                 f"(sp_size={sp_size}, mode={mode}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
             )
             apply_sequence_parallel(transformer, sp_config, plan)
-            return  # Only apply to first transformer found
+            applied_count += 1
+
+        if applied_count == 0:
+            logger.warning(
+                f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
+                "SP hooks not applied. Consider adding _sp_plan to your transformer model."
+            )
 
     except Exception as e:
         logger.warning(f"Failed to apply sequence parallelism: {e}. Continuing without SP hooks.")
@@ -218,6 +276,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "FluxPipeline": "get_flux_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

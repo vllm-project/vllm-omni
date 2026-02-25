@@ -1,0 +1,263 @@
+# BAGEL-7B-MoT
+
+## Set up
+
+Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+
+## Run examples
+
+**Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, please modify the stage configuration to distribute the model across devices.
+
+Get into the bagel folder
+
+```bash
+cd examples/offline_inference/bagel
+```
+
+### Modality Control
+
+BAGEL-7B-MoT supports multiple modality modes. You can control the mode using the `--modality` argument:
+
+#### Text to Image (text2img)
+
+- **Pipeline**: Text → Thinker  → DiT → VAE Decode → Image
+- **Stages Used**: Stage 0 (Thinker) + Stage 1 (DiT)
+- **KV Transfer**: Thinker sends KV cache to DiT for conditioned generation
+
+Generate images from text prompts:
+
+```bash
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2img \
+                  --prompts "A cute cat"
+```
+
+#### Image to Image (img2img)
+
+- **Pipeline**: Image → VAE Encode → DiT → VAE Decode → New Image
+- **Stages Used**: Stage 1 (DiT) only
+- **Special**: Bypasses the Thinker stage, direct image-to-image transformation
+
+Transform images based on text prompts:
+
+```bash
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality img2img \
+                  --image-path /path/to/image.jpg \
+                  --prompts "Let the woman wear a blue dress"
+```
+
+#### Image to Text (img2text)
+
+- **Pipeline**: Image → ViT + VAE Encode → Thinker → Text Output
+- **Stages Used**: Stage 0 (Thinker) only
+- **Special**: Uses both VAE latent encoding AND ViT semantic encoding for comprehensive image understanding
+
+Generate text descriptions from images:
+
+```bash
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality img2text \
+                  --image-path /path/to/image.jpg \
+                  --prompts "Describe this image in detail"
+```
+
+#### Text to Text (text2text)
+
+- **Pipeline**: Text → Thinker → Text Output
+- **Stages Used**: Stage 0 (Thinker) only
+- **Special**: No visual components involved, operates as pure language model
+
+Pure text generation:
+
+```bash
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2text \
+                  --prompts "What is the capital of France?"
+
+# You can load prompts from a text file (one prompt per line):  
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2text \
+                  --txt-prompts /path/to/prompts.txt
+```
+
+### Inference Steps
+
+Control the number of inference steps for image generation:
+
+```bash
+# You can adjust steps to 100 to improve image quality
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2img \
+                  --steps 50 \
+                  --prompts "A cute cat"
+```
+
+### Key arguments
+
+BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
+
+The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
+
+#### 📌 Command Line Arguments (end2end.py)
+
+| Argument               | Type   | Default                       | Description                                                  |
+| :--------------------- | :----- | :---------------------------- | :----------------------------------------------------------- |
+| `--model`              | string | `ByteDance-Seed/BAGEL-7B-MoT` | Model path or name                                           |
+| `--modality`           | choice | `text2img`                    | Modality mode: `text2img`, `img2img`, `img2text`, `text2text` |
+| `--prompts`            | list   | `None`                        | Input text prompts directly                                  |
+| `--txt-prompts`        | string | `None`                        | Path to txt file with one prompt per line                    |
+| `--image-path`         | string | `None`                        | Input image path (for `img2img`/`img2text`)                  |
+| `--steps`              | int    | `50`                          | Number of inference steps                                    |
+| `--stage-configs-path` | string | `None`                        | Custom stage config file path                                |
+| `--worker-backend`     | choice | `process`                     | Worker backend: `process` or `ray`                           |
+| `--ray-address`        | string | `None`                        | Ray cluster address                                          |
+| `--enable-stats`       | flag   | `False`                       | Enable statistics logging                                    |
+| `--init-sleep-seconds` | int    | `20`                          | Initialization sleep time                                    |
+| `--batch-timeout`      | int    | `5`                           | Batch timeout                                                |
+| `--init-timeout`       | int    | `300`                         | Initialization timeout                                       |
+
+------
+
+#### ⚙️ Stage Configuration Parameters (bagel.yaml)
+
+ **Stage 0 - Thinker (LLM Stage)**
+
+| Parameter                        | Value                           | Description              |
+| :------------------------------- | :------------------------------ | :----------------------- |
+| `stage_type`                     | `llm`                           | Stage type               |
+| `devices`                        | `"0"`                           | GPU device ID            |
+| `max_batch_size`                 | `1`                             | Maximum batch size       |
+| `model_stage`                    | `thinker`                       | Model stage identifier   |
+| `model_arch`                     | `BagelForConditionalGeneration` | Model architecture       |
+| `gpu_memory_utilization`         | `0.4`                           | GPU memory utilization   |
+| `tensor_parallel_size`           | `1`                             | Tensor parallel size     |
+| `max_num_batched_tokens`         | `32768`                         | Maximum batched tokens   |
+| `omni_kv_config.need_send_cache` | `true`                          | Whether to send KV cache |
+
+------
+
+**Stage 1 - DiT (Diffusion Stage)**
+
+| Parameter                        | Value       | Description                 |
+| :------------------------------- | :---------- | :-------------------------- |
+| `stage_type`                     | `diffusion` | Stage type                  |
+| `devices`                        | `"0"`       | GPU device ID               |
+| `max_batch_size`                 | `1`         | Maximum batch size          |
+| `model_stage`                    | `dit`       | Model stage identifier      |
+| `gpu_memory_utilization`         | `0.4`       | GPU memory utilization      |
+| `omni_kv_config.need_recv_cache` | `true`      | Whether to receive KV cache |
+| `engine_input_source`            | `[0]`       | Input source from Stage 0   |
+
+------
+
+#### Tensor Parallelism (TP)
+
+For larger models or multi-GPU environments, you can enable Tensor Parallelism (TP) by modifying the stage configuration (e.g., [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)).
+
+1. **Set `tensor_parallel_size`**: Increase this value (e.g., to `2` or `4`).
+2. **Set `devices`**: Specify the comma-separated GPU IDs to be used for the stage (e.g., `"0,1"`).
+
+Example configuration for TP=2 on GPUs 0 and 1:
+```yaml
+    engine_args:
+      tensor_parallel_size: 2
+      ...
+    runtime:
+      devices: "0,1"
+```
+
+------
+
+#### 🔗 Runtime Configuration
+
+| Parameter             | Value   | Description                      |
+| :-------------------- | :------ | :------------------------------- |
+| `window_size`         | `-1`    | Window size (-1 means unlimited) |
+| `max_inflight`        | `1`     | Maximum inflight requests        |
+| `shm_threshold_bytes` | `65536` | Shared memory threshold (64KB)   |
+
+## Using Mooncake Connector
+
+[Mooncake](https://github.com/kvcache-ai/Mooncake) is a high-performance distributed KV cache transfer engine that enables efficient cross-node data movement via TCP or RDMA, making it ideal for multi-node disaggregated inference.
+
+By default, BAGEL uses `SharedMemoryConnector` for inter-stage communication. You can switch to the Mooncake connector for better performance on multi-GPU setups and to enable multi-node deployment.
+
+### Prerequisites
+
+Install the Mooncake transfer engine:
+
+```bash
+# For CUDA-enabled systems (recommended)
+pip install mooncake-transfer-engine
+
+# For non-CUDA systems
+pip install mooncake-transfer-engine-non-cuda
+```
+
+### Step 1: Start the Mooncake Master
+
+On the **primary node**, start the Mooncake master service (run in a separate terminal or background with `&`):
+
+```bash
+# Optional: enable disk-backed storage by creating a directory and passing --root_fs_dir.
+# Without it, Mooncake runs in memory-only mode, which is sufficient for KV cache transfer.
+mkdir -p ./mc_storage
+
+mooncake_master \
+  --rpc_port=50051 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080 \
+  --metrics_port=9003 \
+  --root_fs_dir=./mc_storage/ \
+  --cluster_id=mc-local-1 &
+```
+
+### Step 2: Run Offline Inference with Mooncake
+
+Use the provided Mooncake stage config [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml). Before launching, update the `metadata_server` and `master` addresses in the YAML to match your Mooncake master node's IP (use `127.0.0.1` for single-node testing).
+
+```bash
+cd examples/offline_inference/bagel
+
+# Text to Image with Mooncake
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2img \
+                  --prompts "A cute cat" \
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+
+# Image to Text with Mooncake
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality img2text \
+                  --image-path /path/to/image.jpg \
+                  --prompts "Describe this image" \
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+
+# Text to Text with Mooncake
+python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
+                  --modality text2text \
+                  --prompts "What is the capital of France?" \
+                  --stage-configs-path ../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml
+```
+
+For more details on the Mooncake connector and multi-node setup, see the [Mooncake Store Connector documentation](../../../docs/design/feature/omni_connectors/mooncake_store_connector.md).
+
+------
+
+## FAQ
+
+- If you encounter an error about the backend of librosa, try to install ffmpeg with the command below.
+
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
+
+- If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
+
+| Stage               | VRAM                         |
+| :------------------ | :--------------------------- |
+| Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
+| Stage-1 (DiT)       | **26.50 GiB**                |
+| Total               | **~42 GiB + KV Cache**       |

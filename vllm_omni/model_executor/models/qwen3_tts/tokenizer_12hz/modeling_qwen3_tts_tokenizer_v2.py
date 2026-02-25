@@ -39,7 +39,6 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import check_model_inputs
 
 from .configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -198,12 +197,13 @@ class Qwen3TTSTokenizerV2CausalTransConvNet(nn.Module):
         self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride=stride)
 
         pad = kernel_size - stride
-        self.left_pad = math.ceil(pad)
-        self.right_pad = pad = self.left_pad
+        self.left_pad = 0
+        self.right_pad = int(pad)
 
     def forward(self, hidden_state):
         hidden_state = self.conv(hidden_state)
-        hidden_state = hidden_state[..., self.left_pad : hidden_state.shape[-1] - self.right_pad]
+        if self.right_pad > 0:
+            hidden_state = hidden_state[..., : hidden_state.shape[-1] - self.right_pad]
         return hidden_state.contiguous()
 
 
@@ -495,7 +495,8 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    # Note: @check_model_inputs decorator removed for vLLM compatibility
+    # The decorator causes "unexpected keyword argument 'inputs_embeds'" error
     @auto_docstring
     def forward(
         self,

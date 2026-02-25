@@ -25,6 +25,9 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # Bagel transformer coefficients
+    # Using Qwen's coefficients as reasonable default given shared architecture
+    "Bagel": [1.33313129e06, -1.68644226e05, 7.95050740e03, -1.63747873e02, 1.26352397e00],
     # Z-Image transformer coefficients
     # Copied from Qwen-Image, need to be tuned specifically for Z-Image in future
     "ZImageTransformer2DModel": [

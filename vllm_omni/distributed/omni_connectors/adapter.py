@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import OmniStageTaskType
+from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
 
@@ -23,7 +24,7 @@ def try_send_via_connector(
     sampling_params: Any,
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
-    metrics: Any,
+    metrics: OrchestratorAggregator,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -170,3 +171,36 @@ def try_recv_via_connector(
             # but for Stage-0 seed it should be there.
             # We'll return None to let caller handle error if strictly required.
             return None, None
+
+
+def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
+    """Compute the length of the talker prompt ids.
+
+    Args:
+        prompt_ids: The prompt ids tensor.
+
+    Returns:
+        The length of the talker prompt ids.
+    """
+    im_start_token_id = 151644
+    system_token_id = 8948
+    user_token_id = 872
+    assistant_token_id = 77091
+    im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
+    im_start_indexes.append(len(prompt_ids))
+    sum_user_len = 0
+    assistant_len = 0
+    for i in range(len(im_start_indexes) - 1):
+        s = im_start_indexes[i]
+        e = im_start_indexes[i + 1]
+        role = prompt_ids[s + 1]
+        if role == system_token_id:
+            continue
+        elif role == user_token_id:
+            sum_user_len += e - s
+        elif role == assistant_token_id and i == len(im_start_indexes) - 2:
+            assistant_len += 9  # 3 + 4 + 1 + 1
+        else:
+            pass
+
+    return sum_user_len + assistant_len

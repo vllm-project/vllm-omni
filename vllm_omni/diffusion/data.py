@@ -4,7 +4,7 @@
 import enum
 import os
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -14,6 +14,10 @@ from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.quantization import (
+    DiffusionQuantizationConfig,
+    get_diffusion_quant_config,
+)
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 logger = init_logger(__name__)
@@ -45,6 +49,9 @@ class DiffusionParallelConfig:
     cfg_parallel_size: int = 1
     """Number of Classifier Free Guidance (CFG) parallel groups."""
 
+    vae_patch_parallel_size: int = 1
+    """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
+
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
         """Validates the config relationships among the parallel strategies."""
@@ -55,6 +62,8 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
+        assert self.cfg_parallel_size in [1, 2], f"CFG parallel size must be 1 or 2, but got {self.cfg_parallel_size}"
+        assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
@@ -64,6 +73,7 @@ class DiffusionParallelConfig:
     def __post_init__(self) -> None:
         if self.sequence_parallel_size is None:
             self.sequence_parallel_size = self.ulysses_degree * self.ring_degree
+
         self.world_size = (
             self.pipeline_parallel_size
             * self.data_parallel_size
@@ -258,6 +268,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    enable_cache_dit_summary: bool = False
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -276,12 +287,9 @@ class OmniDiffusionConfig:
     # pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # LoRA parameters
-    # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
-    lora_nickname: str = "default"  # for swapping adapters in the pipeline
-    # can restrict layers to adapt, e.g. ["q_proj"]
-    # Will adapt only q, k, v, o by default.
-    lora_target_modules: list[str] | None = None
+    lora_scale: float = 1.0
+    max_cpu_loras: int | None = None
 
     output_type: str = "pil"
 
@@ -290,6 +298,9 @@ class OmniDiffusionConfig:
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
     enable_cpu_offload: bool = False
+    # Layer-wise offloading (block-level offloading) parameters
+    enable_layerwise_offload: bool = False
+
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -320,6 +331,15 @@ class OmniDiffusionConfig:
     # Master port for distributed inference
     # TODO: do not hard code
     master_port: int | None = None
+
+    # Worker extension class for custom functionality
+    worker_extension_cls: str | None = None
+
+    # Custom pipeline arguments for custom pipelines
+    custom_pipeline_args: dict[str, Any] | None = None
+
+    # Diffusion model loading format
+    diffusion_load_format: str = "default"  # "default", "custom_pipeline", "dummy"
 
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
@@ -354,11 +374,15 @@ class OmniDiffusionConfig:
     # support multi images input
     supports_multimodal_inputs: bool = False
 
-    # Logging
     log_level: str = "info"
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+
+    # Quantization settings
+    # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
+    quantization: str | None = None
+    quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
 
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
@@ -446,11 +470,51 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        # Convert quantization config
+        if self.quantization is not None or self.quantization_config is not None:
+            # Handle dict or DictConfig (from OmegaConf) - use Mapping for broader compatibility
+            if isinstance(self.quantization_config, Mapping):
+                # Convert DictConfig to dict if needed (OmegaConf compatibility)
+                config_dict = dict(self.quantization_config)
+                # Use get() instead of pop() to avoid mutating original dict
+                quant_method = config_dict.get("method", self.quantization)
+                # Filter out "method" key for kwargs
+                quant_kwargs = {k: v for k, v in config_dict.items() if k != "method"}
+
+                # Validate conflicting methods
+                if self.quantization is not None and quant_method is not None and quant_method != self.quantization:
+                    logger.warning(
+                        f"Conflicting quantization methods: quantization={self.quantization!r}, "
+                        f"quantization_config['method']={quant_method!r}. Using quantization_config['method']."
+                    )
+
+                self.quantization_config = get_diffusion_quant_config(quant_method, **quant_kwargs)
+            elif self.quantization_config is None and self.quantization is not None:
+                self.quantization_config = get_diffusion_quant_config(self.quantization)
+            elif not isinstance(self.quantization_config, DiffusionQuantizationConfig):
+                raise TypeError(
+                    f"quantization_config must be a DiffusionQuantizationConfig, dict, or None, "
+                    f"got {type(self.quantization_config)!r}"
+                )
+
+        if self.max_cpu_loras is None:
+            self.max_cpu_loras = 1
+        elif self.max_cpu_loras < 1:
+            raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        # Backwards-compatibility: older callers may use a diffusion-specific
+        # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale"
+        # before constructing the dataclass to avoid TypeError on unknown fields.
+        if "static_lora_scale" in kwargs:
+            if "lora_scale" not in kwargs:
+                kwargs["lora_scale"] = kwargs["static_lora_scale"]
+            kwargs.pop("static_lora_scale", None)
+
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
         if "cache_backend" not in kwargs:

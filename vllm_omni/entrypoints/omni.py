@@ -3,21 +3,24 @@
 import json
 import multiprocessing as mp
 import os
+import threading
 import time
 import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
-from pprint import pformat
-from typing import Any
+from typing import Any, Literal, overload
 
+import huggingface_hub
+import msgspec.msgpack
+import zmq
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
-from vllm.inputs import PromptType
+from vllm import SamplingParams
 from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.utils import get_engine_client_zmq_addr
 
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
     initialize_orchestrator_connectors,
@@ -31,23 +34,35 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
-from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
     inject_omni_kv_config,
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
-    resolve_model_config_path,
+    load_and_resolve_stage_configs,
+)
+from vllm_omni.entrypoints.zmq_utils import ZmqQueue
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
+def _weak_close_cleanup(
+    stage_list,
+    stage_in_queues,
+    stage_out_queues,
+    ray_pg,
+    zmq_ctx=None,
+    handshake_stop: threading.Event | None = None,
+    zmq_handshake_socket: zmq.Socket | None = None,
+    handshake_thread: threading.Thread | None = None,
+):
     """Weak reference cleanup function for OmniBase instances."""
     if stage_list:
         for q in stage_in_queues:
@@ -55,6 +70,13 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+        for q in stage_out_queues:
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
         for stage in stage_list:
             try:
                 stage.stop_stage_worker()
@@ -62,30 +84,59 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
                 logger.warning(f"Failed to stop stage worker: {e}")
     try_close_ray(ray_pg)
 
+    # Gracefully shutdown handshake server thread
+    if handshake_stop is not None:
+        handshake_stop.set()
+    if handshake_thread is not None:
+        handshake_thread.join(timeout=2.0)
+        if handshake_thread.is_alive():
+            logger.warning("Handshake server thread did not terminate gracefully within timeout")
+
+    # Close ZMQ resources after thread has exited
+    if zmq_handshake_socket is not None:
+        zmq_handshake_socket.close(0)
+    if zmq_ctx is not None:
+        zmq_ctx.term()
+
 
 def _dummy_snapshot_download(model_id):
     return model_id
 
 
 def omni_snapshot_download(model_id) -> str:
+    # If it's already a local path, just return it
+    if os.path.exists(model_id):
+        return model_id
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
     if os.environ.get("VLLM_USE_MODELSCOPE", False):
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
-    else:
-        return _dummy_snapshot_download(model_id)
+    # For other cases (Hugging Face), perform a real download to ensure all
+    # necessary files (including *.pt for audio/diffusion) are available locally
+    # before stage workers are spawned. This prevents initialization timeouts.
+    # Return the original model_id so that model_config.model preserves
+    # HuggingFace semantics (e.g. "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    # instead of the resolved cache path.
+    try:
+        download_weights_from_hf_specific(
+            model_name_or_path=model_id,
+            cache_dir=None,
+            allow_patterns=["*"],
+            require_all=True,
+        )
+    except huggingface_hub.errors.RepositoryNotFoundError:
+        logger.warning(f"Repository not found for '{model_id}'.")
+    return model_id
 
 
 class OmniBase:
     """Base class for serving Omni models.
 
     Args:
-        *args: Variable length argument list.
-            - args[0]: Model name or path to load.
+        model: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -102,23 +153,27 @@ class OmniBase:
             - Additional keyword arguments passed to stage engines.
     """
 
-    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        model = args[0] if args else kwargs.get("model", "")
-        assert model != "", "Null model id detected, please specify a model id."
+    def __init__(self, model: str, **kwargs: Any) -> None:
         model = omni_snapshot_download(model)
-        if args:
-            args[0] = model
-        elif kwargs.get("model", "") != "":
-            kwargs["model"] = model
+        kwargs["model"] = model
 
         # Stage management attributes
         self.stage_list: list[OmniStage] = []
-        self._stage_in_queues: list[mp.Queue] = []
-        self._stage_out_queues: list[mp.Queue] = []
+        self._stage_in_queues: list[Any] = []
+        self._stage_out_queues: list[Any] = []
         self._stages_ready: set[int] = set()
         self._ray_pg = None
         self._queue_cls = None
         self._ctx = None
+        self._zmq_ctx: zmq.Context | None = None
+        self._zmq_master_address: str | None = None
+        self._zmq_master_port: int | None = None
+        self._zmq_handshake_socket: zmq.Socket | None = None
+        self._handshake_thread: threading.Thread | None = None
+        self._handshake_stop: threading.Event | None = None
+        self._handshake_endpoints: dict[int, tuple[str, str]] = {}
+        self._handshake_seen: set[int] = set()  # Track which stage IDs have completed ZMQ handshake
+        self._single_stage_id: int | None = None  # Optional: deploy only a specific stage ID
 
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
@@ -194,6 +249,44 @@ class OmniBase:
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
+    def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+        """Resolve stage configs and inject defaults shared by orchestrator/headless."""
+        # TODO(wuhang):
+        # Remove kwargs as parameters in the future.
+        # Use dataclass directly for engine args.
+
+        stage_configs_path = kwargs.get("stage_configs_path", None)
+
+        # Load stage configurations from YAML
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model,
+            stage_configs_path,
+            kwargs,
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+        )
+
+        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        for cfg in stage_configs:
+            try:
+                if getattr(cfg, "stage_type", None) != "diffusion":
+                    continue
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+                if kwargs.get("lora_path") is not None:
+                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
+                        cfg.engine_args.lora_path = kwargs["lora_path"]
+                lora_scale = kwargs.get("lora_scale")
+                if lora_scale is None:
+                    # Backwards compatibility for older callers.
+                    lora_scale = kwargs.get("static_lora_scale")
+                if lora_scale is not None:
+                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
+                        cfg.engine_args.lora_scale = lora_scale
+            except Exception as e:
+                logger.warning("Failed to inject LoRA config for stage: %s", e)
+
+        return config_path, stage_configs
+
     def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
         """Initialize stage list management."""
         stage_init_timeout = kwargs.get("stage_init_timeout", 20)
@@ -202,24 +295,16 @@ class OmniBase:
         worker_backend = kwargs.get("worker_backend", "multi_process")
         ray_address = kwargs.get("ray_address", None)
         batch_timeout = kwargs.get("batch_timeout", 10)
-        stage_configs_path = kwargs.get("stage_configs_path", None)
         log_stats = kwargs.get("log_stats", False)
+        self._single_stage_id = kwargs.get("stage_id", None)
+        self._zmq_master_address = kwargs.get("omni_master_address", None)
+        if self._zmq_master_address is None:
+            self._zmq_master_address = "127.0.0.1"
+            logger.info("No omni_master_address provided, defaulting to localhost (127.0.0.1)")
+        self._zmq_master_port = kwargs.get("omni_master_port", None)
 
-        ### base engine args
-        tokenizer = kwargs.get("tokenizer", None)
-
-        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-
-        # Load stage configurations from YAML
-        if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
-            if not self.stage_configs:
-                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
-                self.stage_configs = OmegaConf.create(default_stage_cfg)
-        else:
-            self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+        # Resolve stage configs shared by orchestrator/headless paths.
+        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -227,11 +312,13 @@ class OmniBase:
         )
 
         # Initialize stats paths
-        self._enable_stats: bool = bool(log_stats)
+        self.log_stats: bool = bool(log_stats)
 
         self.worker_backend = worker_backend
         self.ray_address = ray_address
         self.batch_timeout = batch_timeout
+        # async chunk remains the same for each stage
+        self.async_chunk = self._is_async_chunk_enable(self.stage_configs)
 
         # Build OmniStage instances in parallel, preserve original order
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, OmniStage]:
@@ -247,7 +334,7 @@ class OmniBase:
         self.stage_list = [st for _, st in results]
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
-        logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
+        logger.info(f"[{self._name}] Loaded {len(self.stage_list)} stages")
 
         if self.worker_backend == "ray":
             self._queue_cls = get_ray_queue_class()
@@ -261,6 +348,11 @@ class OmniBase:
         # Wait for all stages to report readiness before seeding
         self._wait_for_stages_ready(timeout=init_timeout)
 
+    def _is_async_chunk_enable(self, stage_args: list) -> bool:
+        """get async chunk flag"""
+        engine_args = getattr(stage_args[0], "engine_args", None)
+        return bool(getattr(engine_args, "async_chunk", False))
+
     def _start_stages(self, model: str) -> None:
         """Start all stage processes."""
         if self.worker_backend == "ray":
@@ -268,10 +360,34 @@ class OmniBase:
             self._ray_pg = create_placement_group(
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
+        else:
+            # Initialize ZMQ context
+            if self._zmq_ctx is None:
+                self._zmq_ctx = zmq.Context()
+
+            # Allocate endpoints for each stage
+            total_stages = len(self.stage_configs)
+            self._handshake_endpoints = {}
+            for sid in range(total_stages):
+                in_endpoint = get_engine_client_zmq_addr(local_only=False, host=self._zmq_master_address)
+                out_endpoint = get_engine_client_zmq_addr(local_only=False, host=self._zmq_master_address)
+                self._handshake_endpoints[sid] = (in_endpoint, out_endpoint)
+                logger.debug(
+                    f"[{self._name}] Allocated endpoints for stage-{sid}: in={in_endpoint}, out={out_endpoint}"
+                )
+
+            # Start handshake server
+            self.start_handshake_server()
 
         for stage_id, stage in enumerate[OmniStage](self.stage_list):
-            in_q = self._queue_cls()
-            out_q = self._queue_cls()
+            if self.worker_backend == "ray":
+                in_q = self._queue_cls()
+                out_q = self._queue_cls()
+            else:
+                in_endpoint, out_endpoint = self._handshake_endpoints[stage_id]
+                in_q = ZmqQueue(self._zmq_ctx, zmq.PUSH, bind=in_endpoint)
+                out_q = ZmqQueue(self._zmq_ctx, zmq.PULL, bind=out_endpoint)
+
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
             stage.attach_queues(in_q, out_q)
@@ -293,6 +409,12 @@ class OmniBase:
             except Exception as e:
                 logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
 
+            if self._single_stage_id is not None and stage_id != int(self._single_stage_id):
+                logger.info(
+                    f"[{self._name}] Skipping initialization of stage-{stage_id} worker due to single_stage_id setting"
+                )
+                continue
+
             stage.init_stage_worker(
                 model,
                 is_async=self.is_async,
@@ -302,6 +424,7 @@ class OmniBase:
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
                 ray_placement_group=self._ray_pg,
+                ignore_runtime_config=True if self._single_stage_id is not None else False,
             )
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
@@ -312,6 +435,9 @@ class OmniBase:
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
         """Wait for all stages to report readiness with optimized polling."""
+        if self._single_stage_id is not None and self.worker_backend != "ray":
+            timeout = self._wait_for_handshakes(timeout)
+
         num_stages = len(self.stage_list)
         deadline = time.time() + max(0, int(timeout))
 
@@ -462,6 +588,129 @@ class OmniBase:
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
+    def _process_handshake_message(self, msg: Any) -> dict[str, Any]:
+        """Process incoming handshake message and generate response.
+
+        Args:
+            msg: Decoded message from client
+
+        Returns:
+            Response dictionary with ok status and either endpoints or error
+        """
+        if not isinstance(msg, dict) or msg.get("type") != "handshake":
+            return {"ok": False, "error": "invalid handshake payload"}
+
+        try:
+            stage_id = int(msg.get("stage_id"))
+        except (TypeError, ValueError) as e:
+            return {"ok": False, "error": f"invalid stage_id: {e}"}
+
+        endpoints = self._handshake_endpoints.get(stage_id)
+        if endpoints is None:
+            return {"ok": False, "error": f"unknown stage_id: {stage_id}"}
+
+        # Mark stage as seen and prepare success response
+        self._handshake_seen.add(stage_id)
+        in_endpoint, out_endpoint = endpoints
+
+        logger.info(
+            "[%s] Handshake received from stage-%s",
+            self._name,
+            stage_id,
+        )
+
+        return {
+            "ok": True,
+            "in_endpoint": in_endpoint,
+            "out_endpoint": out_endpoint,
+        }
+
+    def _run_handshake_server_loop(self) -> None:
+        """Main loop for handshake server - polls for messages and responds."""
+        poller = zmq.Poller()
+        poller.register(self._zmq_handshake_socket, zmq.POLLIN)
+
+        try:
+            while not self._handshake_stop.is_set():
+                events = poller.poll(1000)
+                has_message = any(sock == self._zmq_handshake_socket and event == zmq.POLLIN for sock, event in events)
+                if not has_message:
+                    continue
+
+                msg = msgspec.msgpack.decode(self._zmq_handshake_socket.recv())
+                response = msgspec.msgpack.encode(self._process_handshake_message(msg))
+                self._zmq_handshake_socket.send(response)
+        finally:
+            poller.unregister(self._zmq_handshake_socket)
+
+    def start_handshake_server(self) -> None:
+        """Start the ZMQ handshake server.
+
+        The handshake server allows distributed stages to discover their
+        queue endpoints by querying the orchestrator with their stage_id.
+        Skips starting if the server is already running or ZMQ is not initialized.
+        """
+        # Skip if already running or ZMQ not initialized
+        if self._handshake_thread is not None or self._zmq_ctx is None:
+            return
+
+        # Skip if master address/port not configured
+        if not self._zmq_master_address or self._zmq_master_port is None:
+            return
+
+        # Create server endpoint and socket
+        endpoint = get_engine_client_zmq_addr(
+            local_only=False, host=self._zmq_master_address, port=int(self._zmq_master_port)
+        )
+
+        self._handshake_stop = threading.Event()
+        self._zmq_handshake_socket = make_zmq_socket(self._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000)
+
+        # Start server thread
+        self._handshake_thread = threading.Thread(
+            target=self._run_handshake_server_loop, daemon=True, name="zmq-handshake-server"
+        )
+        self._handshake_thread.start()
+
+    def _wait_for_handshakes(self, timeout: int = 120) -> int:
+        """Wait for handshakes from all expected stages.
+
+        Args:
+            timeout: Timeout in seconds for waiting for handshakes. Default is 120s.
+
+        Returns:
+            Remaining timeout in seconds after waiting for handshakes.
+        """
+        total_stages = len(self.stage_configs)
+        expected = set(range(total_stages)) - {int(self._single_stage_id)}
+        if not expected:
+            return timeout
+
+        deadline = time.time() + max(0, int(timeout))
+        logger.info(f"[{self._name}] Waiting for handshakes from stages: {expected} (timeout: {timeout}s)")
+
+        # NOTE: _handshake_seen may be updated from the handshake server thread.
+        # It is intentionally used here without additional locking because:
+        #   - _handshake_seen only ever grows (stages are added but never removed), and
+        #   - we only check membership and set inclusion relative to `expected`.
+        # Under these monotonic semantics and the CPython GIL, concurrent reads/writes
+        # are safe for this usage and cannot violate correctness: we may observe a
+        # slightly stale view, but the loop condition remains valid and eventually
+        # becomes true once all expected stages have handshaked or the timeout elapses.
+        while not expected.issubset(self._handshake_seen) and time.time() < deadline:
+            time.sleep(1.0)
+
+        remaining_timeout = max(0, int(deadline - time.time()))
+
+        if not expected.issubset(self._handshake_seen):
+            missing = sorted(expected - self._handshake_seen)
+            logger.warning(
+                f"[{self._name}] Handshake timeout: {len(self._handshake_seen)}/{len(expected)} "
+                f"stages completed handshake. Missing stages: {missing}"
+            )
+
+        return remaining_timeout
+
     @property
     def _name(self) -> str:
         return "OmniBase"
@@ -475,10 +724,8 @@ class Omni(OmniBase):
     """Unified entrypoint for both LLM and Diffusion models for better usability.
 
     Args:
-        *args: Variable length argument list.
-            - args[0]: Model name or path to load.
+        model: Model name or path to load.
         **kwargs: Arbitrary keyword arguments.
-            - model: Model name or path to load (if not in args).
             - stage_configs_path: Optional path to YAML file containing stage
               configurations. If None, configurations are loaded from the model.
             - log_stats: Whether to enable statistics logging
@@ -500,8 +747,8 @@ class Omni(OmniBase):
         >>> print(outputs)
     """
 
-    def __init__(self, *args: Any, **kwargs: dict[str, Any]) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, model: str, **kwargs: Any) -> None:
+        super().__init__(model, **kwargs)
 
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
@@ -509,11 +756,39 @@ class Omni(OmniBase):
             _weak_close_cleanup,
             self.stage_list,
             self._stage_in_queues,
+            self._stage_out_queues,
             self._ray_pg,
+            self._zmq_ctx,
+            self._handshake_stop,
+            self._zmq_handshake_socket,
+            self._handshake_thread,
         )
 
+    @overload
     def generate(
-        self, *args: Any, **kwargs: dict[str, Any]
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        *,
+        py_generator: Literal[True],
+    ) -> Generator[OmniRequestOutput, None, None]: ...
+
+    @overload
+    def generate(
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        *,
+        py_generator: Literal[False] = False,
+    ) -> list[OmniRequestOutput]: ...
+
+    def generate(
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: OmniSamplingParams | Sequence[OmniSamplingParams] | None = None,
+        *,
+        py_generator: bool = False,
+        use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         """Generate outputs for the given prompts.
 
@@ -521,12 +796,10 @@ class Omni(OmniBase):
         Each stage will use OmniLLM or OmniDiffusion based on stage_type.
 
         Args:
-            *args: Variable length argument list.
-                - args[0]: Input prompts for generation.
-                - args[1]: Optional list of per-stage parameters.
-            **kwargs: Arbitrary keyword arguments.
-                - prompt: Input prompts for generation (if not in args).
-                - sampling_params_list: Optional list of per-stage parameters (if not in args).
+            prompts: Input prompt(s) for generation.
+            sampling_params_list: Optional list of per-stage parameters.
+            py_generator: Whether the returned result(s) are wrapped in a generator instead of a list.
+            use_tqdm: Whether to use tqdm progress bar
 
         Returns:
             List of OmniRequestOutput objects, one for each input prompt.
@@ -536,40 +809,26 @@ class Omni(OmniBase):
         Raises:
             ValueError: If sampling_params_list is None or has incorrect length.
         """
-        prompts = args[0] if args else kwargs.get("prompts")
-        sampling_params_list = args[1] if len(args) > 1 else kwargs.get("sampling_params_list")
-        py_generator = kwargs.get("py_generator", False)
-        if prompts is None:
-            if kwargs.get("prompt") is None:
-                raise ValueError("prompts is required for generation")
-            prompts = kwargs.get("prompt")
-
         if sampling_params_list is None:
-            # For Omni LLM, the params are parsed via the yaml file. For the current version,
-            # diffusion params can parsed via the command line.
-            omni_params_kwargs = {
-                k: v for k, v in kwargs.items() if k not in ["prompt", "request_id", "output_modalities"]
-            }
-
-            per_stage_params: list[Any] = []
-            for stage_id, stage in enumerate(self.stage_list):
-                stage_type = getattr(stage, "stage_type", "llm")
-                if stage_type == "diffusion":
-                    default_dict = self.default_sampling_params_list[stage_id]
-                    # Merge user-provided kwargs
-                    merged = {**default_dict, **omni_params_kwargs}
-                    # Diffusion only needs to keep diff params, will be used via OmniDiffusionRequest
-                    per_stage_params.append(merged)
+            sampling_params_list = self.default_sampling_params_list
+        elif not isinstance(sampling_params_list, Sequence):
+            # TODO: After the recent introduction of BAGEL model (one LLM and one Diffusion),
+            # expect the text_to_image example code to run when only passing one OmniDiffusionSamplingParams
+            # This behavior may be confusing, and future PR can improve it.
+            per_stage_params: list[OmniSamplingParams] = []
+            for default_stage_sp in self.default_sampling_params_list:
+                default_sp_type = default_stage_sp.__class__
+                if default_sp_type == sampling_params_list.__class__:
+                    per_stage_params.append(sampling_params_list)
                 else:
-                    # LLM directly constructs SamplingParams, don't use the merged params
-                    per_stage_params.append(self.default_sampling_params_list[stage_id])
-
+                    per_stage_params.append(default_stage_sp)
             sampling_params_list = per_stage_params
+
         try:
             if py_generator:
                 return self._run_generation_with_generator(prompts, sampling_params_list)
             else:
-                outputs = list(self._run_generation(prompts, sampling_params_list))
+                outputs = list(self._run_generation(prompts, sampling_params_list, use_tqdm))
                 return outputs
         except Exception as e:
             logger.exception("[Orchestrator] Failed to run generation: %s", e)
@@ -579,8 +838,8 @@ class Omni(OmniBase):
 
     def _run_generation_with_generator(
         self,
-        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
-        sampling_params_list: Any | Sequence[Any] | None,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: Sequence[OmniSamplingParams],
     ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline and return a generator."""
         gen = self._run_generation(prompts, sampling_params_list)
@@ -595,8 +854,8 @@ class Omni(OmniBase):
 
     def _run_generation(
         self,
-        prompts: PromptType | Sequence[PromptType] | OmniDiffusionRequest | Sequence[OmniDiffusionRequest],
-        sampling_params_list: Any | Sequence[Any] | None = None,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None]:
         """Run generation through all stages in the pipeline."""
@@ -604,18 +863,20 @@ class Omni(OmniBase):
         if sampling_params_list is None:
             raise ValueError("sampling_params_list is required for pipelined generation")
 
-        # Normalize sampling_params_list to a list
-        if not isinstance(sampling_params_list, (list, tuple)):
-            sampling_params_list = [sampling_params_list]
-        else:
-            sampling_params_list = list(sampling_params_list)
-
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
+        for i, (stage, sp) in enumerate(zip(self.stage_list, sampling_params_list)):
+            ExpectedSPType = OmniDiffusionSamplingParams if stage.stage_type == "diffusion" else SamplingParams
+            if not isinstance(sp, ExpectedSPType):
+                raise ValueError(
+                    f"Expected sampling parameters with type {ExpectedSPType} in stage {i}, got {sp.__class__}"
+                )
+
         # Normalize prompts to a list for per-request iteration
-        if not isinstance(prompts, (list, tuple)):
-            request_prompts: list[PromptType] = [prompts]
+        # str is also Sequence but only test list-like containers here
+        if isinstance(prompts, str) or not isinstance(prompts, Sequence):
+            request_prompts: list[OmniPromptType] = [prompts]
         else:
             request_prompts = list(prompts)
 
@@ -623,8 +884,8 @@ class Omni(OmniBase):
         num_stages = len(self.stage_list)
 
         # Generate globally unique request IDs and map them to original prompts
-        request_ids: list[str] = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
-        request_id_to_prompt: dict[str, PromptType] = {rid: p for rid, p in zip(request_ids, request_prompts)}
+        request_ids = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
+        request_id_to_prompt = {rid: p for rid, p in zip(request_ids, request_prompts)}
 
         # Track per-request start time for end-to-end timing
         _req_start_ts: dict[str, float] = {}
@@ -643,10 +904,11 @@ class Omni(OmniBase):
             final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
         # Metrics/aggregation helper
-        metrics = OrchestratorMetrics(
+        metrics = OrchestratorAggregator(
             num_stages,
-            self._enable_stats,
+            self.log_stats,
             _wall_start_ts,
+            final_stage_id_to_prompt,
         )
 
         it = request_id_to_prompt.items()
@@ -713,11 +975,15 @@ class Omni(OmniBase):
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = result.get("metrics")
+                    _m: StageRequestStats = result.get("metrics")
                     if _m is not None:
-                        if not isinstance(_m, dict):
-                            _m = asdict(_m)
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
+                        # Accumulate generation time
+                        metrics.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
+
+                        # For diffusion stages, we also accumulate diffusion time
+                        metrics.accumulate_diffusion_metrics(stage.stage_type, req_id, engine_outputs)
+
+                        metrics.on_stage_metrics(stage_id, req_id, _m, stage.final_output_type)
                         if pbar:
                             elapsed = pbar.format_dict["elapsed"] or 1e-6
                             # Aggregate total tokens/images across all stages
@@ -754,8 +1020,7 @@ class Omni(OmniBase):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_key = str(req_id)
-                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
+                        if stage_id == final_stage_id_to_prompt[req_id]:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -765,17 +1030,43 @@ class Omni(OmniBase):
                         logger.exception(
                             f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
                         )
-                    yield OmniRequestOutput(
+                    output_to_yield = OmniRequestOutput(
                         stage_id=stage_id,
                         final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
                         request_output=engine_outputs,
                     )
 
+                    # Record audio generated frames (only when finished)
+                    try:
+                        finished = (
+                            engine_outputs.finished
+                            if hasattr(engine_outputs, "finished")
+                            else (
+                                engine_outputs[0].finished
+                                if isinstance(engine_outputs, list)
+                                and engine_outputs
+                                and hasattr(engine_outputs[0], "finished")
+                                else False
+                            )
+                        )
+                        if finished:
+                            metrics.record_audio_generated_frames(output_to_yield, stage_id, req_id)
+                    except Exception as e:
+                        logger.exception(
+                            f"[{self._name}] Failed to record audio metrics for req {req_id} at stage {stage_id}: {e}",
+                        )
+
+                    yield output_to_yield
+
                 next_stage_id = stage_id + 1
                 if next_stage_id <= final_stage_id_to_prompt[req_id]:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     try:
-                        next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                        # Derive inputs for the next stage, record preprocess time
+                        with metrics.stage_postprocess_timer(stage_id, req_id):
+                            next_inputs = next_stage.process_engine_inputs(
+                                self.stage_list, [request_id_to_prompt[req_id]]
+                            )
                     except Exception as e:
                         logger.exception(
                             f"[{self._name}] Process engine inputs error for req {req_id}"
@@ -829,8 +1120,7 @@ class Omni(OmniBase):
 
         # Summarize and print stats
         try:
-            summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
+            metrics.build_and_log_summary()
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 
