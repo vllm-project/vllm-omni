@@ -68,9 +68,9 @@ The following table shows which models are currently supported by each accelerat
 
 ### VideoGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
-|-------|------------------|:--------:|:---------:|:----------:|:--------------:|:----------------:|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel | VAE-Patch-Parallel |
+|-------|------------------|:--------:|:---------:|:----------:|:--------------:|:----------------:|:----------------:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Quantization
 

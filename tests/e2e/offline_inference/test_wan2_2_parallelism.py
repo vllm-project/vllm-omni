@@ -24,7 +24,7 @@ from vllm_omni.platforms import current_omni_platform
 # os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-models = ["Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers"]
+models = ["Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "Wan-AI/Wan2.2-I2V-A14B-Diffusers"]
 
 
 def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae_patch_parallel_size=1):

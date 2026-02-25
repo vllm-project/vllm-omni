@@ -4,7 +4,6 @@ import pytest
 import torch
 import torch.distributed as dist
 
-# TODO: 替换为你的真实模块路径
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeExecutor,
     DistributedVaeMixin,
