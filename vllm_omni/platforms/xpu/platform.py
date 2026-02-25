@@ -79,3 +79,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
             device_id = device.index if device.index is not None else 0
         props = torch.xpu.get_device_properties(device_id)
         return props.total_memory
+
+    @classmethod
+    def supports_cpu_offload(cls) -> bool:
+        return True

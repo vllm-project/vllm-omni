@@ -99,3 +99,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.cuda.mem_get_info(device)
         return free
+
+    @classmethod
+    def supports_cpu_offload(cls) -> bool:
+        return True

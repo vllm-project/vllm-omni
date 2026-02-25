@@ -86,3 +86,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
+
+    @classmethod
+    def supports_cpu_offload(cls) -> bool:
+        return False
