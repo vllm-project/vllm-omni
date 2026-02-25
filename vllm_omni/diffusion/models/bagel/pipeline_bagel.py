@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable
+from copy import deepcopy
 from dataclasses import dataclass
 from math import isqrt
 
@@ -37,7 +38,12 @@ logger = init_logger(__name__)
 @dataclass
 class BagelGenParams:
     num_timesteps: int = 50
-    timestep_shift: float = 1.0
+    timestep_shift: float = 3.0
+    cfg_text_scale: float = 4.0
+    cfg_img_scale: float = 1.5
+    cfg_interval: tuple = (0.4, 1.0)
+    cfg_renorm_min: float = 0.0
+    cfg_renorm_type: str = "global"
 
 
 def add_special_tokens(tokenizer):
@@ -296,10 +302,15 @@ class BagelPipeline(nn.Module):
             )
         image_shape = (height, width)
 
-        # Map request params to Bagel gen params (defaults follow Bagel inferencer)
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
+        cfg_img_scale = extra_args.get("cfg_img_scale", 1.5)
+
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
         )
 
         gen_context = {
@@ -307,19 +318,25 @@ class BagelPipeline(nn.Module):
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
+        cfg_text_context = deepcopy(gen_context)
+        cfg_img_context = deepcopy(gen_context)
 
-        # Add text prompt (prefill) on gen context.
-        # [Omni] Check for injected KV Cache from remote transfer
         injected_kv = req.sampling_params.past_key_values
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
             gen_context["past_key_values"] = injected_kv
-
-            # User requested: kv_lens and ropes set to [gen_context["past_key_values"].key_cache[0].shape[0]]
-            # Assuming injected_kv is compatible and has key_cache[0]
             seq_len = injected_kv.key_cache[0].shape[0]
             gen_context["kv_lens"] = [seq_len]
             gen_context["ropes"] = [seq_len]
+
+            # Disable CFG: single KV cache cannot support 3-branch CFG
+            logger.warning("CFG is disabled when using injected KV Cache")
+            gen_params = BagelGenParams(
+                num_timesteps=gen_params.num_timesteps,
+                timestep_shift=gen_params.timestep_shift,
+                cfg_text_scale=1.0,
+                cfg_img_scale=1.0,
+            )
 
         else:
             image_input = (
@@ -335,8 +352,34 @@ class BagelPipeline(nn.Module):
                 if self.image_processor and self.vae:
 
                     def vit_transforms(img):
-                        # SigLIP processor returns dict with pixel_values; we want the tensor
                         return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
+
+                    stride = self.bagel.latent_downsample
+                    max_img_size = int(self.bagel.max_latent_size * stride)
+
+                    def _resize_to_stride(img):
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        w, h = img.size
+                        # Scale down if longest edge exceeds max
+                        scale = min(max_img_size / max(w, h), 1.0)
+                        # Scale up if shortest edge is too small (min 256)
+                        min_img_size = min(256, max_img_size)
+                        scale = max(scale, min_img_size / min(w, h))
+                        new_w = max(stride, int(round(w * scale / stride) * stride))
+                        new_h = max(stride, int(round(h * scale / stride) * stride))
+                        # Clamp to max
+                        new_w = min(new_w, max_img_size)
+                        new_h = min(new_h, max_img_size)
+                        if new_w != w or new_h != h:
+                            img = img.resize((new_w, new_h), Image.BICUBIC)
+                        return img
+
+                    image_input = [_resize_to_stride(img) for img in image_input]
+
+                    resized_w, resized_h = image_input[0].size
+                    image_shape = (resized_h, resized_w)
+                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
 
                     def vae_transforms(img):
                         if img.mode != "RGB":
@@ -345,7 +388,7 @@ class BagelPipeline(nn.Module):
                         arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
                         return arr.permute(2, 0, 1)
 
-                    # 1. Update VAE
+                    # Update gen_context with image (VAE + ViT)
                     gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
                         curr_kvlens=gen_context["kv_lens"],
                         curr_rope=gen_context["ropes"],
@@ -353,12 +396,9 @@ class BagelPipeline(nn.Module):
                         transforms=vae_transforms,
                         new_token_ids=self.new_token_ids,
                     )
-
                     for k, v in gen_input_vae.items():
                         if torch.is_tensor(v):
                             gen_input_vae[k] = v.to(self.device)
-
-                    # VAE needs bfloat16 to match model strings usually, specifically encode
                     with torch.autocast(
                         device_type=self.device.type,
                         enabled=self.device.type != "cpu",
@@ -370,7 +410,6 @@ class BagelPipeline(nn.Module):
                     gen_context["kv_lens"] = newlens_vae
                     gen_context["ropes"] = new_rope_vae
 
-                    # 2. Update ViT
                     gen_input_img, newlens_img, new_rope_img = self.bagel.prepare_vit_images(
                         curr_kvlens=gen_context["kv_lens"],
                         curr_rope=gen_context["ropes"],
@@ -378,11 +417,9 @@ class BagelPipeline(nn.Module):
                         transforms=vit_transforms,
                         new_token_ids=self.new_token_ids,
                     )
-
                     for k, v in gen_input_img.items():
                         if torch.is_tensor(v):
                             gen_input_img[k] = v.to(self.device)
-
                     with torch.autocast(
                         device_type=self.device.type,
                         enabled=self.device.type != "cpu",
@@ -393,6 +430,10 @@ class BagelPipeline(nn.Module):
                         )
                     gen_context["kv_lens"] = newlens_img
                     gen_context["ropes"] = new_rope_img
+
+                    cfg_text_context = deepcopy(gen_context)
+
+            # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -424,12 +465,56 @@ class BagelPipeline(nn.Module):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
+            # cfg_text_context: update with negative prompt (no text condition)
+            neg_prompt = extra_args.get("negative_prompt", "")
+            neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
+                curr_kvlens=cfg_text_context["kv_lens"],
+                curr_rope=cfg_text_context["ropes"],
+                prompts=[neg_prompt],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            for k, v in neg_input.items():
+                if torch.is_tensor(v):
+                    neg_input[k] = v.to(self.device)
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    cfg_text_context["past_key_values"], **neg_input
+                )
+            cfg_text_context["kv_lens"] = neg_newlens
+            cfg_text_context["ropes"] = neg_rope
+
+            # cfg_img_context: update with text prompt (no image condition)
+            cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
+                curr_kvlens=cfg_img_context["kv_lens"],
+                curr_rope=cfg_img_context["ropes"],
+                prompts=[prompt],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            for k, v in cfg_img_generation_input.items():
+                if torch.is_tensor(v):
+                    cfg_img_generation_input[k] = v.to(self.device)
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                cfg_img_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    cfg_img_context["past_key_values"], **cfg_img_generation_input
+                )
+            cfg_img_context["kv_lens"] = cfg_img_newlens
+            cfg_img_context["ropes"] = cfg_img_new_rope
+
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(req.sampling_params.seed)
 
-        # Prepare latent query and run flow
         generation_input = self.bagel.prepare_vae_latent(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
@@ -462,6 +547,25 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
+        # text cfg
+        generation_input_cfg_text = self.bagel.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_text_context["kv_lens"],
+            curr_rope=cfg_text_context["ropes"],
+            image_sizes=[image_shape],
+        )
+        # img cfg
+        generation_input_cfg_img = self.bagel.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_img_context["kv_lens"],
+            curr_rope=cfg_img_context["ropes"],
+            image_sizes=[image_shape],
+        )
+        for k, v in generation_input_cfg_text.items():
+            if torch.is_tensor(v):
+                generation_input_cfg_text[k] = v.to(self.device)
+        for k, v in generation_input_cfg_img.items():
+            if torch.is_tensor(v):
+                generation_input_cfg_img[k] = v.to(self.device)
+
         with torch.autocast(
             device_type=self.device.type,
             enabled=self.device.type != "cpu",
@@ -469,12 +573,26 @@ class BagelPipeline(nn.Module):
         ):
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
+                cfg_text_past_key_values=cfg_text_context["past_key_values"],
+                cfg_img_past_key_values=cfg_img_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
+                cfg_text_scale=gen_params.cfg_text_scale,
+                cfg_img_scale=gen_params.cfg_img_scale,
+                cfg_interval=gen_params.cfg_interval,
+                cfg_renorm_min=gen_params.cfg_renorm_min,
+                cfg_renorm_type=gen_params.cfg_renorm_type,
                 **generation_input,
+                cfg_text_packed_position_ids=generation_input_cfg_text["cfg_packed_position_ids"],
+                cfg_text_packed_query_indexes=generation_input_cfg_text["cfg_packed_query_indexes"],
+                cfg_text_key_values_lens=generation_input_cfg_text["cfg_key_values_lens"],
+                cfg_text_packed_key_value_indexes=generation_input_cfg_text["cfg_packed_key_value_indexes"],
+                cfg_img_packed_position_ids=generation_input_cfg_img["cfg_packed_position_ids"],
+                cfg_img_packed_query_indexes=generation_input_cfg_img["cfg_packed_query_indexes"],
+                cfg_img_key_values_lens=generation_input_cfg_img["cfg_key_values_lens"],
+                cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
             )
 
-        # Decode first sample
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
         return DiffusionOutput(output=img)
 

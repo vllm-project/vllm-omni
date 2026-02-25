@@ -69,6 +69,7 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     runner.text_step = DummyBuffer(torch.zeros((bsz, hidden_size), dtype=torch.float32))
 
     runner.talker_mtp = DummyTalkerMTP()
+    runner.model = SimpleNamespace(talker_mtp_output_key="code_predictor_codes")
     runner.vllm_config = object()
 
     # Provide a minimal implementation that returns the expected 4-tuple.

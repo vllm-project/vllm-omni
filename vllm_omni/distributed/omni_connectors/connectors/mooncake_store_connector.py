@@ -19,7 +19,7 @@ except ImportError:
         ReplicateConfig = None
 
 
-class MooncakeConnector(OmniConnectorBase):
+class MooncakeStoreConnector(OmniConnectorBase):
     """Mooncake-based distributed connector for OmniConnector."""
 
     def __init__(self, config: dict[str, Any]):
@@ -51,10 +51,6 @@ class MooncakeConnector(OmniConnectorBase):
 
         self._init_store()
 
-    def _make_key(self, rid: str, from_stage: str, to_stage: str) -> str:
-        """Generate store key for request between stages."""
-        return f"{rid}/{from_stage}_{to_stage}"
-
     def _init_store(self):
         """Initialize Mooncake store."""
         try:
@@ -67,7 +63,7 @@ class MooncakeConnector(OmniConnectorBase):
 
             self.pin = ReplicateConfig()
             self.pin.with_soft_pin = True
-            logger.info("MooncakeConnector initialized successfully")
+            logger.info("MooncakeStoreConnector initialized successfully")
         except Exception as e:
             logger.error("Failed to initialize Mooncake store: %s", e)
             raise
@@ -88,7 +84,7 @@ class MooncakeConnector(OmniConnectorBase):
             self._metrics["bytes_transferred"] += len(serialized_data)
 
             logger.debug(
-                "MooncakeConnector: stored %s (%s -> %s) %d bytes",
+                "MooncakeStoreConnector: stored %s (%s -> %s) %d bytes",
                 key,
                 from_stage,
                 to_stage,
@@ -98,7 +94,7 @@ class MooncakeConnector(OmniConnectorBase):
 
         except Exception as e:
             self._metrics["errors"] += 1
-            logger.error("MooncakeConnector put failed: %s", e)
+            logger.error("MooncakeStoreConnector put failed: %s", e)
             return False, 0, None
 
     def get(
@@ -108,35 +104,47 @@ class MooncakeConnector(OmniConnectorBase):
             logger.error("Store not initialized")
             return None
 
+        import time as _time
+
+        _t0 = _time.perf_counter()
+
         retries = 20
         sleep_s = 0.05
         key = self._make_key(get_key, from_stage, to_stage)
 
         for attempt in range(retries):
             try:
+                _t_fetch_start = _time.perf_counter()
                 raw_data = self.store.get(key)
+                _t_fetch_end = _time.perf_counter()
 
                 if raw_data:
+                    _fetch_ms = (_t_fetch_end - _t_fetch_start) * 1000
+
+                    _t_deser_start = _time.perf_counter()
                     data = self.deserialize_obj(raw_data)
+                    _t_deser_end = _time.perf_counter()
+                    _deser_ms = (_t_deser_end - _t_deser_start) * 1000
+
                     self._metrics["gets"] += 1
                     payload_size = len(raw_data)
-                    logger.debug(
-                        "MooncakeConnector: retrieved %s (%s -> %s) %d bytes",
-                        key,
-                        from_stage,
-                        to_stage,
-                        payload_size,
+
+                    _total_ms = (_t_deser_end - _t0) * 1000
+                    _mbps = (payload_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                    logger.info(
+                        f"[TCP GET] {get_key}: fetch={_fetch_ms:.1f}ms, deser={_deser_ms:.1f}ms, "
+                        f"total={_total_ms:.1f}ms, {payload_size} bytes, {_mbps:.1f} MB/s"
                     )
                     return data, payload_size
 
             except Exception as e:
-                logger.debug("MooncakeConnector get attempt %s failed: %s", attempt, e)
+                logger.debug("MooncakeStoreConnector get attempt %s failed: %s", attempt, e)
 
             if attempt < retries - 1:
                 time.sleep(sleep_s)
 
         self._metrics["timeouts"] += 1
-        logger.warning("MooncakeConnector: timeout waiting for %s", key)
+        logger.warning("MooncakeStoreConnector: timeout waiting for %s", key)
         return None
 
     def cleanup(self, request_id: str) -> None:
@@ -145,7 +153,7 @@ class MooncakeConnector(OmniConnectorBase):
 
         # Note: Mooncake doesn't have explicit delete, data will be garbage collected
         # We could implement a cleanup mechanism by storing deletion markers
-        logger.debug("MooncakeConnector: cleanup requested for %s (no-op)", request_id)
+        logger.debug("MooncakeStoreConnector: cleanup requested for %s (no-op)", request_id)
 
     def health(self) -> dict[str, Any]:
         if not self.store:
@@ -156,6 +164,9 @@ class MooncakeConnector(OmniConnectorBase):
             "host": self.host,
             "metadata_server": self.metadata,
             "master": self.master,
+            "protocol": None,
+            "pool_device": None,
+            "pool_size": 0,
             **self._metrics,
         }
 
@@ -165,6 +176,6 @@ class MooncakeConnector(OmniConnectorBase):
             try:
                 self.store.close()
                 self.store = None
-                logger.info("MooncakeConnector closed")
+                logger.info("MooncakeStoreConnector closed")
             except Exception as e:
                 logger.error("Error closing Mooncake store: %s", e)

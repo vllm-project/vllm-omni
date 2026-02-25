@@ -3,7 +3,8 @@ import pprint
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
 
-from vllm import PromptType, SamplingParams
+from vllm.inputs import PromptType
+from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
 
@@ -12,6 +13,7 @@ try:
 except ImportError:
     # Python < 3.11: use typing_extensions
     from typing_extensions import NotRequired
+
 
 import torch
 from vllm.inputs.data import EmbedsPrompt, TextPrompt, TokenInputs, TokensPrompt
@@ -104,8 +106,8 @@ class OmniEmbedsPrompt(EmbedsPrompt):
 # Must ensure that all additional prompt types are inherited from vLLM prompt types
 # Because TypedDict doesn't support isinstance and are dict. Cannot distinguish them in runtime.
 # Inheritance ensure that there are only additional fields but not removing fields--safe to route to LLM.generate()
-OmniSingletonPrompt: TypeAlias = str | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
-"""Omni singleton prompt type extending vLLM's SingletonPrompt with additional fields."""
+OmniSingletonPrompt: TypeAlias = str | list[int] | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
+"""Omni singleton prompt type extending vLLM's SingletonPrompt."""
 
 OmniPromptType: TypeAlias = PromptType | OmniTextPrompt | OmniTokensPrompt | OmniEmbedsPrompt
 

@@ -1,0 +1,62 @@
+name: VLLM-Omni PR Reviewer
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  pr-reviewer:
+    name: Review Pull Request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only run when the comment is from a collaborator/owner/member
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '@vllm-omni-reviewer') &&
+      (github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR' ||
+       github.event.comment.author_association == 'OWNER')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip==24.0
+          pip install requests==2.31.0 pyyaml==6.0.1
+
+      - name: Run PR Reviewer
+        id: reviewer
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          REPO_NAME: ${{ github.repository }}
+          PR_REVIEWER_COOLDOWN_MINUTES: 5
+          PR_REVIEWER_MAX_RETRIES: 3
+        run: |
+          python .github/scripts/pr_reviewer.py 2>&1 | tee "/tmp/pr_review_${PR_NUMBER}.log"
+
+      - name: Upload review logs
+        if: always()
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: pr-review-logs-${{ github.event.issue.number || github.event.pull_request.number }}
+          path: /tmp/pr_review_*.log
+          retention-days: 7
+          if-no-files-found: ignore

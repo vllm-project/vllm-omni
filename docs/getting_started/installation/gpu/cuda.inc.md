@@ -20,7 +20,20 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.15.0 --torch-backend=auto
+# vllm 0.16.0 is still under prerelease
+uv pip install --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
+
+# vllm 0.16.0 may have some bugs for cuda 12.9, here is how we solve them:
+export FLASHINFER_CUDA_TAG="$(python3 -c 'import torch; print((torch.version.cuda or "12.4").replace(".", ""))')"
+
+uv pip install --upgrade --force-reinstall \
+  "flashinfer-python==0.6.3" \
+  "flashinfer-cubin==0.6.3" \
+  "flashinfer-jit-cache==0.6.3" \
+  --extra-index-url "https://flashinfer.ai/whl/cu${FLASHINFER_CUDA_TAG}"
+
+uv pip install --upgrade --force-reinstall "nvidia-cublas-cu12==12.9.1.4"
+uv pip install --upgrade --force-reinstall "numpy==2.2.6"
 ```
 
 #### Installation of vLLM-Omni
@@ -34,10 +47,10 @@ uv pip install vllm-omni
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.15.0 release version of the library
+If you do not need to modify source code of vLLM, you can directly install the stable 0.16.0 release version of the library
 
 ```bash
-uv pip install vllm==0.15.0 --torch-backend=auto
+uv pip install vllm==0.16.0 --torch-backend=auto
 ```
 
 The release 0.14.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
@@ -56,11 +69,11 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.15.0
+git checkout v0.16.0
 ```
 Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set `VLLM_PRECOMPILED_WHEEL_LOCATION` as your local absolute path of whl file.
 ```bash
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.15.0/vllm-0.15.0-cp38-abi3-manylinux_2_31_x86_64.whl
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_x86_64.whl
 ```
 Install vllm with command below (If you have no existing PyTorch).
 ```bash
