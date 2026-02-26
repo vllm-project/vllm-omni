@@ -210,6 +210,27 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
 
+        # HSDP (Hybrid Sharded Data Parallel) parameters
+        omni_config_group.add_argument(
+            "--use-hsdp",
+            dest="use_hsdp",
+            action="store_true",
+            help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models. "
+            "Shards model weights across GPUs to reduce per-GPU memory usage.",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-shard-size",
+            type=int,
+            default=-1,
+            help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-replicate-size",
+            type=int,
+            default=1,
+            help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
+        )
+
         # Cache optimization parameters
         omni_config_group.add_argument(
             "--cache-backend",

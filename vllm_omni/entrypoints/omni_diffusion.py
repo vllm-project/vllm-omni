@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import logging
 import uuid
 from collections.abc import Sequence
 
-from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
@@ -13,11 +11,6 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
-
-# TODO configure logging properly
-logging.basicConfig(level=logging.INFO)
-
-logger = init_logger(__name__)
 
 
 class OmniDiffusion:

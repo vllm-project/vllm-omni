@@ -24,7 +24,7 @@ steps:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
       - docker#v5.2.0:
-          image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
           propagate-environment: true
           environment:

@@ -7,7 +7,6 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.utils import GPUMemoryMonitor
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
