@@ -110,9 +110,7 @@ class DiffusionEngine:
 
         metrics = {
             "preprocess_time_ms": round(preprocess_time * 1000, 2),
-            "diffusion_engine_exec_time_ms": round(
-                (time.time() - diffusion_engine_start_time) * 1000, 2
-            ),
+            "diffusion_engine_exec_time_ms": round((time.time() - diffusion_engine_start_time) * 1000, 2),
             "dit_time_ms": round(exec_total_time * 1000, 2),
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
@@ -129,15 +127,8 @@ class DiffusionEngine:
 
         if num_steps > 0:
             total_denoise_time = dit_time_seconds
-            metrics["denoise_time_per_step_ms"] = round(
-                (total_denoise_time / num_steps) * 1000, 2
-            )
-
-        metrics["vae_time_ms"] = round(dit_time_seconds * 1000, 2)
-
-        if num_steps > 0:
-            total_denoise_time = dit_time_seconds
             metrics["denoise_time_per_step_ms"] = round((total_denoise_time / num_steps) * 1000, 2)
+            
 
         metrics["vae_time_ms"] = round(dit_time_seconds * 1000, 2)
 
