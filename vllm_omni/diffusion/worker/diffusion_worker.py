@@ -143,7 +143,10 @@ class DiffusionWorker:
                 self.rank,
                 process_memory / GiB_bytes,
             )
-        assert self.model_runner.pipeline is not None
+
+        # When load_format is "dummy", pipeline will init with custom pipeline later
+        if load_format != "dummy":
+            assert self.model_runner.pipeline is not None
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
