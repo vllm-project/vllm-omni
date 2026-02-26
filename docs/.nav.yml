@@ -15,7 +15,6 @@ nav:
       - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
-      - LoRA Inference(Diffusion): user_guide/examples/offline_inference/lora_inference.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/offline_inference/qwen3_tts.md
@@ -25,11 +24,12 @@ nav:
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
-      - LoRA Inference(Diffusion): user_guide/examples/online_serving/lora_inference.md
+      - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
       - Qwen3-TTS: user_guide/examples/online_serving/qwen3_tts.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
+      - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:
     - usage/*
   - Configuration:

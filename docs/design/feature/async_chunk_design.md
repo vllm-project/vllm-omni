@@ -19,7 +19,7 @@ The `async_chunk` feature enables asynchronous, chunked processing of data acros
 
 For qwen3-omni:
 - **Thinker → Talker**: Per decode step (typically chunk_size=1)
-- **Talker → Code2Wav**: Accumulated to code2wav chunk_size(default=25, current only support default, will support chunk_size soon) before sending
+- **Talker → Code2Wav**: Accumulated to code2wav chunk_size(default=25, currently only support default, will support chunk_size soon) before sending
 - **Code2Wav**: Streaming decode with code2wav chunk_size
 
 With `async_chunk`:
@@ -36,41 +36,34 @@ With `async_chunk`:
 4. **Non-blocking Scheduler**: Requests waiting for chunks don't block the entire scheduler
 5. **Code2Wav Batch Inference**: Supports batched processing in code2wav stage
 
-| Input/Output | Async_chunk enabled | cuda graph | Max_Concurrency | Prompts | Mean E2E | TTFT | TPOT | TTFP | RTF | ITL |
-|--------------|--------------------|------------|-----------------|---------|----------|------|------|------|-----|-----|
-| text 2500/ text 900 + Audio2048 | False | False | 1 | 10 | 169670.74 | 222.30 | 0.42 | 169468.94 | 1.04 | 40.77 |
-| text 2500/ text 900 + Audio2048 | False | False | 4 | 40 | 179178.47 | 495.05 | 0.45 | 178973.77 | 1.09 | 44.92 |
-| text 2500/ text 900 + Audio2048 | False | False | 8 | 80 | 202325.90 | 912.31 | 0.51 | 202122.80 | 1.24 | 50.40 |
-| mix_modality/text 900 + Audio2048 | False | False | 1 | 10 | 174105.55 | 2708.65 | 0.42 | 173911.15 | 1.06 | 42.27 |
-| mix_modality/text 900 + Audio2048 | False | False | 4 | 40 | 179145.45 | 563.60 | 0.44 | 178944.69 | 1.09 | 45.59 |
-| mix_modality/text 900 + Audio2048 | False | False | 8 | 80 | 202338.01 | 1196.76 | 0.51 | 202137.49 | 1.24 | 51.05 |
-| text 2500/ text 900 + Audio 2048 | True | False | 1 | 10 | 133524.14 | 230.06 | 0.33 | 2187.38 | 0.82 | 40.54 |
-| text 2500/ text 900 + Audio 2048 | True | False | 4 | 40 | 169980.54 | 818.90 | 0.42 | 126714.64 | 1.05 | 41.84 |
-| text 2500/ text 900 + Audio 2048 | True | False | 8 | 80 | 190142.91 | 1261.42 | 0.47 | 165481.64 | 1.17 | 44.06 |
-| mix_modality/text 900 + Audio 2048 | True | False | 1 | 10 | 136287.53 | 2629.88 | 0.33 | 4577.68 | 0.84 | 41.22 |
-| mix_modality/text 900 + Audio 2048 | True | False | 4 | 40 | 160287.43 | 981.72 | 0.39 | 119458.83 | 0.99 | 43.20 |
-| mix_modality/text 900 + Audio 2048 | True | False | 8 | 80 | 190811.37 | 1432.88 | 0.47 | 166075.49 | 1.18 | 44.17 |
-| text 2500/ text 900 + Audio 2048 | False | True | 1 | 10 | 30691.59 | 207.21 | 0.08 | 30490.14 | 0.19 | 8.86 |
-| text 2500/ text 900 + Audio 2048 | False | True | 4 | 40 | 40214.43 | 431.38 | 0.10 | 40010.45 | 0.24 | 14.11 |
-| text 2500/ text 900 + Audio 2048 | False | True | 8 | 80 | 52034.78 | 889.18 | 0.13 | 51840.75 | 0.32 | 20.61 |
-| mix_modality/text 900 + Audio 2048 | False | True | 1 | 10 | 32894.34 | 2730.08 | 0.07 | 32689.03 | 0.20 | 8.78 |
-| mix_modality/text 900 + Audio 2048 | False | True | 4 | 40 | 41223.70 | 570.17 | 0.10 | 41017.76 | 0.25 | 14.69 |
-| mix_modality/text 900 + Audio 2048 | False | True | 8 | 80 | 52902.84 | 1143.91 | 0.14 | 52702.21 | 0.32 | 20.97 |
-| text 2500/ text 900 + Audio 2048 | True | True | 1 | 10 | 30535.75 | 205.73 | 0.07 | 744.13 | 0.19 | 9.12 |
-| text 2500/ text 900 + Audio2048 | True | True | 4 | 40 | 91392.10 | 792.43 | 0.22 | 67717.28 | 0.56 | 9.84 |
-| text 2500/ text 900 + Audio2048 | True | True | 8 | 80 | 180537.21 | 1178.16 | 0.44 | 157043.02 | 1.11 | 10.59 |
-| mix_modality/text 900 + Audio2048 | True | True | 1 | 10 | 33132.83 | 2668.88 | 0.08 | 3235.70 | 0.20 | 9.22 |
-| mix_modality/text 900 + Audio2048 | True | True | 4 | 40 | 90883.91 | 859.90 | 0.22 | 67343.66 | 0.56 | 9.87 |
-| mix_modality/text 900 + Audio2048 | True | True | 8 | 80 | 180765.18 | 1298.46 | 0.45 | 157264.30 | 1.12 | 10.54 |
+| Input     | Output           | Async_chunk enabled | Code2Wav batch size | Max_Concurrency | Prompts | Mean E2E   | Mean TTFT  | Mean TPOT | Mean TTFP   | Mean RTF | Mean ITL |
+|-----------|------------------|---------------------|---------------------|----------------|---------|------------|------------|-----------|-------------|----------|----------|
+| text 100  | text 100+audio   | False               | 1                   | 1              | 50      | 6581.80    | 43.22      | 8.31      | 6459.34     | 0.24     | 8.22     |
+| text 100  | text 100+audio   | False               | 1                   | 4              | 50      | 7398.63    | 67.57      | 9.14      | 7285.35     | 0.27     | 9.05     |
+| text 100  | text 100+audio   | False               | 1                   | 10             | 50      | 13522.99   | 131.82     | 12.72     | 13410.44    | 0.49     | 12.60    |
+| text 100  | text 100+audio   | False               | 64                  | 1              | 50      | 6505.13    | 43.14      | 8.52      | 6395.40     | 0.24     | 8.44     |
+| text 100  | text 100+audio   | False               | 64                  | 4              | 50      | 7668.15    | 51.15      | 9.36      | 7562.37     | 0.28     | 9.27     |
+| text 100  | text 100+audio   | False               | 64                  | 10             | 50      | 9516.18    | 138.06     | 14.75     | 9409.26     | 0.34     | 14.60    |
+| text 100  | text 100+audio   | True                | 1                   | 1              | 50      | 6179.79    | 44.58      | 8.69      | 522.99      | 0.22     | 8.60     |
+| text 100  | text 100+audio   | True                | 1                   | 4              | 50      | 7692.69    | 103.96     | 10.22     | 785.85      | 0.29     | 10.12    |
+| text 100  | text 100+audio   | True                | 1                   | 10             | 50      | 11152.71   | 685.60     | 17.64     | 1628.88     | 0.41     | 17.62    |
 
-Performance data collected on H800 GPUs through comprehensive benchmarking. text input uses random dataset. mix modality (1 image+1 video+1 audio) input uses random_mm dataset.
 
-**async_chunk enables transformative results: CUDA Graph disabled achieves 98.7% TTFP reduction (169s→2.2s) + 21.3% E2E improvement; CUDA Graph enabled maintains 97.6% TTFP reduction (30s→0.7s)**
+Performance data collected on H800 GPUs through comprehensive benchmarking with cudagraph enabled. text input uses random dataset.
+
+Enabling **async_chunk** (False→True) sharply reduces time-to-first-audio (TTFP)—e.g. ~92% at concurrency 1 (6.5s→0.52s)—and improves E2E latency (e.g. ~6% at conc 1, ~17% at conc 10). RTF (Real Time Factor) also improves with async_chunk on (e.g. ~8% at conc 1: 0.24→0.22, ~16% at conc 10: 0.49→0.41). Enabling **Code2Wav batch size 64** (vs 1) improves E2E and TTFP at higher concurrency when async_chunk is off (e.g. ~30% at conc 10: 13.5s→9.5s E2E, 13.4s→9.4s TTFP).
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_performance.png">
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_ttfp_performance.png">
     <img alt="TTFP Performance Data Comparison" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_ttfp_performance.png" width=100%>
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_rft_performance.png">
+    <img alt="TTFP Performance Data Comparison" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/performance/qwen3-omni_rft_performance.png" width=100%>
   </picture>
 </p>
 
@@ -112,7 +105,7 @@ Performance data collected on H800 GPUs through comprehensive benchmarking. text
    - Chunk keys and request/chunk lifecycle are managed by **OmniChunkTransferAdapter**
 
 2. **Transfer Adapter Layer**: Extensible abstraction for managing data transfer via connectors
-   - **OmniTransferAdapterBase**: Base class with background **recv_loop** and **save_loop** threads; 
+   - **OmniTransferAdapterBase**: Base class with background **recv_loop** and **save_loop** threads;
    - **OmniChunkTransferAdapter**: Chunk-specific implementation that owns the full chunk lifecycle when async_chunk is enabled
      - **Chunk ID and key construction**: Builds keys like `{req_id}_{stage_id}_{chunk_id}` for put/get
      - **Async get**: `load_async(request)` enqueues the request; background **recv_loop** polls the connector (non-blocking); when data is available, updates the request and marks it in `_finished_load_reqs`; scheduler calls `get_finished_requests()` to learn which requests have chunks ready
