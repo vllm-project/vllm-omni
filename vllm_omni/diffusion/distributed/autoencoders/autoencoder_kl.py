@@ -96,6 +96,7 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
         for rows in range(root, 0, -1):
             if max_parallel_size % rows == 0:
                 grid_rows, grid_cols = rows, max_parallel_size // rows
+                break
         tiletask_list = []
         halo_size = dict()
         for i in range(grid_rows):
@@ -142,14 +143,14 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
         for i in range(grid_h):
             result_row = []
             for j in range(grid_w):
-                hello = grid_spec.tile_spec["halo_size"][(i, j)]
+                halo = grid_spec.tile_spec["halo_size"][(i, j)]
                 scale = grid_spec.tile_spec["scale"]
 
                 tile = coord_tensor_map[(i, j)]
-                halo_up = hello["up"] * scale
-                halo_down = hello["down"] * scale
-                halo_left = hello["left"] * scale
-                halo_right = hello["right"] * scale
+                halo_up = halo["up"] * scale
+                halo_down = halo["down"] * scale
+                halo_left = halo["left"] * scale
+                halo_right = halo["right"] * scale
 
                 core_tile = tile[
                     :,
@@ -172,6 +173,8 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
 
         return self.patch_split, self.patch_exec, self.patch_merge
 
+    # Normally, we should override tiled_decode. However, since we also need to
+    # support the patch split strategy, we override decode instead.
     def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
         if not self.is_distributed_enabled():
             return super().decode(z, return_dict=return_dict, *args, **kwargs)

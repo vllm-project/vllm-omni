@@ -4,8 +4,7 @@
 from typing import Any
 
 import torch
-from diffusers.models.autoencoders import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+from diffusers.models.autoencoders import AutoencoderKLQwenImage
 from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
@@ -19,7 +18,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 logger = init_logger(__name__)
 
 
-class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
+class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMixin):
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
         model = super().from_pretrained(*args, **kwargs)
@@ -27,6 +26,7 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
         return model
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        # mostly copy from AutoencoderKL
         _, _, num_frames, height, width = z.shape
         sample_height = height * self.spatial_compression_ratio
         sample_width = width * self.spatial_compression_ratio
@@ -35,19 +35,12 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
         tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
         tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
-        tile_sample_stride_height = self.tile_sample_stride_height
-        tile_sample_stride_width = self.tile_sample_stride_width
-        if self.config.patch_size is not None:
-            sample_height = sample_height // self.config.patch_size
-            sample_width = sample_width // self.config.patch_size
-            tile_sample_stride_height = tile_sample_stride_height // self.config.patch_size
-            tile_sample_stride_width = tile_sample_stride_width // self.config.patch_size
-            blend_height = self.tile_sample_min_height // self.config.patch_size - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width // self.config.patch_size - tile_sample_stride_width
-        else:
-            blend_height = self.tile_sample_min_height - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width - tile_sample_stride_width
 
+        blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
+        blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
+
+        # Split z into overlapping tiles and decode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
         tiletask_list = []
         for i in range(0, height, tile_latent_stride_height):
             for j in range(0, width, tile_latent_stride_width):
@@ -69,8 +62,6 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
             "sample_width": sample_width,
             "blend_height": blend_height,
             "blend_width": blend_width,
-            "tile_sample_stride_height": tile_sample_stride_height,
-            "tile_sample_stride_width": tile_sample_stride_width,
         }
         grid_spec = GridSpec(
             split_dims=(3, 4),
@@ -87,7 +78,7 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
         for k in range(len(task.tensor)):
             self._conv_idx = [0]
             tile = self.post_quant_conv(task.tensor[k])
-            decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0))
+            decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx)
             time.append(decoded)
         result = torch.cat(time, dim=2)
         return result
@@ -97,6 +88,8 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
         self.clear_cache()
+
+        result_rows = []
         for i in range(grid_h):
             result_row = []
             for j in range(grid_w):
@@ -105,25 +98,11 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
                     tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_height"])
                 if j > 0:
                     tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_width"])
-                result_row.append(
-                    tile[
-                        :,
-                        :,
-                        :,
-                        : grid_spec.tile_spec["tile_sample_stride_height"],
-                        : grid_spec.tile_spec["tile_sample_stride_width"],
-                    ]
-                )
+                result_row.append(tile[:, :, :, : self.tile_sample_stride_height, : self.tile_sample_stride_width])
             result_rows.append(torch.cat(result_row, dim=-1))
-
         dec = torch.cat(result_rows, dim=3)[
             :, :, :, : grid_spec.tile_spec["sample_height"], : grid_spec.tile_spec["sample_width"]
         ]
-
-        if self.config.patch_size is not None:
-            dec = unpatchify(dec, patch_size=self.config.patch_size)
-
-        dec = torch.clamp(dec, min=-1.0, max=1.0)
         return dec
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
@@ -134,7 +113,7 @@ class DistributedAutoencoderKLWan(AutoencoderKLWan, DistributedVaeMixin):
         result = self.distributed_decoder.execute(
             z,
             DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
-            broadcast_result=False,
+            broadcast_result=True,
         )
         if not return_dict:
             return (result,)

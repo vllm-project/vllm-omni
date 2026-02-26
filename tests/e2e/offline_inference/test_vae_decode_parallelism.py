@@ -24,13 +24,38 @@ from vllm_omni.platforms import current_omni_platform
 # os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-models = ["Wan-AI/Wan2.2-TI2V-5B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers", "Wan-AI/Wan2.2-I2V-A14B-Diffusers"]
+all_model_configs = [
+    {
+        "model_name": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        "out_width": 1280,
+        "out_height": 720,
+        "out_frames": 16,
+    },
+    {
+        "model_name": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        "out_width": 1280,
+        "out_height": 720,
+        "out_frames": 16,
+    },
+    {
+        "model_name": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "out_width": 1280,
+        "out_height": 720,
+        "out_frames": 16,
+    },
+    {
+        "model_name": "Qwen/Qwen-Image",
+        "out_width": 3072,
+        "out_height": 3072,
+        "out_frames": 1,
+    },
+]
 
 
-def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae_patch_parallel_size=1):
+def model_run(model_configs, tp, out_height, out_width, out_frames, using_tile, vae_patch_parallel_size=1):
     try:
         m = Omni(
-            model=model_name,
+            model=model_configs["model_name"],
             vae_use_tiling=using_tile,
             parallel_config=DiffusionParallelConfig(
                 tensor_parallel_size=tp,
@@ -45,9 +70,9 @@ def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae
                 "multi_modal_data": {"image": image},
             },
             sampling_params_list=OmniDiffusionSamplingParams(
-                height=out_height,
-                width=out_width,
-                num_frames=out_frames,
+                height=model_configs["out_height"],
+                width=model_configs["out_width"],
+                num_frames=model_configs["out_frames"],
                 num_inference_steps=2,
                 generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
             ),
@@ -58,6 +83,8 @@ def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae
         frames = req_out.images[0]
         if isinstance(frames, torch.Tensor):
             frames = frames.detach().cpu().numpy()
+        elif isinstance(frames, Image.Image):
+            frames = np.array(frames)
         # frames shape: (batch, num_frames, height, width, channels)
         cost = (end - start) * 1000
         return frames, cost
@@ -66,10 +93,10 @@ def model_run(model_name, tp, out_height, out_width, out_frames, using_tile, vae
         cleanup_dist_env_and_memory()
 
 
-@pytest.mark.parametrize("model_name", models)
-def test_vae_parallel_model(model_name: str):
+@pytest.mark.parametrize("model_configs", all_model_configs)
+def test_vae_parallel_model(model_configs: str):
     parallel_result, parallel_time = model_run(
-        model_name=model_name,
+        model_configs=model_configs,
         tp=2,
         out_width=1280,
         out_height=704,
@@ -78,7 +105,7 @@ def test_vae_parallel_model(model_name: str):
         vae_patch_parallel_size=2,
     )
     non_parallel_result, non_parallel_time = model_run(
-        model_name=model_name,
+        model_configs=model_configs,
         tp=2,
         out_width=1280,
         out_height=704,
@@ -91,7 +118,7 @@ def test_vae_parallel_model(model_name: str):
     mean_threshold = 3e-2
     max_threshold = 3e-2  # they should be totally same
     print(
-        f"{model_name} TP = 2 (tile + parallel vs tile): "
+        f"{model_configs['model_name']} TP = 2 (tile + parallel vs tile): "
         f"mean_abs_diff={result_diff.mean():.6e}, max_abs_diff={result_diff.max():.6e}; "
         f"thresholds: mean<={mean_threshold:.6e}, max<={max_threshold:.6e}; "
         f"parallel generate take time: {parallel_time:.2f} ms, non-parallel take time: {non_parallel_time:.2f} ms"
