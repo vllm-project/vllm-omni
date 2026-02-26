@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import GPUMemoryMonitor, hardware_test
+from tests.utils import DeviceMemoryMonitor, hardware_test
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -95,7 +95,7 @@ def _run_zimage_generate(
 
     torch.cuda.empty_cache()
     device_index = torch.cuda.current_device()
-    monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
+    monitor = DeviceMemoryMonitor.instantiate(device_index=device_index, interval=0.02)
     monitor.start()
     m = Omni(
         model=_get_zimage_model(),

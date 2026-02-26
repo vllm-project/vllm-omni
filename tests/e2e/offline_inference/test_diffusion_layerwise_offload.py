@@ -5,8 +5,9 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import GPUMemoryMonitor
+from tests.utils import DeviceMemoryMonitor
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,11 +28,9 @@ def run_inference(
     layerwise_offload: bool = False,
     num_inference_steps: int = 3,
 ) -> float:
-    # For now, only support on GPU, so apply torch.cuda operations here
-    # NPU / ROCm platforms are expected to be detected and skipped this test function
-    torch.cuda.empty_cache()
-    device_index = torch.cuda.current_device()
-    monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
+    current_omni_platform.empty_cache()
+    device_index = torch.accelerator.current_device_index()
+    monitor = DeviceMemoryMonitor.instantiate(device_index=device_index, interval=0.02)
     monitor.start()
 
     m = Omni(
@@ -41,7 +40,7 @@ def run_inference(
         flow_shift=5.0,
     )
 
-    torch.cuda.reset_peak_memory_stats(device=device_index)
+    torch.accelerator.reset_peak_memory_stats()
 
     # Refer to tests/e2e/offline_inference/test_t2v_model.py
     # Use minimal settings for testing
@@ -54,7 +53,7 @@ def run_inference(
         OmniDiffusionSamplingParams(
             height=height,
             width=width,
-            generator=torch.Generator("cuda").manual_seed(42),
+            generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
             guidance_scale=1.0,
             num_inference_steps=num_inference_steps,
             num_frames=num_frames,
