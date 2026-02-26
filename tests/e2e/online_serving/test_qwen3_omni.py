@@ -114,7 +114,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": True,
         "key_words": {
-            "audio": ["water", "chirping", "crackling"],
+            "audio": ["water", "chirping", "crackling", "rain"],
             "image": ["square", "quadrate"],
         },
     }
