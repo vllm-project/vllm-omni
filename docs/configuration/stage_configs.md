@@ -273,3 +273,15 @@ Default: `True`
 Penalty applied to tokens that have already appeared in the generated sequence. Values greater than 1.0 discourage repetition, while values less than 1.0 encourage it. A value of 1.0 applies no penalty.
 
 Default: `1.1`
+
+### `tts_args` (TTS stages only)
+
+Configuration for Text-to-Speech specific parameters. This section is only applicable to TTS model stages (e.g., `qwen3_tts`).
+
+#### `tts_args.max_instructions_length`
+
+Maximum character length for voice style/emotion instructions. Instructions exceeding this limit will be rejected with a validation error.
+
+Default: `500`
+
+This value can be overridden at runtime using the `--tts-max-instructions-length` CLI parameter when starting the server.

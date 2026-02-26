@@ -65,6 +65,8 @@ stage_args:
     # Distributed connector configuration
     input_connectors:
       from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
