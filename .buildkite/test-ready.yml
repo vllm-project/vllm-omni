@@ -21,11 +21,15 @@ steps:
       - echo "--- Pulling Docker image"
       - docker pull public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
 
+      - echo "--- Preparing environment file"
+      - env > /tmp/buildkite-env
+
       - echo "--- Running tests"
       - |
         set -x
         TEST_START=$(/bin/date +%s)
         timeout 20m docker run --rm \
+          --gpus all \
           -e HF_HOME=/fsx/hf_cache \
           --env-file /tmp/buildkite-env \
           -v /fsx/hf_cache:/fsx/hf_cache \
