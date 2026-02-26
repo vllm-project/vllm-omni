@@ -127,7 +127,7 @@ class DiffusionEngine:
         if num_steps > 0:
             total_denoise_time = dit_time_seconds
             metrics["denoise_time_per_step_ms"] = round((total_denoise_time / num_steps) * 1000, 2)
-            
+
         metrics["vae_time_ms"] = round(dit_time_seconds * 1000, 2)
 
         if len(request.prompts) == 1:
