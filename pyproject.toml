@@ -62,6 +62,7 @@ docs = [
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
+    "mkdocs-macros-plugin",
     "regex",
     "ruff",
     "pydantic",
