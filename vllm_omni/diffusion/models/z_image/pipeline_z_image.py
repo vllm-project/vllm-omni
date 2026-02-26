@@ -144,7 +144,6 @@ def retrieve_timesteps(
 
 
 class ZImagePipeline(nn.Module):
-
     def __init__(
         self,
         *,

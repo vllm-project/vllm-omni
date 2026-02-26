@@ -13,7 +13,6 @@ from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
 from vllm.logger import init_logger
-
 from vllm.platforms import current_platform
 
 from vllm_omni.diffusion.quantization import (
@@ -558,9 +557,7 @@ class OmniDiffusionConfig:
                 if on_gfx9 is not None and on_gfx9():
                     raise ValueError("bitsandbytes is not supported on ROCm gfx9 GPUs.")
             if self.quantization_config.load_in_8bit and not self.enforce_eager:
-                logger.warning(
-                    "CUDA graph is not supported on BitsAndBytes 8bit yet, fallback to the eager mode."
-                )
+                logger.warning("CUDA graph is not supported on BitsAndBytes 8bit yet, fallback to the eager mode.")
                 self.enforce_eager = True
 
         if self.max_cpu_loras is None:

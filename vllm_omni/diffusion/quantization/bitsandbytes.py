@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import contextvars
-from dataclasses import dataclass
 import os
 import threading
-from typing import Any, Iterable, Iterator, Literal, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -75,9 +76,9 @@ class DiffusionBitsAndBytesConfig(DiffusionQuantizationConfig):
 
     load_in_8bit: bool = False
     load_in_4bit: bool = True
-    bnb_4bit_compute_dtype: torch.dtype | str | None = "float32"
-    bnb_4bit_quant_type: str = "fp4"
-    bnb_4bit_use_double_quant: bool = False
+    bnb_4bit_compute_dtype: torch.dtype | str | None = "bfloat16"
+    bnb_4bit_quant_type: str = "nf4"
+    bnb_4bit_use_double_quant: bool = True
     llm_int8_enable_fp32_cpu_offload: bool = False
     llm_int8_has_fp16_weight: bool = False
     modules: Sequence[str] | str | None = None
@@ -377,9 +378,7 @@ def apply_bnb_quantization(
                 tuple(quant_modules),
             )
         else:
-            logger.warning_once(
-                "bitsandbytes: no Linear layers replaced; quantization may be ineffective."
-            )
+            logger.warning_once("bitsandbytes: no Linear layers replaced; quantization may be ineffective.")
 
     return quantized_components
 
@@ -410,9 +409,7 @@ def _apply_to_component(
         llm_int8_has_fp16_weight=llm_int8_has_fp16_weight,
         copy_weights=copy_weights,
     )
-    logger.info(
-        "Quantized %d Linear layers with %s in %s", num_replaced, backend, component.__class__.__name__
-    )
+    logger.info("Quantized %d Linear layers with %s in %s", num_replaced, backend, component.__class__.__name__)
     if original_device is not None and original_device.type != "cpu":
         component.to(original_device)
     return num_replaced
@@ -432,6 +429,16 @@ def _replace_linear_modules_inplace(
     replaced = 0
     for child_name, child in list(root.named_children()):
         if _is_bnb_linear(child, bnb):
+            continue
+        if _is_vllm_linear(child) and backend == "bitsandbytes_4bit" and copy_weights:
+            if _quantize_vllm_linear_inplace(
+                child,
+                bnb=bnb,
+                bnb_4bit_quant_type=bnb_4bit_quant_type,
+                bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+                bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+            ):
+                replaced += 1
             continue
         if _is_supported_linear(child, copy_weights=copy_weights):
             new_child = _convert_linear_module(
@@ -462,6 +469,85 @@ def _replace_linear_modules_inplace(
     return replaced
 
 
+class _DiffusionBnbLinearMethod:
+    """Minimal bnb 4bit method for vLLM Linear modules."""
+
+    def __init__(self, compute_dtype: torch.dtype | None) -> None:
+        self.compute_dtype = compute_dtype
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from bitsandbytes import matmul_4bit
+
+        original_type = x.dtype
+        original_shape = x.shape
+        reshape_after_matmul = False
+        if x.ndim > 2:
+            x = x.reshape(-1, x.size(-1))
+            reshape_after_matmul = True
+
+        compute_dtype = self.compute_dtype or x.dtype
+        if compute_dtype != x.dtype:
+            x = x.to(compute_dtype)
+
+        weight = layer.weight
+        out = matmul_4bit(x, weight.t(), weight.quant_state)
+        if out.dtype != original_type:
+            out = out.to(original_type)
+
+        if reshape_after_matmul:
+            out = out.view(*original_shape[:-1], out.size(-1))
+
+        if bias is not None:
+            out += bias
+        return out
+
+
+def _quantize_vllm_linear_inplace(
+    linear: nn.Module,
+    *,
+    bnb: Any,
+    bnb_4bit_quant_type: str,
+    bnb_4bit_compute_dtype: torch.dtype | str | None,
+    bnb_4bit_use_double_quant: bool,
+) -> bool:
+    if getattr(linear, "tp_size", 1) != 1:
+        return False
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        return False
+    if getattr(weight, "quant_state", None) is not None:
+        return False
+    original_device = weight.device
+    if original_device.type != "cuda":
+        return False
+
+    in_features, out_features = _get_linear_io_features(linear)
+    compute_dtype = bnb_4bit_compute_dtype or torch.float32
+
+    temp = bnb.nn.Linear4bit(
+        in_features,
+        out_features,
+        bias=False,
+        compute_dtype=compute_dtype,
+        compress_statistics=bnb_4bit_use_double_quant,
+        quant_type=bnb_4bit_quant_type,
+        device=torch.device("cpu"),
+    )
+    _load_linear_weights(linear, temp, include_bias=False)
+    temp = temp.to(original_device)
+
+    linear._parameters["weight"] = temp.weight
+    linear.quant_method = _DiffusionBnbLinearMethod(
+        compute_dtype=getattr(temp, "compute_dtype", compute_dtype),
+    )
+    return True
+
+
 def _convert_linear_module(
     linear: nn.Module,
     *,
@@ -477,17 +563,21 @@ def _convert_linear_module(
     in_features, out_features = _get_linear_io_features(linear)
     bias = getattr(linear, "bias", None)
     has_bias = bias is not None
+    is_vllm_linear = _is_vllm_linear(linear)
+    return_bias = bool(getattr(linear, "return_bias", False))
+    skip_bias_add = bool(getattr(linear, "skip_bias_add", False))
 
     if copy_weights:
         target_device = torch.device("cpu")
     else:
         target_device = original_device
 
+    inner_has_bias = has_bias if not (is_vllm_linear and return_bias and skip_bias_add) else False
     if backend == "bitsandbytes_8bit":
         new_linear = bnb.nn.Linear8bitLt(
             in_features,
             out_features,
-            bias=has_bias,
+            bias=inner_has_bias,
             has_fp16_weights=llm_int8_has_fp16_weight,
             device=target_device,
         )
@@ -495,7 +585,7 @@ def _convert_linear_module(
         new_linear = bnb.nn.Linear4bit(
             in_features,
             out_features,
-            bias=has_bias,
+            bias=inner_has_bias,
             compute_dtype=bnb_4bit_compute_dtype,
             compress_statistics=bnb_4bit_use_double_quant,
             quant_type=bnb_4bit_quant_type,
@@ -505,9 +595,21 @@ def _convert_linear_module(
         raise ValueError(f"Unknown backend: {backend}")
 
     if copy_weights:
-        _load_linear_weights(linear, new_linear)
+        _load_linear_weights(linear, new_linear, include_bias=inner_has_bias)
         if original_device.type != "cpu":
             new_linear = new_linear.to(original_device)
+
+    if is_vllm_linear and return_bias:
+        bias_param = None
+        if has_bias and skip_bias_add:
+            bias_param = bias.detach().clone()
+        return _BnbLinearReturnBiasWrapper(
+            linear=new_linear,
+            bias=bias_param,
+            return_bias=return_bias,
+            skip_bias_add=skip_bias_add,
+            meta=_collect_vllm_linear_meta(linear),
+        )
 
     return new_linear
 
@@ -560,14 +662,57 @@ def _get_linear_io_features(module: nn.Module) -> tuple[int, int]:
     raise ValueError(f"Cannot infer linear features for module {module.__class__.__name__}")
 
 
-def _load_linear_weights(src: nn.Module, dst: nn.Module) -> None:
+def _load_linear_weights(src: nn.Module, dst: nn.Module, *, include_bias: bool = True) -> None:
     # Loading via state_dict ensures bitsandbytes hooks see fp weights,
     # and .to("cuda") triggers internal quantization.
     state = src.state_dict()
-    filtered = {k: v for k, v in state.items() if k in {"weight", "bias"}}
+    keys = {"weight", "bias"} if include_bias else {"weight"}
+    filtered = {k: v for k, v in state.items() if k in keys}
     if any(getattr(t, "is_cuda", False) for t in filtered.values()):
         filtered = {k: v.detach().cpu() for k, v in filtered.items()}
+    # bitsandbytes 4bit is sensitive to bf16 weights; cast to compute dtype if set.
+    compute_dtype = getattr(dst, "compute_dtype", None)
+    if compute_dtype is not None:
+        filtered = {k: (v.to(compute_dtype) if torch.is_floating_point(v) else v) for k, v in filtered.items()}
     dst.load_state_dict(filtered, strict=False)
+
+
+def _collect_vllm_linear_meta(module: nn.Module) -> dict[str, object]:
+    meta = {}
+    for name in ("num_heads", "num_kv_heads", "head_dim", "tp_size", "tp_rank", "input_size", "output_size"):
+        if hasattr(module, name):
+            meta[name] = getattr(module, name)
+    return meta
+
+
+class _BnbLinearReturnBiasWrapper(nn.Module):
+    """Wrapper to preserve (output, bias) semantics for vLLM Linear modules."""
+
+    def __init__(
+        self,
+        *,
+        linear: nn.Module,
+        bias: torch.Tensor | None,
+        return_bias: bool,
+        skip_bias_add: bool,
+        meta: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__()
+        self.linear = linear
+        self.return_bias = return_bias
+        self.skip_bias_add = skip_bias_add
+        if bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(bias, requires_grad=False)
+        for key, value in (meta or {}).items():
+            setattr(self, key, value)
+
+    def forward(self, x: torch.Tensor):
+        out = self.linear(x)
+        if not self.return_bias:
+            return out
+        return out, (self.bias if self.skip_bias_add else None)
 
 
 def _get_module_device(module: nn.Module) -> torch.device | None:

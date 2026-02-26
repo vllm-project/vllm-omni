@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.quantization import bitsandbytes as bnb_module
 from vllm_omni.diffusion.quantization.bitsandbytes import (
     DiffusionBitsAndBytesConfig,
     apply_bnb_quantization,
@@ -201,3 +202,47 @@ def test_hf_bnb_patch_inject_and_restore(monkeypatch):
         assert "transformer" in used
 
     assert DummyPreTrainedModel.__dict__["from_pretrained"] is orig_attr
+
+
+def test_vllm_linear_bnb4_return_bias_semantics(monkeypatch):
+    dummy_bnb = _install_dummy_bnb(monkeypatch)
+
+    def matmul_4bit(x, w_t, quant_state):
+        return x @ w_t
+
+    dummy_bnb.matmul_4bit = matmul_4bit
+    monkeypatch.setitem(sys.modules, "bitsandbytes", dummy_bnb)
+
+    class DummyVllmLinear(nn.Module):
+        def __init__(self, return_bias: bool, skip_bias_add: bool):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4, 4))
+            self.bias = nn.Parameter(torch.randn(4))
+            self.return_bias = return_bias
+            self.skip_bias_add = skip_bias_add
+            self.quant_method = None
+
+        def forward(self, x: torch.Tensor):
+            bias = self.bias if not self.skip_bias_add else None
+            out = self.quant_method.apply(self, x, bias)
+            if not self.return_bias:
+                return out
+            output_bias = self.bias if self.skip_bias_add else None
+            return out, output_bias
+
+    method = bnb_module._DiffusionBnbLinearMethod(compute_dtype=torch.float32)
+
+    x = torch.randn(2, 4)
+    linear = DummyVllmLinear(return_bias=True, skip_bias_add=True)
+    linear.weight.quant_state = object()
+    linear.quant_method = method
+    out, out_bias = linear(x)
+    assert torch.allclose(out, x @ linear.weight.t())
+    assert out_bias is linear.bias
+
+    linear2 = DummyVllmLinear(return_bias=True, skip_bias_add=False)
+    linear2.weight.quant_state = object()
+    linear2.quant_method = method
+    out2, out_bias2 = linear2(x)
+    assert torch.allclose(out2, x @ linear2.weight.t() + linear2.bias)
+    assert out_bias2 is None

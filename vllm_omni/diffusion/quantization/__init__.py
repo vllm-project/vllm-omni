@@ -27,13 +27,13 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 
 from .base import DiffusionQuantizationConfig
-from .fp8 import DiffusionFp8Config
 from .bitsandbytes import (
     DiffusionBitsAndBytesConfig,
     apply_bnb_quantization,
     get_bnb_module_kwargs,
     patch_transformers_for_bnb_load,
 )
+from .fp8 import DiffusionFp8Config
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (

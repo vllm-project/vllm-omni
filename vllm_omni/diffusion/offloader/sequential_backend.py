@@ -182,15 +182,9 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         skip_components = set(getattr(pipeline, "_bnb_offload_skip_components", None) or set())
-        offload_dits = [
-            module
-            for name, module in zip(modules.dit_names, modules.dits)
-            if name not in skip_components
-        ]
+        offload_dits = [module for name, module in zip(modules.dit_names, modules.dits) if name not in skip_components]
         offload_encoders = [
-            module
-            for name, module in zip(modules.encoder_names, modules.encoders)
-            if name not in skip_components
+            module for name, module in zip(modules.encoder_names, modules.encoders) if name not in skip_components
         ]
         if skip_components:
             logger.debug("Skipping offload for quantized components: %s", sorted(skip_components))

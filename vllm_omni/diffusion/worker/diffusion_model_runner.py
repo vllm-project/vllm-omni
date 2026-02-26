@@ -146,9 +146,7 @@ class DiffusionModelRunner:
                 if bnb_config.load_in_8bit:
                     skip_components = set(getattr(self.pipeline, "_bnb_quantized_components", set()) or set())
                     self.pipeline._bnb_offload_skip_components = skip_components
-                    logger.warning(
-                        "bitsandbytes 8bit + offload: disabled for quantized components (stability)."
-                    )
+                    logger.warning("bitsandbytes 8bit + offload: disabled for quantized components (stability).")
                 else:
                     self.pipeline._bnb_offload_skip_components = set()
                     logger.info("bitsandbytes 4bit + offload: enabled.")

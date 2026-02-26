@@ -225,8 +225,7 @@ class DiffusersPipelineLoader:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         enable_offload = bool(
-            getattr(od_config, "enable_cpu_offload", False)
-            or getattr(od_config, "enable_layerwise_offload", False)
+            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
         )
         with set_default_torch_dtype(od_config.dtype):
             with target_device:
@@ -267,7 +266,14 @@ class DiffusersPipelineLoader:
                         if module_name:
                             pre_replace_modules.add(module_name)
                 if pre_replace_modules:
-                    only_modules = [m for m in bnb_config.get_modules() if m in pre_replace_modules]
+                    only_modules = []
+                    for module_name in bnb_config.get_modules():
+                        if module_name not in pre_replace_modules:
+                            continue
+                        component = getattr(model, module_name, None)
+                        if component is not None and _component_contains_vllm_linear(component):
+                            continue
+                        only_modules.append(module_name)
                     quantized_components |= apply_bnb_quantization(
                         model,
                         bnb_config,
@@ -328,3 +334,18 @@ class DiffusersPipelineLoader:
         #             "Following weights were not initialized from "
         #             f"checkpoint: {weights_not_loaded}"
         #         )
+
+
+def _component_contains_vllm_linear(component: nn.Module) -> bool:
+    """Return True if component includes vLLM LinearBase modules."""
+    try:
+        from vllm.model_executor.layers.linear import LinearBase
+    except Exception:
+        LinearBase = None
+    for module in component.modules():
+        module_path = getattr(module.__class__, "__module__", "")
+        if module_path.startswith("vllm.model_executor.layers.linear"):
+            return True
+        if LinearBase is not None and isinstance(module, LinearBase):
+            return True
+    return False

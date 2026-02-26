@@ -71,6 +71,20 @@ class OmniServeCommand(CLISubcommand):
         serve_parser = make_arg_parser(serve_parser)
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
 
+        # Remove upstream quantization flags to avoid conflicts with diffusion
+        # quantization (same option strings).
+        def _drop_option(parser: FlexibleArgumentParser, option_strings: list[str]) -> None:
+            for opt in option_strings:
+                action = parser._option_string_actions.get(opt)
+                if action is None:
+                    continue
+                for opt_str in list(action.option_strings):
+                    parser._option_string_actions.pop(opt_str, None)
+                if action in parser._actions:
+                    parser._actions.remove(action)
+
+        _drop_option(serve_parser, ["--quantization", "-q", "--quantization-config"])
+
         # Create OmniConfig argument group for omni-related parameters
         # This ensures the parameters appear in --help output
         omni_config_group = serve_parser.add_argument_group(
@@ -194,7 +208,8 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "JSON string for diffusion quantization config. For bitsandbytes, "
-                "use fields like '{\"load_in_4bit\": true, \"bnb_4bit_compute_dtype\": \"float16\"}'."
+                'use fields like \'{"load_in_4bit": true, "bnb_4bit_compute_dtype": "bfloat16", '
+                '"bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": true}\'.'
             ),
         )
 
