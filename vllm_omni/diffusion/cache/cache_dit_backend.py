@@ -358,6 +358,8 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
     """
     # Build DBCacheConfig for transformer
     db_cache_config = _build_db_cache_config(cache_config)
+    # The Fn_compute_blocks = 2 override is the most important decision here,
+    # and the rationale (quality degradation at Fn=1) only lives in flux2_klein.
     db_cache_config.Fn_compute_blocks = 2
 
     calibrator = None
@@ -373,7 +375,7 @@ def enable_cache_for_flux2_klein(pipeline: Any, cache_config: Any) -> Callable[[
     )
 
     logger.info(
-        f"Enabling cache-dit on Flux transformer with BlockAdapter: "
+        f"Enabling cache-dit on Flux2-Klein transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
         f"W={db_cache_config.max_warmup_steps}, "
