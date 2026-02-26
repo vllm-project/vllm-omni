@@ -115,7 +115,3 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return torch.cuda.get_device_name(device_id)
-
-    @classmethod
-    def supports_cpu_offload(cls) -> bool:
-        return True
