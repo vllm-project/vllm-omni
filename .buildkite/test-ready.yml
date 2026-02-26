@@ -157,7 +157,7 @@ steps:
   #                 type: DirectoryOrCreate
 
   - label: "Omni Model Test"
-    timeout_in_minutes: 15
+    timeout_in_minutes: 17
     depends_on: upload-ready-pipeline
     commands:
       - export VLLM_LOGGING_LEVEL=DEBUG

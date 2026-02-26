@@ -38,21 +38,77 @@ class _FakeLinearBase(LinearBase):
         torch.nn.Module.__init__(self)
 
 
+class _DummyBaseLayerWithLoRA(torch.nn.Module):
+    def __init__(self, base_layer: torch.nn.Module):
+        super().__init__()
+        self.base_layer = base_layer
+
+        self.set_calls: list[
+            tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
+        ] = []
+        self.reset_calls: int = 0
+        self.create_calls: int = 0
+
+    def set_lora(self, index: int, lora_a, lora_b):
+        assert index == 0
+        self.set_calls.append((lora_a, lora_b))
+
+    def reset_lora(self, index: int):
+        assert index == 0
+        self.reset_calls += 1
+
+    def create_lora_weights(self, max_loras, lora_config, model_config):
+        # Needs to be callable for scale test when rank changes, but not
+        # actually used since we mock everything and check everything based
+        # on set calls.
+        self.create_calls += 1
+
+
+class _DummyPipeline(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.transformer = torch.nn.Module()
+        self.transformer.foo = _FakeLinearBase()
+
+
+class _DummyLM(torch.nn.Module):
+    """LoRA enabled wrapper for _DummyPipeline."""
+
+    def __init__(self, rank: int):
+        super().__init__()
+        self.transformer = torch.nn.Module()
+        self.transformer.foo = _DummyBaseLayerWithLoRA(_FakeLinearBase())
+        self.rank = rank
+        self.loras = self.get_lora_modules()
+
+    def get_lora_modules(self):
+        return {"transformer.foo": self._get_initial_lora(self.rank)}
+
+    def get_lora(self, k: str) -> LoRALayerWeights:
+        """Get the unscaled LoRA weights for transformer.foo"""
+        return self.loras[k]
+
+    def _get_initial_lora(self, rank: int) -> LoRALayerWeights:
+        """Initializes a dummy LoRA for the current rank."""
+        A = torch.ones((rank, 4))
+        B = torch.ones((4, rank))
+        return LoRALayerWeights(
+            module_name="foo",
+            rank=rank,
+            lora_alpha=rank,
+            lora_a=A,
+            lora_b=B,
+        )
+
+
 def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypatch):
     # Simulate a pipeline that already contains LoRA wrappers where the original
     # LinearBase is nested under ".base_layer".
     import vllm_omni.diffusion.lora.manager as manager_mod
 
-    class _DummyBaseLayerWithLoRA(torch.nn.Module):
-        def __init__(self, base_layer: torch.nn.Module):
-            super().__init__()
-            self.base_layer = base_layer
-
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
-    pipeline = torch.nn.Module()
-    pipeline.transformer = torch.nn.Module()
-    pipeline.transformer.foo = _DummyBaseLayerWithLoRA(_FakeLinearBase())
+    pipeline = _DummyLM(rank=2)
 
     # vLLM helper would see only the nested LinearBase and yield "base_layer".
     assert get_supported_lora_modules(pipeline) == ["base_layer"]
@@ -70,11 +126,6 @@ def test_lora_manager_supported_modules_are_stable_with_wrapped_layers(monkeypat
 
 def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
     import vllm_omni.diffusion.lora.manager as manager_mod
-
-    class _DummyBaseLayerWithLoRA(torch.nn.Module):
-        def __init__(self, base_layer: torch.nn.Module):
-            super().__init__()
-            self.base_layer = base_layer
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -115,11 +166,6 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
 
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
     import vllm_omni.diffusion.lora.manager as manager_mod
-
-    class _DummyBaseLayerWithLoRA(torch.nn.Module):
-        def __init__(self, base_layer: torch.nn.Module):
-            super().__init__()
-            self.base_layer = base_layer
 
     monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
 
@@ -189,9 +235,8 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
             },
         )()
     }
-    manager._adapter_scales = {7: 0.5}
 
-    manager._activate_adapter(7)
+    manager._activate_adapter(7, 0.5)
 
     assert packed_layer.reset_calls == 0
     assert len(packed_layer.set_calls) == 1
@@ -234,9 +279,8 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     manager._registered_adapters = {
         1: type("LM", (), {"id": 1, "loras": loras, "get_lora": lambda self, k: self.loras.get(k)})()
     }
-    manager._adapter_scales = {1: 2.0}
 
-    manager._activate_adapter(1)
+    manager._activate_adapter(1, scale=2.0)
 
     assert packed_layer.reset_calls == 0
     assert len(packed_layer.set_calls) == 1
@@ -274,7 +318,7 @@ def test_lora_manager_evicts_lru_adapter_when_cache_full(monkeypatch):
 
     monkeypatch.setattr(manager, "_load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id: None)
+    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
     req1 = _dummy_lora_request(1)
     req2 = _dummy_lora_request(2)
@@ -306,7 +350,7 @@ def test_lora_manager_does_not_evict_pinned_adapter(monkeypatch):
 
     monkeypatch.setattr(manager, "_load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id: None)
+    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
     manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
     assert manager.pin_adapter(1)
@@ -332,7 +376,7 @@ def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
 
     monkeypatch.setattr(manager, "_load_adapter", _fake_load)
     monkeypatch.setattr(manager, "_replace_layers_with_lora", lambda _peft: None)
-    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id: None)
+    monkeypatch.setattr(manager, "_activate_adapter", lambda _adapter_id, scale: None)
 
     manager.set_active_adapter(_dummy_lora_request(1), lora_scale=1.0)
     manager.set_active_adapter(_dummy_lora_request(2), lora_scale=1.0)
@@ -341,6 +385,118 @@ def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
     assert manager.pin_adapter(2)
 
     manager.max_cached_adapters = 1
-    manager._evict_if_needed()
+    manager._evict_for_new_adapter()
 
     assert set(manager.list_adapters()) == {1, 2}
+
+
+def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
+    """Ensure that the LoRA manager applies scales correctly when the
+    active adapter receives a different scale, i.e., the rank is unchanged.
+    """
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyLoRALayer)
+
+    rank = 2
+    adapter_id = 7
+    req1 = _dummy_lora_request(adapter_id)
+    scale_1 = 0.25
+    scale_2 = 0.5
+
+    lora_model = _DummyLM(rank=rank)
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    def _fake_load(_req: LoRARequest):
+        peft_helper = type("PH", (), {"r": rank})()
+        return lora_model, peft_helper
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    manager._registered_adapters = {
+        adapter_id: lora_model,
+    }
+    manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+
+    # After the first scale, all B values should go from 1 -> scale_1
+    manager.set_active_adapter(req1, lora_scale=scale_1)
+    assert len(lora_model.transformer.foo.set_calls) == 1
+    lora_a, lora_b = lora_model.transformer.foo.set_calls[0]
+    assert torch.all(lora_a == 1)
+    assert torch.all(lora_b == scale_1)
+
+    # After the second scale, all B values should go from 1 -> scale_2
+    manager.set_active_adapter(req1, lora_scale=scale_2)
+    assert len(lora_model.transformer.foo.set_calls) == 2
+
+    lora_a, lora_b = lora_model.transformer.foo.set_calls[1]
+    assert torch.all(lora_a == 1)
+    assert torch.all(lora_b == scale_2)
+
+
+def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
+    """Ensure that the LoRA manager correctly handles scaling when the rank
+    is changed and the buffers are reset + we reactivate.
+    """
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    rank = 2
+    adapter_id = 7
+    req1 = _dummy_lora_request(adapter_id)
+    initial_scale = 0.5
+
+    lora_model = _DummyLM(rank=rank)
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    def _fake_load(_req: LoRARequest):
+        peft_helper = type("PH", (), {"r": rank})()
+        return lora_model, peft_helper
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    manager._registered_adapters = {
+        adapter_id: lora_model,
+    }
+    manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+
+    # Activate adapter with initial scale
+    manager.set_active_adapter(req1, lora_scale=initial_scale)
+    assert lora_model.transformer.foo.create_calls == 0
+    assert len(lora_model.transformer.foo.set_calls) == 1
+    lora_a, lora_b = lora_model.transformer.foo.set_calls[0]
+    assert torch.all(lora_a == 1)
+    assert torch.all(lora_b == initial_scale)
+
+    # Increase the rank; this resets the buffers, so the adapter is activated again
+    manager._ensure_max_lora_rank(8)
+
+    # Ensure we actually took the rank expansion path, which recreates
+    # and sets the weight buffets, but that the scale didn't change
+    assert lora_model.transformer.foo.create_calls == 1
+    assert len(lora_model.transformer.foo.set_calls) == 2
+    lora_a, lora_b = lora_model.transformer.foo.set_calls[1]
+    assert torch.all(lora_a == 1)
+    assert torch.all(lora_b == initial_scale)
+
+
+def test_scale_keys_are_rounded():
+    """Ensure that added adapter scales are rounded to avoid lookup
+    issues due to precision differences, e.g., computed scales.
+    """
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    adapter_id = 1
+    # Currently we round keys to 3 decimal places
+    manager._update_adapter_scale(adapter_id, 0.0031)
+    assert manager._adapter_scales[adapter_id] == 0.003

@@ -10,11 +10,11 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 import base64
 import io
 from argparse import Namespace
-from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from pytest_mock import MockerFixture
 from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -128,11 +128,11 @@ class FakeAsyncOmni:
 
 
 @pytest.fixture
-def mock_async_diffusion():
+def mock_async_diffusion(mocker: MockerFixture):
     """Mock AsyncOmniDiffusion instance that returns fake images"""
-    mock = Mock()
+    mock = mocker.Mock()
     mock.is_running = True  # For health endpoint
-    mock.check_health = AsyncMock()  # For LLM mode health check
+    mock.check_health = mocker.AsyncMock()  # For LLM mode health check
 
     async def generate(**kwargs):
         # Return n PIL images wrapped in result object
@@ -143,7 +143,7 @@ def mock_async_diffusion():
         images = [Image.new("RGB", (64, 64), color="blue") for _ in range(n)]
         return MockGenerationResult(images)
 
-    mock.generate = AsyncMock(side_effect=generate)
+    mock.generate = mocker.AsyncMock(side_effect=generate)
     return mock
 
 
