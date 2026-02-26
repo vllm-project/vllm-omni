@@ -1038,6 +1038,13 @@ class Omni(OmniBase):
                         final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
                         request_output=engine_outputs,
                     )
+                    try:
+                        if stage.final_output_type == "text" or metrics.log_stats:
+                            output_to_yield.metrics = metrics.build_output_metrics(stage_id, req_id)
+                    except Exception as e:
+                        logger.exception(
+                            f"[{self._name}] Failed to attach output metrics for req {req_id} at stage {stage_id}: {e}",
+                        )
 
                     # Record audio generated frames (only when finished)
                     try:

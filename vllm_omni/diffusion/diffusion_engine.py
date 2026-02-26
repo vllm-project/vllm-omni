@@ -110,25 +110,20 @@ class DiffusionEngine:
         metrics = {
             "preprocess_time_ms": round(preprocess_time * 1000, 2),
             "diffusion_engine_exec_time_ms": round((time.time() - diffusion_engine_start_time) * 1000, 2),
-            "dit_time_ms": round(exec_total_time * 1000, 2),
+            "executor_time_ms": round(exec_total_time * 1000, 2),
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
-            "denoise_time_per_step_ms": 0.0,
-            "vae_time_ms": 0.0,
         }
 
         if self.pre_process_func is not None:
             metrics["preprocessing_time_ms"] = round(preprocess_time * 1000, 2)
 
         # Handle single request or multiple requests
-        dit_time_seconds = metrics["dit_time_ms"] / 1000
+        metrics["postprocess_time_ms"] = round(postprocess_time * 1000, 2)
+        metrics["vae_time_ms"] = metrics["postprocess_time_ms"]
+        metrics["dit_time_ms"] = round(max(exec_total_time - postprocess_time, 0.0) * 1000, 2)
         num_steps = request.sampling_params.num_inference_steps
-
-        if num_steps > 0:
-            total_denoise_time = dit_time_seconds
-            metrics["denoise_time_per_step_ms"] = round((total_denoise_time / num_steps) * 1000, 2)
-
-        metrics["vae_time_ms"] = round(dit_time_seconds * 1000, 2)
+        metrics["denoise_time_per_step_ms"] = round(metrics["dit_time_ms"] / num_steps, 2) if num_steps > 0 else 0.0
 
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
