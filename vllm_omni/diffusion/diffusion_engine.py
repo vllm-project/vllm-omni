@@ -67,7 +67,6 @@ class DiffusionEngine:
             raise e
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
-
         diffusion_engine_start_time = time.time()
         # Apply pre-processing if available
         preprocess_time = 0.0
@@ -129,7 +128,6 @@ class DiffusionEngine:
             total_denoise_time = dit_time_seconds
             metrics["denoise_time_per_step_ms"] = round((total_denoise_time / num_steps) * 1000, 2)
             
-
         metrics["vae_time_ms"] = round(dit_time_seconds * 1000, 2)
 
         if len(request.prompts) == 1:
