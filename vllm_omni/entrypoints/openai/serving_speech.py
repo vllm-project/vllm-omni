@@ -153,13 +153,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
-        stage_list = getattr(self.engine_client, "stage_list", None)
-        if stage_list:
-            for stage in stage_list:
-                model_stage = getattr(stage, "model_stage", None)
-                if model_stage in _TTS_MODEL_STAGES:
-                    return True
-        return False
+        return self._is_tts
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""

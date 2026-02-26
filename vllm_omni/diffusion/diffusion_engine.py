@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 import os
 import time
 from collections.abc import Iterable
@@ -23,6 +24,7 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+@functools.cache
 def supports_image_input(model_class_name: str) -> bool:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:
@@ -30,11 +32,13 @@ def supports_image_input(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_image_input", False))
 
 
+@functools.cache
 def image_color_format(model_class_name: str) -> str:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     return getattr(model_cls, "color_format", "RGB")
 
 
+@functools.cache
 def supports_audio_output(model_class_name: str) -> bool:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:

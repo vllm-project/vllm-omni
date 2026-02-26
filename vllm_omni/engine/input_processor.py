@@ -42,6 +42,25 @@ from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
 
+_DTYPE_NAME_MAP = {
+    torch.float32: "float32",
+    torch.float: "float32",
+    torch.float16: "float16",
+    torch.half: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float64: "float64",
+    torch.double: "float64",
+    torch.int64: "int64",
+    torch.long: "int64",
+    torch.int32: "int32",
+    torch.int: "int32",
+    torch.int16: "int16",
+    torch.short: "int16",
+    torch.int8: "int8",
+    torch.uint8: "uint8",
+    torch.bool: "bool",
+}
+
 
 class OmniInputProcessor(InputProcessor):
     """Processor for omni models, handling multimodal inputs and embeddings.
@@ -57,33 +76,8 @@ class OmniInputProcessor(InputProcessor):
 
     @staticmethod
     def _dtype_to_name(dtype: torch.dtype) -> str:
-        """Convert torch dtype to string representation.
-
-        Args:
-            dtype: PyTorch dtype to convert
-
-        Returns:
-            String representation of the dtype (e.g., "float32", "int64")
-        """
-        mapping = {
-            torch.float32: "float32",
-            torch.float: "float32",
-            torch.float16: "float16",
-            torch.half: "float16",
-            torch.bfloat16: "bfloat16",
-            torch.float64: "float64",
-            torch.double: "float64",
-            torch.int64: "int64",
-            torch.long: "int64",
-            torch.int32: "int32",
-            torch.int: "int32",
-            torch.int16: "int16",
-            torch.short: "int16",
-            torch.int8: "int8",
-            torch.uint8: "uint8",
-            torch.bool: "bool",
-        }
-        return mapping.get(dtype, str(dtype).replace("torch.", ""))
+        """Convert torch dtype to string representation."""
+        return _DTYPE_NAME_MAP.get(dtype, str(dtype).replace("torch.", ""))
 
     def __init__(
         self,
