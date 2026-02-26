@@ -108,6 +108,36 @@ Key arguments:
 
 > ℹ️ Qwen-Image currently publishes best-effort presets at `1328x1328`, `1664x928`, `928x1664`, `1472x1140`, `1140x1472`, `1584x1056`, and `1056x1584`. Adjust `--height/--width` accordingly for the most reliable outcomes.
 
+## LoRA
+
+This example supports Peft-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. Pass `--lora-path` to use a LoRA adapter and optionally `--lora-scale` (default 1.0); omit it to use the base model only.
+
+### Basic usage with LoRA
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "A piece of cheesecake" \
+  --lora-path /path/to/lora/ \
+  --lora-scale 1.0 \
+  --output output.png
+```
+
+### LoRA parameters
+
+- `--lora-path`: Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.
+- `--lora-scale`: Scale factor for LoRA weights (default: 1.0). Higher values increase the influence of the LoRA adapter.
+
+### LoRA adapter format
+
+LoRA adapters must be in PEFT (Parameter-Efficient Fine-Tuning) format. A typical LoRA adapter directory structure:
+
+```
+lora_adapter/
+├── adapter_config.json
+└── adapter_model.safetensors
+```
+
 ## Web UI Demo
 
 Launch the gradio demo:
