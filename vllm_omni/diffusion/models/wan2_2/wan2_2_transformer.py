@@ -725,6 +725,13 @@ class WanTransformer3DModel(nn.Module):
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        """Match transformer blocks for HSDP sharding (e.g., blocks.0, blocks.1)."""
+        return "blocks" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:

@@ -122,6 +122,7 @@ class DiffusionWorker:
                 ring_degree=parallel_config.ring_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
             )
             init_workspace_manager(self.device)
 

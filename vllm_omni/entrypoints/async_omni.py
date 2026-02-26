@@ -141,9 +141,20 @@ class AsyncOmni(OmniBase):
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
+            use_hsdp = kwargs.get("use_hsdp", False)
+            hsdp_shard_size = kwargs.get("hsdp_shard_size", -1)
+            hsdp_replicate_size = kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
-            num_devices = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
+
+            # Calculate num_devices: consider standalone HSDP
+            other_parallel_size = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
+            if use_hsdp and other_parallel_size == 1 and hsdp_shard_size > 0:
+                # Standalone HSDP: num_devices is determined by HSDP dimensions
+                num_devices = hsdp_shard_size * hsdp_replicate_size
+            else:
+                num_devices = other_parallel_size
+
             for i in range(1, num_devices):
                 devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
@@ -154,6 +165,9 @@ class AsyncOmni(OmniBase):
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
                 cfg_parallel_size=cfg_parallel_size,
+                use_hsdp=use_hsdp,
+                hsdp_shard_size=hsdp_shard_size,
+                hsdp_replicate_size=hsdp_replicate_size,
             )
         default_stage_cfg = [
             {
