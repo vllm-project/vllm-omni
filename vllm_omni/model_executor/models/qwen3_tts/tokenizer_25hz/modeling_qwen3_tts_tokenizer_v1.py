@@ -1297,8 +1297,6 @@ class Qwen3TTSTokenizerV1Encoder(Qwen3TTSTokenizerV1EncoderPreTrainedModel):
             n_layer=config.n_layer,
             n_window=config.n_window,
             output_dim=config.output_dim,
-            grad_checkpointing=config.grad_checkpointing,
-            enable_mp=config.enable_mp,
             audio_sequence_parallel=config.audio_sequence_parallel,
             audio_vq_type=config.audio_vq_type,
             audio_vq_layers=config.audio_vq_layers,
