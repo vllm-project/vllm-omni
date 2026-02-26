@@ -1200,6 +1200,25 @@ async def health(raw_request: Request) -> JSONResponse:
     )
 
 
+# Remove existing models endpoint if present (from vllm imports)
+# to ensure our handler takes precedence
+_remove_route_from_router(router, "/v1/models")
+
+
+@router.get("/v1/models")
+async def show_available_models(raw_request: Request) -> JSONResponse:
+    """Show available models for both LLM and diffusion modes.
+
+    Delegates to state.openai_serving_models which is set to either
+    OpenAIServingModels (LLM) or _DiffusionServingModels (pure diffusion).
+    """
+    handler = getattr(raw_request.app.state, "openai_serving_models", None)
+    if handler is not None:
+        models = await handler.show_available_models()
+        return JSONResponse(content=models.model_dump())
+    return JSONResponse(content={"object": "list", "data": []})
+
+
 # Image generation API endpoints
 
 
