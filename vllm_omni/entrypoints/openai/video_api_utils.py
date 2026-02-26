@@ -147,15 +147,14 @@ def encode_video_base64(video: Any, fps: int) -> str:
     if not frames:
         raise ValueError("No frames found to encode.")
 
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_file.close()
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
     try:
-        export_to_video(frames, tmp_file.name, fps=fps)
-        with open(tmp_file.name, "rb") as f:
-            video_bytes = f.read()
-        return base64.b64encode(video_bytes).decode("utf-8")
+        export_to_video(frames, tmp_path, fps=fps)
+        with open(tmp_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
     finally:
         try:
-            os.remove(tmp_file.name)
+            os.remove(tmp_path)
         except OSError:
             pass
