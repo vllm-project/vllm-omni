@@ -7,9 +7,9 @@ Unit tests for patch.py
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
@@ -51,7 +51,7 @@ def create_sse_chunk(data_dict):
 
 
 @pytest.mark.asyncio
-async def test_output_tokens_assigned_with_metrics():
+async def test_output_tokens_assigned_with_metrics(mocker: MockerFixture):
     """Test that output.output_tokens is assigned when metrics are present"""
     # Arrange
     request_input = RequestFuncInput(
@@ -82,8 +82,8 @@ async def test_output_tokens_assigned_with_metrics():
     ]
 
     mock_response = MockResponse(200, chunks)
-    mock_session = AsyncMock()
-    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
     output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -95,7 +95,7 @@ async def test_output_tokens_assigned_with_metrics():
 
 
 @pytest.mark.asyncio
-async def test_output_tokens_not_assigned_without_metrics():
+async def test_output_tokens_not_assigned_without_metrics(mocker: MockerFixture):
     """Test that output.output_tokens defaults to 0 when no metrics present"""
     # Arrange
     request_input = RequestFuncInput(
@@ -125,8 +125,8 @@ async def test_output_tokens_not_assigned_without_metrics():
     ]
 
     mock_response = MockResponse(200, chunks)
-    mock_session = AsyncMock()
-    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
     output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -138,7 +138,7 @@ async def test_output_tokens_not_assigned_without_metrics():
 
 
 @pytest.mark.asyncio
-async def test_output_tokens_assigned_multiple_metrics():
+async def test_output_tokens_assigned_multiple_metrics(mocker: MockerFixture):
     """Test that output.output_tokens is updated with the latest metrics value"""
     # Arrange
     request_input = RequestFuncInput(
@@ -177,8 +177,8 @@ async def test_output_tokens_assigned_multiple_metrics():
     ]
 
     mock_response = MockResponse(200, chunks)
-    mock_session = AsyncMock()
-    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
     output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -190,7 +190,7 @@ async def test_output_tokens_assigned_multiple_metrics():
 
 
 @pytest.mark.asyncio
-async def test_output_tokens_with_audio_and_text():
+async def test_output_tokens_with_audio_and_text(mocker: MockerFixture):
     """Test output_tokens assignment in mixed audio and text response"""
     # Arrange
     request_input = RequestFuncInput(
@@ -226,8 +226,8 @@ async def test_output_tokens_with_audio_and_text():
     ]
 
     mock_response = MockResponse(200, chunks)
-    mock_session = AsyncMock()
-    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
     output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -238,7 +238,7 @@ async def test_output_tokens_with_audio_and_text():
 
 
 @pytest.mark.asyncio
-async def test_output_tokens_with_missing_num_tokens_out():
+async def test_output_tokens_with_missing_num_tokens_out(mocker: MockerFixture):
     """Test that output_tokens defaults to 0 when num_tokens_out is missing in metrics"""
     # Arrange
     request_input = RequestFuncInput(
@@ -269,8 +269,8 @@ async def test_output_tokens_with_missing_num_tokens_out():
     ]
 
     mock_response = MockResponse(200, chunks)
-    mock_session = AsyncMock()
-    mock_session.post = MagicMock(return_value=mock_response)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
 
     # Act
     output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -312,7 +312,7 @@ class TestTextLatencyAttribute:
         assert text_latency is not None or hasattr(output, "text_latency"), "text_latency attribute should exist"
 
     @pytest.mark.asyncio
-    async def test_text_latency_assigned_with_text_response(self):
+    async def test_text_latency_assigned_with_text_response(self, mocker: MockerFixture):
         """Test that text_latency is assigned when text response is received"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -341,8 +341,8 @@ class TestTextLatencyAttribute:
         ]
 
         mock_response = MockResponse(200, chunks)
-        mock_session = AsyncMock()
-        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
         output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -353,7 +353,7 @@ class TestTextLatencyAttribute:
         assert output.text_latency > 0, "text_latency should be greater than 0 for text response"
 
     @pytest.mark.asyncio
-    async def test_text_latency_updated_with_multiple_text_chunks(self):
+    async def test_text_latency_updated_with_multiple_text_chunks(self, mocker: MockerFixture):
         """Test that text_latency is updated as more text chunks arrive"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -388,8 +388,8 @@ class TestTextLatencyAttribute:
         ]
 
         mock_response = MockResponse(200, chunks)
-        mock_session = AsyncMock()
-        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
         output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -401,7 +401,7 @@ class TestTextLatencyAttribute:
         assert output.generated_text == "First second third"
 
     @pytest.mark.asyncio
-    async def test_text_latency_with_only_audio_response(self):
+    async def test_text_latency_with_only_audio_response(self, mocker: MockerFixture):
         """Test text_latency behavior when only audio is received"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -424,8 +424,8 @@ class TestTextLatencyAttribute:
         ]
 
         mock_response = MockResponse(200, chunks)
-        mock_session = AsyncMock()
-        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
         output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -437,7 +437,7 @@ class TestTextLatencyAttribute:
         assert output.text_latency >= 0, "text_latency should be non-negative"
 
     @pytest.mark.asyncio
-    async def test_text_latency_not_affected_by_metrics(self):
+    async def test_text_latency_not_affected_by_metrics(self, mocker: MockerFixture):
         """Test that text_latency is independent of metrics data"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -467,8 +467,8 @@ class TestTextLatencyAttribute:
         ]
 
         mock_response = MockResponse(200, chunks)
-        mock_session = AsyncMock()
-        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
         output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -481,7 +481,7 @@ class TestTextLatencyAttribute:
         assert output.output_tokens == 100, "metrics should not affect text_latency"
 
     @pytest.mark.asyncio
-    async def test_text_latency_mixed_modalities(self):
+    async def test_text_latency_mixed_modalities(self, mocker: MockerFixture):
         """Test text_latency with mixed text and audio modalities"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -516,8 +516,8 @@ class TestTextLatencyAttribute:
         ]
 
         mock_response = MockResponse(200, chunks)
-        mock_session = AsyncMock()
-        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
         output = await async_request_openai_chat_omni_completions(request_input, mock_session)
@@ -529,7 +529,7 @@ class TestTextLatencyAttribute:
         assert output.generated_text == "Text more text"
 
     @pytest.mark.asyncio
-    async def test_text_latency_value_consistency(self):
+    async def test_text_latency_value_consistency(self, mocker: MockerFixture):
         """Test that text_latency matches latency minus ttft relationship"""
         request_input = RequestFuncInput(
             model="test-model",
@@ -557,8 +557,8 @@ class TestTextLatencyAttribute:
         ]
 
         mock_response = MockResponse(200, chunks)
-        mock_session = AsyncMock()
-        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
 
         # Act
         output = await async_request_openai_chat_omni_completions(request_input, mock_session)
