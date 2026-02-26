@@ -128,6 +128,14 @@ class MammothModa2ARProcessingInfo(Qwen2_5_VLProcessingInfo):
         # MammothModa2 currently supports only image input, not video.
         return {"image": None}
 
+    def get_data_parser(self) -> Qwen2VLMultiModalDataParser:
+        # vLLM >=0.16 expects the parser to be provided by ProcessingInfo,
+        # not by BaseMultiModalProcessor._get_data_parser.
+        return Qwen2VLMultiModalDataParser(
+            spatial_merge_size=self.get_hf_config().vision_config.spatial_merge_size,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
 
 class MammothModa2ARDummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
     """Reuse Qwen2.5-VL's dummy input generation logic."""
@@ -135,11 +143,6 @@ class MammothModa2ARDummyInputsBuilder(Qwen2_5_VLDummyInputsBuilder):
 
 class MammothModa2ARMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
     """Reuse Qwen2.5-VL's multi-modal processing,"""
-
-    def _get_data_parser(self) -> Qwen2VLMultiModalDataParser:
-        return Qwen2VLMultiModalDataParser(
-            spatial_merge_size=self.info.get_hf_config().vision_config.spatial_merge_size
-        )
 
 
 class Mammoth2DecoderLayer(nn.Module):

@@ -31,10 +31,18 @@ def ar2dit(
 
         prompt_token_ids = ar_output.prompt_token_ids
         # exclude the last token because it has no corresponding hidden state
-        gen_token_ids = ar_output.outputs[0].token_ids[:-1]
+        completion_output = ar_output.outputs[0]
+        gen_token_ids = completion_output.token_ids[:-1]
         full_token_ids = prompt_token_ids + gen_token_ids
 
-        full_hidden_states = ar_output.multimodal_output["latent"]
+        mm_output = getattr(completion_output, "multimodal_output", None)
+        if not isinstance(mm_output, dict) or "latent" not in mm_output:
+            raise ValueError(
+                "AR stage output missing latent multimodal output. "
+                f"request_id={getattr(ar_output, 'request_id', None)}, "
+                f"completion_has_mm={hasattr(completion_output, 'multimodal_output')}"
+            )
+        full_hidden_states = mm_output["latent"]
         hidden_total = int(full_hidden_states.shape[0])
         assert hidden_total == len(prompt_token_ids) + len(gen_token_ids), (
             f"Hidden states length mismatch: expected {len(prompt_token_ids) + len(gen_token_ids)}, got {hidden_total}"

@@ -208,21 +208,31 @@ def main() -> None:
             req_suffix = f"_{req_id}" if isinstance(req_id, str) and req_id else f"_{out_idx}"
 
             for sample_idx, ro_item in enumerate(ro_list):
-                mm = getattr(ro_item, "multimodal_output", None)
-                if not isinstance(mm, dict) or "image" not in mm:
-                    raise RuntimeError(f"Unexpected final output payload: {type(mm)} {mm}")
+                completion_outputs = getattr(ro_item, "outputs", None)
+                if not isinstance(completion_outputs, list) or not completion_outputs:
+                    raise RuntimeError(f"Unexpected RequestOutput.outputs: {type(completion_outputs)} {completion_outputs}")
 
-                img_payload = mm["image"]
-                img_list = img_payload if isinstance(img_payload, list) else [img_payload]
-                for img_idx, img_tensor in enumerate(img_list):
-                    if not isinstance(img_tensor, torch.Tensor):
-                        raise TypeError(f"Expected image tensor, got {type(img_tensor)}")
-                    suffix_parts = [req_suffix]
-                    if len(ro_list) > 1:
-                        suffix_parts.append(f"_s{sample_idx}")
-                    if len(img_list) > 1:
-                        suffix_parts.append(f"_i{img_idx}")
-                    images_to_save.append((img_tensor, "".join(suffix_parts)))
+                for completion_idx, completion in enumerate(completion_outputs):
+                    mm = getattr(completion, "multimodal_output", None)
+                    if not isinstance(mm, dict) or "image" not in mm:
+                        raise RuntimeError(
+                            "Unexpected completion multimodal output: "
+                            f"{type(mm)} {mm}, completion={completion}"
+                        )
+
+                    img_payload = mm["image"]
+                    img_list = img_payload if isinstance(img_payload, list) else [img_payload]
+                    for img_idx, img_tensor in enumerate(img_list):
+                        if not isinstance(img_tensor, torch.Tensor):
+                            raise TypeError(f"Expected image tensor, got {type(img_tensor)}")
+                        suffix_parts = [req_suffix]
+                        if len(ro_list) > 1:
+                            suffix_parts.append(f"_s{sample_idx}")
+                        if len(completion_outputs) > 1:
+                            suffix_parts.append(f"_c{completion_idx}")
+                        if len(img_list) > 1:
+                            suffix_parts.append(f"_i{img_idx}")
+                        images_to_save.append((img_tensor, "".join(suffix_parts)))
 
         # If there's only one image, respect `--out` exactly.
         if len(images_to_save) == 1:
