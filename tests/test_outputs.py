@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for OmniRequestOutput class."""
 
-from unittest.mock import Mock
-
+import pytest
 from PIL import Image
+from pytest_mock import MockerFixture
 
 from vllm_omni.outputs import OmniRequestOutput
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TestOmniRequestOutput:
@@ -28,17 +30,17 @@ class TestOmniRequestOutput:
         assert output.is_diffusion_output
         assert output.num_images == 1
 
-    def test_from_pipeline(self):
+    def test_from_pipeline(self, mocker: MockerFixture):
         """Test creating output from pipeline stage."""
-        mock_request_output = Mock()
+        mock_request_output = mocker.Mock()
         mock_request_output.request_id = "pipeline-123"
         mock_request_output.prompt_token_ids = [1, 2, 3]
-        mock_request_output.outputs = [Mock()]
+        mock_request_output.outputs = [mocker.Mock()]
         mock_request_output.encoder_prompt_token_ids = None
         mock_request_output.prompt_logprobs = None
         mock_request_output.num_cached_tokens = 10
         mock_request_output.kv_transfer_params = None
-        mock_request_output.multimodal_output = {"image": Mock()}
+        mock_request_output.multimodal_output = {"image": mocker.Mock()}
 
         output = OmniRequestOutput.from_pipeline(
             stage_id=0,
@@ -51,9 +53,9 @@ class TestOmniRequestOutput:
         assert output.final_output_type == "text"
         assert output.is_pipeline_output
 
-    def test_prompt_token_ids_property(self):
+    def test_prompt_token_ids_property(self, mocker: MockerFixture):
         """Test prompt_token_ids property for streaming compatibility."""
-        mock_request_output = Mock()
+        mock_request_output = mocker.Mock()
         mock_request_output.prompt_token_ids = [1, 2, 3, 4, 5]
 
         output = OmniRequestOutput.from_pipeline(
@@ -73,10 +75,10 @@ class TestOmniRequestOutput:
         )
         assert output.prompt_token_ids is None
 
-    def test_outputs_property(self):
+    def test_outputs_property(self, mocker: MockerFixture):
         """Test outputs property for chat completion compatibility."""
-        mock_output = Mock()
-        mock_request_output = Mock()
+        mock_output = mocker.Mock()
+        mock_request_output = mocker.Mock()
         mock_request_output.outputs = [mock_output]
 
         output = OmniRequestOutput.from_pipeline(
@@ -96,9 +98,9 @@ class TestOmniRequestOutput:
         )
         assert output.outputs == []
 
-    def test_encoder_prompt_token_ids_property(self):
+    def test_encoder_prompt_token_ids_property(self, mocker: MockerFixture):
         """Test encoder_prompt_token_ids property."""
-        mock_request_output = Mock()
+        mock_request_output = mocker.Mock()
         mock_request_output.encoder_prompt_token_ids = [10, 20, 30]
 
         output = OmniRequestOutput.from_pipeline(
@@ -109,9 +111,9 @@ class TestOmniRequestOutput:
 
         assert output.encoder_prompt_token_ids == [10, 20, 30]
 
-    def test_num_cached_tokens_property(self):
+    def test_num_cached_tokens_property(self, mocker: MockerFixture):
         """Test num_cached_tokens property."""
-        mock_request_output = Mock()
+        mock_request_output = mocker.Mock()
         mock_request_output.num_cached_tokens = 42
 
         output = OmniRequestOutput.from_pipeline(
@@ -122,11 +124,12 @@ class TestOmniRequestOutput:
 
         assert output.num_cached_tokens == 42
 
-    def test_multimodal_output_property(self):
+    def test_multimodal_output_property(self, mocker: MockerFixture):
         """Test multimodal_output property."""
-        mock_request_output = Mock()
-        mock_audio = Mock()
+        mock_request_output = mocker.Mock()
+        mock_audio = mocker.Mock()
         expected_output = {"audio": mock_audio}
+        mock_request_output.outputs = []
         mock_request_output.multimodal_output = expected_output
 
         output = OmniRequestOutput.from_pipeline(
@@ -153,9 +156,9 @@ class TestOmniRequestOutput:
         assert result["num_images"] == 1
         assert result["prompt"] == "a cat"
 
-    def test_to_dict_pipeline(self):
+    def test_to_dict_pipeline(self, mocker: MockerFixture):
         """Test to_dict for pipeline output."""
-        mock_request_output = Mock()
+        mock_request_output = mocker.Mock()
         mock_request_output.request_id = "pipeline-123"
 
         output = OmniRequestOutput.from_pipeline(

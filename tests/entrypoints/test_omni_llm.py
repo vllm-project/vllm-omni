@@ -2,9 +2,9 @@ import uuid
 import warnings
 from queue import Empty, Queue
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 from vllm import SamplingParams
 
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK
@@ -123,7 +123,7 @@ class _FakeZmqQueue:
 class _FakeStage:
     """Lightweight Stage stub for multi-process pipeline version with queue support."""
 
-    def __init__(self, config, stage_init_timeout: int = 300):
+    def __init__(self, mocker: MockerFixture, config, stage_init_timeout: int = 300):
         # Handle both dict and object configs
         if isinstance(config, dict):
             config = _FakeStageConfig(config)
@@ -149,6 +149,8 @@ class _FakeStage:
         self._out_q = None
         self._proc = None  # Mock process reference
         self._stage_init_timeout = max(0, int(stage_init_timeout))
+        # NOTE: mocker fixture object **must be provided**
+        self._mocker = mocker
 
     def attach_queues(self, in_q, out_q):
         """Attach input and output queues."""
@@ -167,11 +169,11 @@ class _FakeStage:
     ):
         """Mock init_stage_worker: don't start real process, just send stage_ready message."""
         # Create a mock process object
-        self._proc = MagicMock()
-        self._proc.start = MagicMock()
-        self._proc.join = MagicMock()
-        self._proc.is_alive = MagicMock(return_value=False)
-        self._proc.terminate = MagicMock()
+        self._proc = self._mocker.MagicMock()
+        self._proc.start = self._mocker.MagicMock()
+        self._proc.join = self._mocker.MagicMock()
+        self._proc.is_alive = self._mocker.MagicMock(return_value=False)
+        self._proc.terminate = self._mocker.MagicMock()
         # Send stage_ready message to output queue
         if self._out_q is not None:
             try:
@@ -235,21 +237,21 @@ def fake_stage_config():
     }
 
 
-def _setup_engine_mocks(monkeypatch):
+def _setup_engine_mocks(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     """Helper function to set up common engine mocks."""
-    fake_engine = MagicMock()
+    fake_engine = mocker.MagicMock()
     # Add necessary attributes to fake_engine
-    fake_engine.tokenizer = MagicMock()
+    fake_engine.tokenizer = mocker.MagicMock()
     fake_engine.log_stats = False
-    fake_engine.vllm_config = MagicMock()
-    fake_engine.vllm_config.model_config = MagicMock()
+    fake_engine.vllm_config = mocker.MagicMock()
+    fake_engine.vllm_config.model_config = mocker.MagicMock()
     fake_engine.vllm_config.model_config.io_processor_plugin = None
-    fake_engine.get_supported_tasks = MagicMock(return_value=[])
-    fake_engine.model_config = MagicMock()
+    fake_engine.get_supported_tasks = mocker.MagicMock(return_value=[])
+    fake_engine.model_config = mocker.MagicMock()
     fake_engine.model_config.io_processor_plugin = None
     # Add registry with resolve_model_cls method
-    fake_registry = MagicMock()
-    fake_registry.resolve_model_cls = MagicMock(return_value=(MagicMock(), "test_arch"))
+    fake_registry = mocker.MagicMock()
+    fake_registry.resolve_model_cls = mocker.MagicMock(return_value=(mocker.MagicMock(), "test_arch"))
     fake_engine.model_config.registry = fake_registry
     fake_engine.vllm_config.model_config.registry = fake_registry
 
@@ -298,21 +300,21 @@ def _setup_engine_mocks(monkeypatch):
     )
 
 
-def _setup_multiprocessing_mocks(monkeypatch):
+def _setup_multiprocessing_mocks(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     """Helper function to set up multiprocessing mocks."""
     import multiprocessing as mp
 
     # Mock Process
-    fake_process_class = MagicMock()
-    fake_process_instance = MagicMock()
-    fake_process_instance.start = MagicMock()
-    fake_process_instance.join = MagicMock()
-    fake_process_instance.is_alive = MagicMock(return_value=False)
-    fake_process_instance.terminate = MagicMock()
+    fake_process_class = mocker.MagicMock()
+    fake_process_instance = mocker.MagicMock()
+    fake_process_instance.start = mocker.MagicMock()
+    fake_process_instance.join = mocker.MagicMock()
+    fake_process_instance.is_alive = mocker.MagicMock(return_value=False)
+    fake_process_instance.terminate = mocker.MagicMock()
     fake_process_class.return_value = fake_process_instance
 
     # Mock get_context to return a context with Queue that returns _FakeQueue
-    fake_ctx = MagicMock()
+    fake_ctx = mocker.MagicMock()
     fake_ctx.Queue = lambda maxsize=0: _FakeQueue(maxsize=maxsize)
     fake_ctx.Process = fake_process_class
 
@@ -336,7 +338,7 @@ def _setup_multiprocessing_mocks(monkeypatch):
     )
 
 
-def _setup_ipc_mocks(monkeypatch):
+def _setup_ipc_mocks(monkeypatch: pytest.MonkeyPatch):
     """Helper function to set up IPC function mocks."""
 
     # Mock _encode: simple serialization
@@ -356,7 +358,7 @@ def _setup_ipc_mocks(monkeypatch):
     monkeypatch.setattr("vllm_omni.entrypoints.omni._set", _fake_set, raising=False)
 
 
-def _setup_log_mocks(monkeypatch):
+def _setup_log_mocks(monkeypatch: pytest.MonkeyPatch):
     """Helper function to set up logging and stats mocks."""
     # Mock OrchestratorMetrics to be a simple class that doesn't require file operations
 
@@ -387,7 +389,7 @@ def _setup_log_mocks(monkeypatch):
     )
 
 
-def _setup_connector_mocks(monkeypatch, omni_module=None):
+def _setup_connector_mocks(monkeypatch, mocker, omni_module=None):
     """Helper function to set up connector mocks for stage-to-stage forwarding.
 
     If omni_module is provided, mocks directly on the module. Otherwise, uses string path.
@@ -400,7 +402,7 @@ def _setup_connector_mocks(monkeypatch, omni_module=None):
         fake_connectors = {}
         # Add connectors for common edges (0->1, 1->2, etc.)
         for i in range(10):  # Support up to 10 stages
-            fake_connectors[(str(i), str(i + 1))] = MagicMock()
+            fake_connectors[(str(i), str(i + 1))] = mocker.MagicMock()
         return None, fake_connectors
 
     if omni_module is not None:
@@ -447,15 +449,15 @@ def _setup_connector_adapter_mock(monkeypatch, omni_module):
 
 
 @pytest.fixture(autouse=True)
-def mock_get_config(monkeypatch):
+def mock_get_config(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     """Auto-mock get_config and related model loading functions to avoid model path validation."""
     # CRITICAL: Mock tokenizer-related imports FIRST, before any module imports
     # This prevents ImportError when async_omni is imported (which happens via omni_stage)
     import sys
 
-    fake_tokenizer = MagicMock()
-    fake_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-    fake_tokenizer.decode = MagicMock(return_value="test")
+    fake_tokenizer = mocker.MagicMock()
+    fake_tokenizer.encode = mocker.MagicMock(return_value=[1, 2, 3])
+    fake_tokenizer.decode = mocker.MagicMock(return_value="test")
 
     # Mock init_tokenizer_from_configs (used in async_omni)
     def _mock_init_tokenizer_from_configs(model_config=None, **kwargs):
@@ -526,7 +528,7 @@ def mock_get_config(monkeypatch):
         setattr(async_omni_module, "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
 
     # Now mock get_config and other functions
-    fake_hf_config = MagicMock()
+    fake_hf_config = mocker.MagicMock()
     fake_hf_config.model_type = "qwen2_5_omni"
 
     def _mock_get_config(model, **kwargs):
@@ -568,7 +570,9 @@ def mock_get_config(monkeypatch):
     )
 
 
-def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_config):
+def test_initialize_stage_configs_called_when_none(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that stage configs are auto-loaded when stage_configs_path is None."""
 
     def _fake_loader(
@@ -598,11 +602,11 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
             del sys.modules[module_name]
 
     # Set up mocks
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     # Mock load_and_resolve_stage_configs
     monkeypatch.setattr(
@@ -614,7 +618,7 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     # Replace OmniStage
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
@@ -623,9 +627,9 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
 
     # Patch the imported function and class in the module
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
     # Apply connector and adapter mocks after importing omni module
-    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_mocks(monkeypatch, mocker, omni_module)
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -645,7 +649,7 @@ def test_initialize_stage_configs_called_when_none(monkeypatch, fake_stage_confi
     assert len(omni._stages_ready) == 2
 
 
-def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
+def test_generate_raises_on_length_mismatch(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
     """Test that generate raises ValueError when sampling_params_list length doesn't match."""
 
     def _fake_loader(
@@ -668,11 +672,11 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -681,14 +685,14 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -697,7 +701,7 @@ def test_generate_raises_on_length_mismatch(monkeypatch, fake_stage_config):
         omni.generate(prompts=["hi"], sampling_params_list=[])
 
 
-def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
+def test_generate_pipeline_and_final_outputs(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
     """Test multi-stage generation pipeline with queue polling."""
     stage_cfg0 = dict(fake_stage_config)
     stage_cfg0["stage_id"] = 0
@@ -723,11 +727,11 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -736,16 +740,16 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
     # Apply connector and adapter mocks after importing omni module
-    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_mocks(monkeypatch, mocker, omni_module)
     _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
@@ -802,7 +806,9 @@ def test_generate_pipeline_and_final_outputs(monkeypatch, fake_stage_config):
     assert omni.stage_list[1].process_engine_inputs([], []) is not None
 
 
-def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
+def test_generate_no_final_output_returns_empty(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that generate returns empty list when all stages have final_output=False."""
     stage_cfg0 = dict(fake_stage_config)
     stage_cfg0["stage_id"] = 0
@@ -829,11 +835,11 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -842,16 +848,16 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
     # Apply connector and adapter mocks after importing omni module
-    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_mocks(monkeypatch, mocker, omni_module)
     _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
@@ -892,7 +898,9 @@ def test_generate_no_final_output_returns_empty(monkeypatch, fake_stage_config):
     assert outputs == []
 
 
-def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_config):
+def test_generate_sampling_params_none_use_default(
+    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config
+):
     """Test that generate uses default sampling params when sampling_params_list is None."""
     stage_cfg0 = dict(fake_stage_config)
     stage_cfg0["stage_id"] = 0
@@ -919,11 +927,11 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -932,16 +940,16 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
     # Apply connector and adapter mocks after importing omni module
-    _setup_connector_mocks(monkeypatch, omni_module)
+    _setup_connector_mocks(monkeypatch, mocker, omni_module)
     _setup_connector_adapter_mock(monkeypatch, omni_module)
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
@@ -975,7 +983,7 @@ def test_generate_sampling_params_none_use_default(monkeypatch, fake_stage_confi
     omni.generate(prompts=["p"], sampling_params_list=None)
 
 
-def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
+def test_wait_for_stages_ready_timeout(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
     """Test that _wait_for_stages_ready handles timeout correctly."""
 
     def _fake_loader(
@@ -998,11 +1006,11 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -1014,22 +1022,22 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     class _FakeStageNoReady(_FakeStage):
         def init_stage_worker(self, *args, **kwargs):
             # Don't send stage_ready message
-            self._proc = MagicMock()
-            self._proc.start = MagicMock()
-            self._proc.join = MagicMock()
-            self._proc.is_alive = MagicMock(return_value=False)
-            self._proc.terminate = MagicMock()
+            self._proc = self._mocker.MagicMock()
+            self._proc.start = self._mocker.MagicMock()
+            self._proc.join = self._mocker.MagicMock()
+            self._proc.is_alive = self._mocker.MagicMock(return_value=False)
+            self._proc.terminate = self._mocker.MagicMock()
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStageNoReady(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStageNoReady(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStageNoReady(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStageNoReady(mocker, cfg, **kwargs))
 
     from vllm_omni.entrypoints.omni import Omni
 
@@ -1039,7 +1047,7 @@ def test_wait_for_stages_ready_timeout(monkeypatch, fake_stage_config):
     assert len(omni._stages_ready) == 0
 
 
-def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
+def test_generate_handles_error_messages(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
     """Test that generate handles error messages from stages correctly."""
 
     def _fake_loader(
@@ -1062,11 +1070,11 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -1075,14 +1083,14 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
 
     # Mock uuid.uuid4() to return a predictable value for request ID generation
     test_uuid = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -1122,7 +1130,7 @@ def test_generate_handles_error_messages(monkeypatch, fake_stage_config):
     assert len(outputs) == 1
 
 
-def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
+def test_close_sends_shutdown_signal(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture, fake_stage_config):
     """Test that close() sends shutdown signal to all input queues."""
 
     def _fake_loader(
@@ -1145,11 +1153,11 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
         if module_name in sys.modules:
             del sys.modules[module_name]
 
-    _setup_engine_mocks(monkeypatch)
-    _setup_multiprocessing_mocks(monkeypatch)
+    _setup_engine_mocks(monkeypatch, mocker)
+    _setup_multiprocessing_mocks(monkeypatch, mocker)
     _setup_ipc_mocks(monkeypatch)
     _setup_log_mocks(monkeypatch)
-    _setup_connector_mocks(monkeypatch)
+    _setup_connector_mocks(monkeypatch, mocker)
 
     monkeypatch.setattr(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
@@ -1158,14 +1166,14 @@ def test_close_sends_shutdown_signal(monkeypatch, fake_stage_config):
     )
     monkeypatch.setattr(
         "vllm_omni.entrypoints.omni_stage.OmniStage",
-        lambda cfg, **kwargs: _FakeStage(cfg, **kwargs),
+        lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs),
         raising=False,
     )
 
     import vllm_omni.entrypoints.omni as omni_module
 
     monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", _fake_loader)
-    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(cfg, **kwargs))
+    monkeypatch.setattr(omni_module, "OmniStage", lambda cfg, **kwargs: _FakeStage(mocker, cfg, **kwargs))
 
     from vllm_omni.entrypoints.omni import Omni
 
