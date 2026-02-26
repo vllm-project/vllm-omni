@@ -1,18 +1,19 @@
 from typing import Any
 
 from typing_extensions import assert_never
-from vllm.inputs.data import SingletonInputs, SingletonPrompt
+from vllm.inputs.data import EmbedsInputs, SingletonInputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs, MultiModalUUIDDict
+from vllm.renderers.inputs import SingletonDictPrompt
 
 from vllm_omni.inputs.data import (
+    OmniEmbedsPrompt,
     OmniTextPrompt,
     OmniTokenInputs,
     OmniTokensPrompt,
     token_inputs_omni,
 )
-from vllm_omni.inputs.parse import parse_singleton_prompt_omni
 
 logger = init_logger(__name__)
 
@@ -101,9 +102,28 @@ class OmniInputPreprocessor(InputPreprocessor):
 
         return inputs
 
+    def _process_embeds(
+        self,
+        parsed_content: OmniEmbedsPrompt,
+    ) -> EmbedsInputs:
+        """Process embeddings prompt with omni-specific extensions.
+
+        Extends base _process_embeds to handle additional_information payload
+        for direct transfer between pipeline stages.
+        """
+        # Call parent implementation for base embeds processing
+        inputs = super()._process_embeds(parsed_content)
+
+        # Add omni-specific additional_information if present
+        additional_information = parsed_content.get("additional_information")
+        if additional_information is not None:
+            inputs["additional_information"] = additional_information  # type: ignore[typeddict-unknown-key]
+
+        return inputs
+
     def _prompt_to_llm_inputs(
         self,
-        prompt: SingletonPrompt,
+        prompt: SingletonDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
@@ -114,31 +134,25 @@ class OmniInputPreprocessor(InputPreprocessor):
         Arguments:
 
         * prompt: single encoder or decoder input prompt
-        * lora_request: this is only valid for decoder prompts
-        * return_mm_hashes: whether to return multimodal hashes
 
         Returns:
 
-        * Input container compatible with vLLM's singleton prompt handling.
+        * [`SingletonInputs`][vllm.inputs.data.SingletonInputs] instance
         """
-        parsed = parse_singleton_prompt_omni(prompt)
-
-        if parsed["type"] == "tokens":
+        if "prompt_token_ids" in prompt:
             return self._process_tokens(
-                parsed["content"],
+                prompt,  # type: ignore[arg-type]
                 mm_uuids=mm_uuids,
             )
-        if parsed["type"] == "text":
+
+        if "prompt_embeds" in prompt:
+            return self._process_embeds(prompt)  # type: ignore[arg-type]
+
+        if "prompt" in prompt:
             return self._process_text(
-                parsed["content"],
-                tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
-            )
-        if parsed["type"] == "str":
-            return self._process_text(
-                OmniTextPrompt(prompt=parsed["content"]),
+                prompt,  # type: ignore[arg-type]
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )
 
-        assert_never(parsed)
+        assert_never(prompt)  # type: ignore[arg-type]

@@ -5,9 +5,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.lora.layers.base_linear import DiffusionBaseLinearLayerWithLoRA
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @dataclass

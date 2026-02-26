@@ -37,6 +37,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -173,7 +174,9 @@ class ZImagePipeline(nn.Module):
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
         )
-        self.transformer = ZImageTransformer2DModel()
+        # Get vLLM quantization config for linear layers
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        self.transformer = ZImageTransformer2DModel(quant_config=quant_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         # Note: Context parallelism is applied centrally in registry.initialize_model()
@@ -561,14 +564,14 @@ class ZImagePipeline(nn.Module):
 
             # Run CFG only if configured AND scale is non-zero
             apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
+            latents_typed = latents.to(self.od_config.dtype)
 
             if apply_cfg:
-                latents_typed = latents.to(self.transformer.dtype)
                 latent_model_input = latents_typed.repeat(2, 1, 1, 1)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                 timestep_model_input = timestep.repeat(2)
             else:
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents_typed
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
 

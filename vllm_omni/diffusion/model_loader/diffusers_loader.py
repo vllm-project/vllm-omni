@@ -13,6 +13,7 @@ from torch import nn
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -21,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_download_from_modelscope,
     safetensors_weights_iterator,
 )
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -207,17 +209,54 @@ class DiffusersPipelineLoader:
             allow_patterns_overrides=None,
         )
 
-    def load_model(self, od_config: OmniDiffusionConfig, load_device: str) -> nn.Module:
+    def load_model(
+        self,
+        od_config: OmniDiffusionConfig,
+        load_device: str,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> nn.Module:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             with target_device:
-                model = initialize_model(od_config)
-
+                if load_format == "default":
+                    model = initialize_model(od_config)
+                elif load_format == "custom_pipeline":
+                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                    model = model_cls(od_config=od_config)
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model)
+
+            # Process weights after loading for quantization (e.g., FP8 online quantization)
+            # This is needed for vLLM's quantization methods that need to transform weights
+            self._process_weights_after_loading(model, target_device)
+
         return model.eval()
+
+    def _process_weights_after_loading(self, model: nn.Module, target_device: torch.device) -> None:
+        """Process weights after loading for quantization methods.
+
+        This handles vLLM's quantization methods that need to process weights
+        after loading (e.g., FP8 online quantization from BF16/FP16 weights).
+        """
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, QuantizeMethodBase):
+                # Move module to target device for processing if needed
+                module_device = next(module.parameters(), None)
+                if module_device is not None:
+                    module_device = module_device.device
+                needs_device_move = module_device != target_device
+
+                if needs_device_move:
+                    module.to(target_device)
+
+                quant_method.process_weights_after_loading(module)
+
+                if needs_device_move:
+                    module.to(module_device)
 
     def load_weights(self, model: nn.Module) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}

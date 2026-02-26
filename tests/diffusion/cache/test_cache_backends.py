@@ -22,6 +22,8 @@ from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestCacheDiTBackend:
     """Test CacheDiTBackend implementation."""

@@ -5,7 +5,7 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import GPUMemoryMonitor
+from tests.utils import GPUMemoryMonitor, hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -45,6 +45,9 @@ def inference(model_name: str, offload: bool = True):
     return peak
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.skipif(current_omni_platform.is_npu() or current_omni_platform.is_rocm(), reason="Hardware not supported")
 @pytest.mark.parametrize("model_name", models)
 def test_cpu_offload_diffusion_model(model_name: str):

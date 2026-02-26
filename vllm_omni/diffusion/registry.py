@@ -85,10 +85,20 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image_3",
+        "pipeline_hunyuan_image_3",
+        "HunyuanImage3Pipeline",
+    ),
     "Flux2KleinPipeline": (
         "flux2_klein",
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
+    ),
+    "NextStep11Pipeline": (
+        "nextstep_1_1",
+        "pipeline_nextstep_1_1",
+        "NextStep11Pipeline",
     ),
     "FluxPipeline": (
         "flux",
@@ -107,6 +117,17 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+_VAE_PATCH_PARALLEL_ALLOWLIST = {
+    # Only enable for models we have validated end-to-end.
+    "ZImagePipeline",
+    "NextStep11Pipeline",
+}
+
+_NO_CACHE_ACCELERATION = {
+    # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
+    "NextStep11Pipeline",
+}
 
 
 def initialize_model(
@@ -132,11 +153,45 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
+
+        vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
+        if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
+            logger.warning(
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is only enabled for %s; ignoring.",
+                vae_pp_size,
+                sorted(_VAE_PATCH_PARALLEL_ALLOWLIST),
+            )
+        if (
+            vae_pp_size > 1
+            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+            and not od_config.vae_use_tiling
+        ):
+            logger.info(
+                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                vae_pp_size,
+            )
+            od_config.vae_use_tiling = True
+
         # Configure VAE memory optimization settings from config
         if hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+
+        if (
+            vae_pp_size > 1
+            and hasattr(model, "vae")
+            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
+            and od_config.vae_use_tiling
+        ):
+            from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_wrap_vae_decode_with_patch_parallelism
+
+            maybe_wrap_vae_decode_with_patch_parallelism(
+                model,
+                vae_patch_parallel_size=vae_pp_size,
+                group_getter=get_dit_group,
+            )
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -232,6 +287,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
 }
 

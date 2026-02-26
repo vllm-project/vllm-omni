@@ -4,27 +4,29 @@ import os
 import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
 
-class GPUARWorker(OmniWorkerMixin, GPUWorker):
+class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU worker for autoregressive omni model stages.
 
     Extends the base GPUWorker to initialize and manage autoregressive
     model runners for text generation stages (e.g., thinker stages).
     """
 
+    @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.

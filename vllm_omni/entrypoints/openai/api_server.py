@@ -31,9 +31,15 @@ from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
-from vllm.entrypoints.openai.api_server import base, load_log_config
 from vllm.entrypoints.openai.api_server import build_app as build_openai_app
 from vllm.entrypoints.openai.api_server import setup_server as setup_openai_server
+
+# vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
+# Keep a fallback for older/newer upstream layouts during rebase windows.
+try:
+    from vllm.entrypoints.serve.instrumentator.basic import base
+except ModuleNotFoundError:
+    from vllm.entrypoints.openai.basic.api_router import base
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -53,7 +59,8 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
-from vllm.entrypoints.openai.translations.serving import (
+from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
+from vllm.entrypoints.openai.speech_to_text.serving import (
     OpenAIServingTranscription,
     OpenAIServingTranslation,
 )
@@ -85,8 +92,13 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageGenerationRequest,
     ImageGenerationResponse,
 )
+from vllm_omni.entrypoints.openai.protocol.videos import (
+    VideoGenerationRequest,
+    VideoGenerationResponse,
+)
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -190,7 +202,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
     # Load logging config for uvicorn if specified
-    log_config = load_log_config(getattr(args, "log_config_file", None))
+    log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
@@ -206,7 +218,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         if not supported_tasks:
             supported_tasks = ("generate",)
 
-        app = build_openai_app(args)
+        # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
+        app = build_openai_app(args, supported_tasks)
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
@@ -404,6 +417,13 @@ async def omni_init_app_state(
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+        )
+
+        diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+        state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
+            diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
         )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
@@ -684,8 +704,18 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
+    state.openai_serving_video = OmniOpenAIServingVideo(
+        engine_client,
+        model_name=served_model_names[0] if served_model_names else None,
+        stage_configs=state.stage_configs,
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+
+
+def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
+    return request.app.state.openai_serving_video
 
 
 def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
@@ -968,7 +998,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", random.randint(0, 2**32 - 1) if request.seed is None else request.seed)
+        _update_if_not_none(
+            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
+        )
+        _update_if_not_none(gen_params, "generator_device", request.generator_device)
 
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
@@ -1045,6 +1078,7 @@ async def edit_images(
     guidance_scale: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
+    generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
 ) -> ImageGenerationResponse:
@@ -1126,7 +1160,8 @@ async def edit_images(
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", seed or random.randint(0, 2**32 - 1))
+        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
+        _update_if_not_none(gen_params, "generator_device", generator_device)
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit_{int(time.time())}"
@@ -1451,3 +1486,104 @@ def apply_stage_default_sampling_params(
             for param_name, param_value in stage_defaults.items():
                 if hasattr(sampling_params, param_name):
                     setattr(sampling_params, param_name, param_value)
+
+
+async def _run_video_generation(
+    request: VideoGenerationRequest,
+    raw_request: Request,
+    *,
+    input_reference_bytes: bytes | None = None,
+) -> VideoGenerationResponse:
+    handler = Omnivideo(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="Video generation handler not initialized.",
+        )
+    logger.info("Video generation handler: %s", type(handler).__name__)
+    try:
+        return await handler.generate_videos(request, raw_request, input_reference_bytes=input_reference_bytes)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Video generation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=f"Video generation failed: {str(e)}",
+        )
+
+
+def _parse_form_json(value: str | None) -> Any:
+    if value is None or value == "":
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Invalid JSON in form field.",
+        ) from exc
+
+
+@router.post(
+    "/v1/videos",
+    responses={
+        HTTPStatus.OK.value: {"model": VideoGenerationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def create_video(
+    raw_request: Request,
+    prompt: str = Form(...),
+    input_reference: UploadFile | None = File(default=None),
+    model: str | None = Form(default=None),
+    n: int | None = Form(default=None),
+    seconds: int | None = Form(default=None),
+    size: str | None = Form(default=None),
+    response_format: str | None = Form(default=None),
+    user: str | None = Form(default=None),
+    width: int | None = Form(default=None),
+    height: int | None = Form(default=None),
+    num_frames: int | None = Form(default=None),
+    fps: int | None = Form(default=None),
+    num_inference_steps: int | None = Form(default=None),
+    guidance_scale: float | None = Form(default=None),
+    guidance_scale_2: float | None = Form(default=None),
+    boundary_ratio: float | None = Form(default=None),
+    flow_shift: float | None = Form(default=None),
+    true_cfg_scale: float | None = Form(default=None),
+    seed: int | None = Form(default=None),
+    negative_prompt: str | None = Form(default=None),
+    lora: str | None = Form(default=None),
+) -> VideoGenerationResponse:
+    """OpenAI-style video create endpoint (multipart form-data)."""
+    input_reference_bytes = await input_reference.read() if input_reference is not None else None
+
+    request_data: dict[str, Any] = {
+        "prompt": prompt,
+        "model": model,
+        "seconds": seconds,
+        "size": size,
+        "user": user,
+        "response_format": response_format,
+        "input_reference": None,
+        "n": n,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "fps": fps,
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": guidance_scale,
+        "guidance_scale_2": guidance_scale_2,
+        "boundary_ratio": boundary_ratio,
+        "flow_shift": flow_shift,
+        "true_cfg_scale": true_cfg_scale,
+        "seed": seed,
+        "negative_prompt": negative_prompt,
+        "lora": _parse_form_json(lora),
+    }
+    request_data = {k: v for k, v in request_data.items() if v is not None}
+    request = VideoGenerationRequest(**request_data)
+    return await _run_video_generation(request, raw_request, input_reference_bytes=input_reference_bytes)

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm_omni.entrypoints.omni_stage import _build_od_config
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_build_od_config_includes_diffusion_fields():

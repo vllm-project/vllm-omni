@@ -108,7 +108,7 @@ runtime:
   connectors:
     # Mooncake connector for cross-node/intra-node communication
     mooncake_connector:
-      name: MooncakeConnector
+      name: MooncakeStoreConnector
       extra:
         host: "127.0.0.1"
         metadata_server: "http://10.90.67.86:8080/metadata"

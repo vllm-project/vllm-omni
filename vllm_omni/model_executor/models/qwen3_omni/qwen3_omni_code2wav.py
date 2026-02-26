@@ -162,7 +162,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         codes: torch.Tensor,
         chunk_size: int = 300,
         left_context_size: int = 25,
-    ) -> torch.Tensor:
+        seq_token_counts: list[int] | None = None,
+    ) -> list[torch.Tensor]:
         """
         Decode long sequences in chunks to avoid OOM.
 
@@ -172,9 +173,12 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             codes: [batch, num_quantizers, seq_len] - num_quantizers-layer RVQ codes
             chunk_size: Number of codec frames per chunk
             left_context_size: Number of overlapping frames for context
+            seq_token_counts: Token count for each request in batch
 
         Returns:
-            waveform: [batch, 1, waveform_len] - Complete waveform
+            list[torch.Tensor]: Complete waveform decoded from the input
+                codes. For ``batch_size == 1``, this is a list containing a
+                single tensor with shape ``[1, waveform_len]``.
         """
         wavs = []
         start_index = 0
@@ -194,14 +198,25 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
 
             start_index = end_index
 
-        return torch.cat(wavs, dim=-1)
+        if seq_token_counts is not None:
+            code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in seq_token_counts]
+        else:
+            # Fallback: assume all batch elements share the same sequence length.
+            code_seq_lens = [codes.shape[-1]] * codes.shape[0]
+        batch_wav = torch.cat(wavs, dim=-1)
+        wavs = []
+        for idx, code_seq_len in enumerate(code_seq_lens):
+            wav_chunk = batch_wav[idx, :, : code_seq_len * self.total_upsample]
+            wavs.append(wav_chunk)
+        return wavs
 
     def chunked_decode_streaming(
         self,
         codes: torch.Tensor,
         chunk_size: int = 25,
         left_context_size: int = 25,
-    ) -> torch.Tensor:
+        seq_token_counts: list[int] | None = None,
+    ) -> list[torch.Tensor]:
         """
         Decode long sequences in chunks to avoid OOM.
 
@@ -211,23 +226,31 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             codes: [batch, num_quantizers, seq_len] - num_quantizers-layer RVQ codes
             chunk_size: Number of codec frames per chunk
             left_context_size: Number of overlapping frames for context
+            seq_token_counts: Token count for each request in batch
 
         Returns:
-            waveform: [batch, 1, waveform_len] - Complete waveform
+            list[torch.Tensor]: Complete waveform decoded from the input
+                codes. For ``batch_size == 1``, this is a list containing a
+                single tensor with shape ``[1, waveform_len]``.
         """
         wavs = []
-        end_index = codes.shape[-1]
-        # TODO: need to optimize algorithms, current only support
-        # chunk_size = left_context_size = 25
-        if end_index <= chunk_size:
-            context_size = 0
+        batch_wav = self(codes)
+        if seq_token_counts is not None:
+            code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
         else:
-            context_size = left_context_size
-        # Decode chunk
-        wav_chunk = self(codes)
-        # Remove context from output (context_size * total_upsample samples)
-        wavs.append(wav_chunk[..., context_size * self.total_upsample :])
-        return torch.cat(wavs, dim=-1)
+            # Fallback: assume all batch elements share the same sequence length.
+            code_seq_lens = [codes.shape[-1]] * codes.shape[0]
+        for idx, code_seq_len in enumerate(code_seq_lens):
+            # TODO: need to optimize algorithms, current only support
+            # chunk_size = left_context_size = 25
+            if code_seq_len <= chunk_size:
+                context_size = 0
+            else:
+                context_size = left_context_size
+            # Remove context from output (context_size * total_upsample samples)
+            wav_chunk = batch_wav[idx, :, context_size * self.total_upsample : code_seq_len * self.total_upsample]
+            wavs.append(wav_chunk)
+        return wavs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from HuggingFace checkpoint."""
