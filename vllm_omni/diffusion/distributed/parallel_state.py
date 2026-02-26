@@ -56,6 +56,7 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
 
 
@@ -175,7 +176,8 @@ class RankGenerator:
         pp: int,
         cfg: int,
         dp: int,
-        order: str,
+        fs: int = 1,
+        order: str = "tp-sp-pp-cfg-dp",
         rank_offset: int = 0,
     ) -> None:
         self.tp = tp
@@ -183,6 +185,7 @@ class RankGenerator:
         self.pp = pp
         self.cfg = cfg
         self.dp = dp
+        self.fs = fs
         self.rank_offset = rank_offset
         self.world_size = tp * sp * pp * cfg * dp
 
@@ -192,14 +195,19 @@ class RankGenerator:
             "pp": self.pp,
             "cfg": self.cfg,
             "dp": self.dp,
+            "fs": self.fs,
         }
         order = order.lower()
 
         for name in self.name_to_size.keys():
+            # Skip 'fs' validation - it's handled separately with independent_ranks=True
+            # and doesn't participate in the main orthogonal rank generation
+            if name == "fs":
+                continue
             if name not in order and self.name_to_size[name] != 1:
                 raise RuntimeError(
                     f"The size of ({name}) is ({self.name_to_size[name]}), "
-                    f"but you haven't specified the order ({self.order})."
+                    f"but you haven't specified the order ({order})."
                 )
             elif name not in order:
                 order = order + "-" + name
@@ -218,7 +226,7 @@ class RankGenerator:
             mask[ordered_token.index(t)] = True
         return mask
 
-    def get_ranks(self, token):
+    def get_ranks(self, token, independent_ranks: bool = False):
         """Get rank group by input token.
 
         Arguments:
@@ -227,7 +235,21 @@ class RankGenerator:
                 to obtain multiple parallel types, we can use a hyphen
                 '-' to separate them. For example, if we want to obtain
                 the TP_DP group, the token should be 'tp-dp'.
+            independent_ranks (bool):
+                If True, generate independent rank groups that divide the world
+                into groups of the specified size. Used for FS (fully shard) groups
+                which operate independently from the main parallelism hierarchy.
         """
+        if independent_ranks and token == "fs":
+            # FS groups divide world into groups of size fs
+            # e.g., world_size=8, fs=4 -> [[0,1,2,3], [4,5,6,7]]
+            ranks = []
+            num_groups = self.world_size // self.fs
+            for i in range(num_groups):
+                group = list(range(i * self.fs + self.rank_offset, (i + 1) * self.fs + self.rank_offset))
+                ranks.append(group)
+            return ranks
+
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
         if self.rank_offset > 0:
@@ -331,6 +353,22 @@ def get_data_parallel_world_size():
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
     return get_dp_group().rank_in_group
+
+
+# FS (Fully Shard / HSDP shard dimension)
+def get_fs_group() -> GroupCoordinator:
+    assert _FS is not None, "fully shard group is not initialized"
+    return _FS
+
+
+def get_fully_shard_world_size():
+    """Return world size for the fully shard group."""
+    return get_fs_group().world_size
+
+
+def get_fully_shard_rank():
+    """Return my rank for the fully shard group."""
+    return get_fs_group().rank_in_group
 
 
 def is_dp_last_group():
@@ -438,6 +476,7 @@ def init_model_parallel_group(
         "tensor",
         "sequence",
         "classifier_free_guidance",
+        "fully_shard",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -629,6 +668,7 @@ def initialize_model_parallel(
     ring_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
+    fully_shard_degree: int = 1,
     backend: str | None = None,
 ) -> None:
     if backend is None:
@@ -645,6 +685,7 @@ def initialize_model_parallel(
         ring_degree: number of GPUs used for ring sequence parallelism.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
+        fully_shard_degree: number of GPUs used for fully sharded data parallelism (HSDP shard dimension).
         backend: distributed backend of pytorch collective comm.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
@@ -716,7 +757,8 @@ def initialize_model_parallel(
         pipeline_parallel_size,
         cfg_parallel_size,
         data_parallel_size,
-        "tp-sp-pp-cfg-dp",
+        fs=fully_shard_degree,
+        order="tp-sp-pp-cfg-dp",
     )
     sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
@@ -772,6 +814,16 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+
+    global _FS
+    assert _FS is None, "fully shard group is already initialized"
+    _FS = init_model_parallel_group(
+        group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="fully_shard",
+    )
+
     init_dit_group(dit_parallel_size, backend)
 
 
@@ -800,6 +852,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _FS
+    if _FS:
+        _FS.destroy()
+    _FS = None
 
 
 def destroy_distributed_environment():

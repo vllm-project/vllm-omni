@@ -1,0 +1,552 @@
+{
+    "id": "6643e5fd-fa2a-4f25-935a-483173a8097c",
+    "revision": 0,
+    "last_node_id": 8,
+    "last_link_id": 6,
+    "nodes": [
+        {
+            "id": 1,
+            "type": "PreviewImage",
+            "pos": [
+                1446.2005205859512,
+                -316.7359686049902
+            ],
+            "size": [
+                305.6628685610174,
+                307.0336884172169
+            ],
+            "flags": {},
+            "order": 5,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "images",
+                    "name": "images",
+                    "type": "IMAGE",
+                    "link": 1
+                }
+            ],
+            "outputs": [],
+            "properties": {
+                "Node name for S&R": "PreviewImage"
+            },
+            "widgets_values": []
+        },
+        {
+            "id": 8,
+            "type": "PreviewImage",
+            "pos": [
+                1010.1848219273943,
+                -311.54216706114363
+            ],
+            "size": [
+                305.6628685610174,
+                307.0336884172169
+            ],
+            "flags": {},
+            "order": 4,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "images",
+                    "name": "images",
+                    "type": "IMAGE",
+                    "link": 6
+                }
+            ],
+            "outputs": [],
+            "properties": {
+                "Node name for S&R": "PreviewImage"
+            },
+            "widgets_values": []
+        },
+        {
+            "id": 7,
+            "type": "VLLMOmniDiffusionSampling",
+            "pos": [
+                234.61958293819296,
+                9.405681270043619
+            ],
+            "size": [
+                284.205078125,
+                226
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "n",
+                    "name": "n",
+                    "type": "INT",
+                    "widget": {
+                        "name": "n"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "num_inference_steps",
+                    "name": "num_inference_steps",
+                    "type": "INT",
+                    "widget": {
+                        "name": "num_inference_steps"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "guidance_scale",
+                    "name": "guidance_scale",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "guidance_scale"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "true_cfg_scale",
+                    "name": "true_cfg_scale",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "true_cfg_scale"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "vae_use_slicing",
+                    "name": "vae_use_slicing",
+                    "type": "BOOLEAN",
+                    "widget": {
+                        "name": "vae_use_slicing"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "vae_use_tiling",
+                    "name": "vae_use_tiling",
+                    "type": "BOOLEAN",
+                    "widget": {
+                        "name": "vae_use_tiling"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "seed",
+                    "name": "seed",
+                    "type": "INT",
+                    "widget": {
+                        "name": "seed"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "diffusion sampling params",
+                    "name": "diffusion sampling params",
+                    "type": "SAMPLING_PARAMS",
+                    "links": [
+                        5
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniDiffusionSampling"
+            },
+            "widgets_values": [
+                1,
+                50,
+                1,
+                1,
+                false,
+                false,
+                1525,
+                "randomize"
+            ]
+        },
+        {
+            "id": 4,
+            "type": "VLLMOmniDiffusionSampling",
+            "pos": [
+                666.8380026154548,
+                268.86271068330126
+            ],
+            "size": [
+                284.205078125,
+                226
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "n",
+                    "name": "n",
+                    "type": "INT",
+                    "widget": {
+                        "name": "n"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "num_inference_steps",
+                    "name": "num_inference_steps",
+                    "type": "INT",
+                    "widget": {
+                        "name": "num_inference_steps"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "guidance_scale",
+                    "name": "guidance_scale",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "guidance_scale"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "true_cfg_scale",
+                    "name": "true_cfg_scale",
+                    "type": "FLOAT",
+                    "widget": {
+                        "name": "true_cfg_scale"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "vae_use_slicing",
+                    "name": "vae_use_slicing",
+                    "type": "BOOLEAN",
+                    "widget": {
+                        "name": "vae_use_slicing"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "vae_use_tiling",
+                    "name": "vae_use_tiling",
+                    "type": "BOOLEAN",
+                    "widget": {
+                        "name": "vae_use_tiling"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "seed",
+                    "name": "seed",
+                    "type": "INT",
+                    "widget": {
+                        "name": "seed"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "diffusion sampling params",
+                    "name": "diffusion sampling params",
+                    "type": "SAMPLING_PARAMS",
+                    "links": [
+                        2
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniDiffusionSampling"
+            },
+            "widgets_values": [
+                4,
+                50,
+                7,
+                1,
+                false,
+                false,
+                42,
+                "fixed"
+            ]
+        },
+        {
+            "id": 5,
+            "type": "VLLMOmniGenerateImage",
+            "pos": [
+                984.723613585788,
+                63.376900027553276
+            ],
+            "size": [
+                416.56628685610167,
+                372.1662621294205
+            ],
+            "flags": {},
+            "order": 3,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "image",
+                    "name": "image",
+                    "shape": 7,
+                    "type": "IMAGE",
+                    "link": 4
+                },
+                {
+                    "localized_name": "mask",
+                    "name": "mask",
+                    "shape": 7,
+                    "type": "MASK",
+                    "link": null
+                },
+                {
+                    "localized_name": "sampling_params",
+                    "name": "sampling_params",
+                    "shape": 7,
+                    "type": "SAMPLING_PARAMS",
+                    "link": 2
+                },
+                {
+                    "localized_name": "url",
+                    "name": "url",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "url"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "model",
+                    "name": "model",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "model"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "prompt",
+                    "name": "prompt",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "prompt"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "negative_prompt",
+                    "name": "negative_prompt",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "negative_prompt"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "width",
+                    "name": "width",
+                    "type": "INT",
+                    "widget": {
+                        "name": "width"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "height",
+                    "name": "height",
+                    "type": "INT",
+                    "widget": {
+                        "name": "height"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "image",
+                    "name": "image",
+                    "type": "IMAGE",
+                    "links": [
+                        1
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniGenerateImage"
+            },
+            "widgets_values": [
+                "http://localhost:8001/v1",
+                "/home/models/Qwen/Qwen-Image-Edit",
+                "A high-quality, high contrast, stylized portrait of the object in the uploaded reference image. Pop art and doodle style, with abundant scribbling patterns, such as a teal crown, orange lightning bolts, colorful handwritten scripts.",
+                "Realistic",
+                800,
+                800
+            ]
+        },
+        {
+            "id": 6,
+            "type": "VLLMOmniGenerateImage",
+            "pos": [
+                541.2702717429818,
+                -160.70392744708548
+            ],
+            "size": [
+                416.56628685610167,
+                372.1662621294205
+            ],
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+                {
+                    "localized_name": "image",
+                    "name": "image",
+                    "shape": 7,
+                    "type": "IMAGE",
+                    "link": null
+                },
+                {
+                    "localized_name": "mask",
+                    "name": "mask",
+                    "shape": 7,
+                    "type": "MASK",
+                    "link": null
+                },
+                {
+                    "localized_name": "sampling_params",
+                    "name": "sampling_params",
+                    "shape": 7,
+                    "type": "SAMPLING_PARAMS",
+                    "link": 5
+                },
+                {
+                    "localized_name": "url",
+                    "name": "url",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "url"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "model",
+                    "name": "model",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "model"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "prompt",
+                    "name": "prompt",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "prompt"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "negative_prompt",
+                    "name": "negative_prompt",
+                    "type": "STRING",
+                    "widget": {
+                        "name": "negative_prompt"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "width",
+                    "name": "width",
+                    "type": "INT",
+                    "widget": {
+                        "name": "width"
+                    },
+                    "link": null
+                },
+                {
+                    "localized_name": "height",
+                    "name": "height",
+                    "type": "INT",
+                    "widget": {
+                        "name": "height"
+                    },
+                    "link": null
+                }
+            ],
+            "outputs": [
+                {
+                    "localized_name": "image",
+                    "name": "image",
+                    "type": "IMAGE",
+                    "links": [
+                        4,
+                        6
+                    ]
+                }
+            ],
+            "properties": {
+                "Node name for S&R": "VLLMOmniGenerateImage"
+            },
+            "widgets_values": [
+                "http://localhost:8000/v1",
+                "/home/models/Tongyi-MAI/Z-Image-Turbo",
+                "A headshot of a cute Siamese kitty. Blurred background due to wide aperture. Close-up look. Realistic.",
+                "Cartoonish.",
+                800,
+                800
+            ]
+        }
+    ],
+    "links": [
+        [
+            1,
+            5,
+            0,
+            1,
+            0,
+            "IMAGE"
+        ],
+        [
+            2,
+            4,
+            0,
+            5,
+            2,
+            "SAMPLING_PARAMS"
+        ],
+        [
+            4,
+            6,
+            0,
+            5,
+            0,
+            "IMAGE"
+        ],
+        [
+            5,
+            7,
+            0,
+            6,
+            2,
+            "SAMPLING_PARAMS"
+        ],
+        [
+            6,
+            6,
+            0,
+            8,
+            0,
+            "IMAGE"
+        ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+        "workflowRendererVersion": "LG",
+        "ds": {
+            "scale": 1.0426432563169903,
+            "offset": [
+                -90.4071374799346,
+                575.2948920069742
+            ]
+        }
+    },
+    "version": 0.4
+}

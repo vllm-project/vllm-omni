@@ -81,6 +81,24 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
         "--cfg-parallel-size",
         type=int,
         default=1,
@@ -91,6 +109,29 @@ def parse_args() -> argparse.Namespace:
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help=("Enable Hybrid Sharded Data Parallel to shard model weights across GPUs. "),
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=-1,
+        help=(
+            "Number of GPUs to shard model weights across within each replica group. "
+            "-1 (default) auto-calculates as world_size / replicate_size. "
+        ),
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of replica groups for HSDP. Each replica holds a full sharded copy. "
+            "Default 1 means pure sharding (no replication). "
+        ),
     )
     return parser.parse_args()
 
@@ -128,7 +169,13 @@ def main():
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
     parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
     )
     omni = Omni(
         model=args.model,

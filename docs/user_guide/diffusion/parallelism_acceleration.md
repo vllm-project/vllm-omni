@@ -16,6 +16,8 @@ The following parallelism methods are currently supported in vLLM-Omni:
 
 5. [VAE Patch Parallelism](#vae-patch-parallelism): VAE patch parallelism shards VAE decode spatially across ranks. This can reduce the peak memory of VAE decode and (depending on resolution and communication overhead) speed up VAE decode.
 
+6. [HSDP](#hsdp): Hybrid Sharded Data Parallel shards model weights across GPUs using PyTorch FSDP2. This reduces per-GPU memory usage, enabling inference of large models on GPUs with limited memory.
+
 The following table shows which models are currently supported by parallelism method:
 
 ### ImageGen
@@ -49,9 +51,9 @@ The following table shows which models are currently supported by parallelism me
 
 ### VideoGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel |
-|-------|------------------|------------|---------|--------------------------|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ |
+| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP |
+|-------|------------------|:----------:|:--------------:|:---------------:|:----:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ |
 
 ### Tensor Parallelism
 
@@ -330,3 +332,84 @@ You can enable CFG-Parallel in online serving for diffusion models via `--cfg-pa
 ```bash
 vllm serve Qwen/Qwen-Image-Edit --omni --port 8091 --cfg-parallel-size 2
 ```
+
+### HSDP
+
+HSDP (Hybrid Sharded Data Parallel) shards model weights across GPUs to reduce per-GPU memory usage. This enables inference of large models (e.g., Wan2.2 14B) on GPUs with limited memory.
+
+Unlike Tensor Parallelism which splits computation, HSDP uses PyTorch's FSDP2 to shard and redistribute weights at runtime. Each GPU only holds a fraction of the model weights, and weights are gathered on-demand during forward passes.
+
+#### Configuration
+
+HSDP is configured via `DiffusionParallelConfig`:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_hsdp` | bool | False | Enable HSDP |
+| `hsdp_shard_size` | int | -1 | Number of GPUs to shard weights across. -1 = auto (requires other parallelism > 1) |
+| `hsdp_replicate_size` | int | 1 | Number of replica groups. Each group holds a full sharded copy |
+
+**Constraints:**
+
+- `hsdp_replicate_size × hsdp_shard_size == world_size`
+- HSDP cannot be used with Tensor Parallelism (`tensor_parallel_size` must be 1)
+
+#### Operating Modes
+
+HSDP can work in two modes:
+
+- **Standalone Mode**: HSDP alone without other parallelism. Must specify `hsdp_shard_size` explicitly.
+- **Combined Mode**: HSDP overlays on top of other parallelism (Ulysses Sequence Parallel, CFG Parallel). HSDP dimensions must match world_size.
+
+#### Offline Inference
+
+**Standalone HSDP** (shard across 4 GPUs, no other parallelism):
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    parallel_config=DiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_shard_size=4,  # Shard across 4 GPUs
+    ),
+)
+
+outputs = omni.generate(
+    "A cat playing piano",
+    OmniDiffusionSamplingParams(num_inference_steps=50),
+)
+```
+
+**Combined HSDP + Sequence Parallel**:
+
+```python
+omni = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    parallel_config=DiffusionParallelConfig(
+        ulysses_degree=4,  # Sequence parallel
+        use_hsdp=True,     # HSDP overlays on SP
+    ),
+)
+```
+
+#### Online Serving
+
+**Standalone HSDP** (shard model across 4 GPUs):
+
+```bash
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 --use-hsdp --hsdp-shard-size 4
+```
+
+**Combined with Sequence Parallel**:
+
+```bash
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 --use-hsdp --usp 4
+```
+
+#### Adding HSDP Support to New Models
+
+For detailed instructions on adding HSDP support to new models, see the [HSDP Contributing Guide](../../design/feature/hsdp.md).

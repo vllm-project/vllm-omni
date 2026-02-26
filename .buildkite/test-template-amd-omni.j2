@@ -14,7 +14,7 @@
         soft_fail: false
         commands:
           - "source .buildkite/scripts/docker_login_ecr_public.sh && safe_docker_login_ecr_public"
-          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target final --progress plain ."
+          - "docker build -f docker/Dockerfile.rocm -t {{ docker_image_amd }} --target test --build-arg ARG_PYTORCH_ROCM_ARCH=gfx942 --progress plain ."
           - "docker push {{ docker_image_amd }}"
         key: "amd-build"
         env:

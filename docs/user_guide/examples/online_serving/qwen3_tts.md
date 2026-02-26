@@ -264,9 +264,30 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `ref_text` | string | No | Transcript of reference audio (for ICL mode) |
 | `x_vector_only_mode` | bool | No | Use speaker embedding only (no ICL) |
 
+## Streaming
+
+Set `stream=true` with `response_format="pcm"` to receive raw PCM audio chunks as they are decoded
+(one chunk per 25-frame Code2Wav window):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, how are you?",
+        "voice": "vivian",
+        "language": "English",
+        "stream": true,
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
+```
+
+**Constraints:**
+- `stream=true` requires `response_format="pcm"` (raw 16-bit signed PCM, 24 kHz mono).
+- `speed` adjustment is not supported when streaming.
+- Requires the server stage config to have `async_chunk: true` (default in `qwen3_tts.yaml`).
+
 ## Limitations
 
-- **No streaming**: Audio is generated completely before being returned. Streaming will be supported after the pipeline is disaggregated (see RFC #938).
 - **Single request**: Batch processing is not yet optimized for online serving.
 
 ## Troubleshooting

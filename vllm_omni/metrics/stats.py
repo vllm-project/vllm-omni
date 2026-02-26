@@ -226,8 +226,10 @@ class OrchestratorAggregator:
                 and (multimodal_output := output_to_yield.multimodal_output.get("audio")) is not None
                 and len(multimodal_output) > 0
             ):
-                last = multimodal_output[-1]
-                nframes = int(last.shape[0]) if last.ndim > 0 else 1
+                nframes = sum(
+                    int(t.shape[0]) if t.ndim > 0 else 1
+                    for t in (multimodal_output if isinstance(multimodal_output, list) else [multimodal_output])
+                )
                 stage_events_for_req = self.stage_events.get(request_id, [])
                 if stage_events_for_req:
                     for stage_event in stage_events_for_req:

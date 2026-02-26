@@ -38,7 +38,7 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handler):
+def _weak_close_cleanup_async(stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None):
     """Weak reference cleanup function for AsyncOmni instances."""
     if stage_list:
         for q in stage_in_queues:
@@ -46,6 +46,13 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handle
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+        for q in stage_out_queues:
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
         for stage in stage_list:
             try:
                 stage.stop_stage_worker()
@@ -55,6 +62,8 @@ def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handle
     # Cancel output handler
     if output_handler is not None:
         output_handler.cancel()
+    if zmq_ctx is not None:
+        zmq_ctx.term()
 
 
 class AsyncOmni(OmniBase):
@@ -108,8 +117,10 @@ class AsyncOmni(OmniBase):
             _weak_close_cleanup_async,
             self.stage_list,
             self._stage_in_queues,
+            self._stage_out_queues,
             self._ray_pg,
             self.output_handler,
+            self._zmq_ctx,
         )
 
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -130,9 +141,20 @@ class AsyncOmni(OmniBase):
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
             tensor_parallel_size = kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = kwargs.get("cfg_parallel_size") or 1
+            use_hsdp = kwargs.get("use_hsdp", False)
+            hsdp_shard_size = kwargs.get("hsdp_shard_size", -1)
+            hsdp_replicate_size = kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
-            num_devices = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
+
+            # Calculate num_devices: consider standalone HSDP
+            other_parallel_size = sequence_parallel_size * tensor_parallel_size * cfg_parallel_size
+            if use_hsdp and other_parallel_size == 1 and hsdp_shard_size > 0:
+                # Standalone HSDP: num_devices is determined by HSDP dimensions
+                num_devices = hsdp_shard_size * hsdp_replicate_size
+            else:
+                num_devices = other_parallel_size
+
             for i in range(1, num_devices):
                 devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
@@ -143,6 +165,9 @@ class AsyncOmni(OmniBase):
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
                 cfg_parallel_size=cfg_parallel_size,
+                use_hsdp=use_hsdp,
+                hsdp_shard_size=hsdp_shard_size,
+                hsdp_replicate_size=hsdp_replicate_size,
             )
         default_stage_cfg = [
             {
@@ -390,7 +415,8 @@ class AsyncOmni(OmniBase):
                     submit_flag = False
                     prompt_token_ids = engine_outputs.prompt_token_ids
                     engine_input = copy.deepcopy(prompt)
-                    engine_input["prompt_token_ids"] = [0] * compute_talker_prompt_ids_length(prompt_token_ids)
+                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
                     for i in range(1, len(self.stage_list)):
                         task = {
@@ -516,12 +542,14 @@ class AsyncOmni(OmniBase):
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
                     images=images,
+                    finished=finished,
                 )
             else:
                 output_to_yield = OmniRequestOutput(
                     stage_id=stage_id,
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
+                    finished=finished,
                 )
         # Mark last output time
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())

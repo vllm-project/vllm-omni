@@ -196,8 +196,6 @@ class WhisperEncoderVQ(WhisperEncoder):
         n_layer: int,
         n_window: int = 1500,
         output_dim: int = 512,
-        grad_checkpointing: bool = False,
-        enable_mp: bool = False,
         audio_sequence_parallel: bool = False,
         audio_vq_layers: int = -1,
         audio_vq_type: str = "NULL",
@@ -219,8 +217,6 @@ class WhisperEncoderVQ(WhisperEncoder):
             n_layer,
             n_window,
             output_dim,
-            grad_checkpointing,
-            enable_mp,
             audio_sequence_parallel,
         )
 
