@@ -4,10 +4,10 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -39,9 +39,9 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 
 @pytest.fixture
-def build_adapter(monkeypatch):
+def build_adapter(monkeypatch, mocker: MockerFixture):
     def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
-        connector = MagicMock()
+        connector = mocker.MagicMock()
         connector.stage_id = stage_id
         connector.get.return_value = None
         connector.put.return_value = (True, 1, {})
