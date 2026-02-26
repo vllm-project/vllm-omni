@@ -99,7 +99,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
-        # rope_scaling already contains rope_theta, just assign it to rope_parameters
         talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
         talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
         self.quant_config = vllm_config.quant_config
