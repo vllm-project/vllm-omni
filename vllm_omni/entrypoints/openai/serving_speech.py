@@ -61,10 +61,47 @@ _TTS_MAX_NEW_TOKENS_MAX = 4096
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Find and cache the TTS stage (if any) during initialization
+        self._tts_stage = self._find_tts_stage()
+        self._is_tts = self._tts_stage is not None
+
+        # Cache TTS configuration values (computed once, reused per request)
+        self._max_instructions_length = self._compute_max_instructions_length()
+
         # Load supported speakers
         self.supported_speakers = self._load_supported_speakers()
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         self._tts_tokenizer = None
+
+    def _find_tts_stage(self):
+        """Find and return the TTS stage from the stage list, or None if not found."""
+        stage_list = getattr(self.engine_client, "stage_list", None)
+        if stage_list is None:
+            return None
+        for stage in stage_list:
+            if getattr(stage, "model_stage", None) in _TTS_MODEL_STAGES:
+                return stage
+        return None
+
+    def _compute_max_instructions_length(self) -> int:
+        """Compute max instructions length with precedence: CLI > stage config > default.
+
+        Called once during initialization; result is cached in self._max_instructions_length.
+        """
+        # 1. CLI override takes highest priority (stored in engine_client)
+        cli_override = getattr(self.engine_client, "tts_max_instructions_length", None)
+        if cli_override is not None:
+            return cli_override
+
+        # 2. Try to get from TTS stage config
+        if self._tts_stage is not None:
+            tts_args = getattr(self._tts_stage, "tts_args", {})
+            if "max_instructions_length" in tts_args:
+                return tts_args["max_instructions_length"]
+
+        # 3. Default fallback
+        return _TTS_MAX_INSTRUCTIONS_LENGTH
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -164,9 +201,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if task_type == "VoiceDesign" and not request.instructions:
             return "VoiceDesign task requires 'instructions' to describe the voice"
 
-        # Validate instructions length
-        if request.instructions and len(request.instructions) > _TTS_MAX_INSTRUCTIONS_LENGTH:
-            return f"Instructions too long (max {_TTS_MAX_INSTRUCTIONS_LENGTH} characters)"
+        # Validate instructions length (using cached value from initialization)
+        if request.instructions and len(request.instructions) > self._max_instructions_length:
+            return f"Instructions too long (max {self._max_instructions_length} characters)"
 
         # Validate max_new_tokens range
         if request.max_new_tokens is not None:
@@ -300,7 +337,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = f"speech-{random_uuid()}"
 
         try:
-            if self._is_tts_model():
+            if self._is_tts:
                 # Validate TTS parameters
                 validation_error = self._validate_tts_request(request)
                 if validation_error:

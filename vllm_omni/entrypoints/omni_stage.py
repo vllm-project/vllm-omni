@@ -285,6 +285,7 @@ class OmniStage:
 
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
+        self.tts_args = _to_dict(getattr(stage_config, "tts_args", {}))
         default_sampling_params = getattr(stage_config, "default_sampling_params", {})
         # For LLM stage, this can directly be a SamplingParams-compatible dict;
         # For diffusion stage, this only serves as default values for diffusion kwargs.
