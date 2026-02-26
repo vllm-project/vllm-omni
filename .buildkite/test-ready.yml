@@ -18,40 +18,26 @@ steps:
   - label: "Diffusion Model Test"
     depends_on: upload-ready-pipeline
     commands:
-      - echo "--- Pulling Docker image"
-      - docker pull public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-
-      - echo "--- Preparing environment file"
-
-      - echo "--- Running tests"
       - |
-        set -x
-        TEST_START=$(/bin/date +%s)
-        timeout 20m docker run --rm \
-          --gpus all \
-          -v "$(pwd):$(pwd)" \
-          -w "$(pwd)" \
-          -e HF_HOME=/fsx/hf_cache \
-          -v /fsx/hf_cache:/fsx/hf_cache \
-          public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT \
-          pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
-        TEST_END=$(/bin/date +%s)
-        TEST_DURATION=$((TEST_END - TEST_START))
-        set +x
-
-        echo "TEST_START=$TEST_START"
-        echo "TEST_END=$TEST_END"
-        echo "TEST_DURATION=$TEST_DURATION"
-
-        if [ -n "$TEST_DURATION" ] && [ "$TEST_DURATION" -gt 0 ]; then
-          buildkite-agent annotate --style "success" --context "test-time-${BUILDKITE_JOB_ID}" \
-            "<h3>✅ Diffusion Model Test : ${TEST_DURATION} seconds</h3>"
-          buildkite-agent meta-data set "test-duration-${BUILDKITE_JOB_ID}" "${TEST_DURATION}"
-        else
-          echo "⚠️ TEST_DURATION invalid ($TEST_DURATION), skipping annotation."
-        fi
+        START_TIME=$(date +%s)
+        timeout 20m pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
+        EXIT_CODE=$?
+        END_TIME=$(date +%s)
+        DURATION=$((END_TIME - START_TIME))
+        echo "Pytest duration: ${DURATION} seconds"
+        buildkite-agent annotate --style "info" --context "test-duration" "⏱️ Diffusion test took ${DURATION} seconds"
+        exit $EXIT_CODE
     agents:
       queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
 
   # - label: "Diffusion Model CPU offloading Test"
   #   timeout_in_minutes: 20
