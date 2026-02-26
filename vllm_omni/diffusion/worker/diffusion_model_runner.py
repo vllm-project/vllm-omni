@@ -27,6 +27,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -148,7 +149,16 @@ class DiffusionModelRunner:
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
         if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
+                logger.warning(
+                    "Cache backend '%s' is not supported for %s; disabling cache acceleration.",
+                    self.od_config.cache_backend,
+                    self.od_config.model_class_name,
+                )
+                self.cache_backend = None
+                self.od_config.cache_backend = None
+            else:
+                self.cache_backend.enable(self.pipeline)
 
         logger.info("Model runner: Initialization complete.")
 
@@ -196,7 +206,12 @@ class DiffusionModelRunner:
                 output = self.pipeline.forward(req)
 
             # NOTE:
-            if self.od_config.cache_backend == "cache_dit" and self.od_config.enable_cache_dit_summary:
+            if (
+                self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+                and self.od_config.cache_backend == "cache_dit"
+                and self.od_config.enable_cache_dit_summary
+            ):
                 cache_summary(self.pipeline, details=True)
 
         return output
