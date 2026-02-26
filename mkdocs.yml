@@ -67,6 +67,7 @@ exclude_docs: |
 
 # Plugins
 plugins:
+  - macros
   - meta
   - search
   - autorefs
@@ -168,3 +169,9 @@ extra_javascript:
   - mkdocs/javascript/mermaid.js
   - mkdocs/javascript/edit_and_feedback.js
   - mkdocs/javascript/slack_and_forum.js
+
+# Extra variables
+extra:
+  vllm_version: 0.16.0
+  vllm_omni_version: 0.14.0
+  vllm_ascend_version: 0.14.0rc1
