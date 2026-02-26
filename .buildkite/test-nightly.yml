@@ -1,7 +1,7 @@
 steps:
   - label: "Omni Model Test with H100"
-    timeout_in_minutes: 60
-    depends_on: image-build
+    timeout_in_minutes: 90
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -38,10 +38,9 @@ steps:
 
   - label: "Omni Model Test"
     timeout_in_minutes: 60
-    depends_on: image-build
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
-      - export VLLM_LOGGING_LEVEL=DEBUG
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
     agents:
@@ -50,16 +49,16 @@ steps:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
+          shm-size: "8gb"
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-
   - label: "Omni Model Perf Test"
     timeout_in_minutes: 120
-    depends_on: image-build
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
