@@ -41,7 +41,6 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
-      - export VLLM_LOGGING_LEVEL=DEBUG
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
       - pytest -s -v tests/examples/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
     agents:
@@ -50,6 +49,7 @@ steps:
       - docker#v5.2.0:
           image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
           always-pull: true
+          shm-size: "8gb"
           propagate-environment: true
           environment:
             - "HF_HOME=/fsx/hf_cache"

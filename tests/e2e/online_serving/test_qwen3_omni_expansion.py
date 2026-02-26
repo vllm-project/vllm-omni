@@ -267,6 +267,7 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
     openai_client.send_request(request_config)
 
 
+@pytest.mark.skip(reason="There is a known issue with oom error.")
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
