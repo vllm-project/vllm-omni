@@ -192,15 +192,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
-            logger.debug(
-                "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                "should_ubatch: %s, num_tokens_across_dp: %s",
-                cudagraph_mode,
-                batch_desc,
-                should_ubatch,
-                num_tokens_across_dp,
-            )
-
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
@@ -209,12 +200,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_tokens_padded,
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
-            )
-
-            logger.debug(
-                "ubatch_slices: %s, ubatch_slices_padded: %s",
-                ubatch_slices,
-                ubatch_slices_padded,
             )
 
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
@@ -308,15 +293,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
-            if multimodal_outputs is not None:
-                keys_or_type = (
-                    list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, dict)
-                    else type(multimodal_outputs)
-                )
-                logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
-            else:
-                logger.debug("[AR] execute_model: multimodal_outputs is None")
 
             if not self.broadcast_pp_output:
                 # Common case.

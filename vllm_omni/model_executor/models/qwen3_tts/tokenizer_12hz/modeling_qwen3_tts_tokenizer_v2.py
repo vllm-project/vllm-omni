@@ -991,10 +991,11 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
 
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
+        audio_lengths = (audio_codes[..., 0] > -1).sum(1) * self.decode_upsample_rate
 
+        audio_codes = torch.clamp(audio_codes, min=0)
         audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
 
-        audio_lengths = (audio_codes[..., 0] > 0).sum(1) * self.decode_upsample_rate
         audio_values = [a[:length] for a, length in zip(audio_values, audio_lengths)]
 
         if not return_dict:

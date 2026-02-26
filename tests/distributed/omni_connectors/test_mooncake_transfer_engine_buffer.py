@@ -7,7 +7,6 @@ These tests do NOT require Mooncake or RDMA environment.
 """
 
 import threading
-import unittest
 
 import pytest
 import torch
@@ -22,7 +21,7 @@ pytestmark = [pytest.mark.cpu, pytest.mark.parallel]
 
 
 @pytest.mark.core_model
-class TestBufferAllocator(unittest.TestCase):
+class TestBufferAllocator:
     """Unit tests for BufferAllocator."""
 
     def test_basic_alloc_free(self):
@@ -30,15 +29,15 @@ class TestBufferAllocator(unittest.TestCase):
         allocator = BufferAllocator(total_size=4096, alignment=64)
 
         offset1 = allocator.alloc(512)
-        self.assertEqual(offset1, 0)
+        assert offset1 == 0
 
         offset2 = allocator.alloc(512)
-        self.assertGreater(offset2, 0)
+        assert offset2 > 0
 
         # Free first block, should be reusable
         allocator.free(offset1, 512)
         offset3 = allocator.alloc(512)
-        self.assertEqual(offset3, 0)
+        assert offset3 == 0
 
     def test_alignment(self):
         """Verify allocation respects alignment."""
@@ -47,22 +46,22 @@ class TestBufferAllocator(unittest.TestCase):
         _offset1 = allocator.alloc(100)
         offset2 = allocator.alloc(100)
 
-        self.assertEqual(offset2 % 128, 0)
-        self.assertEqual(offset2, 128)
+        assert offset2 % 128 == 0
+        assert offset2 == 128
 
     def test_exhaustion_and_recovery(self):
         """Test that full allocation fails, then succeeds after free."""
         allocator = BufferAllocator(total_size=1024, alignment=64)
 
         offset = allocator.alloc(1024)
-        self.assertEqual(offset, 0)
+        assert offset == 0
 
-        with self.assertRaises(MemoryError):
+        with pytest.raises(MemoryError):
             allocator.alloc(64)
 
         allocator.free(offset, 1024)
         offset2 = allocator.alloc(1024)
-        self.assertEqual(offset2, 0)
+        assert offset2 == 0
 
     def test_thread_safety(self):
         """Verify allocator is thread-safe under concurrent access."""
@@ -84,10 +83,10 @@ class TestBufferAllocator(unittest.TestCase):
         for t in threads:
             t.join()
 
-        self.assertEqual(len(errors), 0, f"Thread safety errors: {errors}")
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
 
 
-class TestAllocatorInvariants(unittest.TestCase):
+class TestAllocatorInvariants:
     """
     Defensive invariant tests for BufferAllocator: double-free, partial
     overlap corruption, and adjacent-block merging.
@@ -106,7 +105,7 @@ class TestAllocatorInvariants(unittest.TestCase):
         allocator.free(offset, 256)
         # Pool should still be consistent: allocate full size back
         offset2 = allocator.alloc(4096)
-        self.assertEqual(offset2, 0)
+        assert offset2 == 0
 
     @pytest.mark.slow
     def test_double_free_after_merge_is_safe(self):
@@ -123,7 +122,7 @@ class TestAllocatorInvariants(unittest.TestCase):
         allocator.free(a, 64)  # should not raise
         # Pool should still be fully usable
         offset = allocator.alloc(4096)
-        self.assertEqual(offset, 0)
+        assert offset == 0
 
     @pytest.mark.slow
     def test_partial_overlap_raises_corruption(self):
@@ -133,7 +132,7 @@ class TestAllocatorInvariants(unittest.TestCase):
         b = allocator.alloc(128)
         allocator.free(a, 128)  # [0, 128) is now free
         # Try to free a region that starts inside [0,128) but extends beyond
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             allocator.free(64, 128)  # [64, 192) overlaps with free [0, 128)
 
         # b is still allocated; freeing b should be fine
@@ -154,7 +153,7 @@ class TestAllocatorInvariants(unittest.TestCase):
         # covering at least 192 bytes (3 * 64).
         # Verify by allocating a contiguous block of 192 bytes.
         offset = allocator.alloc(192)
-        self.assertEqual(offset, 0, "Adjacent blocks were not merged properly")
+        assert offset == 0, "Adjacent blocks were not merged properly"
 
     @pytest.mark.slow
     def test_fragmentation_and_defrag(self):
@@ -174,7 +173,7 @@ class TestAllocatorInvariants(unittest.TestCase):
         allocator.free(d, 64)  # free blocks: [64, 128) and [192, 256)
 
         # Pool has two 64-byte holes; contiguous 128 is unavailable
-        with self.assertRaises(MemoryError):
+        with pytest.raises(MemoryError):
             allocator.alloc(128)
 
         allocator.free(a, 64)
@@ -182,14 +181,16 @@ class TestAllocatorInvariants(unittest.TestCase):
 
         # After freeing everything, full pool should be available
         offset = allocator.alloc(256)
-        self.assertEqual(offset, 0)
+        assert offset == 0
 
 
 @pytest.mark.core_model
-class TestManagedBuffer(unittest.TestCase):
+class TestManagedBuffer:
     """Unit tests for ManagedBuffer."""
 
-    def setUp(self):
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        # automatically invoked for every test method in the class
         self.allocator = BufferAllocator(total_size=4096, alignment=64)
         self.pool = torch.zeros(4096, dtype=torch.uint8)
 
@@ -203,12 +204,12 @@ class TestManagedBuffer(unittest.TestCase):
         self.pool[offset : offset + 64] = src.view(torch.uint8)
 
         # Raw uint8 view
-        self.assertEqual(buf.tensor.shape[0], 64)
+        assert buf.tensor.shape[0] == 64
 
         # Typed view
         typed = buf.as_tensor(dtype=torch.float32, shape=(4, 4))
-        self.assertEqual(typed.shape, (4, 4))
-        self.assertTrue(torch.equal(typed.flatten(), src))
+        assert typed.shape == (4, 4)
+        assert torch.equal(typed.flatten(), src)
 
         buf.release()
 
@@ -217,14 +218,10 @@ class TestManagedBuffer(unittest.TestCase):
         offset = self.allocator.alloc(128)
 
         with ManagedBuffer(self.allocator, offset, 128, self.pool) as buf:
-            self.assertFalse(buf._released)
+            assert not buf._released
 
-        self.assertTrue(buf._released)
+        assert buf._released
 
         # Space should be reusable
         new_offset = self.allocator.alloc(128)
-        self.assertEqual(new_offset, offset)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert new_offset == offset

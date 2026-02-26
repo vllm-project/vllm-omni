@@ -22,11 +22,13 @@ from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
@@ -395,6 +397,7 @@ class WanSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Fused QKV projection
         qkv, _ = self.to_qkv(hidden_states)
@@ -418,8 +421,13 @@ class WanSelfAttention(nn.Module):
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
+        # Create attention metadata if mask is provided
+        attn_metadata = None
+        if attn_mask is not None:
+            attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+
         # Compute attention using unified attention layer
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -637,6 +645,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        hidden_states_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -657,7 +666,7 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, rotary_emb)
+        attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
@@ -716,6 +725,13 @@ class WanTransformer3DModel(nn.Module):
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        """Match transformer blocks for HSDP sharding (e.g., blocks.0, blocks.1)."""
+        return "blocks" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:
@@ -727,25 +743,32 @@ class WanTransformer3DModel(nn.Module):
     # Note: _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism)
     _sp_plan = {
         # Shard RoPE embeddings after rope module computes them
+        # auto_pad=True enables variable sequence length support
         "rope": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # freqs_cos [1, seq, 1, dim]
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # freqs_sin [1, seq, 1, dim]
+            0: SequenceParallelInput(
+                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+            ),  # freqs_cos [1, seq, 1, dim]
+            1: SequenceParallelInput(
+                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+            ),  # freqs_sin [1, seq, 1, dim]
         },
         # Shard timestep_proj for TI2V models (4D tensor: [batch, seq_len, 6, inner_dim])
         # This is only active when ts_seq_len is not None (TI2V mode)
         # Output is a single tensor, shard along dim=1 (sequence dimension)
         "timestep_proj_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True),  # [B, seq, 6, dim]
+            0: SequenceParallelInput(
+                split_dim=1, expected_dims=4, split_output=True, auto_pad=True
+            ),  # [B, seq, 6, dim]
         },
         # Shard hidden_states at first transformer block input
         # (after patch_embedding + flatten + transpose)
         "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),  # [B, seq, dim]
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),  # [B, seq, dim]
         },
         # Shard output scale/shift for TI2V (3D); T2V outputs 2D and skips sharding
         "output_scale_shift_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
         },
         # Gather at proj_out (final linear projection before unpatchify)
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
@@ -878,9 +901,32 @@ class WanTransformer3DModel(nn.Module):
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
 
+        # Check for SP auto_pad: create attention mask dynamically if padding was applied
+        hidden_states_mask = None  # default
+        config = get_forward_context().omni_diffusion_config
+        parallel_config = config.parallel_config
+        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                # Create mask for the full (padded) sequence
+                # valid positions = True, padding positions = False
+                batch_size = hidden_states.shape[0]
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    batch_size,
+                    padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+
+        # if mask is all true, set it to None
+        if hidden_states_mask is not None and hidden_states_mask.all():
+            hidden_states_mask = None
+
         # Transformer blocks
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)

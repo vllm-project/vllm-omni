@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from unittest.mock import MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
+# pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_basic_serialization():
@@ -79,19 +81,19 @@ def test_put_get_inline(shm_connector):
     assert size == ret_size
 
 
-def test_put_get_shm(shm_connector, monkeypatch):
+def test_put_get_shm(mocker: MockerFixture, shm_connector, monkeypatch: pytest.MonkeyPatch):
     """Test SHM transfer logic for large data (Mocked)."""
     # Create data larger than 100 bytes
     data = {"large": "x" * 200}
 
     # Mock SHM return values
     mock_handle = {"name": "test_shm", "size": 200}
-    mock_write = MagicMock(return_value=mock_handle)
+    mock_write = mocker.MagicMock(return_value=mock_handle)
     monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_write_bytes", mock_write)
 
     # When reading, return the serialized bytes of the data
     serialized_data = shm_connector.serialize_obj(data)
-    mock_read = MagicMock(return_value=serialized_data)
+    mock_read = mocker.MagicMock(return_value=serialized_data)
     monkeypatch.setattr("vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_read_bytes", mock_read)
 
     # Put

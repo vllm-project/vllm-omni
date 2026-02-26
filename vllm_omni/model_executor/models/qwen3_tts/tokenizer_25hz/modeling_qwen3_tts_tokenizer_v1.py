@@ -1297,8 +1297,6 @@ class Qwen3TTSTokenizerV1Encoder(Qwen3TTSTokenizerV1EncoderPreTrainedModel):
             n_layer=config.n_layer,
             n_window=config.n_window,
             output_dim=config.output_dim,
-            grad_checkpointing=config.grad_checkpointing,
-            enable_mp=config.enable_mp,
             audio_sequence_parallel=config.audio_sequence_parallel,
             audio_vq_type=config.audio_vq_type,
             audio_vq_layers=config.audio_vq_layers,
@@ -1510,10 +1508,11 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
 
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
+        audio_lengths = (audio_codes > -1).sum(1) * self.decode_upsample_rate
 
+        audio_codes = torch.clamp(audio_codes, min=0)
         audio_values = self.decoder(code=audio_codes, reference_mel=ref_mels, conditioning=xvectors)
 
-        audio_lengths = (audio_codes > 0).sum(1) * self.decode_upsample_rate
         audio_values = [a[:length] for a, length in zip(audio_values, audio_lengths)]
 
         if not return_dict:

@@ -4,6 +4,7 @@ Provides single and batch sample inputs for CustomVoice, VoiceDesign, and Base
 tasks, then runs Omni generation and saves output wav files.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, NamedTuple
@@ -15,7 +16,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni import Omni
+from vllm_omni import AsyncOmni, Omni
 
 logger = logging.getLogger(__name__)
 
@@ -242,24 +243,70 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
     )
 
 
-def main(args):
-    """Run offline inference with Omni using prepared sample inputs.
+query_map = {
+    "CustomVoice": get_custom_voice_query,
+    "VoiceDesign": get_voice_design_query,
+    "Base": get_base_query,
+}
 
-    Args:
-        args: Parsed CLI args from parse_args().
-    """
+
+def _build_inputs(args) -> tuple[str, list]:
+    """Resolve model name and inputs list from CLI args."""
+    if args.batch_size < 1 or (args.batch_size & (args.batch_size - 1)) != 0:
+        raise ValueError(
+            f"--batch-size must be a power of two (got {args.batch_size}); "
+            "non-power-of-two values do not align with CUDA graph capture sizes "
+            "of Code2Wav."
+        )
+
     query_func = query_map[args.query_type]
     if args.query_type in {"CustomVoice", "VoiceDesign"}:
         query_result = query_func(use_batch_sample=args.use_batch_sample)
     elif args.query_type == "Base":
-        query_result = query_func(
-            use_batch_sample=args.use_batch_sample,
-            mode_tag=args.mode_tag,
-        )
+        query_result = query_func(use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag)
     else:
         query_result = query_func()
 
     model_name = query_result.model_name
+
+    if args.txt_prompts:
+        with open(args.txt_prompts) as f:
+            lines = [line.strip() for line in f if line.strip()]
+        if not lines:
+            raise ValueError(f"No valid prompts found in {args.txt_prompts}")
+        template = query_result.inputs if not isinstance(query_result.inputs, list) else query_result.inputs[0]
+        template_info = template["additional_information"]
+        inputs = [
+            {
+                "prompt_token_ids": [0] * _estimate_prompt_len({**template_info, "text": [t]}, model_name),
+                "additional_information": {**template_info, "text": [t]},
+            }
+            for t in lines
+        ]
+    else:
+        inputs = query_result.inputs if isinstance(query_result.inputs, list) else [query_result.inputs]
+
+    return model_name, inputs
+
+
+def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
+    """Concatenate audio chunks and write to a wav file."""
+    audio_data = mm["audio"]
+    sr_raw = mm["sr"]
+    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+    sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+    audio_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+    out_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+    sf.write(out_wav, audio_tensor.float().cpu().numpy().flatten(), samplerate=sr, format="WAV")
+    logger.info(f"Request ID: {request_id}, Saved audio to {out_wav}")
+
+
+def main(args):
+    """Run offline inference with Omni."""
+    model_name, inputs = _build_inputs(args)
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
     omni = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
@@ -267,40 +314,40 @@ def main(args):
         stage_init_timeout=args.stage_init_timeout,
     )
 
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    batch_size = args.batch_size
+    for batch_start in range(0, len(inputs), batch_size):
+        batch = inputs[batch_start : batch_start + batch_size]
+        for stage_outputs in omni.generate(batch):
+            for output in stage_outputs.request_output:
+                _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+
+
+async def main_streaming(args):
+    """Run offline inference with AsyncOmni, logging each audio chunk as it arrives."""
+    model_name, inputs = _build_inputs(args)
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni_generator = omni.generate(query_result.inputs, sampling_params_list=None)
-    for stage_outputs in omni_generator:
-        for output in stage_outputs.request_output:
-            request_id = output.request_id
-            audio_data = output.outputs[0].multimodal_output["audio"]
-            # async_chunk mode returns a list of chunks; concatenate them.
-            if isinstance(audio_data, list):
-                audio_tensor = torch.cat(audio_data, dim=-1)
+    omni = AsyncOmni(
+        model=model_name,
+        stage_configs_path=args.stage_configs_path,
+        log_stats=args.log_stats,
+        stage_init_timeout=args.stage_init_timeout,
+    )
+
+    for i, prompt in enumerate(inputs):
+        request_id = str(i)
+        async for stage_output in omni.generate(prompt, request_id=request_id):
+            mm = stage_output.request_output.outputs[0].multimodal_output
+            if not stage_output.finished:
+                audio = mm.get("audio")
+                n = len(audio) if isinstance(audio, list) else (0 if audio is None else 1)
+                logger.info(f"Request {request_id}: received chunk {n}")
             else:
-                audio_tensor = audio_data
-            output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-            sr_val = output.outputs[0].multimodal_output["sr"]
-            audio_samplerate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val[-1])
-            # Convert to numpy array and ensure correct format
-            audio_numpy = audio_tensor.float().detach().cpu().numpy()
-
-            # Ensure audio is 1D (flatten if needed)
-            if audio_numpy.ndim > 1:
-                audio_numpy = audio_numpy.flatten()
-
-            # Save audio file with explicit WAV format
-            sf.write(output_wav, audio_numpy, samplerate=audio_samplerate, format="WAV")
-            print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+                _save_wav(output_dir, request_id, mm)
 
 
 def parse_args():
-    """Parse CLI arguments for offline TTS inference.
-
-    Returns:
-        argparse.Namespace with CLI options.
-    """
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
         "--query-type",
@@ -341,9 +388,9 @@ def parse_args():
         help="Threshold for using shared memory in bytes (default: 65536)",
     )
     parser.add_argument(
-        "--output-wav",
+        "--output-dir",
         default="output_audio",
-        help="[Deprecated] Output wav directory (use --output-dir).",
+        help="Output directory for generated wav files (default: output_audio).",
     )
     parser.add_argument(
         "--num-prompts",
@@ -401,17 +448,25 @@ def parse_args():
         choices=["icl", "xvec_only"],
         help="Mode tag for Base query x_vector_only_mode (default: icl).",
     )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Stream audio chunks as they arrive via AsyncOmni (async_chunk mode only).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts per batch (default: 1, sequential).",
+    )
 
     return parser.parse_args()
 
 
-query_map = {
-    "CustomVoice": get_custom_voice_query,
-    "VoiceDesign": get_voice_design_query,
-    "Base": get_base_query,
-}
-
-
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    if args.streaming:
+        asyncio.run(main_streaming(args))
+    else:
+        main(args)
