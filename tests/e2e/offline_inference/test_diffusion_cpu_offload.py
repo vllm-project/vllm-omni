@@ -48,7 +48,6 @@ def inference(model_name: str, offload: bool = True):
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.skipif(current_omni_platform.is_npu() or current_omni_platform.is_rocm(), reason="Hardware not supported")
 @pytest.mark.parametrize("model_name", models)
 def test_cpu_offload_diffusion_model(model_name: str):
     try:
