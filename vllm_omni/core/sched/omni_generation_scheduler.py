@@ -77,7 +77,6 @@ class OmniGenerationScheduler(VLLMScheduler):
                     self.chunk_transfer_adapter is not None
                     and request.request_id in self.chunk_transfer_adapter.finished_requests
                 ):
-                    request.status = RequestStatus.FINISHED_STOPPED
                     # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
                     if len(request.prompt_token_ids) <= num_computed_tokens:
                         request.prompt_token_ids.append(0)
@@ -132,7 +131,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
                 if request.request_id in self.chunk_transfer_adapter.finished_requests:
-                    request.status = RequestStatus.FINISHED_STOPPED
                     request.prompt_token_ids.append(0)
                     try:
                         request._all_token_ids.append(0)  # type: ignore[attr-defined]
