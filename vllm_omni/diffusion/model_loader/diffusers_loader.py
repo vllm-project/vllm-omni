@@ -30,6 +30,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.quantization.bitsandbytes import (
     DiffusionBitsAndBytesConfig,
     apply_bnb_quantization,
+    matches_bnb_module_name,
     patch_transformers_for_bnb_load,
 )
 from vllm_omni.diffusion.registry import initialize_model
@@ -267,8 +268,9 @@ class DiffusersPipelineLoader:
                             pre_replace_modules.add(module_name)
                 if pre_replace_modules:
                     only_modules = []
-                    for module_name in bnb_config.get_modules():
-                        if module_name not in pre_replace_modules:
+                    requested_modules = bnb_config.get_modules()
+                    for module_name in pre_replace_modules:
+                        if not matches_bnb_module_name(module_name, requested_modules):
                             continue
                         component = getattr(model, module_name, None)
                         if component is not None and _component_contains_vllm_linear(component):

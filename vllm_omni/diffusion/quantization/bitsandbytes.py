@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import contextvars
+import fnmatch
 import os
 import threading
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -18,7 +19,7 @@ from vllm.logger import init_logger
 from .base import DiffusionQuantizationConfig
 
 BnbBackend = Literal["bitsandbytes_8bit", "bitsandbytes_4bit"]
-DEFAULT_BNB_MODULES = ("transformer", "text_encoder", "text_encoder_2", "text_encoder_3")
+DEFAULT_BNB_MODULES = ("transformer", "text_encoder*")
 
 logger = init_logger(__name__)
 
@@ -41,6 +42,32 @@ def _normalize_modules(modules: Sequence[str] | str | None) -> list[str] | None:
     else:
         items = [str(m).strip() for m in list(modules)]
     return [m for m in items if m]
+
+
+def matches_bnb_module_name(name: str, patterns: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def _resolve_module_patterns(available: Iterable[str], patterns: Sequence[str]) -> list[str]:
+    ordered_available = list(dict.fromkeys(available))
+    matched: list[str] = []
+    for pattern in patterns:
+        for name in ordered_available:
+            if fnmatch.fnmatchcase(name, pattern) and name not in matched:
+                matched.append(name)
+    return matched
+
+
+def _get_pipeline_component_names(pipeline: Any) -> list[str]:
+    names: list[str] = []
+    if isinstance(pipeline, nn.Module):
+        names.extend(pipeline._modules.keys())
+    components = getattr(pipeline, "components", None)
+    if isinstance(components, Mapping):
+        for name in components.keys():
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def _normalize_bnb_compute_dtype(value: torch.dtype | str | None) -> torch.dtype | None:
@@ -124,7 +151,7 @@ def get_bnb_module_kwargs(
     if not module_name:
         return {}
 
-    if module_name not in quant_config.get_modules():
+    if not matches_bnb_module_name(module_name, quant_config.get_modules()):
         return {}
 
     if device.type != "cuda":
@@ -171,7 +198,7 @@ def _infer_bnb_module_name(
         return str(subfolder)
     if isinstance(model_name_or_path, (str, os.PathLike)):
         base = os.path.basename(str(model_name_or_path).rstrip("/"))
-        if base in DEFAULT_BNB_MODULES or base.startswith("text_encoder"):
+        if matches_bnb_module_name(base, DEFAULT_BNB_MODULES):
             return base
     return None
 
@@ -323,21 +350,24 @@ def apply_bnb_quantization(
             "it is ignored for post-hoc quantization."
         )
 
-    quant_modules = quant_config.get_modules()
-    if only_modules is not None:
-        only = {m for m in only_modules}
-        quant_modules = [m for m in quant_modules if m in only]
+    requested_modules = quant_config.get_modules()
+    available_modules = list(only_modules) if only_modules is not None else _get_pipeline_component_names(pipeline)
+    quant_modules = _resolve_module_patterns(available_modules, requested_modules)
     if skip_modules is not None:
         skip = {m for m in skip_modules}
         quant_modules = [m for m in quant_modules if m not in skip]
     if not quant_modules:
+        if only_modules is None:
+            logger.warning_once(
+                "bitsandbytes: none of the configured modules were found on the pipeline (%s).",
+                tuple(requested_modules),
+            )
         return set()
 
     logger.info_once("Applying bitsandbytes quantization to modules=%s", tuple(quant_modules))
 
     bnb_compute_dtype = quant_config.bnb_4bit_compute_dtype or torch.float32
     quantized_components: set[str] = set()
-    found_components = False
     replaced_any = False
 
     for module_name in quant_modules:
@@ -346,7 +376,6 @@ def apply_bnb_quantization(
             continue
         if not isinstance(component, nn.Module):
             continue
-        found_components = True
         already_quantized = _contains_bnb_linear(component, bnb)
         num_replaced = _apply_to_component(
             component,
@@ -372,13 +401,7 @@ def apply_bnb_quantization(
             )
 
     if not replaced_any:
-        if not found_components:
-            logger.warning_once(
-                "bitsandbytes: none of the configured modules were found on the pipeline (%s).",
-                tuple(quant_modules),
-            )
-        else:
-            logger.warning_once("bitsandbytes: no Linear layers replaced; quantization may be ineffective.")
+        logger.warning_once("bitsandbytes: no Linear layers replaced; quantization may be ineffective.")
 
     return quantized_components
 
