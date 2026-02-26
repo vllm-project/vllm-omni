@@ -15,6 +15,8 @@ from .utils.config import ConnectorSpec
 
 logger = init_logger(__name__)
 
+LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
 
 @dataclass
 class OmniKVCacheConfig:
@@ -157,7 +159,7 @@ class OmniKVTransferManager:
     def handle_finished_requests_kv_transfer(
         self,
         finished_reqs: dict[str, dict[str, Any]],
-        kv_caches: list[torch.Tensor],
+        kv_caches: list[LayerKV],
         block_size: int,
         cache_dtype: str,
         request_id_resolver: Callable[[str], str] | None = None,
@@ -169,7 +171,7 @@ class OmniKVTransferManager:
 
         Args:
             finished_reqs: Dict mapping request_id to {block_ids, seq_len}
-            kv_caches: List of KV cache tensors per layer
+            kv_caches: List of KV cache (tensor or tuple) per layer
             block_size: Size of each cache block
             cache_dtype: Data type of the cache
             request_id_resolver: Optional function to resolve global request ID
@@ -219,7 +221,7 @@ class OmniKVTransferManager:
         req_id: str,
         block_ids: list[int],
         seq_len: int,
-        kv_caches: list[torch.Tensor],
+        kv_caches: list[LayerKV],
         block_size: int,
         cache_dtype: str,
     ) -> KVCacheTransferData | None:
@@ -229,9 +231,12 @@ class OmniKVTransferManager:
             req_id: Request identifier
             block_ids: List of block IDs to extract
             seq_len: Sequence length
-            kv_caches: List of KV cache tensors per layer
+            kv_caches: List of KV cache (tensor or tuple) per layer
             block_size: Size of each cache block
             cache_dtype: Data type of the cache
+
+        Note: If key/value block counts differ, extraction uses only the overlapping
+        block range. Extra key/value blocks are ignored, so returned KV may be partial.
 
         Returns:
             KVCacheTransferData if extraction successful, None otherwise
@@ -240,25 +245,37 @@ class OmniKVTransferManager:
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
 
-        for layer_idx, kv_tensor in enumerate(kv_caches):
-            # Validate block IDs - shape: [2, num_blocks, block_size, n_heads, head_dim]
-            max_block = kv_tensor.shape[1] - 1
+        for layer_idx, layer_kv in enumerate(kv_caches):
+            kv_pair = self._normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
+            if kv_pair is None:
+                continue
+            key_blocks, value_blocks = kv_pair
+
+            if key_blocks.shape[0] != value_blocks.shape[0]:
+                logger.warning(
+                    f"Layer {layer_idx} for request {req_id} has mismatched KV block counts: "
+                    f"key={key_blocks.shape[0]}, value={value_blocks.shape[0]}; using shared range"
+                )
+
+            # Validate block IDs - shape: [num_blocks, block_size, n_heads, head_dim]
+            max_block = min(key_blocks.shape[0], value_blocks.shape[0]) - 1
             valid_ids = [bid for bid in block_ids if 0 <= bid <= max_block]
             if not valid_ids:
                 continue
 
-            # Extract and reshape: [2, n_blocks, block_size, n_heads, head_dim]
-            # -> [2, seq_len, n_heads, head_dim]
-            selected = kv_tensor[:, valid_ids]  # [2, n_valid, block_size, n_heads, head_dim]
-            n_kv, n_blks, blk_sz, n_heads, d_head = selected.shape
-            flat = selected.reshape(n_kv, n_blks * blk_sz, n_heads, d_head)
-            if seq_len < flat.shape[1]:
-                flat = flat[:, :seq_len]
+            # Extract and reshape: [n_blocks, block_size, n_heads, head_dim]
+            # -> [seq_len, n_heads, head_dim]
+            selected_k = key_blocks[valid_ids]
+            selected_v = value_blocks[valid_ids]
+            flat_k = selected_k.flatten(0, 1)
+            flat_v = selected_v.flatten(0, 1)
+            if seq_len < flat_k.shape[0]:
+                flat_k = flat_k[:seq_len]
+                flat_v = flat_v[:seq_len]
 
             # Move to CPU
-            flat_cpu = flat.detach().cpu().contiguous()
-            key_cache[layer_idx] = flat_cpu[0]
-            value_cache[layer_idx] = flat_cpu[1]
+            key_cache[layer_idx] = flat_k.detach().cpu().contiguous()
+            value_cache[layer_idx] = flat_v.detach().cpu().contiguous()
 
         if not any(k is not None for k in key_cache):
             return None
@@ -274,6 +291,54 @@ class OmniKVTransferManager:
                 "seq_len": seq_len,
             },
         )
+
+    def _normalize_layer_kv(
+        self,
+        layer_kv: LayerKV,
+        req_id: str,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Normalize one layer KV cache to a `(key_blocks, value_blocks)` tuple.
+
+        Args:
+            layer_kv: The raw KV cache (tensor or tuple) for the layer
+            req_id: Request ID for logging
+            layer_idx: Layer index for logging
+
+        Returns:
+            Tuple of (key_blocks, value_blocks) if valid, None otherwise
+        """
+        if isinstance(layer_kv, torch.Tensor):
+            if layer_kv.ndim < 3 or layer_kv.shape[0] != 2:
+                logger.warning(
+                    f"Layer {layer_idx} for request {req_id} has invalid stacked KV shape: "
+                    f"expected [2, blocks, block_size, ...], got {tuple(layer_kv.shape)}"
+                )
+                return None
+            key_blocks = layer_kv[0]
+            value_blocks = layer_kv[1]
+        elif isinstance(layer_kv, tuple):
+            if len(layer_kv) != 2:
+                logger.warning(
+                    f"Layer {layer_idx} for request {req_id} has KV pair length {len(layer_kv)} (expected 2)"
+                )
+                return None
+            key_blocks, value_blocks = layer_kv
+            if not isinstance(key_blocks, torch.Tensor) or not isinstance(value_blocks, torch.Tensor):
+                logger.warning(f"Layer {layer_idx} for request {req_id} has non-tensor KV pair entries")
+                return None
+        else:
+            logger.warning(f"Layer {layer_idx} for request {req_id} has unsupported KV type {type(layer_kv).__name__}")
+            return None
+        # ensure key/value blocks are at least 2D for block indexing
+        if key_blocks.ndim < 2 or value_blocks.ndim < 2:
+            logger.warning(
+                f"Layer {layer_idx} for request {req_id} has invalid KV block shape: "
+                f"got key={tuple(key_blocks.shape)} value={tuple(value_blocks.shape)}"
+            )
+            return None
+
+        return key_blocks, value_blocks
 
     def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
         """Transfer KV cache data to downstream stage via OmniConnector.

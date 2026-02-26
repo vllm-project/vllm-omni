@@ -192,8 +192,10 @@ class DiffusionWorker:
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
 
-    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
-        return self.lora_manager.add_adapter(lora_request, lora_scale)
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        # NOTE (Alex): We have not implemented the API routing
+        # for the frontend server yet.
+        return self.lora_manager.add_adapter(lora_request)
 
     def list_loras(self) -> list[int]:
         return self.lora_manager.list_adapters()

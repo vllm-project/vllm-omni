@@ -257,6 +257,9 @@ class OmniBase:
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
 
+        # TTS-specific CLI overrides
+        self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
+
         # Load stage configurations from YAML
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,

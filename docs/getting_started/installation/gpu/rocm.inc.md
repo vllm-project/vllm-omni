@@ -13,7 +13,7 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.14.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.14.0/rocm700
+uv pip install vllm==0.16.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.16.0/rocm700
 ```
 
 #### Installation of vLLM-Omni
@@ -34,13 +34,13 @@ uv pip install onnxruntime-rocm sox
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.14.0 release version of the library
+If you do not need to modify source code of vLLM, you can directly install the stable 0.16.0 release version of the library
 
 ```bash
-uv pip install vllm==0.14.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.14.0/rocm700
+uv pip install vllm==0.16.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.16.0/rocm700
 ```
 
-The release 0.14.0 of vLLM requires ROCm 7.0 environment.
+The release 0.16.0 of vLLM requires ROCm 7.0 environment.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -58,7 +58,7 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.14.0
+git checkout v0.16.0
 python3 -m pip install -r requirements/rocm.txt
 python3 setup.py develop
 ```

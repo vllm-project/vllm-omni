@@ -90,6 +90,25 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 curl http://localhost:8091/v1/audio/voices
 ```
 
+## Server Configuration
+
+### TTS-Specific CLI Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--tts-max-instructions-length` | int | 500 | Maximum character length for voice style instructions |
+
+**Example with custom instructions length:**
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --omni \
+    --port 8000 \
+    --tts-max-instructions-length 1000
+```
+
+This is useful when you need longer voice style descriptions, especially for the VoiceDesign task type.
+
 ## API Reference
 
 ### Endpoint

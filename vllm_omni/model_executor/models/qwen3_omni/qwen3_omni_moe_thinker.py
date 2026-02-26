@@ -343,11 +343,17 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
 
         use_audio_in_video = False
         if "video" in mm_kwargs:
-            for item in mm_kwargs["video"]:
-                if item and item["use_audio_in_video"].data:
-                    use_audio_in_video = True
-                else:
-                    use_audio_in_video = False
+            non_none_items = [item for item in mm_kwargs["video"] if item is not None]
+            if non_none_items:
+                # Normal case: at least one non-cached item, read flag directly
+                use_audio_in_video = any(item["use_audio_in_video"].data for item in non_none_items)
+            elif "audio" in mm_prompt_updates:
+                # All video items are from cache (None); infer from prompt:
+                # use_audio_in_video=True means the prompt has no <|audio_pad|>
+                # placeholder (audio is embedded in video tokens instead)
+                tokenizer = self.info.get_tokenizer()
+                audio_pad_id = tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+                use_audio_in_video = audio_pad_id not in prompt_ids
 
         # normal case with `use_audio_in_video=False`
         if is_update_applied:

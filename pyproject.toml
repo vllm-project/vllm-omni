@@ -41,6 +41,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
