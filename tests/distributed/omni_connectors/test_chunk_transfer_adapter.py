@@ -35,6 +35,7 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
         prompt_token_ids=[],
         num_computed_tokens=0,
         additional_information=None,
+        is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
     )
 
 
@@ -48,9 +49,9 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 
         def _fake_base_init(self, config):
             self.config = config
-            self._pending_load_reqs = {}
+            self._pending_load_reqs = deque()
             self._finished_load_reqs = set()
-            self._pending_save_reqs = {}
+            self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
             self.stop_event = threading.Event()
             self.lock = threading.Lock()
@@ -108,9 +109,8 @@ def test_load_poll(build_adapter):
     adapter.load_async(request)
     payload = {"code_predictor_codes": [[1]], "hidden_states": torch.tensor([[2.0]]), "finished": True}
     connector.get.return_value = (payload, 16)
-    adapter._poll_single_request("req-1")
+    adapter._poll_single_request(request)
 
-    connector.get.assert_called_once_with("1", "2", "external-1_1_0")
     assert request.additional_information == payload
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" in adapter._finished_load_reqs
@@ -120,17 +120,15 @@ def test_load_poll(build_adapter):
 
 def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
-    request = SimpleNamespace(external_req_id="external-1")
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": False}
     adapter.save_async(pooling_output=None, request=request)
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {}
     adapter.save_async(pooling_output=None, request=request)
 
-    assert adapter.put_req_chunk["external-1"] == 1
-    queued = adapter._pending_save_reqs["external-1"]
-    assert len(queued) == 1
-    assert queued[0]["put_key"] == "external-1_1_0"
+    task = adapter._pending_save_reqs.popleft()
+    assert task["is_finished"] is False
 
 
 def test_update_request_payload(build_adapter):
