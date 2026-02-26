@@ -108,9 +108,6 @@ def test_send_multimodal_request_002(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.skip(
-    reason="There is an issue with empty output in the current CI environment, which will be fixed in a subsequent PR."
-)
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
