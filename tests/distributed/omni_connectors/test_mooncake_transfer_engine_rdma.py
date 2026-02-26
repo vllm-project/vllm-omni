@@ -13,7 +13,6 @@ import os
 import subprocess
 import threading
 import time
-import unittest
 
 import pytest
 import torch
@@ -195,43 +194,43 @@ def _md5(tensor: torch.Tensor) -> str:
 # ---------------------------------------------------------------------------
 
 
-@unittest.skipIf(TransferEngine is None, "Mooncake TransferEngine not available")
-class TestBasicConnector(unittest.TestCase):
+@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+class TestBasicConnector:
     """Verify connector initialization, put, cleanup, and health check."""
 
     def test_initialization(self):
         port = _free_port()
         with MooncakeTransferEngineConnector(_connector_config(port, pool_size=1024 * 1024)) as c:
-            self.assertNotEqual(c.rpc_port, 0)
-            self.assertEqual(c.pool_size, 1024 * 1024)
-            self.assertTrue(c.pool.is_pinned())
+            assert c.rpc_port != 0
+            assert c.pool_size == 1024 * 1024
+            assert c.pool.is_pinned()
             health = c.health()
-            self.assertEqual(health["status"], "healthy")
+            assert health["status"] == "healthy"
 
     def test_put_tensor_bytes_object(self):
         """Put tensor / bytes / dict and verify metadata."""
         port = _free_port()
         with MooncakeTransferEngineConnector(_connector_config(port)) as c:
             ok, sz, meta = c.put("s0", "s1", "t", torch.randn(100))
-            self.assertTrue(ok)
-            self.assertTrue(meta["is_fast_path"])
+            assert ok
+            assert meta["is_fast_path"]
 
             ok, sz, meta = c.put("s0", "s1", "b", b"hello" * 100)
-            self.assertTrue(ok)
-            self.assertTrue(meta["is_fast_path"])
+            assert ok
+            assert meta["is_fast_path"]
 
             ok, sz, meta = c.put("s0", "s1", "d", {"k": [1, 2, 3]})
-            self.assertTrue(ok)
-            self.assertFalse(meta["is_fast_path"])
+            assert ok
+            assert not meta["is_fast_path"]
 
     def test_cleanup_releases_buffer(self):
         port = _free_port()
         with MooncakeTransferEngineConnector(_connector_config(port)) as c:
             c.put("s0", "s1", "r1", torch.randn(100))
             key = MooncakeTransferEngineConnector._make_key("r1", "s0", "s1")
-            self.assertIn(key, c._local_buffers)
+            assert key in c._local_buffers
             c.cleanup("r1", from_stage="s0", to_stage="s1")
-            self.assertNotIn(key, c._local_buffers)
+            assert key not in c._local_buffers
 
     def test_pool_exhaustion_and_recovery(self):
         """Fill pool, verify failure, free, verify recovery."""
@@ -247,7 +246,7 @@ class TestBasicConnector(unittest.TestCase):
             for rid in ids:
                 c.cleanup(rid, from_stage="s", to_stage="s")
             ok, _, _ = c.put("s", "s", "recovery", torch.randn(1000))
-            self.assertTrue(ok, "Pool recovery failed after cleanup")
+            assert ok, "Pool recovery failed after cleanup"
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +254,8 @@ class TestBasicConnector(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-@unittest.skipIf(TransferEngine is None, "Mooncake TransferEngine not available")
-class TestEndToEnd(unittest.TestCase):
+@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+class TestEndToEnd:
     """E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload, mixed types."""
 
     def _pair(self, pool_size=16 * 1024 * 1024):
@@ -269,14 +268,14 @@ class TestEndToEnd(unittest.TestCase):
         try:
             orig = torch.randn(1024, 1024, dtype=torch.float32)
             ok, sz, meta = p.put("s0", "s1", "t1", orig)
-            self.assertTrue(ok)
+            assert ok
             time.sleep(0.5)
             result = c.get("s0", "s1", "t1", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
-            self.assertIsInstance(buf, ManagedBuffer)
+            assert isinstance(buf, ManagedBuffer)
             recon = buf.as_tensor(dtype=orig.dtype, shape=orig.shape)
-            self.assertTrue(torch.equal(recon, orig))
+            assert torch.equal(recon, orig)
             buf.release()
         finally:
             p.close()
@@ -287,15 +286,15 @@ class TestEndToEnd(unittest.TestCase):
         try:
             orig = b"Hello RDMA! " * 1000
             ok, _, meta = p.put("s0", "s1", "b1", orig)
-            self.assertTrue(ok)
+            assert ok
             time.sleep(0.5)
             result = c.get("s0", "s1", "b1", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
             recv = buf.to_bytes() if hasattr(buf, "to_bytes") else buf
             if hasattr(buf, "release"):
                 buf.release()
-            self.assertEqual(recv, orig)
+            assert recv == orig
         finally:
             p.close()
             c.close()
@@ -305,13 +304,13 @@ class TestEndToEnd(unittest.TestCase):
         try:
             orig = {"msg": "hello", "nums": [1, 2, 3], "nested": {"k": "v"}}
             ok, _, meta = p.put("s0", "s1", "o1", orig)
-            self.assertTrue(ok)
-            self.assertFalse(meta["is_fast_path"])
+            assert ok
+            assert not meta["is_fast_path"]
             time.sleep(1.0)
             result = c.get("s0", "s1", "o1", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             recv, _ = result
-            self.assertEqual(recv, orig)
+            assert recv == orig
         finally:
             p.close()
             c.close()
@@ -327,15 +326,15 @@ class TestEndToEnd(unittest.TestCase):
             sbuf.as_tensor(dtype=torch.float32, shape=shape).copy_(ref)
 
             ok, sz, meta = p.put("s0", "s1", "zc", sbuf)
-            self.assertTrue(ok)
-            self.assertTrue(meta.get("is_fast_path"))
+            assert ok
+            assert meta.get("is_fast_path")
             time.sleep(0.5)
 
             result = c.get("s0", "s1", "zc", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             rbuf, _ = result
             recon = rbuf.as_tensor(dtype=torch.float32, shape=shape)
-            self.assertTrue(torch.equal(recon, ref))
+            assert torch.equal(recon, ref)
             rbuf.release()
         finally:
             p.close()
@@ -348,13 +347,13 @@ class TestEndToEnd(unittest.TestCase):
             orig = torch.randn(5000, 5000, dtype=torch.float32)
             md5_send = _md5(orig)
             ok, _, meta = p.put("s0", "s1", "lg", orig)
-            self.assertTrue(ok)
+            assert ok
             time.sleep(1.0)
             result = c.get("s0", "s1", "lg", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
             recon = buf.as_tensor(dtype=orig.dtype, shape=orig.shape)
-            self.assertEqual(_md5(recon), md5_send)
+            assert _md5(recon) == md5_send
             buf.release()
         finally:
             p.close()
@@ -374,23 +373,23 @@ class TestEndToEnd(unittest.TestCase):
             time.sleep(0.5)
             for name, data in cases:
                 ok, _, meta = p.put("s0", "s1", name, data)
-                self.assertTrue(ok, f"put failed: {name}")
+                assert ok, f"put failed: {name}"
                 time.sleep(0.3)
                 result = c.get("s0", "s1", name, meta)
-                self.assertIsNotNone(result, f"get failed: {name}")
+                assert result is not None, f"get failed: {name}"
                 recv, _ = result
                 if isinstance(data, torch.Tensor):
-                    self.assertIsInstance(recv, ManagedBuffer)
+                    assert isinstance(recv, ManagedBuffer)
                     recon = recv.as_tensor(dtype=data.dtype, shape=data.shape)
-                    self.assertTrue(torch.equal(recon, data), f"mismatch: {name}")
+                    assert torch.equal(recon, data), f"mismatch: {name}"
                     recv.release()
                 elif isinstance(data, bytes):
                     got = recv.to_bytes() if hasattr(recv, "to_bytes") else recv
                     if hasattr(recv, "release"):
                         recv.release()
-                    self.assertEqual(got, data)
+                    assert got == data
                 else:
-                    self.assertEqual(recv, data)
+                    assert recv == data
         finally:
             p.close()
             c.close()
@@ -420,24 +419,24 @@ class TestEndToEnd(unittest.TestCase):
                 t.start()
             for t in threads:
                 t.join()
-            self.assertEqual(len(errors), 0, f"errors: {errors}")
+            assert len(errors) == 0, f"errors: {errors}"
 
     def test_auto_cleanup(self):
         """Producer buffer should be released after consumer get."""
         p, c = self._pair()
         try:
             ok, _, meta = p.put("s0", "s1", "ac", torch.randn(100))
-            self.assertTrue(ok)
+            assert ok
             key = MooncakeTransferEngineConnector._make_key("ac", "s0", "s1")
-            self.assertIn(key, p._local_buffers)
+            assert key in p._local_buffers
             time.sleep(0.5)
             result = c.get("s0", "s1", "ac", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
             if isinstance(buf, ManagedBuffer):
                 buf.release()
             time.sleep(0.3)
-            self.assertNotIn(key, p._local_buffers)
+            assert key not in p._local_buffers
         finally:
             p.close()
             c.close()
@@ -448,22 +447,22 @@ class TestEndToEnd(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-@unittest.skipIf(TransferEngine is None, "Mooncake TransferEngine not available")
-class TestLifecycle(unittest.TestCase):
+@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+class TestLifecycle:
     """Close, context manager, double-close safety."""
 
     def test_close_releases_resources(self):
         c = MooncakeTransferEngineConnector(_connector_config(_free_port(), pool_size=1024 * 1024))
         c.put("s0", "s1", "x", torch.randn(100))
         c.close()
-        self.assertTrue(c._stop_event.is_set())
-        self.assertEqual(len(c._local_buffers), 0)
+        assert c._stop_event.is_set()
+        assert len(c._local_buffers) == 0
 
     def test_context_manager(self):
         with MooncakeTransferEngineConnector(_connector_config(_free_port())) as c:
             ok, _, _ = c.put("s0", "s1", "ctx", torch.randn(50))
-            self.assertTrue(ok)
-        self.assertTrue(c._stop_event.is_set())
+            assert ok
+        assert c._stop_event.is_set()
 
     def test_double_close_safe(self):
         c = MooncakeTransferEngineConnector(_connector_config(_free_port()))
@@ -477,9 +476,9 @@ class TestLifecycle(unittest.TestCase):
 
 
 @pytest.mark.cuda
-@unittest.skipIf(TransferEngine is None, "Mooncake TransferEngine not available")
-@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
-class TestGPUPool(unittest.TestCase):
+@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestGPUPool:
     """GPU memory pool: initialization, put (CPU/GPU tensor), E2E transfer."""
 
     @staticmethod
@@ -488,18 +487,18 @@ class TestGPUPool(unittest.TestCase):
 
     def test_gpu_pool_init(self):
         with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
-            self.assertEqual(c.pool_device, "cuda:0")
-            self.assertTrue(c.pool.is_cuda)
+            assert c.pool_device == "cuda:0"
+            assert c.pool.is_cuda
 
     def test_gpu_pool_put_cpu_and_gpu_tensor(self):
         with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
             ok, _, meta = c.put("s0", "s1", "h2d", torch.randn(256, 256))
-            self.assertTrue(ok)
-            self.assertTrue(meta["is_fast_path"])
+            assert ok
+            assert meta["is_fast_path"]
 
             ok, _, meta = c.put("s0", "s1", "d2d", torch.randn(256, 256, device="cuda:0"))
-            self.assertTrue(ok)
-            self.assertTrue(meta["is_fast_path"])
+            assert ok
+            assert meta["is_fast_path"]
 
     def test_gpu_e2e_transfer(self):
         p = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
@@ -507,14 +506,14 @@ class TestGPUPool(unittest.TestCase):
         try:
             orig = torch.randn(512, 512, dtype=torch.float32, device="cuda:0")
             ok, _, meta = p.put("s0", "s1", "ge", orig)
-            self.assertTrue(ok)
+            assert ok
             time.sleep(0.5)
             result = c.get("s0", "s1", "ge", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
             recon = buf.as_tensor(dtype=orig.dtype, shape=orig.shape)
-            self.assertTrue(recon.is_cuda)
-            self.assertTrue(torch.equal(recon.cpu(), orig.cpu()))
+            assert recon.is_cuda
+            assert torch.equal(recon.cpu(), orig.cpu())
             buf.release()
         finally:
             p.close()
@@ -527,8 +526,8 @@ class TestGPUPool(unittest.TestCase):
 
 
 @pytest.mark.slow
-@unittest.skipIf(TransferEngine is None, "Mooncake TransferEngine not available")
-class TestStressCorrectness(unittest.TestCase):
+@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+class TestStressCorrectness:
     """
     Slow but high-value regression tests: concurrent put+get with data
     integrity, large payload, edge cases, and sustained stress.
@@ -581,20 +580,20 @@ class TestStressCorrectness(unittest.TestCase):
             for t in threads:
                 t.join()
 
-            self.assertEqual(len(errors), 0, f"Producer errors: {errors}")
-            self.assertEqual(len(meta_map), num_workers)
+            assert len(errors) == 0, f"Producer errors: {errors}"
+            assert len(meta_map) == num_workers
 
             time.sleep(1.0)
 
             # Consumer: get each tensor and verify integrity
             for rid, meta in meta_map.items():
                 result = c.get("s0", "s1", rid, meta)
-                self.assertIsNotNone(result, f"get returned None for {rid}")
+                assert result is not None, f"get returned None for {rid}"
                 buf, _ = result
-                self.assertIsInstance(buf, ManagedBuffer, f"{rid} not ManagedBuffer")
+                assert isinstance(buf, ManagedBuffer), f"{rid} not ManagedBuffer"
                 recon = buf.as_tensor(dtype=torch.float32, shape=(512, 512))
                 recv_md5 = _md5(recon)
-                self.assertEqual(recv_md5, md5_sent[rid], f"MD5 mismatch for {rid}")
+                assert recv_md5 == md5_sent[rid], f"MD5 mismatch for {rid}"
                 buf.release()
         finally:
             p.close()
@@ -683,12 +682,8 @@ class TestStressCorrectness(unittest.TestCase):
             for t in threads:
                 t.join()
             ct.join(timeout=60)
-            self.assertEqual(len(errors), 0, f"errors: {errors}")
-            self.assertEqual(
-                consumed_count[0],
-                num_items,
-                f"Consumer only processed {consumed_count[0]}/{num_items} items",
-            )
+            assert len(errors) == 0, f"errors: {errors}"
+            assert consumed_count[0] == num_items, f"Consumer only processed {consumed_count[0]}/{num_items} items"
         finally:
             p.close()
             c.close()
@@ -701,13 +696,13 @@ class TestStressCorrectness(unittest.TestCase):
         try:
             orig = torch.tensor([3.14], dtype=torch.float32)
             ok, _, meta = p.put("s0", "s1", "tiny", orig)
-            self.assertTrue(ok)
+            assert ok
             time.sleep(0.5)
             result = c.get("s0", "s1", "tiny", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
             recon = buf.as_tensor(dtype=torch.float32, shape=(1,))
-            self.assertTrue(torch.equal(recon, orig))
+            assert torch.equal(recon, orig)
             buf.release()
         finally:
             p.close()
@@ -718,7 +713,7 @@ class TestStressCorrectness(unittest.TestCase):
         port = _free_port()
         with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
             ok, sz, meta = c.put("s0", "s1", "empty_b", b"")
-            self.assertFalse(ok, "Empty bytes should be rejected by connector")
+            assert not ok, "Empty bytes should be rejected by connector"
 
     # -- Large payload stress (500 MB) --
 
@@ -731,13 +726,13 @@ class TestStressCorrectness(unittest.TestCase):
             orig = torch.randn(side, side, dtype=torch.float32)
             md5_send = _md5(orig)
             ok, _, meta = p.put("s0", "s1", "500mb", orig)
-            self.assertTrue(ok)
+            assert ok
             time.sleep(2.0)
             result = c.get("s0", "s1", "500mb", meta)
-            self.assertIsNotNone(result)
+            assert result is not None
             buf, _ = result
             recon = buf.as_tensor(dtype=orig.dtype, shape=orig.shape)
-            self.assertEqual(_md5(recon), md5_send)
+            assert _md5(recon) == md5_send
             buf.release()
         finally:
             p.close()
@@ -752,12 +747,8 @@ class TestStressCorrectness(unittest.TestCase):
             for i in range(50):
                 rid = f"cycle_{i}"
                 ok, _, _ = c.put("s0", "s1", rid, torch.randn(256, 256))
-                self.assertTrue(ok, f"Put failed at iteration {i}")
+                assert ok, f"Put failed at iteration {i}"
                 c.cleanup(rid, from_stage="s0", to_stage="s1")
             # After all cycles, pool should be fully recovered
             ok, _, _ = c.put("s0", "s1", "final", torch.randn(1024, 1024))
-            self.assertTrue(ok, "Pool not fully recovered after rapid cycles")
-
-
-if __name__ == "__main__":
-    unittest.main()
+            assert ok, "Pool not fully recovered after rapid cycles"
