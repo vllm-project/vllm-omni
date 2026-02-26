@@ -252,6 +252,33 @@ def test_health_endpoint_no_engine():
     assert data["status"] == "unhealthy"
 
 
+def test_models_endpoint(test_client):
+    """Test /v1/models endpoint for diffusion mode"""
+    response = test_client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 1
+    assert data["data"][0]["id"] == "Qwen/Qwen-Image"
+    assert data["data"][0]["object"] == "model"
+
+
+def test_models_endpoint_no_engine():
+    """Test /v1/models endpoint when no engine is initialized"""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+    # Don't set any engine
+
+    client = TestClient(app)
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 0
 
 
 def test_generate_single_image(test_client):
