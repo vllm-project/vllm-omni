@@ -263,7 +263,7 @@ class AsyncOmniDiffusion:
         )
         return all(results) if isinstance(results, list) else results
 
-    async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Add a LoRA adapter"""
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(
@@ -272,7 +272,7 @@ class AsyncOmniDiffusion:
             "add_lora",
             None,
             (),
-            {"lora_request": lora_request, "lora_scale": lora_scale},
+            {"lora_request": lora_request},
             None,
         )
         return all(results) if isinstance(results, list) else results
