@@ -38,10 +38,10 @@ steps:
         timeout 20m bash -c '
           set +e
           pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
-          EXIT1=$?
+          EXIT1=$$?
           pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
-          EXIT2=$?
-          exit $((EXIT1 | EXIT2))
+          EXIT2=$$?
+          exit $$((EXIT1 | EXIT2))
         '
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
@@ -130,10 +130,10 @@ steps:
                 export VLLM_WORKER_MULTIPROC_METHOD=spawn
                 set +e
                 pytest -s -v tests/benchmarks/test_serve_cli.py
-                EXIT1=$?
+                EXIT1=$$?
                 pytest -s -v tests/engine/test_async_omni_engine_abort.py
-                EXIT2=$?
-                exit $((EXIT1 | EXIT2))
+                EXIT2=$$?
+                exit $$((EXIT1 | EXIT2))
         '
     agents:
       queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
