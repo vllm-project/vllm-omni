@@ -11,11 +11,14 @@ from vllm_omni.entrypoints.omni import Omni
 """
 The tencent/HunyuanImage-3.0-Instruct base model is built on the Hunyuan v1 architecture, specifically the tencent/Hunyuan-A13B-Instruct model. It utilizes two tokenizer delimiter templates:
 
-1) Pretrained template, which is suitable for text-to-text scenarios:
-"<|startoftext|>You are a study abroad planning consultant.<|extra_4|>I don't need general comprehensive rankings. Please list the world's top ten universities for computer science based on the 2025 U.S. News subject rankings.<|extra_0|>\n"
+1) Pretrained template (default for gen_text mode), which concatenates system, image
+   tokens, and user question WITHOUT role delimiters:
+"<|startoftext|>{system_prompt}{image_tokens}{user_question}"
 
-2) Instruct template, which is designed for image-to-text scenarios:
-"<bos>You are an assistant for recognizing pictures, outputting text.\n\nUser: <img> Describe the content of the picture.\n\nAssistant: "
+   Example (before image token expansion):
+"<|startoftext|>You are an assistant that understands images and outputs text.<img>Describe the content of the picture."
+
+2) Instruct template, which uses explicit role prefixes and separators.
 """
 
 
@@ -35,8 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt",
         type=str,
-        default="<bos>You are an assistant for recognizing pictures, outputting text.\n\nUser: <img> Describe the content of the picture.\n\nAssistant: ",
-        help="Text prompt for the model.",
+        default="<|startoftext|>You are an assistant that understands images and outputs text.<img>Identify the animal in this image and describe this animal's characteristics in the image.",
+        help="Pretrain template prompt: <|startoftext|>{system}<img>{question}",
     )
     return parser.parse_args()
 

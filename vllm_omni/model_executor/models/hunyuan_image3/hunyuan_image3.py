@@ -13,7 +13,7 @@ from einops import rearrange
 from PIL import Image
 from torch import nn
 from torchvision import transforms
-from transformers import Siglip2ImageProcessorFast
+from transformers import PretrainedConfig, Siglip2ImageProcessorFast
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
@@ -44,6 +44,7 @@ from vllm.model_executor.models.hunyuan_v1 import (
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
     _require_is_multimodal,
@@ -58,6 +59,7 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
+    MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -73,6 +75,7 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
 from vllm.v1.sample.metadata import SamplingMetadata
 
@@ -1060,7 +1063,8 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
 
             timestep_token_num = 1
             vae_token_num = _vae_token_grid_hw[0] * _vae_token_grid_hw[1]
-            vit_token_num = _vit_token_grid_hw[0] * _vit_token_grid_hw[1]
+            hf_config = self.info.get_hf_config()
+            vit_token_num = hf_config.vit_processor.get("max_num_patches", 729)
 
             base_size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{_base_size}>")
             if base_size_token_id is None:
@@ -1092,7 +1096,7 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
     info=HunyuanImage3ProcessingInfo,
     dummy_inputs=HunyuanImage3DummyInputsBuilder,
 )
-class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA, SupportsPP):
+class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA, SupportsPP, SupportsMRoPE):
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     packed_modules_mapping = {
@@ -1113,9 +1117,15 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
 
-        # Change the rope_type from 'custom' to 'default' in the AR stage
+        # Use mRoPE to preserve 2D positional encoding for image tokens.
         if isinstance(config.rope_parameters, dict):
             config.rope_parameters["rope_type"] = "default"
+            head_dim = getattr(
+                config,
+                "head_dim",
+                getattr(config, "attention_head_dim", config.hidden_size // config.num_attention_heads),
+            )
+            config.rope_parameters["mrope_section"] = [0, head_dim // 4, head_dim // 4]
 
         self.config = config
         self.quant_config = quant_config
@@ -1158,6 +1168,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # Used to embed timestep information into the input sequence.
         self.timestep_emb = TimestepEmbedder(hidden_size=config.hidden_size)
+
+        tokenizer = get_tokenizer(vllm_config.model_config.tokenizer)
+        self._mrope_img_token_id = tokenizer.convert_tokens_to_ids("<img>")
+        self._mrope_boi_token_id = tokenizer.convert_tokens_to_ids("<boi>")
+        self._mrope_eoi_token_id = tokenizer.convert_tokens_to_ids("<eoi>")
+        self._mrope_joint_img_sep_token_id = tokenizer.convert_tokens_to_ids("<joint_img_sep>")
+        self._mrope_max_num_patches = config.vit_processor.get("max_num_patches", 729)
 
     def _parse_and_validate_image_input(
         self,
@@ -1323,11 +1340,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             # 3. ViT image embeddings
             vit_embed = vit_embeddings[img_idx]
 
-            # Slice vit_embed to valid tokens
-            h, w = vit_spatial_shapes[img_idx]
-            valid_tokens = int(h * w)
-            vit_embed = vit_embed[:valid_tokens]
-
             stacked_embed = torch.cat([timestep_emb, vae_token_embed, vit_embed], dim=0)
             combined_embeddings.append(stacked_embed)
 
@@ -1408,3 +1420,165 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     def get_language_model(self) -> torch.nn.Module:
         return self.model
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec] | None = None,
+        *,
+        hf_config: PretrainedConfig,
+        image_grid_thw: list[list[int]] | torch.Tensor,
+        video_grid_thw: list[list[int]] | torch.Tensor,
+        second_per_grid_ts: list[float] | None = None,
+        context_len: int = 0,
+        seq_len: int | None = None,
+        audio_feature_lengths: torch.Tensor | None = None,
+        use_audio_in_video: bool = False,
+    ) -> tuple[torch.Tensor, int]:
+        """Compute mRoPE positions for HunyuanImage-3.
+
+        Maps the original model's build_2d_rope logic into vLLM's 3-dim
+        mRoPE position tensor [3, seq_len] where dim-0 is temporal (unused,
+        kept equal to 1D), dim-1 is height, and dim-2 is width.
+
+        For text tokens and auxiliary image tokens (timestep, ViT):
+            All three dims get the same flat 1D position id.
+        For VAE image tokens:
+            dim-0 (T): flat 1D position id at the image start
+            dim-1 (H): 2D y-position using build_2d_rope centering
+            dim-2 (W): 2D x-position using build_2d_rope centering
+        """
+
+        # Extract per-image VAE grid dims from mm_features
+        vae_grids: list[tuple[int, int]] = []
+        if mm_features is not None:
+            for mm_feature in mm_features:
+                mm_item = mm_feature.data
+                if mm_item is None:
+                    continue
+                mm_input = mm_item.get_data()
+                vae_hw = mm_input.get("vae_token_grid_hw")
+                if vae_hw is not None:
+                    grid = vae_hw.tolist()
+                    vae_grids.append((int(grid[0]), int(grid[1])))
+
+        # Identify image token ids (cached from __init__)
+        img_token_id = self._mrope_img_token_id
+        boi_token_id = self._mrope_boi_token_id
+        eoi_token_id = self._mrope_eoi_token_id
+        joint_img_sep_token_id = self._mrope_joint_img_sep_token_id
+        max_num_patches = self._mrope_max_num_patches
+
+        # Build position arrays
+        t_pos = []  # temporal (same as 1D for this model)
+        h_pos = []  # height
+        w_pos = []  # width
+
+        pos = 0  # current 1D position counter
+        image_idx = 0
+        i = 0
+        n = len(input_tokens)
+
+        while i < n:
+            tok = input_tokens[i]
+
+            if tok == boi_token_id:
+                # Found start of image block.
+                # Structure: <boi> <size> <ratio> <img>*timestep <img>*vae
+                #            <joint_img_sep> <img>*vit <eoi>
+                # Assign <boi> a flat position
+                t_pos.append(pos)
+                h_pos.append(pos)
+                w_pos.append(pos)
+                pos += 1
+                i += 1
+
+                # <size> token
+                if i < n:
+                    t_pos.append(pos)
+                    h_pos.append(pos)
+                    w_pos.append(pos)
+                    pos += 1
+                    i += 1
+
+                # <ratio> token
+                if i < n:
+                    t_pos.append(pos)
+                    h_pos.append(pos)
+                    w_pos.append(pos)
+                    pos += 1
+                    i += 1
+
+                # Timestep token (1 <img> token)
+                if i < n and input_tokens[i] == img_token_id:
+                    t_pos.append(pos)
+                    h_pos.append(pos)
+                    w_pos.append(pos)
+                    pos += 1
+                    i += 1
+
+                # VAE tokens: get grid dims
+                if image_idx < len(vae_grids):
+                    vae_h, vae_w = vae_grids[image_idx]
+                else:
+                    vae_h, vae_w = 0, 0
+                image_idx += 1
+
+                # Assign 2D positions to VAE tokens using build_2d_rope
+                # centering logic
+                L = pos  # position at start of VAE region
+                wh = vae_w * vae_h
+                beta_y = L + (wh - vae_h) / 2
+                beta_x = L + (wh - vae_w) / 2
+
+                for row in range(vae_h):
+                    for col in range(vae_w):
+                        if i < n and input_tokens[i] == img_token_id:
+                            t_pos.append(L)  # temporal stays flat
+                            h_pos.append(int(beta_y + row))
+                            w_pos.append(int(beta_x + col))
+                            i += 1
+
+                pos = L + wh  # advance past VAE region
+
+                # <joint_img_sep> token
+                if i < n and input_tokens[i] == joint_img_sep_token_id:
+                    t_pos.append(pos)
+                    h_pos.append(pos)
+                    w_pos.append(pos)
+                    pos += 1
+                    i += 1
+
+                # ViT tokens (max_num_patches <img> tokens) — flat 1D
+                vit_consumed = 0
+                while i < n and input_tokens[i] == img_token_id and vit_consumed < max_num_patches:
+                    t_pos.append(pos)
+                    h_pos.append(pos)
+                    w_pos.append(pos)
+                    pos += 1
+                    i += 1
+                    vit_consumed += 1
+
+                # <eoi> token
+                if i < n and input_tokens[i] == eoi_token_id:
+                    t_pos.append(pos)
+                    h_pos.append(pos)
+                    w_pos.append(pos)
+                    pos += 1
+                    i += 1
+
+            else:
+                # Regular text token — flat 1D position
+                t_pos.append(pos)
+                h_pos.append(pos)
+                w_pos.append(pos)
+                pos += 1
+                i += 1
+
+        llm_positions = torch.tensor([t_pos, h_pos, w_pos], dtype=torch.long)
+        mrope_position_delta = llm_positions.max() + 1 - len(input_tokens)
+
+        if seq_len is not None:
+            llm_positions = llm_positions[:, context_len:seq_len]
+
+        return llm_positions, mrope_position_delta
