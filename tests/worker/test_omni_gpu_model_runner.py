@@ -29,6 +29,15 @@ class DummyReqState:
     pass
 
 
+class MiMoAudioForConditionalGeneration(torch.nn.Module):
+    """Dummy model whose class name must exactly match the production check."""
+
+    def __init__(self):
+        super().__init__()
+
+    # No real forward needed for these tests.
+
+
 class DummyTalkerMTP(torch.nn.Module):
     """A fake talker_mtp module for deterministic CPU testing."""
 
@@ -82,6 +91,30 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     return runner
 
 
+def _make_runner_for_mimo(req_id="r_mimo"):
+    """Create a minimal runner with MiMoAudio-like model and request state."""
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = MiMoAudioForConditionalGeneration()
+
+    # Minimal vllm_config / model_config used by helper.
+    class _DummyModelConfig:
+        async_chunk = False
+
+    class _DummyVllmConfig:
+        model_config = _DummyModelConfig()
+
+    runner.vllm_config = _DummyVllmConfig()
+
+    # Attach a single request state with mm_features and additional_information_cpu.
+    req_state = DummyReqState()
+    req_state.mm_features = ["mm_feature_obj"]
+    req_state.additional_information_cpu = {"some_key": "some_value"}
+
+    runner.requests = {req_id: req_state}
+
+    return runner
+
+
 def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     # Patch the module-level `set_forward_context` symbol used inside
     # OmniGPUModelRunner._talker_mtp_forward.
@@ -132,3 +165,32 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
 
     # Ensure no changes were made
     assert torch.allclose(inputs_embeds, before)
+
+
+def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
+    runner = _make_runner_for_mimo()
+    req_id = "r_mimo"
+    req_state = runner.requests[req_id]
+
+    # Existing req_infos should be copied and enriched, not mutated in place.
+    original_req_infos = {"existing": 1}
+    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, original_req_infos, req_id)
+
+    assert enriched is not original_req_infos
+    assert enriched["existing"] == 1
+    # mm_features should be filled from req_state when missing
+    assert enriched["mm_features"] == req_state.mm_features
+    # req_id should always be attached
+    assert enriched["req_id"] == req_id
+
+
+def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
+    runner = _make_runner_for_mimo()
+    req_id = "missing"
+    req_state = None
+    req_infos = {"k": "v"}
+
+    result = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, req_infos, req_id)
+
+    # When no req_state, helper should be a no-op.
+    assert result is req_infos

@@ -47,8 +47,9 @@ class OmniDiffusion:
         if engine_input_source is not None:
             self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
+        # Detect model class and load config
         # Diffusers-style models expose `model_index.json` with `_class_name`.
-        # Non-diffusers models (e.g. Bagel, NextStep) only have `config.json`,
+        # Non-diffusers models (e.g. Bagel, NextStep, GLM-Image) only have `config.json`,
         # so we fall back to reading that and mapping model_type manually.
         try:
             config_dict = get_hf_file_to_dict(
@@ -71,6 +72,7 @@ class OmniDiffusion:
             if cfg is None:
                 raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
+            # Map model_type or architecture to pipeline class
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
@@ -83,10 +85,17 @@ class OmniDiffusion:
                     od_config.model_class_name = "NextStep11Pipeline"
                 od_config.tf_model_config = TransformerConfig()
                 od_config.update_multimodal_support()
+            elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
+                pipeline_class = "GlmImagePipeline"
             elif architectures and len(architectures) == 1:
-                od_config.model_class_name = architectures[0]
-            else:
-                raise
+                pipeline_class = architectures[0]
+
+            if pipeline_class is None:
+                raise ValueError(f"Unknown model type: {model_type}, architectures: {architectures}")
+
+            od_config.model_class_name = pipeline_class
+            od_config.tf_model_config = TransformerConfig()
+            od_config.update_multimodal_support()
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 

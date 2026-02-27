@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -230,7 +231,8 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(**transformer_kwargs)
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
+        self.transformer = Flux2Transformer2DModel(quant_config=quant_config, **transformer_kwargs)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
@@ -993,4 +995,8 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        # Record components loaded by diffusers submodules to satisfy strict checks.
+        loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
+        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        return loaded_weights

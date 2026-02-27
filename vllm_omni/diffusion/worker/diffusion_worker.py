@@ -122,6 +122,7 @@ class DiffusionWorker:
                 ring_degree=parallel_config.ring_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
             )
             init_workspace_manager(self.device)
 
@@ -143,7 +144,10 @@ class DiffusionWorker:
                 self.rank,
                 process_memory / GiB_bytes,
             )
-        assert self.model_runner.pipeline is not None
+
+        # When load_format is "dummy", pipeline will init with custom pipeline later
+        if load_format != "dummy":
+            assert self.model_runner.pipeline is not None
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""

@@ -33,6 +33,7 @@ steps:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
+    - pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
 
 - label: "Diffusion Cache Backend Test"
   timeout_in_minutes: 15
