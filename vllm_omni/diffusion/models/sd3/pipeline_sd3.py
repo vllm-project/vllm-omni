@@ -15,6 +15,7 @@ from torch import nn
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.config import SD3Transformer2DModelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -172,7 +173,12 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
             subfolder="text_encoder_3",
             local_files_only=local_files_only,
         )
-        self.transformer = SD3Transformer2DModel(od_config=od_config)
+
+        hf_config = SD3Transformer2DModelConfig.from_tf_config(od_config.tf_model_config)
+        self.transformer = SD3Transformer2DModel(
+            hf_config=hf_config,
+            od_config=od_config,
+        )
 
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device

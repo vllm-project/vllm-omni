@@ -21,6 +21,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelL
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config.flux import FluxTransformer2DModelConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -435,45 +436,37 @@ class FluxTransformer2DModel(nn.Module):
 
     def __init__(
         self,
+        hf_config: FluxTransformer2DModelConfig,
         od_config: OmniDiffusionConfig,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        out_channels: int = None,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 4096,
-        pooled_projection_dim: int = 768,
-        guidance_embeds: bool = True,
-        axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
     ):
         super().__init__()
         model_config = od_config.tf_model_config
         num_layers = model_config.num_layers
         self.parallel_config = od_config.parallel_config
-        self.in_channels = in_channels
-        self.out_channels = out_channels or in_channels
-        self.inner_dim = num_attention_heads * attention_head_dim
-        self.guidance_embeds = guidance_embeds
+        self.in_channels = hf_config.in_channels
+        self.out_channels = hf_config.out_channels or self.in_channels
+        self.inner_dim = hf_config.num_attention_heads * hf_config.attention_head_dim
+        self.guidance_embeds = hf_config.guidance_embeds
 
-        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
+        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=hf_config.axes_dims_rope)
         text_time_guidance_cls = (
-            CombinedTimestepGuidanceTextProjEmbeddings if guidance_embeds else CombinedTimestepTextProjEmbeddings
+            CombinedTimestepGuidanceTextProjEmbeddings
+            if hf_config.guidance_embeds
+            else CombinedTimestepTextProjEmbeddings
         )
         self.time_text_embed = text_time_guidance_cls(
-            embedding_dim=self.inner_dim, pooled_projection_dim=pooled_projection_dim
+            embedding_dim=self.inner_dim, pooled_projection_dim=hf_config.pooled_projection_dim
         )
 
-        self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim)
-        self.x_embedder = nn.Linear(in_channels, self.inner_dim)
+        self.context_embedder = nn.Linear(hf_config.joint_attention_dim, self.inner_dim)
+        self.x_embedder = nn.Linear(hf_config.in_channels, self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
                 FluxTransformerBlock(
                     dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=hf_config.num_attention_heads,
+                    attention_head_dim=hf_config.attention_head_dim,
                 )
                 for _ in range(num_layers)
             ]
@@ -483,15 +476,16 @@ class FluxTransformer2DModel(nn.Module):
             [
                 FluxSingleTransformerBlock(
                     dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=hf_config.num_attention_heads,
+                    attention_head_dim=hf_config.attention_head_dim,
                 )
-                for _ in range(num_single_layers)
+                for _ in range(hf_config.num_single_layers)
             ]
         )
 
+        proj_out_dim = (hf_config.patch_size**2) * self.out_channels
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.proj_out = nn.Linear(self.inner_dim, proj_out_dim, bias=True)
 
     def forward(
         self,

@@ -17,6 +17,7 @@ from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.config import WanTransformer3DModelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -69,42 +70,18 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
-    kwargs = {}
+def get_dit_model(od_config: OmniDiffusionConfig, subfolder: str, local_files_only: bool) -> WanTransformer3DModel:
+    """Given the OmniDiffusion config & subfolder (transformer/transformer2), create the DiT."""
+    model = od_config.model
+    # Download the config from the appropriate subfolder & convert to our wrapper class
+    transformer_config = load_transformer_config(model, subfolder, local_files_only)
+    hf_config = WanTransformer3DModelConfig.from_dict(transformer_config)
 
-    if "patch_size" in config:
-        kwargs["patch_size"] = tuple(config["patch_size"])
-    if "num_attention_heads" in config:
-        kwargs["num_attention_heads"] = config["num_attention_heads"]
-    if "attention_head_dim" in config:
-        kwargs["attention_head_dim"] = config["attention_head_dim"]
-    if "in_channels" in config:
-        kwargs["in_channels"] = config["in_channels"]
-    if "out_channels" in config:
-        kwargs["out_channels"] = config["out_channels"]
-    if "text_dim" in config:
-        kwargs["text_dim"] = config["text_dim"]
-    if "freq_dim" in config:
-        kwargs["freq_dim"] = config["freq_dim"]
-    if "ffn_dim" in config:
-        kwargs["ffn_dim"] = config["ffn_dim"]
-    if "num_layers" in config:
-        kwargs["num_layers"] = config["num_layers"]
-    if "cross_attn_norm" in config:
-        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
-    if "eps" in config:
-        kwargs["eps"] = config["eps"]
-    if "image_dim" in config:
-        kwargs["image_dim"] = config["image_dim"]
-    if "added_kv_proj_dim" in config:
-        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
-    if "rope_max_seq_len" in config:
-        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
-    if "pos_embed_seq_len" in config:
-        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
-
-    return WanTransformer3DModel(**kwargs)
+    # Create the DiT corresponding to the subfolder
+    return WanTransformer3DModel(
+        od_config=od_config,
+        hf_config=hf_config,
+    )
 
 
 def get_wan22_post_process_func(
@@ -272,23 +249,31 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin):
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
-        if load_transformer:
-            transformer_config = load_transformer_config(model, "transformer", local_files_only)
-            self.transformer = create_transformer_from_config(transformer_config)
-        else:
-            self.transformer = None
+        self.transformer = (
+            get_dit_model(
+                od_config=od_config,
+                subfolder="transformer",
+                local_files_only=local_files_only,
+            )
+            if load_transformer
+            else None
+        )
 
-        if load_transformer_2:
-            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = create_transformer_from_config(transformer_2_config)
-        else:
-            self.transformer_2 = None
+        self.transformer_2 = (
+            get_dit_model(
+                od_config=od_config,
+                subfolder="transformer_2",
+                local_files_only=local_files_only,
+            )
+            if load_transformer_2
+            else None
+        )
 
         # Store the active transformer config
         if load_transformer:
-            self.transformer_config = self.transformer.config
+            self.transformer_config = self.transformer.hf_config
         elif load_transformer_2:
-            self.transformer_config = self.transformer_2.config
+            self.transformer_config = self.transformer_2.hf_config
         else:
             raise RuntimeError("No transformer loaded")
 

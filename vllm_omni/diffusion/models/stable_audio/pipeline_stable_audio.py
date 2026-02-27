@@ -24,6 +24,7 @@ from transformers import T5EncoderModel, T5TokenizerFast
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.config.stable_audio import StableAudioDiTModelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -128,7 +129,11 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         ).to(self.device)
 
         # Initialize our custom transformer (weights loaded via load_weights)
-        self.transformer = StableAudioDiTModel(od_config=od_config)
+        hf_config = StableAudioDiTModelConfig.from_tf_config(od_config.tf_model_config)
+        self.transformer = StableAudioDiTModel(
+            hf_config=hf_config,
+            od_config=od_config,
+        )
 
         # Load scheduler
         self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(
@@ -138,7 +143,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         )
 
         # Compute rotary embedding dimension
-        self.rotary_embed_dim = self.transformer.config.attention_head_dim // 2
+        self.rotary_embed_dim = self.transformer.hf_config.attention_head_dim // 2
 
         # Cache backend (set by worker if needed)
         self._cache_backend = None
@@ -408,7 +413,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
 
         # Calculate audio length
         downsample_ratio = self.vae.hop_length
-        max_audio_length_in_s = self.transformer.config.sample_size * downsample_ratio / self.vae.config.sampling_rate
+        max_audio_length_in_s = (
+            self.transformer.hf_config.sample_size * downsample_ratio / self.vae.config.sampling_rate
+        )
 
         if audio_end_in_s is None:
             audio_end_in_s = max_audio_length_in_s
@@ -421,7 +428,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
 
         waveform_start = int(audio_start_in_s * self.vae.config.sampling_rate)
         waveform_end = int(audio_end_in_s * self.vae.config.sampling_rate)
-        waveform_length = int(self.transformer.config.sample_size)
+        waveform_length = int(self.transformer.hf_config.sample_size)
 
         # Validate inputs
         self.check_inputs(
@@ -504,7 +511,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         self._num_timesteps = len(timesteps)
 
         # Prepare latents
-        num_channels_vae = self.transformer.config.in_channels
+        num_channels_vae = self.transformer.hf_config.in_channels
         latents = self.prepare_latents(
             batch_size * num_waveforms_per_prompt,
             num_channels_vae,

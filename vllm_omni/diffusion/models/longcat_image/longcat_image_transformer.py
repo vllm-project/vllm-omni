@@ -18,6 +18,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config.longcat_image import LongCatImageTransformer2DModelConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
@@ -516,40 +517,32 @@ class LongCatImageTransformer2DModel(nn.Module):
 
     def __init__(
         self,
+        hf_config: LongCatImageTransformer2DModelConfig,
         od_config: OmniDiffusionConfig,
-        patch_size: int = 1,
-        in_channels: int = 64,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
-        attention_head_dim: int = 128,
-        num_attention_heads: int = 24,
-        joint_attention_dim: int = 3584,
-        pooled_projection_dim: int = 3584,
-        axes_dims_rope: list[int] = [16, 56, 56],
     ):
         super().__init__()
-        self.out_channels = in_channels
-        self.inner_dim = num_attention_heads * attention_head_dim
-        self.pooled_projection_dim = pooled_projection_dim
+        self.out_channels = hf_config.in_channels
+        self.inner_dim = hf_config.num_attention_heads * hf_config.attention_head_dim
+        self.pooled_projection_dim = hf_config.pooled_projection_dim
 
         # Store parallel config for SP support
         self.parallel_config = od_config.parallel_config
 
-        self.pos_embed = LongCatImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
+        self.pos_embed = LongCatImagePosEmbed(theta=10000, axes_dim=hf_config.axes_dims_rope)
 
         self.time_embed = LongCatImageTimestepEmbeddings(embedding_dim=self.inner_dim)
 
-        self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim)
-        self.x_embedder = torch.nn.Linear(in_channels, self.inner_dim)
+        self.context_embedder = nn.Linear(hf_config.joint_attention_dim, self.inner_dim)
+        self.x_embedder = torch.nn.Linear(hf_config.in_channels, self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
                 LongCatImageTransformerBlock(
                     dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=hf_config.num_attention_heads,
+                    attention_head_dim=hf_config.attention_head_dim,
                 )
-                for i in range(num_layers)
+                for i in range(hf_config.num_layers)
             ]
         )
 
@@ -557,20 +550,20 @@ class LongCatImageTransformer2DModel(nn.Module):
             [
                 LongCatImageSingleTransformerBlock(
                     dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
+                    num_attention_heads=hf_config.num_attention_heads,
+                    attention_head_dim=hf_config.attention_head_dim,
                 )
-                for i in range(num_single_layers)
+                for i in range(hf_config.num_single_layers)
             ]
         )
-
+        proj_out_dim = (hf_config.patch_size**2) * self.out_channels
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+        self.proj_out = nn.Linear(self.inner_dim, proj_out_dim, bias=True)
 
         self.gradient_checkpointing = False
 
-        self.use_checkpoint = [True] * num_layers
-        self.use_single_checkpoint = [True] * num_single_layers
+        self.use_checkpoint = [True] * hf_config.num_layers
+        self.use_single_checkpoint = [True] * hf_config.num_single_layers
 
     def forward(
         self,

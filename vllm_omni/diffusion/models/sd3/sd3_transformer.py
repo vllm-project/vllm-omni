@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import SD3Transformer2DModelConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
@@ -388,27 +389,25 @@ class SD3Transformer2DModel(nn.Module):
 
     def __init__(
         self,
+        hf_config: SD3Transformer2DModelConfig,
         od_config: OmniDiffusionConfig,
-    ):
+    ) -> None:
         super().__init__()
-        model_config = od_config.tf_model_config
-        self.num_layers = model_config.num_layers
+        self.num_layers = hf_config.num_layers
         self.parallel_config = od_config.parallel_config
-        self.sample_size = model_config.sample_size
-        self.in_channels = model_config.in_channels
-        self.out_channels = model_config.out_channels
-        self.num_attention_heads = model_config.num_attention_heads
-        self.attention_head_dim = model_config.attention_head_dim
-        self.inner_dim = model_config.num_attention_heads * model_config.attention_head_dim
-        self.caption_projection_dim = model_config.caption_projection_dim
-        self.pooled_projection_dim = model_config.pooled_projection_dim
-        self.joint_attention_dim = model_config.joint_attention_dim
-        self.patch_size = model_config.patch_size
-        self.dual_attention_layers = (
-            model_config.dual_attention_layers if hasattr(model_config, "dual_attention_layers") else ()
-        )
-        self.qk_norm = model_config.qk_norm if hasattr(model_config, "qk_norm") else ""
-        self.pos_embed_max_size = model_config.pos_embed_max_size
+        self.sample_size = hf_config.sample_size
+        self.in_channels = hf_config.in_channels
+        self.out_channels = hf_config.out_channels
+        self.num_attention_heads = hf_config.num_attention_heads
+        self.attention_head_dim = hf_config.attention_head_dim
+        self.inner_dim = hf_config.num_attention_heads * hf_config.attention_head_dim
+        self.caption_projection_dim = hf_config.caption_projection_dim
+        self.pooled_projection_dim = hf_config.pooled_projection_dim
+        self.joint_attention_dim = hf_config.joint_attention_dim
+        self.patch_size = hf_config.patch_size
+        self.dual_attention_layers = hf_config.dual_attention_layers
+        self.qk_norm = hf_config.qk_norm
+        self.pos_embed_max_size = hf_config.pos_embed_max_size
 
         self.pos_embed = PatchEmbed(
             height=self.sample_size,

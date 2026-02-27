@@ -24,6 +24,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import WanTransformer3DModelConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -776,49 +778,30 @@ class WanTransformer3DModel(nn.Module):
 
     def __init__(
         self,
-        patch_size: tuple[int, int, int] = (1, 2, 2),
-        num_attention_heads: int = 40,
-        attention_head_dim: int = 128,
-        in_channels: int = 16,
-        out_channels: int = 16,
-        text_dim: int = 4096,
-        freq_dim: int = 256,
-        ffn_dim: int = 13824,
-        num_layers: int = 40,
-        cross_attn_norm: bool = True,
-        eps: float = 1e-6,
-        image_dim: int | None = None,
-        added_kv_proj_dim: int | None = None,
-        rope_max_seq_len: int = 1024,
-        pos_embed_seq_len: int | None = None,
+        od_config: OmniDiffusionConfig,
+        hf_config: WanTransformer3DModelConfig,
     ):
         super().__init__()
+        self.hf_config = hf_config
 
-        # Store config for compatibility
-        self.config = type(
-            "Config",
-            (),
-            {
-                "patch_size": patch_size,
-                "num_attention_heads": num_attention_heads,
-                "attention_head_dim": attention_head_dim,
-                "in_channels": in_channels,
-                "out_channels": out_channels,
-                "text_dim": text_dim,
-                "freq_dim": freq_dim,
-                "ffn_dim": ffn_dim,
-                "num_layers": num_layers,
-                "cross_attn_norm": cross_attn_norm,
-                "eps": eps,
-                "image_dim": image_dim,
-                "added_kv_proj_dim": added_kv_proj_dim,
-                "rope_max_seq_len": rope_max_seq_len,
-                "pos_embed_seq_len": pos_embed_seq_len,
-            },
-        )()
+        # Unpack attributes from the config after resolving missing defaults
+        num_attention_heads = self.hf_config.num_attention_heads
+        attention_head_dim = self.hf_config.attention_head_dim
+        in_channels = self.hf_config.in_channels
+        patch_size = self.hf_config.patch_size
+        freq_dim = self.hf_config.freq_dim
+        text_dim = self.hf_config.text_dim
+        image_dim = self.hf_config.image_dim
+        pos_embed_seq_len = self.hf_config.pos_embed_seq_len
+        rope_max_seq_len = self.hf_config.rope_max_seq_len
+        eps = self.hf_config.eps
+        ffn_dim = self.hf_config.ffn_dim
+        added_kv_proj_dim = self.hf_config.added_kv_proj_dim
+        cross_attn_norm = self.hf_config.cross_attn_norm
+        num_layers = self.hf_config.num_layers
 
         inner_dim = num_attention_heads * attention_head_dim
-        out_channels = out_channels or in_channels
+        out_channels = self.hf_config.out_channels or in_channels
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
@@ -870,7 +853,7 @@ class WanTransformer3DModel(nn.Module):
         attention_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
-        p_t, p_h, p_w = self.config.patch_size
+        p_t, p_h, p_w = self.hf_config.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w

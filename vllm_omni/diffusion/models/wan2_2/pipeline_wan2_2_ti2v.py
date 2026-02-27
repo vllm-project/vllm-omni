@@ -37,8 +37,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
-    create_transformer_from_config,
-    load_transformer_config,
+    get_dit_model,
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -179,8 +178,11 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
 
         # Single transformer (TI2V uses dense 5B model, not MoE)
         # Load config from model to get correct dimensions
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = get_dit_model(
+            od_config=od_config,
+            subfolder="transformer",
+            local_files_only=local_files_only,
+        )
 
         # Initialize UniPC scheduler
         flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
@@ -328,7 +330,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         self._num_timesteps = len(timesteps)
 
         # Prepare latents
-        num_channels_latents = self.transformer.config.in_channels
+        num_channels_latents = self.transformer.hf_config.in_channels
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial

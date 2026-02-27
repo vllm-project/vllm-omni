@@ -33,6 +33,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.quantization import get_vllm_quant_config_for_layers
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
+from vllm_omni.diffusion.config import ZImageTransformer2DModelConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -596,36 +600,32 @@ class ZImageTransformer2DModel(CachedTransformer):
 
     def __init__(
         self,
-        all_patch_size=(2,),
-        all_f_patch_size=(1,),
-        in_channels=16,
-        dim=3840,
-        n_layers=30,
-        n_refiner_layers=2,
-        n_heads=30,
-        n_kv_heads=30,
-        norm_eps=1e-5,
-        qk_norm=True,
-        cap_feat_dim=2560,
-        rope_theta=256.0,
-        t_scale=1000.0,
-        axes_dims=[32, 48, 48],
-        axes_lens=[1024, 512, 512],
-        quant_config: "QuantizationConfig | None" = None,
+        hf_config: ZImageTransformer2DModelConfig,
+        od_config: OmniDiffusionConfig,
     ) -> None:
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
-        self.all_patch_size = all_patch_size
-        self.all_f_patch_size = all_f_patch_size
-        self.dim = dim
-        self.n_heads = n_heads
+        quant_config = get_vllm_quant_config_for_layers(od_config.quantization_config)
 
-        self.rope_theta = rope_theta
-        self.t_scale = t_scale
-        self.gradient_checkpointing = False
+        self.hf_config = hf_config
+        self.t_scale = self.hf_config.t_scale
+        self.out_channels = self.hf_config.in_channels
+        self.in_channels = self.hf_config.in_channels
+        self.axes_dims = self.hf_config.axes_dims
+        self.axes_lens = self.hf_config.axes_lens
+        self.all_patch_size = self.hf_config.all_patch_size
+        self.all_f_patch_size = self.hf_config.all_f_patch_size
 
-        assert len(all_patch_size) == len(all_f_patch_size)
+        in_channels = self.hf_config.in_channels
+        dim = self.hf_config.dim
+        n_layers = self.hf_config.n_layers
+        n_refiner_layers = self.hf_config.n_refiner_layers
+        n_heads = self.hf_config.n_heads
+        n_kv_heads = self.hf_config.n_kv_heads
+        norm_eps = self.hf_config.norm_eps
+        qk_norm = self.hf_config.qk_norm
+        cap_feat_dim = self.hf_config.cap_feat_dim
+
+        assert len(self.all_patch_size) == len(self.all_f_patch_size)
 
         tp_size = _get_tensor_parallel_size_from_context()
         ffn_hidden_dim, final_out_dims, supported_tp_candidates = validate_zimage_tp_constraints(
@@ -633,8 +633,8 @@ class ZImageTransformer2DModel(CachedTransformer):
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             in_channels=self.out_channels,
-            all_patch_size=tuple(all_patch_size),
-            all_f_patch_size=tuple(all_f_patch_size),
+            all_patch_size=tuple(self.all_patch_size),
+            all_f_patch_size=tuple(self.all_f_patch_size),
             tensor_parallel_size=tp_size,
         )
 
@@ -651,7 +651,7 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         all_x_embedder = {}
         all_final_layer = {}
-        for patch_idx, (patch_size, f_patch_size) in enumerate(zip(all_patch_size, all_f_patch_size)):
+        for patch_idx, (patch_size, f_patch_size) in enumerate(zip(self.all_patch_size, self.all_f_patch_size)):
             x_embedder = nn.Linear(f_patch_size * patch_size * patch_size * in_channels, dim, bias=True)
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
 
@@ -713,10 +713,12 @@ class ZImageTransformer2DModel(CachedTransformer):
                 for layer_id in range(n_layers)
             ]
         )
-        self.axes_dims = axes_dims
-        self.axes_lens = axes_lens
 
-        self.rope_embedder = RopeEmbedder(theta=rope_theta, axes_dims=axes_dims, axes_lens=axes_lens)
+        self.rope_embedder = RopeEmbedder(
+            theta=self.hf_config.rope_theta,
+            axes_dims=self.axes_dims,
+            axes_lens=self.axes_lens,
+        )
 
         # UnifiedPrepare module for combining x and cap tensors
         # This enables _cp_plan to shard outputs via split_output=True

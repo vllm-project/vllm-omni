@@ -24,8 +24,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
-    create_transformer_from_config,
-    load_transformer_config,
+    get_dit_model,
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -216,13 +215,21 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
 
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
-        if self.has_transformer_2:
-            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = create_transformer_from_config(transformer_2_config)
-        else:
-            self.transformer_2 = None
+        self.transformer = get_dit_model(
+            od_config=od_config,
+            subfolder="transformer",
+            local_files_only=local_files_only,
+        )
+
+        self.transformer_2 = (
+            get_dit_model(
+                od_config=od_config,
+                subfolder="transformer_2",
+                local_files_only=local_files_only,
+            )
+            if self.has_transformer_2
+            else None
+        )
 
         # Initialize UniPC scheduler
         flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
@@ -406,7 +413,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         batch_size = prompt_embeds.shape[0]
 
         # Encode image embeddings (for Wan2.1-style with CLIP)
-        if self.has_image_encoder and self.transformer.config.image_dim is not None:
+        if self.has_image_encoder and self.transformer.hf_config.image_dim is not None:
             if image_embeds is None:
                 if last_image is None:
                     image_embeds = self.encode_image(image, device)
@@ -427,7 +434,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
-        num_channels_latents = self.transformer.config.out_channels
+        num_channels_latents = self.transformer.hf_config.out_channels
 
         # Preprocess image for VAE
         from diffusers.video_processor import VideoProcessor

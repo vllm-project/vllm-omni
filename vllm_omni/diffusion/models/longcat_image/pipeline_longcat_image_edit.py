@@ -25,6 +25,7 @@ from transformers import (
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.config.longcat_image import LongCatImageTransformer2DModelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -256,7 +257,15 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = LongCatImageTransformer2DModel(od_config=od_config)
+
+        hf_config = LongCatImageTransformer2DModelConfig.from_tf_config(
+            od_config.tf_model_config,
+        )
+        self.transformer = LongCatImageTransformer2DModel(
+            hf_config=hf_config,
+            od_config=od_config,
+        )
+
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8

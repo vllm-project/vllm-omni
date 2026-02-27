@@ -16,6 +16,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config.stable_audio import StableAudioDiTModelConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
@@ -377,49 +378,26 @@ class StableAudioDiTModel(nn.Module):
 
     def __init__(
         self,
-        od_config: OmniDiffusionConfig | None = None,
-        sample_size: int = 1024,
-        in_channels: int = 64,
-        num_layers: int = 24,
-        attention_head_dim: int = 64,
-        num_attention_heads: int = 24,
-        num_key_value_attention_heads: int = 12,
-        out_channels: int = 64,
-        cross_attention_dim: int = 768,
-        time_proj_dim: int = 256,
-        global_states_input_dim: int = 1536,
-        cross_attention_input_dim: int = 768,
-    ):
+        hf_config: StableAudioDiTModelConfig,
+        od_config: OmniDiffusionConfig,
+    ) -> None:
         super().__init__()
 
-        self.sample_size = sample_size
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_layers = num_layers
-        self.attention_head_dim = attention_head_dim
-        self.num_attention_heads = num_attention_heads
+        self.hf_config = hf_config
+        self.sample_size = hf_config.sample_size
+        self.in_channels = hf_config.in_channels
+        self.out_channels = hf_config.out_channels
+        self.num_layers = hf_config.num_layers
+        self.attention_head_dim = hf_config.attention_head_dim
+        self.num_attention_heads = hf_config.num_attention_heads
+        in_channels = hf_config.in_channels
+        out_channels = hf_config.out_channels
+        time_proj_dim = hf_config.time_proj_dim
+        cross_attention_input_dim = hf_config.cross_attention_input_dim
+        cross_attention_dim = hf_config.cross_attention_dim
 
         # inner_dim is the transformer hidden dimension
-        self.inner_dim = num_attention_heads * attention_head_dim
-
-        # Store config for compatibility
-        self.config = type(
-            "Config",
-            (),
-            {
-                "sample_size": sample_size,
-                "in_channels": in_channels,
-                "out_channels": out_channels,
-                "num_layers": num_layers,
-                "attention_head_dim": attention_head_dim,
-                "num_attention_heads": num_attention_heads,
-                "num_key_value_attention_heads": num_key_value_attention_heads,
-                "cross_attention_dim": cross_attention_dim,
-                "time_proj_dim": time_proj_dim,
-                "global_states_input_dim": global_states_input_dim,
-                "cross_attention_input_dim": cross_attention_input_dim,
-            },
-        )()
+        self.inner_dim = hf_config.num_attention_heads * hf_config.attention_head_dim
 
         # Time projection (Gaussian Fourier features)
         # time_proj_dim is the OUTPUT dimension (after sin/cos concatenation)
@@ -436,7 +414,7 @@ class StableAudioDiTModel(nn.Module):
         # Global states projection (for audio duration conditioning)
         # Output is inner_dim, added to time embedding
         self.global_proj = nn.Sequential(
-            nn.Linear(global_states_input_dim, self.inner_dim, bias=False),
+            nn.Linear(hf_config.global_states_input_dim, self.inner_dim, bias=False),
             nn.SiLU(),
             nn.Linear(self.inner_dim, self.inner_dim, bias=False),
         )
@@ -460,12 +438,12 @@ class StableAudioDiTModel(nn.Module):
             [
                 StableAudioDiTBlock(
                     dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    num_key_value_attention_heads=num_key_value_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    cross_attention_dim=cross_attention_dim,
+                    num_attention_heads=hf_config.num_attention_heads,
+                    num_key_value_attention_heads=hf_config.num_key_value_attention_heads,
+                    attention_head_dim=hf_config.attention_head_dim,
+                    cross_attention_dim=hf_config.cross_attention_dim,
                 )
-                for _ in range(num_layers)
+                for _ in range(hf_config.num_layers)
             ]
         )
 
