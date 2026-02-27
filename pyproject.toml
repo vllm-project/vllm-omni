@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni"
-version = "0.14.0"
+dynamic = ["version", "dependencies"]
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -17,7 +17,6 @@ authors = [
     {name = "vLLM-Omni Team"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
-dynamic = ["dependencies"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -85,7 +84,11 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
+"vllm_omni" = ["_version.py", "py.typed"]
 "vllm_omni.model_executor.stage_configs" = ["*.yaml"]
+
+[tool.setuptools_scm]
+# no extra settings needed, presence enables setuptools-scm
 
 [tool.ruff]
 line-length = 120
