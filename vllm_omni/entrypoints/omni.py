@@ -496,6 +496,22 @@ class OmniBase:
 
         logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
 
+    def _is_profiler_enabled(self, stage_id: int) -> bool:
+        """Check if profiler config is set for a given stage."""
+        stage = self.stage_list[stage_id]
+        # For diffusion stages, profiling is controlled by VLLM_TORCH_PROFILER_DIR env var
+        if stage.stage_type == "diffusion":
+            return True
+        # For LLM stages, check if profiler_config is set in engine_args
+        engine_args = getattr(stage.stage_config, "engine_args", None)
+        if engine_args is None:
+            return False
+        profiler_config = getattr(engine_args, "profiler_config", None)
+        if profiler_config is None:
+            return False
+        profiler = getattr(profiler_config, "profiler", None)
+        return profiler is not None
+
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.
 
@@ -520,6 +536,13 @@ class OmniBase:
 
         for stage_id in stages:
             if stage_id < len(self.stage_list):
+                if not self._is_profiler_enabled(stage_id):
+                    logger.info(
+                        "[%s] Skipping start_profile for stage-%s: profiler config not set",
+                        self._name,
+                        stage_id,
+                    )
+                    continue
                 try:
                     self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
                     logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
@@ -543,6 +566,13 @@ class OmniBase:
 
         for stage_id in stages:
             if stage_id < len(self.stage_list):
+                if not self._is_profiler_enabled(stage_id):
+                    logger.info(
+                        "[%s] Skipping stop_profile for stage-%s: profiler config not set",
+                        self._name,
+                        stage_id,
+                    )
+                    continue
                 stage = self.stage_list[stage_id]
 
                 # Check if the stage object has our new bridge method
