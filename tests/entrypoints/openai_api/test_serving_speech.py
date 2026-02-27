@@ -7,6 +7,7 @@ import pytest
 import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
@@ -507,3 +508,110 @@ class TestTTSMethods:
         error = server._validate_tts_request(req)
         assert error is not None
         assert "max 10 characters" in error
+
+
+class TestStreamingProtocolValidation:
+    """Unit tests for the stream field validators in OpenAICreateSpeechRequest."""
+
+    def test_stream_validation_errors(self):
+        """stream=True requires response_format='pcm' and speed=1.0."""
+        with pytest.raises(ValidationError, match="response_format='pcm'"):
+            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
+        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
+            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+
+    def test_stream_valid(self):
+        """stream=True + response_format='pcm' + speed=1.0 is accepted."""
+        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm")
+        assert req.stream is True
+
+    def test_sse_stream_format_is_blocked(self):
+        """stream_format='sse' is blocked."""
+        with pytest.raises(ValidationError, match="sse"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
+
+
+class TestStreamingResponse:
+    """Integration tests for the streaming audio response path."""
+
+    @pytest.fixture
+    def streaming_app(self, mocker: MockerFixture):
+        """Test app whose mock engine yields one intermediate chunk then a final chunk."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+
+        def _make_output(finished: bool) -> OmniRequestOutput:
+            chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
+
+            class MockCompletionOutput:
+                def __init__(self, index: int = 0):
+                    self.index = index
+                    self.text = ""
+                    self.token_ids = []
+                    self.finish_reason = "stop"
+                    self.stop_reason = None
+                    self.logprobs = None
+
+            class MockRequestOutput:
+                def __init__(self, audio_tensor: torch.Tensor):
+                    self.request_id = "speech-stream-test"
+                    self.outputs = [MockCompletionOutput(index=0)]
+                    self.multimodal_output = {"audio": audio_tensor}
+                    self.finished = finished
+                    self.prompt_token_ids = None
+                    self.encoder_prompt_token_ids = None
+                    self.num_cached_tokens = None
+                    self.prompt_logprobs = None
+                    self.kv_transfer_params = None
+
+            return OmniRequestOutput(
+                stage_id=0,
+                final_output_type="audio",
+                request_output=MockRequestOutput(audio_tensor=chunk),
+                finished=finished,
+            )
+
+        async def mock_generate_streaming(*args, **kwargs):
+            yield _make_output(finished=False)
+            yield _make_output(finished=True)
+
+        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        original_create_speech = speech_server.create_speech
+        sig = signature(original_create_speech)
+        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
+        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+        async def awaitable_create_speech(*args, **kwargs):
+            return await original_create_speech(*args, **kwargs)
+
+        awaitable_create_speech.__signature__ = new_sig
+        speech_server.create_speech = awaitable_create_speech
+
+        app = FastAPI()
+        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        return app
+
+    def test_streaming(self, streaming_app):
+        """stream=True must return audio/pcm with non-empty body."""
+        client = TestClient(streaming_app)
+        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers["content-type"]
+        assert len(response.content) > 0
+
+    def test_non_streaming_unchanged(self, streaming_app):
+        """Non-streaming path must still return audio/wav."""
+        client = TestClient(streaming_app)
+        response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
+        assert response.status_code == 200
+        assert "audio/wav" in response.headers["content-type"]

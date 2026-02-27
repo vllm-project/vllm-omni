@@ -175,16 +175,6 @@ def parse_args() -> argparse.Namespace:
         help="Scale factor for LoRA weights (default: 1.0).",
     )
     parser.add_argument(
-        "--vae_use_slicing",
-        action="store_true",
-        help="Enable VAE slicing for memory optimization.",
-    )
-    parser.add_argument(
-        "--vae_use_tiling",
-        action="store_true",
-        help="Enable VAE tiling for memory optimization.",
-    )
-    parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
         default=1,
@@ -286,7 +276,6 @@ def main():
     omni_kwargs = {
         "model": args.model,
         "enable_layerwise_offload": args.enable_layerwise_offload,
-        "layerwise_num_gpu_layers": args.layerwise_num_gpu_layers,
         "vae_use_slicing": args.vae_use_slicing,
         "vae_use_tiling": args.vae_use_tiling,
         "cache_backend": args.cache_backend,
