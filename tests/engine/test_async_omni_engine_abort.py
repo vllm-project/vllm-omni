@@ -60,7 +60,7 @@ async def generate(
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_abort():
     with ExitStack() as after:
