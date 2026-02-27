@@ -1,0 +1,44 @@
+steps:
+  - input: "Provide Release version here"
+    id: input-release-version
+    fields:
+      - text: "What is the release version? (in X.X.X format or in X.X.XrcX format)"
+        key: release-version
+
+  - group: "Build release Docker images"
+    key: "build-release-images"
+    steps:
+      - label: "Build release image - x86_64 - CUDA 12.9"
+        depends_on: ~
+        id: build-release-image-x86
+        agents:
+          queue: cpu_queue_postmerge
+        commands:
+          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - "DOCKER_BUILDKIT=1 docker build --build-arg max_jobs=16 --tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) --target vllm-omni-openai --progress plain -f docker/Dockerfile ."
+          - "docker tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m) public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
+          - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT"
+
+      - label: "Build release image - x86_64 - ROCm"
+        depends_on: ~
+        id: build-release-image-x86-rocm
+        agents:
+          queue: cpu_queue_postmerge
+        commands:
+          - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
+          - "DOCKER_BUILDKIT=1 docker build --build-arg max_jobs=16 --tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)-rocm --target vllm-omni-openai --progress plain -f docker/Dockerfile.rocm ."
+          - "docker tag public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-$(uname -m)-rocm public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-rocm"
+          - "docker push public.ecr.aws/q9t5s3a7/vllm-omni-release-repo:$BUILDKITE_COMMIT-rocm"
+
+  - group: "Publish release images"
+    key: "publish-release-images"
+    steps:
+      - label: "Annotate release workflow"
+        depends_on:
+          - build-release-images
+          - input-release-version
+        id: annotate-release-workflow
+        agents:
+          queue: small_cpu_queue_postmerge
+        commands:
+          - "bash .buildkite/scripts/annotate-release.sh"

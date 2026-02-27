@@ -18,4 +18,8 @@ RUN uv pip install --system --no-cache-dir ".[dev]"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
+FROM base AS test
 ENTRYPOINT []
+
+FROM base AS vllm-omni-openai
+ENTRYPOINT ["vllm", "serve", "--omni"]
