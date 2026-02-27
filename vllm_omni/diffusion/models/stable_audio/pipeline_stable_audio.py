@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
 logger = init_logger(__name__)
 
@@ -127,8 +128,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             local_files_only=local_files_only,
         ).to(self.device)
 
-        # Initialize our custom transformer (weights loaded via load_weights)
-        self.transformer = StableAudioDiTModel(od_config=od_config)
+        # Initialize transformer from HF config to keep architecture aligned with checkpoint.
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, StableAudioDiTModel)
+        self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
 
         # Load scheduler
         self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(

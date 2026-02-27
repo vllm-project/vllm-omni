@@ -46,6 +46,7 @@ nav:
       - Quantization:
         - Overview: user_guide/diffusion/quantization/overview.md
         - FP8: user_guide/diffusion/quantization/fp8.md
+        - GGUF: user_guide/diffusion/quantization/gguf.md
       - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md

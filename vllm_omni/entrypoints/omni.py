@@ -285,6 +285,13 @@ class OmniBase:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                quantization_config = kwargs.get("quantization_config")
+                if quantization_config is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "quantization_config")
+                        or cfg.engine_args.quantization_config is None
+                    ):
+                        cfg.engine_args.quantization_config = quantization_config
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 
