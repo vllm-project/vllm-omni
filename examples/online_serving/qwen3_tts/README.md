@@ -234,22 +234,23 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### OpenAI Standard Parameters
 
-| Parameter         | Type   | Default        | Description                                               |
-| ----------------- | ------ | -------------- | --------------------------------------------------------- |
-| `input`           | string | **required**   | Text to synthesize                                        |
-| `model`           | string | server's model | Model to use (optional, should match server if specified) |
-| `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                  |
-| `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus              |
-| `speed`           | float  | 1.0            | Playback speed (0.25-4.0)                                 |
+| Parameter         | Type   | Default        | Description                                                 |
+| ----------------- | ------ | -------------- | ----------------------------------------------------------- |
+| `input`           | string | **required**   | Text to synthesize                                          |
+| `model`           | string | server's model | Model to use (optional, should match server if specified)   |
+| `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
+| `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus                |
+| `speed`           | float  | 1.0            | Playback speed (0.25-4.0, not supported with `stream=true`) |
 
 ### vLLM-Omni Extension Parameters
 
-| Parameter        | Type   | Default       | Description                              |
-| ---------------- | ------ | ------------- | ---------------------------------------- |
-| `task_type`      | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base  |
-| `language`       | string | "Auto"        | Language (see supported languages below) |
-| `instructions`   | string | ""            | Voice style/emotion instructions         |
-| `max_new_tokens` | int    | 2048          | Maximum tokens to generate               |
+| Parameter        | Type   | Default       | Description                                                                  |
+| ---------------- | ------ | ------------- | ---------------------------------------------------------------------------- |
+| `task_type`      | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base                                      |
+| `language`       | string | "Auto"        | Language (see supported languages below)                                     |
+| `instructions`   | string | ""            | Voice style/emotion instructions                                             |
+| `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
+| `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
