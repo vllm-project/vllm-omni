@@ -3,16 +3,16 @@
 
 from __future__ import annotations
 
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -24,16 +24,16 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
-from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
+from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
+from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
 # yapf conflicts with isort for this block
 # yapf: disable
-from vllm_ascend.compilation.acl_graph import update_full_graph_params
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.utils import ProfileExecuteDuration
+from vllm_ascend.utils import enable_sp
 
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -47,13 +47,14 @@ class ExecuteModelState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: torch.Tensor
     spec_decode_metadata: SpecDecodeMetadata | None
+    spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
     hidden_states: torch.Tensor
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
-    kv_connector_output: KVConnectorOutput | None
-    attn_metadata: dict[str, Any]
+    attn_metadata: PerLayerAttnMetadata
     positions: torch.Tensor
     ec_connector_output: ECConnectorOutput | None
+    cudagraph_stats: CUDAGraphStat | None
     multimodal_outputs: Any
 
 class NPUARModelRunner(OmniNPUModelRunner):
@@ -86,10 +87,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
         self,
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+    ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
-            raise RuntimeError("State error: sample_tokens() must be called "
-                               "after execute_model() returns None.")
+            raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
@@ -101,110 +101,202 @@ class NPUARModelRunner(OmniNPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
         #  -------------------------------------- Omni-new -------------------------------------------------
+        # self._draft_token_ids is None when `input_fits_in_drafter=False`
+        # and there is no draft tokens scheduled. so it need to update the
+        # spec_decoding info in scheduler_output with async_scheduling.
+        # use deepcopy to avoid the modification has influence on the
+        # scheduler_output in engine core process.
+        # TODO(Ronald1995): deepcopy is expensive when there is a large
+        # number of requests, optimize it later.
+        if (
+            self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
+        ):
+            scheduler_output = deepcopy(scheduler_output)
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        with record_function_or_nullcontext("prepare input"):
+            with self.synchronize_input_prep():
+                #  -------------------------------------- Omni-new -------------------------------------------------
+                self._update_states(scheduler_output)
+                #  ------------------------------------------------------------------------------------------------
+                # Update persistent batch states.
 
-        with ProfileExecuteDuration().capture_async("prepare input"):
-            #  -------------------------------------- Omni-new -------------------------------------------------
-            self._update_states(scheduler_output)
-            self._decode_and_store_request_payloads(scheduler_output)
-            #  ------------------------------------------------------------------------------------------------
-
-            if has_ec_transfer() and get_ec_transfer().is_producer:
-                with self.maybe_get_ec_connector_output(
+                if has_ec_transfer() and get_ec_transfer().is_producer:
+                    with self.maybe_get_ec_connector_output(
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
-                ) as ec_connector_output:
-                    self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(
-                        scheduler_output)
+                    ) as ec_connector_output:
+                        self._execute_mm_encoder(scheduler_output)
+                        return make_empty_encoder_model_runner_output(scheduler_output)
 
-            if not scheduler_output.total_num_scheduled_tokens:
-                if not has_kv_transfer_group():
-                    logger.debug(
-                        "skip this step for we receive the data from remote disaggregate prefill node"
+                if not num_scheduled_tokens:
+                    if (
+                        self.parallel_config.distributed_executor_backend == "external_launcher"
+                        and self.parallel_config.data_parallel_size > 1
+                    ):
+                        # this is a corner case when both external launcher
+                        # and DP are enabled, num_scheduled_tokens could be
+                        # 0, and has_unfinished_requests in the outer loop
+                        # returns True. before returning early here we call
+                        # dummy run to ensure coordinate_batch_across_dp
+                        # is called into to avoid out of sync issues.
+                        self._dummy_run(1)
+                    if not has_kv_transfer_group():
+                        # Return empty ModelRunnerOutput if no work to do.
+                        return EMPTY_MODEL_RUNNER_OUTPUT
+                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                if self.cache_config.kv_sharing_fast_prefill:
+                    assert not self.num_prompt_logprobs, (
+                        "--kv-sharing-fast-prefill produces incorrect "
+                        "logprobs for prompt tokens, tokens, please disable "
+                        "it when the requests need prompt logprobs"
                     )
-                    # Return empty ModelRunnerOutput if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output,
-                                                    self.vllm_config)
+                num_reqs = self.input_batch.num_reqs
+                req_ids = self.input_batch.req_ids
+                tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+                num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-            if self.dynamic_eplb:
-                self.eplb_updator.forward_before()
+                (
+                    logits_indices,
+                    spec_decode_metadata,
+                ) = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
 
-            (attn_metadata, num_scheduled_tokens_np, num_input_tokens,
-             num_tokens_across_dp, logits_indices, spec_decode_metadata,
-             max_query_len) = self._prepare_inputs(scheduler_output)
+                num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                if self.pcp_size > 1:
+                    num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
+                cascade_attn_prefix_lens = None
+                # Disable cascade attention when using microbatching (DBO)
+                if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
+                    # Pre-compute cascade attention prefix lengths
+                    cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                        num_scheduled_tokens_np,
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                        scheduler_output.num_common_prefix_blocks,
+                    )
 
-            (input_ids, inputs_embeds, positions, intermediate_tensors,
-             model_kwargs, ec_connector_output) = self._preprocess(scheduler_output,
-                                              num_input_tokens,
-                                              intermediate_tensors)
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                )
 
+                logger.debug(
+                    "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                    "should_ubatch: %s, num_tokens_across_dp: %s",
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                )
+
+                num_tokens_padded = batch_desc.num_tokens
+                num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                    should_ubatch,
+                    num_scheduled_tokens_np,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    self.parallel_config.num_ubatches,
+                )
+
+                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+                use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+                if (
+                    cudagraph_mode == CUDAGraphMode.FULL
+                    or (enable_sp() and not self.model_config.use_mla)
+                    and self.pcp_size == 1  # TODO(lxs): fix this
+                ):
+                    # Currently, Graph Mode and SP will both pad num_tokens,
+                    # Another possible condition is num_tokens_padded != num_tokens_unpadded
+                    # but this scope is way too big and the consequences are unpredictable
+                    num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
+
+                (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                )
+
+            (
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+                ec_connector_output,
+            ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
             # update global cos, sin
             update_cos_sin(positions)
-
-            if self.dynamic_eplb:
-                self.eplb_updator.take_update_info_from_eplb_process()
-
+        # Set cudagraph mode to none if calc_kv_scales is true.
+        # KV scales calculation involves dynamic operations that are incompatible
+        # with CUDA graph capture.
+        if self.calculate_kv_scales:  # type: ignore[has-type]
+            cudagraph_mode = CUDAGraphMode.NONE
+            # Mark KV scales as calculated after the first forward pass
+            self.calculate_kv_scales = False  # type: ignore[has-type]
         # prevent debugger is None
         if self.debugger is not None:
             dbg_cfg = getattr(self.debugger, "config", None)
-            dump_level = str(
-                getattr(dbg_cfg, "level",
-                        "L1")).upper() if dbg_cfg is not None else "L1"
+            dump_level = str(getattr(dbg_cfg, "level", "L1")).upper() if dbg_cfg is not None else "L1"
             if dump_level in ("L0", "MIX"):
                 self.debugger.start(model=self.model)
             else:
                 self.debugger.start()
-
-        uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
-            scheduler_output.total_num_scheduled_tokens
-            == self.input_batch.num_reqs * max_query_len)
-        has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
-        aclgraph_runtime_mode, batch_descriptor = \
-            self.cudagraph_dispatcher.dispatch(
-                num_tokens=num_input_tokens,
-                uniform_decode=uniform_decode,
-                has_lora=has_lora
-            )
-
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
                 head_dim=self.model_config.get_vocab_size(),
-                generators=self.input_batch.sampling_metadata.generators)
+                generators=self.input_batch.sampling_metadata.generators,
+            )
+
+        # Encoder-decoder models can only compile the pure decode steps where no
+        # encoder inputs are present. Use eager for the first pass.
+        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+        has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        with ProfileExecuteDuration().capture_async("forward"):
-            with set_ascend_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_input_tokens,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    batch_descriptor=batch_descriptor,
-                    num_actual_tokens=scheduler_output.
-                    total_num_scheduled_tokens,
-                    model_instance=self.model):
-                self.maybe_setup_kv_connector(scheduler_output)
-
-                hidden_states = self._generate_process_reqs_hidden_states(
-                    num_input_tokens, input_ids, positions,
-                    intermediate_tensors, inputs_embeds, model_kwargs)
-
-            self.maybe_wait_for_kv_save()
-            finished_sending, finished_recving = self.get_finished_kv_transfer(
-                scheduler_output)
-
-            aux_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = hidden_states
-
-        kv_connector_output = KVConnectorOutput(
-            finished_sending=finished_sending,
-            finished_recving=finished_recving)
-        finished_sending = None
-        finished_recving = None
-        with ProfileExecuteDuration().capture_async("post process"):
+        with (
+            record_function_or_nullcontext("forward"),
+            set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                model_instance=self.model,
+                skip_compiled=has_encoder_input,
+            ),
+            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+        ):
+            hidden_states = self._model_forward(
+                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
+        with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
@@ -218,36 +310,36 @@ class NPUARModelRunner(OmniNPUModelRunner):
             else:
                 logger.debug("[AR] execute_model: multimodal_outputs is None")
             #  -------------------------------------- Omni-new -------------------------------------------------
-            # Broadcast PP output for external_launcher (torchrun)
-            # to make sure we are synced across pp ranks
-            # TODO: Support overlapping mirco-batches
-            # https://github.com/vllm-project/vllm/issues/18019
-            broadcast_pp_output = \
-                self.parallel_config.distributed_executor_backend \
-                == "external_launcher" and len(get_pp_group().ranks) > 0
-            if not get_pp_group().is_last_rank:
-                # For mid-pipeline stages, return the hidden states.
-                if not broadcast_pp_output:
+            if self.pcp_size > 1:
+                # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
+                # ignores the padding from CUDA Graph.
+                hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
+            aux_hidden_states = None
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = hidden_states
+
+            if not self.broadcast_pp_output:
+                # Common case.
+                if not get_pp_group().is_last_rank:
+                    # Return the intermediate tensors.
+                    assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
                     return hidden_states
-                assert isinstance(hidden_states, IntermediateTensors)
-                get_pp_group().send_tensor_dict(
-                    hidden_states.tensors, all_gather_group=get_tp_group())
-                logits = None
-            else:
-                if self.input_batch.pooling_params:
-                    pool_output = self._pool(
-                        hidden_states,
-                        scheduler_output.total_num_scheduled_tokens,
-                        num_scheduled_tokens_np, kv_connector_output)
+                if self.is_pooling_model:
+                    # Return the pooling output.
+                    output = self._pool(
+                        hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
+                    )
+                    output.kv_connector_output = kv_connector_output
                     if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
-                    return pool_output
+                    return output
+
                 sample_hidden_states = hidden_states[logits_indices]
                 #  -------------------------------------- Omni-new -------------------------------------------------
                 # Try with sampling_metadata first; fall back to without for models that don't support it
@@ -258,37 +350,56 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 except TypeError:
                     logits = self.model.compute_logits(sample_hidden_states)
                 #  -------------------------------------- Omni-new -------------------------------------------------
-            if broadcast_pp_output:
-                model_output_broadcast_data = {
-                    "logits": logits.contiguous(),
-                } if logits is not None else {}
-                model_output_broadcast_data = get_pp_group(
-                ).broadcast_tensor_dict(model_output_broadcast_data,
-                                        src=len(get_pp_group().ranks) - 1)
-                assert model_output_broadcast_data is not None
-                logits = model_output_broadcast_data["logits"]
+            else:
+                # Rare case.
+                assert not self.is_pooling_model
+
+                if not get_pp_group().is_last_rank:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
+                    logits = None
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    #  -------------------------------------- Omni-new -------------------------------------------------
+                    # Try with sampling_metadata first; fall back to without for models that don't support it
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
+                    #  -------------------------------------- Omni-new -------------------------------------------------
+
+                model_output_broadcast_data: dict[str, Any] = {}
+                if logits is not None:
+                    model_output_broadcast_data["logits"] = logits.contiguous()
+                broadcasted = get_pp_group().broadcast_tensor_dict(
+                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                )
+                assert broadcasted is not None
+                logits = broadcasted["logits"]
 
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
                 logits,
                 spec_decode_metadata,
+                spec_decode_common_attn_metadata,
                 hidden_states,
                 sample_hidden_states,
                 aux_hidden_states,
-                kv_connector_output,
                 attn_metadata,
                 positions,
                 ec_connector_output,
-                multimodal_outputs, # Omni-new
+                cudagraph_stats,
+                multimodal_outputs,
             )
             self.kv_connector_output = kv_connector_output
         return None
 
     @torch.inference_mode()
     def sample_tokens(
-        self,
-        grammar_output: GrammarOutput | None = None,
+        self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
@@ -297,6 +408,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
         #  -------------------------------------- Omni-new -------------------------------------------------
+
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -316,13 +428,14 @@ class NPUARModelRunner(OmniNPUModelRunner):
             scheduler_output,
             logits,
             spec_decode_metadata,
+            spec_decode_common_attn_metadata,
             hidden_states,
             sample_hidden_states,
             aux_hidden_states,
-            kv_connector_output,
             attn_metadata,
             positions,
             ec_connector_output,
+            cudagraph_stats,
             multimodal_outputs,
         ) = self.execute_model_state
         # Clear ephemeral state.
@@ -334,26 +447,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
             # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
             logits_dtype = logits.dtype
             logits = logits.to("cpu").float()
-            apply_grammar_bitmask(scheduler_output, grammar_output,
-                                  self.input_batch, logits)
+            apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        with ProfileExecuteDuration().capture_async("Sample"):
+        with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         def propose_draft_token_ids(sampled_token_ids):
-            assert self.spec_decode_common_attn_metadata is not None
+            assert spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
                 scheduler_output,
                 spec_decode_metadata,
+                spec_decode_common_attn_metadata,
                 positions,
                 scheduler_output.total_num_scheduled_tokens,
                 hidden_states,
                 attn_metadata,
                 aux_hidden_states,
-                sample_hidden_states
+                sample_hidden_states,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -373,11 +486,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
             spec_decode_metadata,
         )
 
-        with ProfileExecuteDuration().capture_async("Draft"):
+        with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                use_padded_batch_for_eagle = self.speculative_config and \
-                    self.speculative_config.use_eagle() and \
-                    not self.speculative_config.disable_padded_drafter_batch
+                use_padded_batch_for_eagle = (
+                    self.speculative_config
+                    and self.speculative_config.use_eagle()
+                    and not self.speculative_config.disable_padded_drafter_batch
+                )
                 if use_padded_batch_for_eagle:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
@@ -389,7 +504,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
-
         #  -------------------------------------- Omni-new -------------------------------------------------
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -448,28 +562,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         #  -------------------------------------- Omni-new -------------------------------------------------
 
-        durations = ProfileExecuteDuration().pop_captured_sync()
-        if durations:
-            dr_str = [
-                f"[{tag}]:{duration:.2f}ms"
-                for tag, duration in durations.items()
-            ]
-            captured_name = "Decode" if self.attn_state == AscendAttentionState.DecodeOnly else "Prefill"
-            logger.info("Profile execute duration [%s]:%s", captured_name,
-                        " ".join(dr_str))
+
         if self.dynamic_eplb:
             self.eplb_updator.forward_end()
-        if not self.use_async_scheduling:
-            if self.debugger is not None:
-                assert self.debugger is not None
-                self.debugger.stop()
-                self.debugger.step()
-            return model_runner_output
 
         if self.debugger is not None:
-            assert self.debugger is not None
             self.debugger.stop()
             self.debugger.step()
+        if not self.use_async_scheduling:
+            return model_runner_output
         return AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -478,33 +579,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
-
-    def _generate_process_reqs_hidden_states(self, num_input_tokens,
-                                             input_ids, positions,
-                                             intermediate_tensors,
-                                             inputs_embeds, model_kwargs):
-        assert self.model is not None
-        hidden_states = self._model_forward(input_ids=input_ids,
-                                   positions=positions,
-                                   intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds,
-                                   **model_kwargs)
-
-        forward_context = get_forward_context()
-        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL \
-            and not self.use_sparse:
-            if self.vllm_config.model_config.use_mla:
-                if self.pcp_size * self.dcp_size > 1:
-                    update_full_graph_params(self.attn_backend, self.update_stream, forward_context,
-                                     num_input_tokens, self.vllm_config,
-                                      self.vllm_config.speculative_config)
-
-        if get_forward_context().sp_enabled and not isinstance(
-                hidden_states, IntermediateTensors):
-            hidden_states = self._all_gather_hidden_states_and_aux(
-                hidden_states)
-        return hidden_states if self.pcp_size == 1 else self.pcp_manager.get_restore_hidden_states(
-            hidden_states)
 
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""

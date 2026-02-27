@@ -26,6 +26,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 from vllm_omni.diffusion.registry import initialize_model
 
 logger = init_logger(__name__)
@@ -219,15 +220,20 @@ class DiffusersPipelineLoader:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
-            with target_device:
-                if load_format == "default":
-                    model = initialize_model(od_config)
-                elif load_format == "custom_pipeline":
-                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-                    model = model_cls(od_config=od_config)
-            logger.debug("Loading weights on %s ...", load_device)
-            # Quantization does not happen in `load_weights` but after it
-            self.load_weights(model)
+            if od_config.parallel_config.use_hsdp:
+                model = self._load_model_with_hsdp(
+                    od_config, load_format=load_format, custom_pipeline_name=custom_pipeline_name
+                )
+            else:
+                with target_device:
+                    if load_format == "default":
+                        model = initialize_model(od_config)
+                    elif load_format == "custom_pipeline":
+                        model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                        model = model_cls(od_config=od_config)
+                logger.debug("Loading weights on %s ...", load_device)
+                # Quantization does not happen in `load_weights` but after it
+                self.load_weights(model)
 
             # Process weights after loading for quantization (e.g., FP8 online quantization)
             # This is needed for vLLM's quantization methods that need to transform weights
@@ -278,3 +284,57 @@ class DiffusersPipelineLoader:
         #             "Following weights were not initialized from "
         #             f"checkpoint: {weights_not_loaded}"
         #         )
+
+    def _load_model_with_hsdp(
+        self,
+        od_config: OmniDiffusionConfig,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> nn.Module:
+        """Load model with HSDP sharding for inference.
+
+        The pipeline contains multiple components (text_encoder, VAE, transformer).
+        Only the transformer is sharded with HSDP. Other components are loaded normally.
+
+        Approach: Load weights first using model's load_weights (handles QKV fusion etc.),
+        then apply HSDP sharding to redistribute weights across GPUs.
+        """
+        from vllm_omni.diffusion.distributed.hsdp import apply_hsdp_to_model
+
+        parallel_config = od_config.parallel_config
+        hsdp_config = HSDPInferenceConfig(
+            enabled=True,
+            hsdp_replicate_size=parallel_config.hsdp_replicate_size,
+            hsdp_shard_size=parallel_config.hsdp_shard_size,
+            param_dtype=od_config.dtype,
+        )
+
+        # Initialize model WITHOUT device context (weights start on CPU).
+        # Unlike the non-HSDP path which uses `with target_device:` to create weights
+        # directly on GPU, HSDP needs weights on CPU first so they can be redistributed
+        # across GPUs by apply_hsdp_to_model. The model's load_weights handles weight
+        # mapping (QKV fusion, etc.).
+        if load_format == "default":
+            model = initialize_model(od_config)
+        elif load_format == "custom_pipeline":
+            model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+            model = model_cls(od_config=od_config)
+        self.load_weights(model)
+
+        # Collect all transformers to shard (some models have transformer_2 for MoE)
+        transformers_to_shard = []
+        transformer = getattr(model, "transformer", None)
+        if transformer is None:
+            raise ValueError("Model has no transformer attribute for HSDP")
+        transformers_to_shard.append(("transformer", transformer))
+
+        # Check for transformer_2 (MoE two-stage models like Wan2.2-I2V)
+        transformer_2 = getattr(model, "transformer_2", None)
+        if transformer_2 is not None:
+            transformers_to_shard.append(("transformer_2", transformer_2))
+
+        # Apply HSDP sharding to all transformers
+        for name, trans in transformers_to_shard:
+            logger.debug("Applying HSDP to %s", name)
+            apply_hsdp_to_model(trans, hsdp_config)
+        return model

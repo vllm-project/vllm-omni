@@ -5,7 +5,7 @@ import math
 from typing import Any
 
 import torch
-from diffusers.models.autoencoders import AutoencoderKL
+from diffusers.models.autoencoders import AutoencoderKL as Diffusers_AutoencoderKL
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
@@ -14,11 +14,13 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import Next_Step_AutoencoderKL
 
 logger = init_logger(__name__)
 
 
-class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
+# We use base class because some model re-implement AutoencoderKL, but split is share.
+class DistributedAutoencoderKL_base(DistributedVaeMixin):
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
         model = super().from_pretrained(*args, **kwargs)
@@ -195,3 +197,19 @@ class DistributedAutoencoderKL(AutoencoderKL, DistributedVaeMixin):
             return DecoderOutput(sample=result)
         else:
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
+
+
+class DistributedAutoencoderKL(Diffusers_AutoencoderKL, DistributedAutoencoderKL_base):
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any):
+        model = super().from_pretrained(*args, **kwargs)
+        model.init_distributed()
+        return model
+
+
+class DistributedAutoencoderKL_NextStep(Next_Step_AutoencoderKL, DistributedAutoencoderKL_base):
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any):
+        model = super().from_pretrained(*args, **kwargs)
+        model.init_distributed()
+        return model

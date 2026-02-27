@@ -1,13 +1,14 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import logging
 from inspect import Signature, signature
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
@@ -26,25 +27,24 @@ class TestAudioMixin:
     def audio_mixin(self):
         return AudioMixin()
 
-    def test_stereo_to_mono_conversion(self, audio_mixin):
+    def test_stereo_to_mono_conversion(self, audio_mixin, mocker: MockerFixture):
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
         audio_obj = CreateAudio(audio_tensor=stereo_tensor)
 
-        with (
-            patch.object(
-                audio_mixin, "_apply_speed_adjustment", side_effect=lambda tensor, speed, sr: (tensor, sr)
-            ) as mock_speed,
-            patch("soundfile.write") as _,
-        ):
-            audio_mixin.create_audio(audio_obj)
+        mock_speed = mocker.patch.object(
+            audio_mixin, "_apply_speed_adjustment", side_effect=lambda tensor, speed, sr: (tensor, sr)
+        )
+        mocker.patch("soundfile.write")
 
-            # Check that the tensor passed to speed adjustment is mono
-            mock_speed.assert_called_once()
-            adjusted_tensor = mock_speed.call_args[0][0]
-            assert len(adjusted_tensor) == 24000
+        audio_mixin.create_audio(audio_obj)
 
-    @patch("librosa.effects.time_stretch")
-    def test_speed_adjustment(self, mock_time_stretch, audio_mixin):
+        # Check that the tensor passed to speed adjustment is mono
+        mock_speed.assert_called_once()
+        adjusted_tensor = mock_speed.call_args[0][0]
+        assert len(adjusted_tensor) == 24000
+
+    def test_speed_adjustment(self, audio_mixin, mocker: MockerFixture):
+        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
         mock_time_stretch.return_value = np.zeros(12000)
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
@@ -53,8 +53,8 @@ class TestAudioMixin:
         mock_time_stretch.assert_called_with(y=audio_tensor, rate=2.0)
         assert adjusted_audio.shape == (12000,)
 
-    @patch("soundfile.write")
-    def test_unsupported_format_fallback(self, mock_write, audio_mixin, caplog):
+    def test_unsupported_format_fallback(self, audio_mixin, caplog, mocker: MockerFixture):
+        mock_write = mocker.patch("soundfile.write")
         audio_tensor = np.random.rand(24000).astype(np.float32)
         # Use a format that is not in the list of supported formats
         audio_obj = CreateAudio(audio_tensor=audio_tensor, response_format="vorbis")
@@ -66,50 +66,50 @@ class TestAudioMixin:
         write_kwargs = mock_write.call_args.kwargs
         assert write_kwargs["format"] == "WAV"
 
-    def test_mono_audio_preservation(self, audio_mixin):
+    def test_mono_audio_preservation(self, audio_mixin, mocker: MockerFixture):
         """Test that mono (1D) audio tensors are processed correctly and passed to writer."""
         mono_tensor = np.random.rand(24000).astype(np.float32)
         audio_obj = CreateAudio(audio_tensor=mono_tensor)
 
-        with patch("soundfile.write") as mock_write:
-            audio_mixin.create_audio(audio_obj)
+        mock_write = mocker.patch("soundfile.write")
+        audio_mixin.create_audio(audio_obj)
 
-            mock_write.assert_called_once()
-            # Verify the tensor passed to soundfile.write is the exact 1D tensor
-            output_tensor = mock_write.call_args[0][1]
-            assert output_tensor.ndim == 1
-            assert output_tensor.shape == (24000,)
-            assert np.array_equal(output_tensor, mono_tensor)
+        mock_write.assert_called_once()
+        # Verify the tensor passed to soundfile.write is the exact 1D tensor
+        output_tensor = mock_write.call_args[0][1]
+        assert output_tensor.ndim == 1
+        assert output_tensor.shape == (24000,)
+        assert np.array_equal(output_tensor, mono_tensor)
 
-    def test_stereo_audio_preservation(self, audio_mixin):
+    def test_stereo_audio_preservation(self, audio_mixin, mocker: MockerFixture):
         """Test that stereo (2D) audio tensors are processed correctly and preserved."""
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
         audio_obj = CreateAudio(audio_tensor=stereo_tensor)
 
-        with patch("soundfile.write") as mock_write:
-            audio_mixin.create_audio(audio_obj)
+        mock_write = mocker.patch("soundfile.write")
+        audio_mixin.create_audio(audio_obj)
 
-            mock_write.assert_called_once()
-            # Verify the tensor passed to soundfile.write is the exact 2D tensor
-            output_tensor = mock_write.call_args[0][1]
-            assert output_tensor.ndim == 2
-            assert output_tensor.shape == (24000, 2)
-            assert np.array_equal(output_tensor, stereo_tensor)
+        mock_write.assert_called_once()
+        # Verify the tensor passed to soundfile.write is the exact 2D tensor
+        output_tensor = mock_write.call_args[0][1]
+        assert output_tensor.ndim == 2
+        assert output_tensor.shape == (24000, 2)
+        assert np.array_equal(output_tensor, stereo_tensor)
 
-    def test_speed_adjustment_bypass(self, audio_mixin):
+    def test_speed_adjustment_bypass(self, audio_mixin, mocker: MockerFixture):
         """Test that speed=1.0 bypasses the expensive librosa time stretching."""
         audio_tensor = np.random.rand(24000).astype(np.float32)
 
-        with patch("librosa.effects.time_stretch") as mock_time_stretch:
-            # speed=1.0 should return immediately without calling librosa
-            result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
+        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
+        # speed=1.0 should return immediately without calling librosa
+        result, _ = audio_mixin._apply_speed_adjustment(audio_tensor, speed=1.0, sample_rate=24000)
 
-            mock_time_stretch.assert_not_called()
-            assert np.array_equal(result, audio_tensor)
+        mock_time_stretch.assert_not_called()
+        assert np.array_equal(result, audio_tensor)
 
-    @patch("librosa.effects.time_stretch")
-    def test_speed_adjustment_stereo_handling(self, mock_time_stretch, audio_mixin):
+    def test_speed_adjustment_stereo_handling(self, audio_mixin, mocker: MockerFixture):
         """Test that speed adjustment is attempted on stereo inputs."""
+        mock_time_stretch = mocker.patch("librosa.effects.time_stretch")
         stereo_tensor = np.random.rand(24000, 2).astype(np.float32)
         # Mock return value representing a sped-up version (half length)
         mock_time_stretch.return_value = np.zeros((12000, 2), dtype=np.float32)
@@ -161,22 +161,22 @@ def create_mock_audio_output_for_test(
 
 
 @pytest.fixture
-def test_app():
+def test_app(mocker: MockerFixture):
     # Mock the engine client
-    mock_engine_client = MagicMock()
+    mock_engine_client = mocker.MagicMock()
     mock_engine_client.errored = False
 
     async def mock_generate_fn(*args, **kwargs):
         yield create_mock_audio_output_for_test(request_id=kwargs.get("request_id"))
 
-    mock_engine_client.generate = MagicMock(side_effect=mock_generate_fn)
+    mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_fn)
     mock_engine_client.default_sampling_params_list = [{}]
 
     # Mock models to have an is_base_model method
-    mock_models = MagicMock()
+    mock_models = mocker.MagicMock()
     mock_models.is_base_model.return_value = True
 
-    mock_request_logger = MagicMock()
+    mock_request_logger = mocker.MagicMock()
 
     speech_server = OmniOpenAIServingSpeech(
         engine_client=mock_engine_client,
@@ -186,7 +186,7 @@ def test_app():
 
     # Patch the signature of create_speech to remove 'raw_request' for FastAPI route introspection
     original_create_speech = speech_server.create_speech
-    _ = MagicMock(side_effect=original_create_speech)
+    _ = mocker.MagicMock(side_effect=original_create_speech)
 
     sig = signature(original_create_speech)
 
@@ -253,11 +253,13 @@ class TestSpeechAPI:
         response = client.post("/v1/audio/speech", json=payload)
         assert response.status_code == 422  # Unprocessable Entity
 
-    @patch("vllm_omni.entrypoints.openai.serving_speech.OmniOpenAIServingSpeech.create_audio")
-    def test_speed_parameter_is_used(self, mock_create_audio, test_app):
+    def test_speed_parameter_is_used(self, test_app, mocker: MockerFixture):
+        mock_create_audio = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.OmniOpenAIServingSpeech.create_audio"
+        )
         client = TestClient(test_app)
 
-        mock_audio_response = MagicMock()
+        mock_audio_response = mocker.MagicMock()
         mock_audio_response.audio_data = b"dummy_audio"
         mock_audio_response.media_type = "audio/wav"
         mock_create_audio.return_value = mock_audio_response
@@ -287,28 +289,48 @@ class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
 
     @pytest.fixture
-    def speech_server(self):
-        mock_engine_client = MagicMock()
+    def speech_server(self, mocker: MockerFixture):
+        mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
         mock_engine_client.stage_list = None
-        mock_models = MagicMock()
+        mock_engine_client.tts_max_instructions_length = None
+        mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
         return OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
             models=mock_models,
-            request_logger=MagicMock(),
+            request_logger=mocker.MagicMock(),
         )
 
-    def test_is_tts_model(self, speech_server):
-        """Test TTS model detection."""
-        # No stage_list -> False
-        assert speech_server._is_tts_model() is False
+    def test_is_tts_detection_no_stage(self, speech_server):
+        """Test TTS model detection when no TTS stage exists."""
+        # Fixture creates server with stage_list = None -> _is_tts should be False
+        assert speech_server._is_tts is False
+        assert speech_server._tts_stage is None
 
-        # With qwen3_tts stage -> True
-        mock_stage = MagicMock()
+    def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
+        """Test TTS model detection when TTS stage exists."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+
+        # Create a TTS stage
+        mock_stage = mocker.MagicMock()
         mock_stage.model_stage = "qwen3_tts"
-        speech_server.engine_client.stage_list = [mock_stage]
-        assert speech_server._is_tts_model() is True
+        mock_stage.tts_args = {}
+        mock_engine_client.stage_list = [mock_stage]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        assert server._is_tts is True
+        assert server._tts_stage is mock_stage
 
     def test_estimate_prompt_len_fallback(self, speech_server):
         """Test prompt length estimation falls back to 2048 when model is unavailable."""
@@ -359,25 +381,237 @@ class TestTTSMethods:
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
 
-    def test_load_supported_speakers(self):
+    def test_load_supported_speakers(self, mocker: MockerFixture):
         """Test _load_supported_speakers."""
-        mock_engine_client = MagicMock()
+        mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
         mock_engine_client.stage_list = None
 
         # Mock talker_config with mixed-case speaker names
-        mock_talker_config = MagicMock()
+        mock_talker_config = mocker.MagicMock()
         mock_talker_config.spk_id = {"Ryan": 0, "Vivian": 1, "Aiden": 2}
         mock_engine_client.model_config.hf_config.talker_config = mock_talker_config
 
-        mock_models = MagicMock()
+        mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
 
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
             models=mock_models,
-            request_logger=MagicMock(),
+            request_logger=mocker.MagicMock(),
         )
 
         # Verify speakers are normalized to lowercase
         assert server.supported_speakers == {"ryan", "vivian", "aiden"}
+
+    def test_max_instructions_length_default(self, speech_server):
+        """Test default max instructions length (500) when no config provided."""
+        # Fixture creates server with no CLI override and no TTS stage
+        assert speech_server._max_instructions_length == 500
+
+    def test_max_instructions_length_cli_override(self, mocker: MockerFixture):
+        """Test CLI override (stored in engine_client) takes highest priority."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_list = None
+        # CLI override is stored in engine_client
+        mock_engine_client.tts_max_instructions_length = 1000
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        # Value is cached during __init__
+        assert server._max_instructions_length == 1000
+
+    def test_max_instructions_length_stage_config(self, mocker: MockerFixture):
+        """Test stage config value is used when no CLI override."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None  # No CLI override
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        # Mock stage with tts_args
+        mock_stage = mocker.MagicMock()
+        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.tts_args = {"max_instructions_length": 750}
+        mock_engine_client.stage_list = [mock_stage]
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        # Value is cached during __init__
+        assert server._max_instructions_length == 750
+
+    def test_max_instructions_length_cli_overrides_stage_config(self, mocker: MockerFixture):
+        """Test CLI override (in engine_client) takes precedence over stage config."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        # CLI override stored in engine_client
+        mock_engine_client.tts_max_instructions_length = 2000
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        # Mock stage with tts_args
+        mock_stage = mocker.MagicMock()
+        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.tts_args = {"max_instructions_length": 750}
+        mock_engine_client.stage_list = [mock_stage]
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        # CLI value (2000) should override stage config (750)
+        assert server._max_instructions_length == 2000
+
+    def test_validate_instructions_length_uses_cached_value(self, mocker: MockerFixture):
+        """Test instructions length validation uses cached _max_instructions_length."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_list = None
+        # CLI override with max length of 10 characters
+        mock_engine_client.tts_max_instructions_length = 10
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        # Verify cached value
+        assert server._max_instructions_length == 10
+
+        # Instructions within limit should pass
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="short",
+        )
+        assert server._validate_tts_request(req) is None
+
+        # Instructions exceeding limit should fail
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="VoiceDesign",
+            instructions="this is too long",
+        )
+        error = server._validate_tts_request(req)
+        assert error is not None
+        assert "max 10 characters" in error
+
+
+class TestStreamingProtocolValidation:
+    """Unit tests for the stream field validators in OpenAICreateSpeechRequest."""
+
+    def test_stream_validation_errors(self):
+        """stream=True requires response_format='pcm' and speed=1.0."""
+        with pytest.raises(ValidationError, match="response_format='pcm'"):
+            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
+        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
+            OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+
+    def test_stream_valid(self):
+        """stream=True + response_format='pcm' + speed=1.0 is accepted."""
+        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm")
+        assert req.stream is True
+
+    def test_sse_stream_format_is_blocked(self):
+        """stream_format='sse' is blocked."""
+        with pytest.raises(ValidationError, match="sse"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
+
+
+class TestStreamingResponse:
+    """Integration tests for the streaming audio response path."""
+
+    @pytest.fixture
+    def streaming_app(self, mocker: MockerFixture):
+        """Test app whose mock engine yields one intermediate chunk then a final chunk."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+
+        def _make_output(finished: bool) -> OmniRequestOutput:
+            chunk = torch.sin(torch.linspace(0, 440 * 2 * torch.pi, 24000))
+
+            class MockCompletionOutput:
+                def __init__(self, index: int = 0):
+                    self.index = index
+                    self.text = ""
+                    self.token_ids = []
+                    self.finish_reason = "stop"
+                    self.stop_reason = None
+                    self.logprobs = None
+
+            class MockRequestOutput:
+                def __init__(self, audio_tensor: torch.Tensor):
+                    self.request_id = "speech-stream-test"
+                    self.outputs = [MockCompletionOutput(index=0)]
+                    self.multimodal_output = {"audio": audio_tensor}
+                    self.finished = finished
+                    self.prompt_token_ids = None
+                    self.encoder_prompt_token_ids = None
+                    self.num_cached_tokens = None
+                    self.prompt_logprobs = None
+                    self.kv_transfer_params = None
+
+            return OmniRequestOutput(
+                stage_id=0,
+                final_output_type="audio",
+                request_output=MockRequestOutput(audio_tensor=chunk),
+                finished=finished,
+            )
+
+        async def mock_generate_streaming(*args, **kwargs):
+            yield _make_output(finished=False)
+            yield _make_output(finished=True)
+
+        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        original_create_speech = speech_server.create_speech
+        sig = signature(original_create_speech)
+        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
+        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+        async def awaitable_create_speech(*args, **kwargs):
+            return await original_create_speech(*args, **kwargs)
+
+        awaitable_create_speech.__signature__ = new_sig
+        speech_server.create_speech = awaitable_create_speech
+
+        app = FastAPI()
+        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        return app
+
+    def test_streaming(self, streaming_app):
+        """stream=True must return audio/pcm with non-empty body."""
+        client = TestClient(streaming_app)
+        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers["content-type"]
+        assert len(response.content) > 0
+
+    def test_non_streaming_unchanged(self, streaming_app):
+        """Non-streaming path must still return audio/wav."""
+        client = TestClient(streaming_app)
+        response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
+        assert response.status_code == 200
+        assert "audio/wav" in response.headers["content-type"]

@@ -89,15 +89,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request: The request object needing data.
         """
         stage_id = self.connector.stage_id
-        request_id = request.request_id
-        self.request_ids_mapping[request_id] = request.external_req_id
 
         if stage_id == 0:
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
-        with self.lock:
-            self._pending_load_reqs[request_id] = request
+        self._pending_load_reqs.append(request)
 
     def save_async(self, pooling_output: torch.Tensor | None = None, request: Request | None = None):
         """Build and enqueue one chunk for asynchronous sending.
@@ -109,93 +106,61 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             pooling_output: Partial pooling output dictionary
             request: Request object
         """
-        stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
-        request_id = request.external_req_id
-        chunk_id = self.put_req_chunk[request_id]
-
-        # Process payload in main thread to avoid race conditions on request state
-        payload_data = None
-        if self.custom_process_next_stage_input_func:
-            try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    pooling_output=pooling_output,
-                    request=request,
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
-
-        if not payload_data:
-            return
-
-        # Increment chunk_id
-        self.put_req_chunk[request_id] += 1
-        connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
-
         task = {
-            "stage_id": stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": payload_data,
-            "request_id": request_id,
+            "pooling_output": pooling_output,
+            "request": request,
+            "is_finished": request.is_finished(),
         }
+        self._pending_save_reqs.append(task)
 
-        with self.lock:
-            if request_id not in self._pending_save_reqs:
-                self._pending_save_reqs[request_id] = deque()
-            self._pending_save_reqs[request_id].append(task)
-
-    def _poll_single_request(self, req_id: str):
+    def _poll_single_request(self, request: Request):
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
+        req_id = request.request_id
         chunk_id = self.get_req_chunk[req_id]
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
-        result = self.connector.get(
-            str(target_stage_id),
-            str(stage_id),
-            connector_get_key,
-        )
-
-        if result is None:
-            return
+        try:
+            result = self.connector.get(
+                str(target_stage_id),
+                str(stage_id),
+                connector_get_key,
+            )
+        except Exception as e:
+            logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
+            return False
 
         payload_data, size = result
 
         if payload_data:
             # Update connector state
             self.get_req_chunk[req_id] += 1
-            req = self._pending_load_reqs[req_id]
 
             if self.model_mode == "ar":
                 self._update_request_payload(external_req_id, payload_data)
-                req.additional_information = payload_data
+                request.additional_information = payload_data
                 if payload_data.get("finished"):
                     self.finished_requests.add(req_id)
             else:
                 if payload_data.get("finished"):
                     self.finished_requests.add(req_id)
 
-                # req.prompt_token_ids = payload_data.get("code_predictor_codes", [])
-                # req.num_computed_tokens = 0
                 new_ids = payload_data.get("code_predictor_codes", [])
-                req.prompt_token_ids = new_ids
-                req.num_computed_tokens = 0
+                request.prompt_token_ids = new_ids
+                request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
                 if not new_ids and not payload_data.get("finished"):
-                    return
+                    return True
 
             # Mark as finished for consumption
-            with self.lock:
-                self._finished_load_reqs.add(req_id)
-                if req_id in self._pending_load_reqs:
-                    del self._pending_load_reqs[req_id]
+            self._finished_load_reqs.add(req_id)
             logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            return True
+
+        return False
 
     def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
         """Update the payload data for a request in the connector.
@@ -221,10 +186,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return payload_data
 
     def _send_single_request(self, task: dict):
-        connector_put_key = task["put_key"]
-        stage_id = task["stage_id"]
-        next_stage_id = task["next_stage_id"]
-        payload_data = task["data"]
+        pooling_output = task["pooling_output"]
+        request = task["request"]
+        is_finished = task["is_finished"]
+        stage_id = self.connector.stage_id
+        next_stage_id = stage_id + 1
+        request_id = request.external_req_id
+        chunk_id = self.put_req_chunk[request_id]
+        connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
+        # Process payload in main thread to avoid race conditions on request state
+        payload_data = None
+        if self.custom_process_next_stage_input_func:
+            try:
+                payload_data = self.custom_process_next_stage_input_func(
+                    transfer_manager=self,
+                    pooling_output=pooling_output,
+                    request=request,
+                    is_finished=is_finished,
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+
+        if not payload_data:
+            return
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -234,6 +219,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         if success:
+            self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
 
     ########################################################################
@@ -250,12 +236,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         if self.connector.stage_id == 0:
             return
-        finished_load_reqs = self.get_finished_requests()
         self._process_chunk_queue(
-            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, finished_load_reqs
+            waiting_queue, self.waiting_for_chunk_waiting_requests, RequestStatus.WAITING, self._finished_load_reqs
         )
         self._process_chunk_queue(
-            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, finished_load_reqs
+            running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
         while len(running_queue) > self.scheduler_max_num_seqs:
             request = running_queue.pop()
@@ -321,6 +306,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
+                    finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
@@ -336,9 +322,3 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 if req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_id)
-
-    def get_finished_requests(self):
-        with self.lock:
-            finished_load = set(self._finished_load_reqs)
-            self._finished_load_reqs = set()
-        return finished_load
