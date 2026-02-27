@@ -243,7 +243,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `model`           | string | server's model | Model to use (optional, should match server if specified) |
 | `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                  |
 | `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus              |
-| `speed`           | float  | 1.0            | Playback speed (0.25-4.0)                                 |
+| `speed`           | float  | 1.0            | Playback speed (0.25-4.0, not supported with `stream=true`)              |
 
 ### vLLM-Omni Extension Parameters
 
