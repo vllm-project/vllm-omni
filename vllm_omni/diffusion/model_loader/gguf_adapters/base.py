@@ -4,7 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import gguf
 import numpy as np
@@ -33,8 +33,8 @@ class GGUFAdapter(ABC):
         self,
         gguf_file: str,
         model: torch.nn.Module,
-        source: "DiffusersPipelineLoader",
-        od_config: "OmniDiffusionConfig",
+        source: DiffusersPipelineLoader.ComponentSource,
+        od_config: OmniDiffusionConfig,
     ) -> None:
         self.gguf_file = gguf_file
         self.model = model
@@ -42,7 +42,11 @@ class GGUFAdapter(ABC):
         self.od_config = od_config
 
     @staticmethod
-    def is_compatible(od_config: "OmniDiffusionConfig", model: torch.nn.Module, source) -> bool:
+    def is_compatible(
+        od_config: OmniDiffusionConfig,
+        model: torch.nn.Module,
+        source: DiffusersPipelineLoader.ComponentSource,
+    ) -> bool:
         return False
 
     @abstractmethod
