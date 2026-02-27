@@ -63,6 +63,11 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    "GlmImageForConditionalGeneration": (
+        "glm_image",
+        "glm_image_ar",
+        "GlmImageForConditionalGeneration",
+    ),
 }
 
 

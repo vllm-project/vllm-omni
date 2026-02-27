@@ -133,6 +133,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
         if supports_mrope(self.get_model()):
+            # Model implements SupportsMRoPE interface
+            # Pass all extracted metadata; models use what they need via **kwargs
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,
@@ -153,6 +155,71 @@ class OmniGPUModelRunner(GPUModelRunner):
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
             )
+
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        """Calculate M-RoPE positions for scheduled tokens.
+
+        Delegates to the upstream implementation first, then applies a fixup
+        pass for models that pre-compute 2D spatial decode positions (e.g.
+        GLM-Image).  This avoids duplicating the full upstream method while
+        still supporting non-linear decode position patterns.
+
+        Models opt-in by declaring ``precomputed_mrope_decode = True`` as a
+        class attribute.  When set, ``get_mrope_input_positions`` is expected
+        to return positions covering **both** prefill and decode tokens.
+        """
+        # Run upstream logic (handles prompt positions + linear decode fallback)
+        super()._calc_mrope_positions(scheduler_output)
+
+        # Only run the fixup if the model pre-computes decode M-RoPE positions
+        if not getattr(self.get_model(), "precomputed_mrope_decode", False):
+            return
+
+        self._fixup_precomputed_mrope_decode_positions(scheduler_output)
+
+    def _fixup_precomputed_mrope_decode_positions(self, scheduler_output: "SchedulerOutput") -> None:
+        """Overwrite linear decode M-RoPE positions with pre-computed ones.
+
+        For image-generation models (like GLM-Image) that output tokens in 2D
+        grid order, ``get_mrope_input_positions`` returns positions for the
+        full sequence (prefill + decode).  The upstream runner only uses the
+        prefill portion and falls back to linear increments for decode.  This
+        method patches the decode slice with the correct pre-computed values.
+        """
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
+
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
+
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
+
+            mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                dst_start = mrope_pos_ptr
+                decode_start = num_computed_tokens + prompt_part_len
+                decode_end = decode_start + completion_part_len
+                total_precomputed = req.mrope_positions.shape[1]
+
+                if decode_end <= total_precomputed:
+                    # Overwrite the linear positions written by upstream with
+                    # the correct pre-computed 2D spatial positions.
+                    self.mrope_positions.cpu[:, dst_start : dst_start + completion_part_len] = req.mrope_positions[
+                        :, decode_start:decode_end
+                    ]
+
+                mrope_pos_ptr += completion_part_len
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler

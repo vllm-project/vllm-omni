@@ -44,6 +44,7 @@ from vllm_omni.entrypoints.omni_llm import OmniLLM
 from vllm_omni.entrypoints.stage_utils import (
     SHUTDOWN_TASK,
     OmniStageTaskType,
+    _resolve_model_tokenizer_paths,
     _to_dict,
     is_profiler_task,
     maybe_dump_to_shm,
@@ -251,7 +252,7 @@ class OmniStage:
     """
 
     def __init__(self, stage_config: Any, stage_init_timeout: int = 300):
-        logger.info(f"[OmniStage] stage_config: {stage_config}")
+        logger.debug(f"[OmniStage] stage_config: {stage_config}")
         self.stage_config = stage_config
         self.engine = None
         self.async_engine = None
@@ -708,6 +709,9 @@ def _stage_worker(
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
 
+    # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
+
     # Resolve ZMQ queue endpoints if needed
     zmq_ctx = None
     if isinstance(in_q, str) or isinstance(out_q, str):
@@ -933,8 +937,9 @@ def _stage_worker(
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
-            if isinstance(ein, (str, dict)):
-                # Types like OmniTextPrompt, TextPrompt are TypedDict, essentially dict and enters this branch
+
+            if isinstance(ein, (dict, str)):
+                # For diffusion stage-0, ein might be a string prompt directly
                 batch_engine_inputs.append(ein)
             elif isinstance(ein, Sequence):
                 batch_engine_inputs.extend(ein)
@@ -1107,6 +1112,9 @@ async def _stage_worker_async(
     stage_type = stage_payload.get("stage_type", "llm")
     final_output = stage_payload.get("final_output", False)
     final_output_type = stage_payload.get("final_output_type", None)
+
+    # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
 
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
