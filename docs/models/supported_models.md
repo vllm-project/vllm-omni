@@ -43,6 +43,7 @@ th {
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` |
 |`GlmImageForConditionalGeneration` | GLM-Image | `zai-org/GLM-Image` |
 |`NextStep11Pipeline` | NextStep-1.1 | `stepfun-ai/NextStep-1.1` |
+|`MiMoAudioForConditionalGeneration` | MiMo-Audio-7B-Instruct | `XiaomiMiMo/MiMo-Audio-7B-Instruct` |
 
 
 ## List of Supported Models for NPU
