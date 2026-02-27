@@ -509,15 +509,6 @@ def hardware_test(*, res: dict[str, str], num_cards: int | dict[str, int] = 1):
 class DeviceMemoryMonitor:
     """Poll global device memory usage."""
 
-    @classmethod
-    def instantiate(cls, **kwargs: Any) -> "DeviceMemoryMonitor":
-        if current_omni_platform.is_npu():
-            return NPUMemoryMonitor(**kwargs)
-        elif current_omni_platform.is_xpu():
-            return XPUMemoryMonitor(**kwargs)
-        else:
-            return cls(**kwargs)
-
     def __init__(self, device_index: int, interval: float = 0.05):
         self.device_index = device_index
         self.interval = interval
@@ -529,8 +520,8 @@ class DeviceMemoryMonitor:
         def monitor_loop() -> None:
             while not self._stop_event.is_set():
                 try:
-                    with torch.cuda.device(self.device_index):
-                        free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    with current_omni_platform.device(self.device_index):
+                        free_bytes, total_bytes = current_omni_platform.mem_get_info()
                     used_mb = (total_bytes - free_bytes) / (1024**2)
                     self._peak_used_mb = max(self._peak_used_mb, used_mb)
                 except Exception:
@@ -548,55 +539,9 @@ class DeviceMemoryMonitor:
 
     @property
     def peak_used_mb(self) -> float:
-        fallback_alloc = torch.cuda.max_memory_allocated(device=self.device_index) / (1024**2)
-        fallback_reserved = torch.cuda.max_memory_reserved(device=self.device_index) / (1024**2)
+        fallback_alloc = current_omni_platform.max_memory_allocated(device=self.device_index) / (1024**2)
+        fallback_reserved = current_omni_platform.max_memory_reserved(device=self.device_index) / (1024**2)
         return max(self._peak_used_mb, fallback_alloc, fallback_reserved)
 
     def __del__(self):
         self.stop()
-
-
-class NPUMemoryMonitor(DeviceMemoryMonitor):
-    def start(self) -> None:
-        def monitor_loop() -> None:
-            while not self._stop_event.is_set():
-                try:
-                    with torch.npu.device(self.device_index):
-                        free_bytes, total_bytes = torch.npu.mem_get_info()
-                    used_mb = (total_bytes - free_bytes) / (1024**2)
-                    self._peak_used_mb = max(self._peak_used_mb, used_mb)
-                except Exception:
-                    pass
-                time.sleep(self.interval)
-
-        self._thread = threading.Thread(target=monitor_loop, daemon=False)
-        self._thread.start()
-
-    @property
-    def peak_used_mb(self) -> float:
-        fallback_alloc = torch.npu.max_memory_allocated(device=self.device_index) / (1024**2)
-        fallback_reserved = torch.npu.max_memory_reserved(device=self.device_index) / (1024**2)
-        return max(self._peak_used_mb, fallback_alloc, fallback_reserved)
-
-
-class XPUMemoryMonitor(DeviceMemoryMonitor):
-    def start(self) -> None:
-        def monitor_loop() -> None:
-            while not self._stop_event.is_set():
-                try:
-                    with torch.xpu.device(self.device_index):
-                        free_bytes, total_bytes = torch.xpu.mem_get_info()
-                    used_mb = (total_bytes - free_bytes) / (1024**2)
-                    self._peak_used_mb = max(self._peak_used_mb, used_mb)
-                except Exception:
-                    pass
-                time.sleep(self.interval)
-
-        self._thread = threading.Thread(target=monitor_loop, daemon=False)
-        self._thread.start()
-
-    @property
-    def peak_used_mb(self) -> float:
-        fallback_alloc = torch.xpu.max_memory_allocated(device=self.device_index) / (1024**2)
-        fallback_reserved = torch.xpu.max_memory_reserved(device=self.device_index) / (1024**2)
-        return max(self._peak_used_mb, fallback_alloc, fallback_reserved)

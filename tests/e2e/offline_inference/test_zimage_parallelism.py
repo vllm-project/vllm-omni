@@ -93,9 +93,9 @@ def _run_zimage_generate(
     if num_requests < 2:
         raise ValueError("num_requests must be >= 2 (1 warmup + >=1 timed)")
 
-    torch.cuda.empty_cache()
-    device_index = torch.cuda.current_device()
-    monitor = DeviceMemoryMonitor.instantiate(device_index=device_index, interval=0.02)
+    current_omni_platform.empty_cache()
+    device_index = current_omni_platform.current_device()
+    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     m = Omni(
         model=_get_zimage_model(),

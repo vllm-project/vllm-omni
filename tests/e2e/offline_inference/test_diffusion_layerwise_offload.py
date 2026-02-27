@@ -29,8 +29,8 @@ def run_inference(
     num_inference_steps: int = 3,
 ) -> float:
     current_omni_platform.empty_cache()
-    device_index = torch.accelerator.current_device_index()
-    monitor = DeviceMemoryMonitor.instantiate(device_index=device_index, interval=0.02)
+    device_index = current_omni_platform.current_device()
+    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
 
     m = Omni(
@@ -40,7 +40,7 @@ def run_inference(
         flow_shift=5.0,
     )
 
-    torch.accelerator.reset_peak_memory_stats()
+    current_omni_platform.reset_peak_memory_stats()
 
     # Refer to tests/e2e/offline_inference/test_t2v_model.py
     # Use minimal settings for testing

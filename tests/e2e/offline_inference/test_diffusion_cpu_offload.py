@@ -21,11 +21,11 @@ models = ["riverclouds/qwen_image_random"]
 
 def inference(model_name: str, offload: bool = True):
     current_omni_platform.empty_cache()
-    device_index = torch.accelerator.current_device_index()
-    monitor = DeviceMemoryMonitor.instantiate(device_index=device_index, interval=0.02)
+    device_index = current_omni_platform.current_device()
+    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     m = Omni(model=model_name, enable_cpu_offload=offload)
-    torch.accelerator.reset_peak_memory_stats()
+    current_omni_platform.reset_peak_memory_stats()
     height = 256
     width = 256
 
