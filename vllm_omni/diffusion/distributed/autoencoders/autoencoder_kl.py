@@ -14,7 +14,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
-from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import Next_Step_AutoencoderKL
+from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL as Next_Step_AutoencoderKL
 
 logger = init_logger(__name__)
 
