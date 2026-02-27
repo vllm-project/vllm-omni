@@ -96,11 +96,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request.additional_information = None
         self._pending_load_reqs.append(request)
 
-    def save_async(self, pooling_output: torch.Tensor | None = None, request: Request | None = None):
+    def save_async(
+        self,
+        pooling_output: torch.Tensor | None = None,
+        request: Request | None = None,
+    ):
         """Build and enqueue one chunk for asynchronous sending.
 
-        Payload extraction is executed in the caller thread via
-        ``custom_process_next_stage_input_func``
+        Payload extraction happens in ``_send_single_request`` on the
+        background save_loop thread.
 
         Args:
             pooling_output: Partial pooling output dictionary
@@ -194,7 +198,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request_id = request.external_req_id
         chunk_id = self.put_req_chunk[request_id]
         connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
-        # Process payload in main thread to avoid race conditions on request state
+        # Process payload in save_loop thread
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
@@ -221,6 +225,40 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[request_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+
+    ########################################################################
+    # Cleanup
+    ########################################################################
+
+    def cleanup(
+        self,
+        request_id: str,
+        external_req_id: str | None = None,
+    ) -> None:
+        """Reclaim all per-request state after a request finishes.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+
+        Args:
+            request_id: Internal request id (receive / scheduler side key).
+            external_req_id: External request id (send / payload side key).
+                When *None*, looked up from ``request_ids_mapping``.
+        """
+        if external_req_id is None:
+            external_req_id = self.request_ids_mapping.get(request_id, request_id)
+
+        self.finished_requests.discard(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.request_ids_mapping.pop(request_id, None)
+
+        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
+        self._pending_load_reqs = remaining
+        self._finished_load_reqs.discard(request_id)
+
+        self.put_req_chunk.pop(external_req_id, None)
+        self.request_payload.pop(external_req_id, None)
+        self.code_prompt_token_ids.pop(external_req_id, None)
 
     ########################################################################
     # Schedule Helper

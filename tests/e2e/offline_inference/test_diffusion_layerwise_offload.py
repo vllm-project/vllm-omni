@@ -7,6 +7,7 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.utils import GPUMemoryMonitor
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -29,7 +30,7 @@ def run_inference(
 ) -> float:
     # For now, only support on GPU, so apply torch.cuda operations here
     # NPU / ROCm platforms are expected to be detected and skipped this test function
-    torch.cuda.empty_cache()
+    current_omni_platform.empty_cache()
     device_index = torch.cuda.current_device()
     monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
