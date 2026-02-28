@@ -624,16 +624,14 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         # Add learnable embeddings to distinguish different images
         self.image_index_embedding = nn.Parameter(torch.randn(5, hidden_size))  # support max 5 ref images
 
-    def forward(
+    def _validate_inputs(
         self,
         hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
         text_hidden_states: torch.Tensor,
-        freqs_cis: torch.Tensor,
         text_attention_mask: torch.Tensor,
-        ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
-        return_dict: bool = False,
-    ) -> torch.Tensor:
+        ref_image_hidden_states: list[list[torch.Tensor]] | None,
+        return_dict: bool,
+    ) -> tuple[int, int, int]:
         if return_dict:
             raise ValueError("return_dict=True is not supported in vLLM inference.")
         if ref_image_hidden_states is not None:
@@ -652,8 +650,21 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         p = self.config.patch_size
         if height % p != 0 or width % p != 0:
             raise ValueError(f"Input latent H/W must be divisible by patch_size={p}, got {height}x{width}")
+        return batch_size, height, width
 
+    def _prepare_embeddings(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_hidden_states: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        batch_size: int,
+        height: int,
+        width: int,
+    ):
         device = hidden_states.device
+        p = self.config.patch_size
 
         temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states.dtype)
 
@@ -685,11 +696,87 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             device,
         )
 
+        return (
+            temb,
+            text_hidden_states,
+            img_tokens,
+            img_mask,
+            img_len,
+            context_rotary_emb,
+            noise_rotary_emb,
+            rotary_emb,
+            encoder_seq_lengths,
+            seq_lengths,
+        )
+
+    def _apply_refiners(
+        self,
+        text_hidden_states: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        context_rotary_emb: torch.Tensor,
+        img_tokens: torch.Tensor,
+        img_mask: torch.Tensor,
+        noise_rotary_emb: torch.Tensor,
+        temb: torch.Tensor,
+    ):
         for layer in self.context_refiner:
             text_hidden_states = layer(text_hidden_states, text_attention_mask, context_rotary_emb)
 
         for layer in self.noise_refiner:
             img_tokens = layer(img_tokens, img_mask, noise_rotary_emb, temb)
+
+        return text_hidden_states, img_tokens
+
+    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+        return hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_hidden_states: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+        return_dict: bool = False,
+    ) -> torch.Tensor:
+        batch_size, height, width = self._validate_inputs(
+            hidden_states, text_hidden_states, text_attention_mask, ref_image_hidden_states, return_dict
+        )
+
+        (
+            temb,
+            text_hidden_states,
+            img_tokens,
+            img_mask,
+            img_len,
+            context_rotary_emb,
+            noise_rotary_emb,
+            rotary_emb,
+            encoder_seq_lengths,
+            seq_lengths,
+        ) = self._prepare_embeddings(
+            hidden_states,
+            timestep,
+            text_hidden_states,
+            text_attention_mask,
+            freqs_cis,
+            batch_size,
+            height,
+            width,
+        )
+
+        text_hidden_states, img_tokens = self._apply_refiners(
+            text_hidden_states,
+            text_attention_mask,
+            context_rotary_emb,
+            img_tokens,
+            img_mask,
+            noise_rotary_emb,
+            temb,
+        )
 
         max_seq_len = max(seq_lengths)
         attention_mask = hidden_states.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
@@ -699,12 +786,11 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
             joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
 
-        hidden_states = joint_hidden_states
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+        hidden_states = self._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
 
         hidden_states = self.norm_out(hidden_states, temb)
 
+        p = self.config.patch_size
         img_hidden_states = torch.stack(
             [
                 hidden_states[i, encoder_seq_len : encoder_seq_len + img_len]

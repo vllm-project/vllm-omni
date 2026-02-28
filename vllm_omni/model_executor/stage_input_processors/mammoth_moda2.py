@@ -28,6 +28,8 @@ def ar2dit(
         cfg_range = addi_info["cfg_range"]
         num_inference_steps = addi_info["num_inference_steps"][0]
         gen_vocab_start_index = addi_info["visual_token_start_id"][0]
+        # ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
+        visual_ids = addi_info["visual_ids"]
 
         prompt_token_ids = ar_output.prompt_token_ids
         # exclude the last token because it has no corresponding hidden state
@@ -52,21 +54,14 @@ def ar2dit(
         full_token_ids_t = torch.tensor(full_token_ids, dtype=torch.long, device=mask_device)
         attention_mask = torch.ones_like(full_token_ids_t, dtype=torch.bool)
 
-        L = int(full_token_ids_t.shape[0])
-        answer_start_index = max(L - 10, 0)  # the last 10 tokens as answer
-        pos = torch.arange(L, device=mask_device)
+        pos = torch.arange(full_token_ids_t.shape[0], device=mask_device)
+        answer_start_index = len(prompt_token_ids)
         questions_mask = pos < answer_start_index
         answers_mask = ~questions_mask
 
         gen_token_mask = full_token_ids_t >= gen_vocab_start_index
 
         visual_token_mask = torch.zeros_like(gen_token_mask)
-        visual_ids = [
-            151655,
-            151656,
-            151652,
-            151653,
-        ]  # ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
         visual_token_mask = torch.isin(
             full_token_ids_t,
             torch.tensor(visual_ids, dtype=torch.long, device=mask_device),

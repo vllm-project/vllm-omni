@@ -49,12 +49,64 @@ from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Con
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
+def moe_enable(moe_type, layer_type, layer_idx):
+    """Determine if MoE should be enabled for a specific layer type and index.
+
+    Args:
+        moe_type (str): The MoE configuration string (e.g., "ffn", "ffn_attention-14:28").
+        layer_type (str): The type of layer being checked (e.g., "ffn", "attention").
+        layer_idx (int): The index of the current layer.
+
+    Returns:
+        bool: True if MoE should be enabled for this layer, False otherwise.
+    """
+    if ":" in moe_type:
+        # moe_type like ffn_attention-14:28
+        moe_type, layers = moe_type.split("-")
+        start, end = [int(n) for n in layers.split(":")]
+    else:
+        moe_type = moe_type
+        start, end = 0, float("inf")
+    assert moe_type in ["none", "attention", "ffn", "ffn_attention"]
+    if layer_type in moe_type and start <= layer_idx < end:
+        return True
+    else:
+        return False
+
 def moe_forward(
     hidden_states: torch.Tensor,
     und_expert: Callable[[torch.Tensor], torch.Tensor],
     gen_expert: Callable[[torch.Tensor], torch.Tensor] | None,
     gen_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Perform Mixture-of-Experts (MoE) routing and forward pass.
+
+    This function routes tokens to either the understanding expert (`und_expert`) or the
+    generation expert (`gen_expert`) based on the `gen_token_mask`.
+
+    Routing Logic:
+    - If `gen_expert` is None: All tokens go to `und_expert`.
+    - If `gen_token_mask` is None or all False: All tokens go to `und_expert`.
+    - If `gen_token_mask` is all True: All tokens go to `gen_expert`.
+    - Otherwise (mixed batch):
+        - Tokens where `gen_token_mask` is True go to `gen_expert`.
+        - Tokens where `gen_token_mask` is False go to `und_expert`.
+        - Results are concatenated and reordered to match the original input order.
+
+    Args:
+        hidden_states (torch.Tensor): Input hidden states. Shape: `(batch_size, seq_len, hidden_size)`
+            or `(num_tokens, hidden_size)`.
+        und_expert (Callable): The expert module for understanding/text tokens.
+            Takes `(N, D)` tensor, returns `(N, D_out)`.
+        gen_expert (Callable | None): The expert module for generation/image tokens, or None.
+            If provided, takes `(N, D)` tensor, returns `(N, D_out)`.
+        gen_token_mask (torch.Tensor | None): Boolean mask indicating generation tokens.
+            Shape matches `hidden_states` (excluding feature dim). True for generation tokens.
+
+    Returns:
+        torch.Tensor: The processed hidden states with the same shape as input (except potentially
+        different feature dimension if `D_out != D`).
+    """
     if gen_expert is None:
         return und_expert(hidden_states)
 
@@ -182,7 +234,8 @@ class Mammoth2DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
 
-        if 14 <= layer_idx < 28:
+        self.moe_enable = moe_enable(config.moe_type, "ffn", layer_idx)
+        if self.moe_enable:
             self.gen_mlp = Qwen2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -589,11 +642,6 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 row[:visual_start] = neg_inf
                 row[visual_end:] = neg_inf
                 row[eol_token_id] = neg_inf
-
-            if generated_len >= expected_token_num:
-                row.fill_(neg_inf)
-                end_of_image_id = 152071
-                row[end_of_image_id] = 1.0  # Allow only end_of_image_id after expected tokens num
 
         return logits
 

@@ -153,8 +153,8 @@ def main() -> None:
             temperature=1.0,
             top_p=1.0,
             top_k=2048,
-            # +1 for generating eoi, +1 for generating hidden state of eoi
-            max_tokens=max(1, expected_grid_tokens + 1 + 1),
+            # +1 for generating hidden state of eoi
+            max_tokens=max(1, expected_grid_tokens + 1),
             detokenize=False,
         )
 
@@ -179,6 +179,8 @@ def main() -> None:
             "num_inference_steps": [args.num_inference_steps],
             "text_guidance_scale": [args.text_guidance_scale],
             "cfg_range": [args.cfg_range[0], args.cfg_range[1]],
+            # ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
+            "visual_ids": [151655, 151656, 151652, 151653,]
         }
         inputs = [
             {
