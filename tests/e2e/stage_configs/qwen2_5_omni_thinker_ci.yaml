@@ -1,0 +1,31 @@
+stage_args:
+  - stage_id: 0
+    runtime:
+      process: true            # Run this stage in a separate process
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: Qwen2_5OmniForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      max_model_len: 16384
+      max_num_batched_tokens: 16384
+      max_num_seqs: 1
+      gpu_memory_utilization: 0.9
+      skip_mm_profiling: true
+      enforce_eager: true  # Now we only support eager mode
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 128
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1

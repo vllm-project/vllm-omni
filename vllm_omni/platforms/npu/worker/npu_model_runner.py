@@ -34,15 +34,22 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
         enable_sp(self.vllm_config)
         # TODO move this model specific logic to a separate class
-        if hasattr(self.model, "talker_mtp") and self.model.talker is not None:
-            self.talker_mtp = self.model.talker_mtp
+        # TTS model IS the talker (no .talker sub-attr); use getattr to support both Omni and TTS.
+        talker_mtp = getattr(self.model, "talker_mtp", None)
+        if talker_mtp is not None:
+            self.talker_mtp = talker_mtp  # type: ignore[assignment]
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
-            if cudagraph_mode.has_full_cudagraphs():
-                self.talker_mtp = ACLGraphWrapper(
-                    self.model.talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
-                )
-            hidden_size = self.model_config.hf_config.talker_config.text_config.hidden_size
+            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
+            # have a separate .talker sub-module.  TTS models' code predictor
+            # has internal AR loops / torch.multinomial — not graph-safe.
+            has_separate_talker = getattr(self.model, "talker", None) is not None
+            if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
+                self.talker_mtp = ACLGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
+            hidden_size = int(
+                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
+            )
             max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
             self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
@@ -337,12 +344,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # Omni-specific: build and inject extra model kwargs
         model_kwargs_extra = self._build_model_kwargs_extra()
 
-        runtime_info = model_kwargs_extra.get("runtime_additional_information", [])
-        if runtime_info:
-            for i, info in enumerate(runtime_info):
-                if info:
-                    logger.debug(f"[OMNI] req[{i}] runtime_additional_information keys: {list(info.keys())}")
-
         # Call the model forward (same as NPUModelRunner)
         assert self.model is not None
         model_output = self.model(
@@ -397,6 +398,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             max_num_scheduled_tokens=1,
             use_cascade_attn=False,
         )
+        # Force eager for unwrapped code predictors (AR loops / multinomial).
+        if not isinstance(self.talker_mtp, ACLGraphWrapper):
+            _cudagraph_mode = CUDAGraphMode.NONE
         num_tokens_padded = batch_desc.num_tokens
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
@@ -408,9 +412,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
         # update the inputs_embeds and code_predictor_codes
         code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
+        out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {"code_predictor_codes": code_predictor_codes_cpu[idx : idx + 1]}
+            update_dict = {out_key: code_predictor_codes_cpu[idx : idx + 1]}
             self._merge_additional_information_update(req_id, update_dict)

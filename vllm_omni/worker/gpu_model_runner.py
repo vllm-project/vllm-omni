@@ -133,6 +133,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
         if supports_mrope(self.get_model()):
+            # Model implements SupportsMRoPE interface
+            # Pass all extracted metadata; models use what they need via **kwargs
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 mm_features=req_state.mm_features,
@@ -153,6 +155,71 @@ class OmniGPUModelRunner(GPUModelRunner):
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
             )
+
+    def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
+        """Calculate M-RoPE positions for scheduled tokens.
+
+        Delegates to the upstream implementation first, then applies a fixup
+        pass for models that pre-compute 2D spatial decode positions (e.g.
+        GLM-Image).  This avoids duplicating the full upstream method while
+        still supporting non-linear decode position patterns.
+
+        Models opt-in by declaring ``precomputed_mrope_decode = True`` as a
+        class attribute.  When set, ``get_mrope_input_positions`` is expected
+        to return positions covering **both** prefill and decode tokens.
+        """
+        # Run upstream logic (handles prompt positions + linear decode fallback)
+        super()._calc_mrope_positions(scheduler_output)
+
+        # Only run the fixup if the model pre-computes decode M-RoPE positions
+        if not getattr(self.get_model(), "precomputed_mrope_decode", False):
+            return
+
+        self._fixup_precomputed_mrope_decode_positions(scheduler_output)
+
+    def _fixup_precomputed_mrope_decode_positions(self, scheduler_output: "SchedulerOutput") -> None:
+        """Overwrite linear decode M-RoPE positions with pre-computed ones.
+
+        For image-generation models (like GLM-Image) that output tokens in 2D
+        grid order, ``get_mrope_input_positions`` returns positions for the
+        full sequence (prefill + decode).  The upstream runner only uses the
+        prefill portion and falls back to linear increments for decode.  This
+        method patches the decode slice with the correct pre-computed values.
+        """
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
+
+        mrope_pos_ptr = 0
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            assert req.mrope_positions is not None
+
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
+
+            if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+                prompt_part_len = max(0, num_prompt_tokens - num_computed_tokens)
+                completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+            else:
+                prompt_part_len = num_scheduled_tokens
+                completion_part_len = 0
+
+            mrope_pos_ptr += prompt_part_len
+
+            if completion_part_len > 0:
+                dst_start = mrope_pos_ptr
+                decode_start = num_computed_tokens + prompt_part_len
+                decode_end = decode_start + completion_part_len
+                total_precomputed = req.mrope_positions.shape[1]
+
+                if decode_end <= total_precomputed:
+                    # Overwrite the linear positions written by upstream with
+                    # the correct pre-computed 2D spatial positions.
+                    self.mrope_positions.cpu[:, dst_start : dst_start + completion_part_len] = req.mrope_positions[
+                        :, decode_start:decode_end
+                    ]
+
+                mrope_pos_ptr += completion_part_len
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -924,17 +991,50 @@ class OmniGPUModelRunner(GPUModelRunner):
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
 
+    def _update_request_information(self, request_id: str, payload_info: dict) -> None:
+        """Update per-request additional_information stored in request state."""
+        req_state = self.requests.get(request_id)
+        if req_state is None:
+            return
+
+        info_dict = getattr(req_state, "additional_information_cpu", None)
+        if isinstance(payload_info, dict) and info_dict is not None:
+            info_dict.update(payload_info)
+
     def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
             payload_info = getattr(new_req, "additional_information", None)
             if isinstance(payload_info, dict):
-                self._merge_additional_information_update(new_req.req_id, payload_info)
+                self._update_request_information(new_req.req_id, payload_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
             if isinstance(cached_infos, dict):
                 for req_id, req_infos in cached_infos.items():
-                    self._merge_additional_information_update(req_id, req_infos)
+                    self._update_request_information(req_id, req_infos)
+
+    def _maybe_attach_mimo_audio_req_infos(
+        self,
+        req_state: CachedRequestState | None,
+        req_infos: dict | None,
+        req_id: str,
+    ) -> dict | None:
+        """Attach MiMoAudio-specific fields into req_infos if applicable.
+
+        This helper is intentionally small and self-contained so that it can be
+        unit-tested to prevent regressions when updating MiMoAudio handling.
+        """
+        if req_state is None or self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+            return req_infos
+
+        # Always operate on a dict copy to avoid mutating shared instances.
+        req_infos = dict(req_infos) if isinstance(req_infos, dict) else {}
+        mm_features = getattr(req_state, "mm_features", None)
+        if mm_features and (not req_infos.get("mm_features")):
+            req_infos["mm_features"] = mm_features
+        req_infos["req_id"] = req_id
+
+        return req_infos
 
     def _preprocess(
         self,
@@ -1060,6 +1160,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests.get(req_id)
                 req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+
+                # mimo-audio check
+                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])
                 s, e = start_offset, start_offset + sched_tokens

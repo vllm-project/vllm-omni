@@ -125,6 +125,7 @@ DiffusionModelRegistry = _ModelRegistry(
 
 _VAE_PATCH_PARALLEL_ALLOWLIST = {
     # Only enable for models we have validated end-to-end.
+    "StableDiffusion3Pipeline",
     "ZImagePipeline",
     "NextStep11Pipeline",
 }

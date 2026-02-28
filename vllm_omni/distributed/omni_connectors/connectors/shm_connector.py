@@ -3,7 +3,7 @@
 
 import fcntl
 import os
-import time
+from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
@@ -51,7 +51,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             if True:
                 # Use Shared Memory
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-                with open(lock_file, "w") as lockf:
+                with open(lock_file, "wb+") as lockf:
                     fcntl.flock(lockf, fcntl.LOCK_EX)
                     meta = shm_write_bytes(payload, name=put_key)
                     fcntl.flock(lockf, fcntl.LOCK_UN)
@@ -75,6 +75,23 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
+    def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
+        obj = None
+        try:
+            with open(lock_file, "rb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                data_bytes = shm_read_bytes(shm_handle)
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            obj = self.deserialize_obj(data_bytes)
+            return obj, int(shm_handle.get("size", 0))
+        except Exception as e:
+            logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
+            return None, 0
+        finally:
+            # If data has been received, delete lock_file.
+            if obj and os.path.exists(lock_file):
+                os.remove(lock_file)
+
     def get(
         self,
         from_stage: str,
@@ -88,7 +105,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 metadata = metadata.get(get_key)
 
             if not isinstance(metadata, dict):
-                return None
+                return None, 0
 
             if "inline_bytes" in metadata:
                 try:
@@ -96,63 +113,27 @@ class SharedMemoryConnector(OmniConnectorBase):
                     return obj, int(metadata.get("size", 0))
                 except Exception as e:
                     logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
-                    return None
+                    return None, 0
 
             if "shm" in metadata:
-                try:
-                    shm_handle = metadata["shm"]
-                    lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
-                    with open(lock_file, "w") as lockf:
-                        fcntl.flock(lockf, fcntl.LOCK_SH)
-                        data_bytes = shm_read_bytes(shm_handle)
-                        fcntl.flock(lockf, fcntl.LOCK_UN)
-                    if os.path.exists(lock_file):
-                        os.remove(lock_file)
-                    obj = self.deserialize_obj(data_bytes)
-                    return obj, int(metadata.get("size", 0))
-                except Exception as e:
-                    logger.error(f"SharedMemoryConnector shm get failed for req {get_key}: {e}")
-                    return None
+                shm_handle = metadata["shm"]
+                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                return self._get_data_with_lock(lock_file, shm_handle)
 
-            return None
-
-        from multiprocessing import shared_memory as shm_pkg
-
-        # Wait for shared memory to be available (with retry logic)
-        max_retries = 30
-        retry_delay = 0.1  # 100ms between retries
+            return None, 0
         shm = None
-
-        for attempt in range(max_retries):
-            try:
-                shm = shm_pkg.SharedMemory(name=get_key)
-                break  # Successfully opened, exit retry loop
-            except FileNotFoundError:
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                else:
-                    # Max retries reached, return None
-                    logger.warning(f"Shared memory '{get_key}' not found after {max_retries} retries")
-                    return None
-
-        if shm is None:
-            return None
-
         try:
+            shm = shm_pkg.SharedMemory(name=get_key)
+            if shm is None or shm.size == 0:
+                return None, 0
             lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-            with open(lock_file) as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_SH)
-                data_bytes = shm_read_bytes({"name": get_key, "size": shm.size})
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-            # Clean up the temporary file if it still exists.
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
-            obj = self.deserialize_obj(data_bytes)
-            return obj, shm.size
+            shm_handle = {"name": get_key, "size": shm.size}
+            return self._get_data_with_lock(lock_file, shm_handle)
+        except Exception:
+            return None, 0
         finally:
-            shm.close()
-
-        # TODO: update another read method
+            if shm:
+                shm.close()
 
     def cleanup(self, request_id: str) -> None:
         # SHM segments are automatically unlinked during 'get' (shm_read_bytes).
