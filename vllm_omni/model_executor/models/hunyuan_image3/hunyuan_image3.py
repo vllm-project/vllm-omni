@@ -832,7 +832,7 @@ class HunyuanImage3Processor:
         for image in images:
             current_info = {}
 
-            if self.hf_config.vit["num_channels"] == 3 and image.mode == 'RGBA':
+            if self.hf_config.vit["num_channels"] == 3 and image.mode == "RGBA":
                 image = rgba_to_rgb(image, (255, 255, 255))
 
             # VIT processing
