@@ -75,16 +75,13 @@ class OmniDiffusion:
             # Map model_type or architecture to pipeline class
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
+            pipeline_class = None
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
             if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
+                pipeline_class = "BagelPipeline"
             elif model_type == "nextstep":
                 if od_config.model_class_name is None:
-                    od_config.model_class_name = "NextStep11Pipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
+                    pipeline_class = "NextStep11Pipeline"
             elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
                 pipeline_class = "GlmImagePipeline"
             elif architectures and len(architectures) == 1:
