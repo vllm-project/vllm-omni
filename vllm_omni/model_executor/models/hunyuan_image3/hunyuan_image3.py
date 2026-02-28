@@ -8,7 +8,6 @@ from typing import Any, Literal, TypeAlias
 import numpy as np
 import regex as re
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
 from torch import nn
