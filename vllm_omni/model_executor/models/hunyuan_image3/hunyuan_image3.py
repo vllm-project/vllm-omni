@@ -56,6 +56,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.image import rgba_to_rgb
 from vllm.multimodal.inputs import (
     MultiModalDataDict,
     MultiModalFeatureSpec,
@@ -831,6 +832,9 @@ class HunyuanImage3Processor:
         for image in images:
             current_info = {}
 
+            if self.hf_config.vit["num_channels"] == 3 and image.mode == 'RGBA':
+                image = rgba_to_rgb(image, (255, 255, 255))
+
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
             # shape: (seq_len, num_channels * patch_size * patch_size)
@@ -1056,6 +1060,20 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
     dummy_inputs=HunyuanImage3DummyInputsBuilder,
 )
 class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA, SupportsPP, SupportsMRoPE):
+    """
+    HunyuanImage3.0 model for conditional image generation.
+
+    This is the main entry point for HunyuanImage3.0 in vLLM. It wraps:
+    - HunyuanModel
+    - VAE Encoder (AutoencoderKLConv3D + TimestepEmbedder + UNetDown)
+    - ViT Encoder (Siglip2VisionTransformer + LightProjector)
+    - LM Head for token prediction
+
+    Supports:
+    - Text-to-Text and Image-to-Text generation
+    - Tensor Parallelism
+    """
+
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     packed_modules_mapping = {

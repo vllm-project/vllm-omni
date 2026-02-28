@@ -44,8 +44,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def load_image(image_path: str) -> Image.Image:
+    """Load an image from file path."""
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+    return Image.open(image_path).convert("RGB")
+
+
+def main(args: argparse.Namespace) -> None:
     omni = Omni(model=args.model)
 
     prompt_dict = {
@@ -58,10 +64,17 @@ if __name__ == "__main__":
         if not os.path.exists(args.image):
             raise FileNotFoundError(f"Input image not found: {args.image}")
 
-        input_image = Image.open(args.image).convert("RGB")
+        input_image = load_image(args.image)
         prompt_dict["multi_modal_data"] = {"image": input_image}
-        print(f"Input image size: {input_image.size}")
 
     prompts = [prompt_dict]
     omni_outputs = omni.generate(prompts=prompts)
-    print("omni_output = " + str(omni_outputs))
+    
+    prompt_text = omni_outputs[0].request_output[0].prompt
+    generated_text = omni_outputs[0].request_output[0].outputs[0].text
+    print(f"Prompt: {prompt_text}")
+    print(f"Text: {generated_text}")
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
