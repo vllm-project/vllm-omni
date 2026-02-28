@@ -128,13 +128,10 @@ class SiglipNaViTWrapper(nn.Module):
         else:
             self.vision_model = vision_model
 
-        # Configure weights for linear equivalent of patch embedding
-        self.patch_embed_weight = self.vision_model.embeddings.patch_embedding.weight
-        self.patch_embed_bias = self.vision_model.embeddings.patch_embedding.bias
-
     def forward(self, packed_pixel_values, packed_flattened_position_ids, cu_seqlens, max_seqlen):
-        w = self.patch_embed_weight.view(self.patch_embed_weight.shape[0], -1)
-        x = F.linear(packed_pixel_values, w, self.patch_embed_bias)
+        patch_embed = self.vision_model.embeddings.patch_embedding
+        w = patch_embed.weight.view(patch_embed.weight.shape[0], -1)
+        x = F.linear(packed_pixel_values, w, patch_embed.bias)
         pos = self.vision_model.embeddings.position_embedding(packed_flattened_position_ids)
         x = x + pos
         hidden_states = x.unsqueeze(0)
@@ -205,6 +202,9 @@ class BagelPipeline(nn.Module):
         )
         vit_config_path = os.path.join(model_path, "vit_config.json")
         vit_conf = SiglipVisionConfig.from_json_file(vit_config_path)
+        if vit_conf.num_hidden_layers == 27:
+            vit_conf.num_hidden_layers = 26
+        vit_conf.vision_use_head = False
         self.vit_model = SiglipVisionModel(vit_conf)
         self.image_processor = SiglipImageProcessor.from_pretrained(model_path, local_files_only=True)
 

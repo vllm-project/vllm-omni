@@ -136,6 +136,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             return False
 
+        if result is None:
+            return False
         payload_data, size = result
 
         if payload_data:
