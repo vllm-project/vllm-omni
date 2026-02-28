@@ -78,6 +78,8 @@ Configuration classes.
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
+- [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioConfig][]
+- [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioTokenizerConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSSpeakerEncoderConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerCodePredictorConfig][]
