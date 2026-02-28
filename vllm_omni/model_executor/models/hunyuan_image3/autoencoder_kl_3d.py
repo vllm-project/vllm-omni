@@ -904,40 +904,6 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             self.enable_temporal_tiling()
 
 
-def load_sharded_safetensors(model_dir):
-    """
-    Manually load sharded safetensors files
-
-    Args:
-        model_dir: Directory path containing shard files
-
-    Returns:
-        Merged complete weight dictionary
-    """
-    # Get all shard files and sort by number
-    shard_files = []
-    for file in os.listdir(model_dir):
-        if file.endswith(".safetensors"):
-            shard_files.append(file)
-
-    # Sort by shard number
-    shard_files.sort(key=lambda x: int(x.split("-")[1]))
-
-    # Merge all weights
-    merged_state_dict = dict()
-
-    for shard_file in shard_files:
-        shard_path = os.path.join(model_dir, shard_file)
-
-        # Load current shard using safetensors
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
-                merged_state_dict[key] = tensor
-
-    return merged_state_dict
-
-
 def load_weights(model, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     def update_state_dict(state_dict: dict[str, torch.Tensor], name, weight):
         if name not in state_dict:
