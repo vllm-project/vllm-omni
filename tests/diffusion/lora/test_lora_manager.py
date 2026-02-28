@@ -137,9 +137,9 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
 
     pipeline = torch.nn.Module()
     pipeline.stacked_params_mapping = [
-        (".to_qkv", ".to_q", "q"),
-        (".to_qkv", ".to_k", "k"),
-        (".to_qkv", ".to_v", "v"),
+        (".to_qkv.", ".to_q.", "q"),
+        (".to_qkv.", ".to_k.", "k"),
+        (".to_qkv.", ".to_v.", "v"),
     ]
     pipeline.transformer = torch.nn.Module()
     pipeline.transformer.to_qkv = _FakeLinearBase()

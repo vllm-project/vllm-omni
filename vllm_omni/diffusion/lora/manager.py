@@ -155,8 +155,8 @@ class DiffusionLoRAManager:
                 # The mapping strings are usually suffix patterns (e.g. ".to_qkv"),
                 # but some models scope them under submodules (e.g. ".attn1.to_qkv").
                 # For LoRA we only care about the leaf module names.
-                packed_name = packed_suffix.split(".")[-1]
-                sub_name = sub_suffix.split(".")[-1]
+                packed_name = packed_suffix.strip(".").split(".")[-1]
+                sub_name = sub_suffix.strip(".").split(".")[-1]
                 existing = derived.get(packed_name)
                 if existing is None:
                     derived[packed_name] = [sub_name]
