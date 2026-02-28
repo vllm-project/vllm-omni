@@ -275,6 +275,7 @@ class HunyuanModel(HunYuanModel):
                         weight_loader(param, loaded_weight[offset:new_offset], shard_id)
                     offset = new_offset
 
+                loaded_params.add(name)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -360,7 +361,7 @@ class HunyuanModel(HunYuanModel):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                loaded_params.add(name)
         return loaded_params
 
 
@@ -413,37 +414,6 @@ def normalization(channels, **kwargs):
     return nn.GroupNorm(32, channels, **kwargs)
 
 
-class Upsample(nn.Module):
-    """
-    An upsampling layer with an optional convolution.
-
-    :param channels: channels in the inputs and outputs.
-    :param use_conv: a bool determining if a convolution is applied.
-    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
-                 upsampling occurs in the inner-two dimensions.
-    """
-
-    def __init__(self, channels, use_conv, dims=2, out_channels=None, device=None, dtype=None):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.channels = channels
-        self.out_channels = out_channels or channels
-        self.use_conv = use_conv
-        self.dims = dims
-        if use_conv:
-            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1, **factory_kwargs)
-
-    def forward(self, x):
-        assert x.shape[1] == self.channels
-        if self.dims == 3:
-            x = F.interpolate(x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest")
-        else:
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
-        if self.use_conv:
-            x = self.conv(x)
-        return x
-
-
 class Downsample(nn.Module):
     """
     A downsampling layer with an optional convolution.
@@ -485,7 +455,6 @@ class ResBlock(nn.Module):
         convolution instead of a smaller 1x1 convolution to change the
         channels in the skip connection.
     :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param up: if True, use this block for upsampling.
     :param down: if True, use this block for downsampling.
     """
 
@@ -497,7 +466,6 @@ class ResBlock(nn.Module):
         dropout=0.0,
         use_conv=False,
         dims=2,
-        up=False,
         down=False,
         device=None,
         dtype=None,
@@ -515,12 +483,9 @@ class ResBlock(nn.Module):
             conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),
         )
 
-        self.updown = up or down
+        self.down = down
 
-        if up:
-            self.h_upd = Upsample(self.in_channels, False, dims, **factory_kwargs)
-            self.x_upd = Upsample(self.in_channels, False, dims, **factory_kwargs)
-        elif down:
+        if down:
             self.h_upd = Downsample(self.in_channels, False, dims, **factory_kwargs)
             self.x_upd = Downsample(self.in_channels, False, dims, **factory_kwargs)
         else:
@@ -543,7 +508,7 @@ class ResBlock(nn.Module):
             self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 1, **factory_kwargs)
 
     def forward(self, x, emb):
-        if self.updown:
+        if self.down:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
             h = self.h_upd(h)
@@ -875,9 +840,6 @@ class HunyuanImage3Processor:
             current_info["vit_pixel_attention_mask"] = vit_pixel_values["pixel_attention_mask"].squeeze(0)
             # shape: (2, )
             current_info["vit_spatial_shapes"] = vit_pixel_values["spatial_shapes"].squeeze(0)
-            logger.info(
-                f"vit input image: {image.width} x {image.height}, token grid: {vit_pixel_values['spatial_shapes']}"
-            )
 
             # VAE processing
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
@@ -887,16 +849,11 @@ class HunyuanImage3Processor:
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
             current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(dtype=torch_dtype)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
-            logger.info(
-                f"vae input image: {image.width} x {image.height}, target size: {image_width} x {image_height}, "
-                + f"token grid: {token_width} x {token_height}."
-            )
 
             # size
             base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
             current_info["base_size"] = torch.tensor(base_size)
             current_info["ratio_index"] = torch.tensor(ratio_index)
-            logger.info(f"base size: {base_size} and ratio index: {ratio_index}")
 
             batch_data.append(current_info)
 
@@ -905,6 +862,10 @@ class HunyuanImage3Processor:
         if len(batch_data) > 0:
             for key in batch_data[0].keys():
                 final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
+
+        if final_image_info:
+            shapes_info = {k: tuple(v.shape) for k, v in final_image_info.items()}
+            logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
 
         return final_image_info
 
@@ -963,7 +924,6 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
         mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
-        logger.info(f"dummy image count: {num_images}")
 
         hf_config = self.info.get_hf_config()
         image_size = hf_config.image_base_size
@@ -991,7 +951,7 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
     ) -> BatchFeature:
         image_processor = self.info.get_image_processor(**mm_kwargs)
         images = mm_data.get("images", [])
-        logger.info(f"process image count: {len(images)}")
+        logger.debug(f"process image count: {len(images)}")
         batch_feature = image_processor(prompt, images, **tok_kwargs)
         return batch_feature
 
@@ -1083,7 +1043,7 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
                 + [img_token_id] * vit_token_num
                 + [eoi_token_id]
             )
-            logger.info(f"actual replacement token count: {timestep_token_num + vae_token_num + vit_token_num}")
+            logger.debug(f"actual replacement token count: {timestep_token_num + vae_token_num + vit_token_num}")
             return PromptUpdateDetails.select_token_id(replacement, embed_token_id=img_token_id)
 
         return [
