@@ -71,7 +71,7 @@ def get_system_prompt():
 
 def get_prompt(prompt_type="text_only"):
     prompts = {
-        "text_only": "What is the capital of China?",
+        "text_only": "What is the capital of China? Answer in 20 words.",
         "mix": "What is recited in the audio? What is in this image? What is in this video?",
         "text_video": "What is in this video? ",
         "text_image": "What is in this image? ",
