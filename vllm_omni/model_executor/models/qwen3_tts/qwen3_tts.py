@@ -100,6 +100,33 @@ class Qwen3TTSModelForGeneration(nn.Module):
         # Store vllm_config for potential future use
         self.vllm_config = vllm_config
 
+        # Enable CUDA Graph for decoder
+        self._enable_decoder_cudagraph()
+
+    def _enable_decoder_cudagraph(self):
+        # Respect --enforce-eager flag
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if model_cfg and getattr(model_cfg, "enforce_eager", False):
+            logger.info("CUDA Graph not enabled: --enforce-eager is set")
+            return
+        try:
+            inner_model = getattr(self.model, "model", None)
+            if inner_model is None or not hasattr(inner_model, "speech_tokenizer"):
+                return
+            tokenizer = inner_model.speech_tokenizer
+            if not (hasattr(tokenizer, "model") and hasattr(tokenizer.model, "decoder")):
+                return
+            decoder = tokenizer.model.decoder
+            device = next(decoder.parameters()).device
+            if device.type != "cuda":
+                logger.info("CUDA Graph not enabled: decoder is on %s", device)
+                return
+            if hasattr(decoder, "enable_cudagraph"):
+                decoder.enable_cudagraph()
+                logger.info("CUDA Graph enabled for speech tokenizer decoder")
+        except Exception:
+            logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
