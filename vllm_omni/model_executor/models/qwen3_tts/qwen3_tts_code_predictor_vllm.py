@@ -18,6 +18,8 @@ from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheTensor
 from vllm.v1.worker.gpu import attn_utils
 
+from vllm_omni.platforms import current_omni_platform
+
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
 
@@ -148,18 +150,40 @@ class _LocalPredictorKVCache:
         block_table = self._block_table[:num_reqs].contiguous()
         slot_mapping_gpu = slot_mapping.to(device=self.device)
 
-        attn_metadata = attn_utils.build_attn_metadata(
-            self.attn_metadata_builders,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=query_start_loc_gpu,
-            query_start_loc_cpu=qsl,
-            seq_lens=seq_lens_gpu,
-            max_seq_len=max_seq_len,
-            block_tables=[block_table],
-            slot_mappings=[slot_mapping_gpu],
-            kv_cache_config=self.kv_cache_config,
-        )
+        # FIXME(gcanlin): Refactor build_attn_metadata to avoid special-casing NPU backends here.
+        if current_omni_platform.is_npu():
+            # NPU requires AscendCommonAttentionMetadata with extra attributes
+            from vllm_ascend.worker.v2 import attn_utils as attn_utils_npu
+
+            max_query_len = int(query_lens_i32[:num_reqs].max().item())
+            # NPU version expects slot_mappings as a stacked tensor, not a list
+            slot_mappings_tensor = slot_mapping_gpu.unsqueeze(0)
+            attn_metadata = attn_utils_npu.build_attn_metadata(
+                attn_metadata_builders=self.attn_metadata_builders,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=query_start_loc_gpu,
+                query_start_loc_cpu=qsl,
+                max_query_len=max_query_len,
+                seq_lens=seq_lens_gpu,
+                max_seq_len=max_seq_len,
+                block_tables=[block_table],
+                slot_mappings=slot_mappings_tensor,
+                kv_cache_config=self.kv_cache_config,
+            )
+        else:
+            attn_metadata = attn_utils.build_attn_metadata(
+                self.attn_metadata_builders,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=query_start_loc_gpu,
+                query_start_loc_cpu=qsl,
+                seq_lens=seq_lens_gpu,
+                max_seq_len=max_seq_len,
+                block_tables=[block_table],
+                slot_mappings=[slot_mapping_gpu],
+                kv_cache_config=self.kv_cache_config,
+            )
 
         # Build slot_mappings_by_layer for set_forward_context.
         # Fix for vllm 0.15.0
