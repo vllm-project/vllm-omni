@@ -5,7 +5,6 @@ Reference code
 """
 
 import math
-import os
 import random
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -20,7 +19,6 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
-from safetensors import safe_open
 from torch import Tensor, nn
 
 
