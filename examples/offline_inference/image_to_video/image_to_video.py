@@ -107,12 +107,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
-    )
-    parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
         default=1,
