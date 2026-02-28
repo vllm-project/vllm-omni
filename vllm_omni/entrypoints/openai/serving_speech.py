@@ -2,6 +2,9 @@ import asyncio
 import base64
 import io
 import ipaddress
+import json
+import math
+import os
 import socket
 from typing import Any
 from urllib.parse import urlparse
@@ -73,6 +76,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         self._tts_tokenizer = None
 
+        # Load speech tokenizer codec parameters for prompt length estimation
+        self._codec_frame_rate: float | None = self._load_codec_frame_rate()
+
+    def _load_codec_frame_rate(self) -> float | None:
+        """Load codec frame rate from speech tokenizer config for prompt length estimation."""
+        try:
+            model_path = self.engine_client.model_config.model
+            st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
+            if os.path.exists(st_config_path):
+                with open(st_config_path) as f:
+                    st_config = json.load(f)
+                output_sr = st_config.get("output_sample_rate")
+                downsample = st_config.get("encode_downsample_rate")
+                if output_sr and downsample and downsample > 0:
+                    rate = float(output_sr) / float(downsample)
+                    logger.info(
+                        f"Loaded codec frame rate: {rate:.1f} Hz "
+                        f"(output_sample_rate={output_sr}, encode_downsample_rate={downsample})"
+                    )
+                    return rate
+        except Exception as e:
+            logger.warning(f"Failed to load codec frame rate from speech tokenizer config: {e}")
+
+        # Fallback: try codec_frame_rate_hz from hf_config
+        try:
+            hf_config = self.engine_client.model_config.hf_config
+            rate = getattr(hf_config, "codec_frame_rate_hz", None)
+            if rate is not None:
+                logger.info(f"Using codec frame rate from hf_config: {rate} Hz")
+                return float(rate)
+        except Exception:
+            pass
+        return None
+
     def _find_tts_stage(self):
         """Find and return the TTS stage from the stage list, or None if not found."""
         stage_list = getattr(self.engine_client, "stage_list", None)
@@ -120,6 +157,41 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return set()
 
+    def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
+        """Estimate ref_code length from ref_audio waveform without running the codec.
+
+        The codec produces one frame per (output_sample_rate / encode_downsample_rate)
+        audio samples, so ref_code_len = ceil(duration_seconds * codec_frame_rate).
+        """
+        if self._codec_frame_rate is None:
+            return None
+        try:
+            # ref_audio comes from tts_params as [[wav_array, sr]] or similar nested structure
+            item = ref_audio
+            while isinstance(item, list) and item:
+                if len(item) == 2 and isinstance(item[1], (int, float)):
+                    break
+                item = item[0]
+            if isinstance(item, list) and len(item) == 2:
+                wav, sr = item
+            elif isinstance(item, tuple) and len(item) == 2:
+                wav, sr = item
+            else:
+                return None
+            sr = int(sr)
+            if hasattr(wav, "__len__"):
+                n_samples = len(wav)
+            elif hasattr(wav, "shape"):
+                n_samples = wav.shape[-1] if wav.ndim > 1 else wav.shape[0]
+            else:
+                return None
+            if sr <= 0 or n_samples <= 0:
+                return None
+            duration = n_samples / sr
+            return math.ceil(duration * self._codec_frame_rate)
+        except Exception:
+            return None
+
     def _estimate_prompt_len(self, tts_params: dict[str, Any]) -> int:
         """Estimate prompt length so the placeholder matches model-side embeddings."""
         try:
@@ -145,6 +217,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
                 codec_language_id=getattr(talker_config, "codec_language_id", None),
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
+                estimate_ref_code_len=self._estimate_ref_code_len,
             )
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
