@@ -121,7 +121,6 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         out = self.model(*args, **kwargs)
         if isinstance(out, OmniOutput):
             return out
-        # 子模块可能直接返回 tensor / list；保持向后兼容
         if isinstance(out, list):
             out = out[0]
         return OmniOutput(text_hidden_states=out, multimodal_outputs={}, intermediate_tensors=None)
@@ -145,8 +144,6 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         return self.dit.get_dummy_runtime_additional_information(num_reqs)
 
     def load_weights(self, weights):
-        # 参考 Qwen2_5OmniForConditionalGeneration：按 stage 把权重交给对应子模块加载，
-        # 并将子模块返回的“已加载参数名集合”补上正确的前缀，以通过 DefaultModelLoader 的严格校验。
         if self.model_stage == "ar":
             if self.ar is None or not hasattr(self.ar, "load_weights"):
                 return set()
