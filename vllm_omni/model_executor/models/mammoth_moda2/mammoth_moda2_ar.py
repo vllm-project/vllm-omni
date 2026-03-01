@@ -65,13 +65,9 @@ def moe_enable(moe_type, layer_type, layer_idx):
         moe_type, layers = moe_type.split("-")
         start, end = [int(n) for n in layers.split(":")]
     else:
-        moe_type = moe_type
         start, end = 0, float("inf")
     assert moe_type in ["none", "attention", "ffn", "ffn_attention"]
-    if layer_type in moe_type and start <= layer_idx < end:
-        return True
-    else:
-        return False
+    return layer_type in moe_type and start <= layer_idx < end
 
 def moe_forward(
     hidden_states: torch.Tensor,
@@ -622,13 +618,10 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
                 continue
 
             ar_width = runtime_info["ar_width"][0]
-            ar_height = runtime_info["ar_height"][0]
             eol_token_id = runtime_info["eol_token_id"][0]
             visual_start = runtime_info["visual_token_start_id"][0]
             visual_end = runtime_info["visual_token_end_id"][0]
             generated_len = runtime_info["generated_len"]
-
-            expected_token_num = (ar_width + 1) * ar_height
 
             row = logits[i]
             column_id = generated_len % (ar_width + 1)
