@@ -22,6 +22,7 @@ import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
+from pydantic import BaseModel, Field
 from starlette.datastructures import State
 from starlette.routing import Route
 from vllm import SamplingParams
@@ -105,6 +106,30 @@ from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 router = APIRouter()
+profiler_router = APIRouter()
+
+
+def _should_enable_profiler_endpoints(args: Namespace) -> bool:
+    # Check upstream vLLM's profiler_config
+    profiler_config = getattr(args, "profiler_config", None)
+    if profiler_config is not None:
+        # profiler_config exists, check if profiler is set
+        profiler = getattr(profiler_config, "profiler", None)
+        if profiler is not None:
+            return True
+
+    # TODO: remove this env after refactoring torch profiler to CLI args
+    env_value = os.environ.get("VLLM_TORCH_PROFILER_DIR")
+    return env_value is not None
+
+
+class ProfileRequest(BaseModel):
+    """Request model for profiling endpoints."""
+
+    stages: list[int] | None = Field(
+        default=None,
+        description="List of stage IDs to profile. If None, profiles all stages.",
+    )
 
 
 def _remove_route_from_router(
@@ -226,6 +251,11 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         app.include_router(router)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # Conditionally register profiler endpoints based on config or env var
+        if _should_enable_profiler_endpoints(args):
+            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            app.include_router(profiler_router)
 
         vllm_config = await engine_client.get_vllm_config()
 
@@ -1486,6 +1516,58 @@ def apply_stage_default_sampling_params(
             for param_name, param_value in stage_defaults.items():
                 if hasattr(sampling_params, param_name):
                     setattr(sampling_params, param_name, param_value)
+
+
+@profiler_router.post("/start_profile")
+async def start_profile(raw_request: Request, request: ProfileRequest | None = None):
+    """Start profiling for the engine.
+
+    Args:
+        request: Optional request body with stages to profile.
+            - stages: List of stage IDs to profile. If None, profiles all stages.
+
+    Example:
+        POST /start_profile
+        {"stages": [0, 1]}  # Profile only stages 0 and 1
+    """
+    try:
+        stages = request.stages if request else None
+        logger.info("Starting profiler for stages: %s", stages if stages else "all")
+        engine_client = raw_request.app.state.engine_client
+        result = await engine_client.start_profile(stages=stages)
+        logger.info("Profiler started.")
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.exception("Failed to start profiler: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to start profiler: {str(e)}"
+        )
+
+
+@profiler_router.post("/stop_profile")
+async def stop_profile(raw_request: Request, request: ProfileRequest | None = None):
+    """Stop profiling for the engine.
+
+    Args:
+        request: Optional request body with stages to stop profiling.
+            - stages: List of stage IDs to stop profiling. If None, stops all stages.
+
+    Example:
+        POST /stop_profile
+        {"stages": [0, 1]}  # Stop profiling only stages 0 and 1
+    """
+    try:
+        stages = request.stages if request else None
+        logger.info("Stopping profiler for stages: %s", stages if stages else "all")
+        engine_client = raw_request.app.state.engine_client
+        result = await engine_client.stop_profile(stages=stages)
+        logger.info("Profiler stopped.")
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.exception("Failed to stop profiler: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stop profiler: {str(e)}"
+        )
 
 
 async def _run_video_generation(

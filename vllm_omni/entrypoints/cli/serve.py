@@ -6,6 +6,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
 import argparse
+import json
 import os
 import signal
 from typing import Any
@@ -209,6 +210,36 @@ class OmniServeCommand(CLISubcommand):
             help="Ring Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
+        omni_config_group.add_argument(
+            "--quantization-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON string for diffusion quantization_config. "
+                'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
+            ),
+        )
+
+        # HSDP (Hybrid Sharded Data Parallel) parameters
+        omni_config_group.add_argument(
+            "--use-hsdp",
+            dest="use_hsdp",
+            action="store_true",
+            help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models. "
+            "Shards model weights across GPUs to reduce per-GPU memory usage.",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-shard-size",
+            type=int,
+            default=-1,
+            help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-replicate-size",
+            type=int,
+            default=1,
+            help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
+        )
 
         # Cache optimization parameters
         omni_config_group.add_argument(
@@ -289,6 +320,14 @@ class OmniServeCommand(CLISubcommand):
             "--max-generated-image-size",
             type=int,
             help="The max size of generate image (height * width).",
+        )
+
+        # TTS-specific parameters
+        omni_config_group.add_argument(
+            "--tts-max-instructions-length",
+            type=int,
+            default=None,
+            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
         )
         return serve_parser
 

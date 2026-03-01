@@ -131,9 +131,6 @@ python image_to_video.py \
 
 2. **Wan-AI/Wan2.2-I2V-A14B-Diffusers**:   [https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video)
 
-> **Note:**
-As of now, asynchronous (online) profiling is not fully supported in vLLM-Omni. While start_profile() and stop_profile() methods exist, they are only reliable in offline inference scripts (e.g., the provided end2end.py examples). Do not use them in server-mode or streaming scenarios—traces may be incomplete or fail to flush.
-
 ### 4. Analyzing Omni Traces
 
 Output files are saved to your configured ```VLLM_TORCH_PROFILER_DIR```.

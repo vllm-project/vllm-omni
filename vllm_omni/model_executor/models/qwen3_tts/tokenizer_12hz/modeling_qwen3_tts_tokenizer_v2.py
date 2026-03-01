@@ -848,6 +848,38 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self.post_init()
 
+        # CUDA Graph support
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+
+    def enable_cudagraph(
+        self,
+        capture_sizes: list[int] | None = None,
+        device: torch.device | None = None,
+    ):
+        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+
+        if device is None:
+            device = next(self.parameters()).device
+        if device.type != "cuda":
+            logger.warning("Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)", device)
+            return
+        self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
+            decoder=self,
+            capture_sizes=capture_sizes,
+            num_quantizers=self.config.num_quantizers,
+            enabled=True,
+        )
+        self._cudagraph_wrapper.warmup(device, dtype=torch.long)
+        self._cudagraph_enabled = True
+        sizes = self._cudagraph_wrapper.capture_sizes
+        logger.info("CUDA Graph enabled for decoder with sizes: %s", sizes)
+
+    def disable_cudagraph(self):
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+        logger.info("CUDA Graph disabled for decoder")
+
     def forward(self, codes):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
@@ -866,6 +898,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return wav.clamp(min=-1, max=1)
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        # Use CUDA graph if enabled
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
+
+        # Original implementation (eager mode)
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:
@@ -991,10 +1028,11 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
 
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
+        audio_lengths = (audio_codes[..., 0] > -1).sum(1) * self.decode_upsample_rate
 
+        audio_codes = torch.clamp(audio_codes, min=0)
         audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
 
-        audio_lengths = (audio_codes[..., 0] > 0).sum(1) * self.decode_upsample_rate
         audio_values = [a[:length] for a, length in zip(audio_values, audio_lengths)]
 
         if not return_dict:

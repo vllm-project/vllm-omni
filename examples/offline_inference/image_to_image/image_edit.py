@@ -2,6 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
+Example script for image editing with OmniGen2.
+
+    python image_edit.py \
+        --image input.png \
+        --model "OmniGen2/OmniGen2" \
+        --prompt "Change the background to classroom." \
+        --negative-prompt "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar" \
+        --num-inference-steps 50 \
+        --seed 0 \
+        --guidance-scale 5.0 \
+        --guidance-scale-2 2.0 \
+        --output outputs/image_edit.png \
+        --num-outputs-per-prompt 2
+
+    Note: For OmniGen2, `guidance_scale` works as `text_guidance_scale`,
+    and `guidance_scale_2` works as `image_guidance_scale`.
+
 Example script for image editing with Qwen-Image-Edit.
 
 Usage (single image):
@@ -140,6 +157,9 @@ def parse_args() -> argparse.Namespace:
             "Unlike classifier-free guidance (--cfg-scale), guidance-distilled models take the guidance scale "
             "directly as an input parameter. Enabled when guidance_scale > 1. Ignored when not using guidance-distilled models."
         ),
+    )
+    parser.add_argument(
+        "--guidance-scale-2", type=float, default=None, help="image guidance scale for image-to-image generation."
     )
     parser.add_argument(
         "--output",
@@ -403,6 +423,7 @@ def main():
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_outputs_per_prompt,
             layers=args.layers,

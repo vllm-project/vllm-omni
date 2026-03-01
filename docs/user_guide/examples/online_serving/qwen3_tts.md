@@ -9,13 +9,13 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 
 ## Supported Models
 
-| Model | Task Type | Description |
-|-------|-----------|-------------|
+| Model                                  | Task Type   | Description                                           |
+| -------------------------------------- | ----------- | ----------------------------------------------------- |
 | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | CustomVoice | Predefined speaker voices with optional style control |
-| `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | VoiceDesign | Natural language voice style description |
-| `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Base | Voice cloning from reference audio |
-| `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant |
-| `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Base | Smaller/faster variant for voice cloning |
+| `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | VoiceDesign | Natural language voice style description              |
+| `Qwen/Qwen3-TTS-12Hz-1.7B-Base`        | Base        | Voice cloning from reference audio                    |
+| `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | CustomVoice | Smaller/faster variant                                |
+| `Qwen/Qwen3-TTS-12Hz-0.6B-Base`        | Base        | Smaller/faster variant for voice cloning              |
 
 ## Run examples (Qwen3-TTS)
 
@@ -237,36 +237,58 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### OpenAI Standard Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `input` | string | **required** | Text to synthesize |
-| `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
-| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
-| `speed` | float | 1.0 | Playback speed (0.25-4.0) |
+| Parameter         | Type   | Default        | Description                                                 |
+| ----------------- | ------ | -------------- | ----------------------------------------------------------- |
+| `input`           | string | **required**   | Text to synthesize                                          |
+| `model`           | string | server's model | Model to use (optional, should match server if specified)   |
+| `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
+| `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus                |
+| `speed`           | float  | 1.0            | Playback speed (0.25-4.0, not supported with `stream=true`) |
 
 ### vLLM-Omni Extension Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `task_type` | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base |
-| `language` | string | "Auto" | Language (see supported languages below) |
-| `instructions` | string | "" | Voice style/emotion instructions |
-| `max_new_tokens` | int | 2048 | Maximum tokens to generate |
+| Parameter        | Type   | Default       | Description                                                                  |
+| ---------------- | ------ | ------------- | ---------------------------------------------------------------------------- |
+| `task_type`      | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base                                      |
+| `language`       | string | "Auto"        | Language (see supported languages below)                                     |
+| `instructions`   | string | ""            | Voice style/emotion instructions                                             |
+| `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
+| `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
 ### Voice Clone Parameters (Base task)
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `ref_audio` | string | **Yes** | Reference audio (URL or base64 data URL) |
-| `ref_text` | string | No | Transcript of reference audio (for ICL mode) |
-| `x_vector_only_mode` | bool | No | Use speaker embedding only (no ICL) |
+| Parameter            | Type   | Required | Description                                  |
+| -------------------- | ------ | -------- | -------------------------------------------- |
+| `ref_audio`          | string | **Yes**  | Reference audio (URL or base64 data URL)     |
+| `ref_text`           | string | No       | Transcript of reference audio (for ICL mode) |
+| `x_vector_only_mode` | bool   | No       | Use speaker embedding only (no ICL)          |
+
+## Streaming
+
+Set `stream=true` with `response_format="pcm"` to receive raw PCM audio chunks as they are decoded
+(one chunk per 25-frame Code2Wav window):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, how are you?",
+        "voice": "vivian",
+        "language": "English",
+        "stream": true,
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
+```
+
+**Constraints:**
+- `stream=true` requires `response_format="pcm"` (raw 16-bit signed PCM, 24 kHz mono).
+- `speed` adjustment is not supported when streaming.
+- Requires the server stage config to have `async_chunk: true` (default in `qwen3_tts.yaml`).
 
 ## Limitations
 
-- **No streaming**: Audio is generated completely before being returned. Streaming will be supported after the pipeline is disaggregated (see RFC #938).
 - **Single request**: Batch processing is not yet optimized for online serving.
 
 ## Troubleshooting

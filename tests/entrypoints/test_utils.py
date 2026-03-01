@@ -2,9 +2,9 @@
 
 from collections import Counter
 from dataclasses import dataclass
-from unittest.mock import patch
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -140,7 +140,7 @@ class TestFilterDictLikeObject:
         assert 42 in result
         assert (1, 2) in result
 
-    def test_dict_with_recursive_structure(self):
+    def test_dict_with_recursive_structure(self, mocker: MockerFixture):
         """Test filtering dict with recursive/complex nested structure."""
         input_dict = {
             "level1": {
@@ -152,15 +152,15 @@ class TestFilterDictLikeObject:
             "normal": "value",
         }
 
-        with patch("vllm_omni.entrypoints.utils.logger"):
-            result = _filter_dict_like_object(input_dict)
+        mocker.patch("vllm_omni.entrypoints.utils.logger")
+        result = _filter_dict_like_object(input_dict)
 
-            # Normal key should exist
-            assert "normal" in result
-            # Level1 should exist
-            assert "level1" in result
+        # Normal key should exist
+        assert "normal" in result
+        # Level1 should exist
+        assert "level1" in result
 
-    def test_integration_with_convert_dataclasses(self):
+    def test_integration_with_convert_dataclasses(self, mocker: MockerFixture):
         """Test that _filter_dict_like_object integrates properly with _convert_dataclasses_to_dict."""
 
         @dataclass
@@ -174,32 +174,32 @@ class TestFilterDictLikeObject:
             "normal": "value",
         }
 
-        with patch("vllm_omni.entrypoints.utils.logger"):
-            result = _filter_dict_like_object(input_dict)
+        mocker.patch("vllm_omni.entrypoints.utils.logger")
+        result = _filter_dict_like_object(input_dict)
 
-            # Callable should be filtered
-            assert "func" not in result
-            # Config should be converted to dict
-            assert "config" in result
-            assert "normal" in result
+        # Callable should be filtered
+        assert "func" not in result
+        # Config should be converted to dict
+        assert "config" in result
+        assert "normal" in result
 
 
 class TestConvertDataclassesToDict:
     """Test suite for _convert_dataclasses_to_dict function."""
 
-    def test_uses_filter_dict_like_object(self):
+    def test_uses_filter_dict_like_object(self, mocker: MockerFixture):
         """Test that _convert_dataclasses_to_dict uses _filter_dict_like_object for dicts."""
         input_dict = {
             "normal": "value",
             "callable": lambda x: x,
         }
 
-        with patch("vllm_omni.entrypoints.utils.logger"):
-            result = _convert_dataclasses_to_dict(input_dict)
+        mocker.patch("vllm_omni.entrypoints.utils.logger")
+        result = _convert_dataclasses_to_dict(input_dict)
 
-            # Callable should be filtered out by _filter_dict_like_object
-            assert "normal" in result
-            assert "callable" not in result
+        # Callable should be filtered out by _filter_dict_like_object
+        assert "normal" in result
+        assert "callable" not in result
 
 
 class TestFilterDataclassKwargs:
