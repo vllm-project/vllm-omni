@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from PIL import Image
@@ -31,78 +32,65 @@ from vllm_omni import Omni
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+_PATCH_SIZE = 16   # AR image grid patch size (pixels per token)
 
-def load_t2i_generation_config(model_dir: str) -> tuple[int, int, int]:
-    """Load T2I token ranges from t2i_generation_config.json."""
-    cfg_path = Path(model_dir) / "t2i_generation_config.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
 
-    with cfg_path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+class T2IGenConfig(NamedTuple):
+    eol_token_id: int
+    visual_token_start_id: int
+    visual_token_end_id: int
+    top_k: int           # AR sampling top-k (covers the full visual generation vocabulary)
+    # Qwen2.5-VL special vision tokens: <|image_pad|>, <|video_pad|>, <|vision_start|>, <|vision_end|>
+    visual_ids: list[int]
 
-    return (
-        int(cfg["eol_token_id"]),
-        int(cfg["visual_token_start_id"]),
-        int(cfg["visual_token_end_id"]),
+
+def load_t2i_generation_config(model_dir: str) -> T2IGenConfig:
+    """Load T2I token IDs from t2i_generation_config.json and config.json."""
+    model_path = Path(model_dir)
+
+    gen_cfg_path = model_path / "t2i_generation_config.json"
+    if not gen_cfg_path.exists():
+        raise FileNotFoundError(f"Config not found: {gen_cfg_path}")
+    with gen_cfg_path.open(encoding="utf-8") as f:
+        gen_cfg = json.load(f)
+
+    model_cfg_path = model_path / "config.json"
+    if not model_cfg_path.exists():
+        raise FileNotFoundError(f"Config not found: {model_cfg_path}")
+    with model_cfg_path.open(encoding="utf-8") as f:
+        llm_cfg = json.load(f).get("llm_config", {})
+
+    return T2IGenConfig(
+        eol_token_id=int(gen_cfg["eol_token_id"]),
+        visual_token_start_id=int(gen_cfg["visual_token_start_id"]),
+        visual_token_end_id=int(gen_cfg["visual_token_end_id"]),
+        top_k=int(gen_cfg["top_k"]),
+        visual_ids=[
+            int(llm_cfg["image_token_id"]),
+            int(llm_cfg["video_token_id"]),
+            int(llm_cfg["vision_start_token_id"]),
+            int(llm_cfg["vision_end_token_id"]),
+        ],
     )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run MammothModa2 T2I (AR -> DiT) with vLLM-Omni.")
-    p.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Path to the model directory.",
-    )
-    p.add_argument(
-        "--stage-config",
-        type=str,
-        required=True,
-        help="Path to the multi-stage YAML configuration.",
-    )
-    p.add_argument(
-        "--prompt",
-        type=str,
-        action="append",
-        default=None,
+    p.add_argument("--model", type=str, required=True, help="Path to the model directory.")
+    p.add_argument("--stage-config", type=str, required=True,help="Path to the multi-stage YAML configuration.")
+    p.add_argument("--prompt", type=str, action="append", default=None,
         help=(
             "Text prompt for image generation. Can be provided multiple times "
-            "to generate multiple images with shared height/width/CFG settings."
-        ),
+            "to generate multiple images with shared height/width/CFG settings."),
     )
-    p.add_argument(
-        "--height",
-        type=int,
-        default=1024,
-        help="Output image height (must be a multiple of 16).",
-    )
-    p.add_argument(
-        "--width",
-        type=int,
-        default=1024,
-        help="Output image width (must be a multiple of 16).",
-    )
-    p.add_argument(
-        "--num-inference-steps",
-        type=int,
-        default=50,
-        help="Number of diffusion steps for the DiT stage.",
-    )
-    p.add_argument(
-        "--text-guidance-scale",
-        type=float,
-        default=9.0,
-        help="Classifier-Free Guidance (CFG) scale for DiT.",
-    )
-    p.add_argument(
-        "--cfg-range",
-        type=float,
-        nargs=2,
-        default=(0.0, 1.0),
-        help="Relative step range [start, end] where CFG is active.",
-    )
+    p.add_argument("--height", type=int, default=1024, help="Output image height (must be a multiple of 16).")
+    p.add_argument("--width", type=int, default=1024, help="Output image width (must be a multiple of 16).")
+    p.add_argument("--num-inference-steps", type=int, default=50, help="Number of diffusion steps for the DiT stage.")
+    p.add_argument("--text-guidance-scale", type=float, default=9.0, help="Classifier-Free Guidance (CFG) scale for DiT.")
+    p.add_argument("--cfg-range", type=float, nargs=2, default=(0.0, 1.0), help="Relative step range [start, end] where CFG is active.",)
     p.add_argument("--out", type=str, default="output.png", help="Path to save the generated image.")
     p.add_argument("--trust-remote-code", action="store_true", help="Trust remote code when loading the model.")
     args = p.parse_args()
@@ -122,140 +110,109 @@ def tensor_to_pil(image: torch.Tensor) -> Image.Image:
     return Image.fromarray(image)
 
 
+def _format_prompt(user_prompt: str, ar_width: int, ar_height: int) -> str:
+    """Build the AR-stage prompt string including the image grid header."""
+    return (
+        "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        f"<|image start|>{ar_width}*{ar_height}<|image token|>"
+    )
+
+
+def _collect_images(outputs: list) -> list[torch.Tensor]:
+    """Extract all image tensors produced by the final (DiT) stage."""
+    images: list[torch.Tensor] = []
+    for out in outputs:
+        ro_list = getattr(out, "request_output", out)
+        if not isinstance(ro_list, list):
+            ro_list = [ro_list]
+        for ro_item in ro_list:
+            for completion in (getattr(ro_item, "outputs", None) or []):
+                mm = getattr(completion, "multimodal_output", None)
+                if not isinstance(mm, dict) or "image" not in mm:
+                    raise RuntimeError(f"Missing image in multimodal output: {mm}")
+                payload = mm["image"]
+                for tensor in (payload if isinstance(payload, list) else [payload]):
+                    if not isinstance(tensor, torch.Tensor):
+                        raise TypeError(f"Expected image tensor, got {type(tensor)}")
+                    images.append(tensor)
+    return images
+
+
+def _save_images(images: list[torch.Tensor], out_path: str) -> list[str]:
+    """Save image tensors to disk.
+
+    Single image: written to *out_path* exactly.
+    Multiple images: suffixed as ``<base>_0<ext>``, ``<base>_1<ext>``, …
+    """
+    if not images:
+        raise RuntimeError("No images to save.")
+    base, ext = os.path.splitext(out_path)
+    ext = ext or ".png"
+    paths = []
+    for i, tensor in enumerate(images):
+        path = out_path if len(images) == 1 else f"{base}_{i}{ext}"
+        tensor_to_pil(tensor).save(path)
+        paths.append(path)
+    return paths
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.height <= 0 or args.width <= 0:
         raise ValueError(f"Height and width must be positive, got {args.height}x{args.width}")
-    if args.height % 16 != 0 or args.width % 16 != 0:
-        raise ValueError(f"Height and width must be multiples of 16, got {args.height}x{args.width}")
+    if args.height % _PATCH_SIZE != 0 or args.width % _PATCH_SIZE != 0:
+        raise ValueError(f"Height and width must be multiples of {_PATCH_SIZE}, got {args.height}x{args.width}")
 
-    ar_height = args.height // 16
-    ar_width = args.width // 16
-
-    eol_token_id, visual_start, visual_end = load_t2i_generation_config(args.model)
+    ar_height = args.height // _PATCH_SIZE
+    ar_width = args.width // _PATCH_SIZE
+    gen_cfg = load_t2i_generation_config(args.model)
     expected_grid_tokens = ar_height * (ar_width + 1)
-
-    def _format_prompt(user_prompt: str) -> str:
-        return (
-            "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
-            f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-            f"<|image start|>{ar_width}*{ar_height}<|image token|>"
-        )
 
     logger.info("Initializing Omni pipeline...")
     omni = Omni(model=args.model, stage_configs_path=args.stage_config, trust_remote_code=args.trust_remote_code)
-
     try:
         ar_sampling = SamplingParams(
             temperature=1.0,
             top_p=1.0,
-            top_k=2048,
-            # +1 for generating hidden state of eoi
-            max_tokens=max(1, expected_grid_tokens + 1),
+            top_k=gen_cfg.top_k,
+            max_tokens=max(1, expected_grid_tokens + 1),  # +1 for hidden state of eoi
             detokenize=False,
         )
-
         dit_sampling = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            top_k=-1,
-            max_tokens=1,
-            detokenize=False,
+            temperature=0.0, top_p=1.0, top_k=-1, max_tokens=1, detokenize=False,
         )
 
-        logger.info("Starting generation...")
-        shared_additional_information = {
+        additional_information = {
             "omni_task": ["t2i"],
-            "ar_width": [ar_width],
-            "ar_height": [ar_height],
-            "eol_token_id": [eol_token_id],
-            "visual_token_start_id": [visual_start],
-            "visual_token_end_id": [visual_end],
-            "image_height": [args.height],
-            "image_width": [args.width],
+            "ar_width": [ar_width], "ar_height": [ar_height],
+            "eol_token_id": [gen_cfg.eol_token_id],
+            "visual_token_start_id": [gen_cfg.visual_token_start_id],
+            "visual_token_end_id": [gen_cfg.visual_token_end_id],
+            "image_height": [args.height], "image_width": [args.width],
             "num_inference_steps": [args.num_inference_steps],
             "text_guidance_scale": [args.text_guidance_scale],
             "cfg_range": [args.cfg_range[0], args.cfg_range[1]],
-            # ["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
-            "visual_ids": [151655, 151656, 151652, 151653,]
+            "visual_ids": gen_cfg.visual_ids,
         }
         inputs = [
             {
-                "prompt": _format_prompt(p),
-                "additional_information": dict(shared_additional_information),
+                "prompt": _format_prompt(p, ar_width, ar_height),
+                "additional_information": dict(additional_information),
             }
             for p in args.prompt
         ]
 
-        # NOTE: omni.generate() returns a Generator[OmniRequestOutput, None, None].
-        # Consume it to actually run the pipeline and obtain final outputs.
+        logger.info("Starting generation...")
+        # omni.generate() returns a Generator; consume it to run the full pipeline.
         outputs = list(omni.generate(inputs, [ar_sampling, dit_sampling]))
 
         logger.info("Post-processing and saving image(s)...")
-        out_base, out_ext = os.path.splitext(args.out)
-        saved_paths: list[str] = []
-
-        # Flatten to (image_tensor, suffix) list so we can decide filenames.
-        images_to_save: list[tuple[torch.Tensor, str]] = []
-        for out_idx, out in enumerate(outputs):
-            ro = getattr(out, "request_output", out)
-            ro_list = ro if isinstance(ro, list) else [ro]
-            if not ro_list:
-                raise RuntimeError("Empty request_output from final stage.")
-
-            req_id = getattr(out, "request_id", None)
-            req_suffix = f"_{req_id}" if isinstance(req_id, str) and req_id else f"_{out_idx}"
-
-            for sample_idx, ro_item in enumerate(ro_list):
-                completion_outputs = getattr(ro_item, "outputs", None)
-                if not isinstance(completion_outputs, list) or not completion_outputs:
-                    raise RuntimeError(f"Unexpected RequestOutput.outputs: {type(completion_outputs)} {completion_outputs}")
-
-                for completion_idx, completion in enumerate(completion_outputs):
-                    mm = getattr(completion, "multimodal_output", None)
-                    if not isinstance(mm, dict) or "image" not in mm:
-                        raise RuntimeError(
-                            "Unexpected completion multimodal output: "
-                            f"{type(mm)} {mm}, completion={completion}"
-                        )
-
-                    img_payload = mm["image"]
-                    img_list = img_payload if isinstance(img_payload, list) else [img_payload]
-                    for img_idx, img_tensor in enumerate(img_list):
-                        if not isinstance(img_tensor, torch.Tensor):
-                            raise TypeError(f"Expected image tensor, got {type(img_tensor)}")
-                        suffix_parts = [req_suffix]
-                        if len(ro_list) > 1:
-                            suffix_parts.append(f"_s{sample_idx}")
-                        if len(completion_outputs) > 1:
-                            suffix_parts.append(f"_c{completion_idx}")
-                        if len(img_list) > 1:
-                            suffix_parts.append(f"_i{img_idx}")
-                        images_to_save.append((img_tensor, "".join(suffix_parts)))
-
-        # If there's only one image, respect `--out` exactly.
-        if len(images_to_save) == 1:
-            img_tensor, _ = images_to_save[0]
-            pil = tensor_to_pil(img_tensor)
-            pil.save(args.out)
-            saved_paths.append(args.out)
-        else:
-            if not out_ext:
-                out_ext = ".png"
-            for img_tensor, suffix in images_to_save:
-                out_path = f"{out_base}{suffix}{out_ext}"
-                pil = tensor_to_pil(img_tensor)
-                pil.save(out_path)
-                saved_paths.append(out_path)
-
-        for p in saved_paths:
-            logger.info(f"Successfully saved generated image to: {p}")
-
-    except Exception as e:
-        logger.exception(f"An error occurred during generation: {e}")
+        for path in _save_images(_collect_images(outputs), args.out):
+            logger.info(f"Saved: {path}")
     finally:
         omni.close()
 
