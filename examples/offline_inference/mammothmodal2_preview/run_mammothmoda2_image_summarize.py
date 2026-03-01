@@ -2,7 +2,7 @@
 Offline inference example: MammothModa2 image summarization (single AR stage).
 
 Example:
-  uv run python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summary.py \
+  uv run python examples/offline_inference/mammothmodal2_preview/run_mammothmoda2_image_summarize.py \
     --model /data/datasets/models-hf/MammothModa2-Preview \
     --image /path/to/input.jpg \
     --question "Please summarize the content of this image."

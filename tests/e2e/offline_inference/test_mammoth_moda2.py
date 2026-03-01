@@ -110,10 +110,22 @@ class TestConfigParsing:
             _ = Mammothmoda2Config(llm_config=None).image_token_id
 
     def test_t2i_generation_config_json(self):
-        """t2i_generation_config.json must contain required token-ID fields."""
+        """t2i_generation_config.json must contain required token-ID and sampling fields."""
         cfg = _load_t2i_gen_config(MODEL_PATH)
-        for key in ("eol_token_id", "visual_token_start_id", "visual_token_end_id"):
+        for key in ("eol_token_id", "visual_token_start_id", "visual_token_end_id", "top_k"):
             assert key in cfg and isinstance(cfg[key], int)
+
+    def test_model_config_visual_ids(self):
+        """config.json llm_config must contain the four Qwen2.5-VL vision token IDs."""
+        cfg_path = Path(MODEL_PATH) / "config.json"
+        if not cfg_path.exists():
+            pytest.skip(f"config.json not found at {cfg_path}")
+        with cfg_path.open() as f:
+            llm_cfg = json.load(f).get("llm_config", {})
+        for key in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"):
+            assert key in llm_cfg and isinstance(llm_cfg[key], int), (
+                f"Missing or non-int field '{key}' in config.json llm_config"
+            )
 
 
 # ---------------------------------------------------------------------------

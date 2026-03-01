@@ -61,7 +61,6 @@ def ar2dit(
 
         gen_token_mask = full_token_ids_t >= gen_vocab_start_index
 
-        visual_token_mask = torch.zeros_like(gen_token_mask)
         visual_token_mask = torch.isin(
             full_token_ids_t,
             torch.tensor(visual_ids, dtype=torch.long, device=mask_device),
