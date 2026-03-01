@@ -28,6 +28,24 @@ from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2dit
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
+# ---------------------------------------------------------------------------
+# Token ID constants (Qwen2.5-VL base tokenizer + MammothModa2 gen vocab)
+# ---------------------------------------------------------------------------
+# Qwen2.5-VL special vision token IDs (match Mammothmoda2Qwen2_5_VLTextConfig defaults)
+_IMAGE_TOKEN_ID = 151655        # "<|image_pad|>"
+_VIDEO_TOKEN_ID = 151656        # "<|video_pad|>"
+_VISION_START_TOKEN_ID = 151652 # "<|vision_start|>"
+_VISION_END_TOKEN_ID = 151653   # "<|vision_end|>"
+# MammothModa2 generation vocab (from t2i_generation_config.json)
+_BASE_VOCAB_SIZE = 152064       # Qwen2.5 base vocab size; also used as eol_token_id
+_VISUAL_TOKEN_START_ID = 152072 # first visual generation token
+_VISUAL_TOKEN_END_ID = 168456   # last visual generation token
+_GEN_VOCAB_SIZE = 32800         # size of the visual generation vocabulary
+# AR stage image grid: each token covers _AR_PATCH_SIZE x _AR_PATCH_SIZE pixels
+_AR_PATCH_SIZE = 16
+# AR sampling top-k covers the full visual generation vocabulary
+_AR_TOP_K = 2048
+
 _EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "offline_inference" / "mammothmodal2_preview"
 MODEL_PATH = os.environ.get("MAMMOTHMODA2_MODEL_PATH", str(_EXAMPLE_DIR / "MammothModa2-Preview"))
 T2I_STAGE_CONFIG = os.environ.get("MAMMOTHMODA2_T2I_STAGE_CONFIG", str(_EXAMPLE_DIR / "mammoth_moda2_t2i.yaml"))
@@ -70,20 +88,20 @@ class TestConfigParsing:
     def test_dual_vocab_size_computation(self):
         """With extra_gen_vocab=True: vocab_size == gen_vocab_start_index + gen_vocab_size."""
         from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Qwen2_5_VLTextConfig
-        tc = Mammothmoda2Qwen2_5_VLTextConfig(vocab_size=152064, extra_gen_vocab=True, gen_vocab_size=32800)
-        assert tc.gen_vocab_start_index == 152064
-        assert tc.vocab_size == 152064 + 32800
+        tc = Mammothmoda2Qwen2_5_VLTextConfig(vocab_size=_BASE_VOCAB_SIZE, extra_gen_vocab=True, gen_vocab_size=_GEN_VOCAB_SIZE)
+        assert tc.gen_vocab_start_index == _BASE_VOCAB_SIZE
+        assert tc.vocab_size == _BASE_VOCAB_SIZE + _GEN_VOCAB_SIZE
 
     def test_proxy_properties(self):
         """Top-level config should proxy token IDs from llm_config."""
         from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
         cfg = Mammothmoda2Config(llm_config={
             "model_type": "mammothmoda2_qwen2_5_vl",
-            "image_token_id": 151655, "video_token_id": 151656,
-            "vision_start_token_id": 151652, "vision_end_token_id": 151653,
+            "image_token_id": _IMAGE_TOKEN_ID, "video_token_id": _VIDEO_TOKEN_ID,
+            "vision_start_token_id": _VISION_START_TOKEN_ID, "vision_end_token_id": _VISION_END_TOKEN_ID,
         })
-        assert cfg.image_token_id == 151655
-        assert cfg.video_token_id == 151656
+        assert cfg.image_token_id == _IMAGE_TOKEN_ID
+        assert cfg.video_token_id == _VIDEO_TOKEN_ID
 
     def test_missing_llm_config_raises(self):
         """Proxy property access with llm_config=None should raise AttributeError."""
@@ -122,13 +140,13 @@ def _stage(ar_outputs: list) -> list:
 
 def _p(image_height: int = 512, image_width: int = 512, visual_ids: list[int] | None = None, **kw) -> dict:
     if visual_ids is None:
-        visual_ids = [151655, 151656, 151652, 151653]
+        visual_ids = [_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID, _VISION_END_TOKEN_ID]
     return {"additional_information": {
         "omni_task": ["t2i"],
-        "ar_width": [image_width // 16], "ar_height": [image_height // 16],
-        "eol_token_id": [kw.get("eol_token_id", 152064)],
-        "visual_token_start_id": [kw.get("visual_token_start_id", 152072)],
-        "visual_token_end_id": [kw.get("visual_token_end_id", 168456)],
+        "ar_width": [image_width // _AR_PATCH_SIZE], "ar_height": [image_height // _AR_PATCH_SIZE],
+        "eol_token_id": [kw.get("eol_token_id", _BASE_VOCAB_SIZE)],
+        "visual_token_start_id": [kw.get("visual_token_start_id", _VISUAL_TOKEN_START_ID)],
+        "visual_token_end_id": [kw.get("visual_token_end_id", _VISUAL_TOKEN_END_ID)],
         "image_height": [image_height], "image_width": [image_width],
         "num_inference_steps": [kw.get("num_inference_steps", 50)],
         "text_guidance_scale": [kw.get("text_guidance_scale", 9.0)],
@@ -142,7 +160,7 @@ class TestAR2DitProcessor:
 
     def test_basic_output_structure(self):
         """ar2dit should produce one dict with expected keys for each input."""
-        ar_out = _mock_ar(list(range(10)), list(range(152072, 152072 + 20)) + [0])
+        ar_out = _mock_ar(list(range(10)), list(range(_VISUAL_TOKEN_START_ID, _VISUAL_TOKEN_START_ID + 20)) + [0])
         dit_inputs = ar2dit(_stage([ar_out]), engine_input_source=[0], prompts=[_p()])
         assert len(dit_inputs) == 1
         inp = dit_inputs[0]
@@ -154,7 +172,7 @@ class TestAR2DitProcessor:
     def test_embed_shapes_and_dtype(self):
         """text/image condition embeds must be 2D float32 with correct leading dim."""
         n_gen = 30
-        ar_out = _mock_ar(list(range(15)), list(range(152072, 152072 + n_gen)) + [0], hidden_dim=128)
+        ar_out = _mock_ar(list(range(15)), list(range(_VISUAL_TOKEN_START_ID, _VISUAL_TOKEN_START_ID + n_gen)) + [0], hidden_dim=128)
         info = ar2dit(_stage([ar_out]), engine_input_source=[0], prompts=[_p()])[0]["additional_information"]
         assert info["image_prompt_embeds"].shape == (n_gen, 128)
         assert info["text_prompt_embeds"].dtype == torch.float32
@@ -162,7 +180,7 @@ class TestAR2DitProcessor:
     def test_missing_latent_raises(self):
         """ar2dit must raise ValueError when AR output has no 'latent' key."""
         c = MagicMock()
-        c.token_ids = [152072, 0]
+        c.token_ids = [_VISUAL_TOKEN_START_ID, 0]
         c.multimodal_output = {}
         ar = MagicMock()
         ar.prompt_token_ids = [1, 2, 3]
@@ -173,7 +191,7 @@ class TestAR2DitProcessor:
 
     def test_hidden_states_mismatch_raises(self):
         """ar2dit must raise AssertionError on hidden-states length mismatch."""
-        prompt_ids, gen_ids = list(range(10)), list(range(152072, 152072 + 5)) + [0]
+        prompt_ids, gen_ids = list(range(10)), list(range(_VISUAL_TOKEN_START_ID, _VISUAL_TOKEN_START_ID + 5)) + [0]
         c = MagicMock()
         c.token_ids = gen_ids
         c.multimodal_output = {"latent": torch.randn(len(prompt_ids) + len(gen_ids) + 5, 64)}
@@ -186,9 +204,9 @@ class TestAR2DitProcessor:
 
     def test_visual_ids_excluded_from_text_embeds(self):
         """Prompt tokens that are visual_ids should not appear in text_prompt_embeds."""
-        visual_ids = [151655, 151656, 151652, 151653]
-        prompt_ids = [100, 151655, 200, 151652, 300]  # 3 plain + 2 visual_id
-        gen_ids = [152072, 0]
+        visual_ids = [_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID, _VISION_END_TOKEN_ID]
+        prompt_ids = [100, _IMAGE_TOKEN_ID, 200, _VISION_START_TOKEN_ID, 300]  # 3 plain + 2 visual_id
+        gen_ids = [_VISUAL_TOKEN_START_ID, 0]
         hidden = torch.randn(len(prompt_ids) + len(gen_ids) - 1, 32)
         c = MagicMock()
         c.token_ids = gen_ids
@@ -230,7 +248,7 @@ def test_mammothmoda2_t2i_e2e():
     visual_end = int(gen_cfg["visual_token_end_id"])
 
     height, width = 256, 256  # small for CI speed
-    ar_height, ar_width = height // 16, width // 16
+    ar_height, ar_width = height // _AR_PATCH_SIZE, width // _AR_PATCH_SIZE
     expected_grid_tokens = ar_height * (ar_width + 1)
 
     prompt_text = "A cat sitting on a laptop keyboard"
@@ -245,7 +263,7 @@ def test_mammothmoda2_t2i_e2e():
         ar_sampling = SamplingParams(
             temperature=1.0,
             top_p=1.0,
-            top_k=2048,
+            top_k=_AR_TOP_K,
             max_tokens=max(1, expected_grid_tokens + 1),
             detokenize=False,
         )
@@ -267,7 +285,7 @@ def test_mammothmoda2_t2i_e2e():
             "num_inference_steps": [2],  # minimal steps for CI
             "text_guidance_scale": [1.0],  # no CFG for speed
             "cfg_range": [0.0, 1.0],
-            "visual_ids": [151655, 151656, 151652, 151653],
+            "visual_ids": [_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID, _VISION_END_TOKEN_ID],
         }
 
         inputs = [
