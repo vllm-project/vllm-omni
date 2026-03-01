@@ -26,6 +26,9 @@ python run_mammothmoda2_t2i.py \
   --out output.png
 ```
 
+If you have 2 GPUS and want to use PP , please use `--stage-config ./mammoth_moda2_t2i_pp.yaml`
+
+
 ### Image Summary
 
 ```bash

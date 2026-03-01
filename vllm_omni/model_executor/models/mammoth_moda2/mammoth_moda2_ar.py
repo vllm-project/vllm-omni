@@ -32,7 +32,6 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -384,9 +383,20 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        def _make_empty_intermediate_tensors(
+            batch_size: int,
+            dtype: torch.dtype,
+            device: torch.device,
+        ) -> IntermediateTensors:
+            return IntermediateTensors(
+                {
+                    "hidden_states": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
+                    "residual": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
+                    "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool, device=device),
+                }
+            )
+
+        self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -452,13 +462,16 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-            gen_token_mask = None
+            gen_token_mask = intermediate_tensors.tensors.get("gen_token_mask")
 
         for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             hidden_states, residual = layer(positions, hidden_states, residual, gen_token_mask)
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if gen_token_mask is not None:
+                tensors["gen_token_mask"] = gen_token_mask
+            return IntermediateTensors(tensors)
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
@@ -613,7 +626,8 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         num_reqs = int(logits.shape[0])
         for i in range(num_reqs):
             runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
-            if runtime_info["omni_task"][0] != "t2i":
+            omni_task = runtime_info.get("omni_task")
+            if not isinstance(omni_task, list) or not omni_task or omni_task[0] != "t2i":
                 # Text/understanding/chat: forbid sampling from the extra gen vocab.
                 logits[i, self.language_model.base_vocab_size :] = neg_inf
                 continue
@@ -634,7 +648,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             else:
                 # Intra-row tokens: only allow visual tokens (explicitly forbid eol).
                 row[:visual_start] = neg_inf
-                row[visual_end:] = neg_inf
+                row[visual_end + 1 :] = neg_inf
                 row[eol_token_id] = neg_inf
 
         return logits
@@ -659,6 +673,8 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+        if isinstance(hidden_states, IntermediateTensors) and not get_pp_group().is_last_rank:
+            return hidden_states
         # NOTE: gpu_model_runner._dummy_run performs hidden_states[logit_indices] after forward.
         # We must ensure text_hidden_states is a torch.Tensor to avoid errors when
         # indexing (which happens if it's a list/tuple).
