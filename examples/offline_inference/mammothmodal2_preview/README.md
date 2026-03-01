@@ -32,6 +32,6 @@ python run_mammothmoda2_t2i.py \
 python run_mammothmoda2_image_summarize.py \
   --model ./MammothModa2-Preview \
   --stage-config ./mammoth_moda2_image_summarize.yaml \
-  --question "Summerize this image." \
+  --question "Summarize this image." \
   --image ./image.png
 ```

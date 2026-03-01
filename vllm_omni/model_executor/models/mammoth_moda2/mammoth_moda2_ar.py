@@ -49,7 +49,7 @@ from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Con
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
-def moe_enable(moe_type, layer_type, layer_idx):
+def moe_enable(moe_type, layer_type, layer_idx) -> bool:
     """Determine if MoE should be enabled for a specific layer type and index.
 
     Args:
@@ -68,6 +68,7 @@ def moe_enable(moe_type, layer_type, layer_idx):
         start, end = 0, float("inf")
     assert moe_type in ["none", "attention", "ffn", "ffn_attention"]
     return layer_type in moe_type and start <= layer_idx < end
+
 
 def moe_forward(
     hidden_states: torch.Tensor,

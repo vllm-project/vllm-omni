@@ -32,15 +32,15 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 # Token ID constants (Qwen2.5-VL base tokenizer + MammothModa2 gen vocab)
 # ---------------------------------------------------------------------------
 # Qwen2.5-VL special vision token IDs (match Mammothmoda2Qwen2_5_VLTextConfig defaults)
-_IMAGE_TOKEN_ID = 151655        # "<|image_pad|>"
-_VIDEO_TOKEN_ID = 151656        # "<|video_pad|>"
-_VISION_START_TOKEN_ID = 151652 # "<|vision_start|>"
-_VISION_END_TOKEN_ID = 151653   # "<|vision_end|>"
+_IMAGE_TOKEN_ID = 151655  # "<|image_pad|>"
+_VIDEO_TOKEN_ID = 151656  # "<|video_pad|>"
+_VISION_START_TOKEN_ID = 151652  # "<|vision_start|>"
+_VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 # MammothModa2 generation vocab (from t2i_generation_config.json)
-_BASE_VOCAB_SIZE = 152064       # Qwen2.5 base vocab size; also used as eol_token_id
-_VISUAL_TOKEN_START_ID = 152072 # first visual generation token
-_VISUAL_TOKEN_END_ID = 168456   # last visual generation token
-_GEN_VOCAB_SIZE = 32800         # size of the visual generation vocabulary
+_BASE_VOCAB_SIZE = 152064  # Qwen2.5 base vocab size; also used as eol_token_id
+_VISUAL_TOKEN_START_ID = 152072  # first visual generation token
+_VISUAL_TOKEN_END_ID = 168456  # last visual generation token
+_GEN_VOCAB_SIZE = 32800  # size of the visual generation vocabulary
 # AR stage image grid: each token covers _AR_PATCH_SIZE x _AR_PATCH_SIZE pixels
 _AR_PATCH_SIZE = 16
 # AR sampling top-k covers the full visual generation vocabulary
@@ -49,7 +49,9 @@ _AR_TOP_K = 2048
 _EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "offline_inference" / "mammothmodal2_preview"
 MODEL_PATH = os.environ.get("MAMMOTHMODA2_MODEL_PATH", str(_EXAMPLE_DIR / "MammothModa2-Preview"))
 T2I_STAGE_CONFIG = os.environ.get("MAMMOTHMODA2_T2I_STAGE_CONFIG", str(_EXAMPLE_DIR / "mammoth_moda2_t2i.yaml"))
-SUMMARIZE_STAGE_CONFIG = os.environ.get("MAMMOTHMODA2_SUMMARIZE_STAGE_CONFIG", str(_EXAMPLE_DIR / "mammoth_moda2_image_summarize.yaml"))
+SUMMARIZE_STAGE_CONFIG = os.environ.get(
+    "MAMMOTHMODA2_SUMMARIZE_STAGE_CONFIG", str(_EXAMPLE_DIR / "mammoth_moda2_image_summarize.yaml")
+)
 
 
 def _load_t2i_gen_config(model_dir: str) -> dict:
@@ -78,7 +80,9 @@ class TestConfigParsing:
     def test_autoconfig_registration(self):
         """AutoConfig should resolve 'mammothmoda2' model_type."""
         from transformers import AutoConfig
+
         from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config  # noqa: F401
+
         cfg = AutoConfig.for_model(
             model_type="mammothmoda2",
             llm_config={"model_type": "mammothmoda2_qwen2_5_vl"},
@@ -88,24 +92,33 @@ class TestConfigParsing:
     def test_dual_vocab_size_computation(self):
         """With extra_gen_vocab=True: vocab_size == gen_vocab_start_index + gen_vocab_size."""
         from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Qwen2_5_VLTextConfig
-        tc = Mammothmoda2Qwen2_5_VLTextConfig(vocab_size=_BASE_VOCAB_SIZE, extra_gen_vocab=True, gen_vocab_size=_GEN_VOCAB_SIZE)
+
+        tc = Mammothmoda2Qwen2_5_VLTextConfig(
+            vocab_size=_BASE_VOCAB_SIZE, extra_gen_vocab=True, gen_vocab_size=_GEN_VOCAB_SIZE
+        )
         assert tc.gen_vocab_start_index == _BASE_VOCAB_SIZE
         assert tc.vocab_size == _BASE_VOCAB_SIZE + _GEN_VOCAB_SIZE
 
     def test_proxy_properties(self):
         """Top-level config should proxy token IDs from llm_config."""
         from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
-        cfg = Mammothmoda2Config(llm_config={
-            "model_type": "mammothmoda2_qwen2_5_vl",
-            "image_token_id": _IMAGE_TOKEN_ID, "video_token_id": _VIDEO_TOKEN_ID,
-            "vision_start_token_id": _VISION_START_TOKEN_ID, "vision_end_token_id": _VISION_END_TOKEN_ID,
-        })
+
+        cfg = Mammothmoda2Config(
+            llm_config={
+                "model_type": "mammothmoda2_qwen2_5_vl",
+                "image_token_id": _IMAGE_TOKEN_ID,
+                "video_token_id": _VIDEO_TOKEN_ID,
+                "vision_start_token_id": _VISION_START_TOKEN_ID,
+                "vision_end_token_id": _VISION_END_TOKEN_ID,
+            }
+        )
         assert cfg.image_token_id == _IMAGE_TOKEN_ID
         assert cfg.video_token_id == _VIDEO_TOKEN_ID
 
     def test_missing_llm_config_raises(self):
         """Proxy property access with llm_config=None should raise AttributeError."""
         from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
+
         with pytest.raises(AttributeError, match="llm_config is None"):
             _ = Mammothmoda2Config(llm_config=None).image_token_id
 
@@ -153,18 +166,22 @@ def _stage(ar_outputs: list) -> list:
 def _p(image_height: int = 512, image_width: int = 512, visual_ids: list[int] | None = None, **kw) -> dict:
     if visual_ids is None:
         visual_ids = [_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID, _VISION_END_TOKEN_ID]
-    return {"additional_information": {
-        "omni_task": ["t2i"],
-        "ar_width": [image_width // _AR_PATCH_SIZE], "ar_height": [image_height // _AR_PATCH_SIZE],
-        "eol_token_id": [kw.get("eol_token_id", _BASE_VOCAB_SIZE)],
-        "visual_token_start_id": [kw.get("visual_token_start_id", _VISUAL_TOKEN_START_ID)],
-        "visual_token_end_id": [kw.get("visual_token_end_id", _VISUAL_TOKEN_END_ID)],
-        "image_height": [image_height], "image_width": [image_width],
-        "num_inference_steps": [kw.get("num_inference_steps", 50)],
-        "text_guidance_scale": [kw.get("text_guidance_scale", 9.0)],
-        "cfg_range": list(kw.get("cfg_range", [0.0, 1.0])),
-        "visual_ids": visual_ids,
-    }}
+    return {
+        "additional_information": {
+            "omni_task": ["t2i"],
+            "ar_width": [image_width // _AR_PATCH_SIZE],
+            "ar_height": [image_height // _AR_PATCH_SIZE],
+            "eol_token_id": [kw.get("eol_token_id", _BASE_VOCAB_SIZE)],
+            "visual_token_start_id": [kw.get("visual_token_start_id", _VISUAL_TOKEN_START_ID)],
+            "visual_token_end_id": [kw.get("visual_token_end_id", _VISUAL_TOKEN_END_ID)],
+            "image_height": [image_height],
+            "image_width": [image_width],
+            "num_inference_steps": [kw.get("num_inference_steps", 50)],
+            "text_guidance_scale": [kw.get("text_guidance_scale", 9.0)],
+            "cfg_range": list(kw.get("cfg_range", [0.0, 1.0])),
+            "visual_ids": visual_ids,
+        }
+    }
 
 
 class TestAR2DitProcessor:
@@ -184,7 +201,9 @@ class TestAR2DitProcessor:
     def test_embed_shapes_and_dtype(self):
         """text/image condition embeds must be 2D float32 with correct leading dim."""
         n_gen = 30
-        ar_out = _mock_ar(list(range(15)), list(range(_VISUAL_TOKEN_START_ID, _VISUAL_TOKEN_START_ID + n_gen)) + [0], hidden_dim=128)
+        ar_out = _mock_ar(
+            list(range(15)), list(range(_VISUAL_TOKEN_START_ID, _VISUAL_TOKEN_START_ID + n_gen)) + [0], hidden_dim=128
+        )
         info = ar2dit(_stage([ar_out]), engine_input_source=[0], prompts=[_p()])[0]["additional_information"]
         assert info["image_prompt_embeds"].shape == (n_gen, 128)
         assert info["text_prompt_embeds"].dtype == torch.float32
@@ -227,8 +246,9 @@ class TestAR2DitProcessor:
         ar.prompt_token_ids = prompt_ids
         ar.outputs = [c]
         ar.request_id = "req-visual"
-        info = ar2dit(_stage([ar]), engine_input_source=[0],
-                      prompts=[_p(visual_ids=visual_ids)])[0]["additional_information"]
+        info = ar2dit(_stage([ar]), engine_input_source=[0], prompts=[_p(visual_ids=visual_ids)])[0][
+            "additional_information"
+        ]
         assert info["text_prompt_embeds"].shape[0] == 3
 
 
@@ -331,9 +351,7 @@ def test_mammothmoda2_t2i_e2e():
                                 f"Expected image tensor, got {type(img_tensor)}"
                             )
                             # DiT output is (C, H*2, W*2) or (1, C, H*2, W*2)
-                            assert img_tensor.ndim in (3, 4), (
-                                f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
-                            )
+                            assert img_tensor.ndim in (3, 4), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
                             found_image = True
 
         assert found_image, "No image tensor found in pipeline output"
@@ -350,6 +368,7 @@ class TestStageConfigValidation:
     def test_t2i_config_two_stages(self):
         """T2I YAML must define exactly 2 stages (AR->latent, DiT->image) with correct wiring."""
         import yaml
+
         if not Path(T2I_STAGE_CONFIG).exists():
             pytest.skip(f"Not found: {T2I_STAGE_CONFIG}")
         with open(T2I_STAGE_CONFIG) as f:
@@ -366,6 +385,7 @@ class TestStageConfigValidation:
     def test_summarize_config_single_ar_stage(self):
         """Image-summarisation YAML must be a single AR stage outputting text."""
         import yaml
+
         if not Path(SUMMARIZE_STAGE_CONFIG).exists():
             pytest.skip(f"Not found: {SUMMARIZE_STAGE_CONFIG}")
         with open(SUMMARIZE_STAGE_CONFIG) as f:
