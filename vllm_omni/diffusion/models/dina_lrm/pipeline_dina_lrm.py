@@ -331,7 +331,7 @@ class DiNaLRMPipeline(nn.Module):
         # ── text prompts ──────────────────────────────────────────────────────
         first_prompt = req.prompts[0]
         prompt_texts: list[str] = first_prompt.get("prompt", "")
-
+        prompt_texts: list[str] = [first_prompt.get("prompt", "")]
         # ── noise level u (passed as extra_args["noise_level"]) ──────────────
         extra_args: dict = getattr(req.sampling_params, "extra_args", {}) or {}
         u: float = float(extra_args.get("noise_level", 0.1))
