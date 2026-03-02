@@ -331,14 +331,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         target_status: RequestStatus,
         finished_load_reqs: set[str],
     ) -> None:
-        queue_snapshot = list(queue)
-        for request in queue_snapshot:
+        # Single-pass partition: O(n) instead of O(n^2) from
+        # queue.remove() inside a loop (each remove scans the queue).
+        keep: list[Any] = []
+        for request in list(queue):
             if request.status != RequestStatus.WAITING_FOR_CHUNK:
                 if request.request_id in self.requests_with_ready_chunks:
                     # Requests that have loaded chunk from last round
                     # of schedule, but have not scheduled
+                    keep.append(request)
                     continue
                 if request.request_id in self.finished_requests:
+                    keep.append(request)
                     continue
                 # Requests that waiting for chunk
                 self.load_async(request)
@@ -348,9 +352,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    keep.append(request)
                     continue
-            queue.remove(request)
             waiting_for_chunk_list.append(request)
+        queue[:] = keep
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:
