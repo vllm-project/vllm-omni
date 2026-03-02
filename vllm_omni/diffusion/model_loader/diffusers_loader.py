@@ -3,6 +3,7 @@
 import dataclasses
 import glob
 import os
+import re
 import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
@@ -22,6 +23,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
+    multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -35,15 +37,18 @@ from vllm_omni.diffusion.registry import initialize_model
 logger = init_logger(__name__)
 
 
+def _natural_sort_key(filepath: str) -> list:
+    """Natural sort key for filenames with numeric components, e.g.
+    model-00001-of-00005.safetensors -> ['model-', 1, '-of-', 5, '.safetensors']."""
+    return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", os.path.basename(filepath))]
+
+
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 
 
 class DiffusersPipelineLoader:
     """Model loader that can load diffusers pipeline components from disk."""
-
-    # default number of thread when enable multithread weight loading
-    DEFAULT_NUM_THREADS = 8
 
     @dataclasses.dataclass
     class ComponentSource:
@@ -70,18 +75,9 @@ class DiffusersPipelineLoader:
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
-    def __init__(self, load_config: LoadConfig):
+    def __init__(self, load_config: LoadConfig, od_config: OmniDiffusionConfig | None = None):
         self.load_config = load_config
-
-        # TODO(Isotr0py): Enable multithreaded weight loading
-        # extra_config = load_config.model_loader_extra_config
-        # allowed_keys = {"enable_multithread_load", "num_threads"}
-        # unexpected_keys = set(extra_config.keys()) - allowed_keys
-
-        # if unexpected_keys:
-        #     raise ValueError(
-        #         f"Unexpected extra config keys for load format {load_config.load_format}: {unexpected_keys}"
-        #     )
+        self.od_config = od_config
 
     def _prepare_weights(
         self,
@@ -175,18 +171,36 @@ class DiffusersPipelineLoader:
 
     def _get_weights_iterator(self, source: "ComponentSource") -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+        _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-        weights_iterator = safetensors_weights_iterator(
-            hf_weights_files,
-            self.load_config.use_tqdm_on_load,
-            self.load_config.safetensors_load_strategy,
+
+        od_config = self.od_config
+        use_multithread = (
+            use_safetensors
+            and od_config is not None
+            and getattr(od_config, "enable_multithread_weight_load", False)
+            and self.load_config.safetensors_load_strategy != "torchao"
         )
+        if use_multithread:
+            num_threads = getattr(od_config, "num_weight_load_threads", 4)
+            # Keep deterministic shard order before passing to vLLM helper.
+            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+            weights_iterator = multi_thread_safetensors_weights_iterator(
+                sorted_hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                max_workers=num_threads,
+            )
+        else:
+            weights_iterator = safetensors_weights_iterator(
+                hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                self.load_config.safetensors_load_strategy,
+            )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
