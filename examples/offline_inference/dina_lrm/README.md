@@ -15,7 +15,7 @@ and a cross-attention reward head.
 ## Requirements
 
 ```bash
-pip install "git+https://github.com/HKUST-C4G/diffusion-rm@main" 
+pip install "git+https://github.com/HKUST-C4G/diffusion-rm@main"
 pip install vllm-omni diffusers transformers peft omegaconf pyyaml \
             huggingface_hub pillow vllm
 ```

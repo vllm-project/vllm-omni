@@ -21,6 +21,7 @@ RTOL = 0.01
 # Fixtures
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def device() -> torch.device:
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -52,6 +53,7 @@ def _image_to_latent(pipe, image: Image.Image, device: torch.device, dtype: torc
 # ──────────────────────────────────────────────────────────────────────────────
 # Path A – official DRMInferencer
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def run_official(prompts, image, device, dtype) -> torch.Tensor:
     """Run inference using the official DRMInferencer from diffusion_rm.
@@ -85,7 +87,7 @@ def run_official(prompts, image, device, dtype) -> torch.Tensor:
     text_encoders = [pipe.text_encoder, pipe.text_encoder_2, pipe.text_encoder_3]
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2, pipe.tokenizer_3]
     with torch.no_grad():
-        prompt_embeds, pooled_embeds = encode_prompt(text_encoders, tokenizers, prompts, max_sequence_length=256)        
+        prompt_embeds, pooled_embeds = encode_prompt(text_encoders, tokenizers, prompts, max_sequence_length=256)
     prompt_embeds = prompt_embeds.to(device)
     pooled_embeds = pooled_embeds.to(device)
     latents = _image_to_latent(pipe, image, device, dtype)
@@ -113,6 +115,7 @@ def run_official(prompts, image, device, dtype) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────────────────────
 # Path B – OmniDiffusion.generate (vLLM-Omni integration)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def run_vllm_omni(prompts, image, device, dtype) -> torch.Tensor:
     """Run inference using OmniDiffusion.generate (the vLLM-Omni integration path).
@@ -150,17 +153,19 @@ def run_vllm_omni(prompts, image, device, dtype) -> torch.Tensor:
 # Test
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.omni
 def test_dina_lrm_numerical_equivalence(synthetic_image, device, dtype):
     """
-    Verifies that DRMInferencer (official) and DiNaLRMPipeline (vllm-omni) 
+    Verifies that DRMInferencer (official) and DiNaLRMPipeline (vllm-omni)
     produce numerically identical reward scores under identical initialization.
     """
     score_official = run_official([PROMPT], synthetic_image, device, dtype)
     score_vllm = run_vllm_omni([PROMPT], synthetic_image, device, dtype)
 
-    max_diff = (score_official - score_vllm).abs().max().item() \
-        / max(score_official.abs().max().item(), score_vllm.abs().max().item(), 1.0)
+    max_diff = (score_official - score_vllm).abs().max().item() / max(
+        score_official.abs().max().item(), score_vllm.abs().max().item(), 1.0
+    )
 
     assert torch.allclose(score_official, score_vllm, atol=0.0, rtol=RTOL), (
         f"Equivalence check FAILED: max_abs_diff = {max_diff:.3e} (rtol = {RTOL:.3e})\n"

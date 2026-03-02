@@ -109,6 +109,7 @@ _DIFFUSION_MODELS = {
         "dina_lrm",
         "pipeline_dina_lrm",
         "DiNaLRMPipeline",
+    ),
     "OmniGen2Pipeline": (
         "omnigen2",
         "pipeline_omnigen2",
