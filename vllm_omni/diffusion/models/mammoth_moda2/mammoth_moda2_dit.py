@@ -282,7 +282,7 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         image = self.gen_vae.decode(latents, return_dict=False)[0]
 
         return OmniOutput(
-            text_hidden_states=inputs_embeds,  # 占位，runner 不会用到
+            text_hidden_states=inputs_embeds,  # placeholder, not used by runner
             multimodal_outputs=image,
             intermediate_tensors=None,
         )
