@@ -9,7 +9,8 @@ Workflow:
 
 Example Usage:
     uv run python examples/offline_inference/run_mammothmoda2_t2i.py \
-        --model /path/to/MammothModa2-Preview \
+        --model path/to/MammothModa2-Preview \
+        --stage-config vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml \
         --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
         --out output.png
 """

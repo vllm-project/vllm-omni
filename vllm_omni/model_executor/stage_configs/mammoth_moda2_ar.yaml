@@ -1,3 +1,9 @@
+# Stage config for running MammothModa2 with single AR stage (understanding / summarization).
+# Stage 0: AR (multimodal understanding + text generation)
+#
+# Use this config for image/video understanding tasks where only text output is needed.
+# For text-to-image generation (AR → DiT), use mammoth_moda2.yaml instead.
+
 stage_args:
   - stage_id: 0
     runtime:

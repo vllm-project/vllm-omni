@@ -47,10 +47,11 @@ _AR_PATCH_SIZE = 16
 _AR_TOP_K = 2048
 
 _EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "offline_inference" / "mammothmodal2_preview"
-MODEL_PATH = os.environ.get("MAMMOTHMODA2_MODEL_PATH", str(_EXAMPLE_DIR / "MammothModa2-Preview"))
-T2I_STAGE_CONFIG = os.environ.get("MAMMOTHMODA2_T2I_STAGE_CONFIG", str(_EXAMPLE_DIR / "mammoth_moda2_t2i.yaml"))
+_STAGE_CONFIGS_DIR = Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs"
+MODEL_PATH = os.environ.get("MAMMOTHMODA2_MODEL_PATH", str(Path(__file__).resolve().parents[3] / "MammothModa2-Preview"))
+T2I_STAGE_CONFIG = os.environ.get("MAMMOTHMODA2_T2I_STAGE_CONFIG", str(_STAGE_CONFIGS_DIR / "mammoth_moda2.yaml"))
 SUMMARIZE_STAGE_CONFIG = os.environ.get(
-    "MAMMOTHMODA2_SUMMARIZE_STAGE_CONFIG", str(_EXAMPLE_DIR / "mammoth_moda2_image_summarize.yaml")
+    "MAMMOTHMODA2_SUMMARIZE_STAGE_CONFIG", str(_STAGE_CONFIGS_DIR / "mammoth_moda2_ar.yaml")
 )
 
 

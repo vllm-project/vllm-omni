@@ -1,3 +1,9 @@
+# Stage config for running MammothModa2 with full AR→DiT pipeline (text-to-image).
+# Stage 0: AR  (multimodal understanding + latent generation)
+# Stage 1: DiT (latent → image)
+#
+# For text/image understanding tasks (text output only), use mammoth_moda2_ar.yaml.
+
 stage_args:
   - stage_id: 0
     runtime:
