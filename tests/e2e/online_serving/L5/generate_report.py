@@ -12,8 +12,21 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 def load_csv(csv_path: str) -> list[dict]:
+    """从 GPU 监控 CSV 加载并解析行。
+
+    Args:
+        csv_path: CSV 文件路径。
+
+    Returns:
+        解析后的行列表，每行为包含 timestamp_epoch、gpu_index、memory_* 等键的 dict。
+        无效行会被跳过并记录日志。
+    """
     rows = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -24,12 +37,21 @@ def load_csv(csv_path: str) -> list[dict]:
                 r["memory_total_mb"] = int(r["memory_total_mb"])
                 r["memory_util_pct"] = int(r["memory_util_pct"])
                 rows.append(r)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError) as e:
+                logger.debug("Skip invalid CSV row: %s", e)
                 continue
     return rows
 
 
 def compute_stats(rows: list[dict]) -> dict:
+    """按 GPU 计算显存利用率的最小、最大、平均、P50、P95 及采样数。
+
+    Args:
+        rows: load_csv 返回的行列表。
+
+    Returns:
+        以 gpu_index 为键的统计 dict，值为 min/max/avg/p50/p95/samples。
+    """
     by_gpu = defaultdict(list)
     for r in rows:
         by_gpu[r["gpu_index"]].append(r["memory_util_pct"])
@@ -88,6 +110,16 @@ def render_html(
     anomalies: list[dict],
     out_path: str,
 ) -> None:
+    """生成单文件 HTML 报告（统计表、时序图、异常表），写入 out_path。
+
+    Args:
+        run_id: 运行标识，用于标题。
+        csv_path: 数据来源 CSV 路径（仅用于展示文件名）。
+        rows: 原始数据行。
+        stats: compute_stats 返回的统计。
+        anomalies: find_anomalies 返回的异常列表。
+        out_path: 输出 HTML 路径；父目录不存在时会创建。
+    """
     times, gpu_series = build_series_by_gpu(rows)
     # X 轴时间：例如 02-27 11:38:07（本地时区），便于长稳时阅读
     labels_js = [
@@ -223,18 +255,23 @@ def render_html(
 
 
 def main() -> int:
+    """入口：从命令行读取 CSV 路径与可选输出路径，生成 report.html。
+
+    Returns:
+        0 成功，1 参数或数据错误。
+    """
     if len(sys.argv) < 2:
-        print("Usage: generate_report.py <gpu_metrics.csv> [output.html]", file=sys.stderr)
+        logger.error("Usage: generate_report.py <gpu_metrics.csv> [output.html]")
         return 1
     csv_path = sys.argv[1]
     out_path = sys.argv[2] if len(sys.argv) > 2 else csv_path.replace(".csv", "_report.html")
     if not os.path.isfile(csv_path):
-        print(f"File not found: {csv_path}", file=sys.stderr)
+        logger.error("File not found: %s", csv_path)
         return 1
     run_id = Path(csv_path).parent.name
     rows = load_csv(csv_path)
     if not rows:
-        print("CSV has no valid data", file=sys.stderr)
+        logger.error("CSV has no valid data")
         return 1
     stats = compute_stats(rows)
     anomalies = find_anomalies(rows)
