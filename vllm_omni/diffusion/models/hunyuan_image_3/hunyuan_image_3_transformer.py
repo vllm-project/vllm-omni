@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import glob
 import inspect
 import logging
 import math
-import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -22,7 +20,6 @@ from diffusers.utils.outputs import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from PIL import Image
-from safetensors.torch import load_file
 from torch import nn
 from torchvision import transforms
 from transformers import PretrainedConfig, Siglip2ImageProcessorFast
@@ -355,14 +352,6 @@ def build_batch_2d_rope(
         return stacked_cos, stacked_sin, all_pos_list
 
     return stacked_cos, stacked_sin
-
-
-def get_full_state_dict(model_path):
-    files = glob.glob(os.path.join(model_path, "*.safetensors"))
-    full_sd = {}
-    for f in files:
-        full_sd.update(load_file(f))
-    return full_sd
 
 
 def rotate_half(x):
@@ -1744,7 +1733,6 @@ class HunyuanImage3Model(nn.Module):
         lora_vocab = (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
-        self.wte = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         if get_pp_group().is_first_rank or (config.tie_word_embeddings and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
@@ -2047,7 +2035,7 @@ class HunyuanImage3Model(nn.Module):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
 
         # embed positions
         hidden_states = inputs_embeds

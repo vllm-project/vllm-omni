@@ -332,7 +332,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-
         # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
@@ -441,7 +440,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return model_outputs
 
         hidden = model_outputs
-        info_dicts = kwargs.get("runtime_additional_information") or []
+        info_dicts = kwargs.get("model_intermediate_buffer")
+        if info_dicts is None:
+            info_dicts = kwargs.get("runtime_additional_information") or []
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         audio_codes_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
         codec_streaming_list: list[torch.Tensor] = []
