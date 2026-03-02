@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from transformers.utils.hub import cached_file
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -116,6 +117,28 @@ class Qwen3TTSCode2Wav(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
 
+    def _split_request_ids(self, ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
+        """Split concatenated input_ids into per-request segments.
+
+        Uses seq_token_counts (injected by the runner via model_kwargs) when
+        available, falling back to forward-context ubatch_slices when
+        micro-batching is active. Returns [ids] for single-request batches.
+        """
+        if seq_token_counts is not None and len(seq_token_counts) > 1:
+            boundaries = [0]
+            for count in seq_token_counts:
+                boundaries.append(boundaries[-1] + count)
+            n = ids.numel()
+            return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
+        if is_forward_context_available():
+            slices = get_forward_context().ubatch_slices
+            if slices is not None and len(slices) > 1 and not any(hasattr(s, "token_slice") for s in slices):
+                boundaries = [0]
+                for s in slices:
+                    boundaries.append(boundaries[-1] + s)
+                return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+        return [ids]
+
     @torch.no_grad()
     def forward(
         self,
@@ -124,98 +147,129 @@ class Qwen3TTSCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> OmniOutput:
         """Decode codec codes into audio waveform.
 
-        input_ids layout: [codec_context_frames, *flat_codes]
+        input_ids layout per request: [codec_context_frames, *flat_codes]
         where flat_codes is codebook-major [q*F].
+
+        When batched, uses forward context ubatch_slices to split the
+        concatenated input_ids and decode via a single batched forward pass.
         """
-        tok = self._ensure_speech_tokenizer_loaded()
+        self._ensure_speech_tokenizer_loaded()
         assert self._num_quantizers is not None
+        assert self._decode_upsample_rate is not None
         assert self._output_sample_rate is not None
 
-        sr_val = self._output_sample_rate
-        empty_ret = (
-            torch.zeros((0,), dtype=torch.float32),
-            torch.tensor(sr_val, dtype=torch.int32),
-        )
-
-        if input_ids is None:
-            return empty_ret
-
+        tok = self._speech_tokenizer
         q = int(self._num_quantizers)
-        ids = input_ids.reshape(-1).to(dtype=torch.long)
-        n_tokens = ids.numel()
+        upsample = int(self._decode_upsample_rate)
+        sr_val = int(self._output_sample_rate)
+        sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
+        empty = torch.zeros((0,), dtype=torch.float32)
 
-        if n_tokens == 0:
-            return empty_ret
-
-        # input_ids[0] = codec_context_frames (prepended by stage_input_processor).
-        ctx_frames = int(ids[0].item())
-        ids = ids[1:]
-        n_tokens = ids.numel()
-
-        if n_tokens == 0:
-            return empty_ret
-
-        # Warmup / dummy_run: not divisible by num_quantizers.
-        if n_tokens % q != 0:
-            logger.warning(
-                "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
-                "likely a warmup run; returning empty audio.",
-                n_tokens,
-                q,
+        if input_ids is None or input_ids.numel() == 0:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
-            return empty_ret
 
-        total_frames = n_tokens // q
+        ids = input_ids.reshape(-1).to(dtype=torch.long)
+        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        # Reshape codebook-major flat [q*F] -> [q, F] -> [F, q] for SpeechTokenizer.
-        codes_fq = ids.reshape(q, total_frames).transpose(0, 1).contiguous()
+        # Parse each request: extract ctx_frames, validate, reshape codes.
+        # input_ids layout per request: [codec_context_frames, *flat_codes]
+        # where flat_codes is codebook-major [q*F].
+        parsed = []  # (ctx_frames, actual_frames)
+        valid_codes = []
+        valid_indices = []
+        for i, req_ids in enumerate(request_ids_list):
+            if req_ids.numel() < 2:
+                parsed.append((0, 0))
+                continue
+            ctx_frames = int(req_ids[0].item())
+            flat = req_ids[1:]
+            n = flat.numel()
+            # Warmup / dummy_run: not divisible by num_quantizers.
+            if n == 0 or n % q != 0:
+                if n > 0:
+                    logger.warning(
+                        "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
+                        "likely a warmup run; returning empty audio.",
+                        n,
+                        q,
+                    )
+                parsed.append((0, 0))
+                continue
+            frames = n // q
+            # Reshape codebook-major flat [q*F] -> [q, F] -> [F, q] for SpeechTokenizer.
+            codes_fq = flat.reshape(q, frames).transpose(0, 1).contiguous()
+            parsed.append((ctx_frames, frames))
+            valid_codes.append({"audio_codes": codes_fq})
+            valid_indices.append(i)
 
-        if not self._logged_codec_stats and total_frames > 1:
+        num_req = len(request_ids_list)
+        if not valid_codes:
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": [empty] * num_req,
+                    "sr": [sr_tensor] * num_req,
+                },
+            )
+
+        if not self._logged_codec_stats:
             self._logged_codec_stats = True
             try:
-                uniq = int(torch.unique(codes_fq).numel())
-                cmin = int(codes_fq.min().item())
-                cmax = int(codes_fq.max().item())
-                head = codes_fq[: min(2, total_frames), : min(8, q)].cpu().tolist()
+                c = valid_codes[0]["audio_codes"]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] head=%s",
-                    total_frames,
+                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] head=%s batch=%d",
+                    c.shape[0],
                     q,
-                    uniq,
-                    cmin,
-                    cmax,
-                    head,
+                    int(torch.unique(c).numel()),
+                    int(c.min().item()),
+                    int(c.max().item()),
+                    c[: min(2, c.shape[0]), : min(8, q)].cpu().tolist(),
+                    len(valid_codes),
                 )
             except Exception:
                 pass
 
-        wavs, sr = tok.decode({"audio_codes": codes_fq})
-        if not wavs:
-            raise ValueError("SpeechTokenizer code2wav produced empty waveform list.")
-        audio_np = wavs[0].astype(np.float32, copy=False)
+        # Batched decode: single forward pass through SpeechTokenizer.
+        wavs, _ = tok.decode(valid_codes)
+        if len(wavs) != len(valid_codes):
+            raise RuntimeError(f"Code2Wav returned {len(wavs)} waveforms for {len(valid_codes)} requests")
 
-        # Trim left-context waveform samples (streaming sliding window).
-        if ctx_frames > 0:
-            upsample = self._decode_upsample_rate
-            if upsample is None or upsample <= 0:
-                raise ValueError(f"Invalid decode upsample rate: {upsample}")
-            cut = ctx_frames * upsample
-            if cut < audio_np.shape[0]:
-                audio_np = audio_np[cut:]
-            else:
-                logger.warning(
-                    "Context trim %d >= decoded length %d; returning empty audio.",
-                    cut,
-                    audio_np.shape[0],
-                )
-                return empty_ret
+        # Build per-request outputs, trimming padding and left-context.
+        audios = [empty] * num_req
+        srs = [sr_tensor] * num_req
 
-        audio_tensor = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1)
-        sr_tensor = torch.tensor(int(sr), dtype=torch.int32)
-        return audio_tensor, sr_tensor
+        for j, idx in enumerate(valid_indices):
+            ctx_frames, actual_frames = parsed[idx]
+            audio_np = wavs[j].astype(np.float32, copy=False)
+            # Trim decoder padding (output may be longer due to batch padding).
+            expected_len = actual_frames * upsample
+            if audio_np.shape[0] > expected_len:
+                audio_np = audio_np[:expected_len]
+            # Trim left-context waveform samples (streaming sliding window).
+            if ctx_frames > 0:
+                cut = ctx_frames * upsample
+                if cut < audio_np.shape[0]:
+                    audio_np = audio_np[cut:]
+                else:
+                    logger.warning(
+                        "Context trim %d >= decoded length %d; returning empty audio.",
+                        cut,
+                        audio_np.shape[0],
+                    )
+                    continue
+            if audio_np.shape[0] > 0:
+                audios[idx] = torch.from_numpy(audio_np).to(dtype=torch.float32).reshape(-1)
+
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={"model_outputs": audios, "sr": srs},
+        )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

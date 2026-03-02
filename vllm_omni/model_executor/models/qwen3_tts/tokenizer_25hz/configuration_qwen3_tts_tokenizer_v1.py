@@ -214,8 +214,6 @@ class Qwen3TTSTokenizerV1EncoderConfig(PretrainedConfig):
         output_dim (`int`, *optional*, defaults to 3584):
             Output feature dimension produced by the encoder head (before/after projection, implementation-dependent).
 
-        grad_checkpointing (`bool`, *optional*, defaults to `False`):
-            Whether to enable gradient checkpointing to reduce memory usage during training.
         enable_mp (`bool`, *optional*, defaults to `False`):
             Whether to enable model parallel features (implementation-dependent).
         audio_sequence_parallel (`bool`, *optional*, defaults to `False`):
@@ -246,7 +244,6 @@ class Qwen3TTSTokenizerV1EncoderConfig(PretrainedConfig):
         n_layer=32,
         n_window=100,
         output_dim=3584,
-        grad_checkpointing=False,
         enable_mp=False,
         audio_sequence_parallel=False,
         audio_vq_type="GRVQ",
@@ -265,7 +262,6 @@ class Qwen3TTSTokenizerV1EncoderConfig(PretrainedConfig):
         self.n_layer = n_layer
         self.n_window = n_window
         self.output_dim = output_dim
-        self.grad_checkpointing = grad_checkpointing
         self.enable_mp = enable_mp
         self.audio_sequence_parallel = audio_sequence_parallel
         self.audio_vq_type = audio_vq_type

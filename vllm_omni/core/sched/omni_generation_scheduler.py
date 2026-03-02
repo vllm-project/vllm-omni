@@ -77,7 +77,6 @@ class OmniGenerationScheduler(VLLMScheduler):
                     self.chunk_transfer_adapter is not None
                     and request.request_id in self.chunk_transfer_adapter.finished_requests
                 ):
-                    request.status = RequestStatus.FINISHED_STOPPED
                     # Upstream may finish with no terminal tokens; append one pad token so we can emit FINISHED.
                     if len(request.prompt_token_ids) <= num_computed_tokens:
                         request.prompt_token_ids.append(0)
@@ -125,11 +124,13 @@ class OmniGenerationScheduler(VLLMScheduler):
                 # Pop the finished request from waiting queue and don't schedule it
                 self.waiting.pop_request()
                 continue
+            # Count the number of prefix cached tokens.
+            if request.num_cached_tokens < 0:
+                request.num_cached_tokens = request.num_computed_tokens
 
             # async_chunk: wait for the first upstream chunk (don't start with placeholders).
             if self.chunk_transfer_adapter is not None and len(request.prompt_token_ids) == 0:
                 if request.request_id in self.chunk_transfer_adapter.finished_requests:
-                    request.status = RequestStatus.FINISHED_STOPPED
                     request.prompt_token_ids.append(0)
                     try:
                         request._all_token_ids.append(0)  # type: ignore[attr-defined]
@@ -413,6 +414,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    if self.chunk_transfer_adapter is not None:
+                        self.chunk_transfer_adapter.cleanup(
+                            request.request_id,
+                            getattr(request, "external_req_id", None),
+                        )
                 if status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
                     stopped_running_reqs.add(request)
                     stopped_preempted_reqs.add(request)
@@ -483,6 +489,11 @@ class OmniGenerationScheduler(VLLMScheduler):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.cleanup(
+                        request.request_id,
+                        getattr(request, "external_req_id", None),
+                    )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

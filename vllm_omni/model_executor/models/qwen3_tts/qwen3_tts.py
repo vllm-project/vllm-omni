@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import copy
 import io
 import urllib.request
 from collections.abc import Iterable
@@ -37,6 +38,18 @@ from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 from .processing_qwen3_tts import Qwen3TTSProcessor
 
 logger = init_logger(__name__)
+
+_TASK_TYPE_CANONICAL: dict[str, str] = {
+    "customvoice": "CustomVoice",
+    "voicedesign": "VoiceDesign",
+    "base": "Base",
+}
+
+
+def _normalize_task_type(raw: str) -> str:
+    """Normalize task type string to its canonical PascalCase form."""
+    return _TASK_TYPE_CANONICAL.get(raw.lower(), raw)
+
 
 AudioLike = (
     str  # wav path, URL, base64
@@ -81,12 +94,39 @@ class Qwen3TTSModelForGeneration(nn.Module):
             torch_dtype=torch.bfloat16,
             **attn_kwargs,
         )
-        self.task_type = model_path.split("-")[-1].split("/")[0]
+        self.task_type = _normalize_task_type(model_path.split("-")[-1].split("/")[0])
         # Mark that this model produces multimodal outputs
         self.have_multimodal_outputs = True
 
         # Store vllm_config for potential future use
         self.vllm_config = vllm_config
+
+        # Enable CUDA Graph for decoder
+        self._enable_decoder_cudagraph()
+
+    def _enable_decoder_cudagraph(self):
+        # Respect --enforce-eager flag
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if model_cfg and getattr(model_cfg, "enforce_eager", False):
+            logger.info("CUDA Graph not enabled: --enforce-eager is set")
+            return
+        try:
+            inner_model = getattr(self.model, "model", None)
+            if inner_model is None or not hasattr(inner_model, "speech_tokenizer"):
+                return
+            tokenizer = inner_model.speech_tokenizer
+            if not (hasattr(tokenizer, "model") and hasattr(tokenizer.model, "decoder")):
+                return
+            decoder = tokenizer.model.decoder
+            device = next(decoder.parameters()).device
+            if device.type != "cuda":
+                logger.info("CUDA Graph not enabled: decoder is on %s", device)
+                return
+            if hasattr(decoder, "enable_cudagraph"):
+                decoder.enable_cudagraph()
+                logger.info("CUDA Graph enabled for speech tokenizer decoder")
+        except Exception:
+            logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
 
     def forward(
         self,
@@ -112,12 +152,17 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
         # Extract additional parameters from kwargs that the generation methods expect
 
-        runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
+        runtime_additional_information = kwargs.get("model_intermediate_buffer")
+        if runtime_additional_information is None:
+            runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
             runtime_additional_information = runtime_additional_information[0]
+        runtime_additional_information = copy.deepcopy(runtime_additional_information)
         text = runtime_additional_information.pop("text", [""])[0]
-        # Extract task_type from kwargs, default to "instruct"
-        task_type = runtime_additional_information.pop("task_type", [self.task_type])[0]
+        # Extract task_type from kwargs, default to self.task_type
+        task_type = _normalize_task_type(runtime_additional_information.pop("task_type", [self.task_type])[0])
         speaker = runtime_additional_information.pop("speaker", ["uncle_fu"])[0]
         language = runtime_additional_information.pop("language", ["Auto"])[0]
         instruct = runtime_additional_information.pop("instruct", [""])[0]

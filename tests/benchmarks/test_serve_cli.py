@@ -3,36 +3,18 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.utils import hardware_test
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
-stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen3_omni_ci.yaml")]
+models = ["Qwen/Qwen2.5-Omni-7B"]
+stage_configs = [str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
-@pytest.fixture(scope="module")
-def omni_server(request):
-    """Start vLLM-Omni server as a subprocess with actual model weights.
-    Uses session scope so the server starts only once for the entire test session.
-    Multi-stage initialization can take 10-20+ minutes.
-    """
-    model, stage_config_path = request.param
-
-    print(f"Starting OmniServer with model: {model}")
-    print("This may take 10-20+ minutes for initialization...")
-
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
-        print("OmniServer started successfully")
-        yield server
-        print("OmniServer stopped")
-
-
 @pytest.mark.core_model
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "L4"}, num_cards=3)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bench_serve_chat(omni_server):
     command = [

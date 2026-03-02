@@ -100,7 +100,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
-            if self.model_config.async_chunk:
+            if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
@@ -250,6 +250,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 intermediate_tensors,
             )
 
+            # [Omni] Pass token counts per request for code2wav output slicing
+            model_kwargs["seq_token_counts"] = tokens
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -257,10 +260,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
-
-        if ubatch_slices_padded is None:
-            # reuse ubatch_slices_padded for code2wav batching
-            ubatch_slices_padded = tokens
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
