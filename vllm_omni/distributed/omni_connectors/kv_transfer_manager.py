@@ -522,3 +522,50 @@ class OmniKVTransferManager:
             self.apply_kv_cache_to_request(req, data)
             return True
         return False
+
+    def receive_multi_kv_cache(
+        self,
+        req: Any,
+        cfg_kv_collect_func: Callable | None = None,
+        target_device: torch.device | None = None,
+    ) -> bool:
+        """Receive primary KV cache and optional CFG companion KV caches.
+
+        First receives the primary KV cache (existing logic). Then, if the
+        request carries cfg_kv_request_ids and a model-specific
+        cfg_kv_collect_func is provided, calls it to fetch and attach the
+        companion KV caches to sampling_params.
+
+        Args:
+            req: Request object with request_id and sampling_params.
+            cfg_kv_collect_func: Model-specific function for collecting
+                CFG KV caches. Signature:
+                (request_id, cfg_request_ids, kv_transfer_manager, target_device)
+                -> dict[str, Any]
+            target_device: Device to move tensors to.
+
+        Returns:
+            True if primary KV cache was received successfully.
+        """
+        primary_ok = self.receive_kv_cache(req, target_device)
+
+        cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
+        if cfg_ids and cfg_kv_collect_func:
+            request_id = getattr(req, "request_id", None) or (
+                req.request_ids[0] if hasattr(req, "request_ids") and req.request_ids else None
+            )
+            try:
+                cfg_kvs = cfg_kv_collect_func(
+                    request_id,
+                    cfg_ids,
+                    self,
+                    target_device,
+                )
+                if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
+                    for key, value in cfg_kvs.items():
+                        setattr(req.sampling_params, key, value)
+                    logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
+            except Exception:
+                logger.exception("Failed to collect CFG KV caches for %s", request_id)
+
+        return primary_ok

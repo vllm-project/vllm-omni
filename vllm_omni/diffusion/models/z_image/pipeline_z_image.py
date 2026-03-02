@@ -644,4 +644,8 @@ class ZImagePipeline(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        # Record components loaded by diffusers submodules to satisfy strict checks.
+        loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
+        loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+        return loaded_weights

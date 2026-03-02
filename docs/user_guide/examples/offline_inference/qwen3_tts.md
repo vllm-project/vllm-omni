@@ -90,13 +90,43 @@ Examples:
 python end2end.py --query-type Base --mode-tag icl
 ```
 
+## Streaming Mode
+
+Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires `async_chunk: true` in the stage config):
+
+```bash
+python end2end.py --query-type CustomVoice --streaming --output-dir /tmp/out_stream
+```
+
+Each 25-frame Code2Wav chunk is logged as it arrives. The final WAV file is written once generation
+completes. This demonstrates that audio data is available progressively rather than only at the end.
+
+> **Note:** Streaming uses `AsyncOmni` internally. The non-streaming path (`Omni`) is unchanged.
+
+## Batched Decoding
+
+The Code2Wav stage (stage 1) supports batched decoding, where multiple requests are decoded in a single forward pass through the SpeechTokenizer. To use it, provide a stage config with `max_batch_size > 1` and pass multiple prompts via `--txt-prompts` with a matching `--batch-size`.
+
+```
+python end2end.py --query-type CustomVoice \
+    --txt-prompts benchmark_prompts.txt \
+    --batch-size 4 \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml
+```
+
+**Important:** `--batch-size` must match a CUDA graph capture size (1, 2, 4, 8, 16...) because the Talker's code predictor KV cache is sized to `max_num_seqs`, and CUDA graphs pad the batch to the next capture size. Both stages need `max_batch_size >= batch_size` in the stage config for batching to take effect. If only stage 1 has a higher `max_batch_size`, it won't help — stage 1 can only batch chunks from requests that are in-flight simultaneously, which requires stage 0 to also process multiple requests concurrently.
+
 ## Notes
 
 - The script uses the model paths embedded in `end2end.py`. Update them if your local cache path differs.
-- Use `--output-dir` (preferred) or `--output-wav` to change the output folder.
+- Use `--output-dir` to change the output folder.
 
 ## Example materials
 
+??? abstract "benchmark_prompts.txt"
+    ``````txt
+    --8<-- "examples/offline_inference/qwen3_tts/benchmark_prompts.txt"
+    ``````
 ??? abstract "end2end.py"
     ``````py
     --8<-- "examples/offline_inference/qwen3_tts/end2end.py"
