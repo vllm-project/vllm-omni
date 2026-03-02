@@ -7,6 +7,10 @@ import time
 from collections import deque
 from types import SimpleNamespace
 
+import pytest
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Simulate RequestStatus enum
 class RequestStatus:
     WAITING = "WAITING"
