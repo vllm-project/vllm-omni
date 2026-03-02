@@ -1,15 +1,33 @@
 from __future__ import annotations
 
 import enum
+import importlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
 from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
+
+
+def load_func_from_config(func_path: str | None) -> Callable[..., Any] | None:
+    """Dynamically import a callable from a fully-qualified dotted path.
+
+    Args:
+        func_path: Dotted path such as ``"pkg.module.func_name"``, or *None*.
+
+    Returns:
+        The imported callable, or *None* when *func_path* is falsy.
+    """
+    if not func_path:
+        return None
+    module_path, func_name = func_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, func_name)
 
 
 class OmniStageTaskType(enum.Enum):

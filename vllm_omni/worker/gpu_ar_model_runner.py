@@ -590,7 +590,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if not req_state:
             return req_id
 
-        add_info = getattr(req_state, "additional_information_cpu", {}) or {}
+        add_info = self.model_intermediate_buffer.get(req_id, {})
         global_id = add_info.get("global_request_id")
         if global_id:
             if isinstance(global_id, list) and global_id:
