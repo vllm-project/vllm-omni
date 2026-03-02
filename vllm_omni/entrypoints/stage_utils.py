@@ -324,8 +324,9 @@ def _to_dict(x: Any) -> dict[str, Any]:
 
 def _resolve_model_to_local_path(model: str) -> str:
     """Resolve an HF Hub model ID to its local cache snapshot path."""
-    if os.path.isabs(model):
+    if os.path.isdir(model):
         return model
+
     try:
         from huggingface_hub import snapshot_download
 
