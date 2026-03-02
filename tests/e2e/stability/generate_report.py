@@ -169,7 +169,7 @@ def render_html(
   </style>
 </head>
 <body>
-  <h1>L5 GPU memory monitor report</h1>
+  <h1>Stability GPU memory monitor report</h1>
   <p class="meta">Run: {run_id} | Data file: {os.path.basename(csv_path)} | Samples: {len(rows)}</p>
   <h2>Statistics</h2>
   <table>

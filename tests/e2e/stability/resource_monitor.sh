@@ -1,24 +1,77 @@
 #!/bin/bash
 #
-# L5 GPU memory monitor - single entry script.
-# Subcommands: start | finalize | run -- <command>
+# Stability 资源监控脚本（统一入口，后续可扩展 CPU/NPU）
+# 当前仅实现 GPU 监控；--backend 预留 cpu/npu 参数，便于后期补充。
 #
-# start   - Background: nvidia-smi loop, write CSV only
-# finalize - Bundle current run (CSV + report.html), print GPU_MONITOR_BUNDLE_DIR=
-# run     - Start monitor, run command, then finalize; in CI upload artifacts
+# 子命令: start | finalize | run -- <command>
 #
-# Env: GPU_MONITOR_DATA_ROOT, GPU_MONITOR_INTERVAL, GPU_MONITOR_DEVICES,
-#      GPU_MONITOR_LOG_INTERVAL, SKIP_DEPS_CHECK
+# start   - 后台采集（当前仅 gpu：nvidia-smi 写 CSV）
+# finalize - 打包当前 run（CSV + report.html），输出 BUNDLE_DIR
+# run     - 启动监控 → 执行命令 → finalize；CI 中可上传 artifact
+#
+# 参数入口（预留多后端）:
+#   --backend, -b   gpu | cpu | npu  默认 gpu，当前仅 gpu 已实现
+#
+# 环境变量:
+#   RESOURCE_MONITOR_BACKEND       默认后端 (gpu|cpu|npu)
+#   RESOURCE_MONITOR_DATA_ROOT     数据根目录（兼容 GPU_MONITOR_DATA_ROOT）
+#   RESOURCE_MONITOR_INTERVAL      采样间隔(秒)（兼容 GPU_MONITOR_INTERVAL）
+#   RESOURCE_MONITOR_LOG_INTERVAL  日志打印间隔(秒)（兼容 GPU_MONITOR_LOG_INTERVAL）
+#   GPU_MONITOR_DEVICES            [仅 GPU 后端] 设备 ID，如 0,1 或 all
+#   SKIP_DEPS_CHECK               跳过依赖检查
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_ROOT="${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}"
+# 数据根目录：优先通用名，兼容旧 GPU 名
+DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}}"
 SUBCMD="${1:-}"
 
-# ---------- subcommand: start (was moniter.sh) ----------
+# 解析可选参数 --backend|-b，结果存入 BACKEND，剩余位置参数存入 REST_ARGS 数组
+parse_backend_and_rest() {
+    BACKEND="${RESOURCE_MONITOR_BACKEND:-gpu}"
+    REST_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --backend|-b)
+                if [[ -z "${2:-}" ]]; then
+                    echo "Error: --backend requires a value (gpu|cpu|npu)" >&2
+                    exit 1
+                fi
+                BACKEND="$2"
+                shift 2
+                ;;
+            *)
+                REST_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+# ---------- subcommand: start ----------
 cmd_start() {
-    local INTERVAL="${2:-${GPU_MONITOR_INTERVAL:-5}}"
+    parse_backend_and_rest "$@"
+    local POS1="${REST_ARGS[0]:-${GPU_MONITOR_DEVICES:-all}}"
+    local POS2="${REST_ARGS[1]:-${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}}"
+
+    case "$BACKEND" in
+        gpu)
+            start_backend_gpu "$POS1" "$POS2"
+            ;;
+        cpu|npu)
+            echo "Error: backend '$BACKEND' not implemented yet. Currently only 'gpu' is supported." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: invalid backend '$BACKEND'. Use gpu|cpu|npu." >&2
+            exit 1
+            ;;
+    esac
+}
+
+start_backend_gpu() {
     local GPU_IDS_RAW="${1:-${GPU_MONITOR_DEVICES:-all}}"
+    local INTERVAL="${2:-${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}}"
 
     if [[ -z "${SKIP_DEPS_CHECK:-}" ]]; then
         if ! command -v nvidia-smi &>/dev/null; then
@@ -29,7 +82,7 @@ cmd_start() {
 
     [[ "$INTERVAL" =~ ^[0-9]+$ ]] && [[ "$INTERVAL" -ge 1 ]] || {
         echo "Error: interval must be a positive integer (seconds)"
-        echo "Usage: $0 start [GPU_IDs|all] [interval_seconds]"
+        echo "Usage: $0 start [--backend gpu|cpu|npu] [gpu_ids] [interval_seconds]"
         exit 1
     }
 
@@ -48,7 +101,7 @@ cmd_start() {
     trap 'echo "[$(date +%H:%M:%S)] Stopping; data saved to $RUN_DIR"; exit 0' SIGTERM SIGINT
 
     echo "========================================"
-    echo "L5 GPU memory monitor started"
+    echo "Stability resource monitor (backend=gpu) started"
     echo "RUN_ID: $RUN_ID"
     echo "Data dir: $RUN_DIR"
     echo "Interval: ${INTERVAL}s | GPU: $GPU_IDS_RAW"
@@ -82,8 +135,27 @@ cmd_start() {
     done
 }
 
-# ---------- subcommand: finalize (was finalize_monitor.sh) ----------
+# ---------- subcommand: finalize ----------
 cmd_finalize() {
+    parse_backend_and_rest "$@"
+    local RUN_ID="${REST_ARGS[0]:-}"
+
+    case "$BACKEND" in
+        gpu)
+            finalize_backend_gpu "$RUN_ID"
+            ;;
+        cpu|npu)
+            echo "Error: backend '$BACKEND' not implemented yet. Currently only 'gpu' is supported." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: invalid backend '$BACKEND'. Use gpu|cpu|npu." >&2
+            exit 1
+            ;;
+    esac
+}
+
+finalize_backend_gpu() {
     local RUN_ID="${1:-}"
 
     if [[ -z "$RUN_ID" ]]; then
@@ -125,7 +197,7 @@ cmd_finalize() {
     fi
 
     cat > "$BUNDLE_DIR/README.txt" << EOF
-L5 GPU monitor bundle - ${RUN_ID}
+Stability resource monitor (gpu) bundle - ${RUN_ID}
 - gpu_metrics.csv: raw samples
 - report.html: report with charts (open in browser)
 Upload this dir as a CI artifact to view after the run.
@@ -134,34 +206,68 @@ EOF
     local BUNDLE_ABS
     BUNDLE_ABS=$(cd "$BUNDLE_DIR" && pwd)
     echo "GPU_MONITOR_BUNDLE_DIR=$BUNDLE_ABS"
+    echo "RESOURCE_MONITOR_BUNDLE_DIR=$BUNDLE_ABS"
     echo "Archive path: $BUNDLE_ABS"
 }
 
-# ---------- subcommand: run (was run_with_gpu_monitor.sh) ----------
+# ---------- subcommand: run ----------
 cmd_run() {
     shift
+    local BACKEND="${RESOURCE_MONITOR_BACKEND:-gpu}"
     local CMD=()
     while [[ $# -gt 0 ]]; do
-        if [[ "$1" == "--" ]]; then
-            shift
-            CMD=("$@")
-            break
-        fi
-        shift
+        case "$1" in
+            --backend|-b)
+                if [[ -n "${2:-}" ]]; then
+                    BACKEND="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --)
+                shift
+                CMD=("$@")
+                break
+                ;;
+            *)
+                shift
+                ;;
+        esac
     done
     if [[ ${#CMD[@]} -eq 0 ]]; then
-        echo "Usage: $0 run -- <command to run>" >&2
+        echo "Usage: $0 run [--backend gpu|cpu|npu] -- <command to run>" >&2
         exit 1
     fi
 
+    case "$BACKEND" in
+        gpu)
+            run_backend_gpu "${CMD[@]}"
+            ;;
+        cpu|npu)
+            echo "Error: backend '$BACKEND' not implemented yet. Currently only 'gpu' is supported." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: invalid backend '$BACKEND'. Use gpu|cpu|npu." >&2
+            exit 1
+            ;;
+    esac
+}
+
+run_backend_gpu() {
+    local CMD=("$@")
+    export RESOURCE_MONITOR_DATA_ROOT="${RESOURCE_MONITOR_DATA_ROOT:-${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}}"
     export GPU_MONITOR_DATA_ROOT="${GPU_MONITOR_DATA_ROOT:-$SCRIPT_DIR/gpu_monitor_data}"
     export SKIP_DEPS_CHECK="${SKIP_DEPS_CHECK:-1}"
-    export GPU_MONITOR_INTERVAL="${GPU_MONITOR_INTERVAL:-5}"
+    export RESOURCE_MONITOR_INTERVAL="${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
+    export GPU_MONITOR_INTERVAL="${RESOURCE_MONITOR_INTERVAL:-${GPU_MONITOR_INTERVAL:-5}}"
     export GPU_MONITOR_DEVICES="${GPU_MONITOR_DEVICES:-all}"
-    export GPU_MONITOR_LOG_INTERVAL="${GPU_MONITOR_LOG_INTERVAL:-15}"
+    export RESOURCE_MONITOR_LOG_INTERVAL="${RESOURCE_MONITOR_LOG_INTERVAL:-${GPU_MONITOR_LOG_INTERVAL:-15}}"
+    export GPU_MONITOR_LOG_INTERVAL="${RESOURCE_MONITOR_LOG_INTERVAL:-${GPU_MONITOR_LOG_INTERVAL:-15}}"
 
     local REPO_ROOT
-    REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
     local MONITOR_PID="" LOG_REPORTER_PID=""
     local TEST_EXIT_CODE=0
 
@@ -169,19 +275,19 @@ cmd_run() {
         [[ -n "$LOG_REPORTER_PID" ]] && kill -0 "$LOG_REPORTER_PID" 2>/dev/null && kill "$LOG_REPORTER_PID" 2>/dev/null || true
         [[ -n "$MONITOR_PID" ]] && kill -0 "$MONITOR_PID" 2>/dev/null && kill "$MONITOR_PID" 2>/dev/null || true
         if [[ -f "$GPU_MONITOR_DATA_ROOT/current_run_id" ]]; then
-            echo "--- Finalizing: bundling GPU monitor data ---"
+            echo "--- Finalizing: bundling resource (gpu) monitor data ---"
             local TMPF BUNDLE_LINE
             TMPF=$(mktemp)
-            "$SCRIPT_DIR/gpu_monitor.sh" finalize 2>&1 | tee "$TMPF"
+            "$SCRIPT_DIR/resource_monitor.sh" finalize --backend gpu 2>&1 | tee "$TMPF"
             BUNDLE_LINE=$(grep '^GPU_MONITOR_BUNDLE_DIR=' "$TMPF" || true)
             rm -f "$TMPF"
             if [[ -n "$BUNDLE_LINE" ]]; then
                 eval "$BUNDLE_LINE"
                 if [[ -d "${GPU_MONITOR_BUNDLE_DIR:-}" ]]; then
-                    echo "--- GPU monitor bundle dir: $GPU_MONITOR_BUNDLE_DIR ---"
+                    echo "--- Resource monitor bundle dir: $GPU_MONITOR_BUNDLE_DIR ---"
                     echo "--- Line chart: open in browser: $GPU_MONITOR_BUNDLE_DIR/report.html ---"
                     if command -v buildkite-agent &>/dev/null; then
-                        echo "--- Uploading GPU monitor artifacts ---"
+                        echo "--- Uploading resource monitor artifacts ---"
                         for f in "$GPU_MONITOR_BUNDLE_DIR"/*; do
                             [[ -e "$f" ]] && buildkite-agent artifact upload "$f"
                         done
@@ -194,17 +300,17 @@ cmd_run() {
     trap cleanup EXIT
 
     if command -v nvidia-smi &>/dev/null; then
-        "$SCRIPT_DIR/gpu_monitor.sh" start "$GPU_MONITOR_DEVICES" "$GPU_MONITOR_INTERVAL" &
+        "$SCRIPT_DIR/resource_monitor.sh" start --backend gpu "$GPU_MONITOR_DEVICES" "$RESOURCE_MONITOR_INTERVAL" &
         MONITOR_PID=$!
-        echo "[GPU Monitor] Started (PID $MONITOR_PID), interval=${GPU_MONITOR_INTERVAL}s, devices=$GPU_MONITOR_DEVICES; log every ${GPU_MONITOR_LOG_INTERVAL}s."
+        echo "[Resource Monitor (gpu)] Started (PID $MONITOR_PID), interval=${RESOURCE_MONITOR_INTERVAL}s, devices=$GPU_MONITOR_DEVICES; log every ${RESOURCE_MONITOR_LOG_INTERVAL}s."
     else
-        echo "[GPU Monitor] nvidia-smi not found; skipping."
+        echo "[Resource Monitor (gpu)] nvidia-smi not found; skipping."
     fi
 
     (
         sleep 10
         while true; do
-            sleep "$GPU_MONITOR_LOG_INTERVAL"
+            sleep "$RESOURCE_MONITOR_LOG_INTERVAL"
             local RID_FILE RUN_ID CSV LINE
             RID_FILE="$GPU_MONITOR_DATA_ROOT/current_run_id"
             [[ -f "$RID_FILE" ]] || continue
@@ -223,14 +329,15 @@ cmd_run() {
 
 # ---------- dispatch ----------
 case "$SUBCMD" in
-    start)   cmd_start "$2" "$3" ;;
-    finalize) cmd_finalize "$2" ;;
+    start)   cmd_start "${@:2}" ;;
+    finalize) cmd_finalize "${@:2}" ;;
     run)     cmd_run "$@" ;;
     *)
-        echo "Usage: $0 { start [gpu_ids] [interval] | finalize [run_id] | run -- <command> }" >&2
-        echo "  start   - background nvidia-smi loop (CSV only)" >&2
-        echo "  finalize - bundle current run, print GPU_MONITOR_BUNDLE_DIR=" >&2
+        echo "Usage: $0 { start [--backend gpu|cpu|npu] [gpu_ids] [interval] | finalize [--backend gpu|cpu|npu] [run_id] | run [--backend gpu|cpu|npu] -- <command> }" >&2
+        echo "  start   - background monitor (currently only backend=gpu)" >&2
+        echo "  finalize - bundle current run, print GPU_MONITOR_BUNDLE_DIR= / RESOURCE_MONITOR_BUNDLE_DIR=" >&2
         echo "  run     - start + command + finalize (+ CI upload)" >&2
+        echo "  --backend gpu|cpu|npu  (default: gpu; cpu/npu reserved for future use)" >&2
         exit 1
         ;;
 esac
