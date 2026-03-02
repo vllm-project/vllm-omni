@@ -121,7 +121,8 @@ class MammothUTokenizer(PreTrainedTokenizer):
         # use ignore if you are in streaming inference
         self.errors = errors
         self.mergeable_ranks = _load_tiktoken_bpe(vocab_file)
-        vision_tokens = [t.strip() for t in open(special_tokens_file).readlines() if len(t.strip()) > 0]
+        with open(special_tokens_file) as f:
+            vision_tokens = [t.strip() for t in f.readlines() if len(t.strip()) > 0]
         SPECIAL_TOKENS = tuple(
             enumerate(
                 (
