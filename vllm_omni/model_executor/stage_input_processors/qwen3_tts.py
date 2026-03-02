@@ -46,18 +46,18 @@ def talker2code2wav_async_chunk(
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size = int(cfg.get("codec_left_context_frames", 25))
     initial_chunk_size = int(cfg.get("initial_codec_chunk_frames", 0))
-    if chunk_size <= 0 or left_context_size < 0:
+    if chunk_size <= 0 or left_context_size < 0 or initial_chunk_size < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
-            f"codec_left_context_frames={left_context_size}"
+            f"codec_left_context_frames={left_context_size}, "
+            f"initial_codec_chunk_frames={initial_chunk_size}"
         )
-    if initial_chunk_size >= chunk_size:
-        if initial_chunk_size > 0:
-            logger.warning(
-                "initial_codec_chunk_frames=%d >= codec_chunk_frames=%d, clamping to codec_chunk_frames.",
-                initial_chunk_size,
-                chunk_size,
-            )
+    if initial_chunk_size > chunk_size:
+        logger.warning(
+            "initial_codec_chunk_frames=%d > codec_chunk_frames=%d, clamping to codec_chunk_frames.",
+            initial_chunk_size,
+            chunk_size,
+        )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 
@@ -78,6 +78,8 @@ def talker2code2wav_async_chunk(
         # Track frames already delivered using put_req_chunk counter.
         already_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_size
         pending = length - already_sent
+        if pending <= 0:
+            return None
         if pending < initial_chunk_size and not finished:
             return None
         context_length = min(pending, initial_chunk_size)
@@ -86,9 +88,10 @@ def talker2code2wav_async_chunk(
         window_frames = transfer_manager.code_prompt_token_ids[request_id][:length]
     else:
         # Normal phase: standard chunk_size cadence with left_context sliding window.
-        # Offset by warmup coverage so normal starts from where warmup left off.
-        warmup_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_size if initial_chunk_size > 0 else 0
-        adjusted = length - warmup_sent
+        # Offset by warmup coverage (static from config) so normal starts
+        # from where warmup left off.
+        warmup_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size if initial_chunk_size > 0 else 0
+        adjusted = length - warmup_coverage
         chunk_length = adjusted % chunk_size
         if chunk_length != 0 and not finished:
             return None

@@ -101,10 +101,18 @@ _CASES = [
     ((25, 25, 10), (20, 1, False), (10, 20)),
     # Non-divisible: holds at chunk boundary
     ((25, 25, 12), (25, 2, False), None),
-    # Normal phase: offset by warmup coverage (put_req * initial)
+    # Normal phase: offset by warmup coverage (chunk//initial * initial)
     ((25, 25, 10), (45, 2, False), (20, 45)),
+    # Second normal emit (put_req includes normal emissions, offset must stay stable)
+    ((25, 25, 10), (70, 3, False), (25, 50)),
     # initial >= chunk clamps to chunk_size (behaves as normal)
     ((25, 25, 30), (25, 0, False), (0, 25)),
+    # finished=True flushes warmup tail
+    ((25, 25, 10), (5, 0, True), (0, 5)),
+    # finished=True flushes non-divisible warmup residual
+    ((25, 25, 12), (25, 2, True), (24, 25)),
+    # finished=True flushes normal phase tail
+    ((25, 25, 10), (30, 2, True), (20, 30)),
 ]
 
 
