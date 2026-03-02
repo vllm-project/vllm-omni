@@ -44,7 +44,7 @@ from vllm.transformers_utils.config import (
 )
 from vllm.v1.attention.backend import AttentionType
 
-from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
+from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 

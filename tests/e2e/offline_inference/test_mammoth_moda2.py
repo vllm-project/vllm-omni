@@ -82,7 +82,7 @@ class TestConfigParsing:
         """AutoConfig should resolve 'mammothmoda2' model_type."""
         from transformers import AutoConfig
 
-        from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config  # noqa: F401
+        from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config  # noqa: F401
 
         cfg = AutoConfig.for_model(
             model_type="mammothmoda2",
@@ -92,7 +92,7 @@ class TestConfigParsing:
 
     def test_dual_vocab_size_computation(self):
         """With extra_gen_vocab=True: vocab_size == gen_vocab_start_index + gen_vocab_size."""
-        from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Qwen2_5_VLTextConfig
+        from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Qwen2_5_VLTextConfig
 
         tc = Mammothmoda2Qwen2_5_VLTextConfig(
             vocab_size=_BASE_VOCAB_SIZE, extra_gen_vocab=True, gen_vocab_size=_GEN_VOCAB_SIZE
@@ -102,7 +102,7 @@ class TestConfigParsing:
 
     def test_proxy_properties(self):
         """Top-level config should proxy token IDs from llm_config."""
-        from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
+        from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
         cfg = Mammothmoda2Config(
             llm_config={
@@ -118,7 +118,7 @@ class TestConfigParsing:
 
     def test_missing_llm_config_raises(self):
         """Proxy property access with llm_config=None should raise AttributeError."""
-        from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
+        from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
         with pytest.raises(AttributeError, match="llm_config is None"):
             _ = Mammothmoda2Config(llm_config=None).image_token_id

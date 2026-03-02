@@ -11,7 +11,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
-from vllm_omni.model_executor.models.mammoth_moda2.config import Mammothmoda2Config
+from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .mammothmoda2_dit_layer import (
