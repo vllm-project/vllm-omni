@@ -14,12 +14,9 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .mammothmoda2_dit_layer import (
-    FlowMatchEulerDiscreteScheduler,
-    RotaryPosEmbedReal,
-    SimpleQFormerImageRefiner,
-    Transformer2DModel,
-)
+from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
+from .rope_real import RotaryPosEmbedReal
+from .schedulers import FlowMatchEulerDiscreteScheduler
 
 
 class MammothModa2DiTForConditionalGeneration(nn.Module):
