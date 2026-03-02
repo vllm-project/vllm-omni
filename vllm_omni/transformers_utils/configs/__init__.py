@@ -35,3 +35,8 @@ def __getattr__(name: str):
 
 def __dir__():
     return sorted(list(__all__))
+
+
+# Eagerly import all config modules so their AutoConfig.register() side-effects
+# run as soon as `vllm_omni.transformers_utils.configs` is imported.
+from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
