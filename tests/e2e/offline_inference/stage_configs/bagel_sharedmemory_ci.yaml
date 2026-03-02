@@ -4,6 +4,7 @@
 stage_args:
   - stage_id: 0
     stage_type: llm
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
       max_batch_size: 1
@@ -38,6 +39,7 @@ stage_args:
 
   - stage_id: 1
     stage_type: diffusion
+    cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
     runtime:
       devices: "0"
       max_batch_size: 1
