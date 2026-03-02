@@ -1,15 +1,14 @@
 #!/bin/bash
 #
 # L5 GPU memory monitor - single entry script.
-# Subcommands: start | finalize | serve [port] | run -- <command>
+# Subcommands: start | finalize | run -- <command>
 #
 # start   - Background: nvidia-smi loop, write CSV only
 # finalize - Bundle current run (CSV + report.html), print GPU_MONITOR_BUNDLE_DIR=
-# serve   - HTTP server for gpu_dashboard.html + /api/latest (default port 8765)
-# run     - Start monitor (+ optional dashboard), run command, then finalize; in CI upload artifacts
+# run     - Start monitor, run command, then finalize; in CI upload artifacts
 #
 # Env: GPU_MONITOR_DATA_ROOT, GPU_MONITOR_INTERVAL, GPU_MONITOR_DEVICES,
-#      GPU_MONITOR_LOG_INTERVAL, GPU_MONITOR_SERVE_DASHBOARD, SKIP_DEPS_CHECK
+#      GPU_MONITOR_LOG_INTERVAL, SKIP_DEPS_CHECK
 #
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -138,75 +137,6 @@ EOF
     echo "Archive path: $BUNDLE_ABS"
 }
 
-# ---------- subcommand: serve (was serve_dashboard.sh) ----------
-cmd_serve() {
-    local PORT="${1:-8765}"
-
-    if ! command -v python3 &>/dev/null; then
-        echo "Error: python3 not found; cannot start dashboard server."
-        exit 1
-    fi
-
-    cd "$SCRIPT_DIR"
-    echo "========================================"
-    echo "GPU monitor dashboard"
-    echo "Data dir: $DATA_ROOT"
-    echo "Open in browser: http://127.0.0.1:$PORT/gpu_dashboard.html"
-    echo "========================================"
-    exec python3 - "$PORT" "$DATA_ROOT" "$SCRIPT_DIR" << 'PY'
-import http.server
-import os
-import sys
-
-PORT = int(sys.argv[1])
-DATA_ROOT = sys.argv[2]
-SCRIPT_DIR = sys.argv[3]
-
-def get_latest_path():
-    rid_file = os.path.join(DATA_ROOT, "current_run_id")
-    if not os.path.isfile(rid_file):
-        return None
-    with open(rid_file, "r") as f:
-        run_id = f.read().strip()
-    path = os.path.join(DATA_ROOT, run_id, "latest.json")
-    return path if os.path.isfile(path) else None
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=SCRIPT_DIR, **kwargs)
-
-    def do_GET(self):
-        if self.path == "/api/latest" or self.path == "/api/latest.json":
-            path = get_latest_path()
-            if not path:
-                self.send_response(404)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"error":"no current run or latest.json"}')
-                return
-            try:
-                with open(path, "rb") as f:
-                    data = f.read()
-            except Exception:
-                self.send_response(500)
-                self.end_headers()
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        return super().do_GET()
-
-    def log_message(self, format, *args):
-        pass
-
-with http.server.HTTPServer(("", PORT), Handler) as httpd:
-    httpd.serve_forever()
-PY
-}
-
 # ---------- subcommand: run (was run_with_gpu_monitor.sh) ----------
 cmd_run() {
     shift
@@ -232,13 +162,11 @@ cmd_run() {
 
     local REPO_ROOT
     REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-    local MONITOR_PID="" DASHBOARD_PID="" LOG_REPORTER_PID=""
-    local DASHBOARD_PORT="${GPU_MONITOR_DASHBOARD_PORT:-8765}"
+    local MONITOR_PID="" LOG_REPORTER_PID=""
     local TEST_EXIT_CODE=0
 
     cleanup() {
         [[ -n "$LOG_REPORTER_PID" ]] && kill -0 "$LOG_REPORTER_PID" 2>/dev/null && kill "$LOG_REPORTER_PID" 2>/dev/null || true
-        [[ -n "$DASHBOARD_PID" ]] && kill -0 "$DASHBOARD_PID" 2>/dev/null && kill "$DASHBOARD_PID" 2>/dev/null || true
         [[ -n "$MONITOR_PID" ]] && kill -0 "$MONITOR_PID" 2>/dev/null && kill "$MONITOR_PID" 2>/dev/null || true
         if [[ -f "$GPU_MONITOR_DATA_ROOT/current_run_id" ]]; then
             echo "--- Finalizing: bundling GPU monitor data ---"
@@ -269,12 +197,6 @@ cmd_run() {
         "$SCRIPT_DIR/gpu_monitor.sh" start "$GPU_MONITOR_DEVICES" "$GPU_MONITOR_INTERVAL" &
         MONITOR_PID=$!
         echo "[GPU Monitor] Started (PID $MONITOR_PID), interval=${GPU_MONITOR_INTERVAL}s, devices=$GPU_MONITOR_DEVICES; log every ${GPU_MONITOR_LOG_INTERVAL}s."
-        if [[ -n "${GPU_MONITOR_SERVE_DASHBOARD:-}" ]] && command -v python3 &>/dev/null; then
-            sleep 2
-            "$SCRIPT_DIR/gpu_monitor.sh" serve "$DASHBOARD_PORT" &
-            DASHBOARD_PID=$!
-            echo "[GPU Monitor] Dashboard (PID $DASHBOARD_PID). Open: http://127.0.0.1:$DASHBOARD_PORT/gpu_dashboard.html"
-        fi
     else
         echo "[GPU Monitor] nvidia-smi not found; skipping."
     fi
@@ -303,14 +225,12 @@ cmd_run() {
 case "$SUBCMD" in
     start)   cmd_start "$2" "$3" ;;
     finalize) cmd_finalize "$2" ;;
-    serve)   cmd_serve "${2:-8765}" ;;
     run)     cmd_run "$@" ;;
     *)
-        echo "Usage: $0 { start [gpu_ids] [interval] | finalize [run_id] | serve [port] | run -- <command> }" >&2
+        echo "Usage: $0 { start [gpu_ids] [interval] | finalize [run_id] | run -- <command> }" >&2
         echo "  start   - background nvidia-smi loop (CSV only)" >&2
         echo "  finalize - bundle current run, print GPU_MONITOR_BUNDLE_DIR=" >&2
-        echo "  serve   - HTTP server for dashboard (default port 8765)" >&2
-        echo "  run     - start + [optional dashboard] + command + finalize (+ CI upload)" >&2
+        echo "  run     - start + command + finalize (+ CI upload)" >&2
         exit 1
         ;;
 esac
