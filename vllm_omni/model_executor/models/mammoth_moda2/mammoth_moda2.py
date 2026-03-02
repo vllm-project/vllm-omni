@@ -126,13 +126,15 @@ def moe_forward(
     else:
         raise ValueError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
 
-    # mask: [num_tokens] or [B, L] -> flatten to [total_tokens]
-    flat_mask = gen_token_mask.reshape(-1)  # type: ignore[union-attr]
-    if flat_mask.numel() != total_tokens:
+    # Validate before reshape to catch shape mismatches where numel() would
+    # coincidentally match after flattening dimensions of different sizes.
+    if gen_token_mask.numel() != total_tokens:  # type: ignore[union-attr]
         raise ValueError(
             "gen_token_mask shape mismatch: "
             f"mask={tuple(gen_token_mask.shape)}, hidden_states={tuple(hidden_states.shape)}"
         )
+    # mask: [num_tokens] or [B, L] -> flatten to [total_tokens]
+    flat_mask = gen_token_mask.reshape(-1)  # type: ignore[union-attr]
     gen_pos = torch.where(flat_mask)[0]
     und_pos = torch.where(~flat_mask)[0]
     permute_order = torch.cat([gen_pos, und_pos], dim=0)
