@@ -102,7 +102,7 @@ class DiffusionModelRunner:
 
         # Load model within forward context
         load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
+        model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 
         with get_memory_context():
