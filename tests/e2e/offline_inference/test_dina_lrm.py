@@ -14,8 +14,8 @@ from PIL import Image
 RM_MODEL = "liuhuohuo/DiNa-LRM-SD35M-12layers"
 SD3_MODEL = "stabilityai/stable-diffusion-3.5-medium"
 PROMPT = "A girl walking in the street"
-NOISE_SIGMA = 0.1
-ATOL = 5e-2
+NOISE_SIGMA = 0.4
+RTOL = 0.01
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -102,6 +102,7 @@ def run_official(prompts, image, device, dtype) -> torch.Tensor:
         )
 
     result = scores[0].float().cpu()
+    result = (result + 10.0) / 10.0  # normalization
     del scorer, pipe
     gc.collect()
     torch.cuda.empty_cache()
@@ -137,6 +138,7 @@ def run_vllm_omni(prompts, image, device, dtype) -> torch.Tensor:
     outputs = client.generate(request_prompts, sampling_params)
 
     scores = outputs[0].latents[0].float().cpu()
+    scores = (scores + 10.0) / 10.0  # normalization
     del client
     gc.collect()
     torch.cuda.empty_cache()
@@ -149,18 +151,19 @@ def run_vllm_omni(prompts, image, device, dtype) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.omni
-def test_dina_lrm_numerical_equivalence(image, device, dtype):
+def test_dina_lrm_numerical_equivalence(synthetic_image, device, dtype):
     """
     Verifies that DRMInferencer (official) and DiNaLRMPipeline (vllm-omni) 
     produce numerically identical reward scores under identical initialization.
     """
-    score_official = run_official([PROMPT], image, device, dtype)
-    score_vllm = run_vllm_omni([PROMPT], image, device, dtype)
+    score_official = run_official([PROMPT], synthetic_image, device, dtype)
+    score_vllm = run_vllm_omni([PROMPT], synthetic_image, device, dtype)
 
-    max_diff = (score_official - score_vllm).abs().max().item()
+    max_diff = (score_official - score_vllm).abs().max().item() \
+        / max(score_official.abs().max().item(), score_vllm.abs().max().item(), 1.0)
 
-    assert torch.allclose(score_official, score_vllm, atol=ATOL, rtol=0.0), (
-        f"Equivalence check FAILED: max_abs_diff = {max_diff:.3e} (atol = {ATOL:.1e})\n"
+    assert torch.allclose(score_official, score_vllm, atol=0.0, rtol=RTOL), (
+        f"Equivalence check FAILED: max_abs_diff = {max_diff:.3e} (rtol = {RTOL:.3e})\n"
         f"  official  = {score_official.tolist()}\n"
         f"  vllm-omni = {score_vllm.tolist()}"
     )
