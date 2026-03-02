@@ -54,12 +54,12 @@ _OMNI_MODELS = {
     ),
     "MammothModa2Qwen2ForCausalLM": (
         "mammoth_moda2",
-        "mammoth_moda2_ar",
+        "mammoth_moda2",
         "MammothModa2Qwen2ForCausalLM",
     ),
     "MammothModa2ARForConditionalGeneration": (
         "mammoth_moda2",
-        "mammoth_moda2_ar",
+        "mammoth_moda2",
         "MammothModa2ARForConditionalGeneration",
     ),
     "MammothModa2DiTForConditionalGeneration": (

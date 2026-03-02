@@ -5,7 +5,7 @@ from vllm_omni.transformers_utils.configs.mammoth_moda2 import (  # noqa: F401 r
     Mammothmoda2Qwen2_5_VLConfig,
 )
 
-from .mammoth_moda2_ar import MammothModa2ARForConditionalGeneration
+from .mammoth_moda2 import MammothModa2ARForConditionalGeneration
 from .tokenizer import MammothUTokenizer
 
 # AutoConfig.register is done inside transformers_utils/configs/mammoth_moda2.py
