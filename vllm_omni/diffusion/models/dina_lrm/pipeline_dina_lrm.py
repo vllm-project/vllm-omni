@@ -325,8 +325,8 @@ class DiNaLRMPipeline(nn.Module):
         """
         if len(req.prompts) > 1:
             logger.warning(
-                """This model only supports a single prompt, not a batched request.""",
-                """Taking only the first image for now.""",
+                "This model only supports a single prompt, not a batched request."
+                "Taking only the first image for now."
             )
         # ── text prompts ──────────────────────────────────────────────────────
         first_prompt = req.prompts[0]

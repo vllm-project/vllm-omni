@@ -556,9 +556,7 @@ class SD3RewardModel(nn.Module):
             token_dim=backbone_dim,
             n_visual_heads=len(config_model.visual_head_idx),
             n_text_heads=len(config_model.text_head_idx),
-            patch_size=pipeline.transformer.config.patch_size,
             t_embed_dim=backbone_dim,
-            use_t_embed=config_model.use_t_embed,
             **config_model.reward_head,
         )
         self.reward_head.to(device, dtype=dtype)
