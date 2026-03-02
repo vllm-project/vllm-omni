@@ -416,6 +416,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if grammar_output is not None:
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
 
+        # Correct padding values of prompt_token_ids to match the logits vocabulary size
+        if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
+            smd = self.input_batch.sampling_metadata
+            if smd.prompt_token_ids is not None:
+                logits_vocab = logits.shape[-1]
+                if self.input_batch.vocab_size > logits_vocab:
+                    smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
+
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
