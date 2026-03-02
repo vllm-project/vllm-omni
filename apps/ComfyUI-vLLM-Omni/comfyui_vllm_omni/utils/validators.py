@@ -1,5 +1,6 @@
 from .logger import get_logger
 from .models import lookup_model_spec
+from .types import AutoregressionSamplingParams, DiffusionSamplingParams
 
 logger = get_logger(__name__)
 
@@ -31,24 +32,20 @@ def validate_model_and_sampling_params_types(
             )
         # Check that each stage's type match
         for i, sp in enumerate(sampling_param_list):
-            if "type" not in sp:
-                raise RuntimeError("Internal error: unknown sampling parameter type")
-            if sp["type"] != stages[i]:
+            if not _check_sampling_param_matches_stage(sp, stages[i]):
                 raise ValueError(
-                    f"Sampling parameter type ({sp['type']}) does not match "
+                    f"Sampling parameter type ({sp.__class__.__name__}) does not match "
                     f"stage type ({stages[i]}) at index {i} for model {model_name}."
                 )
     elif isinstance(sampling_param_list, dict):
-        if "type" not in sampling_param_list:
-            raise RuntimeError("Internal error: unknown sampling parameter type")
         # Check that the provided single sampling param matches all stages
-        elif any(stage != sampling_param_list["type"] for stage in stages):
-            raise ValueError(
-                f"When passing a single sampling parameter node, all stages of the model must match "
-                f"the provided sampling parameter's type. "
-                f"However, the stages of model {model_name} are: {stages}. "
-                f"The provided sampling parameter is {sampling_param_list['type']}"
-            )
+        for i, stage in enumerate(stages):
+            if not _check_sampling_param_matches_stage(sampling_param_list, stage):
+                raise ValueError(
+                    f"Provided single sampling parameter type ({sampling_param_list.__class__.__name__}) must match "
+                    f"the types of all stages of the model. "
+                    f"However, stage {i} of model {model_name} is of type {stage}."
+                )
 
 
 def add_sampling_parameters_to_stage(
@@ -82,3 +79,11 @@ def add_sampling_parameters_to_stage(
                 sampling_param_list[i].update(params_to_add)
 
     return sampling_param_list
+
+
+def _check_sampling_param_matches_stage(sampling_param: dict, stage_type: str) -> bool:
+    if stage_type == "autoregression":
+        return isinstance(sampling_param, AutoregressionSamplingParams)
+    if stage_type == "diffusion":
+        return isinstance(sampling_param, DiffusionSamplingParams)
+    raise RuntimeError(f"Internal error: unknown stage type {stage_type}.")

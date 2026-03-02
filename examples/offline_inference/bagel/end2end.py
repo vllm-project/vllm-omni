@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
     parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
     parser.add_argument(
-        "--negative-prompt", type=str, default=None, help="Negative prompt (not yet supported, reserved for future)"
+        "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
     )
 
     args = parser.parse_args()
@@ -162,6 +162,8 @@ def main():
                 # text2img
                 final_prompt_text = f"<|im_start|>{p}<|im_end|>"
                 prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
+                if args.negative_prompt is not None:
+                    prompt_dict["negative_prompt"] = args.negative_prompt
                 formatted_prompts.append(prompt_dict)
 
         params_list = omni.default_sampling_params_list
@@ -170,10 +172,13 @@ def main():
             if len(params_list) > 1:
                 diffusion_params = params_list[1]
                 diffusion_params.num_inference_steps = args.steps  # type: ignore
-                diffusion_params.extra_args = {  # type: ignore
+                extra = {
                     "cfg_text_scale": args.cfg_text_scale,
                     "cfg_img_scale": args.cfg_img_scale,
                 }
+                if args.negative_prompt is not None:
+                    extra["negative_prompt"] = args.negative_prompt
+                diffusion_params.extra_args = extra  # type: ignore
 
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

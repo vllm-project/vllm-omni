@@ -12,6 +12,8 @@ import torch
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -130,10 +132,18 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8"],
-        help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs). "
-        "Default: None (no quantization, uses BF16).",
+        choices=["fp8", "gguf"],
+        help=(
+            "Quantization method for the transformer. "
+            "Options: 'fp8' (FP8 W8A8), 'gguf' (GGUF quantized weights). "
+            "Default: None (no quantization, uses BF16)."
+        ),
+    )
+    parser.add_argument(
+        "--gguf-model",
+        type=str,
+        default=None,
+        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -159,6 +169,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default=None,
+        help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for LoRA weights (default: 1.0).",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -241,11 +263,24 @@ def main():
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
+    # Prepare LoRA kwargs for Omni initialization
+    lora_args: dict[str, Any] = {}
+    if args.lora_path:
+        lora_args["lora_path"] = args.lora_path
+        print(f"Using LoRA from: {args.lora_path}")
+
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization and ignored_layers:
+    if args.quantization == "gguf":
+        if not args.gguf_model:
+            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+        quant_kwargs["quantization_config"] = {
+            "method": "gguf",
+            "gguf_model": args.gguf_model,
+        }
+    elif args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -253,18 +288,18 @@ def main():
     elif args.quantization:
         quant_kwargs["quantization"] = args.quantization
 
-    # Initialize Omni with model-specific settings
     omni_kwargs = {
         "model": args.model,
         "enable_layerwise_offload": args.enable_layerwise_offload,
         "vae_use_slicing": args.vae_use_slicing,
         "vae_use_tiling": args.vae_use_tiling,
-        "cache_backend": cache_backend,
+        "cache_backend": args.cache_backend,
         "cache_config": cache_config,
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        **lora_args,
         **quant_kwargs,
     }
     if use_nextstep:
@@ -292,7 +327,19 @@ def main():
     )
     print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")
+    if args.lora_path:
+        print(f"  LoRA: scale={args.lora_scale}")
     print(f"{'=' * 60}\n")
+
+    # Build LoRA request when --lora-path is set
+    lora_request = None
+    if args.lora_path:
+        lora_request_id = stable_lora_int_id(args.lora_path)
+        lora_request = LoRARequest(
+            lora_name=Path(args.lora_path).stem,
+            lora_int_id=lora_request_id,
+            lora_path=args.lora_path,
+        )
 
     generation_start = time.perf_counter()
 
@@ -301,6 +348,10 @@ def main():
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
     }
+
+    if lora_request:
+        extra_args["lora_request"] = lora_request
+        extra_args["lora_scale"] = args.lora_scale
 
     outputs = omni.generate(
         {

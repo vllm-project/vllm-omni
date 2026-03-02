@@ -98,6 +98,10 @@ class OmniPlatform(Platform):
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         raise NotImplementedError
 
+    @classmethod
+    def supports_cpu_offload(cls) -> bool:
+        return True
+
 
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
