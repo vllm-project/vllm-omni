@@ -95,13 +95,14 @@ _CASES = [
     # Normal path (initial=0): emit at chunk_size boundaries
     ((25, 25, 0), (24, 0, False), None),
     ((25, 25, 0), (25, 0, False), (0, 25)),
-    # Warmup: first emit, hold, second emit, non-divisible boundary
+    # Warmup: hold, first emit, second emit
     ((25, 25, 10), (9, 0, False), None),
     ((25, 25, 10), (10, 0, False), (0, 10)),
     ((25, 25, 10), (20, 1, False), (10, 20)),
-    ((25, 25, 10), (25, 2, False), (20, 25)),
-    # Normal phase after warmup
-    ((25, 25, 10), (50, 3, False), (25, 50)),
+    # Non-divisible: holds at chunk boundary
+    ((25, 25, 12), (25, 2, False), None),
+    # Normal phase: offset by warmup coverage (put_req * initial)
+    ((25, 25, 10), (45, 2, False), (20, 45)),
     # initial >= chunk clamps to chunk_size (behaves as normal)
     ((25, 25, 30), (25, 0, False), (0, 25)),
 ]
