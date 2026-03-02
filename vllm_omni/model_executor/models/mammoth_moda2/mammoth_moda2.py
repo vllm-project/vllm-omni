@@ -408,7 +408,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
     @property
-    def model(self) -> "MammothModa2Qwen2ForCausalLM":
+    def model(self) -> MammothModa2Qwen2ForCausalLM:
         return self
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:

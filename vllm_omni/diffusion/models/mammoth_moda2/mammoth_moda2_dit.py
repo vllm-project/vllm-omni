@@ -11,8 +11,8 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
-from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
 from .rope_real import RotaryPosEmbedReal
@@ -93,9 +93,12 @@ class MammothModa2DiTForConditionalGeneration(nn.Module):
         )
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
-        num_reqs = 1  # TODO: support num_reqs > 1
         if num_reqs <= 0:
             raise ValueError(f"num_reqs must be positive, got {num_reqs}")
+        if num_reqs > 1:
+            raise NotImplementedError(
+                f"get_dummy_runtime_additional_information does not support num_reqs > 1, got {num_reqs}"
+            )
         text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
         image_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
         negative_prompt_embeds = torch.zeros((0, self._llm_hidden_size), dtype=torch.float32)
