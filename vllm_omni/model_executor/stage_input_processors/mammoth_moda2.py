@@ -12,7 +12,7 @@ def ar2dit(
     stage_list: list[Any],
     engine_input_source: list[int],
     prompts: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
+    requires_multimodal_data: bool = False,  # noqa: ARG001 — interface param, unused for ar2dit
 ) -> list[OmniTokensPrompt]:
     """Convert AR stage outputs to DiT stage inputs."""
 
