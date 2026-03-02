@@ -11,11 +11,23 @@ from typing import (
 AudioFormat: TypeAlias = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
 
 
+class AutoregressionSamplingParams(dict):
+    pass
+
+
+class DiffusionSamplingParams(dict):
+    pass
+
+
+class QwenTTSModelSpecificParams(dict):
+    pass
+
+
 class ModelMode(Enum):
     IMAGE_GENERATION = auto()
     VIDEO_GENERATION = auto()
     AUDIO_GENERATION = auto()
-    COMPREHENSION = auto()
+    UNDERSTANDING = auto()
 
 
 class Modality(Enum):

@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import cast
 
 import torch
+from huggingface_hub import hf_hub_download
 from torch import nn
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
+    download_gguf,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -26,6 +28,8 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.registry import initialize_model
 
 logger = init_logger(__name__)
@@ -193,12 +197,35 @@ class DiffusersPipelineLoader:
         self,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        sources = cast(
-            Iterable[DiffusersPipelineLoader.ComponentSource],
-            getattr(model, "weights_sources", ()),
-        )
+        sources = self._get_weight_sources(model)
         for source in sources:
             yield from self._get_weights_iterator(source)
+
+    def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
+        return tuple(
+            cast(
+                Iterable[DiffusersPipelineLoader.ComponentSource],
+                getattr(model, "weights_sources", ()),
+            )
+        )
+
+    def _get_expected_parameter_names(self, model: nn.Module) -> set[str]:
+        """Return parameter names that should be covered by strict load checks."""
+        all_parameter_names = {name for name, _ in model.named_parameters()}
+        sources = self._get_weight_sources(model)
+
+        # Keep strict behavior if no source metadata exists.
+        if not sources:
+            return all_parameter_names
+
+        # Empty prefix means "root" source, i.e. entire model should be covered.
+        if any(source.prefix == "" for source in sources):
+            return all_parameter_names
+
+        source_prefixes = tuple(source.prefix for source in sources if source.prefix)
+        if not source_prefixes:
+            return all_parameter_names
+        return {name for name in all_parameter_names if name.startswith(source_prefixes)}
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -219,15 +246,23 @@ class DiffusersPipelineLoader:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
-            with target_device:
-                if load_format == "default":
-                    model = initialize_model(od_config)
-                elif load_format == "custom_pipeline":
-                    model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-                    model = model_cls(od_config=od_config)
-            logger.debug("Loading weights on %s ...", load_device)
-            # Quantization does not happen in `load_weights` but after it
-            self.load_weights(model)
+            if od_config.parallel_config.use_hsdp:
+                model = self._load_model_with_hsdp(
+                    od_config, load_format=load_format, custom_pipeline_name=custom_pipeline_name
+                )
+            else:
+                with target_device:
+                    if load_format == "default":
+                        model = initialize_model(od_config)
+                    elif load_format == "custom_pipeline":
+                        model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                        model = model_cls(od_config=od_config)
+                logger.debug("Loading weights on %s ...", load_device)
+                if self._is_gguf_quantization(od_config):
+                    self._load_weights_with_gguf(model, od_config)
+                else:
+                    # Quantization does not happen in `load_weights` but after it
+                    self.load_weights(model)
 
             # Process weights after loading for quantization (e.g., FP8 online quantization)
             # This is needed for vLLM's quantization methods that need to transform weights
@@ -259,7 +294,7 @@ class DiffusersPipelineLoader:
                     module.to(module_device)
 
     def load_weights(self, model: nn.Module) -> None:
-        weights_to_load = {name for name, _ in model.named_parameters()}
+        weights_to_load = self._get_expected_parameter_names(model)
         loaded_weights = model.load_weights(self.get_all_weights(model))
 
         self.counter_after_loading_weights = time.perf_counter()
@@ -272,9 +307,173 @@ class DiffusersPipelineLoader:
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
-            _ = weights_to_load - loaded_weights
-        #     if weights_not_loaded:
-        #         raise ValueError(
-        #             "Following weights were not initialized from "
-        #             f"checkpoint: {weights_not_loaded}"
-        #         )
+            weights_not_loaded = weights_to_load - loaded_weights
+            if weights_not_loaded:
+                raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+
+    def _is_gguf_quantization(self, od_config: OmniDiffusionConfig) -> bool:
+        quant_config = od_config.quantization_config
+        if quant_config is None:
+            return False
+        # Fast path: mapping-style config (e.g., DictConfig)
+        if isinstance(quant_config, dict):
+            method = str(quant_config.get("method", "")).lower()
+            if method != "gguf":
+                return False
+            gguf_model = quant_config.get("gguf_model")
+            if not gguf_model:
+                raise ValueError("GGUF quantization requires quantization_config.gguf_model")
+            return True
+
+        # Normal path: DiffusionQuantizationConfig
+        if not hasattr(quant_config, "get_name"):
+            # Fallback: if it carries gguf_model, treat as GGUF
+            gguf_model = getattr(quant_config, "gguf_model", None)
+            return bool(gguf_model)
+        is_gguf = quant_config.get_name() == "gguf"
+        if not is_gguf:
+            return False
+        gguf_model = getattr(quant_config, "gguf_model", None)
+        if gguf_model is None:
+            raise ValueError("GGUF quantization requires quantization_config.gguf_model")
+        return True
+
+    def _is_transformer_source(self, source: "ComponentSource") -> bool:
+        if source.subfolder == "transformer":
+            return True
+        return source.prefix.startswith("transformer.")
+
+    def _get_model_loadable_names(self, model: nn.Module) -> set[str]:
+        # Avoid model.state_dict() here because GGUF uses UninitializedParameter
+        # which raises during detach(). Collect names directly.
+        names = {name for name, _ in model.named_parameters()}
+        names.update(name for name, _ in model.named_buffers())
+        return names
+
+    def _resolve_gguf_model_path(self, gguf_model: str, revision: str | None) -> str:
+        if os.path.isfile(gguf_model):
+            return gguf_model
+        # repo_id/filename.gguf
+        if "/" in gguf_model and gguf_model.endswith(".gguf"):
+            repo_id, filename = gguf_model.rsplit("/", 1)
+            return hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+                cache_dir=self.load_config.download_dir,
+            )
+        # repo_id:quant_type
+        if "/" in gguf_model and ":" in gguf_model:
+            repo_id, quant_type = gguf_model.rsplit(":", 1)
+            return download_gguf(
+                repo_id,
+                quant_type,
+                cache_dir=self.load_config.download_dir,
+                revision=revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
+        raise ValueError(
+            f"Unrecognized GGUF reference: {gguf_model!r} (expected local file, "
+            "<repo_id>/<filename>.gguf, or <repo_id>:<quant_type>)"
+        )
+
+    def _get_gguf_weights_iterator(
+        self,
+        source: "ComponentSource",
+        model: nn.Module,
+        od_config: OmniDiffusionConfig,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        quant_config = od_config.quantization_config
+        gguf_model = getattr(quant_config, "gguf_model", None)
+        if gguf_model is None:
+            raise ValueError("GGUF quantization requires quantization_config.gguf_model")
+        gguf_file = self._resolve_gguf_model_path(gguf_model, od_config.revision)
+        adapter = get_gguf_adapter(gguf_file, model, source, od_config)
+        weights_iter = adapter.weights_iterator()
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iter)
+
+    def _load_weights_with_gguf(self, model: nn.Module, od_config: OmniDiffusionConfig) -> set[str]:
+        sources = self._get_weight_sources(model)
+        loaded: set[str] = set()
+        loadable_names: set[str] | None = None
+
+        for source in sources:
+            if self._is_transformer_source(source):
+                loaded |= model.load_weights(self._get_gguf_weights_iterator(source, model, od_config))
+
+                # GGUF checkpoints can be transformer-only or partially quantized.
+                # Only fall back to HF if this source still has missing loadable weights.
+                loadable_names = loadable_names or self._get_model_loadable_names(model)
+                has_missing_for_source = any(
+                    name.startswith(source.prefix) and name not in loaded for name in loadable_names
+                )
+                if not has_missing_for_source:
+                    continue
+
+                hf_iter = self._get_weights_iterator(source)
+                hf_iter = (
+                    (name, tensor) for (name, tensor) in hf_iter if name in loadable_names and name not in loaded
+                )
+                loaded |= model.load_weights(hf_iter)
+            else:
+                loaded |= model.load_weights(self._get_weights_iterator(source))
+
+        weights_to_load = self._get_expected_parameter_names(model)
+        weights_not_loaded = weights_to_load - loaded
+        if weights_not_loaded:
+            raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+        return loaded
+
+    def _load_model_with_hsdp(
+        self,
+        od_config: OmniDiffusionConfig,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> nn.Module:
+        """Load model with HSDP sharding for inference.
+
+        The pipeline contains multiple components (text_encoder, VAE, transformer).
+        Only the transformer is sharded with HSDP. Other components are loaded normally.
+
+        Approach: Load weights first using model's load_weights (handles QKV fusion etc.),
+        then apply HSDP sharding to redistribute weights across GPUs.
+        """
+        from vllm_omni.diffusion.distributed.hsdp import apply_hsdp_to_model
+
+        parallel_config = od_config.parallel_config
+        hsdp_config = HSDPInferenceConfig(
+            enabled=True,
+            hsdp_replicate_size=parallel_config.hsdp_replicate_size,
+            hsdp_shard_size=parallel_config.hsdp_shard_size,
+            param_dtype=od_config.dtype,
+        )
+
+        # Initialize model WITHOUT device context (weights start on CPU).
+        # Unlike the non-HSDP path which uses `with target_device:` to create weights
+        # directly on GPU, HSDP needs weights on CPU first so they can be redistributed
+        # across GPUs by apply_hsdp_to_model. The model's load_weights handles weight
+        # mapping (QKV fusion, etc.).
+        if load_format == "default":
+            model = initialize_model(od_config)
+        elif load_format == "custom_pipeline":
+            model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+            model = model_cls(od_config=od_config)
+        self.load_weights(model)
+
+        # Collect all transformers to shard (some models have transformer_2 for MoE)
+        transformers_to_shard = []
+        transformer = getattr(model, "transformer", None)
+        if transformer is None:
+            raise ValueError("Model has no transformer attribute for HSDP")
+        transformers_to_shard.append(("transformer", transformer))
+
+        # Check for transformer_2 (MoE two-stage models like Wan2.2-I2V)
+        transformer_2 = getattr(model, "transformer_2", None)
+        if transformer_2 is not None:
+            transformers_to_shard.append(("transformer_2", transformer_2))
+
+        # Apply HSDP sharding to all transformers
+        for name, trans in transformers_to_shard:
+            logger.debug("Applying HSDP to %s", name)
+            apply_hsdp_to_model(trans, hsdp_config)
+        return model

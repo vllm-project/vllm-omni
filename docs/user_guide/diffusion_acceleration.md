@@ -30,6 +30,8 @@ vLLM-Omni also supports parallelism methods for diffusion models, including:
 
 5. [VAE Patch Parallelism](diffusion/parallelism_acceleration.md#vae-patch-parallelism) - shards VAE decode/encode spatially across ranks to reduce VAE peak memory (and can speed up VAE decode).
 
+6. [HSDP](diffusion/parallelism_acceleration.md#hsdp) - Hybrid Sharded Data Parallel shards model weights across GPUs to reduce per-GPU memory usage, enabling inference of large models on limited GPU memory.
+
 ## Quick Comparison
 
 ### Cache Methods
@@ -69,9 +71,9 @@ The following table shows which models are currently supported by each accelerat
 
 ### VideoGen
 
-| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel |
-|-------|------------------|:--------:|:---------:|:----------:|:--------------:|:----------------:|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Model | Model Identifier | TeaCache | Cache-DiT | Ulysses-SP | Ring-Attention | CFG-Parallel | HSDP |
+|-------|------------------|:--------:|:---------:|:----------:|:--------------:|:------------:|:----:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Quantization
 
@@ -265,6 +267,30 @@ outputs = omni.generate(
 )
 ```
 
+### Using HSDP
+
+HSDP (Hybrid Sharded Data Parallel) shards model weights across GPUs to reduce per-GPU memory usage. This enables inference of large models (e.g., Wan2.2 14B) on GPUs with limited memory.
+
+```python
+from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    parallel_config=DiffusionParallelConfig(
+        use_hsdp=True,
+        hsdp_replicate_size=1,  # Number of replica groups
+        hsdp_shard_size=8,      # Number of GPUs to shard across (or -1 for auto)
+    ),
+)
+
+outputs = omni.generate(
+    "A cat playing piano",
+    OmniDiffusionSamplingParams(num_inference_steps=50),
+)
+```
+
 ### Using CFG-Parallel
 
 Run image-to-image:
@@ -319,3 +345,4 @@ For detailed information on each acceleration method:
 - **[Sequence Parallelism](diffusion/parallelism_acceleration.md#sequence-parallelism)** - Guidance on how to set sequence parallelism with configuration.
 - **[CFG-Parallel](diffusion/parallelism_acceleration.md#cfg-parallel)** - Guidance on how to set CFG-Parallel to run positive/negative branches across ranks.
 - **[VAE Patch Parallelism](diffusion/parallelism_acceleration.md#vae-patch-parallelism)** - Guidance on how to reduce VAE memory via patch/tile parallelism.
+- **[HSDP](diffusion/parallelism_acceleration.md#hsdp)** - Hybrid Sharded Data Parallel for memory-efficient inference of large models.

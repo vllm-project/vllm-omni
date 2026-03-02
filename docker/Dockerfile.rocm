@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.15.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.16.0
 FROM ${BASE_IMAGE} AS base
 
 # Declare a variable to know if we want to use the nightly build or the stable build.
@@ -9,7 +9,7 @@ FROM ${BASE_IMAGE} AS base
 # 2. Whenever vLLM upstream has released a stable version,
 #    we should swap over to use stable release ASAP.
 #    We should avoid relying on custom commits.
-ARG USE_NIGHTLY_BUILD=1
+ARG USE_NIGHTLY_BUILD=0
 ARG VLLM_VERSION_OR_COMMIT_HASH=2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
@@ -19,7 +19,7 @@ WORKDIR ${COMMON_WORKDIR}
 
 # Step 1: Setup - Install system dependencies
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
+    apt-get install -y ffmpeg git sox libsox-fmt-all jq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

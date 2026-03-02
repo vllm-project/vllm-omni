@@ -302,3 +302,41 @@ def _to_dict(x: Any) -> dict[str, Any]:
             return dict(x)
         except Exception:
             return {}
+
+
+def _resolve_model_tokenizer_paths(
+    model: str,
+    engine_args: dict,
+) -> str:
+    """Resolve model and tokenizer paths for non-standard directory structures.
+
+    Some models (e.g., GLM-Image) have tokenizer in root and model in subdirectory.
+    This function handles model_subdir and tokenizer_subdir engine_args.
+
+    Args:
+        model: Base model path
+        engine_args: Engine arguments (modified in-place to remove subdir args
+            and set tokenizer if needed)
+
+    Returns:
+        Resolved model path (may be subdirectory of original)
+    """
+    import os
+
+    model_subdir = engine_args.pop("model_subdir", None)
+    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
+    base_model_path = model
+
+    if model_subdir:
+        model = os.path.join(model, model_subdir)
+        logger.info(f"Using model subdirectory: {model}")
+
+    if tokenizer_subdir is not None:
+        tokenizer_path = os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
+        engine_args["tokenizer"] = tokenizer_path
+        logger.info(f"Using tokenizer from: {tokenizer_path}")
+    elif model_subdir and "tokenizer" not in engine_args:
+        engine_args["tokenizer"] = base_model_path
+        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+
+    return model

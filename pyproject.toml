@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-omni"
-version = "0.14.0"
+dynamic = ["version", "dependencies"]
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -17,7 +17,6 @@ authors = [
     {name = "vLLM-Omni Team"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
-dynamic = ["dependencies"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -41,6 +40,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
     "openai-whisper>=20250625",
@@ -48,7 +48,8 @@ dev = [
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=0.6.0",
     "opencv-python>=4.12.0.88",
-    "mooncake-transfer-engine==0.3.8.post1"
+    "mooncake-transfer-engine==0.3.8.post1",
+    "av" # for ComfyUI tests
 ]
 
 docs = [
@@ -83,7 +84,11 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
+"vllm_omni" = ["_version.py", "py.typed"]
 "vllm_omni.model_executor.stage_configs" = ["*.yaml"]
+
+[tool.setuptools_scm]
+# no extra settings needed, presence enables setuptools-scm
 
 [tool.ruff]
 line-length = 120

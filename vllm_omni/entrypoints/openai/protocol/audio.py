@@ -1,7 +1,7 @@
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class OpenAICreateSpeechRequest(BaseModel):
@@ -22,6 +22,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         le=4.0,
     )
     stream_format: Literal["sse", "audio"] | None = "audio"
+    stream: bool = Field(
+        default=False,
+        description=(
+            "If true, stream raw PCM audio chunks as they are decoded. "
+            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+        ),
+    )
 
     # Qwen3-TTS specific parameters
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = Field(
@@ -55,6 +62,22 @@ class OpenAICreateSpeechRequest(BaseModel):
         if v == "sse":
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
+
+    @model_validator(mode="after")
+    def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
+        if self.stream:
+            if self.response_format != "pcm":
+                raise ValueError(
+                    "Streaming (stream=true) requires response_format='pcm'. "
+                    f"Got response_format='{self.response_format}'."
+                )
+            if self.speed is None:
+                self.speed = 1.0
+            elif self.speed != 1.0:
+                raise ValueError(
+                    "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
+                )
+        return self
 
 
 class CreateAudio(BaseModel):

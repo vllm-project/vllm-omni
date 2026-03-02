@@ -124,6 +124,7 @@ def extract_omni_serve_subparser_init():
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,
                         "argparse": __import__("argparse"),
+                        "json": __import__("json"),
                         "DESCRIPTION": DESCRIPTION,
                     }
                     exec(code, exec_globals, local_vars)
