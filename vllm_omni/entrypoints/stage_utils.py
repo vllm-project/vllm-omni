@@ -333,7 +333,7 @@ def _resolve_model_to_local_path(model: str) -> str:
         # no network access is attempted, check local model path only
         return snapshot_download(model, local_files_only=True)
     except Exception:
-        logger.debug("Could not resolve '%s' to a local snapshot path; using as-is", model)
+        logger.warning(f"Could not resolve {model} to a local snapshot path; using as-is", exc_info=True)
         return model
 
 
