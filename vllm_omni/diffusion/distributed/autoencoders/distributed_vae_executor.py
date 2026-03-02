@@ -68,18 +68,12 @@ class DistributedVaeExecutor:
             for dim_idx, dim_size in enumerate(tile_tensor.shape):
                 local_tile_max_dims[dim_idx] = max(local_tile_max_dims[dim_idx], dim_size)
         local_shape_stat = torch.tensor([len(local_results), *local_tile_max_dims], device=device)
-        # 4. gather result shape
-        all_rank_shape_stats = self.gather_tensors(local_shape_stat)
-        if self.rank == 0:
-            global_padding_shape = [0] * len(local_shape_stat)
-            for rank_stat in all_rank_shape_stats:
-                for idx, value in enumerate(rank_stat):
-                    global_padding_shape[idx] = max(global_padding_shape[idx], int(value.item()))
-        else:
-            global_padding_shape = [0] * len(local_shape_stat)
-        global_shape_tensor = torch.tensor(global_padding_shape, device=device)
-        self.broadcast_tensor(global_shape_tensor)
-        return global_shape_tensor.tolist()
+        dist.all_reduce(
+            local_shape_stat,
+            op=dist.ReduceOp.MAX,
+            group=self.group,
+        )
+        return local_shape_stat.tolist()
 
     def _pack_local_tiles(self, local_results, global_padding_shape, grid_spec, device, dtype):
         tile_tensor = torch.zeros(global_padding_shape, device=device, dtype=dtype)
@@ -131,7 +125,7 @@ class DistributedVaeExecutor:
 
         # 2. local decode
         assigned = self._balance_tasks(tiletask_list, pp_size)
-        local_tasks = assigned[self.rank]
+        local_tasks = assigned[self.rank] if pp_size <= self.world_size else []
         local_results = [(t.tile_id, operator.exec(t)) for t in local_tasks]
 
         # 3. compute shape per rank
@@ -190,4 +184,10 @@ class DistributedVaeMixin:
         pp_size = min(int(self.distributed_decoder.parallel_size), int(world_size))
         if pp_size <= 1:
             return False
+        if self.distributed_decoder.parallel_size > pp_size:
+            logger.warning(
+                f"vae_patch_parallel_size={self.distributed_decoder.parallel_size} "
+                f"is greater than dit_group={world_size};"
+                f" using dit_group size={world_size}"
+            )
         return True

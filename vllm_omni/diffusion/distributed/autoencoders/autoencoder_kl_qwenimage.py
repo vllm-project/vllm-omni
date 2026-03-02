@@ -86,7 +86,6 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
     def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
         """Merge decoded tiles into a full image."""
         grid_h, grid_w = grid_spec.grid_shape
-        result_rows = []
         self.clear_cache()
 
         result_rows = []

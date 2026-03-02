@@ -117,7 +117,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
                 pw0 = max(0, w0 - halo)
                 pw1 = min(latent_w, w1 + halo)
                 tile = z[:, :, ph0:ph1, pw0:pw1]
-                tiletask_list.append(TileTask(len(tiletask_list), (i, j), tile))
+                tiletask_list.append(TileTask(len(tiletask_list), (i, j), tile, tile.shape[2] * tile.shape[3]))
                 halo_size[(i, j)] = {
                     "up": h0 - ph0,
                     "down": ph1 - h1,
