@@ -410,11 +410,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_hidden = model_outputs
             # merge the code_predictor_codes from the info_dict list into a single tensor
             multimodal_outputs: dict = None
-            # Here is the only place to use runtime_additional_information. After MTP in the
+            # Here is the only place to use model_intermediate_buffer. After MTP in the
             # preprocess function, the code_predictor_codes are stored in the info_dict list.
             # We need to merge the tensors from different requests into a single tensor.
             # In the future, we may allow user to custom an aggregated function.
-            info_dicts = kwargs.get("runtime_additional_information")
+            info_dicts = kwargs.get("model_intermediate_buffer")
+            if info_dicts is None:
+                info_dicts = kwargs.get("runtime_additional_information")
+
+            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
             multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
             span_len = multimodal_outputs["code_predictor_codes"].shape[0]

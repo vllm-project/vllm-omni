@@ -37,7 +37,6 @@ from .hunyuan_image_3_transformer import (
     UNetDown,
     UNetUp,
     build_batch_2d_rope,
-    get_full_state_dict,
     real_batched_index_select,
 )
 
@@ -113,10 +112,10 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         self.vllm_config = get_current_vllm_config()
         self.post_init()
 
-    def pre_load(self):
-        tp_rank = get_tensor_model_parallel_rank()
-        state_dict = get_full_state_dict(self.od_config.model)
-        non_layer_prefixes = [
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
+        # List of unexpected keywords in weight names
+        non_model_layer_prefixes = [
             "vae",
             "vision_model",
             "vision_aligner",
@@ -129,32 +128,15 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             "time_embed_2",
             "final_layer.model",
         ]
-        filtered_sd = {}
-        for k, v in state_dict.items():
-            if any(k.startswith(prefix) for prefix in non_layer_prefixes):
-                filtered_sd[k] = v
+        tp_rank = get_tensor_model_parallel_rank()
+        device_str = f"{self.model.device.type}:{tp_rank}"
+        named_modules = dict(self.named_modules())
+        for prefix in non_model_layer_prefixes:
+            mod = named_modules.get(prefix)
+            if mod:
+                mod.to(device_str)
 
-        missing, unexpected = self.load_state_dict(filtered_sd, strict=False)
-
-        for prefix in non_layer_prefixes:
-            if hasattr(self, prefix.split(".")[0]):
-                module = dict(self.named_modules()).get(prefix)
-                if module:
-                    module.to(f"{self.model.device.type}:{tp_rank}")
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        self.pre_load()
-        skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
-        # List of unexpected keywords in weight names
         unexpected_keywords = [
-            "vae",
-            "vision_aligner",
-            "vision_model",
-            "final_layer",
-            "patch_embed",
-            "timestep_emb",
-            "time_embed",
-            "time_embed_2",
             "guidance_emb",
             "timestep_r_emb",
         ]
@@ -892,7 +874,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
 
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
-        inputs_embeds = self.model.wte(input_ids)
+        inputs_embeds = self.model.embed_tokens(input_ids)
 
         bsz, seq_len, n_embd = inputs_embeds.shape
 
