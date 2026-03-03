@@ -95,21 +95,21 @@ _CASES = [
     # Normal path (initial=0): emit at chunk_size boundaries
     ((25, 25, 0), (24, 0, False), None),
     ((25, 25, 0), (25, 0, False), (0, 25)),
-    # Warmup: hold, first emit, second emit
+    # Initial-chunk phase: hold, first emit, second emit
     ((25, 25, 10), (9, 0, False), None),
     ((25, 25, 10), (10, 0, False), (0, 10)),
     ((25, 25, 10), (20, 1, False), (10, 20)),
     # Non-divisible: holds at chunk boundary
     ((25, 25, 12), (25, 2, False), None),
-    # Normal phase: offset by warmup coverage (chunk//initial * initial)
+    # Normal phase: offset by initial_coverage (chunk//initial * initial)
     ((25, 25, 10), (45, 2, False), (20, 45)),
-    # Second normal emit (put_req includes normal emissions, offset must stay stable)
+    # Second normal emit (offset must stay stable)
     ((25, 25, 10), (70, 3, False), (25, 50)),
     # initial >= chunk clamps to chunk_size (behaves as normal)
     ((25, 25, 30), (25, 0, False), (0, 25)),
-    # finished=True flushes warmup tail
+    # finished=True flushes IC tail
     ((25, 25, 10), (5, 0, True), (0, 5)),
-    # finished=True flushes non-divisible warmup residual
+    # finished=True flushes non-divisible IC residual
     ((25, 25, 12), (25, 2, True), (24, 25)),
     # finished=True flushes normal phase tail
     ((25, 25, 10), (30, 2, True), (20, 30)),

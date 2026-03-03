@@ -74,8 +74,7 @@ def talker2code2wav_async_chunk(
     in_initial_phase = initial_chunk_size > 0 and length <= chunk_size
 
     if in_initial_phase:
-        # Initial-chunk phase: emit every initial_chunk_size frames with full context.
-        # Track frames already delivered using put_req_chunk counter.
+        # Initial-chunk phase: emit every initial_chunk_size frames with full accumulated context.
         already_sent = transfer_manager.put_req_chunk[request_id] * initial_chunk_size
         pending = length - already_sent
         if pending <= 0:
@@ -88,8 +87,7 @@ def talker2code2wav_async_chunk(
         window_frames = transfer_manager.code_prompt_token_ids[request_id][:length]
     else:
         # Normal phase: standard chunk_size cadence with left_context sliding window.
-        # Offset by initial-chunk coverage (static from config) so normal starts
-        # from where the initial-chunk phase left off.
+        # Offset by initial_coverage so normal starts from where the initial-chunk phase left off.
         initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size if initial_chunk_size > 0 else 0
         adjusted = length - initial_coverage
         chunk_length = adjusted % chunk_size

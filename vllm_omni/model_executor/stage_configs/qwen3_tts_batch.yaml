@@ -99,7 +99,7 @@ runtime:
         codec_chunk_frames: 25
         codec_left_context_frames: 25
         # First chunk size for reduced TTFA (0 = disabled).
-        # When > 0, emits small chunks every N frames during warmup,
+        # When > 0, emits small chunks every N frames during the initial phase,
         # then switches to codec_chunk_frames cadence.
         initial_codec_chunk_frames: 0
 
