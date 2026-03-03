@@ -2,7 +2,21 @@
 
 长稳结束后 CI 环境会被清理，网页和 CSV 都会丢失。通过**在清理前打包并上传为 CI 产物**，流水线结束后仍可下载查看。
 
-**脚本与数据目录**：`tests/e2e/stability/`（`resource_monitor.sh`、`generate_report.py` 等）。脚本名为资源监控统一入口，当前仅实现 GPU；通过 `--backend gpu|cpu|npu` 预留 CPU/NPU 扩展。
+**脚本与数据目录**：`tests/e2e/stability/`（`resource_monitor.sh`、`generate_report.py`、`run_benchmark_duration.py` 等）。脚本名为资源监控统一入口，当前仅实现 GPU；通过 `--backend gpu|cpu|npu` 预留 CPU/NPU 扩展。
+
+### 长稳 Benchmark 用例
+
+- **`run_benchmark_duration.py`**：在指定时长内循环调用 `vllm bench serve --omni` 向已启动的服务发请求（benchmark 本身不支持「跑满 N 分钟」）。可单独跑或由 pytest 调用。
+- **`test_benchmark_stability.py`**：pytest 用例，先起 OmniServer，再在指定时长内跑上述脚本，断言无失败请求。时长由环境变量 `STABILITY_BENCHMARK_DURATION_SEC` 控制（默认 300 秒）。示例：
+
+```bash
+# 默认约 5 分钟
+pytest -s -v tests/e2e/stability/test_benchmark_stability.py
+
+# 配合资源监控跑 10 分钟
+export STABILITY_BENCHMARK_DURATION_SEC=600
+bash tests/e2e/stability/resource_monitor.sh run -- pytest -s -v tests/e2e/stability/test_benchmark_stability.py
+```
 
 ## 如何查看？
 
