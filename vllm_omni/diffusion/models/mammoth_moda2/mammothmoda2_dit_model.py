@@ -491,7 +491,7 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer2DModel(ModelMixin, ConfigMixin):
-    """MammothModa2 DiT transformer（推理使用）。"""
+    """MammothModa2 DiT transformer"""
 
     @register_to_config
     def __init__(
