@@ -133,6 +133,11 @@ def parse_args() -> argparse.Namespace:
             "Default 1 means pure sharding (no replication). "
         ),
     )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Enable vLLM-Omni statistics logging.",
+    )
     return parser.parse_args()
 
 
@@ -187,6 +192,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        log_stats=args.log_stats,
     )
 
     if profiler_enabled:

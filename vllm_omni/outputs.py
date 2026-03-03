@@ -255,7 +255,7 @@ class OmniRequestOutput:
             f"images={images_repr}",
             f"prompt={self.prompt!r}",
             f"latents={self.latents}",
-            f"metrics={self.metrics}",
+            f"metrics={self._display_metrics_for_print()}",
             f"multimodal_output={self._multimodal_output}",
         ]
         return f"OmniRequestOutput({', '.join(parts)})"
@@ -273,9 +273,10 @@ class OmniRequestOutput:
             return repr(obj)
 
         # Format metrics with each key-value pair on a separate line
-        if self.metrics:
+        display_metrics = self._display_metrics_for_print()
+        if display_metrics:
             metrics_indent = indent + "    "
-            metrics_lines = f",\n{metrics_indent}".join(f"{k!r}: {v!r}" for k, v in self.metrics.items())
+            metrics_lines = f",\n{metrics_indent}".join(f"{k!r}: {v!r}" for k, v in display_metrics.items())
             metrics_repr = f"{{\n{metrics_indent}{metrics_lines}\n{indent}  }}"
         else:
             metrics_repr = "{}"
@@ -294,3 +295,12 @@ class OmniRequestOutput:
             f"{indent})",
         ]
         return "\n".join(lines)
+
+    def _display_metrics_for_print(self) -> dict[str, Any]:
+        if not self.metrics:
+            return {}
+        return {
+            "image_num": self.metrics.get("image_num"),
+            "resolution": self.metrics.get("resolution"),
+            "postprocess_time_ms": self.metrics.get("postprocess_time_ms"),
+        }

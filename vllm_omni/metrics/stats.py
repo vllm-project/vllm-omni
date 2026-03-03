@@ -39,7 +39,7 @@ class StageRequestStats:
     final_output_type: str | None = None
     request_id: str | None = None
     postprocess_time_ms: float = 0.0
-    diffusion_metrics: dict[str, int] = None
+    diffusion_metrics: dict[str, float] = None
     audio_generated_frames: int = 0
 
     @property
@@ -299,6 +299,9 @@ class OrchestratorAggregator:
             self.record_audio_generated_frames(output_to_yield, stage_id, req_id)
 
         except Exception:
+            if output_to_yield is not None:
+                # Make metrics contract explicit on failure.
+                output_to_yield.metrics = {}
             logger.exception(
                 "Failed to process metrics for stage %s, req %s",
                 stage_id,
@@ -318,7 +321,7 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         stats.final_output_type = final_output_type
         stats.diffusion_metrics = (
-            {k: int(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
+            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
             if req_id in self.diffusion_metrics
             else None
         )
@@ -331,15 +334,15 @@ class OrchestratorAggregator:
                 return evt
         return None
 
-    def _collect_diffusion_metrics(self, req_id: Any) -> dict[str, int]:
+    def _collect_diffusion_metrics(self, req_id: Any) -> dict[str, float]:
         """Aggregate diffusion metrics across all stages for a request."""
         rid_key = str(req_id)
-        merged: dict[str, int] = {}
+        merged: dict[str, float] = {}
         for evt in self.stage_events.get(rid_key, []):
             if not evt.diffusion_metrics:
                 continue
             for key, value in evt.diffusion_metrics.items():
-                merged[key] = merged.get(key, 0) + int(value)
+                merged[key] = merged.get(key, 0.0) + float(value)
         return merged
 
     def build_output_metrics(self, stage_id: int, req_id: Any) -> dict[str, Any]:

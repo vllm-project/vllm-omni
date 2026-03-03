@@ -120,10 +120,7 @@ class DiffusionEngine:
 
         # Handle single request or multiple requests
         metrics["postprocess_time_ms"] = round(postprocess_time * 1000, 2)
-        metrics["vae_time_ms"] = metrics["postprocess_time_ms"]
-        metrics["dit_time_ms"] = round(max(exec_total_time - postprocess_time, 0.0) * 1000, 2)
-        num_steps = request.sampling_params.num_inference_steps
-        metrics["denoise_time_per_step_ms"] = round(metrics["dit_time_ms"] / num_steps, 2) if num_steps > 0 else 0.0
+        metrics["num_inference_steps"] = int(request.sampling_params.num_inference_steps)
 
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput

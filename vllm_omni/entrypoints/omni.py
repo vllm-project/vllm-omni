@@ -1083,6 +1083,8 @@ class Omni(OmniBase):
                         if stage.final_output_type == "text" or metrics.log_stats:
                             output_to_yield.metrics = metrics.build_output_metrics(stage_id, req_id)
                     except Exception as e:
+                        # Make metrics contract explicit on failure.
+                        output_to_yield.metrics = {}
                         logger.exception(
                             f"[{self._name}] Failed to attach output metrics for req {req_id} at stage {stage_id}: {e}",
                         )
