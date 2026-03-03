@@ -49,6 +49,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         cached_prompt_token_ids: dict[str, list[int]] = {}
+        cached_additional_information: dict[str, dict | None] = {}
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -105,6 +106,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             cached_prompt_token_ids[request.request_id] = request.prompt_token_ids
+            cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
             req_index += 1
@@ -225,6 +227,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             num_computed_tokens=cached_reqs_data.num_computed_tokens,
             num_output_tokens=cached_reqs_data.num_output_tokens,
             prompt_token_ids=cached_prompt_token_ids,
+            additional_information=cached_additional_information,
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
