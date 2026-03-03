@@ -208,33 +208,14 @@ class Mammoth2DecoderLayer(Qwen2DecoderLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        nn.Module.__init__(self)
-        self.hidden_size = config.hidden_size
+        # Must patch rope parameters on config BEFORE calling super().__init__,
+        # because Qwen2DecoderLayer.__init__ creates Qwen2Attention using the
+        # config's rope settings.  Patching afterwards would leave the attention
+        # module initialised with wrong parameters, causing shape mismatches in
+        # rotary_embedding at runtime.
         patch_rope_parameters(config)
         set_default_rope_theta(config, default_theta=1000000)
-        dual_chunk_attention_config = getattr(config, "dual_chunk_attention_config", None)
-
-        attn_type = AttentionType.DECODER
-
-        self.self_attn = Qwen2Attention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            max_position=config.max_position_embeddings,
-            num_kv_heads=config.num_key_value_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            rope_parameters=config.rope_parameters,
-            prefix=f"{prefix}.self_attn",
-            attn_type=attn_type,
-            dual_chunk_attention_config=dual_chunk_attention_config,
-        )
-        self.mlp = Qwen2MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
+        super().__init__(config, cache_config, quant_config, prefix)
 
         self.moe_enable = moe_enable(config.moe_type, "ffn", layer_idx)
         if self.moe_enable:
@@ -247,9 +228,6 @@ class Mammoth2DecoderLayer(Qwen2DecoderLayer):
             )
         else:
             self.gen_mlp = None
-
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
