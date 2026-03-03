@@ -198,10 +198,9 @@ class _DiffusionServingModels:
         self.model_config = self._NullModelConfig()
 
     def __getattr__(self, name):
-        """
-        Any attribute OpenAIServing tries to access but we don't explicitly define
-        will safely resolve to None.
-        """
+        """Return a sentinel that raises NotImplementedError if called or
+        accessed, so any use of unsupported OpenAIServingModels features in
+        diffusion mode fails loudly with a descriptive message."""
         return self._Unsupported(name)
 
     async def show_available_models(self) -> ModelList:

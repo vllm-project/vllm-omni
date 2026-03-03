@@ -60,7 +60,6 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
         request_id = f"audiogen-{random_uuid()}"
 
         try:
-            sampling_params_list = self.engine_client.default_sampling_params_list
             default_sr = 44100  # Default sample rate for Stable Audio
 
             # Build prompt for diffusion audio generation
