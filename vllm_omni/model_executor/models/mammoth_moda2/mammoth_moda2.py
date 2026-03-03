@@ -22,7 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
-from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2MLP, Qwen2DecoderLayer
+from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLDummyInputsBuilder,
     Qwen2_5_VLForConditionalGeneration,
@@ -45,7 +45,6 @@ from vllm.transformers_utils.config import (
     patch_rope_parameters,
     set_default_rope_theta,
 )
-from vllm.v1.attention.backend import AttentionType
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
