@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 
@@ -123,13 +124,6 @@ DiffusionModelRegistry = _ModelRegistry(
     }
 )
 
-_VAE_PATCH_PARALLEL_ALLOWLIST = {
-    # Only enable for models we have validated end-to-end.
-    "StableDiffusion3Pipeline",
-    "ZImagePipeline",
-    "NextStep11Pipeline",
-}
-
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
@@ -161,17 +155,14 @@ def initialize_model(
         model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
-        if vae_pp_size > 1 and od_config.model_class_name not in _VAE_PATCH_PARALLEL_ALLOWLIST:
+        is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
+        if vae_pp_size > 1 and not is_distributed_vae:
             logger.warning(
-                "vae_patch_parallel_size=%d is set but VAE patch parallelism is only enabled for %s; ignoring.",
+                "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
                 vae_pp_size,
-                sorted(_VAE_PATCH_PARALLEL_ALLOWLIST),
+                od_config.model_class_name,
             )
-        if (
-            vae_pp_size > 1
-            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
-            and not od_config.vae_use_tiling
-        ):
+        if vae_pp_size > 1 and is_distributed_vae and not od_config.vae_use_tiling:
             logger.info(
                 "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
@@ -184,20 +175,8 @@ def initialize_model(
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
-        if (
-            vae_pp_size > 1
-            and hasattr(model, "vae")
-            and od_config.model_class_name in _VAE_PATCH_PARALLEL_ALLOWLIST
-            and od_config.vae_use_tiling
-        ):
-            from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-            from vllm_omni.diffusion.distributed.vae_patch_parallel import maybe_wrap_vae_decode_with_patch_parallelism
-
-            maybe_wrap_vae_decode_with_patch_parallelism(
-                model,
-                vae_patch_parallel_size=vae_pp_size,
-                group_getter=get_dit_group,
-            )
+        if is_distributed_vae:
+            model.vae.set_parallel_size(vae_pp_size)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
