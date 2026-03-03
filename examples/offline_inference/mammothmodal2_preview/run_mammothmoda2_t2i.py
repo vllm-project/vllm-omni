@@ -65,8 +65,7 @@ def load_t2i_generation_config(model_dir: str) -> T2IGenConfig:
             from huggingface_hub import hf_hub_download
         except ImportError as exc:
             raise ImportError(
-                "huggingface_hub is required to load configs from HF Hub. "
-                "Install it with: pip install huggingface_hub"
+                "huggingface_hub is required to load configs from HF Hub. Install it with: pip install huggingface_hub"
             ) from exc
         cached = hf_hub_download(repo_id=model_dir, filename=filename)
         with open(cached, encoding="utf-8") as f:
