@@ -106,7 +106,7 @@ python image_to_video.py \
     #    Reducing frames to the absolute minimum (2) keeps the
     #    tensor size small, ensuring the trace file doesn't become
     #    multi-gigabytes in size.
-    --num_frames 2 \
+    --num-frames 2 \
     \
     # Minimize Iteration Loop (Steps):
     #    This is the most critical setting for profiling.
@@ -114,12 +114,12 @@ python image_to_video.py \
     #    Profiling 2 steps gives you the exact same performance
     #    data as 50 steps, but saves minutes of runtime and
     #    prevents the trace viewer from freezing.
-    --num_inference_steps 2 \
+    --num-inference-steps 2 \
     \
-    --guidance_scale 5.0 \
-    --guidance_scale_high 6.0 \
-    --boundary_ratio 0.875 \
-    --flow_shift 12.0 \
+    --guidance-scale 5.0 \
+    --guidance-scale-high 6.0 \
+    --boundary-ratio 0.875 \
+    --flow-shift 12.0 \
     --fps 16 \
     --output i2v_output.mp4
 
@@ -130,9 +130,6 @@ python image_to_video.py \
 1. **Qwen image edit**:  [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py)
 
 2. **Wan-AI/Wan2.2-I2V-A14B-Diffusers**:   [https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video)
-
-> **Note:**
-As of now, asynchronous (online) profiling is not fully supported in vLLM-Omni. While start_profile() and stop_profile() methods exist, they are only reliable in offline inference scripts (e.g., the provided end2end.py examples). Do not use them in server-mode or streaming scenarios—traces may be incomplete or fail to flush.
 
 ### 4. Analyzing Omni Traces
 

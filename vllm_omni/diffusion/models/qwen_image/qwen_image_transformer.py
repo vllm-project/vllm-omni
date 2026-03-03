@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
+from __future__ import annotations
+
 from collections.abc import Iterable
+from functools import lru_cache
 from math import prod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -22,6 +24,11 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -87,6 +94,66 @@ class ImageRopePrepare(nn.Module):
         vid_freqs, txt_freqs = image_rotary_emb
 
         return hidden_states, vid_freqs, txt_freqs
+
+
+class ModulateIndexPrepare(nn.Module):
+    """Prepares modulate_index for sequence parallel when zero_cond_t is enabled.
+
+    This module encapsulates the creation of modulate_index tensor, which is used
+    to select different conditioning parameters (shift/scale/gate) for different
+    token positions in image editing tasks.
+
+    Similar to Z-Image's UnifiedPrepare and ImageRopePrepare, this creates a module
+    boundary where _sp_plan can shard the output via split_output=True.
+
+    The modulate_index must be sharded along the sequence dimension to match the
+    sharded hidden_states in SP mode.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
+    """
+
+    def __init__(self, zero_cond_t: bool = False):
+        super().__init__()
+        self.zero_cond_t = zero_cond_t
+
+    def forward(
+        self,
+        timestep: torch.Tensor,
+        img_shapes: list[list[tuple[int, int, int]]],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Prepare timestep and modulate_index for SP.
+
+        Args:
+            timestep: Timestep tensor [batch]
+            img_shapes: List of image shape tuples per batch item.
+                Each item is a list of (frame, height, width) tuples.
+                For edit models: [[source_shape], [target_shape1, target_shape2, ...]]
+
+        Returns:
+            timestep: Doubled timestep if zero_cond_t, else original [batch] or [2*batch]
+            modulate_index: Token condition index [batch, seq_len] if zero_cond_t, else None
+                - index=0: source image tokens (use normal timestep conditioning)
+                - index=1: target image tokens (use zero timestep conditioning)
+
+        Note: _sp_plan will shard modulate_index via split_output=True when SP is enabled.
+              The modulate_index sequence dimension must match hidden_states after sharding.
+        """
+        if self.zero_cond_t:
+            # Double the timestep: [timestep, timestep * 0]
+            # This creates two sets of conditioning parameters in AdaLayerNorm
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+
+            # Create modulate_index to select conditioning per token position
+            # - First image (sample[0]): source image, use index=0 (normal timestep)
+            # - Remaining images (sample[1:]): target images, use index=1 (zero timestep)
+            modulate_index = torch.tensor(
+                [[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in img_shapes],
+                device=timestep.device,
+                dtype=torch.int,
+            )
+            return timestep, modulate_index
+
+        return timestep, None
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -189,7 +256,7 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @functools.cache
+    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -208,7 +275,7 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
-    @functools.cache
+    @lru_cache(maxsize=16)
     def _compute_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -251,7 +318,6 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
-        self.rope_cache = {}
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
@@ -289,14 +355,7 @@ class QwenEmbedRope(nn.Module):
         max_vid_index = 0
         for idx, fhw in enumerate(video_fhw):
             frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
-
-            if not torch.compiler.is_compiling():
-                if rope_key not in self.rope_cache:
-                    self.rope_cache[rope_key] = self._compute_video_freqs(frame, height, width, idx)
-                video_freq = self.rope_cache[rope_key]
-            else:
-                video_freq = self._compute_video_freqs(frame, height, width, idx)
+            video_freq = self._compute_video_freqs(frame, height, width, idx)
             video_freq = video_freq.to(device)
             vid_freqs.append(video_freq)
 
@@ -311,7 +370,7 @@ class QwenEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @functools.cache
+    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -338,7 +397,16 @@ class QwenEmbedRope(nn.Module):
 
 
 class ColumnParallelApproxGELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str,
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -346,6 +414,8 @@ class ColumnParallelApproxGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
         )
         self.approximate = approximate
 
@@ -363,6 +433,8 @@ class FeedForward(nn.Module):
         activation_fn: str = "gelu-approximate",
         inner_dim: int | None = None,
         bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -372,13 +444,17 @@ class FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            ColumnParallelApproxGELU(
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=prefix
+            ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
                 inner_dim,
                 dim_out,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=prefix,
             ),
         ]
 
@@ -404,6 +480,7 @@ class QwenImageCrossAttention(nn.Module):
         pre_only: bool = False,
         context_pre_only: bool = False,
         out_dim: int | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -419,6 +496,8 @@ class QwenImageCrossAttention(nn.Module):
             hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=num_heads,
+            quant_config=quant_config,
+            prefix="to_qkv",
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -433,6 +512,8 @@ class QwenImageCrossAttention(nn.Module):
             hidden_size=added_kv_proj_dim,
             head_size=head_dim,
             total_num_heads=num_heads,
+            quant_config=quant_config,
+            prefix="add_kv_proj",
         )
         self.add_query_num_heads = self.add_kv_proj.num_heads
         self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -444,6 +525,8 @@ class QwenImageCrossAttention(nn.Module):
             bias=out_bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix="to_add_out",
         )
 
         assert not pre_only
@@ -453,6 +536,8 @@ class QwenImageCrossAttention(nn.Module):
             bias=out_bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix="to_out",
         )
 
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
@@ -585,6 +670,7 @@ class QwenImageTransformerBlock(nn.Module):
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
         zero_cond_t: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -604,9 +690,10 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
+            quant_config=quant_config,
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim)
+        self.img_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="img_mlp")
 
         # Text processing modules
         self.txt_mod = nn.Sequential(
@@ -616,7 +703,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim)
+        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="txt_mlp")
 
         self.zero_cond_t = zero_cond_t
 
@@ -758,6 +845,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["QwenImageTransformerBlock"]
+    _layerwise_offload_blocks_attr = "transformer_blocks"
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
@@ -784,6 +872,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
             1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
             # txt_freqs (index 2) is NOT sharded - kept replicated for dual-stream attention
         },
+        # Shard ModulateIndexPrepare output (modulate_index must be sharded to match hidden_states)
+        # This is only active when zero_cond_t=True (image editing models)
+        # Output index 1 is modulate_index [batch, seq_len], needs sharding along dim=1
+        "modulate_index_prepare": {
+            1: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
+        },
         # Gather output at proj_out
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -803,6 +897,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         zero_cond_t: bool = False,
         use_additional_t_cond: bool = False,
         use_layer3d_rope: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
@@ -832,6 +927,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     zero_cond_t=zero_cond_t,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]
@@ -846,6 +942,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # ImageRopePrepare module for _sp_plan to shard hidden_states and vid_freqs together
         # This ensures RoPE dimensions align with hidden_states after sharding
         self.image_rope_prepare = ImageRopePrepare(self.img_in, self.pos_embed)
+
+        # ModulateIndexPrepare module for _sp_plan to shard modulate_index
+        # This ensures modulate_index dimensions align with hidden_states after sharding
+        # Only active when zero_cond_t=True (image editing models)
+        self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
     def forward(
         self,
@@ -905,15 +1006,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Ensure timestep tensor is on the same device and dtype as hidden_states
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
-        if self.zero_cond_t:
-            timestep = torch.cat([timestep, timestep * 0], dim=0)
-            modulate_index = torch.tensor(
-                [[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in img_shapes],
-                device=timestep.device,
-                dtype=torch.int,
-            )
-        else:
-            modulate_index = None
+        # Prepare timestep and modulate_index via ModulateIndexPrepare module
+        # _sp_plan will shard modulate_index via split_output=True (when zero_cond_t=True)
+        # This ensures modulate_index sequence dimension matches sharded hidden_states
+        timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)

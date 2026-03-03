@@ -44,6 +44,11 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_torch_inductor(cls) -> bool:
+        # TODO: Enable this when torch compile bugs are resolved
+        return False
+
+    @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/platforms/xpu/stage_configs"
 
@@ -68,9 +73,5 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
-        if device is None:
-            device_id = 0
-        else:
-            device_id = device.index if device.index is not None else 0
-        props = torch.xpu.get_device_properties(device_id)
-        return props.total_memory
+        free, _ = torch.xpu.mem_get_info(device)
+        return free

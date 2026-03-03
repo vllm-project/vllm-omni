@@ -1,13 +1,14 @@
 import pytest
 import torch
 
-from tests.utils import hardware_test
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVCacheConfig,
     OmniKVTransferManager,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.cache]
 
 
 class MockConnector:
@@ -58,11 +59,6 @@ def common_constants():
     }
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_manager_extraction(kv_config, mock_connector, common_constants):
     """Test extraction and sending logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -109,11 +105,98 @@ def test_manager_extraction(kv_config, mock_connector, common_constants):
     assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
+def test_manager_extraction_tuple_layout(kv_config, mock_connector, common_constants):
+    """Test extraction with tuple layout."""
+    num_layers = common_constants["num_layers"]
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    seq_len = common_constants["seq_len"]
+    req_id = common_constants["req_id"]
+
+    num_blocks = 10
+    kv_caches = []
+    for _ in range(num_layers):
+        k_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        v_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        kv_caches.append((k_cache, v_cache))
+
+    block_ids = [1, 3, 5]
+    finished_reqs = {req_id: {"block_ids": block_ids, "seq_len": seq_len}}
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = mock_connector
+
+    processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+    assert req_id in processed
+
+    full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
+    expected_key = f"stage1->stage2:{full_request_id}"
+    assert expected_key in mock_connector.store
+
+    data = mock_connector.store[expected_key]
+    expected_shape = (seq_len, num_heads, head_dim)
+    for idx in range(len(kv_caches)):
+        assert data["layer_blocks"]["key_cache"][idx].shape == expected_shape
+        assert data["layer_blocks"]["value_cache"][idx].shape == expected_shape
+
+
+def test_manager_extraction_mismatched_kv_block_counts(kv_config, mock_connector, common_constants):
+    """Mismatched key/value block counts should not crash extraction."""
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+
+    key_blocks = torch.randn(3, block_size, num_heads, head_dim)
+    value_blocks = torch.randn(2, block_size, num_heads, head_dim)
+    kv_caches = [(key_blocks, value_blocks)]
+
+    finished_reqs = {req_id: {"block_ids": [0, 1, 2], "seq_len": 32}}
+
+    manager = OmniKVTransferManager(kv_config)
+    manager._connector = mock_connector
+
+    processed = manager.handle_finished_requests_kv_transfer(finished_reqs, kv_caches, block_size, "float32")
+    assert req_id in processed
+
+    full_request_id = f"omni_stage1_to_stage2_kv_cache_{req_id}"
+    expected_key = f"stage1->stage2:{full_request_id}"
+    assert expected_key in mock_connector.store
+
+    data = mock_connector.store[expected_key]
+    expected_shape = (2 * block_size, num_heads, head_dim)
+    assert data["layer_blocks"]["key_cache"][0].shape == expected_shape
+    assert data["layer_blocks"]["value_cache"][0].shape == expected_shape
+
+
+@pytest.mark.parametrize(
+    "invalid_case",
+    ["invalid_stacked_shape", "invalid_tuple_length", "non_tensor_entries"],
 )
+def test_normalize_layer_kv_rejects_invalid_inputs(kv_config, common_constants, invalid_case):
+    """_normalize_layer_kv should reject malformed KV representations."""
+    block_size = common_constants["block_size"]
+    num_heads = common_constants["num_heads"]
+    head_dim = common_constants["head_dim"]
+    req_id = common_constants["req_id"]
+
+    if invalid_case == "invalid_stacked_shape":
+        layer_kv = torch.randn(3, block_size, num_heads, head_dim)
+    elif invalid_case == "invalid_tuple_length":
+        layer_kv = (
+            torch.randn(2, block_size, num_heads, head_dim),
+            torch.randn(2, block_size, num_heads, head_dim),
+            torch.randn(2, block_size, num_heads, head_dim),
+        )
+    else:
+        layer_kv = (torch.randn(2, block_size, num_heads, head_dim), "not-a-tensor")
+
+    manager = OmniKVTransferManager(kv_config)
+    normalized = manager._normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=0)
+    assert normalized is None
+
+
 def test_manager_reception(kv_config, mock_connector, common_constants):
     """Test reception and injection logic in OmniKVTransferManager."""
     num_layers = common_constants["num_layers"]
@@ -171,11 +254,6 @@ def test_manager_reception(kv_config, mock_connector, common_constants):
     assert req.kv_metadata["seq_len"] == seq_len
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_integration_flow(common_constants):
     """Simulate extraction -> connector -> reception."""
     num_layers = common_constants["num_layers"]
@@ -211,7 +289,8 @@ def test_integration_flow(common_constants):
         recv_timeout=1.0,
     )
     receiver_manager = OmniKVTransferManager(receiver_config)
-    receiver_manager._connector = connector  # Share the same mock connector instance
+    # Share the same mock connector instance
+    receiver_manager._connector = connector
 
     req = OmniDiffusionRequest(
         prompts=["test_integ"],
@@ -228,11 +307,6 @@ def test_integration_flow(common_constants):
     assert req.kv_metadata["seq_len"] == 10
 
 
-@pytest.mark.cache
-@hardware_test(
-    res={"cuda": "L4"},
-    num_cards=2,
-)
 def test_manager_extraction_no_connector(kv_config, common_constants):
     """Test extraction when connector is unavailable (should still return IDs)."""
     block_size = common_constants["block_size"]

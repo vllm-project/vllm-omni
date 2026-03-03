@@ -5,39 +5,55 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
+def is_nextstep_model(model_name: str) -> bool:
+    """Check if the model is a NextStep model by reading its config."""
+    from vllm.transformers_utils.config import get_hf_file_to_dict
+
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name)
+        if cfg and cfg.get("model_type") == "nextstep":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate an image with Qwen-Image.")
+    parser = argparse.ArgumentParser(description="Generate an image with supported diffusion models.")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
         help="Diffusion model name or local path. Supported models: "
-        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512",
+        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
-        "--negative_prompt",
+        "--negative-prompt",
         default=None,
         help="negative prompt for classifier-free conditional guidance.",
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
-        "--cfg_scale",
+        "--cfg-scale",
         type=float,
         default=4.0,
         help="True classifier-free guidance scale specific to Qwen-Image.",
     )
     parser.add_argument(
-        "--guidance_scale",
+        "--guidance-scale",
         type=float,
         default=1.0,
         help="Classifier-free guidance scale.",
@@ -51,19 +67,19 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the generated image (PNG).",
     )
     parser.add_argument(
-        "--num_images_per_prompt",
+        "--num-images-per-prompt",
         type=int,
         default=1,
         help="Number of images to generate for the given prompt.",
     )
     parser.add_argument(
-        "--num_inference_steps",
+        "--num-inference-steps",
         type=int,
         default=50,
         help="Number of denoising steps for the diffusion sampler.",
     )
     parser.add_argument(
-        "--cache_backend",
+        "--cache-backend",
         type=str,
         default=None,
         choices=["cache_dit", "tea_cache"],
@@ -79,26 +95,26 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument(
-        "--ulysses_degree",
+        "--ulysses-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
-        "--ring_degree",
+        "--ring-degree",
         type=int,
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
     parser.add_argument(
-        "--cfg_parallel_size",
+        "--cfg-parallel-size",
         type=int,
         default=1,
         choices=[1, 2],
         help="Number of GPUs used for classifier free guidance parallel size.",
     )
     parser.add_argument(
-        "--enforce_eager",
+        "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
     )
@@ -108,20 +124,94 @@ def parse_args() -> argparse.Namespace:
         help="Enable CPU offloading for diffusion models.",
     )
     parser.add_argument(
-        "--tensor_parallel_size",
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "gguf"],
+        help=(
+            "Quantization method for the transformer. "
+            "Options: 'fp8' (FP8 W8A8), 'gguf' (GGUF quantized weights). "
+            "Default: None (no quantization, uses BF16)."
+        ),
+    )
+    parser.add_argument(
+        "--gguf-model",
+        type=str,
+        default=None,
+        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
+    )
+    parser.add_argument(
+        "--ignored-layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer name patterns to skip quantization. "
+        "Only used when --quantization is set. "
+        "Available layers: to_qkv, to_out, add_kv_proj, to_add_out, img_mlp, txt_mlp, proj_out. "
+        "Example: --ignored-layers 'add_kv_proj,to_add_out'",
+    )
+    parser.add_argument(
+        "--vae-use-slicing",
+        action="store_true",
+        help="Enable VAE slicing for memory optimization.",
+    )
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
-        "--vae_use_slicing",
-        action="store_true",
-        help="Enable VAE slicing for memory optimization.",
+        "--lora-path",
+        type=str,
+        default=None,
+        help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
     )
     parser.add_argument(
-        "--vae_use_tiling",
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
+    )
+    # NextStep-1.1 specific arguments
+    parser.add_argument(
+        "--guidance-scale-2",
+        type=float,
+        default=1.0,
+        help="Secondary guidance scale (e.g. image-level CFG for NextStep-1.1).",
+    )
+    parser.add_argument(
+        "--timesteps-shift",
+        type=float,
+        default=1.0,
+        help="[NextStep-1.1 only] Timesteps shift parameter for sampling.",
+    )
+    parser.add_argument(
+        "--cfg-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear"],
+        help="[NextStep-1.1 only] CFG schedule type.",
+    )
+    parser.add_argument(
+        "--use-norm",
         action="store_true",
-        help="Enable VAE tiling for memory optimization.",
+        help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
     )
     return parser.parse_args()
 
@@ -129,10 +219,12 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    use_nextstep = is_nextstep_model(args.model)
 
-    # Configure cache based on backend type
     cache_config = None
-    if args.cache_backend == "cache_dit":
+    cache_backend = args.cache_backend
+
+    if cache_backend == "cache_dit":
         # cache-dit configuration: Hybrid DBCache + SCM + TaylorSeer
         # All parameters marked with [cache-dit only] in DiffusionCacheConfig
         cache_config = {
@@ -149,7 +241,7 @@ def main():
             "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
-    elif args.cache_backend == "tea_cache":
+    elif cache_backend == "tea_cache":
         # TeaCache configuration
         # All parameters marked with [tea_cache only] in DiffusionCacheConfig
         cache_config = {
@@ -165,22 +257,55 @@ def main():
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
-    omni = Omni(
-        model=args.model,
-        vae_use_slicing=args.vae_use_slicing,
-        vae_use_tiling=args.vae_use_tiling,
-        cache_backend=args.cache_backend,
-        cache_config=cache_config,
-        enable_cache_dit_summary=args.enable_cache_dit_summary,
-        parallel_config=parallel_config,
-        enforce_eager=args.enforce_eager,
-        enable_cpu_offload=args.enable_cpu_offload,
-    )
+    # Prepare LoRA kwargs for Omni initialization
+    lora_args: dict[str, Any] = {}
+    if args.lora_path:
+        lora_args["lora_path"] = args.lora_path
+        print(f"Using LoRA from: {args.lora_path}")
+
+    # Build quantization kwargs: use quantization_config dict when
+    # ignored_layers is specified so the list flows through OmniDiffusionConfig
+    quant_kwargs: dict[str, Any] = {}
+    ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
+    if args.quantization == "gguf":
+        if not args.gguf_model:
+            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+        quant_kwargs["quantization_config"] = {
+            "method": "gguf",
+            "gguf_model": args.gguf_model,
+        }
+    elif args.quantization and ignored_layers:
+        quant_kwargs["quantization_config"] = {
+            "method": args.quantization,
+            "ignored_layers": ignored_layers,
+        }
+    elif args.quantization:
+        quant_kwargs["quantization"] = args.quantization
+
+    omni_kwargs = {
+        "model": args.model,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "vae_use_slicing": args.vae_use_slicing,
+        "vae_use_tiling": args.vae_use_tiling,
+        "cache_backend": args.cache_backend,
+        "cache_config": cache_config,
+        "enable_cache_dit_summary": args.enable_cache_dit_summary,
+        "parallel_config": parallel_config,
+        "enforce_eager": args.enforce_eager,
+        "enable_cpu_offload": args.enable_cpu_offload,
+        **lora_args,
+        **quant_kwargs,
+    }
+    if use_nextstep:
+        # NextStep-1.1 requires explicit pipeline class
+        omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -191,15 +316,43 @@ def main():
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Cache backend: {cache_backend if cache_backend else 'None (no acceleration)'}")
+    print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
+    if ignored_layers:
+        print(f"  Ignored layers: {ignored_layers}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
-        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}"
     )
+    print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")
+    if args.lora_path:
+        print(f"  LoRA: scale={args.lora_scale}")
     print(f"{'=' * 60}\n")
 
+    # Build LoRA request when --lora-path is set
+    lora_request = None
+    if args.lora_path:
+        lora_request_id = stable_lora_int_id(args.lora_path)
+        lora_request = LoRARequest(
+            lora_name=Path(args.lora_path).stem,
+            lora_int_id=lora_request_id,
+            lora_path=args.lora_path,
+        )
+
     generation_start = time.perf_counter()
+
+    extra_args = {
+        "timesteps_shift": args.timesteps_shift,
+        "cfg_schedule": args.cfg_schedule,
+        "use_norm": args.use_norm,
+    }
+
+    if lora_request:
+        extra_args["lora_request"] = lora_request
+        extra_args["lora_scale"] = args.lora_scale
+
     outputs = omni.generate(
         {
             "prompt": args.prompt,
@@ -211,10 +364,13 @@ def main():
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_images_per_prompt,
+            extra_args=extra_args,
         ),
     )
+
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 

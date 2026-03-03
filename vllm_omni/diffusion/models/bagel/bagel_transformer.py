@@ -114,6 +114,11 @@ class BagelRotaryEmbedding(nn.Module):
         else:
             dim = config.hidden_size // config.num_attention_heads
             inv_freq = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+            inv_freq, self.attention_scaling = rope_init_fn(config, device=None)
+        else:
+            dim = config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
             self.attention_scaling = 1.0
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -269,6 +274,10 @@ class BaseNavitOutputWithPast(ModelOutput):
 
 class PackedAttentionMoT(nn.Module):
     """Packed attention with Mixture-of-Tokens routing for understanding/generation.
+
+    Uses vLLM's QKVParallelLinear and RowParallelLinear for tensor parallelism
+    support, following the same pattern as vLLM's Qwen2Attention.
+
 
     Uses vLLM's QKVParallelLinear and RowParallelLinear for tensor parallelism
     support, following the same pattern as vLLM's Qwen2Attention.

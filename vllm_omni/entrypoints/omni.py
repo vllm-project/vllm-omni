@@ -3,19 +3,23 @@
 import json
 import multiprocessing as mp
 import os
+import threading
 import time
 import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
-from pprint import pformat
 from typing import Any, Literal, overload
 
+import huggingface_hub
+import msgspec.msgpack
+import zmq
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from vllm import SamplingParams
 from vllm.logger import init_logger
+from vllm.utils.network_utils import make_zmq_socket
+from vllm.v1.utils import get_engine_client_zmq_addr
 
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
@@ -30,24 +34,36 @@ from vllm_omni.distributed.ray_utils.utils import (
     get_ray_queue_class,
     try_close_ray,
 )
-from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
+from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
     inject_omni_kv_config,
-    load_stage_configs_from_model,
-    load_stage_configs_from_yaml,
-    resolve_model_config_path,
+    load_and_resolve_stage_configs,
 )
+from vllm_omni.entrypoints.zmq_utils import ZmqQueue
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.metrics import OrchestratorAggregator, StageRequestStats
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 
-def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
+def _weak_close_cleanup(
+    stage_list,
+    stage_in_queues,
+    stage_out_queues,
+    ray_pg,
+    zmq_ctx=None,
+    handshake_stop: threading.Event | None = None,
+    zmq_handshake_socket: zmq.Socket | None = None,
+    handshake_thread: threading.Thread | None = None,
+):
     """Weak reference cleanup function for OmniBase instances."""
     if stage_list:
         for q in stage_in_queues:
@@ -55,6 +71,13 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
                 q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
                 logger.warning(f"Failed to send shutdown signal to stage input queue: {e}")
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
+        for q in stage_out_queues:
+            close_fn = getattr(q, "close", None)
+            if callable(close_fn):
+                close_fn()
         for stage in stage_list:
             try:
                 stage.stop_stage_worker()
@@ -62,20 +85,51 @@ def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
                 logger.warning(f"Failed to stop stage worker: {e}")
     try_close_ray(ray_pg)
 
+    # Gracefully shutdown handshake server thread
+    if handshake_stop is not None:
+        handshake_stop.set()
+    if handshake_thread is not None:
+        handshake_thread.join(timeout=2.0)
+        if handshake_thread.is_alive():
+            logger.warning("Handshake server thread did not terminate gracefully within timeout")
+
+    # Close ZMQ resources after thread has exited
+    if zmq_handshake_socket is not None:
+        zmq_handshake_socket.close(0)
+    if zmq_ctx is not None:
+        zmq_ctx.term()
+
 
 def _dummy_snapshot_download(model_id):
     return model_id
 
 
 def omni_snapshot_download(model_id) -> str:
+    # If it's already a local path, just return it
+    if os.path.exists(model_id):
+        return model_id
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
     if os.environ.get("VLLM_USE_MODELSCOPE", False):
         from modelscope.hub.snapshot_download import snapshot_download
 
         return snapshot_download(model_id)
-    else:
-        return _dummy_snapshot_download(model_id)
+    # For other cases (Hugging Face), perform a real download to ensure all
+    # necessary files (including *.pt for audio/diffusion) are available locally
+    # before stage workers are spawned. This prevents initialization timeouts.
+    # Return the original model_id so that model_config.model preserves
+    # HuggingFace semantics (e.g. "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    # instead of the resolved cache path.
+    try:
+        download_weights_from_hf_specific(
+            model_name_or_path=model_id,
+            cache_dir=None,
+            allow_patterns=["*"],
+            require_all=True,
+        )
+    except huggingface_hub.errors.RepositoryNotFoundError:
+        logger.warning(f"Repository not found for '{model_id}'.")
+    return model_id
 
 
 class OmniBase:
@@ -106,12 +160,21 @@ class OmniBase:
 
         # Stage management attributes
         self.stage_list: list[OmniStage] = []
-        self._stage_in_queues: list[mp.Queue] = []
-        self._stage_out_queues: list[mp.Queue] = []
+        self._stage_in_queues: list[Any] = []
+        self._stage_out_queues: list[Any] = []
         self._stages_ready: set[int] = set()
         self._ray_pg = None
         self._queue_cls = None
         self._ctx = None
+        self._zmq_ctx: zmq.Context | None = None
+        self._zmq_master_address: str | None = None
+        self._zmq_master_port: int | None = None
+        self._zmq_handshake_socket: zmq.Socket | None = None
+        self._handshake_thread: threading.Thread | None = None
+        self._handshake_stop: threading.Event | None = None
+        self._handshake_endpoints: dict[int, tuple[str, str]] = {}
+        self._handshake_seen: set[int] = set()  # Track which stage IDs have completed ZMQ handshake
+        self._single_stage_id: int | None = None  # Optional: deploy only a specific stage ID
 
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
@@ -187,35 +250,27 @@ class OmniBase:
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
         return default_stage_cfg
 
-    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Initialize stage list management."""
-        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
-        shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
-        init_timeout = kwargs.get("init_timeout", 300)
-        worker_backend = kwargs.get("worker_backend", "multi_process")
-        ray_address = kwargs.get("ray_address", None)
-        batch_timeout = kwargs.get("batch_timeout", 10)
+    def _resolve_stage_configs(self, model: str, kwargs: dict[str, Any]) -> tuple[str, list[Any]]:
+        """Resolve stage configs and inject defaults shared by orchestrator/headless."""
+        # TODO(wuhang):
+        # Remove kwargs as parameters in the future.
+        # Use dataclass directly for engine args.
+
         stage_configs_path = kwargs.get("stage_configs_path", None)
-        log_stats = kwargs.get("log_stats", False)
 
-        ### base engine args
-        tokenizer = kwargs.get("tokenizer", None)
-
-        base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
+        # TTS-specific CLI overrides
+        self.tts_max_instructions_length: int | None = kwargs.get("tts_max_instructions_length", None)
 
         # Load stage configurations from YAML
-        if stage_configs_path is None:
-            self.config_path = resolve_model_config_path(model)
-            self.stage_configs = load_stage_configs_from_model(model, base_engine_args=base_engine_args)
-            if not self.stage_configs:
-                default_stage_cfg = self._create_default_diffusion_stage_cfg(kwargs)
-                self.stage_configs = OmegaConf.create(default_stage_cfg)
-        else:
-            self.config_path = stage_configs_path
-            self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model,
+            stage_configs_path,
+            kwargs,
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+        )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
-        for cfg in self.stage_configs:
+        for cfg in stage_configs:
             try:
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
@@ -231,8 +286,36 @@ class OmniBase:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                quantization_config = kwargs.get("quantization_config")
+                if quantization_config is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "quantization_config")
+                        or cfg.engine_args.quantization_config is None
+                    ):
+                        cfg.engine_args.quantization_config = quantization_config
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
+
+        return config_path, stage_configs
+
+    def _initialize_stages(self, model: str, kwargs: dict[str, Any]) -> None:
+        """Initialize stage list management."""
+        stage_init_timeout = kwargs.get("stage_init_timeout", 20)
+        shm_threshold_bytes = kwargs.get("shm_threshold_bytes", 65536)
+        init_timeout = kwargs.get("init_timeout", 300)
+        worker_backend = kwargs.get("worker_backend", "multi_process")
+        ray_address = kwargs.get("ray_address", None)
+        batch_timeout = kwargs.get("batch_timeout", 10)
+        log_stats = kwargs.get("log_stats", False)
+        self._single_stage_id = kwargs.get("stage_id", None)
+        self._zmq_master_address = kwargs.get("omni_master_address", None)
+        if self._zmq_master_address is None:
+            self._zmq_master_address = "127.0.0.1"
+            logger.info("No omni_master_address provided, defaulting to localhost (127.0.0.1)")
+        self._zmq_master_port = kwargs.get("omni_master_port", None)
+
+        # Resolve stage configs shared by orchestrator/headless paths.
+        self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
@@ -240,7 +323,7 @@ class OmniBase:
         )
 
         # Initialize stats paths
-        self._enable_stats: bool = bool(log_stats)
+        self.log_stats: bool = bool(log_stats)
 
         self.worker_backend = worker_backend
         self.ray_address = ray_address
@@ -262,7 +345,7 @@ class OmniBase:
         self.stage_list = [st for _, st in results]
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         self.output_modalities = [st.final_output_type for st in self.stage_list]
-        logger.debug(f"[{self._name}] Loaded {len(self.stage_list)} stages")
+        logger.info(f"[{self._name}] Loaded {len(self.stage_list)} stages")
 
         if self.worker_backend == "ray":
             self._queue_cls = get_ray_queue_class()
@@ -288,10 +371,38 @@ class OmniBase:
             self._ray_pg = create_placement_group(
                 number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
             )
+        else:
+            # Initialize ZMQ context
+            if self._zmq_ctx is None:
+                self._zmq_ctx = zmq.Context()
+
+            # Allocate endpoints for each stage
+            total_stages = len(self.stage_configs)
+            self._handshake_endpoints = {}
+
+            # If --stage-id is not set, use local_only mode
+            local_only = self._single_stage_id is None
+
+            for sid in range(total_stages):
+                in_endpoint = get_engine_client_zmq_addr(local_only=local_only, host=self._zmq_master_address)
+                out_endpoint = get_engine_client_zmq_addr(local_only=local_only, host=self._zmq_master_address)
+                self._handshake_endpoints[sid] = (in_endpoint, out_endpoint)
+                logger.debug(
+                    f"[{self._name}] Allocated endpoints for stage-{sid}: in={in_endpoint}, out={out_endpoint}"
+                )
+
+            # Start handshake server
+            self.start_handshake_server()
 
         for stage_id, stage in enumerate[OmniStage](self.stage_list):
-            in_q = self._queue_cls()
-            out_q = self._queue_cls()
+            if self.worker_backend == "ray":
+                in_q = self._queue_cls()
+                out_q = self._queue_cls()
+            else:
+                in_endpoint, out_endpoint = self._handshake_endpoints[stage_id]
+                in_q = ZmqQueue(self._zmq_ctx, zmq.PUSH, bind=in_endpoint)
+                out_q = ZmqQueue(self._zmq_ctx, zmq.PULL, bind=out_endpoint)
+
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
             stage.attach_queues(in_q, out_q)
@@ -313,6 +424,12 @@ class OmniBase:
             except Exception as e:
                 logger.debug("[Omni] Failed to inject omni connector config into stage-%s: %s", stage_id, e)
 
+            if self._single_stage_id is not None and stage_id != int(self._single_stage_id):
+                logger.info(
+                    f"[{self._name}] Skipping initialization of stage-{stage_id} worker due to single_stage_id setting"
+                )
+                continue
+
             stage.init_stage_worker(
                 model,
                 is_async=self.is_async,
@@ -322,6 +439,7 @@ class OmniBase:
                 connectors_config=stage_connectors_config,
                 worker_backend=self.worker_backend,
                 ray_placement_group=self._ray_pg,
+                ignore_runtime_config=True if self._single_stage_id is not None else False,
             )
 
             logger.debug(f"[{self._name}] Stage-{stage_id} process started")
@@ -332,6 +450,9 @@ class OmniBase:
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
         """Wait for all stages to report readiness with optimized polling."""
+        if self._single_stage_id is not None and self.worker_backend != "ray":
+            timeout = self._wait_for_handshakes(timeout)
+
         num_stages = len(self.stage_list)
         deadline = time.time() + max(0, int(timeout))
 
@@ -376,6 +497,22 @@ class OmniBase:
 
         logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
 
+    def _is_profiler_enabled(self, stage_id: int) -> bool:
+        """Check if profiler config is set for a given stage."""
+        stage = self.stage_list[stage_id]
+        # For diffusion stages, profiling is controlled by VLLM_TORCH_PROFILER_DIR env var
+        if stage.stage_type == "diffusion":
+            return True
+        # For LLM stages, check if profiler_config is set in engine_args
+        engine_args = getattr(stage.stage_config, "engine_args", None)
+        if engine_args is None:
+            return False
+        profiler_config = getattr(engine_args, "profiler_config", None)
+        if profiler_config is None:
+            return False
+        profiler = getattr(profiler_config, "profiler", None)
+        return profiler is not None
+
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.
 
@@ -400,6 +537,13 @@ class OmniBase:
 
         for stage_id in stages:
             if stage_id < len(self.stage_list):
+                if not self._is_profiler_enabled(stage_id):
+                    logger.info(
+                        "[%s] Skipping start_profile for stage-%s: profiler config not set",
+                        self._name,
+                        stage_id,
+                    )
+                    continue
                 try:
                     self.stage_list[stage_id].submit({"type": OmniStageTaskType.PROFILER_START})
                     logger.info("[%s] Sent start_profile to stage-%s", self._name, stage_id)
@@ -423,6 +567,13 @@ class OmniBase:
 
         for stage_id in stages:
             if stage_id < len(self.stage_list):
+                if not self._is_profiler_enabled(stage_id):
+                    logger.info(
+                        "[%s] Skipping stop_profile for stage-%s: profiler config not set",
+                        self._name,
+                        stage_id,
+                    )
+                    continue
                 stage = self.stage_list[stage_id]
 
                 # Check if the stage object has our new bridge method
@@ -482,6 +633,129 @@ class OmniBase:
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
+    def _process_handshake_message(self, msg: Any) -> dict[str, Any]:
+        """Process incoming handshake message and generate response.
+
+        Args:
+            msg: Decoded message from client
+
+        Returns:
+            Response dictionary with ok status and either endpoints or error
+        """
+        if not isinstance(msg, dict) or msg.get("type") != "handshake":
+            return {"ok": False, "error": "invalid handshake payload"}
+
+        try:
+            stage_id = int(msg.get("stage_id"))
+        except (TypeError, ValueError) as e:
+            return {"ok": False, "error": f"invalid stage_id: {e}"}
+
+        endpoints = self._handshake_endpoints.get(stage_id)
+        if endpoints is None:
+            return {"ok": False, "error": f"unknown stage_id: {stage_id}"}
+
+        # Mark stage as seen and prepare success response
+        self._handshake_seen.add(stage_id)
+        in_endpoint, out_endpoint = endpoints
+
+        logger.info(
+            "[%s] Handshake received from stage-%s",
+            self._name,
+            stage_id,
+        )
+
+        return {
+            "ok": True,
+            "in_endpoint": in_endpoint,
+            "out_endpoint": out_endpoint,
+        }
+
+    def _run_handshake_server_loop(self) -> None:
+        """Main loop for handshake server - polls for messages and responds."""
+        poller = zmq.Poller()
+        poller.register(self._zmq_handshake_socket, zmq.POLLIN)
+
+        try:
+            while not self._handshake_stop.is_set():
+                events = poller.poll(1000)
+                has_message = any(sock == self._zmq_handshake_socket and event == zmq.POLLIN for sock, event in events)
+                if not has_message:
+                    continue
+
+                msg = msgspec.msgpack.decode(self._zmq_handshake_socket.recv())
+                response = msgspec.msgpack.encode(self._process_handshake_message(msg))
+                self._zmq_handshake_socket.send(response)
+        finally:
+            poller.unregister(self._zmq_handshake_socket)
+
+    def start_handshake_server(self) -> None:
+        """Start the ZMQ handshake server.
+
+        The handshake server allows distributed stages to discover their
+        queue endpoints by querying the orchestrator with their stage_id.
+        Skips starting if the server is already running or ZMQ is not initialized.
+        """
+        # Skip if already running or ZMQ not initialized
+        if self._handshake_thread is not None or self._zmq_ctx is None:
+            return
+
+        # Skip if master address/port not configured
+        if not self._zmq_master_address or self._zmq_master_port is None:
+            return
+
+        # Create server endpoint and socket
+        endpoint = get_engine_client_zmq_addr(
+            local_only=False, host=self._zmq_master_address, port=int(self._zmq_master_port)
+        )
+
+        self._handshake_stop = threading.Event()
+        self._zmq_handshake_socket = make_zmq_socket(self._zmq_ctx, endpoint, zmq.REP, bind=True, linger=5000)
+
+        # Start server thread
+        self._handshake_thread = threading.Thread(
+            target=self._run_handshake_server_loop, daemon=True, name="zmq-handshake-server"
+        )
+        self._handshake_thread.start()
+
+    def _wait_for_handshakes(self, timeout: int = 120) -> int:
+        """Wait for handshakes from all expected stages.
+
+        Args:
+            timeout: Timeout in seconds for waiting for handshakes. Default is 120s.
+
+        Returns:
+            Remaining timeout in seconds after waiting for handshakes.
+        """
+        total_stages = len(self.stage_configs)
+        expected = set(range(total_stages)) - {int(self._single_stage_id)}
+        if not expected:
+            return timeout
+
+        deadline = time.time() + max(0, int(timeout))
+        logger.info(f"[{self._name}] Waiting for handshakes from stages: {expected} (timeout: {timeout}s)")
+
+        # NOTE: _handshake_seen may be updated from the handshake server thread.
+        # It is intentionally used here without additional locking because:
+        #   - _handshake_seen only ever grows (stages are added but never removed), and
+        #   - we only check membership and set inclusion relative to `expected`.
+        # Under these monotonic semantics and the CPython GIL, concurrent reads/writes
+        # are safe for this usage and cannot violate correctness: we may observe a
+        # slightly stale view, but the loop condition remains valid and eventually
+        # becomes true once all expected stages have handshaked or the timeout elapses.
+        while not expected.issubset(self._handshake_seen) and time.time() < deadline:
+            time.sleep(1.0)
+
+        remaining_timeout = max(0, int(deadline - time.time()))
+
+        if not expected.issubset(self._handshake_seen):
+            missing = sorted(expected - self._handshake_seen)
+            logger.warning(
+                f"[{self._name}] Handshake timeout: {len(self._handshake_seen)}/{len(expected)} "
+                f"stages completed handshake. Missing stages: {missing}"
+            )
+
+        return remaining_timeout
+
     @property
     def _name(self) -> str:
         return "OmniBase"
@@ -527,7 +801,12 @@ class Omni(OmniBase):
             _weak_close_cleanup,
             self.stage_list,
             self._stage_in_queues,
+            self._stage_out_queues,
             self._ray_pg,
+            self._zmq_ctx,
+            self._handshake_stop,
+            self._zmq_handshake_socket,
+            self._handshake_thread,
         )
 
     @overload
@@ -657,6 +936,13 @@ class Omni(OmniBase):
         _req_start_ts: dict[str, float] = {}
         _wall_start_ts: float = time.time()
 
+        # CFG companion tracking (prompt expansion + lifecycle management)
+        cfg = CfgCompanionTracker(
+            prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
+            stage0_sampling_params=sampling_params_list[0],
+        )
+        expanded_companions = cfg.expand_prompts(request_id_to_prompt)
+
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
         final_stage_id_to_prompt: dict[str, int] = {}
         for rid, prompt in request_id_to_prompt.items():
@@ -670,10 +956,11 @@ class Omni(OmniBase):
             final_stage_id_to_prompt[rid] = final_stage_id_for_e2e
 
         # Metrics/aggregation helper
-        metrics = OrchestratorMetrics(
+        metrics = OrchestratorAggregator(
             num_stages,
-            self._enable_stats,
+            self.log_stats,
             _wall_start_ts,
+            final_stage_id_to_prompt,
         )
 
         it = request_id_to_prompt.items()
@@ -697,6 +984,18 @@ class Omni(OmniBase):
             _req_start_ts[req_id] = time.time()
             logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
 
+        # Submit CFG companion requests to stage-0
+        if cfg.is_active:
+            for companion_id, companion_prompt in expanded_companions:
+                task = {
+                    "request_id": companion_id,
+                    "engine_inputs": companion_prompt,
+                    "sampling_params": cfg.stage0_sampling_params,
+                }
+                self.stage_list[0].submit(task)
+                _req_start_ts[companion_id] = time.time()
+                logger.debug(f"[{self._name}] Enqueued CFG companion {companion_id} to stage-0")
+
         pbar = None
         if use_tqdm:
             tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
@@ -708,7 +1007,7 @@ class Omni(OmniBase):
             )
         # For each stage, forward results to next stage; collect finals at the end
         # We pipeline by continually polling output queues in stage order
-        remaining_by_stage: list[int] = [len(request_prompts)] + [0] * (num_stages - 1)
+        remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [0] * (num_stages - 1)
         completed_requests = 0
         total_requests = len(request_prompts)
 
@@ -728,6 +1027,14 @@ class Omni(OmniBase):
                     logger.error(
                         f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
                     )
+                    if cfg.is_companion(req_id) and stage_id == 0:
+                        parent_id, parent_aborted = cfg.on_companion_error(req_id)
+                        if parent_aborted:
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {parent_id} aborted due to "
+                                f"companion failure ({completed_requests}/{total_requests})",
+                            )
                     continue
 
                 if result.get("type") == "stage_ready":
@@ -736,15 +1043,43 @@ class Omni(OmniBase):
                     time.sleep(0.05)
                     continue
 
+                # CFG: companion requests only run through Stage-0
+                if cfg.is_companion(req_id) and stage_id == 0:
+                    ready_parent = cfg.on_companion_completed(req_id)
+                    if ready_parent is not None:
+                        success = cfg.forward_parent_with_cfg(
+                            ready_parent,
+                            cfg.pop_pending_parent(ready_parent),
+                            self.stage_list,
+                            self.connectors,
+                            sampling_params_list,
+                            request_id_to_prompt,
+                            final_stage_id_to_prompt,
+                            metrics,
+                            remaining_by_stage,
+                        )
+                        if not success:
+                            cfg.consume_parent_failure(ready_parent)
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {ready_parent} dropped due to CFG forwarding failure "
+                                f"({completed_requests}/{total_requests})",
+                            )
+                    continue
+
                 engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
                 # Mark last output time for this stage whenever we receive outputs
                 metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, time.time())
                 try:
-                    _m = result.get("metrics")
+                    _m: StageRequestStats = result.get("metrics")
                     if _m is not None:
-                        if not isinstance(_m, dict):
-                            _m = asdict(_m)
-                        metrics.on_stage_metrics(stage_id, req_id, _m)
+                        # Accumulate generation time
+                        metrics.accumulated_gen_time_ms[req_id][stage_id] += _m.stage_gen_time_ms
+
+                        # For diffusion stages, we also accumulate diffusion time
+                        metrics.accumulate_diffusion_metrics(stage.stage_type, req_id, engine_outputs)
+
+                        metrics.on_stage_metrics(stage_id, req_id, _m, stage.final_output_type)
                         if pbar:
                             elapsed = pbar.format_dict["elapsed"] or 1e-6
                             # Aggregate total tokens/images across all stages
@@ -781,8 +1116,7 @@ class Omni(OmniBase):
                     # End-to-end timing and time-per-token for final output
                     # (only once per request at the designated final stage)
                     try:
-                        rid_key = str(req_id)
-                        if stage_id == final_stage_id_to_prompt[req_id] and rid_key not in metrics.e2e_done:
+                        if stage_id == final_stage_id_to_prompt[req_id]:
                             metrics.on_finalize_request(
                                 stage_id,
                                 req_id,
@@ -792,21 +1126,82 @@ class Omni(OmniBase):
                         logger.exception(
                             f"[{self._name}] Finalize request handling error for req {req_id} at stage {stage_id}: {e}",
                         )
-                    yield OmniRequestOutput(
+                    output_to_yield = OmniRequestOutput(
                         stage_id=stage_id,
                         final_output_type=stage.final_output_type,  # type: ignore[attr-defined]
                         request_output=engine_outputs,
                     )
 
-                next_stage_id = stage_id + 1
-                if next_stage_id <= final_stage_id_to_prompt[req_id]:
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
+                    # Record audio generated frames (only when finished)
                     try:
-                        next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
+                        finished = (
+                            engine_outputs.finished
+                            if hasattr(engine_outputs, "finished")
+                            else (
+                                engine_outputs[0].finished
+                                if isinstance(engine_outputs, list)
+                                and engine_outputs
+                                and hasattr(engine_outputs[0], "finished")
+                                else False
+                            )
+                        )
+                        if finished:
+                            metrics.record_audio_generated_frames(output_to_yield, stage_id, req_id)
                     except Exception as e:
                         logger.exception(
+                            f"[{self._name}] Failed to record audio metrics for req {req_id} at stage {stage_id}: {e}",
+                        )
+
+                    yield output_to_yield
+
+                next_stage_id = stage_id + 1
+                if next_stage_id <= final_stage_id_to_prompt[req_id]:
+                    # CFG: if this parent has companions, defer forwarding
+                    if cfg.has_companions(req_id) and stage_id == 0:
+                        if cfg.is_parent_failed(req_id):
+                            cfg.consume_parent_failure(req_id)
+                            completed_requests += 1
+                            logger.error(
+                                f"[{self._name}] Parent {req_id} skipped CFG forwarding due to "
+                                f"companion failure ({completed_requests}/{total_requests})",
+                            )
+                            continue
+
+                        if cfg.all_companions_done(req_id):
+                            success = cfg.forward_parent_with_cfg(
+                                req_id,
+                                {"engine_outputs": engine_outputs, "stage_id": stage_id},
+                                self.stage_list,
+                                self.connectors,
+                                sampling_params_list,
+                                request_id_to_prompt,
+                                final_stage_id_to_prompt,
+                                metrics,
+                                remaining_by_stage,
+                            )
+                            if not success:
+                                cfg.consume_parent_failure(req_id)
+                                completed_requests += 1
+                                logger.error(
+                                    f"[{self._name}] Parent {req_id} dropped due to CFG forwarding failure "
+                                    f"({completed_requests}/{total_requests})",
+                                )
+                        else:
+                            cfg.defer_parent(req_id, engine_outputs, stage_id)
+                        continue
+
+                    next_stage: OmniStage = self.stage_list[next_stage_id]
+                    try:
+                        # Derive inputs for the next stage, record preprocess time
+                        with metrics.stage_postprocess_timer(stage_id, req_id):
+                            next_inputs = next_stage.process_engine_inputs(
+                                self.stage_list, [request_id_to_prompt[req_id]]
+                            )
+                    except Exception as e:
+                        completed_requests += 1
+                        logger.exception(
                             f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e}",
+                            f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
                         )
                         continue
                     sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
@@ -833,6 +1228,7 @@ class Omni(OmniBase):
                             f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
                             "Configure a connector for this edge or inspect connector logs for details."
                         )
+
                     logger.debug(
                         f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
                     )
@@ -846,6 +1242,12 @@ class Omni(OmniBase):
                     logger.debug(
                         f"[{self._name}] Request {req_id} fully completed ({completed_requests}/{total_requests})",
                     )
+            for timed_out_id in cfg.check_timeouts():
+                completed_requests += 1
+                logger.error(
+                    f"[{self._name}] Parent {timed_out_id} timed out; counting as failed "
+                    f"({completed_requests}/{total_requests})",
+                )
 
             if not made_progress:
                 time.sleep(0.005)
@@ -856,8 +1258,7 @@ class Omni(OmniBase):
 
         # Summarize and print stats
         try:
-            summary = metrics.build_and_log_summary(final_stage_id_to_prompt)
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
+            metrics.build_and_log_summary()
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
 

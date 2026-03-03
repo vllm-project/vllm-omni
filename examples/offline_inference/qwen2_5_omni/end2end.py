@@ -322,7 +322,7 @@ def main(args):
         query_result = query_func()
     omni_llm = Omni(
         model=model_name,
-        log_stats=args.enable_stats,
+        log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
@@ -410,7 +410,7 @@ def main(args):
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
                 request_id = output.request_id
-                audio_tensor = output.multimodal_output["audio"]
+                audio_tensor = output.outputs[0].multimodal_output["audio"]
                 output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
@@ -439,7 +439,7 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--enable-stats",
+        "--log-stats",
         action="store_true",
         default=False,
         help="Enable writing detailed statistics (default: disabled)",

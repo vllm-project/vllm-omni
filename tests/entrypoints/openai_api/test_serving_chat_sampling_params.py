@@ -6,25 +6,26 @@ Tests that standard OpenAI API parameters (max_tokens, temperature, etc.)
 are correctly applied to the comprehension stage while preserving YAML defaults.
 """
 
-from unittest.mock import MagicMock
-
 import pytest
+from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def mock_comprehension_stage():
+def mock_comprehension_stage(mocker: MockerFixture):
     """Create a mock comprehension stage with is_comprehension=True."""
-    stage = MagicMock()
+    stage = mocker.MagicMock()
     stage.is_comprehension = True
     stage.model_stage = "comprehension"
     return stage
 
 
 @pytest.fixture
-def mock_other_stage():
+def mock_other_stage(mocker: MockerFixture):
     """Create a mock non-comprehension stage."""
-    stage = MagicMock()
+    stage = mocker.MagicMock()
     stage.is_comprehension = False
     stage.model_stage = "other"
     return stage
@@ -55,9 +56,15 @@ def default_other_params():
 
 
 @pytest.fixture
-def mock_engine_client(mock_comprehension_stage, mock_other_stage, default_comprehension_params, default_other_params):
+def mock_engine_client(
+    mock_comprehension_stage,
+    mock_other_stage,
+    default_comprehension_params,
+    default_other_params,
+    mocker: MockerFixture,
+):
     """Create mock engine client with stage_list and default_sampling_params_list."""
-    engine_client = MagicMock()
+    engine_client = mocker.MagicMock()
     engine_client.stage_list = [mock_comprehension_stage, mock_other_stage]
     engine_client.default_sampling_params_list = [
         default_comprehension_params,
@@ -78,15 +85,19 @@ def serving_chat(mock_engine_client):
 
 
 @pytest.fixture
-def mock_request():
+def mock_request(mocker: MockerFixture):
     """Create a mock request with all OpenAI sampling params set to None."""
-    request = MagicMock()
+    request = mocker.MagicMock()
     # OpenAI standard sampling fields
     request.temperature = None
     request.top_p = None
+    request.top_k = None
     request.max_tokens = None
+    request.min_tokens = None
     request.seed = None
+    request.ignore_eos = None
     request.stop = None
+    request.stop_token_ids = None
     request.frequency_penalty = None
     request.presence_penalty = None
     return request
@@ -104,9 +115,13 @@ def test_openai_sampling_fields_contains_expected_fields():
     expected_fields = {
         "temperature",
         "top_p",
+        "top_k",
         "max_tokens",
+        "min_tokens",
         "seed",
+        "ignore_eos",
         "stop",
+        "stop_token_ids",
         "frequency_penalty",
         "presence_penalty",
     }
@@ -234,20 +249,6 @@ def test_multiple_params_override_together(serving_chat, mock_request):
     assert comprehension_params.repetition_penalty == 1.05
 
 
-def test_yaml_custom_params_not_overridden_by_request(serving_chat, mock_request):
-    """Test that YAML custom params (top_k, repetition_penalty) are not affected."""
-    # Even if request has these attributes, they should not override YAML
-    # because they're not in _OPENAI_SAMPLING_FIELDS
-    mock_request.top_k = 100  # Not in allowlist
-    mock_request.repetition_penalty = 2.0  # Not in allowlist
-
-    result = serving_chat._build_sampling_params_list_from_request(mock_request)
-
-    comprehension_params = result[0]
-    assert comprehension_params.top_k == 1  # YAML default preserved
-    assert comprehension_params.repetition_penalty == 1.05  # YAML default preserved
-
-
 # =============================================================================
 # Tests for _apply_request_overrides
 # =============================================================================
@@ -298,35 +299,35 @@ def test_get_comprehension_stage_index_finds_first_stage(mock_engine_client):
     assert instance._get_comprehension_stage_index() == 0
 
 
-def test_get_comprehension_stage_index_finds_second_stage():
+def test_get_comprehension_stage_index_finds_second_stage(mocker: MockerFixture):
     """Test finding comprehension stage when it's at index 1."""
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     instance = object.__new__(OmniOpenAIServingChat)
 
-    other = MagicMock()
+    other = mocker.MagicMock()
     other.is_comprehension = False
-    comprehension = MagicMock()
+    comprehension = mocker.MagicMock()
     comprehension.is_comprehension = True
 
-    instance.engine_client = MagicMock()
+    instance.engine_client = mocker.MagicMock()
     instance.engine_client.stage_list = [other, comprehension]
 
     assert instance._get_comprehension_stage_index() == 1
 
 
-def test_get_comprehension_stage_index_raises_when_not_found():
+def test_get_comprehension_stage_index_raises_when_not_found(mocker: MockerFixture):
     """Test that ValueError is raised when no comprehension stage exists."""
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     instance = object.__new__(OmniOpenAIServingChat)
 
-    stage1 = MagicMock()
+    stage1 = mocker.MagicMock()
     stage1.is_comprehension = False
-    stage2 = MagicMock()
+    stage2 = mocker.MagicMock()
     stage2.is_comprehension = False
 
-    instance.engine_client = MagicMock()
+    instance.engine_client = mocker.MagicMock()
     instance.engine_client.stage_list = [stage1, stage2]
 
     with pytest.raises(ValueError, match="No comprehension stage"):

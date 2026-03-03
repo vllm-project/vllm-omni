@@ -19,7 +19,7 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
-    parser.add_argument("--prompt_type", default="text", choices=["text"])
+    parser.add_argument("--prompt-type", default="text", choices=["text"])
 
     parser.add_argument(
         "--modality",
@@ -36,7 +36,7 @@ def parse_args():
     )
 
     # OmniLLM init args
-    parser.add_argument("--enable-stats", action="store_true", default=False)
+    parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-sleep-seconds", type=int, default=20)
     parser.add_argument("--batch-timeout", type=int, default=5)
     parser.add_argument("--init-timeout", type=int, default=300)
@@ -45,6 +45,12 @@ def parse_args():
     parser.add_argument("--ray-address", type=str, default=None)
     parser.add_argument("--stage-configs-path", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
+
+    parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
+    parser.add_argument("--cfg-img-scale", type=float, default=1.5, help="Image CFG scale (default: 1.5)")
+    parser.add_argument(
+        "--negative-prompt", type=str, default=None, help="Negative prompt for CFG (default: empty prompt)"
+    )
 
     args = parser.parse_args()
     return args
@@ -102,6 +108,10 @@ def main():
                 seed=52,
                 need_kv_receive=False,
                 num_inference_steps=args.steps,
+                extra_args={
+                    "cfg_text_scale": args.cfg_text_scale,
+                    "cfg_img_scale": args.cfg_img_scale,
+                },
             ),
         )
 
@@ -120,7 +130,7 @@ def main():
 
         omni_kwargs.update(
             {
-                "log_stats": args.enable_stats,
+                "log_stats": args.log_stats,
                 "init_sleep_seconds": args.init_sleep_seconds,
                 "batch_timeout": args.batch_timeout,
                 "init_timeout": args.init_timeout,
@@ -152,13 +162,23 @@ def main():
                 # text2img
                 final_prompt_text = f"<|im_start|>{p}<|im_end|>"
                 prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
+                if args.negative_prompt is not None:
+                    prompt_dict["negative_prompt"] = args.negative_prompt
                 formatted_prompts.append(prompt_dict)
 
         params_list = omni.default_sampling_params_list
         if args.modality == "text2img":
             params_list[0].max_tokens = 1  # type: ignore # The first stage is a SamplingParam (vllm)
             if len(params_list) > 1:
-                params_list[1].num_inference_steps = args.steps  # type: ignore # The second stage is an OmniDiffusionSamplingParam
+                diffusion_params = params_list[1]
+                diffusion_params.num_inference_steps = args.steps  # type: ignore
+                extra = {
+                    "cfg_text_scale": args.cfg_text_scale,
+                    "cfg_img_scale": args.cfg_img_scale,
+                }
+                if args.negative_prompt is not None:
+                    extra["negative_prompt"] = args.negative_prompt
+                diffusion_params.extra_args = extra  # type: ignore
 
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 

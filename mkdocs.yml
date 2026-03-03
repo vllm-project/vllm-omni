@@ -8,7 +8,7 @@ repo_url: https://github.com/vllm-project/vllm-omni
 edit_uri: edit/main/docs/
 
 # Copyright
-copyright: Copyright &copy; 2025 vLLM-Omni Team
+copyright: Copyright &copy; 2026 vLLM-Omni Team
 
 # Theme
 theme:
@@ -59,6 +59,7 @@ hooks:
   - docs/mkdocs/hooks/generate_api_readme.py
   - docs/mkdocs/hooks/url_schemes.py
   - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/generate_argparse.py
 
 # Exclude include files from navigation warnings
 exclude_docs: |
@@ -94,6 +95,7 @@ plugins:
       exclude:
         - "re:vllm_omni\\._.*"  # Internal modules
         - "vllm_omni.diffusion.models.qwen_image"  # avoid importing vllm in mkdocs building
+        - "vllm_omni.diffusion.quantization"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.async_diffusion"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building

@@ -5,7 +5,7 @@ import io
 import json
 import os
 import random
-import sys
+import ssl
 import time
 import traceback
 from collections.abc import Iterable
@@ -39,9 +39,9 @@ get_samples_old = datasets.get_samples
 
 
 def get_samples(args, tokenizer):
-    if args.backend not in ["openai-chat-omni"]:
-        raise ValueError("benchmark is only supported on 'openai-chat-omni' backend.")
-    if args.dataset_name == "random-mm":
+    if args.backend not in ["openai-chat-omni", "openai-audio-speech"]:
+        return get_samples_old(args, tokenizer)
+    elif args.dataset_name == "random-mm":
         dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
         input_requests = dataset.sample(
             tokenizer=tokenizer,
@@ -71,6 +71,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    text_latency: float = 0.0
 
 
 async def async_request_openai_chat_omni_completions(
@@ -98,6 +99,13 @@ async def async_request_openai_chat_omni_completions(
     }
     _update_payload_common(payload, request_func_input)
 
+    response_format = payload.get("response_format", "wav")
+    if response_format == "pcm":
+        raise ValueError(
+            "pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead."
+        )
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -108,13 +116,13 @@ async def async_request_openai_chat_omni_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
-    generated_audio = ""
+    generated_audio = None
     ttft = 0.0
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
+    timestamp = st
     audio_generate_time = 0.0
-    audio_first_timestamp = st
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -133,7 +141,6 @@ async def async_request_openai_chat_omni_completions(
                             continue
 
                         chunk = message.removeprefix("data: ")
-
                         if chunk != "[DONE]":
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
@@ -148,11 +155,12 @@ async def async_request_openai_chat_omni_completions(
                                     else:
                                         output.itl.append(timestamp - most_recent_timestamp)
                                     generated_text += content or ""
+                                    most_recent_timestamp = timestamp
+                                    output.text_latency = timestamp - st
                                 elif modality == "audio":
                                     if output.audio_ttfp == 0.0:
-                                        audio_first_timestamp = timestamp
                                         output.audio_ttfp = timestamp - st
-                                    audio_generate_time = timestamp - audio_first_timestamp
+                                    audio_generate_time = timestamp - st
                                     if content != "":
                                         audio_bytes = base64.b64decode(content)
                                         seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
@@ -160,12 +168,12 @@ async def async_request_openai_chat_omni_completions(
                                             if generated_audio is None:
                                                 generated_audio = seg
                                             else:
-                                                generated_audio = seg + generated_audio
+                                                generated_audio = generated_audio + seg
 
-                            elif usage := data.get("usage"):
-                                output.output_tokens = usage.get("completion_tokens")
-                            most_recent_timestamp = timestamp
+                            if metrics := data.get("metrics"):
+                                output.output_tokens = metrics.get("num_tokens_out", 0)
 
+                output.latency = timestamp - st
                 output.generated_text = generated_text
                 if generated_audio is not None:
                     output.audio_duration = len(generated_audio) / 1000.0
@@ -181,16 +189,94 @@ async def async_request_openai_chat_omni_completions(
                     else:
                         output.audio_rtf = 0
                         logger.warning("Audio duration is zero")
-
                 output.success = True
-                output.latency = most_recent_timestamp - st
             else:
                 output.error = response.reason or ""
                 output.success = False
     except Exception:
         output.success = False
-        exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send request failed, reason is: {output.error}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_audio_speech(
+    request_func_input: RequestFuncInput, session: aiohttp.ClientSession, pbar: tqdm | None = None
+) -> MixRequestFuncOutput:
+    """Non-streaming request to /v1/audio/speech endpoint.
+
+    The endpoint returns raw audio bytes (e.g. WAV). Pass voice, instructions,
+    and other TTS-specific fields via ``extra_body``.
+    """
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
+
+    payload = {
+        "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
+        "input": request_func_input.prompt,
+    }
+    _update_payload_common(payload, request_func_input)
+
+    response_format = payload.get("response_format", "wav")
+    if response_format == "pcm":
+        raise ValueError(
+            "pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead."
+        )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(url=api_url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                audio_bytes = await response.read()
+                end_time = time.perf_counter()
+                output.latency = end_time - st
+                # ttft = latency since this is a non-streaming request
+                # hence there is no distinction between first and last token/audio
+                output.ttft = output.latency
+                output.audio_ttfp = output.latency
+
+                try:
+                    audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                    output.audio_duration = len(audio_segment) / 1000.0
+                    frame_width = audio_segment.frame_width
+                    if frame_width > 0:
+                        output.audio_frames = len(audio_segment.raw_data) // frame_width
+                    else:
+                        output.audio_frames = 0
+                        logger.warning("Audio frame width is zero")
+                    if output.audio_duration > 0:
+                        # rtf = audio_generate_time / audio_duration and
+                        # audio_generate_time = latency since this is a non-streaming request
+                        # so the time to receive last portion of audio is the latency
+                        output.audio_rtf = output.latency / output.audio_duration
+                    else:
+                        output.audio_rtf = 0
+                        logger.warning("Audio duration is zero")
+                    output.success = True
+                except Exception as e:
+                    output.success = False
+                    output.error = f"Failed to parse audio response: {e}"
+                    logger.error(f"ERROR: Failed to parse audio response: {e}")
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
         logger.error(f"ERROR: send request failed, reason is: {output.error}")
 
     if pbar:
@@ -201,6 +287,10 @@ async def async_request_openai_chat_omni_completions(
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
+
+ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
+if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
 
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
@@ -241,6 +331,7 @@ async def benchmark(
     ramp_up_start_rps: int | None = None,
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
+    ssl_context: ssl.SSLContext | bool | None = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -248,6 +339,7 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {endpoint_type}") from None
 
     # Reuses connections across requests to reduce TLS handshake overhead.
+    ssl_setting = ssl_context if ssl_context is not None else ("https://" in api_url)
     connector = aiohttp.TCPConnector(
         limit=max_concurrency or 0,
         limit_per_host=max_concurrency or 0,
@@ -256,7 +348,7 @@ async def benchmark(
         keepalive_timeout=60,
         enable_cleanup_closed=True,
         force_close=False,
-        ssl=("https://" in api_url),
+        ssl=ssl_setting,
     )
 
     session = aiohttp.ClientSession(
@@ -473,6 +565,9 @@ async def benchmark(
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
             "total_token_throughput": metrics.total_token_throughput,
+            "total_audio_duration_s": metrics.total_audio_duration_s,
+            "total_audio_frames": metrics.total_audio_frames,
+            "audio_throughput": metrics.audio_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "output_lens": actual_output_lens,
             "ttfts": [output.ttft for output in outputs],
@@ -505,8 +600,20 @@ async def benchmark(
         if metric_attribute_name not in selected_percentile_metrics:
             return
         is_audio_rtf = metric_attribute_name == "audio_rtf"
+        is_audio_duration = metric_attribute_name == "audio_duration"
 
-        suffix = "" if is_audio_rtf else "_ms"
+        suffix = "_ms"
+        if is_audio_duration:
+            suffix = "_s"
+        elif is_audio_rtf:
+            suffix = ""
+        mean_attr_name = f"mean_{metric_attribute_name}{suffix}"
+        mean_value = getattr(metrics, mean_attr_name, 0.0)
+        result[mean_attr_name] = mean_value
+
+        median_attr_name = f"median_{metric_attribute_name}{suffix}"
+        median_value = getattr(metrics, median_attr_name, 0.0)
+        result[median_attr_name] = median_value
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}"):
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value

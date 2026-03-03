@@ -88,6 +88,10 @@ class ImageGenerationRequest(BaseModel):
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    generator_device: str | None = Field(
+        default=None,
+        description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
+    )
 
     # vllm-omni extension for per-request LoRA.
     # This mirrors the `extra_body.lora` convention in /v1/chat/completions.
@@ -123,3 +127,5 @@ class ImageGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
+    output_format: str = Field(None, description="The output format of the image generation")
+    size: str = Field(None, description="The size of the image generated")

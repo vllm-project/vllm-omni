@@ -1,5 +1,5 @@
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.14.0
+ARG VLLM_BASE_TAG=v0.16.0
 FROM ${VLLM_BASE_IMAGE}:${VLLM_BASE_TAG}
 ARG APP_DIR=/workspace/vllm-omni
 WORKDIR ${APP_DIR}
@@ -8,12 +8,13 @@ COPY . .
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
+    apt-get install -y ffmpeg git sox libsox-fmt-all jq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Install vllm-omni into the same uv-managed Python environment used by the base image.
-RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]"
+# Use bash -c so that $(python3 -c ...) is expanded inside the container.
+RUN uv pip install --system --no-cache-dir ".[dev]"
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

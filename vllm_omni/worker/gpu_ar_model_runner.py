@@ -13,7 +13,8 @@ import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -28,9 +29,6 @@ from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncGPUModelRunnerOutput,
     IntermediateTensors,
-    get_pp_group,
-    get_tp_group,
-    has_kv_transfer_group,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
@@ -52,7 +50,10 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     ec_connector_output: Any
     cudagraph_stats: Any
+    # OMNI: multimodal_outputs field for omni-specific multimodal handling
     multimodal_outputs: Any
+    # slot_mappings for attention/drafter (aligned with upstream v1 API)
+    slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
 class GPUARModelRunner(OmniGPUModelRunner):
@@ -191,15 +192,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
-            logger.debug(
-                "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                "should_ubatch: %s, num_tokens_across_dp: %s",
-                cudagraph_mode,
-                batch_desc,
-                should_ubatch,
-                num_tokens_across_dp,
-            )
-
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
@@ -210,16 +202,28 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 self.parallel_config.num_ubatches,
             )
 
-            logger.debug(
-                "ubatch_slices: %s, ubatch_slices_padded: %s",
-                ubatch_slices,
-                ubatch_slices_padded,
-            )
-
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
+
+            # True if any attention backend handles KV cache update separately
+            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
+            # slot_mappings must use padded dimensions to match the key/value tensors.
+            from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+
+            has_separate_kv_update = not all(
+                all(g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id])
+                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
+                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
+            )
+
+            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                num_tokens_padded=num_tokens_padded if pad_attn or has_separate_kv_update else num_tokens_unpadded,
+                num_reqs_padded=(num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs),
+                num_tokens_unpadded=num_tokens_unpadded,
+                ubatch_slices=ubatch_slices_padded,
+            )
 
             attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
@@ -232,6 +236,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                slot_mappings=slot_mappings_by_group,
             )
 
             (
@@ -262,6 +267,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -287,15 +293,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 aux_hidden_states = None
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
-            if multimodal_outputs is not None:
-                keys_or_type = (
-                    list(multimodal_outputs.keys())
-                    if isinstance(multimodal_outputs, dict)
-                    else type(multimodal_outputs)
-                )
-                logger.debug(f"[AR] execute_model: multimodal_outputs keys = {keys_or_type}")
-            else:
-                logger.debug("[AR] execute_model: multimodal_outputs is None")
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -368,6 +365,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: pass slot_mappings for drafter
         )
         self.kv_connector_output = kv_connector_output
 
@@ -410,12 +408,21 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs,
+            slot_mappings,  # OMNI: unpack slot_mappings for drafter
         ) = self.execute_model_state
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
+
+        # Correct padding values of prompt_token_ids to match the logits vocabulary size
+        if logits is not None and not self.input_batch.sampling_metadata.no_penalties:
+            smd = self.input_batch.sampling_metadata
+            if smd.prompt_token_ids is not None:
+                logits_vocab = logits.shape[-1]
+                if self.input_batch.vocab_size > logits_vocab:
+                    smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
@@ -436,6 +443,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    slot_mappings,  # OMNI: pass slot_mappings to drafter (upstream v1 API)
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -590,7 +598,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if not req_state:
             return req_id
 
-        add_info = getattr(req_state, "additional_information_cpu", {}) or {}
+        add_info = self.model_intermediate_buffer.get(req_id, {})
         global_id = add_info.get("global_request_id")
         if global_id:
             if isinstance(global_id, list) and global_id:

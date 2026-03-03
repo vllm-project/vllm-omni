@@ -1,0 +1,18 @@
+ARG VLLM_ASCEND_IMAGE=quay.io/ascend/vllm-ascend
+ARG VLLM_ASCEND_TAG=v0.14.0rc1
+FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
+
+WORKDIR /vllm-workspace/vllm-ascend
+RUN git checkout e2175d9c7e62b437391dfee996b1375674ba7c18
+RUN pip install -v -e .
+
+ARG APP_DIR=/vllm-workspace/vllm-omni
+WORKDIR ${APP_DIR}
+
+COPY . .
+
+RUN pip install -v -e .
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+ENTRYPOINT []

@@ -26,6 +26,7 @@ import numpy as np
 import PIL.Image
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -41,31 +42,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image", required=True, help="Path to input image.")
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
-    parser.add_argument("--negative_prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--guidance_scale", type=float, default=5.0, help="CFG scale.")
+    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG scale.")
     parser.add_argument(
-        "--guidance_scale_high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
+        "--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
     )
     parser.add_argument(
         "--height", type=int, default=None, help="Video height (auto-calculated from image if not set)."
     )
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames.")
-    parser.add_argument("--num_inference_steps", type=int, default=50, help="Sampling steps.")
-    parser.add_argument("--boundary_ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
+    parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
+    parser.add_argument("--num-inference-steps", type=int, default=50, help="Sampling steps.")
+    parser.add_argument("--boundary-ratio", type=float, default=0.875, help="Boundary split ratio for MoE models.")
     parser.add_argument(
-        "--flow_shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+        "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
     )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
     parser.add_argument(
-        "--vae_use_slicing",
+        "--vae-use-slicing",
         action="store_true",
         help="Enable VAE slicing for memory optimization.",
     )
     parser.add_argument(
-        "--vae_use_tiling",
+        "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
     )
@@ -73,6 +74,64 @@ def parse_args() -> argparse.Namespace:
         "--enable-cpu-offload",
         action="store_true",
         help="Enable CPU offloading for diffusion models.",
+    )
+    parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help=("Enable Hybrid Sharded Data Parallel to shard model weights across GPUs. "),
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=-1,
+        help=(
+            "Number of GPUs to shard model weights across within each replica group. "
+            "-1 (default) auto-calculates as world_size / replicate_size. "
+        ),
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of replica groups for HSDP. Each replica holds a full sharded copy. "
+            "Default 1 means pure sharding (no replication). "
+        ),
     )
     return parser.parse_args()
 
@@ -109,19 +168,40 @@ def main():
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
+    )
     omni = Omni(
         model=args.model,
+        enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
         enable_cpu_offload=args.enable_cpu_offload,
+        parallel_config=parallel_config,
+        enforce_eager=args.enforce_eager,
     )
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
         omni.start_profile()
+
+    # Print generation configuration
+    print(f"\n{'=' * 60}")
+    print("Generation Configuration:")
+    print(f"  Model: {args.model}")
+    print(f"  Inference steps: {args.num_inference_steps}")
+    print(f"  Frames: {args.num_frames}")
+    print(f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size}")
+    print(f"  Video size: {args.width}x{args.height}")
+    print(f"{'=' * 60}\n")
 
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(

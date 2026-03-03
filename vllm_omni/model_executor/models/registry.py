@@ -50,8 +50,40 @@ _OMNI_MODELS = {
     ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
+        "qwen3_tts_talker",
+        "Qwen3TTSTalkerForConditionalGeneration",
+    ),
+    "Qwen3TTSTalkerForConditionalGeneration": (
         "qwen3_tts",
-        "Qwen3TTSModelForGeneration",
+        "qwen3_tts_talker",
+        "Qwen3TTSTalkerForConditionalGeneration",
+    ),
+    "Qwen3TTSCode2Wav": (
+        "qwen3_tts",
+        "qwen3_tts_code2wav",
+        "Qwen3TTSCode2Wav",
+    ),
+    ## mimo_audio
+    "MiMoAudioModel": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
+    "MiMoAudioLLMModel": (
+        "mimo_audio",
+        "mimo_audio_llm",
+        "MiMoAudioLLMForConditionalGeneration",
+    ),
+    "MiMoAudioToken2WavModel": (
+        "mimo_audio",
+        "mimo_audio_code2wav",
+        "MiMoAudioToken2WavForConditionalGenerationVLLM",
+    ),
+    ## glm_image
+    "GlmImageForConditionalGeneration": (
+        "glm_image",
+        "glm_image_ar",
+        "GlmImageForConditionalGeneration",
     ),
 }
 
