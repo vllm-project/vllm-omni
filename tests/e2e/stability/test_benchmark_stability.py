@@ -25,8 +25,12 @@ CONFIG_FILE_PATH = str(STABILITY_DIR / "stability_test.json")
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
     try:
-        with open(Path(config_path).resolve(), encoding="utf-8") as f:
-            return json.load(f)
+        abs_path = Path(config_path).resolve()
+        with open(abs_path, encoding="utf-8") as f:
+            configs = json.load(f)
+
+        return configs
+
     except json.JSONDecodeError as e:
         raise ValueError(f"JSON parsing error: {str(e)}")
     except FileNotFoundError:
@@ -35,15 +39,18 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
         raise RuntimeError(f"Failed to load configuration file: {str(e)}")
 
 
-def modify_stage(default_path: str, updates: dict | None, deletes: dict | None) -> str:
+def modify_stage(default_path, updates, deletes):
     kwargs = {}
     if updates is not None:
         kwargs["updates"] = updates
     if deletes is not None:
         kwargs["deletes"] = deletes
     if kwargs:
-        return modify_stage_config(default_path, **kwargs)
-    return default_path
+        path = modify_stage_config(default_path, **kwargs)
+    else:
+        path = default_path
+
+    return path
 
 
 def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
@@ -53,14 +60,16 @@ def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str
         test_name = config["test_name"]
         model = config["server_params"]["model"]
         stage_config_name = config["server_params"]["stage_config_name"]
-        stage_config_path = str(STAGE_CONFIGS_DIR / stage_config_name)
+        stage_config_path = str(STAGE_CONFIGS_DIR / stage_config_name)  # stability 使用本目录 stage_configs
         delete = config["server_params"].get("delete", None)
         update = config["server_params"].get("update", None)
         stage_config_path = modify_stage(stage_config_path, update, delete)
+
         server_param = (test_name, model, stage_config_path)
         if server_param not in seen:
             seen.add(server_param)
             unique_params.append(server_param)
+
     return unique_params
 
 
@@ -69,7 +78,10 @@ def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, di
     for config in configs:
         test_name = config["test_name"]
         if test_name not in mapping:
-            mapping[test_name] = {"test_name": test_name, "benchmark_params": []}
+            mapping[test_name] = {
+                "test_name": test_name,
+                "benchmark_params": [],
+            }
         mapping[test_name]["benchmark_params"].extend(config["benchmark_params"])
     return mapping
 
@@ -85,13 +97,13 @@ server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) i
 _omni_server_lock = threading.Lock()
 
 
-def get_benchmark_params_for_server(test_name: str) -> list[dict]:
+def get_benchmark_params_for_server(test_name: str) -> list:
     if test_name not in server_to_benchmark_mapping:
         return []
     return server_to_benchmark_mapping[test_name]["benchmark_params"]
 
 
-def create_benchmark_indices() -> list[tuple[str, int]]:
+def create_benchmark_indices():
     indices = []
     seen = set()
     for config in BENCHMARK_CONFIGS:
@@ -101,6 +113,7 @@ def create_benchmark_indices() -> list[tuple[str, int]]:
             params_list = get_benchmark_params_for_server(test_name)
             for idx in range(len(params_list)):
                 indices.append((test_name, idx))
+
     return indices
 
 
@@ -109,24 +122,27 @@ benchmark_indices = create_benchmark_indices()
 
 @pytest.fixture(scope="module")
 def omni_server(request):
-    """与 perf 相同：启动 OmniServer。"""
+    """Start vLLM-Omni server as a subprocess with actual model weights.
+    Uses session scope so the server starts only once for the entire test session.
+    Multi-stage initialization can take 10-20+ minutes.
+    """
     with _omni_server_lock:
         test_name, model, stage_config_path = request.param
-        print(f"Starting OmniServer for stability: {test_name}, model: {model}")
-        with OmniServer(
-            model,
-            ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"],
-        ) as server:
+
+        print(f"Starting OmniServer with test: {test_name}, model: {model}")
+
+        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
+
         print("OmniServer stopped")
 
 
 @pytest.fixture(params=benchmark_indices)
 def stability_benchmark_params(request, omni_server):
-    """与 perf 的 benchmark_params fixture 逻辑一致。"""
+    """Benchmark parameters fixture with proper parametrization (same as perf)."""
     test_name, param_index = request.param
 
     if test_name != omni_server.test_name:
@@ -142,7 +158,7 @@ def stability_benchmark_params(request, omni_server):
 
     current = param_index + 1
     total = len(all_params)
-    print(f"\n  Running stability benchmark {current}/{total} for {test_name}")
+    print(f"\n  Running benchmark {current}/{total} for {test_name}")
 
     return {"test_name": test_name, "params": all_params[param_index]}
 
