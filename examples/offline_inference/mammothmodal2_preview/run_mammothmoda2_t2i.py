@@ -49,20 +49,31 @@ class T2IGenConfig(NamedTuple):
 
 
 def load_t2i_generation_config(model_dir: str) -> T2IGenConfig:
-    """Load T2I token IDs from t2i_generation_config.json and config.json."""
+    """Load T2I token IDs from t2i_generation_config.json and config.json.
+
+    Supports both local directory paths and HuggingFace Hub model IDs.
+    """
     model_path = Path(model_dir)
 
-    gen_cfg_path = model_path / "t2i_generation_config.json"
-    if not gen_cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {gen_cfg_path}")
-    with gen_cfg_path.open(encoding="utf-8") as f:
-        gen_cfg = json.load(f)
+    def _read_json(filename: str) -> dict:
+        local = model_path / filename
+        if local.exists():
+            with local.open(encoding="utf-8") as f:
+                return json.load(f)
+        # Fall back to HuggingFace Hub when model_dir is a repo ID.
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise ImportError(
+                "huggingface_hub is required to load configs from HF Hub. "
+                "Install it with: pip install huggingface_hub"
+            ) from exc
+        cached = hf_hub_download(repo_id=model_dir, filename=filename)
+        with open(cached, encoding="utf-8") as f:
+            return json.load(f)
 
-    model_cfg_path = model_path / "config.json"
-    if not model_cfg_path.exists():
-        raise FileNotFoundError(f"Config not found: {model_cfg_path}")
-    with model_cfg_path.open(encoding="utf-8") as f:
-        llm_cfg = json.load(f).get("llm_config", {})
+    gen_cfg = _read_json("t2i_generation_config.json")
+    llm_cfg = _read_json("config.json").get("llm_config", {})
 
     return T2IGenConfig(
         eol_token_id=int(gen_cfg["eol_token_id"]),
