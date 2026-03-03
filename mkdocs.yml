@@ -173,5 +173,5 @@ extra_javascript:
 # Extra variables
 extra:
   vllm_version: 0.16.0
-  vllm_omni_version: 0.14.0
+  vllm_omni_version: 0.16.0
   vllm_ascend_version: 0.14.0rc1
