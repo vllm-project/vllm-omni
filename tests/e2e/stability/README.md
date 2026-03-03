@@ -6,16 +6,31 @@
 
 ### 长稳 Benchmark 用例
 
-- **`run_benchmark_duration.py`**：在指定时长内循环调用 `vllm bench serve --omni` 向已启动的服务发请求（benchmark 本身不支持「跑满 N 分钟」）。可单独跑或由 pytest 调用。
-- **`test_benchmark_stability.py`**：pytest 用例，先起 OmniServer，再在指定时长内跑上述脚本，断言无失败请求。时长由环境变量 `STABILITY_BENCHMARK_DURATION_SEC` 控制（默认 300 秒）。示例：
+与 **perf** 一致使用 `vllm bench serve --omni`，支持 **`--request-rate`**（请求速率）或 **`--max-concurrency`**（并发数）发请求；长稳额外增加**指定时长**：超过该时间后不再发送新请求，已发出的请求会等其完成。
+
+- **`stability_test.json`**：长稳用例配置（参考 `tests/perf/tests/test.json`），每个 `benchmark_params` 需包含 `duration_sec`，以及 `request_rate` 或 `max_concurrency` 之一。
+- **`run_benchmark_duration.py`**：在指定时长内按 request-rate 或 max-concurrency 调用 `vllm bench serve --omni`（通过环境变量 `VLLM_BENCH_MAX_DURATION_SEC` 限制时长）。可单独跑或由 pytest 调用。
+- **`test_benchmark_stability.py`**：pytest 用例，先起 OmniServer，再在指定时长内跑上述脚本，断言无失败请求。时长优先取环境变量 `STABILITY_BENCHMARK_DURATION_SEC`，否则用配置中的 `duration_sec`（默认 300 秒）。
+
+**示例：**
 
 ```bash
-# 默认约 5 分钟
+# 默认约 5 分钟（配置中的 duration_sec）
 pytest -s -v tests/e2e/stability/test_benchmark_stability.py
 
 # 配合资源监控跑 10 分钟
 export STABILITY_BENCHMARK_DURATION_SEC=600
 bash tests/e2e/stability/resource_monitor.sh run -- pytest -s -v tests/e2e/stability/test_benchmark_stability.py
+```
+
+**单独跑脚本（需先启动服务）：**
+
+```bash
+# 按 request-rate=1 跑 300 秒
+python tests/e2e/stability/run_benchmark_duration.py --duration 300 --request-rate 1 --port 8000
+
+# 按 max-concurrency=4 跑 600 秒
+python tests/e2e/stability/run_benchmark_duration.py --duration 600 --max-concurrency 4 --port 8000
 ```
 
 ## 如何查看？
