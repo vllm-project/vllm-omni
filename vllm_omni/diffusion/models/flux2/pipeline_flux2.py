@@ -908,12 +908,6 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             # And `torch.stack` automatically raises an exception for us
             prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
-        req_negative_prompt_embeds = [
-            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
-        ]
-        if any(p is not None for p in req_negative_prompt_embeds):
-            torch.stack(req_negative_prompt_embeds)
-
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt=prompt,
