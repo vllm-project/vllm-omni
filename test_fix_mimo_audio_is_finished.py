@@ -24,6 +24,10 @@ import torch
 # Worktree root
 WORKTREE = os.path.dirname(os.path.abspath(__file__))
 
+# Will be set in setUpModule / restored in tearDownModule
+_saved_sys_modules = None
+llm2code2wav_async_chunk = None
+
 
 def _load_module_directly(module_name: str, file_path: str):
     """Load a Python module directly from file path, bypassing package __init__.py."""
@@ -63,12 +67,22 @@ def _load_module_directly(module_name: str, file_path: str):
     return mod
 
 
-# Load the target module
-MIMO_AUDIO_PATH = os.path.join(
-    WORKTREE, "vllm_omni", "model_executor", "stage_input_processors", "mimo_audio.py"
-)
-mimo_audio = _load_module_directly("mimo_audio_test_target", MIMO_AUDIO_PATH)
-llm2code2wav_async_chunk = mimo_audio.llm2code2wav_async_chunk
+def setUpModule():
+    """Snapshot sys.modules, then load the target module with stubs."""
+    global _saved_sys_modules, llm2code2wav_async_chunk
+    _saved_sys_modules = sys.modules.copy()
+
+    mimo_audio_path = os.path.join(
+        WORKTREE, "vllm_omni", "model_executor", "stage_input_processors", "mimo_audio.py"
+    )
+    mimo_audio = _load_module_directly("mimo_audio_test_target", mimo_audio_path)
+    llm2code2wav_async_chunk = mimo_audio.llm2code2wav_async_chunk
+
+
+def tearDownModule():
+    """Restore sys.modules to its original state so other tests are unaffected."""
+    sys.modules.clear()
+    sys.modules.update(_saved_sys_modules)
 
 
 class TestMiMoAudioIsFinishedParam(unittest.TestCase):
