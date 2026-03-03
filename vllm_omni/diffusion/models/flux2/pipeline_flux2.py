@@ -155,7 +155,7 @@ def format_input(
     prompts: list[str],
     system_message: str = SYSTEM_MESSAGE,
     images: list[PIL.Image.Image] | list[list[PIL.Image.Image]] = None,
-):
+) -> list[list[dict[str, Any]]]:
     """
     Format a batch of text prompts into the conversation format expected by apply_chat_template. Optionally, add images
     to the input.
@@ -166,7 +166,7 @@ def format_input(
         images (optional): List of images to add to the input.
 
     Returns:
-        List of conversations, where each conversation is a list of message dicts
+        `list[list[dict[str, Any]]]`: List of conversations, where each conversation is a list of message dicts
     """
     # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
     # when truncation is enabled. The processor counts [IMG] tokens and fails
@@ -271,7 +271,7 @@ def retrieve_timesteps(
     timesteps: list[int] | None = None,
     sigmas: list[float] | None = None,
     **kwargs,
-):
+) -> tuple[torch.Tensor, int]:
     r"""
     Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
     custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
@@ -292,7 +292,7 @@ def retrieve_timesteps(
             `num_inference_steps` and `timesteps` must be `None`.
 
     Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        `tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
