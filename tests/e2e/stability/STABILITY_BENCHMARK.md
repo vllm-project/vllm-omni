@@ -13,10 +13,11 @@
 
 ### 1.2 方案
 
-- 写一个**脚本** `run_benchmark_duration.py`：在指定时长内**循环**调用 `vllm bench serve --omni`，每轮发一批请求（batch），直到累计时间 ≥ 目标时长，然后汇总每批的完成数/失败数。
-- 写 **pytest 用例** `test_benchmark_stability.py`：先按配置启动 vLLM-Omni 服务（与 perf 用例形式一致），再 subprocess 调用上述脚本，根据汇总结果断言「无失败请求、至少有一定完成量」。
+- **benchmark 侧**（`vllm_omni/benchmarks/patch/patch.py`）：当环境变量 **`VLLM_BENCH_MAX_DURATION_SEC`** 有值时，在发起每个新请求前检查是否已超过该时长，超过则不再发起新请求，只等待已发出的请求完成后结束。这样与 perf 相同的 **request-rate**、**max-concurrency** 逻辑得以保留，同时满足「超过指定时间不再发新请求」。
+- **脚本** `run_benchmark_duration.py`：**单次**调用 `vllm bench serve --omni`，传入与 perf 一致的 `--request-rate`、`--max-concurrency` 及足够大的 `--num-prompts`，并在子进程中设置 `VLLM_BENCH_MAX_DURATION_SEC=duration_sec`，由 benchmark 内部按时长截断。
+- **pytest 用例** `test_benchmark_stability.py`：先按配置启动 vLLM-Omni 服务，再 subprocess 调用上述脚本，根据汇总结果断言「无失败请求、至少有一定完成量」。
 
-这样既复用了现有 benchmark 的请求协议与指标，又实现了「按时长跑」的长稳需求。
+这样与 perf 一致地支持发送速率与并发，又实现按时长截断、不杀进程。
 
 ---
 
@@ -24,9 +25,9 @@
 
 | 文件 | 作用 |
 |------|------|
-| **`run_benchmark_duration.py`** | 可独立运行的脚本：对**已启动**的服务，在指定时长内循环跑 benchmark，写每批结果 + 汇总 JSON。 |
+| **`run_benchmark_duration.py`** | 可独立运行的脚本：对**已启动**的服务，在指定时长内按「一个一个发」循环跑 benchmark，写每次请求结果 + 汇总 JSON。 |
 | **`test_benchmark_stability.py`** | Pytest 用例：从 config 读 server/参数，起 OmniServer，调脚本，做断言。形式对齐 `tests/perf/scripts/run_benchmark.py`（parametrize + indirect fixture）。 |
-| **`stability_config.json`** | 长稳用配置：定义 test_name、server_params（model、stage_config）、多组 `stability_benchmark_params`（时长、每批请求数、dataset 等）。 |
+| **`stability_config.json`** | 长稳用配置：定义 test_name、server_params（model、stage_config）、多组 `stability_benchmark_params`（时长、request_rate、dataset 等）。脚本内部为逐请求发送，不再使用「每批请求数」。 |
 | **`README.md`** | stability 目录总说明，内含「长稳 Benchmark 用例」小节及运行示例。 |
 
 与现有 stability 资源监控的关系：长稳用例可配合 `resource_monitor.sh run -- pytest ... test_benchmark_stability.py` 使用，在跑长稳的同时采集 GPU 等资源并生成 report.html。
@@ -41,14 +42,15 @@
 
 **核心逻辑**：
 
-1. **单批请求**（`run_one_benchmark_batch`）  
-   调用一次 `vllm bench serve --omni`，传入 `--host`、`--port`、`--model`、`--dataset-name`、`--num-prompts`、`--request-rate` 以及透传的 `--random-input-len`、`--random-output-len`、`--ignore-eos` 等，得到该批的 result JSON（completed/failed 等），并记录本批耗时。
+1. **一个一个发**（`run_one_benchmark_batch` 每次只发 1 个请求）  
+   每次调用 = **只发 1 个请求**（`--num-prompts 1`）。即调用一次 `vllm bench serve --omni`，发完这 1 个请求后返回；得到该次的 result JSON（completed/failed 等），并记录耗时。这样一旦超过截止时间，下一轮循环直接 break，**不会再有新的请求被发出**。
 
 2. **按时长循环**（`run_benchmark_duration`）  
-   - 从 `start_wall` 开始，在 `while True` 里不断调用 `run_one_benchmark_batch`。  
-   - 每批结果累加 `total_completed`、`total_failed`，并追加到 `batch_results`。  
-   - 当 `time.perf_counter() - start_wall >= duration_sec` 时退出循环。  
-   - 最后写 `stability_summary.json`，包含：`total_duration_sec`、`total_completed`、`total_failed`、`batches_run`、`batch_results`。  
+   - 从 `start_wall` 开始，在 `while True` 里：  
+     - **先判断**：若已 `>= duration_sec`，直接 break，**不再发送任何新请求**。  
+     - 否则调用 `run_one_benchmark_batch(..., num_prompts_per_batch=1)` 发 1 个请求，等其完成后累加结果、进入下一轮。  
+   - 因此：**超过截止时间后不会发送新请求**；当前正在跑的那 1 个请求会跑完，然后脚本结束。  
+   - 最后写 `stability_summary.json`，包含：`total_duration_sec`、`total_completed`、`total_failed`、`requests_sent`、`batch_results`（每项对应 1 次请求）。  
    - 若 `total_failed > 0`，脚本 `sys.exit(1)`，便于上层用例或 CI 判断失败。
 
 **入口**：
@@ -62,14 +64,13 @@
 - `--duration-sec`：目标运行时长（秒）。  
 - `--host` / `--port` / `--model`：服务地址与模型。  
 - `--dataset-name`：benchmark 数据集（如 `random`、`random-mm`）。  
-- `--request-rate`：每批的 QPS。  
-- `--num-prompts-per-batch`：每批请求数。  
-- `--result-dir`：结果目录（每批 JSON + `stability_summary.json`）。  
+- `--request-rate`：单次 benchmark 调用的 QPS（每次仅 1 个请求时影响不大）。  
+- `--result-dir`：结果目录（每次请求一个 JSON + `stability_summary.json`）。  
 - 透传：`--random-input-len`、`--random-output-len`、`--ignore-eos`、`--max-concurrency` 等，与 benchmark 文档一致。
 
 **输出**：
 
-- 每批：`stability_batch_{batch_index}_{timestamp}.json`（benchmark 单次运行的结果）。  
+- 每次请求：`stability_batch_{request_index}_{timestamp}.json`（benchmark 单次运行、1 个请求的结果）。  
 - 汇总：`stability_summary.json`，供 pytest 读取并断言。
 
 ---
@@ -131,7 +132,7 @@
   - **`stability_benchmark_params`**：**数组**，每组会与当前场景的 server 组合跑一次长稳。  
     每组可包含（示例）：  
     - `duration_sec`：目标时长（秒），可被环境变量覆盖。  
-    - `num_prompts_per_batch`、`request_rate`、`dataset_name`。  
+    - `request_rate`、`dataset_name`。  
     - `random_input_len`、`random_output_len`、`ignore_eos` 等 benchmark 支持的参数。  
 
 当前示例：一个场景 `test_qwen3_omni_stability`，共用 `qwen3_omni.yaml`，两组 `stability_benchmark_params`（不同 batch 大小、QPS、input/output 长度），因此会跑 **1 个 server × 2 组参数 = 2 个** `test_benchmark_stability_duration` 用例实例。
@@ -193,7 +194,7 @@ test 读取 stability_summary.json → assert total_completed > 0 and total_fail
     `bash tests/e2e/stability/resource_monitor.sh run -- pytest -s -v tests/e2e/stability/test_benchmark_stability.py`
 
 - **单独跑脚本**（需先在本机起好 serve）：  
-  `python tests/e2e/stability/run_benchmark_duration.py --duration-sec 300 --host 127.0.0.1 --port 8080 --model Qwen/Qwen3-Omni-30B-A3B-Instruct --dataset-name random --request-rate 1 --num-prompts-per-batch 20 --random-input-len 100 --random-output-len 50 --ignore-eos`
+  `python tests/e2e/stability/run_benchmark_duration.py --duration-sec 300 --host 127.0.0.1 --port 8080 --model Qwen/Qwen3-Omni-30B-A3B-Instruct --dataset-name random --request-rate 1 --random-input-len 100 --random-output-len 50 --ignore-eos`
 
 ---
 

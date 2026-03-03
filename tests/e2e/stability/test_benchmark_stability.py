@@ -163,19 +163,19 @@ def stability_benchmark_params(request, omni_server):
 def _params_to_script_args(params: dict, duration_sec: float) -> list[str]:
     """把 stability_benchmark_params 里的一项转成 run_benchmark_duration.py 的命令行参数。
     duration_sec 由上层传入（已考虑环境变量 STABILITY_BENCHMARK_DURATION_SEC 优先）。
+    与 perf 一致：支持 request_rate、max_concurrency 等。
     """
     exclude = {"duration_sec", "baseline"}
     args = []
     args.extend(["--duration-sec", str(int(duration_sec))])
-
     args.extend(["--dataset-name", params.get("dataset_name", "random")])
-    args.extend(["--request-rate", str(params.get("request_rate", 1.0))])
-    args.extend(["--num-prompts-per-batch", str(params.get("num_prompts_per_batch", 20))])
+    rr = params.get("request_rate", 1.0)
+    args.extend(["--request-rate", "inf" if rr == float("inf") or rr == "inf" else str(rr)])
 
     for key, value in params.items():
         if key in exclude or value is None:
             continue
-        if key in ("dataset_name", "request_rate", "num_prompts_per_batch", "duration_sec"):
+        if key in ("dataset_name", "request_rate", "duration_sec"):
             continue
         arg_name = f"--{key.replace('_', '-')}"
         if isinstance(value, bool) and value:

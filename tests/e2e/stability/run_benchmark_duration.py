@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-长稳用例：在指定时长内循环运行 benchmark，向已启动的 vLLM-Omni 服务持续发送请求。
+长稳用例：在指定时长内运行 benchmark，向已启动的 vLLM-Omni 服务发请求。
 
-benchmark 自身只支持按请求数（--num-prompts）或按 QPS 发一批请求，不支持「跑满 N 分钟」。
-本脚本通过循环调用 vllm bench serve --omni，在达到目标时长前不断发 batch，用于长稳压测。
+与 perf 一致：支持 --request-rate（发送速率）和 --max-concurrency（并发数）。
+通过环境变量 VLLM_BENCH_MAX_DURATION_SEC 让 benchmark 在超过指定时长后不再发起新请求，
+已发出的请求会等其完成再结束。
 
 用法示例（需先启动 serve）:
   python run_benchmark_duration.py --duration-sec 300 --host 127.0.0.1 --port 8080 \\
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --dataset-name random \\
-    --request-rate 1 --num-prompts-per-batch 20 --random-input-len 100 --random-output-len 50
+    --request-rate 1 --max-concurrency 4 --random-input-len 100 --random-output-len 50
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -36,7 +38,7 @@ def _build_benchmark_args(
     num_prompts: int,
     extra: dict,
 ) -> list[str]:
-    """拼出 vllm bench serve --omni 的参数列表（不含 duration 相关）。"""
+    """拼出 vllm bench serve --omni 的参数列表。"""
     args = [
         "--host",
         host,
@@ -53,7 +55,7 @@ def _build_benchmark_args(
         "--num-prompts",
         str(num_prompts),
         "--request-rate",
-        str(request_rate),
+        "inf" if request_rate == float("inf") else str(request_rate),
         "--save-result",
     ]
     for k, v in extra.items():
@@ -72,56 +74,11 @@ def _build_benchmark_args(
     return args
 
 
-def run_one_benchmark_batch(
-    duration_sec: float,
-    host: str,
-    port: int,
-    model: str,
-    dataset_name: str,
-    request_rate: float,
-    num_prompts_per_batch: int,
-    extra_args: dict,
-    result_dir: Path,
-    batch_index: int,
-) -> tuple[dict, float]:
-    """跑一轮 benchmark（一批请求），返回 (result_dict, elapsed_sec)。"""
-    result_filename = (
-        f"stability_batch_{batch_index}_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    )
-    extra_with_filename = {**extra_args, "result_filename": result_filename}
-    args = _build_benchmark_args(
-        host=host,
-        port=port,
-        model=model,
-        dataset_name=dataset_name,
-        request_rate=request_rate,
-        num_prompts=num_prompts_per_batch,
-        extra=extra_with_filename,
-    )
-    args.extend(["--result-dir", str(result_dir)])
-    cmd = ["vllm", "bench", "serve", "--omni"] + args
-
-    start = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=max(60, duration_sec + 300),
-        cwd=REPO_ROOT,
-    )
-    elapsed = time.perf_counter() - start
-
-    result_path = result_dir / result_filename
-    if not result_path.exists():
-        return {
-            "completed": 0,
-            "failed": num_prompts_per_batch,
-            "error": proc.stderr or proc.stdout or f"exit code {proc.returncode}",
-        }, elapsed
-
-    with open(result_path, encoding="utf-8") as f:
-        result = json.load(f)
-    return result, elapsed
+def _estimate_num_prompts(duration_sec: float, request_rate: float) -> int:
+    """估计要准备的请求数，保证在 duration_sec 内有足够请求可发；benchmark 内会按 max_duration 提前停止发起新请求。"""
+    if request_rate == float("inf") or request_rate <= 0:
+        return max(500, int(duration_sec * 50))
+    return max(100, int(math.ceil(duration_sec * request_rate * 2)))
 
 
 def run_benchmark_duration(
@@ -131,77 +88,84 @@ def run_benchmark_duration(
     model: str,
     dataset_name: str = "random",
     request_rate: float = 1.0,
-    num_prompts_per_batch: int = 20,
     result_dir: Path | None = None,
     **extra_benchmark_args,
 ) -> dict:
-    """在指定时长内循环跑 benchmark，返回汇总结果。
+    """在指定时长内跑一次 benchmark（与 perf 同逻辑：request-rate + max-concurrency），超过 duration_sec 后不再发新请求。
+
+    通过环境变量 VLLM_BENCH_MAX_DURATION_SEC 传入时长，benchmark 内部在发起每个新请求前检查时间，超时则停止发起、等待已发出请求完成。
 
     Args:
-        duration_sec: 目标运行时长（秒），至少会跑满一个 batch。
+        duration_sec: 目标运行时长（秒）；超过后不再发起新请求。
         host: 服务 host。
         port: 服务 port。
         model: 模型名。
         dataset_name: benchmark 数据集名，如 random / random-mm。
-        request_rate: 每批的 QPS（--request-rate）。
-        num_prompts_per_batch: 每批请求数（--num-prompts）。
-        result_dir: 每轮结果 JSON 的目录；默认当前目录下的 stability_bench_result。
-        **extra_benchmark_args: 其它 benchmark 参数，如 random_input_len, random_output_len, ignore_eos。
+        request_rate: 发送速率（--request-rate），与 perf 一致；可为 inf 表示尽快发。
+        result_dir: 结果 JSON 目录；默认当前目录下的 stability_bench_result。
+        **extra_benchmark_args: 其它 benchmark 参数，如 max_concurrency, random_input_len, ignore_eos。
 
     Returns:
-        汇总 dict：total_duration_sec, total_completed, total_failed, batches_run, batch_results 等。
+        汇总 dict：total_duration_sec, total_completed, total_failed, batch_results 等。
     """
     if result_dir is None:
         result_dir = Path.cwd() / "stability_bench_result"
     result_dir = Path(result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
 
+    num_prompts = _estimate_num_prompts(duration_sec, request_rate)
+    result_filename = f"stability_duration_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    extra_with_filename = {**extra_benchmark_args, "result_filename": result_filename}
+    args = _build_benchmark_args(
+        host=host,
+        port=port,
+        model=model,
+        dataset_name=dataset_name,
+        request_rate=request_rate,
+        num_prompts=num_prompts,
+        extra=extra_with_filename,
+    )
+    args.extend(["--result-dir", str(result_dir)])
+    cmd = ["vllm", "bench", "serve", "--omni"] + args
+
+    env = os.environ.copy()
+    env["VLLM_BENCH_MAX_DURATION_SEC"] = str(duration_sec)
+
     start_wall = time.perf_counter()
-    total_completed = 0
-    total_failed = 0
-    batches_run = 0
-    batch_results = []
-
-    while True:
-        batch_index = batches_run + 1
-        result, elapsed = run_one_benchmark_batch(
-            duration_sec=duration_sec,
-            host=host,
-            port=port,
-            model=model,
-            dataset_name=dataset_name,
-            request_rate=request_rate,
-            num_prompts_per_batch=num_prompts_per_batch,
-            extra_args=extra_benchmark_args,
-            result_dir=result_dir,
-            batch_index=batch_index,
-        )
-        batches_run += 1
-        completed = result.get("completed", 0)
-        failed = result.get("failed", 0)
-        total_completed += completed
-        total_failed += failed
-        batch_results.append(
-            {
-                "batch": batch_index,
-                "completed": completed,
-                "failed": failed,
-                "elapsed_sec": round(elapsed, 2),
-            }
-        )
-
-        total_elapsed = time.perf_counter() - start_wall
-        if total_elapsed >= duration_sec:
-            break
-
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=max(60, int(duration_sec) + 600),
+        cwd=REPO_ROOT,
+    )
     total_duration = time.perf_counter() - start_wall
-    summary = {
-        "total_duration_sec": round(total_duration, 2),
-        "total_completed": total_completed,
-        "total_failed": total_failed,
-        "batches_run": batches_run,
-        "batch_results": batch_results,
-    }
+
+    result_path = result_dir / result_filename
+    if not result_path.exists():
+        summary = {
+            "total_duration_sec": round(total_duration, 2),
+            "total_completed": 0,
+            "total_failed": num_prompts,
+            "batch_results": [{"error": proc.stderr or proc.stdout or f"exit {proc.returncode}"}],
+        }
+    else:
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
+        summary = {
+            "total_duration_sec": round(result.get("duration", total_duration), 2),
+            "total_completed": result.get("completed", 0),
+            "total_failed": result.get("failed", 0),
+            "batch_results": [
+                {
+                    "completed": result.get("completed", 0),
+                    "failed": result.get("failed", 0),
+                    "elapsed_sec": round(result.get("duration", total_duration), 2),
+                }
+            ],
+        }
+
     summary_path = result_dir / "stability_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -221,13 +185,7 @@ def parse_args():
         "--request-rate",
         type=float,
         default=1.0,
-        help="每批的 QPS（--request-rate）",
-    )
-    parser.add_argument(
-        "--num-prompts-per-batch",
-        type=int,
-        default=20,
-        help="每批请求数（--num-prompts）",
+        help="发送速率（--request-rate），与 perf 一致；可用 inf 表示尽快发",
     )
     parser.add_argument(
         "--result-dir",
@@ -266,7 +224,6 @@ def main():
         model=args.model,
         dataset_name=args.dataset_name,
         request_rate=args.request_rate,
-        num_prompts_per_batch=args.num_prompts_per_batch,
         result_dir=result_dir,
         **extra,
     )
