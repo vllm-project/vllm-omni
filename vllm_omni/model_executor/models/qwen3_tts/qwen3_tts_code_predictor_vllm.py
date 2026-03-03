@@ -370,16 +370,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     def _maybe_init_kv_cache(self, device: torch.device) -> None:
         if self._kv_cache is not None:
             return
-        max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
-        # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
-        max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
-        max_batch = max(1, max_batch)
-        self._kv_cache = _LocalPredictorKVCache(
-            vllm_config=self._vllm_config,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch,
-            device=device,
-        )
+        with set_current_vllm_config(self._vllm_config):
+            max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
+            # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
+            max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
+            max_batch = max(1, max_batch)
+            self._kv_cache = _LocalPredictorKVCache(
+                vllm_config=self._vllm_config,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch,
+                device=device,
+            )
 
     @torch.inference_mode()
     def reset_cache(self) -> None:
