@@ -22,7 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
-from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2MLP
+from vllm.model_executor.models.qwen2 import Qwen2Attention, Qwen2MLP, Qwen2DecoderLayer
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLDummyInputsBuilder,
     Qwen2_5_VLForConditionalGeneration,
@@ -199,7 +199,7 @@ class MammothModa2ARMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
     """Reuse Qwen2.5-VL's multi-modal processing,"""
 
 
-class Mammoth2DecoderLayer(nn.Module):
+class Mammoth2DecoderLayer(Qwen2DecoderLayer):
     def __init__(
         self,
         config: Qwen2Config,
@@ -208,7 +208,7 @@ class Mammoth2DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         patch_rope_parameters(config)
         set_default_rope_theta(config, default_theta=1000000)
@@ -275,7 +275,7 @@ class Mammoth2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class MammothModa2Qwen2ForCausalLM(nn.Module):
+class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "", decoder_layer_type: type[nn.Module] = Mammoth2DecoderLayer
     ):
@@ -755,7 +755,7 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 # top-level Mammothmoda2Config, and the DiT module reads its own
                 # gen_dit_config / gen_vae_config dicts.
                 hf_config=cfg,
-                architectures=["MammothModa2DiTForConditionalGeneration"],
+                architectures=["MammothModa2DiTPipeline"],
             )
             self.model = self.dit
         elif self.model_stage == "vae":

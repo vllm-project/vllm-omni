@@ -19,7 +19,7 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 
-class MammothModa2DiTForConditionalGeneration(nn.Module):
+class MammothModa2DiTPipeline(nn.Module):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 

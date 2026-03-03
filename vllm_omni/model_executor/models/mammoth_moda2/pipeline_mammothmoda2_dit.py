@@ -6,10 +6,10 @@ with other ARDiT structured models. We keep this module path so existing
 OmniModelRegistry entries (and downstream code) keep working.
 """
 
-from vllm_omni.diffusion.models.mammoth_moda2.mammoth_moda2_dit import (  # noqa: F401
-    MammothModa2DiTForConditionalGeneration,
+from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (  # noqa: F401
+    MammothModa2DiTPipeline,
 )
 
 __all__ = [
-    "MammothModa2DiTForConditionalGeneration",
+    "MammothModa2DiTPipeline",
 ]
