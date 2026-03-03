@@ -9,6 +9,7 @@
 与 **perf** 一致使用 `vllm bench serve --omni`，支持 **`--request-rate`**（请求速率）或 **`--max-concurrency`**（并发数）发请求；长稳额外增加**指定时长**：超过该时间后不再发送新请求，已发出的请求会等其完成。
 
 - **`stability_test.json`**：长稳用例配置（参考 `tests/perf/tests/test.json`），每个 `benchmark_params` 需包含 `duration_sec`，以及 `request_rate` 或 `max_concurrency` 之一。
+- **`stage_configs/`**：本目录下的 stage 配置（如 `qwen3_omni.yaml`），长稳用例只读取此目录，不依赖 `tests/perf`。
 - **`run_benchmark_duration.py`**：在指定时长内按 request-rate 或 max-concurrency 调用 `vllm bench serve --omni`（通过环境变量 `VLLM_BENCH_MAX_DURATION_SEC` 限制时长）。可单独跑或由 pytest 调用。
 - **`test_benchmark_stability.py`**：pytest 用例，先起 OmniServer，再在指定时长内跑上述脚本，断言无失败请求。时长优先取环境变量 `STABILITY_BENCHMARK_DURATION_SEC`，否则用配置中的 `duration_sec`（默认 300 秒）。
 

@@ -2,6 +2,10 @@
 长稳用例：先起 OmniServer，再在指定时长内按 request-rate 或 max-concurrency 跑 benchmark，
 超过时长后不再发新请求，断言无失败请求。
 
+与 perf 逻辑一致：load_configs、modify_stage、create_unique_server_params、create_test_parameter_mapping、
+get_benchmark_params_for_server、create_benchmark_indices、omni_server fixture 与 perf 相同，
+仅 run_benchmark（此处为 run_stability_benchmark 带时长）和测试用例不同。不修改 tests/perf。
+
 时长可由环境变量 STABILITY_BENCHMARK_DURATION_SEC 覆盖配置中的 duration_sec（默认 300）。
 """
 import json
@@ -14,16 +18,21 @@ import pytest
 
 from tests.conftest import OmniServer, modify_stage_config
 
-# 与 perf 共用 stage_configs，路径指向 tests/perf/stage_configs
 STABILITY_DIR = Path(__file__).resolve().parent
-TESTS_ROOT = STABILITY_DIR.parent.parent
-PERF_STAGE_CONFIGS = TESTS_ROOT / "perf" / "stage_configs"
+STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"
 CONFIG_FILE_PATH = str(STABILITY_DIR / "stability_test.json")
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
-    with open(Path(config_path).resolve(), encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(Path(config_path).resolve(), encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON parsing error: {str(e)}")
+    except FileNotFoundError:
+        raise ValueError(f"Configuration file not found: {config_path}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load configuration file: {str(e)}")
 
 
 def modify_stage(default_path: str, updates: dict | None, deletes: dict | None) -> str:
@@ -44,7 +53,7 @@ def create_unique_server_params(configs: list[dict[str, Any]]) -> list[tuple[str
         test_name = config["test_name"]
         model = config["server_params"]["model"]
         stage_config_name = config["server_params"]["stage_config_name"]
-        stage_config_path = str(PERF_STAGE_CONFIGS / stage_config_name)
+        stage_config_path = str(STAGE_CONFIGS_DIR / stage_config_name)
         delete = config["server_params"].get("delete", None)
         update = config["server_params"].get("update", None)
         stage_config_path = modify_stage(stage_config_path, update, delete)
@@ -100,7 +109,7 @@ benchmark_indices = create_benchmark_indices()
 
 @pytest.fixture(scope="module")
 def omni_server(request):
-    """启动 OmniServer，与 perf 相同方式。"""
+    """与 perf 相同：启动 OmniServer。"""
     with _omni_server_lock:
         test_name, model, stage_config_path = request.param
         print(f"Starting OmniServer for stability: {test_name}, model: {model}")
@@ -115,14 +124,26 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
-@pytest.fixture(params=benchmark_indices if benchmark_indices else [])
+@pytest.fixture(params=benchmark_indices)
 def stability_benchmark_params(request, omni_server):
+    """与 perf 的 benchmark_params fixture 逻辑一致。"""
     test_name, param_index = request.param
+
     if test_name != omni_server.test_name:
-        pytest.skip(f"Skipping {test_name} - current server is {omni_server.test_name}")
+        pytest.skip(f"Skipping parameter for {test_name} - current server is {omni_server.test_name}")
+
     all_params = get_benchmark_params_for_server(test_name)
-    if not all_params or param_index >= len(all_params):
-        raise ValueError(f"No benchmark params for {test_name} at index {param_index}")
+
+    if not all_params:
+        raise ValueError(f"No benchmark parameters found for test: {test_name}")
+
+    if param_index >= len(all_params):
+        raise ValueError(f"No benchmark parameters found for index {param_index} in test: {test_name}")
+
+    current = param_index + 1
+    total = len(all_params)
+    print(f"\n  Running stability benchmark {current}/{total} for {test_name}")
+
     return {"test_name": test_name, "params": all_params[param_index]}
 
 
@@ -138,8 +159,11 @@ def test_benchmark_stability(omni_server, stability_benchmark_params):
     request_rate = params.get("request_rate")
     max_concurrency = params.get("max_concurrency")
 
-    # 构建 benchmark 参数字典（去掉 duration_sec / request_rate / max_concurrency，传给 run_stability_benchmark 的 params）
-    bench_params = {k: v for k, v in params.items() if k not in ("duration_sec", "request_rate", "max_concurrency")}
+    bench_params = {
+        k: v
+        for k, v in params.items()
+        if k not in ("duration_sec", "request_rate", "max_concurrency")
+    }
 
     result = run_stability_benchmark(
         host=omni_server.host,
