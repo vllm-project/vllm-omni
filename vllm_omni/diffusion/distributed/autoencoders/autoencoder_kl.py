@@ -200,19 +200,11 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 
 
-class DistributedAutoencoderKL(Diffusers_AutoencoderKL, DistributedAutoencoderKL_base):
-    @classmethod
-    def from_pretrained(cls, *args: Any, **kwargs: Any):
-        model = super().from_pretrained(*args, **kwargs)
-        model.init_distributed()
-        return model
+class DistributedAutoencoderKL(DistributedAutoencoderKL_base, Diffusers_AutoencoderKL):
+    pass
 
 
 # Next_Step_AutoencoderKL not support tiling now, so we currently disable it.
 
-# class DistributedAutoencoderKL_NextStep(Next_Step_AutoencoderKL, DistributedAutoencoderKL_base):
-#     @classmethod
-#     def from_pretrained(cls, *args: Any, **kwargs: Any):
-#         model = super().from_pretrained(*args, **kwargs)
-#         model.init_distributed()
-#         return model
+# class DistributedAutoencoderKL_NextStep(DistributedAutoencoderKL_base, Next_Step_AutoencoderKL):
+#    pass
