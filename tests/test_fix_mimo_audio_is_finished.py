@@ -21,8 +21,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-# Worktree root
-WORKTREE = os.path.dirname(os.path.abspath(__file__))
+# Repository root (one level up from tests/)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Will be set in setUpModule / restored in tearDownModule
 _saved_sys_modules = None
@@ -73,7 +73,7 @@ def setUpModule():
     _saved_sys_modules = sys.modules.copy()
 
     mimo_audio_path = os.path.join(
-        WORKTREE, "vllm_omni", "model_executor", "stage_input_processors", "mimo_audio.py"
+        REPO_ROOT, "vllm_omni", "model_executor", "stage_input_processors", "mimo_audio.py"
     )
     mimo_audio = _load_module_directly("mimo_audio_test_target", mimo_audio_path)
     llm2code2wav_async_chunk = mimo_audio.llm2code2wav_async_chunk
