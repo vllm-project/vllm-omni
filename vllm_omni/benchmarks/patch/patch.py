@@ -6,7 +6,6 @@ import json
 import os
 import random
 import ssl
-import sys
 import time
 import traceback
 from collections.abc import Iterable
@@ -40,9 +39,9 @@ get_samples_old = datasets.get_samples
 
 
 def get_samples(args, tokenizer):
-    if args.backend not in ["openai-chat-omni"]:
-        raise ValueError("benchmark is only supported on 'openai-chat-omni' backend.")
-    if args.dataset_name == "random-mm":
+    if args.backend not in ["openai-chat-omni", "openai-audio-speech"]:
+        return get_samples_old(args, tokenizer)
+    elif args.dataset_name == "random-mm":
         dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
         input_requests = dataset.sample(
             tokenizer=tokenizer,
@@ -99,6 +98,13 @@ async def async_request_openai_chat_omni_completions(
         },
     }
     _update_payload_common(payload, request_func_input)
+
+    response_format = payload.get("response_format", "wav")
+    if response_format == "pcm":
+        raise ValueError(
+            "pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead."
+        )
 
     headers = {
         "Content-Type": "application/json",
@@ -189,8 +195,88 @@ async def async_request_openai_chat_omni_completions(
                 output.success = False
     except Exception:
         output.success = False
-        exc_info = sys.exc_info()
-        output.error = "".join(traceback.format_exception(*exc_info))
+        output.error = traceback.format_exc()
+        logger.error(f"ERROR: send request failed, reason is: {output.error}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_audio_speech(
+    request_func_input: RequestFuncInput, session: aiohttp.ClientSession, pbar: tqdm | None = None
+) -> MixRequestFuncOutput:
+    """Non-streaming request to /v1/audio/speech endpoint.
+
+    The endpoint returns raw audio bytes (e.g. WAV). Pass voice, instructions,
+    and other TTS-specific fields via ``extra_body``.
+    """
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Audio Speech API", "audio/speech")
+
+    payload = {
+        "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
+        "input": request_func_input.prompt,
+    }
+    _update_payload_common(payload, request_func_input)
+
+    response_format = payload.get("response_format", "wav")
+    if response_format == "pcm":
+        raise ValueError(
+            "pcm response format is not supported yet. \
+        Please use other formats like wav, mp3, etc. instead."
+        )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(url=api_url, json=payload, headers=headers) as response:
+            if response.status == 200:
+                audio_bytes = await response.read()
+                end_time = time.perf_counter()
+                output.latency = end_time - st
+                # ttft = latency since this is a non-streaming request
+                # hence there is no distinction between first and last token/audio
+                output.ttft = output.latency
+                output.audio_ttfp = output.latency
+
+                try:
+                    audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
+                    output.audio_duration = len(audio_segment) / 1000.0
+                    frame_width = audio_segment.frame_width
+                    if frame_width > 0:
+                        output.audio_frames = len(audio_segment.raw_data) // frame_width
+                    else:
+                        output.audio_frames = 0
+                        logger.warning("Audio frame width is zero")
+                    if output.audio_duration > 0:
+                        # rtf = audio_generate_time / audio_duration and
+                        # audio_generate_time = latency since this is a non-streaming request
+                        # so the time to receive last portion of audio is the latency
+                        output.audio_rtf = output.latency / output.audio_duration
+                    else:
+                        output.audio_rtf = 0
+                        logger.warning("Audio duration is zero")
+                    output.success = True
+                except Exception as e:
+                    output.success = False
+                    output.error = f"Failed to parse audio response: {e}"
+                    logger.error(f"ERROR: Failed to parse audio response: {e}")
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
         logger.error(f"ERROR: send request failed, reason is: {output.error}")
 
     if pbar:
@@ -201,6 +287,10 @@ async def async_request_openai_chat_omni_completions(
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
+
+ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
+if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
 
 # ruff: noqa: E402
 # Prevent import order from causing patch failures

@@ -1,4 +1,4 @@
-from typing import Literal, cast
+from typing import Literal
 
 import torch
 from comfy_api.input import AudioInput, VideoInput
@@ -6,7 +6,12 @@ from comfy_api.input import AudioInput, VideoInput
 from .utils.api_client import VLLMOmniClient
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
-from .utils.types import AudioFormat
+from .utils.types import (
+    AudioFormat,
+    AutoregressionSamplingParams,
+    DiffusionSamplingParams,
+    QwenTTSModelSpecificParams,
+)
 from .utils.validators import (
     add_sampling_parameters_to_stage,
     validate_model_and_sampling_params_types,
@@ -86,7 +91,10 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
 
         # Prefer DALL-E compatible API for simple (one-stage) diffusion models
         if (spec is None or spec["stages"] == ["diffusion"]) and not is_bagel:
-            sampling_params = cast(dict | None, sampling_params)
+            # The number of sampling parameter groups should have been validated.
+            # Now, simply convert single-item list to dict.
+            if isinstance(sampling_params, list):
+                sampling_params = sampling_params[0]
             if audio is None and image is None and video is None:
                 # No multimodal input --- use DALL-E image generation
                 logger.info("Using DALL-E image generation endpoint")
@@ -133,7 +141,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         return (output,)
 
 
-class VLLMOmniComprehension(_VLLMOmniGenerateBase):
+class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -197,7 +205,7 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
             (
                 text_response,
                 _,
-            ) = await client.generate_comprehension_chat_completion(
+            ) = await client.generate_understanding_chat_completion(
                 model=model,
                 prompt=prompt,
                 image=image,
@@ -221,7 +229,7 @@ class VLLMOmniComprehension(_VLLMOmniGenerateBase):
             (
                 text_response,
                 audio,
-            ) = await client.generate_comprehension_chat_completion(
+            ) = await client.generate_understanding_chat_completion(
                 model=model,
                 prompt=prompt,
                 image=image,
@@ -287,15 +295,13 @@ class VLLMOmniTTS(_VLLMOmniGenerateBase):
         logger.info("Got extra kwargs in TTS: %s", kwargs)
 
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params["type"]
-        if not is_qwen_tts and extra_params_type == "qwen-tts":
+        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
             )
 
         combined_params = {**kwargs, **(model_specific_params or {})}
-        combined_params.pop("type", None)  # Internal fields in model_specific_params
 
         client = VLLMOmniClient(url)
 
@@ -352,8 +358,7 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
         **kwargs,
     ):
         is_qwen_tts = "qwen3-tts" in model.lower()
-        extra_params_type = None if model_specific_params is None else model_specific_params["type"]
-        if not is_qwen_tts and extra_params_type == "qwen-tts":
+        if not is_qwen_tts and isinstance(model_specific_params, QwenTTSModelSpecificParams):
             raise ValueError(
                 "You have provided Qwen-specific TTS params."
                 "However, the model appears to not be a Qwen TTS model (no 'Qwen3-TTS' in model name)."
@@ -366,7 +371,6 @@ class VLLMOmniVoiceClone(_VLLMOmniGenerateBase):
             **kwargs,
             **(model_specific_params or {}),
         }
-        combined_params.pop("type", None)  # Internal fields in model_specific_params
 
         client = VLLMOmniClient(url)
 
@@ -419,10 +423,7 @@ class VLLMOmniARSampling:
     CATEGORY = "vLLM-Omni/Sampling Params"
 
     def get_params(self, seed, **kwargs):
-        params = {
-            "type": "autoregression",  # for internal use, removed before sending the request
-            **kwargs,
-        }
+        params = AutoregressionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
         return (params,)
@@ -479,6 +480,13 @@ class VLLMOmniDiffusionSampling:
                         "tooltip": "Enable VAE slicing for reduced memory usage (slight quality trade-off)",
                     },
                 ),
+                "vae_use_tiling": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable VAE tiling for reduced memory usage (slight quality trade-off)",
+                    },
+                ),
                 # === Put seed at last. ===
                 # Whenever a field named "seed" is present, ComfyUI adds another field called "control after generate"
                 "seed": (
@@ -499,10 +507,7 @@ class VLLMOmniDiffusionSampling:
     CATEGORY = "vLLM-Omni/Sampling Params"
 
     def get_params(self, seed, **kwargs):
-        params = {
-            "type": "diffusion",  # for internal use, removed before sending the request
-            **kwargs,
-        }
+        params = DiffusionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
         return (params,)
@@ -566,4 +571,4 @@ class VLLMOmniQwenTTSParams:
     CATEGORY = "vLLM-Omni/TTS Params"
 
     def get_params(self, **kwargs):
-        return ({"type": "qwen-tts", **kwargs},)
+        return (QwenTTSModelSpecificParams(kwargs),)

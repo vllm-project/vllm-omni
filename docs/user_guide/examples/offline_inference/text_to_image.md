@@ -3,7 +3,7 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_image>.
 
 
-This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` using vLLM-Omni:
+This folder provides several entrypoints for experimenting with `Qwen/Qwen-Image` `Qwen/Qwen-Image-2512` `Tongyi-MAI/Z-Image-Turbo` `stepfun-ai/NextStep-1.1` using vLLM-Omni, note that NextStep-1.1 has different architecture so we treat it differently regarding running arguments and pipeline.
 
 - `text_to_image.py`: command-line script for single image generation with advanced options.
 - `web_demo.py`: lightweight Gradio UI for interactive prompt/seed/CFG exploration.
@@ -77,6 +77,8 @@ if __name__ == "__main__":
 
 ## Local CLI Usage
 
+### Qwen/Tongyi Models
+
 ```bash
 python text_to_image.py \
   --model Tongyi-MAI/Z-Image-Turbo \
@@ -90,7 +92,26 @@ python text_to_image.py \
   --output outputs/coffee.png
 ```
 
-Key arguments:
+### NextStep Models
+
+NextStep-1.1 can have extra arguments
+```bash
+python text_to_image.py \
+  --model stepfun-ai/NextStep-1.1 \
+  --prompt "A baby panda wearing an Iron Man mask, holding a board with 'NextStep-1' written on it" \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 28 \
+  --guidance-scale 7.5 \
+  --guidance-scale-2 1.0 \
+  --cfg-schedule constant \
+  --output nextstep_output.png \
+  --seed 42
+```
+
+### Key Arguments
+
+**Common arguments:**
 
 - `--prompt`: text description (string).
 - `--seed`: integer seed for deterministic sampling.
@@ -101,8 +122,15 @@ Key arguments:
 - `--output`: path to save the generated PNG.
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion_acceleration.md#using-cfg-parallel).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+- `--guidance-scale`: classifier-free guidance scale.
+
+**NextStep-1.1 specific:**
+- `--guidance-scale-2`: secondary guidance scale, e.g. image-level CFG (default: 1.0).
+- `--timesteps-shift`: timesteps shift parameter for sampling (default: 1.0).
+- `--cfg-schedule`: CFG schedule type, "constant" or "linear" (default: "constant").
+- `--use-norm`: apply layer normalization to sampled tokens.
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 

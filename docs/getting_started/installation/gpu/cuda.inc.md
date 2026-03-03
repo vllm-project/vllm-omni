@@ -20,20 +20,7 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-# vllm 0.16.0 is still under prerelease
-uv pip install --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
-
-# vllm 0.16.0 may have some bugs for cuda 12.9, here is how we solve them:
-export FLASHINFER_CUDA_TAG="$(python3 -c 'import torch; print((torch.version.cuda or "12.4").replace(".", ""))')"
-
-uv pip install --upgrade --force-reinstall \
-  "flashinfer-python==0.6.3" \
-  "flashinfer-cubin==0.6.3" \
-  "flashinfer-jit-cache==0.6.3" \
-  --extra-index-url "https://flashinfer.ai/whl/cu${FLASHINFER_CUDA_TAG}"
-
-uv pip install --upgrade --force-reinstall "nvidia-cublas-cu12==12.9.1.4"
-uv pip install --upgrade --force-reinstall "numpy==2.2.6"
+uv pip install vllm --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
@@ -53,7 +40,7 @@ If you do not need to modify source code of vLLM, you can directly install the s
 uv pip install vllm==0.16.0 --torch-backend=auto
 ```
 
-The release 0.14.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
+The release 0.16.0 of vLLM is based on PyTorch 2.9.0 which requires CUDA 12.9 environment.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -104,7 +91,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.14.0 \
+    vllm/vllm-omni:v0.16.0 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 

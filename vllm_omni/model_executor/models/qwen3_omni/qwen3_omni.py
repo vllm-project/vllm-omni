@@ -155,6 +155,8 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
             self._init_special_tokens_embeddings()
+            # suppress tokens by setting their probability to ~1e-9 (finite very small)
+            self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
 
         elif self.model_stage == "code2wav":
@@ -408,11 +410,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_hidden = model_outputs
             # merge the code_predictor_codes from the info_dict list into a single tensor
             multimodal_outputs: dict = None
-            # Here is the only place to use runtime_additional_information. After MTP in the
+            # Here is the only place to use model_intermediate_buffer. After MTP in the
             # preprocess function, the code_predictor_codes are stored in the info_dict list.
             # We need to merge the tensors from different requests into a single tensor.
             # In the future, we may allow user to custom an aggregated function.
-            info_dicts = kwargs.get("runtime_additional_information")
+            info_dicts = kwargs.get("model_intermediate_buffer")
+            if info_dicts is None:
+                info_dicts = kwargs.get("runtime_additional_information")
+
+            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
             multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
             span_len = multimodal_outputs["code_predictor_codes"].shape[0]
@@ -1067,18 +1074,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # implemented by assigning their logits to log(1e-9).
 
         if getattr(self, "model_stage", None) == "talker" and isinstance(logits, torch.Tensor):
-            # suppress tokens by setting their probability to ~1e-9 (finite very small)
-            suppressed_tokens = self._get_talker_suppressed_tokens()
             try:
                 logits_cpu = logits.cpu()
-                logits_cpu[:, suppressed_tokens] = -1e9
+                logits_cpu[:, self.suppressed_tokens] = -1e9
                 logits = logits_cpu.to(logits.device)
             except Exception as e:
                 print(f"Error in logits suppression: {e}")
                 print(f"logits.shape: {logits.shape}")
-                print(f"suppressed_tokens: {suppressed_tokens}")
+                print(f"self.suppressed_tokens: {self.suppressed_tokens}")
                 raise e
-            logits[:, suppressed_tokens] = -1e9
+            logits[:, self.suppressed_tokens] = -1e9
         return logits
 
     def sample(

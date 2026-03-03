@@ -37,19 +37,18 @@ class LayerwiseOffloadHook(ModelHook):
         self,
         next_block: nn.Module,
         device: torch.device,
-        stream: torch.cuda.Stream | None = None,
+        stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
-        assert current_omni_platform.is_cuda(), "Layerwise offloading is only supported on cuda devices for now"
 
         self.next_block = next_block
         self.device = device
-        self.copy_stream = stream or torch.cuda.current_stream()
+        self.copy_stream = stream or current_omni_platform.current_stream()
         self.pin_memory = pin_memory
 
         # Per-block synchronization primitive: set after H2D copy completes.
-        self._prefetch_done: torch.cuda.Event | None = None
+        self._prefetch_done: current_omni_platform.Event | None = None
 
         self.next_block_parameters: dict[str, nn.Parameter] = {}
         self.next_block_buffers: dict[str, torch.Tensor] = {}
@@ -136,15 +135,15 @@ class LayerwiseOffloadHook(ModelHook):
         Pre-fetch target block in an asynchronous way with compute - memory copy overlap,
         with non_blocking set to True.
         """
-        self.copy_stream.wait_stream(torch.cuda.current_stream())
+        self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
         layer_params = self.next_block_parameters
         layer_bufs = self.next_block_buffers
 
-        evt = torch.cuda.Event()
+        evt = current_omni_platform.Event()
         gpu_weights: dict[torch.dtype, torch.Tensor] = {}
 
-        with torch.cuda.stream(self.copy_stream):
+        with current_omni_platform.stream(self.copy_stream):
             for dtype, cpu_weight in self.dtype_cpu_flattened_weights.items():
                 gpu_weight = torch.empty(cpu_weight.shape, dtype=dtype, device=self.device)
                 gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
@@ -175,7 +174,7 @@ class LayerwiseOffloadHook(ModelHook):
         """
         evt = self._prefetch_done
         if evt is not None:
-            torch.cuda.current_stream().wait_event(evt)
+            current_omni_platform.current_stream().wait_event(evt)
 
         self._prefetch_done = None
 
@@ -200,7 +199,7 @@ def apply_block_hook(
     module: nn.Module,
     next_block: nn.Module,
     device: torch.device,
-    stream: torch.cuda.Stream | None = None,
+    stream: current_omni_platform.Stream | None = None,
     pin_memory: bool = True,
 ) -> LayerwiseOffloadHook:
     registry = HookRegistry.get_or_create(module)
@@ -228,7 +227,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
 
-        self.copy_stream = torch.cuda.Stream()
+        self.copy_stream = current_omni_platform.Stream()
         self._blocks: list[list[nn.Module]] = []
 
     def enable(self, pipeline: nn.Module) -> None:
