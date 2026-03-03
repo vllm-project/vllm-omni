@@ -44,12 +44,12 @@ def talker2code2wav_async_chunk(
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
-    left_context_size = int(cfg.get("codec_left_context_frames", 25))
+    left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     initial_chunk_size = int(cfg.get("initial_codec_chunk_frames", 0))
-    if chunk_size <= 0 or left_context_size < 0 or initial_chunk_size < 0:
+    if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
-            f"codec_left_context_frames={left_context_size}, "
+            f"codec_left_context_frames={left_context_size_config}, "
             f"initial_codec_chunk_frames={initial_chunk_size}"
         )
     if initial_chunk_size > chunk_size:
@@ -83,7 +83,7 @@ def talker2code2wav_async_chunk(
             return None
         context_length = min(pending, initial_chunk_size)
         end_index = length
-        ctx_frames = max(0, length - context_length)
+        left_context_size = max(0, length - context_length)
         window_frames = transfer_manager.code_prompt_token_ids[request_id][:length]
     else:
         # Normal phase: standard chunk_size cadence with left_context sliding window.
@@ -94,16 +94,15 @@ def talker2code2wav_async_chunk(
         if chunk_length != 0 and not finished:
             return None
         context_length = chunk_length if chunk_length != 0 else chunk_size
-        end_index = min(length, left_context_size + context_length)
-        ctx_frames = max(0, int(end_index - context_length))
+        end_index = min(length, left_context_size_config + context_length)
+        left_context_size = max(0, int(end_index - context_length))
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
 
-    # Build final prompt_token_ids with ctx_frames header for Qwen3-TTS Code2Wav.
-    # The model expects input_ids layout: [ctx_frames, *flat_codes].
     return {
-        "code_predictor_codes": [int(ctx_frames)] + code_predictor_codes,
+        "code_predictor_codes": code_predictor_codes,
+        "left_context_size": left_context_size,
         "finished": torch.tensor(finished, dtype=torch.bool),
     }

@@ -72,7 +72,7 @@ def test_flushes_tail_when_finished_without_pooler_output():
 
     assert payload is not None
     assert payload["finished"].item() is True
-    assert len(payload["code_predictor_codes"]) == 1 + _Q * 24
+    assert len(payload["code_predictor_codes"]) == _Q * 24
 
 
 def test_emits_eof_marker_when_finished_with_no_frames():
@@ -129,5 +129,5 @@ def test_streaming_decoding_with_variable_initial(config, state, expected):
     else:
         exp_ctx, exp_window = expected
         assert payload is not None
-        assert payload["code_predictor_codes"][0] == exp_ctx
-        assert len(payload["code_predictor_codes"]) == 1 + _Q * exp_window
+        assert payload["left_context_size"] == exp_ctx
+        assert len(payload["code_predictor_codes"]) == _Q * exp_window

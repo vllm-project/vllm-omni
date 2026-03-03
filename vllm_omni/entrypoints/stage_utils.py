@@ -322,6 +322,21 @@ def _to_dict(x: Any) -> dict[str, Any]:
             return {}
 
 
+def _resolve_model_to_local_path(model: str) -> str:
+    """Resolve an HF Hub model ID to its local cache snapshot path."""
+    if os.path.isdir(model):
+        return model
+
+    try:
+        from huggingface_hub import snapshot_download
+
+        # no network access is attempted, check local model path only
+        return snapshot_download(model, local_files_only=True)
+    except Exception:
+        logger.warning(f"Could not resolve {model} to a local snapshot path; using as-is", exc_info=True)
+        return model
+
+
 def _resolve_model_tokenizer_paths(
     model: str,
     engine_args: dict,
@@ -331,30 +346,32 @@ def _resolve_model_tokenizer_paths(
     Some models (e.g., GLM-Image) have tokenizer in root and model in subdirectory.
     This function handles model_subdir and tokenizer_subdir engine_args.
 
+    When the base model path is an HF Hub ID rather than an absolute local path,
+    the ID is first resolved to the local snapshot directory so that subdirectory
+    joins produce valid filesystem paths.
+
     Args:
-        model: Base model path
+        model: Base model path or HF Hub model ID
         engine_args: Engine arguments (modified in-place to remove subdir args
             and set tokenizer if needed)
 
     Returns:
         Resolved model path (may be subdirectory of original)
     """
-    import os
-
     model_subdir = engine_args.pop("model_subdir", None)
     tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
-    base_model_path = model
+    resolved_base = _resolve_model_to_local_path(model)
 
     if model_subdir:
-        model = os.path.join(model, model_subdir)
+        model = os.path.join(resolved_base, model_subdir)
         logger.info(f"Using model subdirectory: {model}")
 
     if tokenizer_subdir is not None:
-        tokenizer_path = os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
+        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
         engine_args["tokenizer"] = tokenizer_path
         logger.info(f"Using tokenizer from: {tokenizer_path}")
     elif model_subdir and "tokenizer" not in engine_args:
-        engine_args["tokenizer"] = base_model_path
-        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+        engine_args["tokenizer"] = resolved_base
+        logger.info(f"Using tokenizer from base model path: {resolved_base}")
 
     return model

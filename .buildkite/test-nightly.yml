@@ -1,5 +1,5 @@
 steps:
-  - label: "Omni Model Test with H100"
+  - label: ":full_moon: Omni Model Test with H100"
     timeout_in_minutes: 90
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
@@ -41,7 +41,7 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: "Omni Model Test"
+  - label: ":full_moon: Omni Model Test"
     timeout_in_minutes: 60
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
@@ -56,18 +56,22 @@ steps:
           always-pull: true
           shm-size: "8gb"
           propagate-environment: true
+          shm-size: "8gb"
           environment:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Omni Model Perf Test"
-    timeout_in_minutes: 120
+  - label: ":full_moon: Omni Model Perf Test with H100"
+    key: nightly-performance
+    timeout_in_minutes: 180
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1"
     commands:
       - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - export BENCHMARK_DIR=tests
       - pytest -s -v tests/perf/scripts/run_benchmark.py
+      - buildkite-agent artifact upload "tests/*.json"
     agents:
       queue: "mithril-h100-pool"
     plugins:
@@ -96,3 +100,18 @@ steps:
                 hostPath:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
+
+  - label: ":email: Nightly Perf Collection & Email"
+    key: nightly-perf-distribution
+    depends_on: nightly-performance
+    if: build.env("NIGHTLY") == "1"
+    commands:
+      - pip install openpyxl
+      - export DEFAULT_INPUT_DIR=tests
+      - export DEFAULT_OUTPUT_DIR=tests
+      - buildkite-agent artifact download "tests/*.json" . --step nightly-performance
+      - python tools/nightly/generate_nightly_perf_excel.py
+      - python tools/nightly/send_nightly_perf_email.py
+      - buildkite-agent artifact upload "tests/*.xlsx"
+    agents:
+      queue: "cpu_queue_premerge"
