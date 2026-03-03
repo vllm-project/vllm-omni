@@ -47,6 +47,6 @@ def log_logo() -> None:
     # check the env vars that control colored output — matching vLLM's
     # _use_color() logic. main.py sets VLLM_LOGGING_COLOR=1 before any
     # vLLM import, so this env var is the authoritative source of truth.
-    use_color = not os.environ.get("NO_COLOR") and os.environ.get("VLLM_LOGGING_COLOR") != "0"
+    use_color = "NO_COLOR" not in os.environ and os.environ.get("VLLM_LOGGING_COLOR") != "0"
     logo = LOGO if use_color else _ANSI_RE.sub("", LOGO)
     logger.info(logo)
