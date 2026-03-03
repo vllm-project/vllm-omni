@@ -229,6 +229,13 @@ class OmniDiffusionSamplingParams:
     kv_metadata: dict[str, Any] | None = None  # Metadata for KV Cache (e.g., kv_lens, ropes)
     need_kv_receive: bool = True  # Flag to indicate if this request expects KV transfer
 
+    # [Omni] Multi-KV for CFG: populated by model-specific cfg_kv_collect_func
+    cfg_text_past_key_values: Any | None = None
+    cfg_img_past_key_values: Any | None = None
+    cfg_text_kv_metadata: dict[str, Any] | None = None
+    cfg_img_kv_metadata: dict[str, Any] | None = None
+    cfg_kv_request_ids: dict[str, str] | None = None
+
     # Component modules
     modules: dict[str, Any] = field(default_factory=dict)
 

@@ -27,7 +27,7 @@ The following table shows which models are currently supported by parallelism me
 | **LongCat-Image**        | `meituan-longcat/LongCat-Image`      |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |
 | **LongCat-Image-Edit**   | `meituan-longcat/LongCat-Image-Edit` |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |
 | **Ovis-Image**           | `OvisAI/Ovis-Image`                  |     ❌      |    ❌    |      ❌       |        ❌        |         ❌          |
-| **Qwen-Image**           | `Qwen/Qwen-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
+| **Qwen-Image**           | `Qwen/Qwen-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |         ✅          |
 | **Qwen-Image-Edit**      | `Qwen/Qwen-Image-Edit`               |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
 | **Qwen-Image-Edit-2509** | `Qwen/Qwen-Image-Edit-2509`          |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
 | **Qwen-Image-Layered**   | `Qwen/Qwen-Image-Layered`            |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |
@@ -51,9 +51,9 @@ The following table shows which models are currently supported by parallelism me
 
 ### VideoGen
 
-| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP |
-|-------|------------------|:----------:|:--------------:|:---------------:|:----:|
-| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ |
+| Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP | VAE-Patch-Parallel |
+|-------|------------------|:----------:|:--------------:|:---------------:|:----:| :----:|
+| **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ### Tensor Parallelism
 
@@ -85,7 +85,7 @@ outputs = omni.generate(
 VAE patch parallelism distributes the VAE decode workload across multiple ranks by splitting the latent spatially. It is configured via `DiffusionParallelConfig.vae_patch_parallel_size` and can be combined with other parallelism methods (e.g., TP).
 
 !!! note "Enablement and feature gate"
-    - VAE patch parallelism is currently **enabled only for validated pipelines** (currently: `Tongyi-MAI/Z-Image-Turbo`, `stabilityai/stable-diffusion-3.5`).
+    - VAE patch parallelism is currently **enabled only for validated pipelines** (check [ImageGen](#imagegen) and [VideoGen](#videogen) for more information).
     - If `vae_patch_parallel_size > 1` is set for a validated pipeline, vLLM-Omni will automatically enable `vae_use_tiling` as a safety gate. (We use `vae_use_tiling` because it indicates the VAE supports diffusers tiling parameters like `tile_latent_min_size` and `tile_overlap_factor`.)
 
 #### Offline Inference

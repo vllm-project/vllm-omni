@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import copy
 import io
 import urllib.request
 from collections.abc import Iterable
@@ -151,9 +152,14 @@ class Qwen3TTSModelForGeneration(nn.Module):
 
         # Extract additional parameters from kwargs that the generation methods expect
 
-        runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
+        runtime_additional_information = kwargs.get("model_intermediate_buffer")
+        if runtime_additional_information is None:
+            runtime_additional_information = kwargs.get("runtime_additional_information", [{}])
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
             runtime_additional_information = runtime_additional_information[0]
+        runtime_additional_information = copy.deepcopy(runtime_additional_information)
         text = runtime_additional_information.pop("text", [""])[0]
         # Extract task_type from kwargs, default to self.task_type
         task_type = _normalize_task_type(runtime_additional_information.pop("task_type", [self.task_type])[0])

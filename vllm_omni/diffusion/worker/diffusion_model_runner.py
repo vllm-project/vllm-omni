@@ -102,7 +102,7 @@ class DiffusionModelRunner:
 
         # Load model within forward context
         load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
+        model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 
         with get_memory_context():
@@ -191,7 +191,11 @@ class DiffusionModelRunner:
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
+            self.kv_transfer_manager.receive_multi_kv_cache(
+                req,
+                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                target_device=getattr(self.pipeline, "device", None),
+            )
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:
