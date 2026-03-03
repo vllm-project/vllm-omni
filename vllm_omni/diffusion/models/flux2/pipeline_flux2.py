@@ -1054,6 +1054,15 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
         self._current_timestep = None
 
         latents = self._unpack_latents_with_ids(latents, latent_ids)
