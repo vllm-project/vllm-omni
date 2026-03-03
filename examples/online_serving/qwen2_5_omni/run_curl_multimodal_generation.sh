@@ -160,10 +160,7 @@ esac
 echo "Running query type: $QUERY_TYPE"
 echo ""
 
-
-output=$(curl -sS -X POST http://localhost:8091/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d @- <<EOF
+request_body=$(cat <<EOF
 {
   "model": "Qwen/Qwen2.5-Omni-7B",
   "sampling_params_list": $sampling_params_list,
@@ -186,7 +183,12 @@ output=$(curl -sS -X POST http://localhost:8091/v1/chat/completions \
   ]
 }
 EOF
-  )
+)
+
+output=$(curl -sS --retry 3 --retry-delay 3 --retry-connrefused \
+    -X POST http://localhost:8091/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d "$request_body")
 
 # Here it only shows the text content of the first choice. Audio content has many binaries, so it's not displayed here.
 echo "Output of request: $(echo "$output" | jq '.choices[0].message.content')"
