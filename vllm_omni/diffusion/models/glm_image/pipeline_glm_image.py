@@ -871,8 +871,8 @@ class GlmImagePipeline(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load transformer weights."""
-        # Filter weights for transformer only
         transformer_weights = (
-            (name.replace("transformer.", ""), weight) for name, weight in weights if name.startswith("transformer.")
+            (name.replace("transformer.", "", 1), weight) for name, weight in weights if name.startswith("transformer.")
         )
-        return self.transformer.load_weights(transformer_weights)
+        loaded = self.transformer.load_weights(transformer_weights)
+        return {f"transformer.{name}" for name in loaded}

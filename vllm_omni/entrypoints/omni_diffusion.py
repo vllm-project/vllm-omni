@@ -28,6 +28,7 @@ class OmniDiffusion:
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
+        cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(**kwargs)
@@ -75,16 +76,13 @@ class OmniDiffusion:
             # Map model_type or architecture to pipeline class
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
+            pipeline_class = None
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
             if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                od_config.model_class_name = "BagelPipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
+                pipeline_class = "BagelPipeline"
             elif model_type == "nextstep":
                 if od_config.model_class_name is None:
-                    od_config.model_class_name = "NextStep11Pipeline"
-                od_config.tf_model_config = TransformerConfig()
-                od_config.update_multimodal_support()
+                    pipeline_class = "NextStep11Pipeline"
             elif model_type == "glm-image" or "GlmImageForConditionalGeneration" in architectures:
                 pipeline_class = "GlmImagePipeline"
             elif architectures and len(architectures) == 1:
@@ -96,6 +94,9 @@ class OmniDiffusion:
             od_config.model_class_name = pipeline_class
             od_config.tf_model_config = TransformerConfig()
             od_config.update_multimodal_support()
+
+        if cfg_kv_collect_func is not None:
+            od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
