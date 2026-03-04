@@ -87,6 +87,19 @@ Examples:
 python end2end.py --query-type Base --mode-tag icl
 ```
 
+## Streaming Mode
+
+Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires `async_chunk: true` in the stage config):
+
+```bash
+python end2end.py --query-type CustomVoice --streaming --output-dir /tmp/out_stream
+```
+
+Each 25-frame Code2Wav chunk is logged as it arrives. The final WAV file is written once generation
+completes. This demonstrates that audio data is available progressively rather than only at the end.
+
+> **Note:** Streaming uses `AsyncOmni` internally. The non-streaming path (`Omni`) is unchanged.
+
 ## Batched Decoding
 
 The Code2Wav stage (stage 1) supports batched decoding, where multiple requests are decoded in a single forward pass through the SpeechTokenizer. To use it, provide a stage config with `max_batch_size > 1` and pass multiple prompts via `--txt-prompts` with a matching `--batch-size`.

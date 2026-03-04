@@ -5,6 +5,7 @@
 
 from collections.abc import Iterable
 from functools import cached_property
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -155,9 +156,12 @@ class Qwen3OmniMoeForConditionalGeneration(
 
             # for CI: Initialize special tokens embeddings early to avoid AttributeError when loading dummy weights
             self._init_special_tokens_embeddings()
+            # suppress tokens by setting their probability to ~1e-9 (finite very small)
+            self.suppressed_tokens = self._get_talker_suppressed_tokens()
             self.requires_raw_input_tokens = True
 
         elif self.model_stage == "code2wav":
+            self.enable_update_additional_information = True
             self.thinker = None
             self.talker = None
             # Initialize code2wav (codec codes → audio waveform)
@@ -252,7 +256,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
-        additional_information: dict[str, object] | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
@@ -357,7 +361,15 @@ class Qwen3OmniMoeForConditionalGeneration(
                 codes = input_ids_flatten.reshape(1, 16, -1)
 
             # Generate audio from codec codes
-            audio_tensors = self.generate_audio(codes, voice_type, seq_token_counts)
+            # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
+            left_context_size = []
+            if runtime_additional_information is not None:
+                for info in runtime_additional_information:
+                    if "left_context_size" in info:
+                        left_context_size.append(info["left_context_size"])
+            else:
+                logger.debug("No additional_information provided to code2wav stage.")
+            audio_tensors = self.generate_audio(codes, voice_type, left_context_size, seq_token_counts)
 
             return audio_tensors
 
@@ -408,11 +420,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_hidden = model_outputs
             # merge the code_predictor_codes from the info_dict list into a single tensor
             multimodal_outputs: dict = None
-            # Here is the only place to use runtime_additional_information. After MTP in the
+            # Here is the only place to use model_intermediate_buffer. After MTP in the
             # preprocess function, the code_predictor_codes are stored in the info_dict list.
             # We need to merge the tensors from different requests into a single tensor.
             # In the future, we may allow user to custom an aggregated function.
-            info_dicts = kwargs.get("runtime_additional_information")
+            info_dicts = kwargs.get("model_intermediate_buffer")
+            if info_dicts is None:
+                info_dicts = kwargs.get("runtime_additional_information")
+
+            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
             multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
             span_len = multimodal_outputs["code_predictor_codes"].shape[0]
@@ -433,6 +450,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         self,
         code: torch.Tensor,
         voice_type: str,
+        left_context_size: list[int] | None = None,
         seq_token_counts: list[int] | None = None,
     ) -> list[torch.Tensor]:
         """
@@ -441,6 +459,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         Args:
             code: [batch, num_quantizers, T] - RVQ codec codes
             voice_type: Voice type (not used in Qwen3, kept for compatibility)
+            left_context_size: Left context size for streaming decode
             seq_token_counts: Token count for each request in batch
 
         Returns:
@@ -464,10 +483,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             talker_codes = talker_codes.expand(1, 16, -1)
 
         if self.vllm_config.model_config.async_chunk:
+            # Only use left_context_size from additional information
             audio_tensors = self.code2wav.chunked_decode_streaming(
                 talker_codes,
-                chunk_size=25,
-                left_context_size=25,
+                left_context_size=left_context_size,
                 seq_token_counts=seq_token_counts,
             )
         else:
@@ -1067,18 +1086,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # implemented by assigning their logits to log(1e-9).
 
         if getattr(self, "model_stage", None) == "talker" and isinstance(logits, torch.Tensor):
-            # suppress tokens by setting their probability to ~1e-9 (finite very small)
-            suppressed_tokens = self._get_talker_suppressed_tokens()
             try:
                 logits_cpu = logits.cpu()
-                logits_cpu[:, suppressed_tokens] = -1e9
+                logits_cpu[:, self.suppressed_tokens] = -1e9
                 logits = logits_cpu.to(logits.device)
             except Exception as e:
                 print(f"Error in logits suppression: {e}")
                 print(f"logits.shape: {logits.shape}")
-                print(f"suppressed_tokens: {suppressed_tokens}")
+                print(f"self.suppressed_tokens: {self.suppressed_tokens}")
                 raise e
-            logits[:, suppressed_tokens] = -1e9
+            logits[:, self.suppressed_tokens] = -1e9
         return logits
 
     def sample(

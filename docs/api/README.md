@@ -7,7 +7,6 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.async_omni.AsyncOmni][]
 - [vllm_omni.entrypoints.async_omni_diffusion.AsyncOmniDiffusion][]
 - [vllm_omni.entrypoints.async_omni_llm.AsyncOmniLLM][]
-- [vllm_omni.entrypoints.chat_utils.extract_audio_from_video_async][]
 - [vllm_omni.entrypoints.cli.benchmark.base.OmniBenchmarkSubcommandBase][]
 - [vllm_omni.entrypoints.cli.benchmark.main.OmniBenchmarkSubcommand][]
 - [vllm_omni.entrypoints.cli.benchmark.serve.OmniBenchmarkServingSubcommand][]
@@ -19,6 +18,7 @@ Main entry points for vLLM-Omni inference and serving.
 - [vllm_omni.entrypoints.omni_llm.OmniLLM][]
 - [vllm_omni.entrypoints.omni_stage.OmniStage][]
 - [vllm_omni.entrypoints.stage_utils.OmniStageTaskType][]
+- [vllm_omni.entrypoints.zmq_utils.ZmqQueue][]
 
 ## Inputs
 
@@ -36,6 +36,12 @@ Input data structures for multi-modal inputs.
 Engine classes for offline and online inference.
 
 - [vllm_omni.diffusion.diffusion_engine.DiffusionEngine][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.BufferAllocator][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.ManagedBuffer][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.MooncakeAgentMetadata][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.MooncakeTransferEngineConnector][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.QueryRequest][]
+- [vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector.QueryResponse][]
 - [vllm_omni.engine.AdditionalInformationEntry][]
 - [vllm_omni.engine.AdditionalInformationPayload][]
 - [vllm_omni.engine.OmniEngineCoreOutput][]
@@ -72,6 +78,8 @@ Configuration classes.
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
+- [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioConfig][]
+- [vllm_omni.model_executor.models.mimo_audio.config_mimo_audio.MiMoAudioTokenizerConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSSpeakerEncoderConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts.Qwen3TTSTalkerCodePredictorConfig][]
@@ -89,8 +97,10 @@ Configuration classes.
 Worker classes and model runners for distributed inference.
 
 - [vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner][]
+- [vllm_omni.diffusion.worker.diffusion_worker.CustomPipelineWorkerExtension][]
 - [vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker][]
 - [vllm_omni.diffusion.worker.diffusion_worker.WorkerProc][]
+- [vllm_omni.diffusion.worker.diffusion_worker.WorkerWrapperBase][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.ExecuteModelState][]
 - [vllm_omni.platforms.npu.worker.npu_ar_model_runner.NPUARModelRunner][]
 - [vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker][]

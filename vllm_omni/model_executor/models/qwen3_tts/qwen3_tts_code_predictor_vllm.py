@@ -18,6 +18,8 @@ from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheTensor
 from vllm.v1.worker.gpu import attn_utils
 
+from vllm_omni.platforms import current_omni_platform
+
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
 
@@ -148,18 +150,40 @@ class _LocalPredictorKVCache:
         block_table = self._block_table[:num_reqs].contiguous()
         slot_mapping_gpu = slot_mapping.to(device=self.device)
 
-        attn_metadata = attn_utils.build_attn_metadata(
-            self.attn_metadata_builders,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=query_start_loc_gpu,
-            query_start_loc_cpu=qsl,
-            seq_lens=seq_lens_gpu,
-            max_seq_len=max_seq_len,
-            block_tables=[block_table],
-            slot_mappings=[slot_mapping_gpu],
-            kv_cache_config=self.kv_cache_config,
-        )
+        # FIXME(gcanlin): Refactor build_attn_metadata to avoid special-casing NPU backends here.
+        if current_omni_platform.is_npu():
+            # NPU requires AscendCommonAttentionMetadata with extra attributes
+            from vllm_ascend.worker.v2 import attn_utils as attn_utils_npu
+
+            max_query_len = int(query_lens_i32[:num_reqs].max().item())
+            # NPU version expects slot_mappings as a stacked tensor, not a list
+            slot_mappings_tensor = slot_mapping_gpu.unsqueeze(0)
+            attn_metadata = attn_utils_npu.build_attn_metadata(
+                attn_metadata_builders=self.attn_metadata_builders,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=query_start_loc_gpu,
+                query_start_loc_cpu=qsl,
+                max_query_len=max_query_len,
+                seq_lens=seq_lens_gpu,
+                max_seq_len=max_seq_len,
+                block_tables=[block_table],
+                slot_mappings=slot_mappings_tensor,
+                kv_cache_config=self.kv_cache_config,
+            )
+        else:
+            attn_metadata = attn_utils.build_attn_metadata(
+                self.attn_metadata_builders,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=query_start_loc_gpu,
+                query_start_loc_cpu=qsl,
+                seq_lens=seq_lens_gpu,
+                max_seq_len=max_seq_len,
+                block_tables=[block_table],
+                slot_mappings=[slot_mapping_gpu],
+                kv_cache_config=self.kv_cache_config,
+            )
 
         # Build slot_mappings_by_layer for set_forward_context.
         # Fix for vllm 0.15.0
@@ -346,16 +370,17 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
     def _maybe_init_kv_cache(self, device: torch.device) -> None:
         if self._kv_cache is not None:
             return
-        max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
-        # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
-        max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
-        max_batch = max(1, max_batch)
-        self._kv_cache = _LocalPredictorKVCache(
-            vllm_config=self._vllm_config,
-            max_seq_len=max_seq_len,
-            max_batch_size=max_batch,
-            device=device,
-        )
+        with set_current_vllm_config(self._vllm_config):
+            max_seq_len = int(getattr(self.config, "num_code_groups", 16) or 16)
+            # Upper bound on batch size: vLLM scheduler max_num_seqs (fallback 8).
+            max_batch = int(getattr(self._vllm_config.scheduler_config, "max_num_seqs", 8) or 8)
+            max_batch = max(1, max_batch)
+            self._kv_cache = _LocalPredictorKVCache(
+                vllm_config=self._vllm_config,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch,
+                device=device,
+            )
 
     @torch.inference_mode()
     def reset_cache(self) -> None:
@@ -372,7 +397,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         bsz = int(inputs_embeds.shape[0])
         qlen = 2
         # Flatten to token-major.
-        hs = inputs_embeds.to(dtype=torch.bfloat16).reshape(bsz * qlen, -1)
+        model_dtype = next(self.model.parameters()).dtype
+        hs = inputs_embeds.to(dtype=model_dtype).reshape(bsz * qlen, -1)
         hs = self.small_to_mtp_projection(hs)
 
         query_lens = torch.full((bsz,), qlen, dtype=torch.int32)
@@ -473,11 +499,15 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         for step in range(1, num_groups):
             # Sample or argmax from logits.
             if do_sample and temperature > 0:
-                scaled = logits / temperature
+                scaled = logits.float() / temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                 probs = torch.softmax(scaled, dim=-1)
+                # Guard against NaN/Inf from lower-precision dtypes.
+                probs = probs.clamp(min=0.0)
+                row_sums = probs.sum(dim=-1, keepdim=True)
+                probs = torch.where(row_sums > 0, probs / row_sums, torch.ones_like(probs) / probs.shape[-1])
                 next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
             else:
                 next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]

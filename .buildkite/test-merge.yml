@@ -155,41 +155,31 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "Benchmark & Engine Test with H100"
-    timeout_in_minutes: 15
+  - label: "Benchmark & Engine Test"
     depends_on: upload-merge-pipeline
     commands:
-      - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-      - pytest -s -v tests/benchmarks/test_serve_cli.py
-      - pytest -s -v tests/engine/test_async_omni_engine_abort.py
+      - |
+        timeout 15m bash -c '
+                export VLLM_WORKER_MULTIPROC_METHOD=spawn
+                set +e
+                pytest -s -v tests/benchmarks/test_serve_cli.py
+                EXIT1=$$?
+                pytest -s -v tests/engine/test_async_omni_engine_abort.py
+                EXIT2=$$?
+                exit $$((EXIT1 | EXIT2))
+        '
     agents:
-      queue: "mithril-h100-pool"
+      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
-                  - name: devshm
-                    mountPath: /dev/shm
-                  - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test"
     timeout_in_minutes: 15
@@ -224,7 +214,7 @@ steps:
       - kubernetes:
           podSpec:
             containers:
-              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                 resources:
                   limits:
                     nvidia.com/gpu: 2
@@ -259,7 +249,7 @@ steps:
       - kubernetes:
           podSpec:
             containers:
-              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                 resources:
                   limits:
                     nvidia.com/gpu: 1
@@ -294,7 +284,7 @@ steps:
   #     - kubernetes:
   #         podSpec:
   #           containers:
-  #             - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #             - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
   #               resources:
   #                 limits:
   #                   nvidia.com/gpu: 1

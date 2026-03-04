@@ -44,8 +44,10 @@ from vllm_omni.entrypoints.omni_llm import OmniLLM
 from vllm_omni.entrypoints.stage_utils import (
     SHUTDOWN_TASK,
     OmniStageTaskType,
+    _resolve_model_tokenizer_paths,
     _to_dict,
     is_profiler_task,
+    load_func_from_config,
     maybe_dump_to_shm,
     set_stage_devices,
 )
@@ -251,7 +253,7 @@ class OmniStage:
     """
 
     def __init__(self, stage_config: Any, stage_init_timeout: int = 300):
-        logger.info(f"[OmniStage] stage_config: {stage_config}")
+        logger.debug(f"[OmniStage] stage_config: {stage_config}")
         self.stage_config = stage_config
         self.engine = None
         self.async_engine = None
@@ -283,6 +285,7 @@ class OmniStage:
         else:
             self.custom_process_input_func = None
 
+        self.prompt_expand_func = load_func_from_config(getattr(stage_config, "prompt_expand_func", None))
         self.final_output = getattr(stage_config, "final_output", False)
         self.final_output_type = getattr(stage_config, "final_output_type", None)
         self.tts_args = _to_dict(getattr(stage_config, "tts_args", {}))
@@ -463,6 +466,7 @@ class OmniStage:
             "connectors_config": connectors_config or {},
             "stage_type": self.stage_type,
             "engine_input_source": self.engine_input_source,
+            "cfg_kv_collect_func": getattr(self.stage_config, "cfg_kv_collect_func", None),
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
         }
@@ -615,7 +619,11 @@ class OmniStage:
             return None
 
     def process_engine_inputs(
-        self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
+        self,
+        stage_list: list[Any],
+        prompt: OmniTokensPrompt | TextPrompt = None,
+        *,
+        source_outputs_override: Any = None,
     ) -> list[OmniTokensPrompt | TextPrompt]:
         """Process engine inputs for this stage from upstream stage outputs.
 
@@ -626,6 +634,8 @@ class OmniStage:
         Args:
             stage_list: List of all stages in the pipeline
             prompt: Optional original prompt (for multimodal data preservation)
+            source_outputs_override: Use these outputs instead of reading from
+                the source stage's ``engine_outputs`` (for deferred CFG requests).
 
         Returns:
             List of processed engine inputs ready for this stage
@@ -638,7 +648,11 @@ class OmniStage:
             if len(self.engine_input_source) == 0:
                 raise ValueError("engine_input_source is empty")
             source_stage_id = self.engine_input_source[0]
-            source_outputs = stage_list[source_stage_id].engine_outputs
+            source_outputs = (
+                source_outputs_override
+                if source_outputs_override is not None
+                else stage_list[source_stage_id].engine_outputs
+            )
             if not isinstance(prompt, list):
                 prompt = [prompt]
             multi_modal_data = {
@@ -660,6 +674,18 @@ class OmniStage:
 
         else:
             engine_input_source = self.engine_input_source
+            if source_outputs_override is not None and engine_input_source:
+                # Temporarily swap engine_outputs so custom_process_input_func
+                # (which reads stage_list directly) sees the correct data.
+                _source_id = engine_input_source[0]
+                _orig_outputs = stage_list[_source_id].engine_outputs
+                stage_list[_source_id].engine_outputs = source_outputs_override
+                try:
+                    return self.custom_process_input_func(
+                        stage_list, engine_input_source, prompt, self.requires_multimodal_data
+                    )
+                finally:
+                    stage_list[_source_id].engine_outputs = _orig_outputs
             return self.custom_process_input_func(
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
@@ -705,8 +731,13 @@ def _stage_worker(
     connectors_config = stage_payload.get("connectors_config", {})
     stage_type: Literal["llm", "diffusion"] = stage_payload.get("stage_type", "llm")
 
+    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
+
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
+
+    # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
 
     # Resolve ZMQ queue endpoints if needed
     zmq_ctx = None
@@ -761,6 +792,7 @@ def _stage_worker(
                 model=model,
                 stage_id=stage_id,
                 engine_input_source=stage_payload.get("engine_input_source", []),
+                cfg_kv_collect_func=cfg_kv_collect_func,
                 **engine_args,
             )
         else:
@@ -933,8 +965,9 @@ def _stage_worker(
             _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
-            if isinstance(ein, (str, dict)):
-                # Types like OmniTextPrompt, TextPrompt are TypedDict, essentially dict and enters this branch
+
+            if isinstance(ein, (dict, str)):
+                # For diffusion stage-0, ein might be a string prompt directly
                 batch_engine_inputs.append(ein)
             elif isinstance(ein, Sequence):
                 batch_engine_inputs.extend(ein)
@@ -1108,6 +1141,10 @@ async def _stage_worker_async(
     final_output = stage_payload.get("final_output", False)
     final_output_type = stage_payload.get("final_output_type", None)
 
+    cfg_kv_collect_func = load_func_from_config(stage_payload.get("cfg_kv_collect_func"))
+    # Handle non-standard model directory structures (e.g., tokenizer in root, model in subdir)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
+
     if stage_type != "diffusion":
         _resolve_worker_cls(engine_args)
 
@@ -1183,10 +1220,13 @@ async def _stage_worker_async(
             od_config["omni_kv_config"]["engine_input_source"] = stage_payload.get("engine_input_source", [])
 
             logger.debug(f"[Stage-%s] Initializing diffusion engine with config: {od_config}", stage_id)
+            _diffusion_kwargs = {k: v for k, v in engine_args.items() if k not in {"od_config", "model"}}
+            if cfg_kv_collect_func is not None:
+                _diffusion_kwargs["cfg_kv_collect_func"] = cfg_kv_collect_func
             stage_engine = AsyncOmniDiffusion(
                 model=model,
                 od_config=od_config,
-                **{k: v for k, v in engine_args.items() if k not in {"od_config", "model"}},
+                **_diffusion_kwargs,
             )
             vllm_config = None  # Diffusion doesn't use vllm_config
         else:
@@ -1222,16 +1262,15 @@ async def _stage_worker_async(
         await stage_engine.reset_mm_cache()
     logger.debug("[Stage-%s] Engine initialized", stage_id)
 
-    async def handle_profiler_task_async(task_type: OmniStageTaskType) -> None:
+    async def handle_profiler_task_async(task_type: OmniStageTaskType) -> dict:
         """Handle profiler task asynchronously for both LLM and diffusion stages."""
         if task_type == OmniStageTaskType.PROFILER_START:
             if stage_type == "diffusion":
                 try:
-                    # Sync call is safe here — diffusion profiling is lightweight
                     profile_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR", "./profiles")
                     os.makedirs(profile_dir, exist_ok=True)
                     trace_filename = f"stage_{stage_id}_diffusion_{int(time.time())}"
-                    stage_engine.start_profile(trace_filename=trace_filename)
+                    await stage_engine.start_profile(trace_filename=trace_filename)
                     logger.info("[Stage-%s] Diffusion Torch profiler started", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to start diffusion profiler: %s", stage_id, e)
@@ -1241,14 +1280,17 @@ async def _stage_worker_async(
                     logger.info("[Stage-%s] vLLM profiler started", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to start vLLM profiler: %s", stage_id, e)
+            return {}
 
         elif task_type == OmniStageTaskType.PROFILER_STOP:
+            result_data: dict = {}
             if stage_type == "diffusion":
                 try:
-                    trace_files = stage_engine.stop_profile()
+                    trace_files = await stage_engine.stop_profile()
                     logger.info("[Stage-%s] Diffusion Torch profiler stopped", stage_id)
                     if trace_files:
                         logger.info("Diffusion trace files: %s", trace_files)
+                        result_data = trace_files
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to stop diffusion profiler: %s", stage_id, e)
             else:
@@ -1257,6 +1299,8 @@ async def _stage_worker_async(
                     logger.info("[Stage-%s] vLLM profiler stopped", stage_id)
                 except Exception as e:
                     logger.warning("[Stage-%s] Failed to stop vLLM profiler: %s", stage_id, e)
+            return result_data
+        return {}
 
     # Signal readiness to orchestrator and send vllm_config back to main process
     try:
@@ -1358,7 +1402,10 @@ async def _stage_worker_async(
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
             elif is_profiler_task(task_type):
-                await handle_profiler_task_async(task_type)
+                profiler_data = await handle_profiler_task_async(task_type)
+                # Send result back to orchestrator for STOP command
+                if task_type == OmniStageTaskType.PROFILER_STOP:
+                    out_q.put({"type": "profiler_result", "data": profiler_data})
             else:
                 asyncio.create_task(generation_single_request(task))
 

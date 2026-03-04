@@ -63,6 +63,28 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## mimo_audio
+    "MiMoAudioModel": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
+    "MiMoAudioLLMModel": (
+        "mimo_audio",
+        "mimo_audio_llm",
+        "MiMoAudioLLMForConditionalGeneration",
+    ),
+    "MiMoAudioToken2WavModel": (
+        "mimo_audio",
+        "mimo_audio_code2wav",
+        "MiMoAudioToken2WavForConditionalGenerationVLLM",
+    ),
+    ## glm_image
+    "GlmImageForConditionalGeneration": (
+        "glm_image",
+        "glm_image_ar",
+        "GlmImageForConditionalGeneration",
+    ),
 }
 
 

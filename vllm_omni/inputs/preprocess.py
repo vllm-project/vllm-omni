@@ -33,23 +33,41 @@ class OmniInputPreprocessor(InputPreprocessor):
         *,
         mm_uuids: MultiModalUUIDDict | None = None,
     ) -> OmniTokenInputs | MultiModalInputs:
+        """Process text prompts with support for mm_processor_kwargs.
+
+        Extends base class to support mm_processor_kwargs without multi_modal_data.
+        This is needed for models like GLM-Image where text-to-image generation
+        requires processor kwargs (target_h, target_w) to format the prompt.
+        """
         prompt_text = parsed_content["prompt"]
+        mm_processor_kwargs = parsed_content.get("mm_processor_kwargs") or {}
 
         inputs: OmniTokenInputs | MultiModalInputs
         if multi_modal_data := parsed_content.get("multi_modal_data"):
             inputs = self._process_multimodal(
                 prompt_text,
                 multi_modal_data,
-                parsed_content.get("mm_processor_kwargs") or {},
+                mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=mm_uuids,
             )
+            # Preserve prompt_embeds and additional_information
             prompt_embeds = parsed_content.get("prompt_embeds")
             if prompt_embeds is not None:
                 inputs["prompt_embeds"] = prompt_embeds
             additional_information = parsed_content.get("additional_information")
             if additional_information is not None:
                 inputs["additional_information"] = additional_information
+        elif mm_processor_kwargs:
+            # Support mm_processor_kwargs without multi_modal_data
+            # Use case: GLM-Image text-to-image needs processor to generate grid tokens
+            inputs = self._process_multimodal(
+                prompt_text,
+                {},  # Empty multi_modal_data
+                mm_processor_kwargs,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_uuids=mm_uuids,
+            )
         else:
             prompt_token_ids = self._tokenize_prompt(
                 prompt_text,
@@ -77,8 +95,10 @@ class OmniInputPreprocessor(InputPreprocessor):
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
 
+        multi_modal_data = parsed_content.get("multi_modal_data")
+
         inputs: OmniTokenInputs | MultiModalInputs
-        if multi_modal_data := parsed_content.get("multi_modal_data"):
+        if multi_modal_data:
             inputs = self._process_multimodal(
                 prompt_token_ids,
                 multi_modal_data,

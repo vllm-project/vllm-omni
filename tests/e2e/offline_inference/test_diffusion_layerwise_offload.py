@@ -30,7 +30,7 @@ def run_inference(
 ) -> float:
     # For now, only support on GPU, so apply torch.cuda operations here
     # NPU / ROCm platforms are expected to be detected and skipped this test function
-    torch.cuda.empty_cache()
+    current_omni_platform.empty_cache()
     device_index = torch.cuda.current_device()
     monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
@@ -68,7 +68,6 @@ def run_inference(
     return peak
 
 
-@pytest.mark.skipif(current_omni_platform.is_npu() or current_omni_platform.is_rocm(), reason="Hardware not supported")
 @pytest.mark.parametrize("model_name", MODELS_SAVED_MEMORY_MB.keys())
 def test_layerwise_offload_diffusion_model(model_name: str):
     """Test that layerwise offloading reduces GPU memory usage.
